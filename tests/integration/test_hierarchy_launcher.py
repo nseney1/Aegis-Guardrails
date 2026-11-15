@@ -220,7 +220,7 @@ def bootstrap_words(built, command):
 
 def bootstrap_call(built, command, expect):
     result = subprocess.run([sys.executable, "-I", str(LAUNCHER), *bootstrap_words(built, command)],
-                            capture_output=True, text=True, timeout=30)
+                            capture_output=True, text=True, timeout=R2_STOP_TIMEOUT_SECONDS)
     assert result.stderr == ""
     assert result.returncode == expect, result.stdout
     if expect == 0:
@@ -234,13 +234,13 @@ def bootstrap_legacy(tmp_path, words):
     legacy.write_text(MR1D_R2_LEGACY_BOOTSTRAP, encoding="utf-8")
     # JSON transport also permits testing the API's NUL-path refusal before OS argv encoding.
     return subprocess.run([sys.executable, "-I", "-c", MR1D_R3_LEGACY_ENTRY, str(legacy), json.dumps(words)],
-                          capture_output=True, text=True, timeout=30)
+                          capture_output=True, text=True, timeout=R2_STOP_TIMEOUT_SECONDS)
 
 
 def bootstrap_lookup_call(built, command, folder, failure):
     return subprocess.run([sys.executable, "-I", "-c", MR1D_R3_LOOKUP_ENTRY,
                            str(LAUNCHER), json.dumps(bootstrap_words(built, command)), json.dumps(str(folder)), failure],
-                          capture_output=True, text=True, timeout=30)
+                          capture_output=True, text=True, timeout=R2_STOP_TIMEOUT_SECONDS)
 
 
 @pytest.mark.parametrize("command", ["start", "resume", "_resume-wake"])
@@ -340,7 +340,7 @@ def test_mr1d_r2_no_plan_matches_integration_tip(bootstrap_base, tmp_path, comma
     argv = ([sys.executable, "-I", "-c", MR1D_R2_UNSUPPORTED_ENTRY, str(LAUNCHER), json.dumps(words), case]
             if case in ("unsupported", "probe-error") else [sys.executable, "-I", str(LAUNCHER), *words])
     for _ in range(2):
-        current = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        current = subprocess.run(argv, capture_output=True, text=True, timeout=R2_STOP_TIMEOUT_SECONDS)
         if case == "probe-error":
             # Round 3 explicitly changes this legacy success to a fail-closed refusal.
             assert (current.returncode, current.stdout, current.stderr) == (
@@ -666,21 +666,84 @@ def census(session, projection=None):
         module = launcher_module(projection)
         return [row.pid for row in module.process_census(session)
                 if not row.state.startswith("Z") and module.names_session(row, session)]
-    rows = subprocess.run(["ps", "-ax", "-ww", "-o", "pid=,stat=,args="], capture_output=True, text=True, timeout=10).stdout
+    rows = subprocess.run(["ps", "-ax", "-ww", "-o", "pid=,stat=,args="], capture_output=True, text=True, timeout=R2_STOP_TIMEOUT_SECONDS).stdout
     return [int(line.split()[0]) for line in rows.splitlines()
             if session in line.split()[2:] and not line.split()[1].startswith("Z")]
 
 
 def alive(pid):
-    shown = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=10).stdout.strip()
+    shown = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=R2_STOP_TIMEOUT_SECONDS).stdout.strip()
     return bool(shown) and not shown.startswith("Z")
 
 
-def wait_until(condition, seconds=5.0):
-    deadline = time.monotonic() + seconds
-    while not condition():
-        assert time.monotonic() < deadline, "condition not met within %.1f s" % seconds
-        time.sleep(0.05)
+def _r2_wait_descriptors(seconds, descriptors=()):
+    """Notifications are hints only; callers re-check their own readiness/exit proof."""
+    watched = [fd for fd in descriptors if isinstance(fd, int) and fd >= 0]
+    if hasattr(select, "poll"):
+        poller = select.poll()
+        for fd in watched:
+            poller.register(fd, select.POLLIN)
+        return bool(poller.poll(max(0, int(seconds * 1000))))
+    return bool(select.select(watched, [], [], seconds)[0])
+
+
+def _r2_child_events_capable():
+    return sys.platform.startswith("linux") and callable(getattr(os, "pidfd_open", None))
+
+
+def _r2_wait_child_event(seconds):
+    """Wake on a current child's exit; sample non-pollable predicates on a short slice.
+
+    These ephemeral pidfds are notification sources, never custody or exit proof.
+    Other POSIX hosts and kernels without pidfds retain bounded predicate sampling.
+    """
+    handles, source = [], None
+    try:
+        if _r2_child_events_capable():
+            source = os.open("/proc/thread-self/children", os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+            raw = os.read(source, 4097)
+            if len(raw) > 4096:
+                raise RuntimeError("R2 fixture: child notification list exceeds bound")
+            for word in raw.split():
+                if len(handles) >= 128:
+                    raise RuntimeError("R2 fixture: too many child notification handles")
+                try:
+                    fd = os.pidfd_open(int(word), 0)
+                except OSError:
+                    continue  # Exiting children need no notification handle.
+                handles.append(fd)
+            # Already-signalled zombies must not turn an unrelated predicate into a busy loop.
+            live = [fd for fd in handles if not _r2_wait_descriptors(0, [fd])]
+        else:
+            live = []
+        _r2_wait_descriptors(max(0, min(seconds, .05)), live)
+    except OSError:
+        # Proc/pidfd access is an optional notification capability, never exit authority.
+        _r2_wait_descriptors(max(0, min(seconds, .05)))
+    finally:
+        _close_fds(source, *handles)
+
+
+def _r2_check_ceiling(seconds):
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not 0 < seconds <= 600:
+        raise RuntimeError("R2 fixture: invalid handshake ceiling")
+
+
+def wait_until(condition, seconds=R2_HANDSHAKE_CEILING_SECONDS, *, clock=None, block=None):
+    """The ceiling detects a hung fixture; scheduling delays are not failures."""
+    _r2_check_ceiling(seconds)
+    clock = time.monotonic if clock is None else clock
+    block = _r2_wait_child_event if block is None else block
+    deadline = clock() + seconds
+    while True:
+        if condition():
+            return
+        remaining = deadline - clock()
+        if remaining <= 0:
+            if not condition():
+                raise AssertionError("condition not met within %.1f s" % seconds)
+            return
+        block(remaining)
 
 
 def test_start_runs_the_start_argv_once_binds_the_session_and_records_it(launch):
@@ -944,12 +1007,12 @@ def test_snapshot4e_launcher_timeout_records_a_fixed_reason(launch, reported):
         refused = launch.start(expect=2)
         assert refused["state"] == "refused"
         assert refused["error"] == "stop custody endpoint is busy: " + REVIEW
-        out, err = running.communicate(timeout=20)
+        out, err = running.communicate(timeout=R2_STOP_TIMEOUT_SECONDS)
         assert running.returncode == 3 and not err, out + err
     finally:
         if running.poll() is None:
             running.kill()
-            running.wait(timeout=5)
+            running.wait(timeout=R2_STOP_TIMEOUT_SECONDS)
     answer = json.loads(out)
     assert answer["timed_out"] is True
     assert answer["state"] == ("failed_to_start" if reported is None else "start_incomplete")
@@ -1077,11 +1140,11 @@ def test_stop_ends_the_process_group_of_a_hung_session(launch):
     try:
         wait_until(lambda: owned_pids(session, projection=context.projection) == [hung.pid])
         children = [int(pid) for pid in subprocess.run(["pgrep", "-g", str(hung.pid)], capture_output=True, text=True,
-                                                       timeout=10).stdout.split() if int(pid) != hung.pid]
+                                                       timeout=R2_STOP_TIMEOUT_SECONDS).stdout.split() if int(pid) != hung.pid]
         answer = launch.run("stop", "--endpoint", REVIEW, "--grace-seconds", "2")
         assert answer["action"] == "stop" and answer["state"] == "stopped" and answer["pids"] == sorted([hung.pid, *children])
         assert answer["wake_marker_present"] is False
-        assert hung.wait(timeout=5) < 0
+        assert hung.wait(timeout=R2_STOP_TIMEOUT_SECONDS) < 0
         wait_until(lambda: not any(alive(pid) for pid in children))
         assert [row["state"] for row in launch.records()] == ["bound", "stopped"]
     finally:
@@ -1191,7 +1254,7 @@ def test_an_interrupted_launcher_stops_its_start_and_records_it(launch, mode, nu
             wait_until(launch.codex_log.exists)
         [started] = [json.loads(line) for line in launch.codex_log.read_text().splitlines()]
         running.send_signal(number)
-        out, err = running.communicate(timeout=20)
+        out, err = running.communicate(timeout=R2_STOP_TIMEOUT_SECONDS)
         assert running.returncode == 3 and err == "", out + err
         answer = json.loads(out)
         assert answer["state"] == state and answer["error"] == "the launcher was interrupted"
@@ -1202,7 +1265,7 @@ def test_an_interrupted_launcher_stops_its_start_and_records_it(launch, mode, nu
     finally:
         if running.poll() is None:
             running.kill()
-            running.wait(timeout=5)
+            running.wait(timeout=R2_STOP_TIMEOUT_SECONDS)
 
 
 def test_a_busy_mailbox_writer_is_waited_for_before_binding(launch):
@@ -1212,13 +1275,13 @@ def test_a_busy_mailbox_writer_is_waited_for_before_binding(launch):
         wait_until(lock.exists)
         time.sleep(1)
         lock.unlink()
-        out, err = running.communicate(timeout=30)
+        out, err = running.communicate(timeout=R2_STOP_TIMEOUT_SECONDS)
         assert running.returncode == 0 and err == "", out + err
         assert json.loads(out)["state"] == "bound" and launch.binding() is not None
     finally:
         if running.poll() is None:
             running.kill()
-            running.wait(timeout=5)
+            running.wait(timeout=R2_STOP_TIMEOUT_SECONDS)
 
 
 def test_a_writer_busy_past_the_wait_is_recorded_as_bind_busy_and_can_be_bound(launch):
@@ -1263,7 +1326,7 @@ def test_stop_refuses_root_and_a_native_thread_and_signals_nothing(launch):
     finally:
         for process in named:
             os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=5)
+            process.wait(timeout=R2_STOP_TIMEOUT_SECONDS)
 
 
 def hold(launch, session, script, *words, **popen):
@@ -1275,7 +1338,7 @@ def hold(launch, session, script, *words, **popen):
 
 def group(pid):
     return [int(member) for member in subprocess.run(["pgrep", "-g", str(pid)], capture_output=True, text=True,
-                                                     timeout=10).stdout.split()]
+                                                     timeout=R2_STOP_TIMEOUT_SECONDS).stdout.split()]
 
 
 def owned_pids(session, host="codex-cli", projection=None):
@@ -1311,7 +1374,7 @@ def test_stop_spares_a_caller_that_names_the_session(launch, observe_after_stop)
         assert last == "exit=0"
         answer = json.loads(answer)
         assert answer["state"] == "stopped" and answer["pids"] == [hung.pid] and caller.pid not in answer["pids"]
-        assert hung.wait(timeout=5) < 0
+        assert hung.wait(timeout=R2_STOP_TIMEOUT_SECONDS) < 0
     finally:
         context.close()
 
@@ -1351,7 +1414,7 @@ def test_stop_kills_a_session_that_ignores_sigterm_after_the_grace(launch, grace
         members = sorted(group(stubborn.pid))
         answer = launch.run("stop", "--endpoint", REVIEW, "--grace-seconds", grace)
         assert answer["state"] == "stopped" and answer["pids"] == members and answer["grace_seconds"] == int(grace)
-        assert stubborn.wait(timeout=5) == -signal.SIGKILL
+        assert stubborn.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
     finally:
         context.close()
 
@@ -1591,15 +1654,32 @@ class WitnessedPopen(subprocess.Popen):
     def captured_communicate(self, input=None, timeout=None):
         if input is not None:
             raise RuntimeError("R2 fixture: captured runner has no input protocol")
-        deadline = None if timeout is None else time.monotonic() + timeout
+        timeout = R2_HANDSHAKE_CEILING_SECONDS if timeout is None else timeout
+        deadline = time.monotonic() + timeout
         while self.poll() is None or not all(row["done"].is_set() for row in self.pipe_capture):
             observer = getattr(self, "wait_observer", None)
             if observer is not None:
                 observer()
+            exited = self.poll() is not None
+            pending = next((row for row in self.pipe_capture if not row["done"].is_set()), None)
+            if exited and pending is None:
+                break
             if deadline is not None and time.monotonic() >= deadline:
                 raise subprocess.TimeoutExpired(self.args, timeout,
                                                 *(b"".join(row["chunks"]) for row in self.pipe_capture))
-            time.sleep(.005)
+            remaining = R2_HANDSHAKE_CEILING_SECONDS if deadline is None else max(0, deadline - time.monotonic())
+            blocker = getattr(self, "wait_blocker", None)
+            if exited:
+                pending["done"].wait(min(remaining, .05))
+            elif blocker is not None:
+                blocker(min(remaining, .05))
+            elif self.native_handle is not None:
+                _r2_wait_descriptors(min(remaining, .05), [self.native_handle])
+            else:
+                if pending is not None:
+                    pending["done"].wait(min(remaining, .05))
+                else:
+                    _r2_wait_descriptors(min(remaining, .05))
         values = []
         for row in self.pipe_capture:
             if row["error"] is not None:
@@ -1628,7 +1708,8 @@ class WitnessedPopen(subprocess.Popen):
             return self.record_wait(pid, status) if pid else None
 
     def wait(self, timeout=None):
-        deadline = None if timeout is None else time.monotonic() + timeout
+        timeout = R2_HANDSHAKE_CEILING_SECONDS if timeout is None else timeout
+        deadline = time.monotonic() + timeout
         while True:
             code = self.poll()
             if code is not None:
@@ -1637,7 +1718,8 @@ class WitnessedPopen(subprocess.Popen):
                 raise ChildProcessError("R2 fixture: native wait status unavailable")
             if deadline is not None and time.monotonic() >= deadline:
                 raise subprocess.TimeoutExpired(self.args, timeout)
-            time.sleep(.005)
+            remaining = R2_HANDSHAKE_CEILING_SECONDS if deadline is None else max(0, deadline - time.monotonic())
+            _r2_wait_descriptors(min(remaining, .05), [self.native_handle])
 
     def send_signal(self, number):
         if self.poll() is not None:
@@ -1853,7 +1935,7 @@ class R2Custody:
     its writer. Children announce themselves while gated, before they may fork or execute the stop runner.
     Missing original-instance/slot closure is UNKNOWN, retained, and blocks subsequent actor admission.
     """
-    LIMIT = 3.0  # Cleanup and direct native-wait cap. Handshakes use R2_HANDSHAKE_CEILING_SECONDS.
+    LIMIT = 3.0  # Active cleanup escalation budget; readiness/native waits have the generous ceiling.
     quarantine_report = None
 
     def __init__(self, folder, quarantine):
@@ -1864,6 +1946,7 @@ class R2Custody:
         self.nonce = uuid.uuid4().hex
         opened = []
         self.folder_fd = None
+        self.control_directory = None
         try:
             self.folder_fd = self._open_folder_fd()
             opened.append(self.folder_fd)
@@ -1937,11 +2020,23 @@ class R2Custody:
             self.slot_provenance[name]["handed_to_actor"] = True
 
     def config(self, nodes, script, path, **extra):
+        if "exit_file" in extra:
+            exit_file = Path(extra["exit_file"])
+            if exit_file.parent != self.folder.parent or not _r2_safe_name(exit_file.name):
+                raise RuntimeError("R2 fixture: exit marker path refused")
+            if self.control_directory is None:
+                # The first config is written before any actor exists. Reuse this anchor thereafter.
+                self.control_directory = self._open_folder_fd(self.folder.parent)
+            extra["exit_directory"] = self.control_directory
+            extra["exit_name"] = exit_file.name
         data = {"nonce": self.nonce, "safety_read": self.safety_read, "report_write": self.report_write,
                 "nodes": {slot: {**row, "gate": self.gates[slot][0],
                                   "started": str(self.folder / (slot + ".started"))}
                           for slot, row in nodes.items()},
-                "inherited": [self.safety_read, self.report_write, *(self.gates[s][0] for s in nodes)],
+                "slot_directory": self.folder_fd,
+                "inherited": [self.safety_read, self.report_write, self.folder_fd,
+                              *([self.control_directory] if self.control_directory is not None else []),
+                              *(self.gates[s][0] for s in nodes)],
                 "script": str(script), "config": str(path), "trusted_root": str(ROOT),
                 "helper": str(Path(__file__).resolve()), **extra}
         path.write_text(json.dumps(data), encoding="utf-8")
@@ -2119,10 +2214,12 @@ class R2Custody:
         return self.capture(slot, process.pid, process)
 
     def stderr_tail(self):
-        return "\n".join("%s:\n%s" % (path.name, path.read_text(errors="replace")[-4096:])
-                         for path in self.stderr_paths.values())
+        if not isinstance(getattr(self, "folder_fd", None), int):
+            return "[stderr omitted: closed]"
+        return "\n".join("%s:\n%s" % (_r2_untrusted_text(path.name, 256), self._bounded_stderr(slot, tail=True))
+                         for slot, path in self.stderr_paths.items())
 
-    def _open_folder_fd(self):
+    def _open_folder_fd(self, directory=None):
         """Anchor the custody directory before any child exists.
 
         Later stderr reads use this descriptor so a rename or symlink on the
@@ -2133,16 +2230,17 @@ class R2Custody:
             flags |= os.O_DIRECTORY
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        return os.open(os.fspath(self.folder), flags)
+        return os.open(os.fspath(self.folder if directory is None else directory), flags)
 
     def _close_folder_fd(self):
-        fd = getattr(self, "folder_fd", None)
-        self.folder_fd = None
-        if isinstance(fd, int):
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+        folder, control = getattr(self, "folder_fd", None), getattr(self, "control_directory", None)
+        self.folder_fd = self.control_directory = None
+        for fd in (folder, control):
+            if isinstance(fd, int):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
     def _discard_pending_report(self):
         """Drop a bounded amount of unread report bytes. Does not retain them."""
@@ -2458,8 +2556,12 @@ class R2Custody:
             self._block_for_handshake(slot, remaining)
 
     def _pidfd_for(self, slot):
+        """Return a live notification source; retain terminal handles as custody evidence."""
         entry = self.entries.get(slot)
-        if entry is None:
+        if entry is None or not entry.get("verified") or entry.get("lost"):
+            return None
+        self._refresh_exit_code(slot)
+        if entry.get("proof_state") == "exited" or entry.get("lost") or entry.get("wait_status") == "unavailable":
             return None
         fd = entry.get("fd")
         if isinstance(fd, int) and entry.get("verified_fd") and entry.get("verified") and not entry.get("lost"):
@@ -2467,6 +2569,21 @@ class R2Custody:
         process = entry.get("process")
         handle = getattr(process, "native_handle", None)
         return handle if isinstance(handle, int) and entry.get("verified") and not entry.get("lost") else None
+
+    def _notification_fds(self, slots):
+        """A newly reconciled terminal state wakes the caller once, even without a pidfd."""
+        handles = []
+        for slot in slots:
+            entry = self.entries.get(slot) or {}
+            before = (entry.get("proof_state"), entry.get("lost"), entry.get("wait_status"))
+            fd = self._pidfd_for(slot)
+            entry = self.entries.get(slot) or {}
+            after = (entry.get("proof_state"), entry.get("lost"), entry.get("wait_status"))
+            if before != after:
+                return handles, True
+            if isinstance(fd, int):
+                handles.append(fd)
+        return handles, False
 
     def _slot_exited(self, slot):
         entry = self.entries.get(slot)
@@ -2527,15 +2644,19 @@ class R2Custody:
             self.control_unknown = True
 
     def _block_for_handshake(self, slot, remaining):
+        if self._handshake_terminal(slot) is not None:
+            return
         poller = select.poll()
         try:
             poller.register(self.report_read, select.POLLIN)
         except (OSError, ValueError):
             self.report_eof = True
             return
-        fd = self._pidfd_for(slot)
+        handles, transitioned = self._notification_fds((slot,))
+        if transitioned:
+            return
         watching_exit = False
-        if isinstance(fd, int):
+        for fd in handles:
             try:
                 poller.register(fd, select.POLLIN)
                 watching_exit = True
@@ -2548,13 +2669,27 @@ class R2Custody:
         timeout_ms = int(limit * 1000)
         if timeout_ms < 1:
             timeout_ms = 1
+        if self._handshake_terminal(slot) is not None:
+            return
         try:
             poller.poll(timeout_ms)
         except OSError:
             return
 
+    def _pending_reap(self, slots):
+        """Reconcile a snapshot using retained original-instance evidence, without sampling."""
+        return [slot for slot in slots if slot not in self.entries or
+                r2_entry_record(self.entries[slot])["exit"] is None]
+
     def _block_for_reap(self, slots, remaining):
-        """Wait until a watched child exits or the report pipe is readable.
+        """A completed outstanding child returns control to cleanup immediately."""
+        slots = list(slots)
+        if self._pending_reap(slots) != slots:
+            return
+        self._block_for_notifications(slots, remaining, outstanding=slots)
+
+    def _block_for_notifications(self, slots, remaining, *, outstanding=()):
+        """Wait for report or live-child notifications, excluding stable terminal actors.
 
         Slots with no pidfd are rechecked on a short slice. The slice is not
         the cleanup deadline; the caller passes the time left on the ceiling.
@@ -2566,11 +2701,11 @@ class R2Custody:
             poller.register(self.report_read, select.POLLIN)
         except (OSError, ValueError):
             return
+        handles, transitioned = self._notification_fds(slots)
+        if transitioned:
+            return
         watching = False
-        for slot in slots:
-            fd = self._pidfd_for(slot)
-            if not isinstance(fd, int):
-                continue
+        for fd in handles:
             try:
                 poller.register(fd, select.POLLIN)
                 watching = True
@@ -2580,15 +2715,21 @@ class R2Custody:
         timeout_ms = int(limit * 1000)
         if timeout_ms < 1:
             timeout_ms = 1
+        # Selection, a peer hook, or a signal recheck can have completed a
+        # cleanup snapshot. Never spend its ceiling on the fixture-owned pipe.
+        if self._pending_reap(outstanding) != list(outstanding):
+            return
         try:
             poller.poll(timeout_ms)
         except OSError:
             return
 
-    def _bounded_stderr(self, slot):
+    def _bounded_stderr(self, slot, *, tail=False):
         path = self.stderr_paths.get(slot)
         directory = getattr(self, "folder_fd", None)
-        if path is None or not isinstance(directory, int) or not hasattr(os, "O_NOFOLLOW"):
+        if not isinstance(directory, int):
+            return "[stderr omitted: closed]"
+        if path is None or not _r2_slot_read_capable():
             return ""
         name = path.name
         if not _r2_safe_name(name):
@@ -2600,7 +2741,7 @@ class R2Custody:
                 flags |= os.O_NONBLOCK
             source = os.open(name, flags, dir_fd=directory)
             info = os.fstat(source)
-            if not stat.S_ISREG(info.st_mode):
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.geteuid():
                 return "[stderr omitted: unsafe]"
             if info.st_size > R2_CONTROL_LINE_LIMIT:
                 return "[stderr omitted: too_large]"
@@ -2613,7 +2754,7 @@ class R2Custody:
                 chunks.append(part)
                 remaining -= len(part)
             raw = b"".join(chunks)
-        except OSError:
+        except (OSError, NotImplementedError):
             return ""
         finally:
             if isinstance(source, int):
@@ -2621,7 +2762,7 @@ class R2Custody:
                     os.close(source)
                 except OSError:
                     pass
-        return _r2_untrusted_text(raw.decode("utf-8", "replace"), 1024)
+        return _r2_untrusted_text(raw.decode("utf-8", "replace"), 4096 if tail else 1024, tail=tail)
 
     def _refuse_handshake(self, slot, field, reason):
         self._refresh_exit_code(slot)
@@ -2785,10 +2926,43 @@ class R2Custody:
             self.control_unknown = True
             raise
 
-    def wait_native(self, slot, seconds=2):
+    def await_slot_file(self, name, slot, *, before=None, ceiling=R2_HANDSHAKE_CEILING_SECONDS):
+        """Only a safe file in the captured directory can complete a marker handshake."""
+        _r2_check_ceiling(ceiling)
+        if not _r2_safe_name(name) or len(name) > 255:
+            raise RuntimeError("R2 fixture: slot file refused")
+        with R2SlotEvents(self.folder_fd) as events:
+            def ready():
+                if before is not None:
+                    before()
+                if _r2_slot_ready(self.folder_fd, name):
+                    return True
+                terminal = self._handshake_terminal(slot)
+                if terminal is not None:
+                    # Re-check after the exit observation, as with report handshakes.
+                    if _r2_slot_ready(self.folder_fd, name):
+                        return True
+                    self._refuse_handshake(slot, "slot_file", terminal)
+                return False
+
+            def block(remaining):
+                handles, transitioned = self._notification_fds(self.entries)
+                if transitioned or self._handshake_terminal(slot) is not None:
+                    return
+                events.wait(min(remaining, .05), [self.report_read, *handles])
+
+            try:
+                wait_until(ready, seconds=ceiling, block=block)
+            except AssertionError as error:
+                if str(error) != "condition not met within %.1f s" % ceiling:
+                    raise
+                self._refuse_handshake(slot, "slot_file", "ceiling")
+
+    def wait_native(self, slot, seconds=R2_HANDSHAKE_CEILING_SECONDS):
         entry = self.entries[slot]
         process = entry["process"]
-        if process is None or not 0 < seconds <= self.LIMIT:
+        if (process is None or isinstance(seconds, bool) or not isinstance(seconds, (int, float))
+                or not 0 < seconds <= 600):
             raise RuntimeError("R2 fixture: invalid direct native wait")
         if isinstance(process, WitnessedPopen):
             code = process.wait(timeout=seconds)
@@ -2799,9 +2973,13 @@ class R2Custody:
             proof = r2_identity_transition(entry, "native_exit")
             if proof is not None:
                 return proof["returncode"]
-            if time.monotonic() >= deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                proof = r2_identity_transition(entry, "native_exit")
+                if proof is not None:
+                    return proof["returncode"]
                 raise RuntimeError("R2 fixture: native wait deadline exceeded")
-            time.sleep(0.01)
+            self._block_for_handshake(slot, min(remaining, .05))
 
     def close(self):
         try:
@@ -2857,7 +3035,7 @@ class R2Custody:
                 break
             if saturated:
                 continue
-            self._block_for_reap([], appear - time.monotonic())
+            self._block_for_notifications([], appear - time.monotonic())
         try:
             os.close(self.safety_write)  # ONLY the fixture owns this writer. All actors independently see EOF.
         except OSError as exc:
@@ -2883,6 +3061,7 @@ class R2Custody:
         drain_unavailable = False
         left = list(self.entries)
         while True:
+            left = self._pending_reap(left)
             if time.monotonic() >= deadline:
                 self._latch_refusal(RuntimeError("R2 fixture: control drain exceeded"))
                 break
@@ -2925,6 +3104,7 @@ class R2Custody:
                 except BaseException as exc:
                     left.append(slot)
                     self.errors.append("observe/cleanup " + slot + ": " + str(exc))
+            left = self._pending_reap(left)
             # Absence of buffered bytes is never a completed drain. Even an
             # empty pump must yield UNKNOWN if the exit observation spent the deadline.
             if time.monotonic() >= deadline:
@@ -3088,25 +3268,31 @@ class R2Processes:
         made.processes, made.group_reaping = {}, True
         return made
 
-    def pending(self, process):
+    def pending(self, process, *, sample=None):
         if str(process.pid) in self.receipts:
             raise RuntimeError("R2 fixture: an existing receipt cannot be renewed")
         self.processes[process.pid] = process
-        physical = r2_kernel_process(process.pid)
+        physical = (r2_kernel_process if sample is None else sample)(process.pid)
         if physical["uid"] != os.geteuid() or physical["euid"] != os.geteuid():
-            raise RuntimeError("R2 fixture: child is not ours")
+            raise R2IdentityConflict("R2 fixture: child is not ours")
         self.receipts[str(process.pid)] = {"state": "PENDING", "birth": physical["birth"],
                                           "digest": None, "argv": None}
         self.census_births[str(process.pid)] = physical["birth"]
         self.save()
 
-    def ready(self, process, argv=None):
+    def ready(self, process, argv=None, *, sample=None):
         receipt = self.receipts.get(str(process.pid))
         if receipt is None or receipt["state"] != "PENDING":
             raise RuntimeError("R2 fixture: READY requires a known pending Popen")
-        physical = r2_kernel_process(process.pid)
-        if (process.poll() is not None or physical["birth"] != receipt["birth"] or physical["state"].startswith("Z") or
-                physical["uid"] != os.geteuid() or physical["euid"] != os.geteuid()):
+        physical = (r2_kernel_process if sample is None else sample)(process.pid)
+        if (physical["birth"] != receipt["birth"] or physical["uid"] != os.geteuid() or
+                physical["euid"] != os.geteuid()):
+            raise R2IdentityConflict("R2 fixture: child changed before READY")
+        status = process.poll()
+        # An owned indirect poll can discover identity loss and return no exit proof.
+        if isinstance(process, R2OwnedChild) and process.custody.entries[process.slot].get("lost"):
+            raise R2IdentityConflict("R2 fixture: child changed before READY")
+        if status is not None or physical["state"].startswith("Z"):
             raise RuntimeError("R2 fixture: child changed before READY")
         if argv is not None and (not isinstance(argv, (list, tuple)) or not argv or
                                  not all(isinstance(word, str) and "\0" not in word for word in argv)):
@@ -3504,10 +3690,10 @@ def r2_captured_entry(arguments):
             options["stdin"] = subprocess.PIPE
         process = popen(argv, **options)
         try:
-            out, err = process.communicate(input, timeout=timeout)
+            out, err = process.communicate(input, timeout=R2_HANDSHAKE_CEILING_SECONDS if timeout is None else timeout)
         except BaseException:
             process.kill()
-            process.wait(timeout=3)
+            process.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS)
             raise
         finally:
             for stream in (process.stdin, process.stdout, process.stderr):
@@ -3590,7 +3776,89 @@ def _r2_safe_name(name):
     return True
 
 
-def _r2_untrusted_text(text, limit):
+def _r2_slot_read_capable():
+    return os.name == "posix" and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_NONBLOCK")
+
+
+
+def _r2_slot_ready(directory, name):
+    """A marker is an owned, unlinked regular inode opened from the retained directory."""
+    if not _r2_slot_read_capable():
+        raise RuntimeError("R2 fixture: slot file support unavailable")
+    if not isinstance(directory, int) or not _r2_safe_name(name) or len(name) > 255:
+        raise RuntimeError("R2 fixture: slot file refused")
+    source = None
+    try:
+        source = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0),
+                         dir_fd=directory)
+        info = os.fstat(source)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.geteuid():
+            raise RuntimeError("R2 fixture: slot file refused")
+        return True
+    except FileNotFoundError:
+        return False
+    except (OSError, NotImplementedError):
+        raise RuntimeError("R2 fixture: slot file refused") from None
+    finally:
+        if source is not None:
+            os.close(source)
+
+
+def _r2_slot_events_capable():
+    return sys.platform.startswith("linux") and _r2_slot_read_capable() and hasattr(select, "poll")
+
+
+class R2SlotEvents:
+    """Inotify watches the retained directory inode. Event names carry no authority."""
+
+    def __init__(self, directory, *, notify=None):
+        self.fd = None
+        if not _r2_slot_events_capable():
+            raise RuntimeError("R2 fixture: slot event support unavailable")
+        if not isinstance(directory, int) or isinstance(directory, bool) or directory < 0:
+            raise RuntimeError("R2 fixture: slot event watch refused")
+        try:
+            if notify is None:
+                import ctypes
+                notify = ctypes.CDLL(None, use_errno=True)
+            libc = notify
+            fd = libc.inotify_init1(os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+            if fd < 0:
+                raise RuntimeError("R2 fixture: slot event support unavailable")
+            self.fd = fd
+            # /proc/self/fd is the kernel's descriptor view, not an untrusted path component.
+            if libc.inotify_add_watch(fd, os.fsencode("/proc/self/fd/%d" % directory), 0x188) < 0:
+                raise RuntimeError("R2 fixture: slot event watch refused")
+        except (OSError, AttributeError, ValueError, TypeError):
+            self.close()
+            raise RuntimeError("R2 fixture: slot event support unavailable") from None
+        except BaseException:
+            self.close()
+            raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *error):
+        self.close()
+
+    def close(self):
+        if self.fd is not None:
+            fd, self.fd = self.fd, None
+            os.close(fd)
+
+    def wait(self, remaining, descriptors=()):
+        if self.fd is None:
+            raise RuntimeError("R2 fixture: slot event watch closed")
+        ready = _r2_wait_descriptors(remaining, [self.fd, *descriptors])
+        try:
+            os.read(self.fd, 65536)  # Bounded notification drain; readiness always reopens the marker.
+        except BlockingIOError:
+            pass
+        return ready
+
+
+def _r2_untrusted_text(text, limit, *, tail=False):
     """Canonicalize, then redact, then truncate. Newlines stay; they are not joined."""
     import unicodedata
     from aegis_core.redaction import TOKEN_REDACTIONS, redact_command_secrets
@@ -3602,14 +3870,15 @@ def _r2_untrusted_text(text, limit):
     for pattern, replacement in TOKEN_REDACTIONS:
         redacted = pattern.sub(replacement, redacted)
     if len(redacted) > limit:
-        redacted = redacted[:limit]
+        redacted = redacted[-limit:] if tail else redacted[:limit]
     return redacted
 
 
 def r2_wait_child_ready(child, ready, ceiling, clock=None, sleeper=None):
     """Wait until ready() is true or the child exits.
 
-    The caller's signal may be a file with no readiness descriptor, so this polls.
+    The caller supplies a readiness/exit notification blocker for slot files.
+    Non-pollable predicates retain a short sampling slice, not a failure bound.
     ceiling is the only failure bound and applies only while the child is still alive.
     A signal that becomes true as the child exits is still success.
     sleeper replaces time.sleep for tests that have to show the wait blocked.
@@ -3619,7 +3888,7 @@ def r2_wait_child_ready(child, ready, ceiling, clock=None, sleeper=None):
     if clock is None:
         clock = time.monotonic
     if sleeper is None:
-        sleeper = time.sleep
+        sleeper = lambda remaining: _r2_wait_descriptors(remaining, [getattr(child, "native_handle", None)])
     deadline = clock() + ceiling
     while True:
         if ready():
@@ -3635,6 +3904,47 @@ def r2_wait_child_ready(child, ready, ceiling, clock=None, sleeper=None):
         if remaining <= 0:
             return True if ready() else False
         sleeper(min(0.05, remaining))
+
+
+
+def r2_wait_marker(directory, relative, *, ceiling=R2_HANDSHAKE_CEILING_SECONDS, clock=None):
+    """Wait on an owned marker below an inherited root, never a pathname-following probe."""
+    _r2_check_ceiling(ceiling)
+    if not _r2_slot_read_capable():
+        raise RuntimeError("R2 fixture: slot file support unavailable")
+    if (not isinstance(directory, int) or isinstance(directory, bool) or directory < 0 or
+            not isinstance(relative, str) or len(relative) > 4096 or relative.count("/") > 63):
+        raise RuntimeError("R2 fixture: marker path refused")
+    parts = relative.split("/")
+    if any(not _r2_safe_name(part) or len(part) > 255 for part in parts):
+        raise RuntimeError("R2 fixture: marker path refused")
+    opened = []
+    try:
+        current = os.dup(directory)
+        opened.append(current)
+        for part in parts[:-1]:
+            current = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW |
+                              getattr(os, "O_CLOEXEC", 0), dir_fd=current)
+            opened.append(current)
+        with R2SlotEvents(current) as events:
+            try:
+                wait_until(lambda: _r2_slot_ready(current, parts[-1]), seconds=ceiling,
+                           clock=clock, block=events.wait)
+            except AssertionError as error:
+                if str(error) != "condition not met within %.1f s" % ceiling:
+                    raise
+                raise RuntimeError("R2 fixture: marker handshake refused: ceiling") from None
+    except (OSError, NotImplementedError):
+        raise RuntimeError("R2 fixture: marker path refused") from None
+    finally:
+        close_failed = False
+        for fd in reversed(opened):
+            try:
+                os.close(fd)
+            except OSError:
+                close_failed = True
+        if close_failed:
+            raise RuntimeError("R2 fixture: marker path refused") from None
 
 
 def r2_actor_main(config, slot):
@@ -3701,10 +4011,14 @@ def r2_actor_main(config, slot):
         # the pending receipt gets no positive logical projection until the caller's exact exec handshake.
         os.execvpe(command[0], command, dict(os.environ))
     if node["kind"] == "C":
-        started = config["nodes"][child_slot]["started"]
-        if not r2_wait_child_ready(child, lambda: Path(started).exists(), R2_HANDSHAKE_CEILING_SECONDS):
-            emit("timeout")
-            return 124
+        started = child_slot + ".started"
+        with R2SlotEvents(config["slot_directory"]) as events:
+            if not r2_wait_child_ready(
+                    child, lambda: _r2_slot_ready(config["slot_directory"], started),
+                    R2_HANDSHAKE_CEILING_SECONDS,
+                    sleeper=lambda remaining: events.wait(remaining, [child.native_handle])):
+                emit("timeout")
+                return 124
         try:
             out, err = child.communicate(timeout=config.get("runner_timeout", R2_STOP_TIMEOUT_SECONDS))
         except subprocess.TimeoutExpired:
@@ -3736,8 +4050,8 @@ def r2_actor_main(config, slot):
             sys.stderr.flush()
             Path(node["started"]).with_suffix(".capture-ready").touch()
         return code
-    while not Path(config["exit_file"]).exists():
-        time.sleep(0.02)
+    with R2SlotEvents(config["exit_directory"]) as events:
+        wait_until(lambda: _r2_slot_ready(config["exit_directory"], config["exit_name"]), block=events.wait)
     return 0
 
 
@@ -3785,7 +4099,7 @@ def test_an_interrupt_during_the_bind_wait_is_recorded_and_releases_the_start_lo
         wait_until(lambda: not alive(started["pid"]))
         time.sleep(0.5)
         running.send_signal(signal.SIGTERM)
-        out, err = running.communicate(timeout=20)
+        out, err = running.communicate(timeout=R2_STOP_TIMEOUT_SECONDS)
         assert running.returncode == 3 and err == "", out + err
         answer = json.loads(out)
         assert answer["state"] == "start_incomplete" and answer["error"] == "the launcher was interrupted"
@@ -3795,7 +4109,7 @@ def test_an_interrupt_during_the_bind_wait_is_recorded_and_releases_the_start_lo
     finally:
         if running.poll() is None:
             running.kill()
-            running.wait(timeout=5)
+            running.wait(timeout=R2_STOP_TIMEOUT_SECONDS)
     lock.unlink()
     launch.add_role(REVIEW, "codex-cli", session=thread)
     assert launch.binding()["session"] == thread
@@ -3827,7 +4141,7 @@ def test_a_census_that_fails_after_signals_were_sent_is_recorded_as_stop_failed(
         answer = json.loads(capsys.readouterr().out)
         assert answer["state"] == "stop_failed" and answer["pids"] == [hung.pid]
         assert answer["error"] == "[Errno 2] No such file or directory: 'ps'"
-        assert hung.wait(timeout=5) < 0
+        assert hung.wait(timeout=R2_STOP_TIMEOUT_SECONDS) < 0
         assert [row["state"] for row in launch.records()] == ["bound", "stop_failed"]
     finally:
         context.close()
@@ -4562,6 +4876,93 @@ def test_r2_handshake_refusal_bounds_stderr_before_reading_it(tmp_path):
             os.close(source)
         _close_fds(latch_read, latch_write)
         custody.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="custody stderr requires directory descriptors")
+@pytest.mark.parametrize("kind", ["regular", "symlink", "fifo", "missing", "large"])
+def test_r2_stderr_tail_reads_only_bounded_regular_slot_files(tmp_path, kind):
+    if not hasattr(os, "O_NOFOLLOW") or os.open not in os.supports_dir_fd:
+        pytest.skip("custody stderr requires no-follow directory descriptors")
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    path = custody.folder / "actor.stderr"
+    custody.stderr_paths["actor"] = path
+    try:
+        if kind == "regular":
+            path.write_text("head-marker\n" + "Q" * 5000 + "\nｔｏｋｅｎ=supersecretvalue\ntail-marker\n")
+        elif kind == "symlink":
+            outside = tmp_path / "outside"
+            outside.write_text("outside-marker\n")
+            symlink_or_skip(outside, path)
+        elif kind == "fifo":
+            os.mkfifo(path)
+        elif kind == "large":
+            path.write_bytes(b"Q" * (R2_CONTROL_LINE_LIMIT + 1))
+        for _ in range(2):
+            tail = custody.stderr_tail()
+            assert "outside-marker" not in tail and "supersecretvalue" not in tail
+            if kind == "regular":
+                assert tail.startswith("actor.stderr:\n") and tail.endswith("tail-marker\n")
+                assert "head-marker" not in tail and len(tail.split(":\n", 1)[1]) <= 4096
+            else:
+                expected = {"fifo": "[stderr omitted: unsafe]", "large": "[stderr omitted: too_large]"}
+                assert tail == "actor.stderr:\n" + expected.get(kind, "")
+    finally:
+        custody.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="custody stderr requires directory descriptors")
+@pytest.mark.parametrize("race", ["directory", "leaf", "read-error"])
+def test_r2_stderr_tail_keeps_its_anchor_and_closes_reads(tmp_path, monkeypatch, race):
+    if not hasattr(os, "O_NOFOLLOW") or os.open not in os.supports_dir_fd:
+        pytest.skip("custody stderr requires no-follow directory descriptors")
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    path = custody.folder / "actor.stderr"
+    path.write_text("real-marker\n")
+    custody.stderr_paths["actor"] = path
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / path.name).write_text("outside-marker\n")
+    real_os, opened = handshake_tests.os, []
+
+    def opening(name, flags, **kwargs):
+        assert name == "actor.stderr" and kwargs == {"dir_fd": custody.folder_fd}
+        assert flags & real_os.O_NOFOLLOW and flags & real_os.O_NONBLOCK
+        fd = real_os.open(name, flags, **kwargs)
+        opened.append(fd)
+        return fd
+
+    def reading(*args):
+        if race == "read-error":
+            raise OSError("token=supersecretvalue")
+        if race == "leaf":
+            path.unlink()
+            symlink_or_skip(outside / path.name, path)
+        return real_os.read(*args)
+
+    try:
+        if race == "directory":
+            custody.folder.rename(tmp_path / "moved")
+            symlink_or_skip(outside, custody.folder)
+        monkeypatch.setattr(handshake_tests, "os", R2Facade(real_os, open=opening, read=reading))
+        assert custody.stderr_tail() == "actor.stderr:\n" + ("" if race == "read-error" else "real-marker\n")
+        for fd in opened:
+            with pytest.raises(OSError):
+                real_os.fstat(fd)
+        assert custody.stderr_tail() == "actor.stderr:\n" + ("real-marker\n" if race == "directory" else "")
+    finally:
+        monkeypatch.setattr(handshake_tests, "os", real_os)
+        custody.close()
+
+
+def test_r2_stderr_tail_omits_content_without_descriptor_support(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    path = tmp_path / "actor.stderr"
+    path.write_text("outside-marker\n")
+    custody = SimpleNamespace(folder_fd=123, stderr_paths={"actor": path})
+    custody._bounded_stderr = lambda *args, **kwargs: R2Custody._bounded_stderr(custody, *args, **kwargs)
+    monkeypatch.setattr(handshake_tests, "_r2_slot_read_capable", lambda: False)
+    assert R2Custody.stderr_tail(custody) == "actor.stderr:\n"
 
 
 def _captured_exit_proven(report):
@@ -5675,6 +6076,249 @@ def test_r2_close_drains_reports_queued_during_exit_observation(tmp_path, monkey
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+@pytest.mark.parametrize("handles", ["pidfd", "native-only"])
+def test_r2_close_reconciles_exit_during_handle_selection(tmp_path, monkeypatch, handles):
+    """A newly observed exit must wake cleanup before its modelled deadline."""
+    real_os, real_select, real_time = os, select, time
+    trace = {"now": 0.0, "observed_live": False, "injected": False,
+             "native_wait": False, "report_waits": 0}
+    latch_read, latch_write = os.pipe()
+    process = None
+
+    def clock():
+        return real_time.monotonic() if trace["native_wait"] else trace["now"]
+
+    class ExitDuringSelection(R2Custody):
+        def observe(self, slot):
+            proof = super().observe(slot)
+            if self.closed and proof is None and not trace["injected"]:
+                assert process.poll() is None
+                trace["observed_live"] = True
+            return proof
+
+        def _pidfd_for(self, slot):
+            if self.closed and trace["observed_live"] and not trace["injected"]:
+                assert process.poll() is None
+                trace["injected"] = True
+                trace["now"] = 0.95
+                assert real_os.write(latch_write, b"X") == 1
+                # Only the real child's wait uses a real hung-fixture ceiling.
+                # The cleanup clock stays just before its deadline.
+                trace["native_wait"] = True
+                try:
+                    assert process.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS) == 7
+                finally:
+                    trace["native_wait"] = False
+            return super()._pidfd_for(slot)
+
+    class DeadlinePoll:
+        def __init__(self):
+            self.poller = real_select.poll()
+            self.watched = set()
+
+        def register(self, fd, event):
+            self.watched.add(fd)
+            self.poller.register(fd, event)
+
+        def poll(self, milliseconds):
+            if milliseconds > 0 and self.watched == {custody.report_read} and not custody.report_writer_retired:
+                trace["report_waits"] += 1
+                trace["now"] = 2.0
+                return []  # The fixture's retained writer prevents EOF here.
+            return self.poller.poll(milliseconds)
+
+    def unavailable(*args, **kwargs):
+        import errno
+        raise OSError(errno.ENOSYS, "modelled unavailable pidfd notification")
+
+    custody = None
+    try:
+        if handles == "native-only":
+            monkeypatch.setattr(handshake_tests, "os", R2Facade(real_os, pidfd_open=unavailable))
+        custody = ExitDuringSelection(tmp_path / "custody", tmp_path / "quarantine.json")
+        process = _start_handshake_child(custody, tmp_path, "actor", "exit", "hello", latch_read)
+        if handles == "pidfd" and custody._pidfd_for("actor") is None:
+            pytest.skip("this case requires an available pidfd notification")
+        assert custody.observe("actor") is None
+        custody.LIMIT = 1.0
+        monkeypatch.setattr(handshake_tests, "time", R2Facade(real_time, monotonic=clock))
+        monkeypatch.setattr(handshake_tests, "select", R2Facade(real_select, poll=DeadlinePoll))
+        report = custody.close()
+        assert trace["observed_live"] and trace["injected"]
+        assert trace["report_waits"] == 0
+        assert report["state"] == "CLOSED" and report["unresolved_slots"] == []
+        assert report["entries"]["actor"]["exit"]["returncode"] == 7
+        assert report["post_exit_drain"]["complete"] is True
+        assert report["post_exit_drain"]["eof_at"] < report["post_exit_drain"]["deadline"]
+    finally:
+        monkeypatch.setattr(handshake_tests, "os", real_os)
+        monkeypatch.setattr(handshake_tests, "time", real_time)
+        monkeypatch.setattr(handshake_tests, "select", real_select)
+        _close_fds(latch_read, latch_write)
+        if process is not None:
+            process.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS)
+        if custody is not None:
+            custody.LIMIT = R2Custody.LIMIT
+            if custody.report is None:
+                try:
+                    custody.close()
+                except R2CleanupUnknown:
+                    pass
+            _clear_r2_quarantine(custody, expected_unknown=True)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+@pytest.mark.parametrize("recognition", ["pidfd-observe", "native-lock", "peer-hook"])
+def test_r2_close_reconciles_retained_exit_before_wait(tmp_path, monkeypatch, recognition):
+    """Every producer of exit evidence invalidates cleanup's outstanding snapshot."""
+    real_os, real_select, real_time, sample = os, select, time, r2_kernel_process
+    trace = {"now": 0.0, "native_wait": False, "live_sample": False, "injected": False,
+             "in_kill": False, "kill_observed_live": False, "recognized": None, "report_waits": 0}
+    latch_read, latch_write = os.pipe()
+    peer_read, peer_write = None, None
+    custody, process, peer, deferred_peer = None, None, None, None
+
+    def clock():
+        return real_time.monotonic() if trace["native_wait"] else trace["now"]
+
+    def release(child, writer):
+        assert child.poll() is None
+        assert real_os.write(writer, b"X") == 1
+        trace["native_wait"] = True
+        try:
+            assert child.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS) == 7
+        finally:
+            trace["native_wait"] = False
+
+    class ExitBeforeWait(R2Custody):
+        def observe(self, slot):
+            proof = super().observe(slot)
+            if self.closed and slot == "actor":
+                if trace["in_kill"]:
+                    trace["kill_observed_live"] = proof is None
+                    if proof is not None:
+                        trace["recognized"] = "pidfd-observe"
+                elif proof is None and not trace["injected"]:
+                    assert process.poll() is None
+                    trace["live_sample"] = True
+                    trace["now"] = .31 if recognition == "peer-hook" else .35
+                    if recognition == "pidfd-observe":
+                        release(process, latch_write)
+                        trace["injected"], trace["now"] = True, .95
+            return proof
+
+        def kill_owned(self, slot):
+            if recognition == "peer-hook":
+                # Hold signal delivery until the peer hook witnesses the real exit.
+                assert process.poll() is None
+                return
+            trace["in_kill"] = True
+            try:
+                return super().kill_owned(slot)
+            finally:
+                trace["in_kill"] = False
+
+        def _native_exit(self, entry):
+            proof = super()._native_exit(entry)
+            if trace["in_kill"] and proof is not None:
+                trace["recognized"] = "native-lock"
+            return proof
+
+    def sample_then_exit(pid):
+        physical = sample(pid)
+        if (recognition == "native-lock" and trace["in_kill"] and
+                trace["kill_observed_live"] and not trace["injected"]):
+            release(process, latch_write)
+            trace["injected"], trace["now"] = True, .95
+        return physical
+
+    def cleanup_hook(slot):
+        if slot == "actor":
+            # Model delayed publication of an already retained original peer.
+            # It joins cleanup after the initial hook snapshot was taken.
+            custody.entries["peer"] = deferred_peer
+            custody.slots["peer"]["permitted"] = True
+        elif slot == "peer":
+            assert trace["live_sample"] and not trace["injected"]
+            release(process, latch_write)
+            release(peer, peer_write)
+            trace["injected"], trace["now"] = True, .35
+            assert custody.observe("actor") is not None
+            trace["recognized"] = "peer-hook"
+
+    class DeadlinePoll:
+        def __init__(self):
+            self.poller, self.watched = real_select.poll(), set()
+
+        def register(self, fd, event):
+            self.watched.add(fd)
+            self.poller.register(fd, event)
+
+        def poll(self, milliseconds):
+            if milliseconds > 0 and self.watched == {custody.report_read} and not custody.report_writer_retired:
+                trace["report_waits"] += 1
+                trace["now"] = .5 if recognition == "peer-hook" else 2.0
+                return []
+            return self.poller.poll(milliseconds)
+
+    def unavailable(*args, **kwargs):
+        import errno
+        raise OSError(errno.ENOSYS, "modelled unavailable pidfd notification")
+
+    try:
+        if recognition == "pidfd-observe":
+            require_r2_indirect_exit(pidfd=True)
+        if recognition == "peer-hook":
+            peer_read, peer_write = real_os.pipe()
+        if recognition == "native-lock":
+            monkeypatch.setattr(handshake_tests, "os", R2Facade(real_os, pidfd_open=unavailable))
+        custody = ExitBeforeWait(tmp_path / "custody", tmp_path / "quarantine.json")
+        process = _start_handshake_child(custody, tmp_path, "actor", "exit", "hello", latch_read)
+        if recognition == "pidfd-observe":
+            fd = custody._pidfd_for("actor")
+            if fd is None or not hasattr(signal, "pidfd_send_signal"):
+                pytest.skip("this case requires a signal-capable pidfd")
+            signal.pidfd_send_signal(fd, 0)
+        if recognition == "peer-hook":
+            peer = _start_handshake_child(custody, tmp_path, "peer", "exit", "hello", peer_read)
+            deferred_peer = custody.entries.pop("peer")
+            custody.slots["peer"]["permitted"] = False
+            custody.cleanup_hook = cleanup_hook
+        assert custody.observe("actor") is None
+        custody.LIMIT = .4 if recognition == "peer-hook" else 1.0
+        monkeypatch.setattr(handshake_tests, "time", R2Facade(real_time, monotonic=clock))
+        monkeypatch.setattr(handshake_tests, "select", R2Facade(real_select, poll=DeadlinePoll))
+        monkeypatch.setattr(handshake_tests, "r2_kernel_process", sample_then_exit)
+        report = custody.close()
+        assert trace["live_sample"] and trace["injected"] and trace["recognized"] == recognition
+        assert trace["report_waits"] == 0
+        assert report["state"] == "CLOSED" and report["unresolved_slots"] == []
+        assert report["entries"]["actor"]["exit"]["returncode"] == 7
+        assert report["post_exit_drain"]["complete"] is True
+        assert report["post_exit_drain"]["eof_at"] < report["post_exit_drain"]["deadline"]
+    finally:
+        monkeypatch.setattr(handshake_tests, "os", real_os)
+        monkeypatch.setattr(handshake_tests, "time", real_time)
+        monkeypatch.setattr(handshake_tests, "select", real_select)
+        monkeypatch.setattr(handshake_tests, "r2_kernel_process", sample)
+        _close_fds(latch_read, latch_write, peer_read, peer_write)
+        for child in (process, peer):
+            if child is not None:
+                child.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS)
+        if custody is not None:
+            if deferred_peer is not None:
+                custody.entries["peer"] = deferred_peer
+                custody.slots["peer"]["permitted"] = True
+            custody.cleanup_hook, custody.LIMIT = None, R2Custody.LIMIT
+            if custody.report is None:
+                try:
+                    custody.close()
+                except R2CleanupUnknown:
+                    pass
+            _clear_r2_quarantine(custody, expected_unknown=True)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
 def test_r2_line_budget_is_shared_by_reads_in_one_pump(tmp_path, monkeypatch):
 
     custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
@@ -6096,7 +6740,7 @@ def _r2_finish_identity_scope(custody):
             reaped.append(dict(wait_pid=pid, wait_status=status))
         else:
             assert time.monotonic() < deadline, "R2 fixture: identity scope exit unproven"
-            time.sleep(0.01)
+            _r2_wait_child_event(min(.05, deadline - time.monotonic()))
     assert R2Custody.quarantine_report is custody.report and custody.report["state"] == "UNKNOWN"
     data = {"report": custody.report, "scope_exit": {"proof": "subreaper_native_ECHILD", "reaped": reaped}}
     (Path(os.environ["R2_IDENTITY_SCOPE_FOLDER"]) / "proof.json").write_text(json.dumps(data, indent=2))
@@ -7271,3 +7915,348 @@ def test_r2_direct_case_without_pidfd_uses_owned_native_wait(launch, monkeypatch
         _teardown_r2_case(context)
     finally:
         context.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="slot files require no-follow directory descriptors")
+@pytest.mark.parametrize("kind", ["hardlink", "foreign-owner", "closed"])
+def test_r2_stderr_tail_refuses_unowned_linked_or_closed_slots(tmp_path, monkeypatch, kind):
+    if not _r2_slot_read_capable() or os.open not in os.supports_dir_fd:
+        pytest.skip("slot files require no-follow directory descriptors")
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    path = custody.folder / "actor.stderr"
+    custody.stderr_paths["actor"] = path
+    outside = tmp_path / "outside"
+    outside.write_text("outside-marker")
+    real_os, opened = handshake_tests.os, []
+
+    def opening(*args, **kwargs):
+        fd = real_os.open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    def metadata(fd):
+        info = real_os.fstat(fd)
+        return SimpleNamespace(st_mode=info.st_mode, st_nlink=info.st_nlink,
+                               st_uid=info.st_uid + 1, st_size=info.st_size)
+
+    def forbidden_read(*args):
+        raise AssertionError("unsafe stderr must be refused before reading")
+
+    try:
+        if kind == "hardlink":
+            os.link(outside, path)
+        else:
+            path.write_text("outside-marker")
+        if kind == "closed":
+            custody.close()
+        monkeypatch.setattr(handshake_tests, "os", R2Facade(
+            real_os, open=opening, read=forbidden_read,
+            fstat=metadata if kind == "foreign-owner" else real_os.fstat))
+        expected = "[stderr omitted: closed]" if kind == "closed" else "actor.stderr:\n[stderr omitted: unsafe]"
+        for _ in range(2):
+            assert custody.stderr_tail() == expected
+        for fd in opened:
+            with pytest.raises(OSError):
+                real_os.fstat(fd)
+    finally:
+        monkeypatch.setattr(handshake_tests, "os", real_os)
+        custody.close()
+
+
+def test_r2_wait_until_accepts_readiness_after_five_seconds():
+    clock = {"now": 0.0}
+    waits = []
+
+    def block(seconds):
+        waits.append(seconds)
+        clock["now"] += min(seconds, 1.0)
+
+    wait_until(lambda: clock["now"] >= 6.0, clock=lambda: clock["now"], block=block)
+    assert waits and 6.0 <= clock["now"] < R2_HANDSHAKE_CEILING_SECONDS
+
+
+@pytest.mark.skipif(os.name != "posix", reason="slot files require no-follow directory descriptors")
+@pytest.mark.parametrize("kind", ["regular", "missing", "symlink", "fifo", "hardlink", "foreign-owner"])
+def test_r2_slot_ready_refuses_unsafe_files_before_reading(tmp_path, monkeypatch, kind):
+    if not _r2_slot_read_capable() or os.open not in os.supports_dir_fd:
+        pytest.skip("slot files require no-follow directory descriptors")
+    directory = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    path, outside = tmp_path / "actor.started", tmp_path / "outside"
+    outside.write_text("outside-marker")
+    real_os, opened = handshake_tests.os, []
+
+    def opening(*args, **kwargs):
+        assert kwargs == {"dir_fd": directory}
+        assert args[1] & real_os.O_NOFOLLOW and args[1] & real_os.O_NONBLOCK
+        fd = real_os.open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    def metadata(fd):
+        info = real_os.fstat(fd)
+        return SimpleNamespace(st_mode=info.st_mode, st_nlink=info.st_nlink,
+                               st_uid=info.st_uid + 1 if kind == "foreign-owner" else info.st_uid)
+
+    def forbidden_read(*args):
+        raise AssertionError("readiness never reads slot contents")
+
+    try:
+        if kind in ("regular", "foreign-owner"):
+            path.touch()
+        elif kind == "symlink":
+            symlink_or_skip(outside, path)
+        elif kind == "fifo":
+            os.mkfifo(path)
+        elif kind == "hardlink":
+            os.link(outside, path)
+        monkeypatch.setattr(handshake_tests, "os", R2Facade(
+            real_os, open=opening, fstat=metadata, read=forbidden_read))
+        for _ in range(2):
+            if kind in ("regular", "missing"):
+                assert _r2_slot_ready(directory, path.name) is (kind == "regular")
+            else:
+                with pytest.raises(RuntimeError, match="^R2 fixture: slot file refused$"):
+                    _r2_slot_ready(directory, path.name)
+        for fd in opened:
+            with pytest.raises(OSError):
+                real_os.fstat(fd)
+    finally:
+        monkeypatch.setattr(handshake_tests, "os", real_os)
+        os.close(directory)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="slot files require no-follow directory descriptors")
+def test_r2_slot_ready_keeps_the_directory_anchor_across_rename(tmp_path):
+    if not _r2_slot_read_capable() or os.open not in os.supports_dir_fd:
+        pytest.skip("slot files require no-follow directory descriptors")
+    root, outside = tmp_path / "slot", tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    (root / "actor.started").touch()
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        root.rename(tmp_path / "moved")
+        symlink_or_skip(outside, root)
+        assert _r2_slot_ready(fd, "actor.started") is True
+        (tmp_path / "moved" / "actor.started").unlink()
+        symlink_or_skip(outside, tmp_path / "moved" / "actor.started")
+        with pytest.raises(RuntimeError, match="^R2 fixture: slot file refused$"):
+            _r2_slot_ready(fd, "actor.started")
+    finally:
+        os.close(fd)
+
+
+def test_r2_slot_probe_unsupported_platform_is_a_fixed_refusal(monkeypatch):
+    monkeypatch.setattr(handshake_tests, "_r2_slot_read_capable", lambda: False)
+    with pytest.raises(RuntimeError, match="^R2 fixture: slot file support unavailable$"):
+        _r2_slot_ready(123, "actor.started")
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="slot events require Linux inotify")
+def test_r2_slot_events_wake_for_a_write_after_directory_rename(tmp_path):
+    folder, outside = tmp_path / "slot", tmp_path / "outside"
+    folder.mkdir()
+    outside.mkdir()
+    fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        with R2SlotEvents(fd) as events:
+            folder.rename(tmp_path / "moved")
+            symlink_or_skip(outside, folder)
+            (tmp_path / "moved" / "actor.started").touch()
+            assert events.wait(R2_HANDSHAKE_CEILING_SECONDS) is True
+            assert _r2_slot_ready(fd, "actor.started") is True
+            watched = events.fd
+        with pytest.raises(OSError):
+            os.fstat(watched)
+    finally:
+        os.close(fd)
+
+
+def test_r2_slot_events_unsupported_platform_is_a_fixed_refusal(monkeypatch):
+    monkeypatch.setattr(handshake_tests, "_r2_slot_events_capable", lambda: False)
+    with pytest.raises(RuntimeError, match="^R2 fixture: slot event support unavailable$"):
+        R2SlotEvents(123)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="slot events require Linux inotify")
+@pytest.mark.parametrize("failure", ["watch", "missing-abi"])
+def test_r2_slot_event_setup_failure_closes_its_descriptor(tmp_path, failure):
+    directory = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    candidate = os.dup(directory)
+
+    class Notify:
+        def inotify_init1(self, flags):
+            return candidate
+
+        def inotify_add_watch(self, *args):
+            if failure == "missing-abi":
+                raise AttributeError("untrusted-marker")
+            return -1
+
+    try:
+        expected = "watch refused" if failure == "watch" else "support unavailable"
+        with pytest.raises(RuntimeError, match="^R2 fixture: slot event " + expected + "$"):
+            R2SlotEvents(directory, notify=Notify())
+        with pytest.raises(OSError):
+            os.fstat(candidate)
+        os.fstat(directory)  # The caller's anchor is still owned by the caller.
+    finally:
+        os.close(directory)
+
+
+def test_r2_wait_until_rechecks_readiness_at_the_ceiling_and_refuses_a_hang():
+    state = {"now": 0, "ready": False}
+
+    def block(remaining):
+        state.update(now=61, ready=True)
+
+    wait_until(lambda: state["ready"], clock=lambda: state["now"], block=block)
+    state.update(now=0, ready=False, reads=0)
+
+    def crossing():
+        state["reads"] += 1
+        if state["reads"] == 2:
+            state.update(now=61, ready=True)
+        return state["now"]
+
+    wait_until(lambda: state["ready"], clock=crossing)
+    state.update(now=0, ready=False)
+    with pytest.raises(AssertionError, match="^condition not met within 60.0 s$"):
+        wait_until(lambda: False, clock=lambda: state["now"],
+                   block=lambda remaining: state.update(now=61))
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="slot events require Linux inotify")
+def test_r2_slot_wait_requires_the_marker_even_after_another_handshake_succeeds(tmp_path):
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    calls = []
+
+    def announced():
+        calls.append(True)
+        if len(calls) == 2:
+            (custody.folder / "actor.started").touch()
+        return True  # A successful service call is not the marker's readiness.
+
+    try:
+        custody.plan({"actor": {"kind": "H", "parent": None, "child": None}}, fixture_only=("actor",))
+        custody.await_slot_file("actor.started", "actor", before=announced)
+        assert len(calls) == 2
+    finally:
+        custody.close()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="actor control descriptors require Linux")
+def test_r2_exit_marker_reuses_its_anchor_and_closes_it(tmp_path):
+    folder = tmp_path / "control"
+    folder.mkdir()
+    custody = R2Custody(folder / "custody", tmp_path / "quarantine.json")
+    nodes = {"actor": {"kind": "H", "parent": None, "child": None}}
+    custody.plan(nodes, fixture_only=("actor",))
+    try:
+        first = custody.config(nodes, folder / "actor.py", folder / "actor.json",
+                               exit_file=str(folder / "actor.exit"))
+        fd = first["exit_directory"]
+        assert fd in first["inherited"] and first["slot_directory"] == custody.folder_fd
+        folder.rename(tmp_path / "moved-control")
+        folder.mkdir()
+        (folder / "actor.exit").touch()
+        assert _r2_slot_ready(fd, first["exit_name"]) is False
+        (tmp_path / "moved-control" / "actor.exit").touch()
+        assert _r2_slot_ready(fd, first["exit_name"]) is True
+        # Restore the separate retention path before asking close() to write its report.
+        (folder / "actor.exit").unlink()
+        folder.rmdir()
+        (tmp_path / "moved-control").rename(folder)
+        custody.close()
+        with pytest.raises(OSError):
+            os.fstat(fd)
+    finally:
+        custody.close()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="marker events require Linux inotify")
+@pytest.mark.parametrize("kind", ["regular", "parent-link", "leaf-link", "missing"])
+def test_r2_nested_marker_wait_anchors_components_and_has_a_fixed_ceiling(tmp_path, kind):
+    root, outside = tmp_path / "root", tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    (outside / "ready").touch()
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        if kind == "parent-link":
+            symlink_or_skip(outside, root / "inner")
+        else:
+            (root / "inner").mkdir()
+            if kind == "regular":
+                (root / "inner" / "ready").touch()
+                root.rename(tmp_path / "moved")
+                symlink_or_skip(outside, root)
+            elif kind == "leaf-link":
+                symlink_or_skip(outside / "ready", root / "inner" / "ready")
+        if kind == "regular":
+            r2_wait_marker(fd, "inner/ready")
+        elif kind == "missing":
+            ticks = iter([0, 61])
+            with pytest.raises(RuntimeError, match="^R2 fixture: marker handshake refused: ceiling$"):
+                r2_wait_marker(fd, "inner/ready", clock=lambda: next(ticks))
+        else:
+            message = "marker path refused" if kind == "parent-link" else "slot file refused"
+            with pytest.raises(RuntimeError, match="^R2 fixture: " + message + "$"):
+                r2_wait_marker(fd, "inner/ready")
+        os.fstat(fd)
+    finally:
+        os.close(fd)
+
+
+def test_r2_nested_marker_wait_refuses_unsupported_platform(monkeypatch):
+    monkeypatch.setattr(handshake_tests, "_r2_slot_read_capable", lambda: False)
+    with pytest.raises(RuntimeError, match="^R2 fixture: slot file support unavailable$"):
+        r2_wait_marker(123, "inner/ready")
+
+
+def test_r2_child_ready_event_fallback_does_not_open_descriptors(monkeypatch):
+    real_os = handshake_tests.os
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("unsupported notification path must not allocate a descriptor")
+
+    monkeypatch.setattr(handshake_tests, "_r2_child_events_capable", lambda: False)
+    monkeypatch.setattr(handshake_tests, "os", R2Facade(real_os, open=forbidden))
+    _r2_wait_child_event(0)
+
+
+@pytest.mark.parametrize("surface", ["nested", "slot"])
+@pytest.mark.parametrize("ceiling", [True, -1, 601, float("nan")])
+def test_r2_marker_wait_limits_precede_descriptor_allocation(monkeypatch, surface, ceiling):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("invalid wait limits must not allocate descriptors")
+
+    monkeypatch.setattr(handshake_tests, "R2SlotEvents", forbidden)
+    real_os = handshake_tests.os
+    monkeypatch.setattr(handshake_tests, "os", R2Facade(real_os, dup=forbidden))
+    with pytest.raises(RuntimeError, match="^R2 fixture: invalid handshake ceiling$"):
+        if surface == "nested":
+            r2_wait_marker(123, "inner/ready", ceiling=ceiling)
+        else:
+            R2Custody.await_slot_file(SimpleNamespace(folder_fd=123), "ready", "actor", ceiling=ceiling)
+
+
+@pytest.mark.parametrize("name", ["Q" * 256, "nested/ready", "../ready"])
+def test_r2_slot_wait_names_precede_notification_allocation(monkeypatch, name):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("invalid slot names must not allocate descriptors")
+
+    monkeypatch.setattr(handshake_tests, "R2SlotEvents", forbidden)
+    with pytest.raises(RuntimeError, match="^R2 fixture: slot file refused$"):
+        R2Custody.await_slot_file(SimpleNamespace(folder_fd=123), name, "actor")
+
+
+def test_r2_child_ready_event_proc_refusal_uses_the_portable_fallback(monkeypatch):
+    real_os = handshake_tests.os
+
+    def refused(*args, **kwargs):
+        raise PermissionError("token=supersecretvalue")
+
+    monkeypatch.setattr(handshake_tests, "_r2_child_events_capable", lambda: True)
+    monkeypatch.setattr(handshake_tests, "os", R2Facade(real_os, open=refused))
+    _r2_wait_child_event(0)
