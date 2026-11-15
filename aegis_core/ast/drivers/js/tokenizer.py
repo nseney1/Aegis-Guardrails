@@ -805,7 +805,9 @@ class Lexer:
             self.tokens.append(_TOKEN_NEW(Token, ('punct', ch, line, begin, self.i, role, None)))
             if role == 'function_arrow':
                 self.arrow_close = (len(self.tokens), self.i)
-            if role in ('interpolation', 'jsx_expression'):
+            if role == 'jsx_expression':
+                self.mode, self.jsx_tag, self.jsx_return, self.jsx_closing = resume
+            elif role == 'interpolation':
                 self.mode = resume
             if role.startswith('parameters_'):
                 self.body = 'function_decl' if role == 'parameters_decl' else 'function_expr'
@@ -939,7 +941,8 @@ class Lexer:
         elif ch == '{':
             self.i += 1
             self.emit('punct', '{', begin, line, 'jsx_expression')
-            self.push('}', 'jsx_expression', self.mode)
+            # Keep the enclosing tag's state: a JSX element inside the expression overwrites it.
+            self.push('}', 'jsx_expression', (self.mode, self.jsx_tag, self.jsx_return, self.jsx_closing))
             self.mode, self.expr, self.statement, self.previous = 'code', True, False, '{'
         elif self.mode == 'jsx_text':
             if ch == '<':

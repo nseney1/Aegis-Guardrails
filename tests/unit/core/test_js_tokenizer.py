@@ -339,3 +339,17 @@ def test_large_template_chunks_keep_exact_tokens_with_a_bounded_process(unit):
     completed = subprocess.run([sys.executable, '-c', code], input=source.encode('utf-8'),
                                capture_output=True, check=True, timeout=20)
     assert json.loads(completed.stdout) == [3, 1, len(source) - 1, len(source) - 2]
+
+
+@pytest.mark.parametrize('source', [
+    'const x = <D><B icon={<C />} />eval(x)<E />{eval(y)}</D>',
+    'const x = <D><B icon={<C />}>eval(x)</B>{eval(y)}</D>',
+    'const x = <D><B icon={<C />} />{eval(y)}</D>',
+    'const x = <D><B render={() => <C><F /></C>} />eval(x){eval(y)}</D>',
+    'const x = <D><B a={x ? <C /> : null} b="s" />eval(x)<E>{eval(y)}</E></D>',
+    'const x = <B icon={<C />} />; eval(y)',
+    'const x = <D>{<C />}eval(x)<E />{eval(y)}</D>',
+])
+def test_jsx_inside_an_attribute_expression_keeps_the_enclosing_tag(source):
+    # The text after the tag is still JSX text (eval(x) is not code); only {eval(y)} is.
+    assert sum(t.kind == 'identifier' and t.value == 'eval' for t in tokens(source)) == 1
