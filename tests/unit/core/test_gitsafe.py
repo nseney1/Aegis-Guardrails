@@ -1297,6 +1297,8 @@ _RUN_ALLOWED_IN = {
     # GM-1 maps refs/remotes/R/B to target B only through the longest configured remote name,
     # so the approval policy lists remote names (read-only, size-bounded by the caller).
     "aegis_core/approval_policy.py": {"remote"},
+    # BL-16d: read-only worktree list; test_team.py pins the exact list argv.
+    "aegis_core/team.py": {"worktree"},
 }
 
 
