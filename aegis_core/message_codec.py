@@ -10,6 +10,7 @@ JSON is default; MD fences that JSON; TSV marks data and uses JSON cells.
 JSON short escapes are preserved; outline alone emits only envelope and outline.
 """
 import hashlib
+from threading import RLock
 from typing import NamedTuple
 
 from . import message_codec_views as _views
@@ -24,6 +25,86 @@ from .message_codec_store import Store
 
 __all__ = ["CodecError", "Store", "canonical", "parse", "compose", "record_id", "read_view",
            "KIND_SCHEMAS", "MAX_BYTES"]
+
+
+class ReadContext:
+    """One request's grant-checked reads of an exact verified Store.
+
+    The service callback authorizes a full record ID and returns author/kind
+    facts. Store alone opens, parses and verifies payload bytes. A context owns
+    accounting and its verified cache, but borrows the service's Store lifetime.
+    No reader protocols or Store subclasses enter the codec read boundary.
+    """
+    __slots__ = ("_store", "_authorize", "_cache", "_lock", "io")
+
+    def __init__(self, store, authorize):
+        require(type(store) is Store, "E_REF")
+        require(callable(authorize), "E_AUTH", detail="reference")
+        self._store, self._authorize = store, authorize
+        self._cache, self._lock, self.io = {}, RLock(), Budget(MAX_REF_BYTES)
+
+    def _read_budget(self, view):
+        def chain(node):
+            nodes, seen = [], set()
+            while node is not None:
+                require(type(node) is Budget and id(node) not in seen, "E_LIMIT")
+                limit, used = getattr(node, "limit", None), getattr(node, "used", None)
+                require(type(limit) is int and type(used) is int and 0 <= used <= limit, "E_LIMIT")
+                require(hasattr(node, "parent"), "E_LIMIT")
+                seen.add(id(node))
+                nodes.append(node)
+                node = node.parent
+            return nodes
+
+        io, replay = chain(self.io), chain(view)
+        require(bool(io), "E_LIMIT")
+        io_ids, charged = {id(node) for node in io}, {id(node) for node in replay}
+        # Store charges the view chain as it reads. Bound every request ancestor
+        # up front; only nodes outside that chain need settlement afterwards.
+        constraining = min(io, key=lambda node: node.limit - node.used)
+        budget = Budget(constraining.limit - constraining.used, parent=view,
+                        detail=getattr(constraining, "detail", None))
+        return (budget, [node for node in io if id(node) not in charged],
+                [node for node in replay if id(node) not in io_ids])
+
+    def read(self, rid, *, _budget=None):
+        require(_budget is None or type(_budget) is Budget, "E_LIMIT")
+        require(type(rid) is str and len(rid) == 64 and
+                all(char in "0123456789abcdef" for char in rid), "E_AUTH", detail="reference")
+        with self._lock:
+            entry = self._authorize(rid)  # Even cached payloads require authorization.
+            require(type(entry) is dict and entry.keys() == {"author", "kind"}, "E_AUTH", detail="reference")
+            budget, pending, replay = self._read_budget(_budget)
+            if rid not in self._cache:
+                try:
+                    store = self._store
+                    value = store.read(rid, _budget=budget)
+                except CodecError as error:
+                    if error.code == "E_REF":
+                        raise CodecError("E_AUTH", detail="reference") from None
+                    raise
+                finally:
+                    # These nodes were bounded before I/O and were not charged
+                    # by Store. Settlement cannot mask a verification refusal
+                    # or recursively charge a shared ancestor a second time.
+                    for node in pending:
+                        node.used += budget.used
+                require(value["meta"] == entry["author"] and value["kind"] == entry["kind"],
+                        "E_AUTH", detail="reference")
+                self._cache[rid] = (value, budget.used)
+            else:
+                value, size = self._cache[rid]
+                for node in replay:
+                    require(node.used + size <= node.limit, "E_LIMIT", detail=getattr(node, "detail", None))
+                for node in replay:
+                    node.used += size
+                require(value["meta"] == entry["author"] and value["kind"] == entry["kind"],
+                        "E_AUTH", detail="reference")
+            return self._cache[rid][0]
+
+    def describe(self, rid, *, _budget=None):
+        value = self.read(rid, _budget=_budget)
+        return {"ref": rid[:16], "kind": value["kind"], "chars": self._cache[rid][1]}
 
 
 def _selector(selector):
@@ -205,7 +286,7 @@ def _select(value, schema, parts, path, missing, coverage, budget):
 
 
 def _refs(value, store, expand, work, names, renderer):
-    require(not value["refs"] or type(store) is Store, "E_REF")
+    require(not value["refs"] or type(store) is Store or type(store) is ReadContext, "E_REF")
     result, cache, io, rendered = {}, {}, Budget(MAX_REF_BYTES), Budget(renderer.limit)
     expanded_ids = {value["refs"][name] for name in expand}
     for name, rid in value["refs"].items():
@@ -279,7 +360,7 @@ def preflight_read(cli=False, /, *, selectors=(), spans=(), expand=(), since=Non
     require(type(cli) is bool, "E_SELECTOR")
     require(type(expand) in (list, tuple) and len(expand) <= MAX_REFS, "E_REF")
     require(all(type(n) is str and REF_NAME.fullmatch(n) for n in expand), "E_REF")
-    require(store is None or type(store) is Store, "E_REF")
+    require(store is None or type(store) is Store or type(store) is ReadContext, "E_REF")
     selectors = _read_selectors(selectors, cli)
     require(type(spans) in (list, tuple) and len(spans) <= MAX_SPANS, "E_SPAN")
     spans = [_read_integer(n, MAX_NODES - 1, "E_SPAN", cli) for n in spans]
@@ -301,21 +382,25 @@ def preflight_read(cli=False, /, *, selectors=(), spans=(), expand=(), since=Non
                              outline=outline, format=format, max_chars=max_chars), planned)
 
 
-def _options(value, selectors, spans, expand, since, row_limit, outline, format, max_chars, store, unknown):
-    planned = preflight_read(selectors=selectors, spans=spans, expand=expand, since=since, row_limit=row_limit,
-                             outline=outline, format=format, max_chars=max_chars, store=store, **unknown).planned
+def prepare_read(value, *, selectors=(), spans=(), expand=(), since=None, row_limit=None,
+                 outline=False, format="json", max_chars=60000, store=None, **unknown):
+    """Public record-aware preparation; validate options without reading refs."""
+    prepared = preflight_read(selectors=selectors, spans=spans, expand=expand, since=since, row_limit=row_limit,
+                              outline=outline, format=format, max_chars=max_chars, store=store, **unknown)
+    planned = prepared.planned
     if type(value) is dict and type(value.get("kind")) is str and value["kind"] in KIND_SCHEMAS:
         for parts in planned:
             _schema_path(_record_schema(value["kind"]), parts)
     require(not expand or (type(value) is dict and type(value.get("refs")) is dict and
                          all(name in value["refs"] for name in expand)), "E_REF")
-    return planned
+    return prepared
 
 
 def read_view(value, *, selectors=(), spans=(), outline=False, since=None, row_limit=None,
               expand=(), store=None, format="json", max_chars=60000, **unknown):
     """Total for data inputs, including unknown options; wrong arity is programmer error."""
-    planned = _options(value, selectors, spans, expand, since, row_limit, outline, format, max_chars, store, unknown)
+    planned = prepare_read(value, selectors=selectors, spans=spans, expand=expand, since=since, row_limit=row_limit,
+                           outline=outline, format=format, max_chars=max_chars, store=store, **unknown).planned
     renderer, budget = _renderer(max_chars), Budget(MAX_WORK_BYTES)
     raw = canonical(value)
     require(all(index < len(value["spans"]) for index in spans), "E_SPAN")

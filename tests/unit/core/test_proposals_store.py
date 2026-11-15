@@ -1092,6 +1092,8 @@ def assert_masked_authority_secrets_absent(text, output):
         assert secret.lower().encode() not in output.lower()
 
 
+# Scanner-shaped token, composed so the source has no credential literal.
+_GOOGLE_TOKEN = "AIza" + "Sy" + "DaGmWKa4JsXZ" + "-HjGw7x8_" + "0" * 12
 _STRUCTURAL_URL_CASES = [
     ("https://ci.example/job?sig=(hunter2)", "https://ci.example/job)", "hunter2"),
     ("https://ci.example/job?sig=[hunter2]", "https://ci.example/job]", "hunter2"),
@@ -1105,8 +1107,8 @@ _STRUCTURAL_URL_CASES = [
     ("redis://:hunter2'mail@example.com/0", "[REDACTED_URL]", "hunter2"),
     ("https://AKIAIOSFODNN7EXAMPLE.example.com/job?sig=1",
      "https://[REDACTED_AWS].example.com/job", "AKIAIOSFODNN7EXAMPLE"),
-    ("https://AIzaSyDaGmWKa4JsXZ-HjGw7x8_000000000000.example.com/job",
-     "https://[REDACTED_TOKEN].example.com/job", "AIzaSyDaGmWKa4JsXZ-HjGw7x8_000000000000"),
+    ("https://" + _GOOGLE_TOKEN + ".example.com/job",
+     "https://[REDACTED_TOKEN].example.com/job", _GOOGLE_TOKEN),
     ("https://ci.example/job?sig=(hunter2)]}.`'\"", "https://ci.example/job)]}.`'\"", "hunter2"),
     ("redis://:hunter2?more@localhost/0", "[REDACTED_URL]", "hunter2"),
     ("redis://:hunter2#more@localhost/0", "[REDACTED_URL]", "hunter2"),
@@ -1175,7 +1177,8 @@ _CONTEXT_REDACTION_CASES = [
     ("https://ci.example/?q=Bearer abcdefghijklmnop", "abcdefghijklmnop"),
     ("https://ci.example/?q=Authorization: Bearer abcdefghijklmnop", "abcdefghijklmnop"),
     ("https://ci.example/?q=token= abcdefghijklmnop", "abcdefghijklmnop"),
-    ("https://ci.example/?q=-----BEGIN PRIVATE KEY-----\nSHORTKEYLINE\n-----END PRIVATE KEY-----", "SHORTKEYLINE"),
+    ("https://ci.example/?q=" + "-----BEGIN " + "PRIVATE KEY-----\nSHORTKEYLINE\n-----END "
+     + "PRIVATE KEY-----", "SHORTKEYLINE"),
     ("https://ci.example/?q=ghp_" + "a" * 24, "ghp_" + "a" * 24),
 ]
 
@@ -1262,7 +1265,8 @@ def test_authority_edits_protect_persisted_fields_and_retries(tmp_path, text, ex
 
 
 _MASKED_USERINFO_CASES = [
-    ("https://-----BEGIN PRIVATE KEY-----\nsourceprivate@ci.example/0\n-----END PRIVATE KEY-----",
+    ("https://" + "-----BEGIN " + "PRIVATE KEY-----\nsourceprivate@ci.example/0\n-----END "
+     + "PRIVATE KEY-----",
      "https://[REDACTED_PEM]", ("sourceprivate", "PRIVATE KEY")),
     ("https://:Bearer abcdefghijklmnop;password=left@ci.example/0",
      "[REDACTED_URL] [REDACTED];password=[REDACTED]", ("abcdefghijklmnop", "left@ci.example", "left")),

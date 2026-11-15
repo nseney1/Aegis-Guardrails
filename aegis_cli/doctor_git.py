@@ -21,7 +21,7 @@ _SIGNER_LINE = re.compile(r"\b(?:ssh-|ecdsa-|sk-)[A-Za-z0-9@.-]* [A-Za-z0-9+/=]{
 def _accepted(text):
     if not isinstance(text, str): return None, "git_failed"
     if len(text) > VALUE_MAX: return None, "value_too_long"
-    if "\n" in text or "\r" in text or "\x00" in text: return None, "multiline_refused"
+    if any(char in rendering.LINE_BREAKS for char in text): return None, "multiline_refused"
     return text, None
 
 def _classify_git(exc):
@@ -52,9 +52,9 @@ def _in_custody(root, limit, produce, command=None):
         return "git_failed"
     scratch, owned = observe.use_scratch(root)
     bind = getattr(scratch, "bind", None)
-    if getattr(scratch, "code", "scratch_unknown") or not isinstance(bind, str):
+    if getattr(scratch, "code", "scratch_unsafe") or not isinstance(bind, str):
         if owned: observe.close_fd(getattr(scratch, "fd", None))
-        return "git_failed"
+        return rendering.scratch_refusal(getattr(scratch, "code", None))[0]
     try:
         with _custody(scratch=Path(bind), stdout_limit=limit, stderr_limit=GIT_STDERR_LIMIT):
             return produce(cwd)
@@ -137,6 +137,9 @@ def _object_bytes(data):
 def _presence(root, rows, info):
     result = _run_git(root, _PRESENCE)
     if isinstance(result, str):
+        if result in rendering.SCRATCH_CODES:
+            code, action, detail = rendering.scratch_refusal(result)
+            rows.append(rendering.row("git_presence", "warn", code, action, "Git inspection was not run: " + detail)); return False
         rows.append(rendering.row("git_presence", "warn", result, rendering.RETRY, "git is not available for a read-only report")); return False
     if getattr(result, "returncode", 1) != 0:
         rows.append(rendering.row("git_presence", "warn", "not_a_repository", rendering.RETRY, "the workspace is not a git repository")); return False
@@ -161,7 +164,12 @@ def _head(root):
 def _policy_at(root, commit):
     try:
         entry = _regular_entry(root, commit, approval_policy.CONFIG_PATH)
-        if not isinstance(entry, tuple): return "policy_unavailable"
+        # Empty ls-tree output is a confirmed absence. A non-regular entry or a
+        # transport failure is a string, and stays the existing refusal.
+        if entry is None:
+            return None
+        if not isinstance(entry, tuple):
+            return "policy_unavailable"
         return _read_policy(root, commit, strict=True)
     except (approval_policy.PolicyUnavailable, approval_policy.InvalidApprovalPolicy) as exc:
         return "policy_unavailable" if isinstance(exc, approval_policy.PolicyUnavailable) else "invalid_approval_policy"
@@ -209,7 +217,7 @@ def _signers_at(root, commit):
 
 def _signers(root, commit):
     result = _scoped(root, lambda: _signers_at(root, commit))
-    return result if not isinstance(result, str) or result in ("git_output_limit", "git_timeout", "git_failed", "git_missing") else "signers_unavailable"
+    return result if not isinstance(result, str) or result in ("git_output_limit", "git_timeout", "git_failed", "git_missing") or result in rendering.SCRATCH_CODES else "signers_unavailable"
 
 def _branch_name(root):
     result = _run_git(root, _BRANCH)
@@ -226,12 +234,27 @@ def _policy_view(policy):
         mod, mcode = _accepted(mode if isinstance(mode, str) else "")
         if pcode or mcode or not pat or mod not in approval_policy.MODES:
             return None, pcode or mcode or "invalid_approval_policy"
-        shown, scode = rendering.display(pat)
+        shown, scode = _bound_name(pat)
         if scode or not shown:
             return None, scode or "invalid_approval_policy"
-        if shown != pat: shown = rendering.digest(pat)
         view.append({"pattern": shown, "mode": mod})
     return view, None
+
+def _bound_name(text):
+    """Publish display(text) when it is the raw name; otherwise the same digest text and JSON share."""
+    return _publish_name(text, rendering.display)
+
+def _bound_target(text):
+    """Same contract as _bound_name, using the approvals-target canonicalizer only."""
+    return _publish_name(text, rendering.display_target)
+
+def _publish_name(text, render):
+    shown, code = render(text)
+    if code or not shown:
+        return None, code or "invalid_approval_policy"
+    if shown != text or any(char.isspace() or char in ",;" for char in text):
+        return rendering.digest(text), None
+    return shown, None
 
 def _signer_row(root, commit, rows):
     count = _signers(root, commit)
@@ -247,6 +270,49 @@ def _signer_row(root, commit, rows):
         return
     rows.append(rendering.row("signers", "pass", "signers_present", rendering.NONE, "signing keys are present"))
 
+def _reject_branch(rows, code):
+    action = rendering.RENAME if code in ("multiline_refused", "value_too_long") else rendering.RETRY
+    rows.append(rendering.row("approvals", "warn", code or "invalid_approval_policy", action, "the current branch name was refused"))
+
+def _branch_known(rows, target, tcode):
+    """Keep the existing current-branch refusal. False means the mode is not claimed."""
+    if tcode:
+        _reject_branch(rows, tcode)
+        return False
+    if not target or target == "HEAD":
+        rows.append(rendering.row("approvals", "warn", "branch_unknown", rendering.RETRY, "the current branch is unknown"))
+        return False
+    return True
+
+def _policy_error(rows, policy):
+    transport = policy in ("policy_unavailable", "git_timeout", "git_failed", "git_missing", "git_output_limit")
+    action = rendering.RETRY if transport else rendering.SUGGEST
+    detail = "the map could not be read" if transport else "the map was refused"
+    rows.append(rendering.row("approvals", "warn", policy, action, detail))
+
+def _refuse_map(rows, code):
+    rows.append(rendering.row("approvals", "warn", code or "invalid_approval_policy", rendering.SUGGEST, "the map was refused"))
+
+def _mode_rows(root, commit, rows, info, policy, target, view, pairs):
+    effective = approval_policy.mode_for(policy, target)
+    shown_target = None
+    if target:
+        shown_target, scode = _bound_name(target)
+        if scode or not shown_target:
+            _reject_branch(rows, scode)
+            _store_modes(info, None, None, view, pairs)
+            return
+    _store_modes(info, effective, shown_target, view, pairs)
+    label = effective if isinstance(effective, str) else "unknown"
+    rows.append(rendering.row("approvals", "pass", "approval_mode", rendering.NONE, f"effective approval mode {label}"))
+    if any(item["mode"] == "signature" for item in view) or effective == "signature":
+        _signer_row(root, commit, rows)
+
+def _store_modes(info, effective, shown_target, view, pairs):
+    info["approval_modes"] = {
+        "present": True, "effective": effective, "target": shown_target, "patterns": view,
+        "ungated": [{"target": name, "mode": mode} for name, mode in pairs]}
+
 def _approval_rows(root, rows, info):
     commit = _head(root)
     if not _commit_id(commit):
@@ -255,38 +321,64 @@ def _approval_rows(root, rows, info):
         rows.append(rendering.row("approvals", "warn", code, rendering.RETRY, detail))
         return
     target, tcode = _branch_name(root)
-    if tcode:
-        action = rendering.RENAME if tcode in ("multiline_refused", "value_too_long") else rendering.RETRY
-        rows.append(rendering.row("approvals", "warn", tcode, action, "the current branch name was refused"))
-        return
-    if not target or target == "HEAD":
-        rows.append(rendering.row("approvals", "warn", "branch_unknown", rendering.RETRY, "the current branch is unknown")); return
+    known = _branch_known(rows, target, tcode)
     policy = _policy(root, commit)
     if isinstance(policy, str):
-        transport = policy in ("policy_unavailable", "git_timeout", "git_failed", "git_missing", "git_output_limit")
-        action = rendering.RETRY if transport else rendering.SUGGEST
-        detail = "the map could not be read" if transport else "the map was refused"
-        rows.append(rendering.row("approvals", "warn", policy, action, detail))
+        _policy_error(rows, policy)
         return
     if policy is None:
-        rows.append(rendering.row("approvals", "warn", "no_approval_map", rendering.SUGGEST, "no approval map is committed"))
+        _legacy_row(root, commit, rows)
         return
     view, pcode = _policy_view(policy)
     if pcode or view is None:
-        rows.append(rendering.row("approvals", "warn", pcode or "invalid_approval_policy", rendering.SUGGEST, "the map was refused"))
+        _refuse_map(rows, pcode)
         return
-    effective = approval_policy.mode_for(policy, target)
-    shown_target = None
-    if target:
-        shown_target, scode = rendering.display(target)
-        if scode or not shown_target:
-            shown_target = None
-        elif shown_target != target: shown_target = rendering.digest(target)
-    info["approval_modes"] = {"present": True, "effective": effective, "target": shown_target, "patterns": view}
-    label = effective if isinstance(effective, str) else "unknown"
-    rows.append(rendering.row("approvals", "pass", "approval_mode", rendering.NONE, f"effective approval mode {label}"))
-    if any(item["mode"] == "signature" for item in view) or effective == "signature":
-        _signer_row(root, commit, rows)
+    pairs = _ungated_pairs(policy)
+    if pairs is None:
+        _refuse_map(rows, "invalid_approval_policy")
+        return
+    if known:
+        _mode_rows(root, commit, rows, info, policy, target, view, pairs)
+    else:
+        _store_modes(info, None, None, view, pairs)
+    _targets_row(rows, pairs)
+
+def _legacy_row(root, commit, rows):
+    try:
+        suggest = _team_profile(root, commit) is True
+    except Exception:
+        suggest = False
+    action = rendering.SUGGEST if suggest else rendering.NONE
+    rows.append(rendering.row("approvals", "pass", "no_approval_map", action, rendering.LEGACY_DETAIL))
+
+def _team_profile(root, commit):
+    """True only for a regular team-profile blob at HEAD. A work-tree file is not evidence."""
+    from aegis_core.team_profile import REPO_PATH
+    path = "/".join(REPO_PATH)
+    try:
+        found = _scoped(root, lambda: _regular_entry(root, commit, path))
+    except Exception:
+        return False
+    return isinstance(found, tuple)
+
+def _ungated_pairs(policy):
+    try:
+        lost = approval_policy.ungated_targets(policy)
+    except approval_policy.InvalidApprovalPolicy:
+        return None
+    pairs = []
+    for target, mode in lost:
+        name, code = _bound_target(target)
+        if code or not name:
+            return None
+        pairs.append((name, mode))
+    return tuple(pairs)
+
+def _targets_row(rows, pairs):
+    if not pairs:
+        rows.append(rendering.row("approvals", "pass", "approval_targets", rendering.NONE, rendering.GATED_DETAIL))
+        return
+    rows.append(rendering.row("approvals", "warn", "approval_targets", rendering.UNGATED, rendering.gate_detail(pairs)))
 
 def _capped(found):
     if not hasattr(found, "__len__"): return None

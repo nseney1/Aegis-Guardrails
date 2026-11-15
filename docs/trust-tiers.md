@@ -36,7 +36,8 @@ the committed config is limited to 64 KiB.
   approval or qualifying tier-A review. Configure `allowed_signers` on the base;
   without a usable key or qualifying review, a flagged change cannot pass.
 - `review` lists both kinds of change and passes the approval gate with
-  `owner_review_required: true`. The owner's merge supplies the review. Restrict
+  the policy boolean `owner_review_required: true`. Individual policy changes
+  appear separately in the `owner_review_findings` array. The owner's merge supplies the review. Restrict
   pushes and merges with forge rules and separate the agent's credentials: this
   CI notice does not enforce who can merge.
 - `none` lists both kinds of change without blocking on approval.
@@ -90,13 +91,36 @@ Selectors are bounded before Git execution; invalid selector text is refused,
 and malformed Git classification output returns `invalid_approval_policy`.
 An explicit branch that disagrees with the event's PR base or push branch is
 unknown; an explicit branch on a tag push is unknown too.
-Reports add `approval_mode`, `approval_target`, `owner_review_required` and
+Reports add `approval_mode`, `approval_target`, the boolean `owner_review_required` and
 `policy_source: base` when a base policy exists (`head` when the head tightens it).
+`owner_review_required` is true only for `review`, false for `none` or `signature`,
+and absent when no approval mode is known. When a signer-less base's policy is
+introduced or lowered, `owner_review_findings` holds rows with string `code`,
+`rule` (the target pattern), `path` and `message` fields, in target order; it is
+absent when there are no rows. These advisory rows never replace the boolean.
+Each human format names the bounded, redacted target; SARIF keeps these rows as
+note notifications. The report schema remains `aegis.rule_integrity/v1`.
 Other CI checks still block and name their blocking cause. CI uses one event
-snapshot, bounded to 25 MiB, for the base, head, target and review identity.
-Malformed event fields produce a fixed refusal when the resolved base declares
-a map; otherwise event handling retains legacy behavior. Branch names outside
-the conservative target grammar use the strictest mode when a map exists.
+snapshot for the base, head, target and review identity.
+For PR and push events, files over 25 MiB are refused before JSON parsing
+(push events over 1 MiB are supported).
+For `pull_request` and `pull_request_target`, `pull_request.base.sha` and
+`pull_request.head.sha` must each be a full 40- or 64-character hexadecimal SHA;
+if present, `pull_request.base.ref` must be a string of at most 255 characters
+without NUL. Missing or malformed SHAs (including when `GITHUB_EVENT_NAME` names
+a PR event without `GITHUB_EVENT_PATH`) or malformed base refs refuse with
+`invalid_ci_event` before any Git or policy lookup, with or without an approval
+map and with or without `--base`.
+For `push`, supplied non-null `before` and `after` values must also be full
+40- or 64-character hexadecimal SHAs, and `GITHUB_REF` must be a string of at
+most 8192 characters without NUL; malformed values receive the same refusal,
+even with `--base`.
+An absent or all-zero push predecessor keeps the base-unavailable/fallback
+behavior described above. Other event names do not undergo these field checks.
+The fixed recovery for `invalid_ci_event` is
+`provide a valid CI event or run locally with --base`.
+Branch names outside the conservative target grammar use the strictest mode
+when a map exists.
 Git object I/O failures refuse with `invalid_approval_policy` and a fetch/repair
 instruction; an unreadable repository cannot establish the absence of a policy.
 The GitHub summary retains permitted changes with their approval mode and shows

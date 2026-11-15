@@ -131,6 +131,7 @@ AUDIT_WRITERS = {
     ("aegis_core/team_lease_custody.py", "_descriptor_binding"): "BL-16d: mkdir of fixed private 0700 lease scratch relative to held owner-checked Git common-dir descriptor; nofollow open and owner/type/mode validation precede use",
     ("aegis_core/team_lease_custody.py", "_pathname_binding"): "BL-16d: Windows fallback mkdir of the same fixed metadata scratch directory; owner/type/reparse checks where available, pathname race residual expressly authorized in round-5 platform ruling",
     ("aegis_core/team_queue.py", "_publish"): "Publishes bounded owner-managed team-queue.json through the reviewed atomic storage writer; callers hold the workspace lock.",
+    ("aegis_core/team_supervisor_start.py", "_spawn"): "SUPERVISOR-START-1: subprocess DEVNULL descriptors for explicit owner component startup; no pipes or captured output; Popen closes setup descriptors, and failed identity registration kills/reaps the owned child.",
     ("aegis_core/testexec.py", "run_pytest_snapshot"): "existing mkdir; source lines 464, 465",
     ("aegis_core/treeid.py", "_spawn"): "existing subprocess DEVNULL; source lines 160",
     ("aegis_core/treeid.py", "BoundTree.__init__"): "existing mkdir; source lines 258",
