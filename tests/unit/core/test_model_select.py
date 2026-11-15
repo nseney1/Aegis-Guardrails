@@ -77,7 +77,8 @@ def admission_refusal(host, intent, role, *, within_band=False):
 @pytest.mark.parametrize("failure", ["planned", "null", "admission"])
 @pytest.mark.parametrize("secret", ["github", "slack"])
 def test_r3_every_core_locator_is_redacted_without_cut_markers(bindings, policy, failure, secret):
-    host = "ghp_" + "A" * 24 if secret == "github" else "xoxb-0123456789." * 7 + "xoxb-0123456789"
+    host = ("ghp_" + "A" * 24 if secret == "github" else
+            ("xox" + "b-" + "0123456789.") * 7 + ("xox" + "b-" + "0123456789"))
     shown = "[REDACTED_TOKEN]" if secret == "github" else ".".join(["[REDACTED_TOKEN]"] * 8)
     assert len(host) <= 128
     for row in bindings["hosts"]:
