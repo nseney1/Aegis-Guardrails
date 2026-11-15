@@ -5222,6 +5222,22 @@
                     "nargs": null,
                     "required": false,
                     "type": "str"
+                  },
+                  {
+                    "choices": [
+                      "full",
+                      "findings"
+                    ],
+                    "default": "full",
+                    "dest": "view",
+                    "flags": [
+                      "--view"
+                    ],
+                    "help": "Full item detail (default), or findings with affected revisions and counts; inspect full constraints before decisions",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
                   }
                 ],
                 "description": null,
@@ -5570,7 +5586,7 @@
                     "flags": [
                       "--capability"
                     ],
-                    "help": "Filter by a team capability label; repeat for each label",
+                    "help": "Capabilities available to this team; list items whose requirements are all satisfied. Repeat for each label",
                     "kind": "Capabilities",
                     "metavar": null,
                     "nargs": null,
@@ -5587,6 +5603,22 @@
                     "kind": "store_true",
                     "metavar": null,
                     "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "choices": [
+                      "full",
+                      "fingerprint"
+                    ],
+                    "default": "full",
+                    "dest": "view",
+                    "flags": [
+                      "--view"
+                    ],
+                    "help": "Full item detail (default), or fingerprint only; run the full list after a change",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
                     "required": false
                   }
                 ],

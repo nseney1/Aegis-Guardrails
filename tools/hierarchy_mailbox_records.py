@@ -44,45 +44,7 @@ class _InboxHistory:
 
 def _inbox_retry(history, arguments, message_id):
     """Page the digest's fully validated history without any further history I/O."""
-    from copy import copy, deepcopy
-    from hierarchy_mailbox_mcp import MAX_RECORDS, _bounded_inbox, _legacy_bounded_inbox, _response_line, _tool_result
-    scratch = copy(history.connection)
-    slimming = scratch.slim_inbox_metadata()
-    scratch._pager = deepcopy(history.connection._pager) if slimming else None
-    scratch.inbox_pager = slimming
-    retry = dict(arguments)
-    # Digest carries no inbox ordering/filter provenance. A planned inbox
-    # therefore starts a fresh oldest walk rather than repurposing its cursor.
-    restart = "after_message_id" in retry and slimming
-    if restart:
-        del retry["after_message_id"]
-    request = scratch.pager.prepare(retry)
-    # Recheck the same manifest and binding fence as Connection.inbox. The
-    # history came from Mailbox.messages after the digest's initial fence.
-    mailbox, snapshot = scratch.checked_binding()
-    ready = mailbox.ready(snapshot)
-
-    def render(value):
-        return _response_line({"jsonrpc": "2.0", "id": 0, "result": _tool_result(value)})
-
-    for _ in range(MAX_RECORDS):
-        scratch.begin_response()
-        page = scratch.pager.page(request, snapshot=snapshot, ready=ready, records=history.records.values(),
-                                  limit=retry["limit"], after=retry.get("after_message_id"),
-                                  read_brief=mailbox.brief, brief_status=None, slimming=slimming)
-        pager = _bounded_inbox if scratch.inbox_pager else _legacy_bounded_inbox
-        page = pager(page, render)
-        raw = render(page)
-        # Only the copied pager commits issued cursor contexts. No read receipt
-        # is written and no state on the live connection is changed.
-        scratch.note_returned(page, len(raw))
-        scratch.record_inbox_page()
-        if any(row["message"]["message_id"] == message_id for row in page["messages"]):
-            return raw, restart
-        if page["next_after"] is None:
-            return None
-        retry["after_message_id"] = page["next_after"]
-    return None
+    return history.connection.preview_inbox(arguments, history.records.values(), message_id)
 
 
 def call(connection, name, arguments, writer_lock):
