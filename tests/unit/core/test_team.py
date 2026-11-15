@@ -2010,8 +2010,9 @@ def test_cli_liveness_missing_branch_refuses_without_echo_and_retries(repo, leas
         if as_json:
             assert (output["status"], output["reason"], output["message"], err) == (
                 "refused", "lease_branch_missing", "lease_branch_missing", "")
+            assert output["next_action"] == "Restore the recorded branch, then retry."
         else:
-            assert (output, err) == ("", "lease_branch_missing\n")
+            assert (output, err) == ("", "lease_branch_missing\nRestore the recorded branch, then retry.\n")
         assert "private-value" not in json.dumps(output) + err
         assert _ref(repo, "docs") == old.oid
     _git(repo, "branch", branch)
