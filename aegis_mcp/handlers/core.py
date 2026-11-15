@@ -7,9 +7,11 @@ import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 from aegis_core import hosts
+from aegis_core.guidance_projection import project_display_text
 from aegis_core.primitives import parse_utc
 from aegis_core.scan import scan, scan_user_layer
-from aegis_core.skills.slots import render_scan_result
+from aegis_core.skills.slots import render_scan_result as render_scan_result
+from aegis_core.skills.slots import scan_registry
 from aegis_mcp.handlers.common import STATUS_FAIL, DEFAULT_CLIENT_PLATFORM, NOT_GOVERNED_MESSAGE, get_workspace
 from aegis_mcp.handlers.common import remember_bounded
 
@@ -23,6 +25,10 @@ from aegis_mcp.handlers.common import remember_bounded
 # write nothing. Bounded: a forgotten key costs one extra row, never the scan result.
 _RECORDED: Dict[Tuple[str, str, Tuple[str, ...]], datetime] = {}
 _MAX_RECORDED = 1024
+
+
+def _scan_error(message: str) -> dict:
+    return {"error": project_display_text(message), "status": STATUS_FAIL}
 
 
 def _slot_profile(host: Any) -> str:
@@ -74,7 +80,7 @@ def _record_scan(workspace: Any, args: dict, files: Optional[List[str]]) -> None
             binding=args.get("_binding"), basis=basis,
         )
     except Exception as exc:  # telemetry only: never fail the scan
-        print(f"aegis-mcp: scan event not recorded: {exc}", file=sys.stderr)
+        print("aegis-mcp: scan event not recorded: " + project_display_text(str(exc)), file=sys.stderr)
         return
     stamp = parse_utc(row["ts"])
     if stamp is not None:
@@ -85,12 +91,13 @@ def _record_exposure(workspace: Any, args: dict, res: dict, files: Optional[List
     """Remember which rules this server session was shown, at each rule's rev: aegis_report_outcome
     credits only those, and insight review joins a correction to them by host, time and rev."""
     from aegis_core import credit
+    from aegis_core.guidance_projection import GuidanceResult
     from aegis_core.scan import RULE_CACHE
     from aegis_core.storage import ledger_site
 
     names = [item.get("name") for key in ("relevant_rules", "invariant_warnings")
              for item in (res.get(key) or []) if isinstance(item, dict)]
-    rule_ids = [n for n in names if isinstance(n, str)]
+    rule_ids = list(res.exposure_rule_ids()) if isinstance(res, GuidanceResult) else [n for n in names if isinstance(n, str)]
     host = str(args.get("_host") or "")
     session = str(args.get("_session") or "")
     error: Optional[Exception] = None
@@ -105,19 +112,18 @@ def _record_exposure(workspace: Any, args: dict, res: dict, files: Optional[List
     except Exception as exc:  # telemetry only: never fail the scan
         error = exc
     if error is not None:
-        print(f"aegis-mcp: exposure record not written: {error}", file=sys.stderr)
+        print("aegis-mcp: exposure record not written: " + project_display_text(str(error)), file=sys.stderr)
 
 
 def _scan_user_layer(args: dict) -> dict:
     """Nothing governs this call (H8): the read-only user layer, never a ledger write."""
     files = args.get("files")
     if files is not None and (not isinstance(files, (list, tuple)) or not all(isinstance(f, str) for f in files)):
-        return {"error": "'files' must be a list of file paths", "status": STATUS_FAIL}
-    res = scan_user_layer(list(files) if files else None)
-    if res.get("status") == STATUS_FAIL:
-        return res
-    res = {"status": "not_governed", "message": NOT_GOVERNED_MESSAGE, "reason": args.get("_unbound"), **res}
-    return render_scan_result(res, _slot_profile(args.get("_host")), None)
+        return _scan_error("'files' must be a list of file paths")
+    registry = scan_registry(_slot_profile(args.get("_host")))
+    return scan_user_layer(list(files) if files else None, registry=registry,
+                           extras={"status": "not_governed", "message": NOT_GOVERNED_MESSAGE,
+                                   "reason": args.get("_unbound")})
 
 
 def handle_scan(args: dict) -> dict:
@@ -134,20 +140,21 @@ def _handle_scan(args: dict) -> dict:
         return _scan_user_layer(args)
     try:
         workspace = get_workspace(args)
-    except ValueError as exc:
-        return {"error": str(exc), "status": STATUS_FAIL}
+    except (ValueError, OSError, RuntimeError) as exc:
+        return _scan_error(str(exc))
     files = args.get("files")
     if files is not None:
         if not isinstance(files, (list, tuple)) or not all(isinstance(f, str) for f in files):
-            return {"error": "'files' must be a list of file paths", "status": STATUS_FAIL}
+            return _scan_error("'files' must be a list of file paths")
         try:  # [] means "none given" here as in scan(): the git diff, recorded as such
             files = [str(workspace.confine_path(f)[1]) for f in files] or None
-        except ValueError as exc:
-            return {"error": str(exc), "status": STATUS_FAIL}
+        except (ValueError, OSError, RuntimeError) as exc:
+            return _scan_error(str(exc))
 
-    res = scan(workspace, changed_files=files)
+    registry = scan_registry(_slot_profile(args.get("_host")), workspace.root)
+    res = scan(workspace, changed_files=files, registry=registry)
     if res.get("status") == STATUS_FAIL:
         return res
     _record_scan(workspace, args, files)
     _record_exposure(workspace, args, res, files)
-    return render_scan_result(res, _slot_profile(args.get("_host")), workspace)
+    return res

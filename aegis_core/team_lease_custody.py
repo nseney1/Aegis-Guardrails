@@ -1,28 +1,35 @@
 """CLI lease observations and writes share repository identity and private scratch.
 
-POSIX holds nofollow directory descriptors through both phases. Windows keeps
-the same metadata location and checks its identity before mutation, but pathname
-opens retain the platform's authorized rename race residual. This module is lazy:
-ordinary team service users and hooks do not enter or import this CLI boundary.
+The descriptor backend is selected only when storage_confined.descriptor_supported()
+is true and /proc/self/fd is a directory: Linux with the required nofollow and
+descriptor-relative primitives and procfs available. It holds directory descriptors
+through observation and mutation; Git addresses the parent's fds via /proc/<pid>/fd.
+The pathname backend is selected otherwise, including Windows, macOS (where
+/dev/fd alone cannot address the parent's held fds), and Linux without procfs or
+the required primitives. It uses the same private metadata scratch and checks
+repository identity before mutation, but pathname opens retain a rename race residual
+on every platform using this backend. The existing Windows residual authorization
+does not qualify this fallback on other platforms; changing backend selection
+requires an owner ruling and native macOS qualification.
+
+This module is lazy: ordinary team service users and hooks do not enter or import
+this CLI boundary.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager, ExitStack, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, ExitStack
 from contextvars import ContextVar
-import io
 import os
 from pathlib import Path
 import stat
-import sys
 
 from aegis_core import gitsafe, gitsafe_run, storage_confined
 
-__all__ = ["custody", "verify", "next_action", "descriptor_supported", "operation"]
+__all__ = ["custody", "verify", "next_action", "descriptor_supported"]
 
 _ACTIVE = ContextVar("aegis_lease_repository", default=None)
 _SCRATCH = "aegis-lease-scratch"
 _LIMIT = 65536
-_OUTPUT_LIMIT = 2 * 1024 * 1024
 _SELECTORS = (gitsafe_run.LOCAL_ENV - {"GIT_NO_REPLACE_OBJECTS"}) | {"GIT_NAMESPACE"}
 
 
@@ -189,7 +196,7 @@ def _descriptor_binding(root, stack, environment):
 
 
 def _record(path, limit):
-    """Bounded Windows pathname read; no fdopen ownership handoff can leak an fd."""
+    """Bounded pathname-backend read; no fdopen ownership handoff can leak an fd."""
     info = os.stat(path, follow_symlinks=False)
     if (not stat.S_ISREG(info.st_mode) or info.st_size > limit
             or getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)):
@@ -320,27 +327,3 @@ def verify(root):
         _refuse("ambient_git_environment" if exc.code == "ambient_git_environment" else "liveness_unknown")
     except (OSError, ValueError, RuntimeError):
         _refuse()
-
-
-class _Output(io.StringIO):
-    def write(self, value):
-        if len(value) > _OUTPUT_LIMIT - self.tell():
-            raise gitsafe.GitError("liveness_unknown", code="git_output_limit")
-        return super().write(value)
-
-
-def operation(root, handler, args, now, *, refused=None, refusal_type=()):
-    """Publish one bounded result after descriptor cleanup has succeeded."""
-    with _Output() as output, _Output() as errors:
-        with redirect_stdout(output), redirect_stderr(errors):
-            with custody(root):
-                try:
-                    result = handler(args, root, now)
-                except refusal_type as exc:
-                    try:
-                        result = refused(args, root, now, exc)
-                    except Exception:
-                        _refuse()  # Rendering failure still produces one typed refusal.
-        sys.stdout.write(output.getvalue())
-        sys.stderr.write(errors.getvalue())
-        return result

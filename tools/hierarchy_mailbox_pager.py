@@ -4,14 +4,15 @@ The adapter supplies fenced snapshots, brief readers, a trusted clock and wire s
 Only commit() after a successful flush retains cursors, freezes cutoffs or suppresses
 previously delivered checkpoint metadata.
 """
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import re
 from typing import Optional
 
-from hierarchy_mailbox import MAX_INBOX_RESPONSE_BYTES, SLUG, matching, require
+from hierarchy_mailbox import MAX_INBOX_RESPONSE_BYTES, MAX_RECORDS, SLUG, integer, matching, require
 
-__all__ = ["InboxPager", "InboxRequest", "bounded_inbox", "parse_inbox_time"]
+__all__ = ["InboxPager", "InboxRequest", "assemble_inbox", "bounded_inbox", "parse_inbox_time"]
 
 
 def parse_inbox_time(value):
@@ -58,6 +59,21 @@ def bounded_inbox(result, render, *, max_response_bytes=MAX_INBOX_RESPONSE_BYTES
         else:
             high = middle - 1
     return page(low)
+
+
+def assemble_inbox(result, render, *, bound, note_returned):
+    """Size and stage one response through the same live/preview assembly path."""
+    sizes = {}
+
+    def measured(page):
+        raw = render(page)
+        sizes[len(page["messages"])] = len(raw)
+        return raw
+
+    result = bound(result, measured)
+    # Both bounds rendered each selected count; retain logarithmic rendering.
+    note_returned(result, sizes[len(result["messages"])])
+    return result
 
 
 def _binding_identity(binding):
@@ -115,6 +131,59 @@ class InboxPager:
         """Abandon an unflushed response without changing committed state."""
         self.pending = None
         self.offered = None
+
+    def _checked_request(self, arguments, checked_binding):
+        request = self.prepare(arguments)
+        try:
+            mailbox, snapshot = checked_binding()
+        except ValueError as exc:
+            if request.since and str(exc).startswith("endpoint has no session binding:"):
+                raise ValueError("current_generation requires a binding; bind the endpoint and reconnect") from exc
+            raise
+        return request, mailbox, snapshot, mailbox.ready(snapshot)
+
+    def inbox(self, arguments, *, checked_binding, slim_metadata, brief_status):
+        """Fence once before reading and selecting the live mailbox history."""
+        request, mailbox, snapshot, ready = self._checked_request(arguments, checked_binding)
+        slimming = slim_metadata()
+        limit = arguments.get("limit", 20)
+        integer(limit, "inbox limit", maximum=100)
+        return self.page(request, snapshot=snapshot, ready=ready, records=mailbox.messages().values(),
+                         limit=limit, after=arguments.get("after_message_id"), read_brief=mailbox.brief,
+                         brief_status=lambda brief: brief_status(mailbox, brief), slimming=slimming)
+
+    def preview(self, arguments, records, message_id, *, checked_binding, slimming, render, bound, max_cursor_pairs):
+        """Walk validated history on an isolated pager; never receive delivery authority.
+
+        A digest cursor has no inbox ordering/filter provenance. Planned retries
+        restart oldest-first; the caller's arguments and live pager stay intact.
+        Only this copy commits cursors, with no connection or read-receipt access.
+        """
+        scratch = deepcopy(self)
+        retry = dict(arguments)
+        restart = "after_message_id" in retry and slimming
+        if restart:
+            del retry["after_message_id"]
+        request, mailbox, snapshot, ready = scratch._checked_request(retry, checked_binding)
+
+        def stage(page, rendered_bytes):
+            if slimming:
+                scratch.stage(page, rendered_bytes, max_cursor_pairs=max_cursor_pairs)
+
+        for _ in range(MAX_RECORDS):
+            scratch.begin_response()
+            page = scratch.page(request, snapshot=snapshot, ready=ready, records=records,
+                                limit=retry["limit"], after=retry.get("after_message_id"),
+                                read_brief=mailbox.brief, brief_status=None, slimming=slimming)
+            page = assemble_inbox(page, render, bound=bound, note_returned=stage)
+            raw = render(page)
+            scratch.commit()
+            if any(row["message"]["message_id"] == message_id for row in page["messages"]):
+                return raw, restart
+            if page["next_after"] is None:
+                return None
+            retry["after_message_id"] = page["next_after"]
+        return None
 
     def prepare(self, arguments):
         include_briefs = arguments.get("include_briefs", False)

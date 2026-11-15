@@ -96,7 +96,7 @@ __all__ = [
     "gc",
     "lane_ref",
     "lease_branch_evidence",
-    "lease_custody", "verify_lease_repository", "lease_next_action", "lease_operation",
+    "lease_custody", "verify_lease_repository", "lease_next_action",
     "lease_view",
     "live_lease",
     "load_team",
@@ -869,12 +869,6 @@ def verify_lease_repository(root: Any) -> None:
 def lease_next_action(reason: str) -> str:
     from aegis_core.team_lease_custody import next_action
     return next_action(reason)
-
-
-def lease_operation(root, handler, args, now, refused=None):
-    from aegis_core.team_lease_custody import operation
-    return operation(root, handler, args, now, refused=refused,
-                     refusal_type=LeaseRefused if refused is not None else ())
 
 
 def _worktree_branches(root: Path) -> Set[bytes]:
