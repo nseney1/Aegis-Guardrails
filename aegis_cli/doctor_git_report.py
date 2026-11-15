@@ -2,7 +2,7 @@
 from __future__ import annotations
 import hashlib, sys
 from aegis_core import primitives
-from aegis_core.redaction import CANDIDATE_TOKEN_RE, is_high_entropy_secret, redact_command_secrets
+from aegis_core.redaction import CANDIDATE_TOKEN_RE, REDACTION_MASK_RE, is_high_entropy_secret, redact_command_secrets
 
 SCHEMA, DISPLAY_MAX, VALUE_MAX = "aegis.doctor.git/v1", 160, 512
 __all__ = [
@@ -30,6 +30,9 @@ __all__ = [
     'PLATFORM',
     'OUTSIDE',
     'SCRATCH_ACT',
+    'SCRATCH_CODES',
+    'scratch_refusal',
+    'location',
     'digest',
     'visible',
     'display',
@@ -64,6 +67,23 @@ _DETAIL_FALLBACKS = {
     "lease_unreadable": "a lane ref is not a readable lease",
     "stale_lane_branch": "a lane branch has no live lease",
 }
+_SCRATCH_REFUSALS = {
+    "scratch_missing": (
+        "owner action: create a private scratch directory outside the workspace and set AEGIS_SCRATCH (doctor does not create it)",
+        "scratch directory is missing"),
+    "scratch_unsafe": (
+        "owner action: select an owner-only writable private directory outside the workspace without symlinks or shared access",
+        "scratch directory is unsafe"),
+    "scratch_unsupported": (
+        "owner action: check scratch access and the host's descriptor, ACL and held-directory binding primitives",
+        "scratch access or required primitives are unavailable"),
+}
+SCRATCH_CODES = frozenset(_SCRATCH_REFUSALS)
+
+def scratch_refusal(code):
+    category = code if code in SCRATCH_CODES else "scratch_unsafe"
+    action, detail = _SCRATCH_REFUSALS[category]
+    return category, action, detail
 
 def _marked_secret(token):
     bare = token
@@ -163,10 +183,9 @@ def _publish(safe, max_len):
     if not isinstance(max_len, int) or isinstance(max_len, bool) or len(redacted) <= max_len:
         return redacted, None
     stop = max_len - 3
-    for marker in ("[REDACTED_HIENT]", "[REDACTED]", "REDACTED"):
-        begin = redacted.rfind(marker, 0, stop + len(marker))
-        if begin != -1 and begin < stop < begin + len(marker):
-            stop = begin
+    for mask in REDACTION_MASK_RE.finditer(redacted):
+        if mask.start() < stop < mask.end():
+            stop = mask.start()
             break
     return redacted[:max(0, stop)].rstrip() + "...", None
 
@@ -186,6 +205,46 @@ def display_target(text, *, max_len=DISPLAY_MAX):
     if len(text) > VALUE_MAX: return None, "value_too_long"
     if any(char in _LINE_BREAKS for char in text): return None, "multiline_refused"
     return _publish(_canonicalize(text), max_len)
+
+def location(parts, *, prefix="", suffix=""):
+    """Render captured relative components only; never inspect the filesystem.
+
+    Reserve room for every disk-row prefix. Changed or shortened names carry an
+    opaque identity so redaction and truncation cannot merge distinct locations.
+    Escape literal brackets and the opaque-label prefix before redaction creates
+    its markers, so unchanged names cannot impersonate generated locations.
+    Bound the spelling before joining it; oversized spellings and components with
+    controls use only a digest, so terminal escapes cannot span components.
+    Validate the complete row detail after slicing and adding the fingerprint;
+    context-sensitive or newly secret-shaped text uses the opaque form instead.
+    """
+    fingerprint = hashlib.sha256()
+    length = max(0, len(parts) - 1)
+    for index, part in enumerate(parts):
+        if index: fingerprint.update(b"/")
+        # Refused enumeration spellings may exceed the component cap. Hash all
+        # their bytes without allocating an encoding proportional to their size.
+        for start in range(0, len(part), 256):
+            fingerprint.update(part[start:start + 256].encode("utf-8", "surrogatepass"))
+        length += len(part)
+    token = fingerprint.hexdigest()[:12]
+    opaque = "path " + token
+    if length > VALUE_MAX or any(not 1 <= len(part) <= 255 for part in parts) or any(not char.isprintable() for part in parts for char in part):
+        return opaque
+    raw = "/".join(parts)
+    if any(char in LINE_BREAKS for char in raw) or any(part in (".", "..") or "/" in part or "\\" in part for part in parts):
+        return opaque
+    safe = _canonicalize(raw).replace("[", "\\[").replace("]", "\\]")
+    if safe.startswith("path "):
+        safe = "path\\ " + safe[5:]
+    shown, _code = _publish(safe, 96)
+    if shown != raw:
+        shown, _code = _publish(safe, 81)
+        shown = (shown or "path") + " [" + token + "]"
+    detail = prefix + shown + suffix
+    if display(shown) != (shown, None) or display(detail) != (detail, None):
+        return opaque
+    return shown
 
 def row(row_id, status, code, owner_action, detail):
     row = {"id": row_id, "status": status, "code": code, "owner_action": owner_action, "detail": detail}
