@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import stat
 import sys
@@ -49,6 +49,29 @@ class RoleRefusal(ValueError):
     def __init__(self, reason):
         self.reason = reason if reason in _NEXT else "role_io_unavailable"
         super().__init__(self.reason)
+
+    @property
+    def next_action(self):
+        return _NEXT[self.reason]
+
+
+# Launch recovery. Claim text in _NEXT stays on the claim envelope.
+_LAUNCH = {
+    "invalid_arguments": "Launch with exactly one registration id.",
+    "role_missing": "Ask the owner to install the registration and restart the queue connection.",
+    "role_invalid": "Ask the owner to repair the authority records and restart the queue connection.",
+    "role_stale": "Retry the launch.",
+    "role_lock_timeout": "Wait for the authority writer, then restart the queue connection.",
+    "role_io_unavailable": "Ask the owner to inspect authority storage and restart the queue connection.",
+    "unsupported_platform": "Use Linux with descriptor-relative no-follow operations.",
+}
+
+
+def launch_advice(reason):
+    """One fixed sentence for a refusal raised while issuing the session."""
+    if reason not in _LAUNCH:
+        reason = "role_io_unavailable"
+    return _LAUNCH[reason]
 
 
 def refusal(reason):
@@ -202,13 +225,42 @@ def _line(value, limit=128):
             all(32 <= ord(char) < 127 for char in value))
 
 
+def _fsencode(value):
+    return os.fsencode(value)
+
+
+def _workspace_path(value):
+    # Bound the spelling before encoding or parsing. POSIX form is intentional:
+    # this connection runs only on Linux, and the same check is what Windows CI executes.
+    if type(value) is not str or not 1 <= len(value) <= MAX_WORKSPACE:
+        return False
+    for char in value:
+        code = ord(char)
+        if code <= 31 or code == 127 or 128 <= code <= 159 or 0xD800 <= code <= 0xDFFF:
+            return False
+    try:
+        encoded = _fsencode(value)
+    except UnicodeError:
+        return False
+    if type(encoded) is not bytes or len(encoded) > MAX_WORKSPACE:
+        return False
+    try:
+        path = PurePosixPath(value)
+    except ValueError:
+        return False
+    # Same predicate the core queue uses, on the POSIX form. Repeated separators
+    # collapse here; a backslash or colon can still hide `..`, and the separator
+    # cap still applies. A core rejection is role_invalid before a session exists.
+    spelled = PurePosixPath("/", *path.parts[1:]).as_posix()
+    return path.is_absolute() and ".." not in path.parts and team_queue.valid_workspace_spelling(spelled)
+
+
 def _policy(value, registration):
     keys = {"schema", "registration_id", "endpoint", "role", "workspace", "lanes", "ttl_s", "session_ttl_s"}
     require(type(value) is dict and value.keys() == keys)
     require(value["schema"] == "aegis.mcp.queue-registration/v1" and value["registration_id"] == registration)
     require(_line(value["endpoint"]) and identifier(value["role"]))
-    workspace = value["workspace"]
-    require(_line(workspace, MAX_WORKSPACE) and Path(workspace).is_absolute() and ".." not in Path(workspace).parts)
+    require(_workspace_path(value["workspace"]))
     for key in ("ttl_s", "session_ttl_s"):
         require(type(value[key]) is int and 1 <= value[key] <= 86400)
     lanes = value["lanes"]

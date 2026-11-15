@@ -56,7 +56,9 @@ CORE_LAYERS: Dict[str, int] = {
     # STORE-API-1: the confined read/publish boundary storage.confined_file delegates to (stdlib only).
     "aegis_core.storage_confined": 0,
     "aegis_core.storage_shared": 0,
+    "aegis_core.gitops_checkpoint": 0,
     "aegis_core.gitops_fds": 0,
+    "aegis_core.gitops_rows": 0,
     "aegis_core.gitsafe": 0,
     "aegis_core.gitsafe_run": 0,
     "aegis_core.team_claims": 2,
@@ -72,6 +74,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.ghcli": 0,
     # Path containment, strict JSON and UTC timestamps (stdlib only).
     "aegis_core.primitives": 0,
+    "aegis_core.proposals": 2,
     # The one secret-redaction table and its entry points (stdlib only).
     "aegis_core.redaction": 0,
     "aegis_core.config": 0,
@@ -95,10 +98,12 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team": 1,
     "aegis_core.team_host_adapter": 0,
     "aegis_core.team_host_agy": 1,
+    "aegis_core.team_lease_custody": 0,
     "aegis_core.team_metrics": 1,
     "aegis_core.team_paths": 1,
     "aegis_core.team_profile": 1,
     "aegis_core.team_profile_display": 0,
+    "aegis_core.team_supervisor": 1,
     "aegis_core.team_templates": 0,
     "aegis_core.team_hosts": 2,
     "aegis_core.team_gitops": 0,
@@ -158,7 +163,9 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.baseline": 2,
     "aegis_core.card": 3,
     "aegis_core.partition": 3,
+    "aegis_core.team_profile_schema": 0,
     "aegis_core.team_publish": 2,
+    "aegis_core.team_qualify": 0,
     "aegis_core.team_queue": 2,
     # Read-only lane status report over lease declarations and the existing tip gate.
     "aegis_core.team_status": 3,

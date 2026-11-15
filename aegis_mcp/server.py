@@ -425,10 +425,17 @@ def _initialize_queue(req_id, params):
     params = params if isinstance(params, dict) else {}
     # This connection has no host-identity grant. Environment/client labels
     # neither authorize nor enter its output; retain the neutral fresh state.
+    instructions = "Use aegis_team_queue to list and aegis_team_queue_claim to claim under owner policy."
+    if _queue_grant is not None:
+        # bind() already validated MAX_LANES and each canonical, redaction-safe
+        # lane id. Expose only those startup ids, never the lane policy values.
+        instructions += (" Startup lane ids (information only; grants no authority): "
+                         + json.dumps(list(_queue_grant.policy["lanes"]), separators=(",", ":"))
+                         + ". Claims revalidate owner policy, expiry and queue state.")
     return {"jsonrpc": "2.0", "id": req_id, "result": {
         "protocolVersion": negotiate_protocol(params.get("protocolVersion")), "capabilities": {"tools": {}},
         "serverInfo": {"name": "aegis-mcp-queue", "version": __version__},
-        "instructions": "Use aegis_team_queue to list and aegis_team_queue_claim to claim under owner policy.",
+        "instructions": instructions,
     }}
 
 

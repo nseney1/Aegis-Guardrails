@@ -2394,7 +2394,12 @@ def test_compat_bad_durable_input_blocks_wakes_but_run_open_continues(tmp_path, 
         assert "busy" in owner[0]["detail"]
         assert (target / ".write.lock").read_text() == "retained fixture lock"
     elif damage == "unreadable":
-        assert "Permission denied" in owner[0]["detail"]
+        if component == "store":
+            from errno import EACCES
+            from hierarchy_workspace_display import _display
+            assert owner[0]["detail"] == _display(PermissionError(EACCES, os.strerror(EACCES), first.name))
+        else:
+            assert "Permission denied" in owner[0]["detail"]
     elif damage == "symlink":
         assert "symlink" in owner[0]["detail"]
     else:
@@ -4828,11 +4833,11 @@ recipe = Path(%r)
 events = Path(%r) / 'events'
 seen['reads'] = {}
 seen['journal_phases'] = {}
-seen['recipe_parses'] = 0
+seen['recipe_preflight_parses'] = 0
 operations = []
 def profiled(frame, event, arg):
-    if event == 'call' and frame.f_code.co_name == 'strict_json' and frame.f_back.f_code.co_name == 'recipe_file':
-        seen['recipe_parses'] += 1
+    if event == 'call' and frame.f_code.co_name == 'strict_json' and frame.f_back.f_code.co_name == '_validate_captured_recipes':
+        seen['recipe_preflight_parses'] += 1
 sys.setprofile(profiled)
 old_open, old_fd = io.open, os.open
 def track(path):
@@ -4865,7 +4870,7 @@ io.open, os.open = opened, descriptor
         answer, seen = r7_router_probe(world, injection)
         assert answer["small_changes"][0]["state"] == "checking", answer
         assert len(world.messages("job_request")) == checks
-        assert seen["reads"][str(world.recipes_path)] == 1 and seen["recipe_parses"] == 1, seen
+        assert seen["reads"][str(world.recipes_path)] == 1 and seen["recipe_preflight_parses"] == 1, seen
         phases = seen["journal_phases"]
         assert set(phases) == {"capture-0", "capture-1", "capture-2"}, seen
         assert all(counts and set(counts.values()) == {1} for counts in phases.values()), seen
@@ -5509,8 +5514,69 @@ os.open = opened
     assert len(list((root / "docs/lane").glob("*scw-*.md"))) == 1
 
 
+@pytest.mark.parametrize("command", ["status", "dispatch"])
+@pytest.mark.parametrize("count", [1, 256])
+@pytest.mark.parametrize("changed", [False, True])
+def test_recipe_folder_validation_uses_linear_metadata_work(tmp_path, command, count, changed):
+    hide, bind = tmp_path / "public-hide", tmp_path / "public-bind"
+    hide.mkdir()
+    bind.mkdir()
+    class FolderWorld(DispatchWorld):
+        def save_recipes(self):
+            self.recipes.update(hide=[str(hide)] * count, ro_binds=[str(bind)] * count)
+            super().save_recipes()
+    world = FolderWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    if changed:
+        world.recipes["recipes"]["focused"]["steps"][0][-1] = "print('changed')"
+        world.save_recipes()
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    injection = r'''
+import hierarchy_jobs as jobs
+import hierarchy_small_change_dispatch as dispatch
+folders = set(map(Path, %r))
+seen['folder_probes'], seen['folder_guards'] = {}, {}
+class RecipePath(type(Path())):
+    def is_dir(self):
+        if self in folders:
+            key = str(self)
+            seen['folder_probes'][key] = seen['folder_probes'].get(key, 0) + 1
+        return super().is_dir()
+original_check = dispatch.checked_path
+def checked(path):
+    if Path(path) in folders:
+        key = str(path)
+        seen['folder_guards'][key] = seen['folder_guards'].get(key, 0) + 1
+    return original_check(path)
+jobs.Path, dispatch.checked_path = RecipePath, checked
+''' % [str(hide), str(bind)]
+    report, seen = r7_router_probe(world, injection, command=command)
+    row = report["small_changes"][0]
+    if changed:
+        assert (row["state"], row["reason"], row["detail"]) == (
+            "held", "small_change_recipe_mismatch", "admitted recipe file changed"), row
+    else:
+        assert row["state"] == "checking", row
+    assert set(seen["folder_probes"]) == {str(hide), str(bind)}, seen
+    limit = count if changed else 2 * count
+    assert all(count <= probes <= limit for probes in seen["folder_probes"].values()), seen
+    assert seen["folder_guards"] == {str(hide): count, str(bind): count}, seen
+    assert len(world.messages("job_request")) == (1 if command == "dispatch" and not changed else 0)
+    if changed or command == "status":
+        assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+
+
 @pytest.mark.parametrize("variant", ["steady", "schema", "python", "path", "env-name", "env-value", "extra", "recipe-kind",
-                                     "steps", "boolean", "identity", "prefix", "valid-env", "valid-prefix", "valid-identity"])
+                                     "steps", "boolean", "identity", "prefix", "valid-env", "valid-prefix", "valid-identity",
+                                     "census-count", "census-report", "census-ignore", "census-invalid", "census-bool",
+                                     "census-int", "census-list", "census-dict", "census-null", "free-zero", "free-invalid",
+                                     "free-bool", "valid-folders", "hide-type", "ro-binds-type", "malformed-json",
+                                     "duplicate-key", "invalid-utf8", "null", "array", "hide-relative", "ro-binds-relative",
+                                     "hide-existing-relative", "ro-binds-existing-relative", "schema-hide-type",
+                                     "missing-hide-type", "python-hide-type", "census-hide-relative", "hide-file-prefix",
+                                     "hide-file-private", "hide-private-invalid-type", "ro-binds-private-invalid-type",
+                                     "header-symlink"])
 def test_r9_recipe_validation_matches_the_public_runner(tmp_path, variant):
     world = DispatchWorld(tmp_path)
     table = world.recipes
@@ -5531,8 +5597,51 @@ def test_r9_recipe_validation_matches_the_public_runner(tmp_path, variant):
     if variant == "valid-identity":
         table["recipes"]["other"] = {"kind": "commit", "timeout_seconds": 5, "sandbox": "none"}
         table["identity"] = {"name": "Fixture", "email": "fixture@example.invalid"}
+    policies = {"census-count": "count", "census-report": "report", "census-ignore": "ignore",
+                "census-invalid": "off", "census-bool": False, "census-int": 1, "census-list": [],
+                "census-dict": {}, "census-null": None}
+    if variant in policies: table["census_outside_policy"] = policies[variant]
+    if variant == "free-zero": table["min_free_gigabytes"] = 0
+    if variant == "free-invalid": table["min_free_gigabytes"] = -1
+    if variant == "free-bool": table["min_free_gigabytes"] = True
+    if variant == "valid-folders": table.update(hide=[str(world.checkout)], ro_binds=[str(world.checkout)])
+    if variant == "hide-type": table["hide"] = "invalid"
+    if variant == "ro-binds-type": table["ro_binds"] = [None]
+    unreachable = []
+    if variant in {"hide-relative", "ro-binds-relative", "hide-existing-relative", "ro-binds-existing-relative"}:
+        field = "hide" if variant.startswith("hide-") else "ro_binds"
+        table[field] = ([str(world.checkout)] if "existing" in variant else []) + ["relative"]
+        unreachable.append("relative")
+    if variant == "schema-hide-type": table.update(schema="unexpected/v99", hide="invalid")
+    if variant == "missing-hide-type":
+        table.clear()
+        table["hide"] = "invalid"
+    if variant == "python-hide-type": table.update(python="relative", hide="invalid")
+    if variant == "census-hide-relative":
+        table.update(census_outside_policy="off", hide=["relative"])
+        unreachable.append("relative")
+    if variant in {"hide-file-prefix", "hide-file-private", "hide-private-invalid-type", "ro-binds-private-invalid-type"}:
+        regular = tmp_path / "folder-is-a-file"
+        regular.write_text("not a directory")
+        private = tmp_path / "home/.codex/unreached"
+        private.mkdir(parents=True)
+        if variant == "hide-file-prefix": table.update(hide=[str(regular)], prefix=["relative"])
+        if variant == "hide-file-private": table["hide"] = [str(regular), str(private)]
+        if variant == "hide-private-invalid-type": table["hide"] = [str(private), None]
+        if variant == "ro-binds-private-invalid-type": table["ro_binds"] = [str(private), None]
+        unreachable.append(str(private))
+    if variant == "header-symlink":
+        from tests.conftest import symlink_or_skip
+        target, linked = tmp_path / "public-folder", tmp_path / "folder-link"
+        target.mkdir()
+        symlink_or_skip(target, linked, target_is_directory=True)
+        table.clear()
+        table.update(schema="other/v1", hide=[str(linked)])
+        unreachable.append(str(linked))
     # Malformed configuration refuses before provenance comparison. A valid changed table reaches that comparison.
     raw = json.dumps(table).encode()
+    raw = {"malformed-json": b"{", "duplicate-key": b'{"schema":"a","schema":"b"}',
+           "invalid-utf8": b"\xff", "null": b"null", "array": b"[]"}.get(variant, raw)
     world.recipes_path.write_bytes(raw)
     script = """import json,sys
 sys.path.insert(0,sys.argv[1]); import hierarchy_jobs as jobs
@@ -5547,7 +5656,30 @@ print(json.dumps(result))
     expected = json.loads(proc.stdout)
     world.dispatch()
     world.finish_writer()
-    row = world.dispatch()["small_changes"][0]
+    injection = PRIVATE_ROOT_PROBE + r'''
+import hierarchy_small_change_dispatch as dispatch
+unreachable = set(map(Path, %r))
+seen['unreached_accesses'], seen['unreached_checks'] = [], []
+original_record, original_check = _probe_record, dispatch.checked_path
+def recorded(kind, value, kwargs=None):
+    path = original_record(kind, value, kwargs)
+    if path is not None and any(path == entry or entry in path.parents for entry in unreachable):
+        seen['unreached_accesses'].append({'path': str(path), 'kind': kind})
+    return path
+def checked(path):
+    if Path(path) in unreachable: seen['unreached_checks'].append(str(path))
+    return original_check(path)
+_probe_record, dispatch.checked_path = recorded, checked
+seen.update(roots=_probe_roots, accesses=_probe_accesses)
+''' % unreachable
+    def dispatch_row(command="dispatch", telemetry=None):
+        if not unreachable:
+            return world.dispatch(command=command)["small_changes"][0]
+        report, seen = r7_router_probe(world, injection, command=command, telemetry=telemetry, extra=("--wait", "5"))
+        assert seen["unreached_accesses"] == seen["unreached_checks"] == [], seen
+        assert_private_root_probes(seen["roots"], seen["accesses"])
+        return report["small_changes"][0]
+    row = dispatch_row()
     if expected["ok"] and variant == "steady":
         assert row["state"] == "checking", row
     elif expected["ok"]:
@@ -5555,6 +5687,22 @@ print(json.dumps(result))
     else:
         assert (row["state"], row.get("reason")) == ("held", "small_change_configuration"), row
         assert row["detail"] == expected["error"], (row, expected)
+        assert "release_validation_error" not in row, row
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    retried = dispatch_row()
+    for field in ("state", "reason", "detail"):
+        assert retried.get(field) == row.get(field), (retried, row)
+    assert "release_validation_error" not in retried, retried
+    if variant in {"hide-relative", "hide-file-private", "header-symlink"}:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(dispatch_row, "status", tmp_path / ("parity-reader-%d.json" % i)) for i in range(2)]
+            for future in futures:
+                current = future.result(timeout=40)
+                for field in ("state", "reason", "detail"):
+                    assert current.get(field) == row.get(field), (current, row)
+                assert "release_validation_error" not in current, current
+    assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
 
 
 def test_r9_wake_absence_is_rechecked_at_the_final_publication_hook(tmp_path):
@@ -6599,11 +6747,11 @@ def test_r14_execution_source_export_is_required_and_bound_to_packet(tmp_path, d
     assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
 
 
-@pytest.mark.xfail(strict=True, reason="R15: deferred until JOBS-1 public validate_recipes(data) lands")
-def test_r14_census_recipe_uses_the_same_public_validation(tmp_path):
+@pytest.mark.parametrize("policy", ["count", "report", "ignore"])
+def test_r14_census_recipe_uses_the_same_public_validation(tmp_path, policy):
     class CensusWorld(DispatchWorld):
         def save_recipes(self):
-            self.recipes['census_outside_policy'] = 'ignore'
+            self.recipes['census_outside_policy'] = policy
             super().save_recipes()
     world = CensusWorld(tmp_path)
     assert world.run_jobs()['rows'] == []
@@ -6612,6 +6760,18 @@ def test_r14_census_recipe_uses_the_same_public_validation(tmp_path):
     world.finish_writer()
     row = world.dispatch()['small_changes'][0]
     assert row['state'] == 'checking' and len(world.messages('job_request')) == 1, row
+    # Retrying publication and concurrent readers retain the admitted hash without duplicate effects.
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    assert world.dispatch()['small_changes'][0]['state'] == 'checking'
+    from concurrent.futures import ThreadPoolExecutor
+    def projection():
+        return world.run("status", "--recipes", str(world.recipes_path), "--wait", "5")["small_changes"][0]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(projection) for _ in range(2)]
+        for future in futures:
+            current = future.result(timeout=40)
+            assert current['state'] == 'checking', current
+    assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
 
 
 @pytest.mark.parametrize('host_kind', ['codex-cli', 'claude-code'])
@@ -9110,3 +9270,346 @@ def test_bl03_both_workspace_replay_loaders_refuse_unknown_schema_or_sequence(tm
     assert 'wrong event schema or sequence' in world.workspace.run('status', expect=2)['error']
     assert 'wrong event schema or sequence' in world.dispatch(command='status', expect=2)['error']
     assert {p.name: p.read_bytes() for p in event_files(world.workspace)} == before
+
+
+def _workspace_harden2_refusal(loop, site, value):
+    from hierarchy_workspace_display import _display
+
+    event = loop.workspace.store / "events/00000001.json"
+    if site == "event-name":
+        # A directory entry cannot contain a slash. Keep the URL corpus's
+        # userinfo intact while spelling its separators as unsafe Unicode.
+        name = value.replace("/", "\u2215")
+        (event.parent / name).write_bytes(b"{}")
+        return "unexpected workspace store entry: " + _display(name)
+    if site == "exception-text":
+        record = json.loads(event.read_text())
+        record[value] = "untrusted extra field"
+        event.write_text(json.dumps(record))
+        return "malformed workspace event: " + _display(event) + ": unexpected fields: " + _display(value)
+    destination = loop.tmp / value / "store"
+    destination.parent.mkdir(parents=True)
+    loop.workspace.store.rename(destination)
+    loop.workspace.store = destination
+    event = destination / "events/00000001.json"
+    record = json.loads(event.read_text())
+    record["seq"] = 2
+    event.write_text(json.dumps(record))
+    return "malformed workspace event: " + _display(event) + ": wrong event schema or sequence"
+
+
+from tests.integration.test_hierarchy_workspace import _CREDENTIAL_CORPUS
+
+
+@pytest.mark.parametrize("site", ["event-name", "exception-text", "path"])
+@pytest.mark.parametrize("label,value,credential", _CREDENTIAL_CORPUS + [
+    ("controls", "row\n\r\t\x1b[31m", None),
+    ("unicode", "\uff54\uff4f\uff4b\uff45\uff4e=SYNTHETIC_PASSWORD", "SYNTHETIC_PASSWORD"),
+    ("long", "a" * 250, None),
+    ("validated-id", "sk-runner", None),
+], ids=[row[0] for row in _CREDENTIAL_CORPUS] + ["controls", "unicode", "long", "validated-id"])
+def test_workspace_harden2_refusal_display_matrix(tmp_path, site, label, value, credential):
+    loop = Loop(tmp_path)
+    expected = _workspace_harden2_refusal(loop, site, value)
+    before = {p: p.read_bytes() for p in loop.workspace.store.rglob("*") if p.is_file()}
+    for _ in range(2):
+        result = loop.run("status", expect=2)
+        assert result == {"state": "hold", "execution_enabled": False, "source": "store", "error": expected}
+        assert result["error"].isprintable()
+        assert len(result["error"]) < 1024
+        if credential is not None:
+            assert credential not in result["error"]
+        if label == "validated-id" and site != "path":
+            assert "sk-runner" in result["error"]
+    assert {p: p.read_bytes() for p in loop.workspace.store.rglob("*") if p.is_file()} == before
+
+
+@pytest.mark.parametrize("site", ["event-name", "exception-text", "path"])
+def test_workspace_harden2_concurrent_refusals_and_recovery(tmp_path, site):
+    from concurrent.futures import ThreadPoolExecutor
+
+    loop = Loop(tmp_path)
+    event = loop.workspace.store / "events/00000001.json"
+    original = event.read_bytes()
+    expected = _workspace_harden2_refusal(loop, site, "token=SYNTHETIC_PASSWORD\n")
+    before = {p: p.read_bytes() for p in loop.workspace.store.rglob("*") if p.is_file()}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(loop.run, "status", expect=2) for _ in range(2)]
+        for future in futures:
+            assert future.result(timeout=30)["error"] == expected
+    assert {p: p.read_bytes() for p in loop.workspace.store.rglob("*") if p.is_file()} == before
+    if site == "event-name":
+        (event.parent / "token=SYNTHETIC_PASSWORD\n").unlink()
+    else:
+        (loop.workspace.store / "events/00000001.json").write_bytes(original)
+    assert loop.run("status")["requests"] == []
+
+
+def test_workspace_harden2_raw_exception_is_displayed_before_any_output_bound(tmp_path):
+    from hierarchy_workspace_display import _display
+
+    loop = Loop(tmp_path)
+    event = loop.workspace.store / "events/00000001.json"
+    value = '\uff54\uff4f\uff4b\uff45\uff4e="' + "SYNTHETIC_PASSWORD" * 1000 + '"\n\x1b'
+    key = json.dumps(value)
+    event.write_text("{" + key + ":1," + key + ":2}")
+    result = loop.run("status", expect=2)
+    assert result["error"] == "malformed workspace event: " + _display(event) + ": " + _display("duplicate JSON key: " + value)
+    assert "SYNTHETIC" not in result["error"] and result["error"].isprintable()
+
+
+def test_workspace_harden2_nonconsecutive_event_name_keeps_validated_bytes(tmp_path):
+    loop = Loop(tmp_path)
+    event = loop.workspace.store / "events/00000001.json"
+    event.rename(event.with_name("00000002.json"))
+    assert loop.run("status", expect=2)["error"] == "nonconsecutive workspace event: 00000002.json"
+
+
+@pytest.mark.parametrize("damage", ["missing-events", "replaced-events", "unreadable-store"])
+def test_workspace_harden2_store_read_failure_is_displayed_and_recovers(tmp_path, damage):
+    from concurrent.futures import ThreadPoolExecutor
+    from hierarchy_workspace_display import _display
+
+    if damage == "unreadable-store" and os.geteuid() == 0:
+        pytest.skip("mode-000 refusal requires an unprivileged runner")
+    base = tmp_path / "token=SYNTHETIC_PASSWORD"
+    base.mkdir()
+    loop = Loop(base)
+    loop.workspace.register("sk-runner")
+    events = loop.workspace.store / "events"
+    retained = loop.workspace.store / "retained-events"
+    if damage != "unreadable-store":
+        events.rename(retained)
+        if damage == "replaced-events":
+            events.write_bytes(b"not a directory")
+    else:
+        loop.workspace.store.chmod(0)
+    try:
+        first = loop.run("status", expect=2)
+        assert first["state"] == "hold" and first["source"] == "store"
+        assert "SYNTHETIC_PASSWORD" not in first["error"]
+        assert first["error"].isprintable() and len(first["error"]) < 1024
+        if damage == "missing-events":
+            assert first["error"] == _display("captured directory disappeared: " + str(events))
+        elif damage == "replaced-events":
+            assert first["error"] == "workspace store is not initialized"
+        assert loop.run("status", expect=2) == first
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(loop.run, "status", expect=2) for _ in range(2)]
+            for future in futures:
+                assert future.result(timeout=30) == first
+    finally:
+        if damage == "unreadable-store":
+            loop.workspace.store.chmod(0o700)
+        else:
+            if damage == "replaced-events":
+                events.unlink()
+            retained.rename(events)
+    assert loop.run("status")["requests"] == []
+    assert "sk-runner" in loop.workspace.run("status")["initiatives"]
+
+
+def test_workspace_harden2_store_directory_swap_refuses_and_recovers(tmp_path):
+    base = tmp_path / "token=SYNTHETIC_PASSWORD"
+    base.mkdir()
+    loop = Loop(base)
+    events = loop.workspace.store / "events"
+    script = """import json, os, sys
+from pathlib import Path
+from types import SimpleNamespace
+sys.path.insert(0, sys.argv[1])
+import hierarchy_fresh_brief as fresh
+import hierarchy_router as router
+events = Path(sys.argv[2])
+identity = events.stat()
+real_os, swapped = fresh.os, []
+def opened(path, *args, **kwargs):
+    parent = kwargs.get('dir_fd')
+    if path == '.' and parent is not None and not swapped:
+        info = real_os.fstat(parent)
+        if (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino):
+            events.rename(events.with_name('retained-events'))
+            events.mkdir()
+            swapped.append(True)
+    return real_os.open(path, *args, **kwargs)
+fresh.os = SimpleNamespace(**{**vars(real_os), 'open': opened})
+code = router.main(sys.argv[3:])
+assert swapped == [True], 'directory replacement did not reach the read boundary'
+sys.exit(code)
+"""
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(ROOT / "tools"), str(events),
+        "--lifecycle", str(loop.ledger.path), "--store", str(loop.workspace.store), "status"],
+        capture_output=True, text=True, timeout=30)
+    assert result.returncode == 2 and result.stderr == "", result.stdout + result.stderr
+    refusal = json.loads(result.stdout)
+    assert refusal["state"] == "hold" and refusal["source"] == "store"
+    assert "SYNTHETIC_PASSWORD" not in refusal["error"]
+    assert refusal["error"].isprintable() and len(refusal["error"]) < 1024
+    events.rmdir()
+    events.with_name("retained-events").rename(events)
+    assert loop.run("status")["requests"] == []
+
+
+@pytest.mark.parametrize("identifier", ["sk-runner", "sk-" + "a" * 24], ids=["short-id", "credential-shaped-id"])
+def test_workspace_harden2_store_boundary_preserves_validated_identifier(tmp_path, identifier):
+    from hierarchy_workspace_display import _display
+
+    loop = Loop(tmp_path)
+    loop.workspace.register(identifier)
+    event = loop.workspace.store / "events/00000002.json"
+    record = json.loads(event.read_text())
+    record["seq"] = 3
+    duplicate = event.with_name("00000003.json")
+    duplicate.write_text(json.dumps(record))
+    assert loop.run("status", expect=2)["error"] == (
+        "malformed workspace event: " + _display(duplicate) + ": initiative already registered: " + identifier)
+
+
+@pytest.mark.parametrize("seam", ["directory", "event"])
+@pytest.mark.parametrize("failure", [ValueError, OSError],
+                         ids=lambda failure: failure.__name__)
+def test_workspace_harden2_store_boundary_displays_every_read_exception(tmp_path, seam, failure):
+    from hierarchy_workspace_display import _display
+
+    base = tmp_path / "token=SYNTHETIC_PASSWORD"
+    base.mkdir()
+    loop = Loop(base)
+    events = loop.workspace.store / "events"
+    marker = "token=SYNTHETIC_PASSWORD\n" + "x" * 6000
+    script = """import builtins, os, sys
+from pathlib import Path
+from types import SimpleNamespace
+sys.path.insert(0, sys.argv[1])
+import hierarchy_fresh_brief as fresh
+import hierarchy_router as router
+events = Path(sys.argv[2])
+failure = getattr(builtins, sys.argv[3])
+seam = sys.argv[4]
+marker = 'token=SYNTHETIC_PASSWORD\\n' + 'x' * 6000
+identity = events.stat()
+real_os, refused = fresh.os, []
+def scanned(path):
+    if isinstance(path, int):
+        info = real_os.fstat(path)
+        selected = (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino)
+    else:
+        selected = Path(path) == events
+    if seam == 'directory' and selected:
+        refused.append(True)
+        raise failure(marker)
+    return real_os.scandir(path)
+def opened(path, *args, **kwargs):
+    parent = kwargs.get('dir_fd')
+    selected = Path(path) == events / '00000001.json'
+    if parent is not None and Path(path).name == '00000001.json':
+        info = real_os.fstat(parent)
+        selected = (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino)
+    if seam == 'event' and selected:
+        refused.append(True)
+        raise failure(marker)
+    return real_os.open(path, *args, **kwargs)
+fresh.os = SimpleNamespace(**{**vars(real_os), 'open': opened, 'scandir': scanned})
+code = router.main(sys.argv[5:])
+assert refused, 'read failure did not reach its OS boundary'
+sys.exit(code)
+"""
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(ROOT / "tools"), str(events),
+        failure.__name__, seam, "--lifecycle", str(loop.ledger.path),
+        "--store", str(loop.workspace.store), "status"], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 2 and result.stderr == "", result.stdout + result.stderr
+    detail = _display(failure(marker))
+    if seam == "event" and issubclass(failure, (ValueError, TypeError, KeyError, UnicodeError)):
+        detail = "malformed workspace event: " + _display(events / "00000001.json") + ": " + detail
+    assert json.loads(result.stdout) == {"state": "hold", "execution_enabled": False, "source": "store", "error": detail}
+    assert "SYNTHETIC_PASSWORD" not in result.stdout
+
+
+def test_workspace_harden2_unsupported_descriptors_refuses_without_echo(tmp_path):
+    base = tmp_path / "token=SYNTHETIC_PASSWORD"
+    base.mkdir()
+    loop = Loop(base)
+    script = """import sys
+sys.path.insert(0, sys.argv[1])
+import hierarchy_fresh_brief as fresh
+import hierarchy_router as router
+fresh._reference_descriptors = lambda: False
+sys.exit(router.main(sys.argv[2:]))
+"""
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(ROOT / "tools"),
+        "--lifecycle", str(loop.ledger.path), "--store", str(loop.workspace.store), "status"],
+        capture_output=True, text=True, timeout=30)
+    assert result.returncode == 2 and result.stderr == "", result.stdout + result.stderr
+    assert json.loads(result.stdout) == {"state": "hold", "execution_enabled": False, "source": "journal",
+        "error": "secure reference hashing requires directory descriptor support"}
+    assert "SYNTHETIC_PASSWORD" not in result.stdout
+
+
+@pytest.mark.parametrize("caller", ["store", "router"])
+@pytest.mark.parametrize("fault", ["policy", "identity", "symlink", "private"])
+def test_workspace_harden2_store_policy_failures_preserve_identity(tmp_path, monkeypatch, caller, fault):
+    from types import SimpleNamespace
+    import hierarchy_fresh_brief as fresh
+    import hierarchy_lifecycle as lifecycle
+    import hierarchy_router as router
+    import hierarchy_small_change_dispatch as dispatch
+    import hierarchy_workspace as workspace
+
+    loop = Loop(tmp_path)
+    events = loop.workspace.store / "events"
+    identity = events.stat()
+    error = {"policy": router.CapturedPolicyError("host-home configuration changed during capture"),
+             "identity": ValueError("cannot determine private directory identity"),
+             "symlink": router.SymlinkPathError(events),
+             "private": router.PrivatePathError(events)}[fault]
+    real_os, injected = fresh.os, []
+
+    def scanned(path):
+        if isinstance(path, int):
+            info = real_os.fstat(path)
+            selected = (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino)
+        else:
+            selected = Path(path) == events
+        if selected:
+            injected.append(True)
+            raise error
+        return real_os.scandir(path)
+
+    monkeypatch.setattr("hierarchy_fresh_brief.os", SimpleNamespace(**{**vars(real_os), "scandir": scanned}))
+    with pytest.raises(type(error)) as caught:
+        if caller == "store":
+            dispatch._CapturedStore(loop.workspace.store, fresh._Operation()).load()
+        else:
+            router.status(lifecycle.Lifecycle(loop.ledger.path), workspace.Store(loop.workspace.store), 0)
+    assert injected
+    assert caught.value is error
+    assert type(caught.value) is type(error)
+    assert str(caught.value) == str(error)
+
+
+@pytest.mark.parametrize("damage", ["missing", "not-directory", "empty"])
+def test_workspace_harden2_store_fixed_refusals_keep_type_and_bytes(tmp_path, damage):
+    import hierarchy_fresh_brief as fresh
+    import hierarchy_small_change_dispatch as dispatch
+
+    loop = Loop(tmp_path)
+    events = loop.workspace.store / "events"
+    retained = events.with_name("retained-events")
+    events.rename(retained)
+    if damage == "not-directory":
+        events.write_bytes(b"not a directory")
+    elif damage == "empty":
+        events.mkdir()
+    expected = ("workspace store is not initialized" if damage != "missing"
+                else "captured directory disappeared: " + str(events))
+    try:
+        with pytest.raises(ValueError) as caught:
+            dispatch._CapturedStore(loop.workspace.store, fresh._Operation()).load()
+        assert type(caught.value) is ValueError
+        assert str(caught.value) == expected
+    finally:
+        if damage == "not-directory":
+            events.unlink()
+        elif damage == "empty":
+            events.rmdir()
+        retained.rename(events)
+    assert loop.run("status")["requests"] == []

@@ -92,6 +92,40 @@ the session's scans and matching diff, not an agent-supplied list of rule IDs.
 Confirmation from the landing commit's CI is a further step; local success alone
 does not establish it. Reviewed adjudications are a separate evidence path.
 
+### Tree-bound Teams qualification
+
+`team_qualify` is a custodian library, with no CLI activation. A trusted executor
+adapter supplies a passing result bound to the exact tree, source/base commit, leg and
+run identifier. The executor never writes refs. The custodian stores the result
+as a bounded JSON message in a commit at `refs/aegis/qual/<tree>/<leg>`, using only
+`team_git.cas_fast_forward`. The first record parents its source/base commit;
+each newer record parents the previous record. Records are never deleted or
+force-moved. A GitOpsJournal intent precedes publication and an observed result
+follows it. A repeated request observes its first attempt without repeating CAS;
+an interrupted result write is recovered through journal reconciliation.
+The tested tree may be an uncommitted private snapshot: its base commit need not
+have that tree, so qualification can precede the tested-bytes lane commit.
+
+`qualified(store, tree, legs)` requires every explicit leg on the exact tree.
+Missing, malformed, foreign-tree, wrong-leg, oversized and non-commit records
+return false. Object sizes are checked before capture and JSON parsing. Ref reads
+use strict custody bound to the GitStore's trusted worktree and validated
+scratch. Object reads and publication use the GitStore's fenced operations, so a
+Git executable planted inside the editable checkout cannot run in the custodian.
+Required legs come from the trusted caller: the Publisher contract requires the applicable
+local legs and hosted legs for release PRs, but declares no fixed leg identifiers.
+Connecting its `qualified(request)` hook is a separate increment.
+
+`approval_equivalent` permits structural carry-over only for a direct empty commit
+with the same tree, the standard approval subject and exactly one printable
+`Aegis-Approve` digest line. Extra metadata, continued values and changed trees
+refuse carry-over. This is separate from the policy gate's signature and digest
+verification; structural equivalence alone grants no approval authority.
+
+`team_qualify` occupies layer zero in `CORE_LAYERS` in
+`tests/contract/test_import_boundary.py`. Its runtime dependencies are existing
+layer-zero Git, journal, approval-shape, primitive and redaction services.
+
 Fitness is derived from the ledger; `aegis sync` computes suggestions. Applying a
 suggestion is an explicit action that changes files for review. Host hooks and
 team events do not silently promote rules.
