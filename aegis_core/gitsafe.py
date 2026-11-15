@@ -101,7 +101,6 @@ __all__ = [
     "read_blob",
     "read_blobs",
     "read_object",
-    "read_private_object", "private_object_headers", "read_private_objects",
     "read_ref",
     "relative_to_prefix",
     "resolve_base_ref",
@@ -1029,25 +1028,6 @@ def update_ref(cwd: Path | str, ref: str, new: Optional[str], old: Optional[str]
         f"git update-ref {ref} failed {UPDATE_REF_ATTEMPTS} times while the ref still held the "
         f"expected value" + (f": {detail}" if detail else "")
     )
-
-
-def private_object_headers(cwd, oids, *, env, scratch):
-    """Bounded mixed metadata for full OIDs; missing objects are explicit None values."""
-    return gitsafe_run.private_headers(cwd, oids, env=env, scratch=scratch, runner=run_checked,
-        batch=["cat-file", "--batch-check"], custody=custody, error=GitError)
-
-
-def read_private_object(cwd, oid: str, *, kind: str, max_bytes: int, env: Mapping[str, str], scratch: Path) -> bytes:
-    """Size/type/hash-verified private object; legacy object readers remain unchanged."""
-    return gitsafe_run.private_object(cwd, oid, kind=kind, max_bytes=max_bytes, env=env, scratch=scratch,
-        headers=private_object_headers, runner=run_checked, custody=custody, error=GitError)
-
-
-def read_private_objects(cwd, oids, *, max_bytes, max_object_bytes, env, scratch):
-    """Batch mixed objects, checking all sizes before capture and every payload's hash."""
-    return gitsafe_run.private_objects(cwd, oids, max_bytes=max_bytes, max_object_bytes=max_object_bytes,
-        env=env, scratch=scratch, headers=private_object_headers, runner=run_checked,
-        batch=["cat-file", "--batch"], custody=custody, error=GitError)
 
 
 def read_object(cwd: Path | str, oid: str, max_bytes: int) -> bytes:

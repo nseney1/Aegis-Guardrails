@@ -25,7 +25,7 @@ from aegis_core.ast.detect import NATIVE_SOURCE_EXTENSIONS
 from aegis_core.ast.driver_errors import ASTDriverError
 from aegis_core.ast.policy import ASTExtractionError, evaluate_forbid_ast_structured, extract_normalized_ast
 from aegis_core.ast.source import decode_python_source
-from aegis_core.packs import PackPathError, parse_pack_path
+from aegis_core.packs import MAX_RULE_BYTES, PackPathError, parse_pack_path
 from aegis_core.primitives import sanitize_display
 from aegis_core.redaction import redact_insight_text
 from aegis_core.rule_inventory import RuleInventory, RuleInventoryEntry, RuleInventoryError, inventory_rules
@@ -45,7 +45,6 @@ __all__ = [
     "MAX_SELECTIONS",
 ]
 
-MAX_RULE_BYTES = 65536
 MAX_RULES = 2048
 MAX_RULE_TOTAL = 8 * 1024 * 1024
 MAX_SOURCE_BYTES = 256 * 1024
