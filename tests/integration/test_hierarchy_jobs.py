@@ -406,9 +406,17 @@ def test_rf42_job_fixtures_reuse_the_worker_source_seed(tmp_path_factory, reques
 
 
 def run_shop_cases(tmp_path, source):
-    suite = tmp_path / "test_shop_cases.py"
-    suite.write_text(source, encoding="utf-8")
-    return subprocess.run([sys.executable, "-m", "pytest", str(suite), "-n", "0", "-q",
+    batch = isinstance(source, dict)
+    sources = source if batch else {"test_shop_cases.py": source}
+    if not sources:
+        raise ValueError("at least one shop case module is required")
+    suites = []
+    for name, text in sources.items():
+        suite = tmp_path / name
+        suite.write_text(text, encoding="utf-8")
+        suites.append(str(suite))
+    options = ["-v", "--rootdir", str(tmp_path)] if batch else ["-q"]
+    return subprocess.run([sys.executable, "-m", "pytest", *suites, "-n", "0", *options,
                            "-c", str(ROOT / "pyproject.toml"),
                            "--confcutdir", str(tmp_path), "--basetemp", str(tmp_path / "nested"),
                            "-o", "tmp_path_retention_policy=failed"],
@@ -645,25 +653,34 @@ def test_rf36_retention_collision_refuses_before_deleting_evidence_and_can_retry
             remove_tree(session.stash[_WORKER_SHOP].snapshot.parent)
 
 
-@pytest.mark.parametrize("module,fixture", [
-    ("jobs", "shop"), ("jobs", "kind_shop"),
-    ("jobs_census_policy", "shop"), ("jobs_census_policy", "policy_shop"),
-    ("recovery", "shop"), ("job_dependencies", "shop"), ("job_results", "shop"),
-    ("jobs_derive", "shop"), ("git_reads", "shop")])
-def test_rf36_fresh_optout_resolves_in_every_using_module(tmp_path, module, fixture):
+def test_rf36_fresh_optout_resolves_in_every_using_module(tmp_path):
+    cases = [
+        ("jobs", "shop"), ("jobs", "kind_shop"),
+        ("jobs_census_policy", "shop"), ("jobs_census_policy", "policy_shop"),
+        ("recovery", "shop"), ("job_dependencies", "shop"), ("job_results", "shop"),
+        ("jobs_derive", "shop"), ("git_reads", "shop")]
     try:
-        source = (
-            "import pytest\n"
-            "from tests.integration import test_hierarchy_%s as fixtures\n"
-            "%s = fixtures.%s\n"
-            "if hasattr(fixtures, 'fresh_shop'): fresh_shop = fixtures.fresh_shop\n"
-            "@pytest.mark.parametrize(%r, ['fresh'], indirect=True)\n"
-            "def test_fresh(%s, tmp_path):\n"
-            "    assert %s.tmp == tmp_path\n"
-            "    assert not %s.sentinel.exists()\n" % (module, fixture, fixture, fixture, fixture, fixture, fixture))
-        result = run_shop_cases(tmp_path, source)
+        sources = {}
+        for module, fixture in cases:
+            sources["test_fresh_%s_%s.py" % (module, fixture)] = (
+                "import pytest\n"
+                "from tests.integration import test_hierarchy_%s as fixtures\n"
+                "%s = fixtures.%s\n"
+                "if hasattr(fixtures, 'fresh_shop'): fresh_shop = fixtures.fresh_shop\n"
+                "@pytest.mark.parametrize('module,fixture', [%r])\n"
+                "@pytest.mark.parametrize(%r, ['fresh'], indirect=True)\n"
+                "def test_fresh(%s, tmp_path, module, fixture):\n"
+                "    assert %s.tmp == tmp_path\n"
+                "    assert not %s.sentinel.exists()\n" %
+                (module, fixture, fixture, (module, fixture), fixture, fixture, fixture, fixture))
+        assert len(sources) == 9
+        result = run_shop_cases(tmp_path, sources)
         assert result.returncode == 0, result.stdout + result.stderr
-        assert "1 passed" in result.stdout
+        assert "9 passed" in result.stdout
+        for module, fixture in cases:
+            # Match each case independently of its temporary path.
+            node = "::test_fresh[fresh-%s-%s]" % (module, fixture)
+            assert node + " PASSED" in result.stdout, result.stdout + result.stderr
     finally:
         if (tmp_path / "nested").exists():
             remove_tree(tmp_path / "nested")
