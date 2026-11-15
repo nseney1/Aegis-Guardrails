@@ -1,9 +1,19 @@
 """CLI lease observations and writes share repository identity and private scratch.
 
-POSIX holds nofollow directory descriptors through both phases. Windows keeps
-the same metadata location and checks its identity before mutation, but pathname
-opens retain the platform's authorized rename race residual. This module is lazy:
-ordinary team service users and hooks do not enter or import this CLI boundary.
+The descriptor backend is selected only when storage_confined.descriptor_supported()
+is true and /proc/self/fd is a directory: Linux with the required nofollow and
+descriptor-relative primitives and procfs available. It holds directory descriptors
+through observation and mutation; Git addresses the parent's fds via /proc/<pid>/fd.
+The pathname backend is selected otherwise, including Windows, macOS (where
+/dev/fd alone cannot address the parent's held fds), and Linux without procfs or
+the required primitives. It uses the same private metadata scratch and checks
+repository identity before mutation, but pathname opens retain a rename race residual
+on every platform using this backend. The existing Windows residual authorization
+does not qualify this fallback on other platforms; changing backend selection
+requires an owner ruling and native macOS qualification.
+
+This module is lazy: ordinary team service users and hooks do not enter or import
+this CLI boundary.
 """
 from __future__ import annotations
 
@@ -186,7 +196,7 @@ def _descriptor_binding(root, stack, environment):
 
 
 def _record(path, limit):
-    """Bounded Windows pathname read; no fdopen ownership handoff can leak an fd."""
+    """Bounded pathname-backend read; no fdopen ownership handoff can leak an fd."""
     info = os.stat(path, follow_symlinks=False)
     if (not stat.S_ISREG(info.st_mode) or info.st_size > limit
             or getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)):
