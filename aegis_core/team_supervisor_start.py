@@ -18,6 +18,7 @@ import sys
 import time
 
 from aegis_core import storage_confined
+from aegis_core.primitives import json_preflight
 from aegis_core.team_supervisor import (
     COMPONENTS, STATE_NAME, STATE_MAX_BYTES, SupervisorError, empty_state,
     note_failure, note_success, plan, read_owned_leaf, validate_input,
@@ -144,71 +145,11 @@ def _pairs(pairs):
     return value
 
 
-def _scan(text):
-    """Bound depth, strings, atoms and nodes before allocating a JSON tree."""
-    depth = nodes = width = 0
-    unicode_left = chars = 0
-    quoted = escaped = atom = False
-    containers = []
-    for char in text:
-        if not quoted and containers and containers[-1][1] and char not in " \t\r\n]}":
-            containers[-1][0] += 1
-            containers[-1][1] = False
-            if containers[-1][0] > 100:
-                raise _Refusal("state_unavailable")
-        if quoted:
-            if unicode_left:
-                unicode_left -= 1
-            elif escaped:
-                escaped = False
-                if char == "u":
-                    unicode_left = 4
-            elif char == "\\":
-                escaped = True
-                chars += 1
-            elif char == '"':
-                quoted = False
-            else:
-                chars += 1
-            if chars > 64:
-                raise _Refusal("state_unavailable")
-        elif char == '"':
-            quoted, atom, chars = True, False, 0
-            nodes += 1
-        elif char in "[{":
-            depth += 1
-            nodes += 1
-            atom = False
-            if depth > 8:
-                raise _Refusal("state_unavailable")
-            containers.append([0, True])
-        elif char in "]}":
-            depth -= 1
-            atom = False
-            if containers:
-                containers.pop()
-        elif char in " \t\r\n,:":
-            atom = False
-            if char == "," and containers:
-                containers[-1][1] = True
-        else:
-            if not atom:
-                nodes += 1
-                width = 0
-                atom = True
-            width += 1
-            if width > 20:
-                raise _Refusal("state_unavailable")
-        # Root/version/components plus five slots of six nodes and 100 events.
-        if nodes > 5 + len(COMPONENTS) * 106:
-            raise _Refusal("state_unavailable")
-
-
 def _decode(data):
-    if len(data) > STATE_MAX_BYTES:
-        raise _Refusal("state_unavailable")
-    text = data.decode("utf-8")
-    _scan(text)
+    # Root/version/components plus five slots of six nodes and 100 events.
+    text = json_preflight(data, max_bytes=STATE_MAX_BYTES, max_depth=8,
+                          max_nodes=5 + len(COMPONENTS) * 106, max_items=100,
+                          max_string=64, string_units="escaped", max_atom=20)
     return json.loads(text, object_pairs_hook=_pairs)
 
 
