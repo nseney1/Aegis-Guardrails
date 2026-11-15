@@ -4436,21 +4436,23 @@ def clean_finished(store_path, initiative_id):
                "not_finished": not_finished}
 
 
-def recovery_recipe_digest(recipes_path):
-    """Unavailable trusted bytes leave admission unverified, without exposing path/parser errors."""
+def recovery_recipe_evidence(recipes_path):
+    """Capture a digest and fixed availability reason together, without exposing path/parser errors."""
     if recipes_path is None:
-        return None
+        return None, "planned recipe path absent"
     from hierarchy_fresh_brief import _read_reference, _reference_descriptors
 
     try:
         require(_reference_descriptors(), "recipe bytes unavailable")
         _, raw = _read_reference(Path(recipes_path), limit=MAX_BYTES, capture=True)
-        return hashlib.sha256(raw).hexdigest()
+        return hashlib.sha256(raw).hexdigest(), None
+    except FileNotFoundError:
+        return None, "planned recipe path absent"
     except ERRORS:
-        return None
+        return None, "planned recipe path unreadable"
 
 
-def recovery_source(job, mailbox, result, recipes_path=None, *, recipe_digest=None):
+def recovery_source(job, mailbox, result, recipes_path=None, *, recipe_evidence=None):
     """Observe the original packet and current source without admitting or running it."""
     if job.planned and result is not None and result.get("provenance_unverified") is True:
         return {"state": "unavailable", "reason": "derivation provenance unverified",
@@ -4481,9 +4483,10 @@ def recovery_source(job, mailbox, result, recipes_path=None, *, recipe_digest=No
         return {"state": "unavailable", "reason": "admission marker unverified"}
     if marker == "regular":
         if job.planned:
-            expected_recipes = recipe_digest() if recipe_digest is not None else recovery_recipe_digest(recipes_path)
+            expected_recipes, reason = (recipe_evidence() if recipe_evidence is not None else
+                                        recovery_recipe_evidence(recipes_path))
             if expected_recipes is None:
-                return {"state": "unavailable", "reason": "planned recipe bytes unavailable",
+                return {"state": "unavailable", "reason": reason,
                         "recipe_bytes_unavailable": True}
         else:
             reference = read_json(job.folder / "admitted.json")
@@ -4505,13 +4508,22 @@ def recovery_source(job, mailbox, result, recipes_path=None, *, recipe_digest=No
         expected["dirty_content_sha256"] = derived["dirty_content_sha256"]
     # A completed commit/merge changes source intentionally. Its after-witness, not the old packet,
     # is the reference for later incoming-work revalidation; the original packet remains untouched.
+    if job.planned and result is not None and result.get("after") is not None:
+        after = result["after"]
+        patterns = (("source_revision", 40, GIT_ID), ("source_tree", 40, GIT_ID),
+                    ("dirty_content_sha256", 64, SHA256))
+        if not (isinstance(after, dict) and all(
+                isinstance(after.get(key), str) and len(after[key]) == length
+                and pattern.fullmatch(after[key]) is not None for key, length, pattern in patterns)):
+            return {"state": "unavailable", "reason": "terminal source witness unverified",
+                    "terminal_source_unverified": True}
     if result is not None and isinstance(result.get("after"), dict):
         expected = {key: result["after"].get(key) for key in expected}
     return {"state": "match" if all(observed.get(key) == value for key, value in expected.items()) else "changed",
             "expected": expected, "observed": observed}
 
 
-def recovery_job(store, ledger, initiative, message, records, mailbox, recipes_path=None, *, recipe_digest=None):
+def recovery_job(store, ledger, initiative, message, records, mailbox, recipes_path=None, *, recipe_evidence=None):
     job_type = PlannedJob if has_host_plan(initiative) else Job
     job = job_type(store.path, initiative, message)
     # Deliberately kind-independent and every state, bound to the initiative: recovery reports every row this job's
@@ -4579,7 +4591,7 @@ def recovery_job(store, ledger, initiative, message, records, mailbox, recipes_p
                                       "Reconcile the exact receipt and result; run-open may settle without rerunning the job.")
         else:
             row["state"] = "reserved_not_started" if held else "pending"
-        row["source"] = recovery_source(job, mailbox, result, recipes_path, recipe_digest=recipe_digest)
+        row["source"] = recovery_source(job, mailbox, result, recipes_path, recipe_evidence=recipe_evidence)
         if job.planned and row["state"] == "admitted" and row["source"].get("recipe_bytes_unavailable") is True:
             row["state"] = "admission_unverified"
             row["next_action"] = ADMISSION_UNVERIFIED_ACTION
@@ -4622,10 +4634,10 @@ def recovery_status(store_path, chosen=(), recipes_path=None):
                          key=lambda i: (i["priority"], i["id"]))
 
     @lru_cache(maxsize=1)
-    def recipe_digest():
+    def recipe_evidence():
         # Lazy so settled jobs and no-plan reports never acquire current recipe bytes.
         # Cache unavailable evidence too: a replacement cannot mix versions within this report.
-        return recovery_recipe_digest(recipes_path)
+        return recovery_recipe_evidence(recipes_path)
 
     rows, blockers, teams, process_census = [], [], [], {}
     for kind in HEAVY_KINDS:
@@ -4678,7 +4690,7 @@ def recovery_status(store_path, chosen=(), recipes_path=None):
             require(folder.is_dir() and SLUG.fullmatch(folder.name) is not None, "unexpected job directory: " + str(folder))
             messages.setdefault(folder.name, {"message_id": folder.name})
         for message in messages.values():
-            row = recovery_job(store, ledger, initiative, message, records, mailbox, recipe_digest=recipe_digest)
+            row = recovery_job(store, ledger, initiative, message, records, mailbox, recipe_evidence=recipe_evidence)
             rows.append(row)
             source_unavailable = row["state"] == "finished" and row["source"].get("terminal_source_unverified") is True
             if row["state"] != "finished" or row["source"]["state"] == "changed" or source_unavailable:
