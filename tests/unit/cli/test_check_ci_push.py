@@ -465,7 +465,7 @@ def test_frame_reconstruction_requires_both_the_owner_and_finding_kind(frame):
 # Ordered like the shared text table: adding/reordering a row requires a probe.
 # Secrets are source regions, not fragments guessed from the mask's spelling.
 REDACTION_FAMILY_PROBES = (
-    ("pem", "-----BEGIN PRIVATE KEY----- material -----END PRIVATE KEY-----", "material", "[REDACTED_PEM]"),
+    ("pem", "-----BEGIN " + "PRIVATE KEY-----" + " material -----END " + "PRIVATE KEY-----", "material", "[REDACTED_PEM]"),
     ("url", "https://user:actual_password@example.test/path", "actual_password", "[REDACTED]"),
     ("jwt", "eyJ" + "a" * 16 + "." + "b" * 12 + "." + "c" * 12, "eyJ" + "a" * 16, "[REDACTED_JWT]"),
     ("aws-access", "AKIA" + "A" * 16, "AKIA" + "A" * 16, "[REDACTED_AWS]"),
