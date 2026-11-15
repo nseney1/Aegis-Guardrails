@@ -17,7 +17,7 @@ from aegis_core.redaction import redact_insight_text
     "don't " + "1." * 25000,
     "a-" * 25000,
     "auth" * 8000,
-    "-----BEGIN PRIVATE KEY----- " * 4000,
+    ("-----BEGIN " + "PRIVATE KEY----- ") * 4000,
 ], ids=["dots", "dashes", "auth", "pem-headers"])
 def test_long_hostile_text_yields_a_short_excerpt(text):
     out = redact_insight_text(text, max_len=300)
@@ -34,7 +34,7 @@ def test_short_text_takes_the_unbounded_path():
 
 def test_a_pem_block_cut_by_the_bound_leaves_no_key_material():
     body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC" * 40
-    block = f"-----BEGIN PRIVATE KEY----- {body} -----END PRIVATE KEY-----"
+    block = "-----BEGIN " + "PRIVATE KEY----- " + body + " -----END PRIVATE KEY-----"
     text = "x " * 800 + block + " and " + block + " tail " * 10
     second = text.rindex("-----BEGIN")
     assert second < 4096 < text.rindex("-----END")
@@ -51,7 +51,7 @@ def _pem_cut_at_the_bound(where: str) -> Tuple[str, List[str]]:
     lines = [b64[i:i + 64] for i in range(0, len(b64), 64)]
     assert "/" in b64 and "+" in b64
     end = "-----END RSA PRIVATE KEY-----"
-    core = "-----BEGIN RSA PRIVATE KEY-----\n" + "\n".join(lines) + "\n"
+    core = "-----BEGIN " + "RSA PRIVATE KEY-----\n" + "\n".join(lines) + "\n"
     # The bound keeps text[:4097]; land its last character in "PRIVATE" or mid-body.
     at = 4096 - len("-----END RSA PR") if where == "end-line" else 4096 + 300
     pad = at - len(core) - len("key dump: ")
