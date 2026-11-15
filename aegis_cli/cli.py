@@ -340,6 +340,11 @@ def _main(argv: List[str], prog: str, policy=None) -> int:
             if args.command != "workspace":
                 _attach_workspace(args)
         except (WorkspaceError, OSError) as exc:
+            workspace_refusal = getattr(command, "workspace_refusal", None)
+            if workspace_refusal is not None:
+                refusal = workspace_refusal(args, exc)
+                if refusal is not None:
+                    return refusal
             refusal = policy.workspace_error(args, exc)
             if refusal is not None:
                 return refusal
