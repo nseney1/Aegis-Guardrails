@@ -26,6 +26,7 @@ from tests.integration.test_hierarchy_mailbox import HELPER, invoke, message, pi
 
 sys.path.insert(0, str(HELPER.parent))
 import hierarchy_mailbox_mcp as mcp
+import hierarchy_mailbox_pager as pager_module
 import hierarchy_mailbox_records as records
 import hierarchy_mailbox_records_guidance as records_guidance
 import hierarchy_mailbox as mailbox_module
@@ -4421,6 +4422,126 @@ def test_digest_unavailable_inbox_probe_keeps_the_ordinary_failure(bound, monkey
                                 "next_action": "inbox retry could not be verified; ask the owner to inspect mailbox availability"}}
     _assert_closed("mailbox_digest", refused)
     assert "HOSTILE" not in json.dumps(refused) and reader.returned == []
+
+
+@pytest.mark.parametrize("planned", [False, True])
+@pytest.mark.parametrize("failure", ["none", "render", "missing", "history"])
+def test_inbox_preview_isolated_assembly_and_snapshot(bound, monkeypatch, planned, failure):
+    from copy import deepcopy
+    root, writer, reader = bound
+    if planned:
+        import hierarchy_hosts
+        plan = hierarchy_hosts.plan_record("a", "codex-cli", "codex-cli", {}, "0" * 64)
+        (root.parent / hierarchy_hosts.PLAN_FILE).write_text(json.dumps(plan), encoding="utf-8")
+    monkeypatch.setattr(mailbox_module, "timestamp", lambda: "2026-11-14T19:24:00Z")
+    for identifier, body in (("a-small", "small"), ("b-overflow", "h" * 61000), ("c-small", "small")):
+        _ordinary(writer, identifier, body)
+    history = reader.checked_mailbox().messages()
+    delivery = root.parent / "preview-delivery"
+    reader.delivery_dir = reader.checked_mailbox().delivery_directory(delivery)
+    assembly = pager_module.assemble_inbox
+    assembled = []
+
+    def observed_assembly(*args, **kwargs):
+        assembled.append(kwargs["note_returned"])
+        return assembly(*args, **kwargs)
+
+    monkeypatch.setattr(pager_module, "assemble_inbox", observed_assembly)
+    # Leave a real response staged. Preview must preserve even unflushed state.
+    call(reader, "mailbox_inbox", {"limit": 1})
+    assert assembled == [reader.note_returned]
+    assembled.clear()
+    live = reader.pager
+
+    def state():
+        return deepcopy((live.session, live.briefs_session, live.offered, live.pending,
+                         live.cutoffs, live.cursors, live.retained_cursor_pairs))
+
+    before = state()
+    returned, mode = reader.returned[:], reader.inbox_pager
+    options = {"limit": 1, "after_message_id": "a-small"}
+    original_options = dict(options)
+    target = "absent" if failure == "missing" else "b-overflow"
+    original_commit = pager_module.InboxPager.commit
+    commits = []
+
+    def isolated_commit(pager):
+        assert pager is not live, "preview committed the live pager"
+        commits.append(pager)
+        original_commit(pager)
+
+    monkeypatch.setattr(pager_module.InboxPager, "commit", isolated_commit)
+    retained = Path(history["b-overflow"]["path"])
+    original_bytes = retained.read_bytes()
+    if failure == "history":
+        # Change the retained file concurrently after the digest snapshot.
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(retained.write_bytes, b"HOSTILE").result(timeout=5)
+    render = mcp._response_line
+
+    def observed_render(frame):
+        assert frame["id"] == 0
+        if failure == "render":
+            raise OSError(errno.EIO, "HOSTILE")
+        return render(frame)
+
+    monkeypatch.setattr(mcp, "_response_line", observed_render)
+    if failure == "render":
+        with pytest.raises(OSError, match="HOSTILE"):
+            reader.preview_inbox(options, history.values(), target)
+        assert not commits
+    else:
+        preview = reader.preview_inbox(options, history.values(), target)
+        assert commits and all(pager is commits[0] for pager in commits)
+        if failure == "missing":
+            assert preview is None
+        else:
+            raw, restart = preview
+            assert restart is planned
+            page = json.loads(json.loads(raw)["result"]["content"][0]["text"])
+            assert [row["message"]["message_id"] for row in page["messages"]] == [target]
+            assert page["messages"][0]["message"]["body"] == "h" * 61000
+            assert page["next_after"] == target and page["remaining"] == 1
+    assert options == original_options
+    assert reader._pager is live and state() == before
+    assert reader.returned == returned and reader.inbox_pager == mode
+    assert not delivery.exists()
+    assert assembled and reader.note_returned not in assembled
+    # The guard must detect a planted implementation committing the live pager.
+    original_preview = pager_module.InboxPager.preview
+
+    def planted_preview(*args, **kwargs):
+        live.commit()
+
+    monkeypatch.setattr(pager_module.InboxPager, "preview", planted_preview)
+    with pytest.raises(AssertionError, match="preview committed the live pager"):
+        reader.preview_inbox(options, history.values(), target)
+    monkeypatch.setattr(pager_module.InboxPager, "preview", original_preview)
+    monkeypatch.setattr(pager_module.InboxPager, "commit", original_commit)
+    monkeypatch.setattr(mcp, "_response_line", render)
+    if failure == "history":
+        retained.write_bytes(original_bytes)
+    if failure in ("none", "history"):
+        # Compare exact preview wire bytes against a fresh real inbox walk.
+        fresh = connection(root, reader.sender["from"])
+        retry = {"limit": 1} if planned else dict(options)
+        for _ in range(3):
+            result = mcp.handle(fresh, {"jsonrpc": "2.0", "id": 0, "method": "tools/call",
+                                       "params": {"name": "mailbox_inbox", "arguments": retry}})
+            expected = data(result)
+            fresh.record_inbox_page()
+            if any(row["message"]["message_id"] == target for row in expected["messages"]):
+                assert raw == render({"jsonrpc": "2.0", "id": 0, "result": result})
+                break
+            retry["after_message_id"] = expected["next_after"]
+        else:
+            pytest.fail("fresh inbox did not reach the preview target")
+    # A later real response still stages and commits through the live pager.
+    result = call(reader, "mailbox_inbox", {"limit": 1})
+    assert data(result)["messages"][0]["message"]["message_id"] == "a-small"
+    reader.record_inbox_page()
+    reader.record_read()
+    assert delivery.exists()
 
 
 def test_digest_record_retry_identifies_the_failing_reference(bound):

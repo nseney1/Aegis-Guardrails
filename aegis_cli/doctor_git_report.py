@@ -32,6 +32,8 @@ __all__ = [
     'SCRATCH_ACT',
     'SCRATCH_CODES',
     'scratch_refusal',
+    'LIMIT_CODES',
+    'limit_row',
     'location',
     'digest',
     'visible',
@@ -259,11 +261,20 @@ _LIMIT_DETAILS = {
     "scan_capped": "the workspace listing reached its entry cap",
     "depth_capped": "a directory was not measured beyond the scan depth",
 }
+LIMIT_CODES = tuple(_LIMIT_DETAILS)
 _LOCATION_SAMPLES = 3
+
+def limit_row(code, parts):
+    """Build a limit row using the same sentence recognized by grouping."""
+    detail = _LIMIT_DETAILS[code]
+    if parts:
+        shown = location(parts, prefix=detail + " (", suffix=")")
+        detail = f"{detail} ({shown})"
+    return row("disk_walk", "warn", code, INSPECT, detail)
 
 def _limit_code(row):
     code = row.get("code")
-    if (code in ("scan_capped", "depth_capped") and row.get("id") == "disk_walk"
+    if (code in LIMIT_CODES and row.get("id") == "disk_walk"
             and row.get("status") == "warn" and row.get("owner_action") == INSPECT):
         return code
     return None
