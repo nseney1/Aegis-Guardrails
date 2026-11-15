@@ -85,6 +85,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.events": 0,
     "aegis_core.stats": 0,
     "aegis_core.workspace": 0,
+    "aegis_core.rule_lint": 2,
     "aegis_core.rules": 1,
     "aegis_core.rule_inventory": 1,
     "aegis_core.yaml_engine": 1,
