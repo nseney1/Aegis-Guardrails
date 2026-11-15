@@ -224,7 +224,9 @@ def test_no_module_imports_a_private_name_of_redaction(monkeypatch: pytest.Monke
     counted_ast.parse = counted_parse
     monkeypatch.setattr(sys.modules[__name__], "ast", counted_ast)
     assert private_imports(_python_sources()) == []
-    assert 0 < parse_count <= 64, parse_count
+    # Bounds the parse cost of the substring prefilter. Headroom over the 65 files that mention
+    # redaction once gitsafe_policy lands; FLAKE-REDACTION-PARSE-CEILING replaces it with a ratchet.
+    assert 0 < parse_count <= 72, parse_count
 
 
 def test_an_import_of_a_private_redaction_name_is_named_with_its_line():
