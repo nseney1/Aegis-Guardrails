@@ -2102,6 +2102,14 @@ PROOF_REGISTRATION_GROUPS = {
         ((0,), 'Fixture chdir operation; environment, path or restoration API outside the module-attribute census. The control enters its temporary directory and pins a missing workspace to verify the fixed model_workspace_unavailable JSON refusal.'),
     ('tests/unit/cli/test_cli_team_queue.py', 'test_queue_refuses_invalid_raw_workspace_before_resolution', 'fixture', 'monkeypatch.chdir', False):
         ((0,), 'BL-16a round 7 runs the raw-workspace refusal table in process; the fixture enters its own temporary workspace cwd and pytest restores it; no module attribute is patched.'),
+    ('tests/unit/cli/test_cli_team_queue.py', 'test_cli_path_byte_goldens', 'fixture', 'monkeypatch.setenv', False):
+        ((0, 1, 2), 'BL-16g round-4 C2 pins terminal width and color for byte goldens (COLUMNS=80, NO_COLOR=1, PYTHON_COLORS=0; clears FORCE_COLOR); pytest restores the environment. No shared process-module attribute is patched.'),
+    ('tests/unit/cli/test_cli_team_queue.py', 'test_cli_path_byte_goldens', 'fixture', 'monkeypatch.delenv', False):
+        ((0,), 'BL-16g round-4 C2 pins terminal width and color for byte goldens (COLUMNS=80, NO_COLOR=1, PYTHON_COLORS=0; clears FORCE_COLOR); pytest restores the environment. No shared process-module attribute is patched.'),
+    ('tests/unit/cli/test_cli_team_queue.py', 'test_public_operation_byte_goldens', 'fixture', 'monkeypatch.setenv', False):
+        ((0, 1, 2), 'BL-16g round-4 C2 pins terminal width and color for byte goldens (COLUMNS=80, NO_COLOR=1, PYTHON_COLORS=0; clears FORCE_COLOR); pytest restores the environment. No shared process-module attribute is patched.'),
+    ('tests/unit/cli/test_cli_team_queue.py', 'test_public_operation_byte_goldens', 'fixture', 'monkeypatch.delenv', False):
+        ((0,), 'BL-16g round-4 C2 pins terminal width and color for byte goldens (COLUMNS=80, NO_COLOR=1, PYTHON_COLORS=0; clears FORCE_COLOR); pytest restores the environment. No shared process-module attribute is patched.'),
     ('tests/unit/mcp/test_mcp_queue_role.py', 'owner_factory.create', 'fixture', 'monkeypatch.setenv', False):
         ((0, 1), 'BL-16c sets HOME and USERPROFILE to the test-owned account fixture for hermetic queue/profile IO; monkeypatch restores both. Product authority still comes from the separately patched account-database boundary.'),
     ('tests/unit/mcp/test_mcp_queue_role.py', 'test_ordinary_connection_has_no_grant', 'fixture', 'monkeypatch.setenv', False):
