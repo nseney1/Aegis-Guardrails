@@ -61,6 +61,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.gitops_holder": 0,
     "aegis_core.gitops_rows": 0,
     "aegis_core.gitsafe": 0,
+    "aegis_core.gitsafe_policy": 0,
     "aegis_core.gitsafe_run": 0,
     "aegis_core.team_claims": 2,
     "aegis_core.team_git": 0,
@@ -120,6 +121,8 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.manager_config": 2,
     # Shared manager decision/report service over the pinned activation service.
     "aegis_core.manager": 3,
+    "aegis_core.guidance_grammar": 0,
+    "aegis_core.guidance_projection": 0,
     # Host hook payload normalization (stdlib only).
     "aegis_core.hook_events": 1,
     # Pure AST inspection of lane declarations and pytest configuration.
