@@ -1272,19 +1272,69 @@ def test_lint_oversized_rule_is_per_file_and_valid_rules_keep_their_results(tmp_
     assert lint.lint_workspace(root)[0].ok
 
 
-def test_lint_writer_maximum_body_exposes_a_per_file_cap_mismatch(tmp_path):
+def test_lint_writer_maximum_body_fits_the_loader_file_cap(tmp_path):
     from aegis_core.lifecycle.creation import MAX_RULE_BODY_BYTES, create_rule
+    from aegis_core.packs import MAX_RULE_BYTES
 
     root = lint_root(tmp_path)
+    body = "## Do\nUse the ${SLOT.TEST_RUNNER} capability.\n\n## Evidence\n"
+    body += "x" * (MAX_RULE_BODY_BYTES - len(body) - 1) + "\n"
     path = create_rule("trap", "A maximum body is accepted by the writer.",
                        id_override="large-created", target_paths=["src/**"], workspace=root,
-                       body="x" * (MAX_RULE_BODY_BYTES - 1) + "\n")
-    assert path.stat().st_size > lint.MAX_RULE_BYTES
+                       body=body)
+    assert MAX_RULE_BODY_BYTES < path.stat().st_size <= MAX_RULE_BYTES
     results = lint.lint_workspace(root)
     assert len(results) == 2
     assert next(result for result in results if result.path == LINT_PATH).ok
     large = next(result for result in results if result.path.endswith("large-created.md"))
-    assert lint_codes(large) == {"too_large"}
+    assert large.ok
+
+
+@pytest.mark.parametrize("extra_bytes", [0, 1])
+def test_lint_in_memory_size_boundary_matches_packs_concurrently(extra_bytes):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.packs import MAX_RULE_BYTES
+
+    data = lint_bytes() + b"\n## Evidence\n"
+    data += b"x" * (MAX_RULE_BYTES + extra_bytes - len(data))
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(lint.lint_rule, data, LINT_PATH) for _ in range(3)]
+        results = [future.result(timeout=10) for future in futures]
+    assert results == [results[0]] * 3
+    if extra_bytes:
+        assert lint_codes(results[0]) == {"too_large"}
+    else:
+        assert results[0].ok
+    assert lint.lint_rule(lint_bytes(), LINT_PATH).ok
+
+
+@pytest.mark.parametrize("extra_bytes", [0, 1])
+@pytest.mark.parametrize("selection", ["all", "single", "neighbors"])
+def test_lint_workspace_size_boundary_matches_pack_export(tmp_path, extra_bytes, selection):
+    from aegis_core.packs import MAX_RULE_BYTES, PackError, build_pack
+    from aegis_core.rules import load_rules
+
+    root = lint_root(tmp_path)
+    path = ".aegis/rules/traps/boundary.md"
+    data = lint_bytes().replace(b"id: sample", b"id: boundary") + b"\n## Evidence\n"
+    data += b"x" * (MAX_RULE_BYTES + extra_bytes - len(data))
+    (root / path).write_bytes(data)
+    rules = load_rules(root).rules
+    if extra_bytes:
+        with pytest.raises(PackError, match=rf"{MAX_RULE_BYTES + 1} bytes exceeds the {MAX_RULE_BYTES} byte limit"):
+            build_pack(rules)
+    else:
+        assert len(build_pack(rules)["rules"]) == 2
+    paths = [] if selection == "all" else ([path] if selection == "single" else [path, LINT_PATH])
+    for _ in range(2):
+        results = {result.path: result for result in lint.lint_workspace(root, paths)}
+        assert len(results) == (1 if selection == "single" else 2)
+        if extra_bytes:
+            assert lint_codes(results[path]) == {"too_large"}
+        else:
+            assert results[path].ok
+        if selection != "single":
+            assert results[LINT_PATH].ok
 
 
 def test_lint_valid_rule_bytes_still_obey_the_aggregate_parser_budget(tmp_path, monkeypatch):
@@ -1952,7 +2002,7 @@ def test_lint_argon_quote_and_fence_inversion_inputs_are_checked(body):
 
 
 @pytest.mark.parametrize("path", [".aegis/rules/README.md", ".aegis/rules/sample.md"])
-@pytest.mark.parametrize("body_size", [65540, 65546])
+@pytest.mark.parametrize("body_size", [lint.MAX_RULE_BYTES + 4, lint.MAX_RULE_BYTES + 10])
 @pytest.mark.parametrize("selected", ["all", "trap", "note"])
 def test_lint_argon_oversized_empty_frontmatter_is_documentation(tmp_path, path, body_size, selected):
     from aegis_core.rules import load_rules
@@ -2114,7 +2164,7 @@ def test_lint_addendum_truncated_comment_delimiters_keep_duplicates(tmp_path, va
     root = lint_root(tmp_path)
     header = b"---\ntitle: Notes\n# "
     if variant == "argon":
-        data = header + b"a" * (65536 - len(header) - 4) + b"\n---" + b"x: 1\n"
+        data = header + b"a" * (lint.MAX_RULE_BYTES - len(header) - 4) + b"\n---" + b"x: 1\n"
     else:
         data = header + b"x" * (lint.MAX_RULE_BYTES - 23) + b"\n---invalid\n"
     path = ".aegis/rules/sample.md"
@@ -2139,7 +2189,7 @@ def test_lint_addendum_headerless_oversized_files_keep_neighbor_results(tmp_path
     root = lint_root(tmp_path)
     target = root / path
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(signature + b"x" * 65537)
+    target.write_bytes(signature + b"x" * (lint.MAX_RULE_BYTES + 1))
     records = load_rules(root).rules
     monkeypatch.setattr(lint, "MAX_RULE_TOTAL", lint.MAX_RULE_BYTES)
     results = lint.lint_workspace(root)
