@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+import aegis_core.rule_lint as lint
+
 from aegis_cli.init import install_rules
 from aegis_core.lifecycle.constants import PROTECTED_RULES
 from aegis_core.yaml_engine.frontmatter import parse_rule_frontmatter
@@ -215,3 +217,1987 @@ def test_optional_import_guard_tables_match_pyproject():
     assert deps == set(), "Aegis has zero runtime dependencies"
     assert _table(oracle, "Required Dependencies") <= deps
     assert not _table(oracle, "Known Optional Dependencies") & deps
+
+
+# Mining lint tests use final accepted-rule bytes, not proposal Markdown.
+def lint_bytes(do="Use the ${SLOT.TEST_RUNNER} capability.", *, extra="", body=None):
+    text = ("---\nid: sample\ntype: trap\nenforcement: advisory\n"
+            "hypothesis: A bounded check prevents repeated mistakes.\n"
+            "prediction: Invalid changes are caught before landing.\n"
+            "target_paths: [src/**]\n" + extra + "---\n" +
+            (body if body is not None else "## Do\n" + do + "\n"))
+    return text.encode("utf-8")
+
+
+LINT_PATH = ".aegis/rules/traps/sample.md"
+
+
+def lint_codes(result):
+    return {finding.code for finding in result.findings}
+
+
+@pytest.mark.parametrize("data", [b"", b"---\nid: sample\n", b"\xff", b"---\nid: other\n---\n"])
+def test_lint_loader_refuses_invalid_final_bytes_without_echo(data):
+    from aegis_core.rule_lint import lint_rule
+
+    result = lint_rule(data, LINT_PATH)
+    assert not result.ok
+    assert "loader" in lint_codes(result)
+    assert all("other" not in finding.message for finding in result.findings)
+
+
+@pytest.mark.parametrize("extra", ["paths: [src/**]\n", "triggers: 42\n", "expired_at: 2000-01-01\n"])
+def test_lint_loader_rejects_aliases_derived_and_expired_fields(extra):
+    from aegis_core.rule_lint import lint_rule
+
+    assert "loader" in lint_codes(lint_rule(lint_bytes(extra=extra), LINT_PATH))
+
+
+@pytest.mark.parametrize("path", ["../sample.md", ".aegis/rules/traps/../sample.md", "traps/sample.md",
+                                  ".aegis/rules/traps/other.md", ".aegis/rules/invariants/sample.md"])
+def test_lint_final_identity_and_destination_are_checked(path):
+    from aegis_core.rule_lint import lint_rule
+
+    assert "loader" in lint_codes(lint_rule(lint_bytes(), path))
+
+
+def test_lint_size_limit_precedes_loader(monkeypatch):
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("oversize input reached parser")
+
+    monkeypatch.setattr(lint, "load_rules", forbidden)
+    result = lint.lint_rule(b"x" * (lint.MAX_RULE_BYTES + 1), LINT_PATH)
+    assert lint_codes(result) == {"too_large"}
+    assert not result.ok
+
+
+@pytest.mark.parametrize("field", ["hypothesis", "prediction"])
+def test_lint_requires_content_fields(field):
+    from aegis_core.rule_lint import lint_rule
+
+    data = re.sub(rb"(?m)^" + field.encode() + rb":.*\n", b"", lint_bytes())
+    assert "required_content" in lint_codes(lint_rule(data, LINT_PATH))
+
+
+@pytest.mark.parametrize("body", ["Do this.\n", "## Do\n\n## Evidence\nNot guidance.\n",
+                                  "## Do\n" + "\n" * 8 + "Too late.\n"])
+def test_lint_requires_a_do_instruction_inside_detail(body):
+    from aegis_core.rule_lint import lint_rule
+
+    assert "do_window" in lint_codes(lint_rule(lint_bytes(body=body), LINT_PATH))
+
+
+def test_lint_does_not_treat_the_do_heading_as_its_instruction():
+    from aegis_core.rule_lint import lint_rule
+
+    assert "do_window" in lint_codes(lint_rule(lint_bytes(do="x" * 301), LINT_PATH))
+
+
+def test_lint_checks_full_slots_and_renders_before_window_cut():
+    from aegis_core.rule_lint import lint_rule
+
+    # The placeholder crosses source character 300 but its rendered Do fits every profile.
+    do = "Keep " + "x" * 272 + " ${SLOT.MODEL_FAST}"
+    detail = "## Do " + do
+    assert detail.index("${SLOT.") < 300 < len(detail)
+    assert lint_rule(lint_bytes(do=do), LINT_PATH).ok
+    assert "unknown_slot" in lint_codes(lint_rule(lint_bytes(do="x" * 301 + " ${SLOT.TOOL_SHELL}"), LINT_PATH))
+    assert "do_window" in lint_codes(lint_rule(lint_bytes(do="x" * 290 + " ${SLOT.TEST_RUNNER}"), LINT_PATH))
+
+
+@pytest.mark.parametrize("do", ["Use ${SLOT.TOOL_SHELL}.", "Use ${SLOT.BAD", "Use ${SLOT.}."])
+def test_lint_unknown_and_unclosed_slots_refuse(do):
+    from aegis_core.rule_lint import lint_rule
+
+    assert "unknown_slot" in lint_codes(lint_rule(lint_bytes(do=do), LINT_PATH))
+
+
+def test_lint_vendor_and_command_suggestions_are_independent():
+    from aegis_core.rule_lint import lint_rule
+
+    result = lint_rule(lint_bytes(do="Run `Bash` with `pytest -q`."), LINT_PATH)
+    assert not result.ok
+    assert {"vendor_name", "concrete_command"} <= lint_codes(result)
+    suggestions = {slot for finding in result.findings for slot in finding.suggestions}
+    assert {"${SLOT.TOOL_RUN}", "${SLOT.TEST_RUNNER}"} <= suggestions
+
+
+@pytest.mark.parametrize("do,slot", [("Use the `apply_patch` tool.", "TOOL_EDIT"),
+                                      ("Use `haiku`.", "MODEL_FAST"),
+                                      ("Run `python3.9 -m pytest -x`.", "TEST_RUNNER"),
+                                      ("Run `ruff check src`.", "LINTER"),
+                                      ("Run `mypy src`.", "TYPE_CHECKER"),
+                                      ("Run `python -m build`.", "BUILD_TOOL")])
+def test_lint_known_capabilities_suggest_slots(do, slot):
+    from aegis_core.rule_lint import lint_rule
+
+    result = lint_rule(lint_bytes(do=do), LINT_PATH)
+    assert not result.ok
+    assert "${SLOT." + slot + "}" in {s for finding in result.findings for s in finding.suggestions}
+
+
+def test_lint_plain_vendor_words_are_allowed_and_unknown_commands_only_warn():
+    from aegis_core.rule_lint import lint_rule
+
+    result = lint_rule(lint_bytes(do="Bash is a shell; run `bespoke-check --strict`."), LINT_PATH)
+    assert result.ok
+    assert "unmapped_command" in lint_codes(result)
+    assert "vendor_name" not in lint_codes(result)
+
+
+def test_lint_configured_commands_and_role_mappings_are_never_executed():
+    from aegis_core.rule_lint import lint_rule
+
+    result = lint_rule(lint_bytes(do="Run `hatch run checks --strict`."), LINT_PATH,
+                       command_slots={"TEST_RUNNER": "hatch run checks"})
+    assert not result.ok
+    assert "concrete_command" in lint_codes(result)
+
+
+def test_lint_shell_fences_are_examples_but_evidence_and_enforcement_are_data():
+    from aegis_core.rule_lint import lint_rule
+
+    body = "## Do\nUse a neutral capability.\n```sh\npytest -q\n```\n"
+    assert "concrete_command" in lint_codes(lint_rule(lint_bytes(body=body), LINT_PATH))
+    body = "## Do\nUse a neutral capability.\n## Evidence\n`Bash` `pytest -q` ${SLOT.UNKNOWN}\n"
+    result = lint_rule(lint_bytes(body=body, extra="forbid_ast:\n  calls: ['${SLOT.UNKNOWN}', Bash]\n"), LINT_PATH)
+    assert result.ok
+    assert not {"vendor_name", "concrete_command", "unknown_slot"} & lint_codes(result)
+
+
+@pytest.mark.parametrize("spec,message", [({}, "forbid_ast declares no patterns"),
+                                          ({"typo": ["eval"]}, "unknown forbid_ast key 'typo' (allowed: imports, calls, decorators)"),
+                                          ({"calls": "eval"}, "forbid_ast.calls must be a list of non-empty strings, not str"),
+                                          ({"calls": ["eval"]}, None)])
+def test_lint_public_validator_preserves_the_existing_grammar_and_messages(spec, message):
+    from aegis_core.verification.forbid_ast_spec import forbid_ast_spec_error
+
+    assert forbid_ast_spec_error(spec) == message
+
+
+def test_lint_validator_extraction_preserves_runner_compatibility_names():
+    from aegis_core.verification.forbid_ast_spec import CALL_SPEC_KEYS, forbid_ast_spec_error
+    from aegis_core.verification.runner import _CALL_SPEC_KEYS, _forbid_ast_spec_error
+
+    assert _CALL_SPEC_KEYS is CALL_SPEC_KEYS
+    assert _forbid_ast_spec_error is forbid_ast_spec_error
+    malformed = {"calls": [{"name": "eval", "where": {"#0": {"absent": "wrong"}}}]}
+    for _ in range(2):
+        assert forbid_ast_spec_error(malformed) == "forbid_ast.calls[0].where.#0: absent needs true or false"
+
+
+@pytest.mark.parametrize("extra", ["", "forbid_ast: {}\n", "forbid_ast:\n  typo: [eval]\n"])
+def test_lint_paper_gates_refuse_but_unchanged_amendment_only_warns(extra):
+    from aegis_core.rule_lint import lint_rule
+    from aegis_core.rules import Rule
+
+    data = lint_bytes(extra=extra).replace(b"type: trap", b"type: invariant").replace(b"enforcement: advisory", b"enforcement: gate")
+    path = ".aegis/rules/invariants/sample.md"
+    result = lint_rule(data, path)
+    assert "paper_gate" in lint_codes(result) and not result.ok
+    meta, _body = parse_rule_frontmatter(data.decode())
+    original = Rule("sample", path, "invariant", meta, "", "old-digest")
+    amended = lint_rule(data, path, original=original)
+    assert amended.ok
+    assert all(f.severity == "warning" for f in amended.findings if f.check == 5)
+    changed = Rule("sample", path, "trap", meta, "", "old-digest")
+    assert not lint_rule(data, path, original=changed).ok
+
+
+def test_lint_target_paths_are_warning_only_and_simulation_is_explicitly_deferred():
+    from aegis_core.rule_lint import lint_rule
+
+    data = lint_bytes().replace(b"target_paths: [src/**]\n", b"")
+    result = lint_rule(data, LINT_PATH)
+    assert result.ok and "target_paths" in lint_codes(result)
+    simulation = next(f for f in result.findings if f.check == 7)
+    assert simulation.message == "not evaluated: pending M2C-SCAN-SIM"
+
+
+def test_lint_gate_dry_run_counts_real_ast_hits_without_running_sources():
+    from aegis_core.rule_lint import lint_rule
+
+    data = lint_bytes(extra="forbid_ast:\n  calls: [eval]\n")
+    result = lint_rule(data, LINT_PATH, sources={"src/a.py": b"eval('1')\neval('2')\neval('3')\n",
+                                               "tests/test_a.py": b"eval('4')\n"})
+    assert result.ok and result.gate_hits == 3 and result.checked_files == 1
+    assert "gate_hits" in lint_codes(result)
+    broken = lint_rule(data, LINT_PATH, sources={"src/a.py": b"def ("})
+    assert broken.ok and broken.gate_hits is None and "source_unavailable" in lint_codes(broken)
+
+
+def test_lint_source_limits_precede_ast_parsing(monkeypatch):
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("oversize source reached AST parser")
+
+    monkeypatch.setattr(lint, "extract_normalized_ast", forbidden)
+    result = lint.lint_rule(lint_bytes(extra="forbid_ast:\n  calls: [eval]\n"), LINT_PATH,
+                            sources={"src/a.py": b"x" * (lint.MAX_SOURCE_BYTES + 1)})
+    assert result.gate_hits is None and "source_limit" in lint_codes(result)
+
+
+def lint_root(tmp_path):
+    from aegis_core.rule_lint import descriptor_supported
+
+    if not descriptor_supported():
+        pytest.skip("descriptor-relative no-follow reads unavailable")
+    root = tmp_path.resolve()
+    path = root / LINT_PATH
+    path.parent.mkdir(parents=True)
+    path.write_bytes(lint_bytes())
+    return root
+
+
+def test_lint_workspace_unsupported_platform_is_reported(monkeypatch, tmp_path):
+
+    monkeypatch.setattr(lint, "descriptor_supported", lambda: False)
+    results = lint.lint_workspace(tmp_path)
+    assert len(results) == 1 and lint_codes(results[0]) == {"unsupported"}
+
+
+def test_lint_workspace_and_cli_are_report_only_and_retry_cleanly(tmp_path, capsys):
+    from aegis_core.rule_lint import lint_workspace
+    from aegis_cli.rule import RuleCommand, run_rule
+    import argparse
+    import json
+
+    root = lint_root(tmp_path)
+    path = root / LINT_PATH
+    path.write_bytes(lint_bytes(do="Use `Bash`."))
+    before = {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    for _ in range(2):
+        assert "vendor_name" in lint_codes(lint_workspace(root)[0])
+        parser = argparse.ArgumentParser()
+        RuleCommand().configure_parser(parser)
+        args = parser.parse_args(["lint", LINT_PATH, "--json", "--workspace", str(root)])
+        assert run_rule(args) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["report_only"] is True and payload["results"][0]["ok"] is False
+    after = {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    assert before == after
+
+
+@pytest.mark.parametrize("selection,code", [("../secret.md", "invalid_path"),
+                                           (".aegis/rules/traps/missing.md", "missing")])
+def test_lint_workspace_path_refusals_have_fixed_codes(tmp_path, selection, code):
+    from aegis_core.rule_lint import lint_workspace
+
+    root = lint_root(tmp_path)
+    result = lint_workspace(root, [selection])[0]
+    assert lint_codes(result) == {code}
+
+
+def test_lint_workspace_symlinks_are_refused(tmp_path):
+    from aegis_core.rule_lint import lint_workspace
+
+    root = lint_root(tmp_path / "root")
+    target = tmp_path / "outside"
+    target.mkdir()
+    try:
+        (root / ".aegis/rules/traps/link.md").symlink_to(target)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+    assert any("unsafe" in lint_codes(result) for result in lint_workspace(root))
+
+
+def test_lint_reads_remain_bound_during_ancestor_replacement(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    root = lint_root(tmp_path / "root")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "sample.md").write_bytes(lint_bytes(do="Run `Bash`."))
+    real_confined = lint.confined_file
+    swapped = []
+
+    @contextmanager
+    def replace_ancestor(workspace, parts):
+        with real_confined(workspace, parts) as reader:
+            if list(parts) == LINT_PATH.split("/") and not swapped:
+                original = root / ".aegis/rules/traps"
+                original.rename(original.with_name("saved"))
+                try:
+                    original.symlink_to(outside, target_is_directory=True)
+                except (OSError, NotImplementedError):
+                    pytest.skip("directory symlinks unavailable")
+                swapped.append(True)
+            yield reader
+
+    monkeypatch.setattr(lint, "confined_file", replace_ancestor)
+    results = lint.lint_workspace(root, [LINT_PATH])
+    assert swapped and lint_codes(results[0]) == {"unsafe"}
+    assert "vendor_name" not in lint_codes(results[0])
+
+
+@pytest.mark.parametrize("failure", ["read", "stat", "open"])
+def test_lint_releases_public_reader_on_every_failure(tmp_path, monkeypatch, failure):
+    from contextlib import contextmanager
+
+    root = lint_root(tmp_path)
+    real_confined = lint.confined_file
+    active = []
+
+    class Reader:
+        def __init__(self, reader):
+            self.reader = reader
+
+        def parent_stat(self):
+            if failure == "stat":
+                raise OSError("UNTRUSTED-DIAGNOSTIC")
+            return self.reader.parent_stat()
+
+        def read_bytes(self, limit):
+            raise OSError("UNTRUSTED-DIAGNOSTIC")
+
+    @contextmanager
+    def denied(workspace, parts):
+        if failure == "open":
+            raise PermissionError("UNTRUSTED-DIAGNOSTIC")
+        with real_confined(workspace, parts) as reader:
+            active.append(True)
+            try:
+                yield Reader(reader)
+            finally:
+                active.pop()
+
+    monkeypatch.setattr(lint, "confined_file", denied)
+    results = lint.lint_workspace(root, [LINT_PATH])
+    assert lint_codes(results[0]) == {"io"} and not active
+    assert all("UNTRUSTED" not in f.message for f in results[0].findings)
+
+
+def test_lint_result_labels_are_canonicalized_redacted_then_truncated():
+    from aegis_core.rule_lint import display_text
+
+    secret = "ｇｈｐ＿" + "Ａ" * 24
+    shown = display_text("\x1b[31m" + secret + "\u202e suffix " + "x" * 400)
+    assert "ghp_" not in shown and "Ａ" not in shown
+    assert "[REDACTED_VCS_TOKEN]" in shown
+    assert "\x1b" not in shown and "\u202e" not in shown and len(shown) <= 240
+
+
+def test_lint_malformed_native_source_is_a_fixed_warning():
+    from aegis_core.rule_lint import lint_rule
+
+    result = lint_rule(lint_bytes(extra="forbid_ast:\n  calls: [eval]\n"), LINT_PATH,
+                       sources={"src/a.js": b"const x = 'unterminated"})
+    assert result.ok and result.gate_hits is None
+    assert "source_unavailable" in lint_codes(result)
+
+
+def test_lint_malformed_command_example_warns_without_echoing_it():
+    from aegis_core.rule_lint import lint_rule
+
+    result = lint_rule(lint_bytes(do='Run `custom "secret-argument`.'), LINT_PATH)
+    assert result.ok and "unmapped_command" in lint_codes(result)
+    assert all("secret-argument" not in finding.message for finding in result.findings)
+
+
+def test_lint_parallel_dry_runs_are_pure_and_repeatable():
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.rule_lint import lint_rule
+
+    data = lint_bytes(extra="forbid_ast:\n  calls: [eval]\n")
+    sources = {"src/a.py": b"eval('1')\n"}
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(lint_rule, data, LINT_PATH, sources=sources) for _ in range(6)]
+        results = [future.result(timeout=5) for future in futures]
+    assert all(result == results[0] for result in results)
+    assert results[0].gate_hits == 1 and sources == {"src/a.py": b"eval('1')\n"}
+
+
+def test_lint_candidate_size_is_refused_before_parsing(tmp_path, monkeypatch):
+    from aegis_core.rules import load_rules
+    from aegis_core.yaml_engine.frontmatter import split_frontmatter
+
+    root = lint_root(tmp_path)
+    (root / LINT_PATH).write_bytes(b"x" * (lint.MAX_RULE_BYTES + 1))
+
+    def bounded_load(workspace, **kwargs):
+        for entry in kwargs["inventory"].entries:
+            assert len(entry.content) <= lint.MAX_RULE_BYTES
+            assert split_frontmatter(entry.content.decode("utf-8-sig"))[0] == "none"
+        return load_rules(workspace, **kwargs)
+
+    # The public loader may classify a verified header-free prefix, without YAML.
+    monkeypatch.setattr(lint, "load_rules", bounded_load)
+    assert lint_codes(lint.lint_workspace(root, [LINT_PATH])[0]) == {"too_large"}
+
+
+def test_lint_parent_change_during_read_is_refused_and_retry_is_clean(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    root = lint_root(tmp_path)
+    path = root / LINT_PATH
+    real_confined = lint.confined_file
+    changed = []
+
+    class Reader:
+        def __init__(self, reader):
+            self.reader = reader
+
+        def parent_stat(self):
+            return self.reader.parent_stat()
+
+        def read_bytes(self, limit):
+            data = self.reader.read_bytes(limit)
+            if not changed:
+                replacement = path.with_suffix(".new")
+                replacement.write_bytes(lint_bytes())
+                replacement.replace(path)
+                changed.append(True)
+            return data
+
+    @contextmanager
+    def replacing(workspace, parts):
+        with real_confined(workspace, parts) as reader:
+            yield Reader(reader)
+
+    monkeypatch.setattr(lint, "confined_file", replacing)
+    assert lint_codes(lint.lint_workspace(root, [LINT_PATH])[0]) == {"changed"}
+    assert lint.lint_workspace(root, [LINT_PATH])[0].ok
+
+
+def test_lint_entry_quota_and_selection_quota_refuse_before_parsing(tmp_path, monkeypatch):
+
+    root = lint_root(tmp_path)
+    monkeypatch.setattr(lint, "MAX_ENTRIES", 0)
+    assert lint_codes(lint.lint_workspace(root)[0]) == {"too_large"}
+    assert lint_codes(lint.lint_workspace(root, [LINT_PATH] * (lint.MAX_SELECTIONS + 1))[0]) == {"invalid_input"}
+
+
+def test_lint_selected_directory_and_absolute_path_are_supported(tmp_path):
+    from aegis_core.rule_lint import lint_workspace
+
+    root = lint_root(tmp_path)
+    assert lint_workspace(root, [".aegis/rules/traps"])[0].ok
+    assert lint_workspace(root, [str(root / LINT_PATH)])[0].ok
+
+
+def test_lint_workspace_gate_dry_run_reads_descriptor_snapshots(tmp_path):
+    from aegis_core.rule_lint import lint_workspace
+
+    root = lint_root(tmp_path)
+    (root / LINT_PATH).write_bytes(lint_bytes(extra="forbid_ast:\n  calls: [eval]\n"))
+    (root / "src").mkdir()
+    (root / "src/a.py").write_bytes(b"eval('1')\neval('2')\n")
+    result = lint_workspace(root)[0]
+    assert result.ok and result.gate_hits == 2
+
+
+def test_lint_cli_workspace_refusal_is_report_only_and_does_not_echo(capsys):
+    import argparse
+    import json
+    from aegis_cli.rule import RuleCommand, run_rule
+
+    parser = argparse.ArgumentParser()
+    RuleCommand().configure_parser(parser)
+    args = parser.parse_args(["lint", "--json", "--workspace", "\x00UNTRUSTED-PATH"])
+    assert run_rule(args) == 0
+    text = capsys.readouterr().out
+    assert "UNTRUSTED-PATH" not in text
+    assert json.loads(text)["results"][0]["findings"][0]["code"] == "workspace"
+
+
+def test_lint_evidence_heading_inside_a_fence_does_not_hide_guidance():
+    from aegis_core.rule_lint import lint_rule
+
+    body = "## Do\nUse a neutral capability.\n```sh\n## Evidence\npytest -q\n```\n"
+    result = lint_rule(lint_bytes(body=body), LINT_PATH)
+    assert not result.ok and "concrete_command" in lint_codes(result)
+    fake_do = "```markdown\n## Do\nA fenced example is not the actual instruction.\n```\n"
+    assert "do_window" in lint_codes(lint_rule(lint_bytes(body=fake_do), LINT_PATH))
+
+
+def test_lint_inventory_entry_budget_is_shared_across_selections(tmp_path, monkeypatch):
+
+    root = lint_root(tmp_path)
+    (root / ".aegis/rules/traps/second.md").write_bytes(lint_bytes())
+    monkeypatch.setattr(lint, "MAX_ENTRIES", 1)
+    results = lint.lint_workspace(root, [".aegis/rules/traps", ".aegis/rules/traps"])
+    assert lint_codes(results[0]) == {"too_large"}
+
+
+def test_lint_zero_width_characters_cannot_split_a_secret_before_redaction():
+    from aegis_core.rule_lint import display_text
+
+    secret = "g\u200bhp_" + "A" * 24
+    assert display_text(secret) == "[REDACTED_VCS_TOKEN]"
+
+
+@pytest.mark.parametrize("folder", [".github", "build", "dist", "node_modules", ".venv"])
+def test_lint_hidden_project_source_directories_are_included_in_gate_dry_run(tmp_path, folder):
+    from aegis_core.rule_lint import lint_workspace
+
+    root = lint_root(tmp_path)
+    data = lint_bytes(extra="forbid_ast:\n  calls: [eval]\n").replace(b"src/**", (folder + "/**").encode())
+    (root / LINT_PATH).write_bytes(data)
+    (root / folder).mkdir()
+    (root / folder / "check.py").write_bytes(b"eval('1')\n")
+    assert lint_workspace(root)[0].gate_hits == 1
+
+
+@pytest.mark.parametrize("fence", ["~~~", "````"])
+def test_lint_all_markdown_shell_fence_forms_check_commands(fence):
+    from aegis_core.rule_lint import lint_rule
+
+    body = "## Do\nUse a neutral capability.\n" + fence + "sh\npytest -q\n" + fence + "\n"
+    assert "concrete_command" in lint_codes(lint_rule(lint_bytes(body=body), LINT_PATH))
+
+
+@pytest.mark.parametrize("body", ["# Do\nAn instruction under the wrong heading.\n",
+                                  "    ## Do\n    An indented code example.\n"])
+def test_lint_do_requires_the_actual_level_two_markdown_heading(body):
+    from aegis_core.rule_lint import lint_rule
+
+    assert "do_window" in lint_codes(lint_rule(lint_bytes(body=body), LINT_PATH))
+
+
+@pytest.mark.parametrize("body", ["## Do\nRun `customcheck`.\n",
+                                  "## Do\nUse the project check.\n```sh\ncustomcheck\n```\n"])
+def test_lint_single_word_unknown_executables_warn(body):
+    from aegis_core.rule_lint import lint_rule
+
+    result = lint_rule(lint_bytes(body=body), LINT_PATH)
+    assert result.ok and "unmapped_command" in lint_codes(result)
+
+
+def test_lint_public_exports_are_explicit_and_resolvable():
+    from aegis_core.verification import forbid_ast_spec
+
+    expected = {"LintFinding", "LintResult", "display_text", "lint_rule", "lint_workspace",
+                "descriptor_supported", "MAX_RULE_BYTES", "MAX_RULES", "MAX_RULE_TOTAL",
+                "MAX_SOURCE_BYTES", "MAX_SOURCE_FILES", "MAX_SOURCE_TOTAL", "MAX_ENTRIES",
+                "MAX_SELECTIONS"}
+    assert set(lint.__all__) == expected
+    assert all(hasattr(lint, name) for name in lint.__all__)
+    assert set(forbid_ast_spec.__all__) == {"CALL_SPEC_KEYS", "forbid_ast_spec_error"}
+    assert all(hasattr(forbid_ast_spec, name) for name in forbid_ast_spec.__all__)
+
+
+def test_lint_uses_public_inventory_once_for_overlapping_selections(tmp_path, monkeypatch):
+    from aegis_core.rule_inventory import inventory_rules
+
+    root = lint_root(tmp_path)
+    calls = []
+
+    def capture(workspace):
+        calls.append(workspace)
+        return inventory_rules(workspace)
+
+    monkeypatch.setattr(lint, "inventory_rules", capture)
+    results = lint.lint_workspace(root, [".aegis/rules/traps", LINT_PATH])
+    assert len(results) == 1 and results[0].ok
+    assert calls == [str(root)]
+
+
+def test_lint_missing_workspace_has_a_fixed_refusal(tmp_path):
+    if not lint.descriptor_supported():
+        pytest.skip("descriptor-relative no-follow reads unavailable")
+    assert lint_codes(lint.lint_workspace(tmp_path / "missing")[0]) == {"missing"}
+
+
+@pytest.mark.parametrize("operation,code", [("validate", "unsafe"), ("read", "changed"), ("list", "changed")])
+def test_lint_inventory_failures_do_not_echo_input_and_retry(tmp_path, monkeypatch, operation, code):
+    from aegis_core.rule_inventory import RuleInventoryError, inventory_rules
+
+    root = lint_root(tmp_path)
+    calls = []
+
+    def capture(workspace):
+        if not calls:
+            calls.append(True)
+            raise RuleInventoryError(operation, "UNTRUSTED-PATH", "UNTRUSTED-DETAIL")
+        return inventory_rules(workspace)
+
+    monkeypatch.setattr(lint, "inventory_rules", capture)
+    result = lint.lint_workspace(root)[0]
+    assert lint_codes(result) == {code}
+    assert "UNTRUSTED" not in repr(result)
+    assert lint.lint_workspace(root)[0].ok
+
+
+def test_lint_candidate_inventory_disagreement_is_refused_then_retried(tmp_path, monkeypatch):
+    from aegis_core.rule_inventory import inventory_rules
+
+    root = lint_root(tmp_path)
+    changed = []
+
+    def capture(workspace):
+        if not changed:
+            (root / LINT_PATH).write_bytes(lint_bytes(do="Use another neutral capability."))
+            changed.append(True)
+        return inventory_rules(workspace)
+
+    monkeypatch.setattr(lint, "inventory_rules", capture)
+    assert lint_codes(lint.lint_workspace(root, [LINT_PATH])[0]) == {"changed"}
+    assert lint.lint_workspace(root, [LINT_PATH])[0].ok
+
+
+def test_lint_source_listing_refusal_is_a_fixed_warning(tmp_path, monkeypatch):
+    root = lint_root(tmp_path)
+    (root / LINT_PATH).write_bytes(lint_bytes(extra="forbid_ast:\n  calls: [eval]\n"))
+
+    def refused(*args, **kwargs):
+        yield root / "src", "UNTRUSTED-DETAIL"
+
+    monkeypatch.setattr(lint, "iter_confined_files", refused)
+    result = lint.lint_workspace(root)[0]
+    assert result.ok and result.gate_hits is None
+    assert "source_unavailable" in lint_codes(result)
+    assert "UNTRUSTED" not in repr(result)
+
+
+def test_lint_decorators_come_from_the_snapshot_when_filename_is_missing():
+    data = lint_bytes(extra="forbid_ast:\n  decorators: [blocked]\n")
+    result = lint.lint_rule(data, LINT_PATH, sources={"src/missing.py": b"@blocked\ndef f(): pass\n"})
+    assert result.gate_hits == 1 and result.checked_files == 1
+
+
+@pytest.mark.parametrize("snapshot,disk,hits", [(b"@blocked\ndef f(): pass\n", b"x = 1\n", 1),
+                                               (b"@blocked\ndef f(): pass\n", b"def (", 1),
+                                               (b"x = 1\n", b"@blocked\ndef f(): pass\n", 0)])
+def test_lint_decorator_snapshot_overrides_existing_disk_bytes(tmp_path, snapshot, disk, hits):
+    import json
+    import subprocess
+    import sys
+
+    path = tmp_path / "src/existing.py"
+    path.parent.mkdir()
+    path.write_bytes(disk)
+    script = ("import json,sys\nfrom aegis_core.rule_lint import lint_rule\n"
+              "data=json.load(sys.stdin)\n"
+              "result=lint_rule(data['rule'].encode(),data['path'],"
+              "sources={'src/existing.py':data['source'].encode()})\n"
+              "print(json.dumps({'hits':result.gate_hits,'checked':result.checked_files}))\n")
+    env = {**os.environ, "PYTHONPATH": str(ROOT)}
+    payload = {"rule": lint_bytes(extra="forbid_ast:\n  decorators: [blocked]\n").decode(),
+               "path": LINT_PATH, "source": snapshot.decode()}
+    process = subprocess.run([sys.executable, "-c", script], cwd=tmp_path, env=env,
+                             input=json.dumps(payload), capture_output=True, text=True, timeout=15)
+    assert process.returncode == 0
+    assert json.loads(process.stdout) == {"hits": hits, "checked": 1}
+    assert path.read_bytes() == disk
+
+
+@pytest.mark.parametrize("path", ["/src/a.py", "../src/a.py", "src/../a.py", "src/\x00a.py",
+                                  "C:/src/a.py", "src\\a.py", "x" * 1025])
+def test_lint_source_keys_must_be_bounded_workspace_relative_paths(path):
+    result = lint.lint_rule(lint_bytes(extra="forbid_ast:\n  decorators: [blocked]\n"), LINT_PATH,
+                            sources={path: b"@blocked\ndef f(): pass\n"})
+    assert result.gate_hits is None and "source_unavailable" in lint_codes(result)
+    assert result.checked_files == 0
+
+
+def test_lint_typed_extraction_failure_is_fixed_and_retry_is_clean(monkeypatch):
+    from aegis_core.ast.policy import ASTExtractionError, extract_normalized_ast
+    calls = []
+
+    def extract(path, **kwargs):
+        if not calls:
+            calls.append(True)
+            raise ASTExtractionError(path, "UNTRUSTED-DETAIL")
+        return extract_normalized_ast(path, **kwargs)
+
+    monkeypatch.setattr(lint, "extract_normalized_ast", extract)
+    data = lint_bytes(extra="forbid_ast:\n  decorators: [blocked]\n")
+    sources = {"src/a.py": b"@blocked\ndef f(): pass\n"}
+    result = lint.lint_rule(data, LINT_PATH, sources=sources)
+    assert result.gate_hits is None and "source_unavailable" in lint_codes(result)
+    assert "UNTRUSTED" not in repr(result)
+    assert lint.lint_rule(data, LINT_PATH, sources=sources).gate_hits == 1
+
+
+@pytest.mark.parametrize("selected", [False, True])
+def test_lint_inventory_duplicate_ids_match_runtime_loader(tmp_path, selected):
+    from aegis_core.rules import load_rules
+
+    root = lint_root(tmp_path)
+    other = root / ".aegis/rules/contracts/sample.md"
+    other.parent.mkdir()
+    other.write_bytes(lint_bytes().replace(b"type: trap", b"type: contract"))
+    assert all(not rule.ok and "duplicate rule id" in rule.error for rule in load_rules(root).rules)
+    results = lint.lint_workspace(root, [LINT_PATH] if selected else [])
+    assert len(results) == (1 if selected else 2)
+    assert all(not result.ok and lint_codes(result) == {"duplicate"} for result in results)
+    other.unlink()
+    assert lint.lint_workspace(root)[0].ok
+
+
+@pytest.mark.parametrize("folder", ["__pycache__", "node_modules", "venv", "target", "build", "dist"])
+def test_lint_reports_rules_in_invalid_directories_instead_of_pruning(tmp_path, folder):
+    root = lint_root(tmp_path)
+    other = root / ".aegis/rules" / folder / "invalid.md"
+    other.parent.mkdir()
+    other.write_bytes(lint_bytes().replace(b"id: sample", b"id: invalid"))
+    results = lint.lint_workspace(root)
+    assert len(results) == 2
+    result = next(result for result in results if result.path.endswith("invalid.md"))
+    assert not result.ok and "loader" in lint_codes(result)
+
+
+def test_lint_uses_loader_classification_and_loads_full_inventory_once(tmp_path, monkeypatch):
+    from aegis_core.rules import load_rules
+    root = lint_root(tmp_path)
+    rules = root / ".aegis/rules"
+    (rules / "README.md").write_text("# Rule documentation\n", encoding="utf-8")
+    (rules / "notes.md").write_text("Ordinary notes.\n", encoding="utf-8")
+    calls = []
+
+    def load(workspace, **kwargs):
+        calls.append(kwargs["inventory"])
+        return load_rules(workspace, **kwargs)
+
+    monkeypatch.setattr(lint, "load_rules", load)
+    results = lint.lint_workspace(root)
+    assert len(results) == 1 and results[0].ok
+    # Bounded README classification belongs to the same public runtime loader.
+    assert len(calls) == 1 and len(calls[0].entries) == 3
+
+
+@pytest.mark.parametrize("do", ["Run ``pytest -q``.", "Run ```pytest -q```.",
+                               "Run `pytest -q && ${SLOT.LINTER}`.",
+                               "Run `${SLOT.LINTER} && pytest -q`.",
+                               "Run `pytest -q; ${SLOT.LINTER}`.",
+                               "Run `pytest -q # ${SLOT.TOOL_RUN}`.",
+                               "Use a capability.\n```sh\npytest -q && ${SLOT.LINTER}\n```"])
+def test_lint_code_delimiters_and_slots_do_not_hide_concrete_commands(do):
+    result = lint.lint_rule(lint_bytes(do=do), LINT_PATH)
+    findings = [finding for finding in result.findings if finding.code == "concrete_command"]
+    assert not result.ok and any("${SLOT.TEST_RUNNER}" in finding.suggestions for finding in findings)
+
+
+def test_lint_opaque_slots_do_not_hide_literal_command_names():
+    result = lint.lint_rule(lint_bytes(do="Run `AEGIS_SLOT`."), LINT_PATH,
+                            command_slots={"TEST_RUNNER": "AEGIS_SLOT"})
+    assert "concrete_command" in lint_codes(result)
+    slots = lint.lint_rule(lint_bytes(do="Run `${SLOT.TEST_RUNNER} -q && ${SLOT.LINTER}`."), LINT_PATH)
+    assert slots.ok and "unmapped_command" not in lint_codes(slots)
+    quoted = lint.lint_rule(lint_bytes(do='Run `echo "&&" pytest`.'), LINT_PATH)
+    assert "concrete_command" not in lint_codes(quoted)
+
+
+def test_lint_full_loader_failure_is_fixed_and_retry_is_clean(tmp_path, monkeypatch):
+    from aegis_core.rules import load_rules
+    root = lint_root(tmp_path)
+    calls = []
+
+    def load(workspace, **kwargs):
+        if not calls:
+            calls.append(True)
+            raise RecursionError("UNTRUSTED-DETAIL")
+        return load_rules(workspace, **kwargs)
+
+    monkeypatch.setattr(lint, "load_rules", load)
+    result = lint.lint_workspace(root)[0]
+    assert lint_codes(result) == {"loader"} and "UNTRUSTED" not in repr(result)
+    assert lint.lint_workspace(root)[0].ok
+
+
+@pytest.mark.parametrize("global_flag", [False, True])
+@pytest.mark.parametrize("refusal", ["root", "pin"])
+def test_lint_real_cli_workspace_refusals_are_fixed_zero_exit_reports(tmp_path, global_flag, refusal):
+    import json
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    env.pop("AEGIS_WORKSPACE", None)
+    env["PYTHONPATH"] = str(ROOT)
+    if refusal == "pin":
+        env["AEGIS_WORKSPACE"] = str(tmp_path / "UNTRUSTED-pin")
+    workspace = ["--workspace", str(Path(tmp_path.anchor))]
+    args = workspace + ["rule", "lint", "--json"] if global_flag else ["rule", "lint", "--json"] + workspace
+    process = subprocess.run([sys.executable, "-m", "aegis_cli"] + args, cwd=tmp_path,
+                             env=env, capture_output=True, text=True, timeout=15)
+    assert process.returncode == 0
+    assert "UNTRUSTED" not in process.stdout + process.stderr
+    result = json.loads(process.stdout)
+    assert result["report_only"] is True
+    assert result["results"][0]["findings"][0]["code"] == "workspace"
+
+
+def test_lint_documentation_does_not_block_supported_source_hit_counts(tmp_path):
+    data = lint_bytes(extra="forbid_ast:\n  calls: [eval]\n").replace(b"target_paths: [src/**]\n", b"")
+    sources = {"src/README.md": b"notes\n", "src/a.py": b"eval('1')\n", "src/b.go": b"package main\n"}
+    direct = lint.lint_rule(data, LINT_PATH, sources=sources)
+    assert direct.gate_hits == 1 and direct.checked_files == 1
+    assert "target_paths" not in lint_codes(direct)
+    root = lint_root(tmp_path)
+    (root / LINT_PATH).write_bytes(data)
+    (root / "src").mkdir()
+    for path, content in sources.items():
+        (root / path).write_bytes(content)
+    result = lint.lint_workspace(root)[0]
+    assert result.gate_hits == 1 and result.checked_files == 1
+
+
+def test_lint_git_storage_does_not_consume_the_source_entry_quota(tmp_path, monkeypatch):
+    root = lint_root(tmp_path)
+    (root / LINT_PATH).write_bytes(lint_bytes(extra="forbid_ast:\n  calls: [eval]\n"))
+    (root / "src").mkdir()
+    (root / "src/a.py").write_bytes(b"eval('1')\n")
+    monkeypatch.setattr(lint, "MAX_ENTRIES", 2)
+
+    def files(*args, **kwargs):
+        for index in range(3):
+            yield root / ".git" / str(index), None
+        yield root / "src/a.py", None
+
+    monkeypatch.setattr(lint, "iter_confined_files", files)
+    assert lint.lint_workspace(root)[0].gate_hits == 1
+
+
+def test_lint_source_capture_refusal_is_single_ordered_and_retains_limit_code(tmp_path, monkeypatch):
+    root = lint_root(tmp_path)
+    (root / LINT_PATH).write_bytes(lint_bytes(extra="forbid_ast:\n  calls: [eval]\n"))
+    monkeypatch.setattr(lint, "MAX_SOURCE_FILES", 0)
+    (root / "src").mkdir()
+    (root / "src/a.py").write_bytes(b"eval('1')\n")
+    result = lint.lint_workspace(root)[0]
+    assert result.gate_hits is None and result.checked_files == 0
+    assert [finding.check for finding in result.findings] == [6, 7]
+    assert [finding.code for finding in result.findings] == ["source_limit", "scan_simulation"]
+    monkeypatch.setattr(lint, "MAX_SOURCE_FILES", 512)
+    assert lint.lint_workspace(root)[0].gate_hits == 1
+
+
+def test_lint_deep_archive_paths_are_ignored_by_runtime_classification(tmp_path):
+    root = lint_root(tmp_path)
+    archived = root / ".aegis/rules/.archive"
+    for _ in range(34):
+        archived = archived / "old"
+    archived.mkdir(parents=True)
+    (archived / "sample.md").write_bytes(lint_bytes())
+    results = lint.lint_workspace(root)
+    assert len(results) == 1 and results[0].ok
+
+
+def test_lint_python_options_do_not_make_unrelated_scripts_match_a_role():
+    commands = {"TEST_RUNNER": "python3 -B -m pytest"}
+    unrelated = lint.lint_rule(lint_bytes(do="Run `python3 unrelated.py`."), LINT_PATH, command_slots=commands)
+    assert "concrete_command" not in lint_codes(unrelated)
+    related = lint.lint_rule(lint_bytes(do="Run `python3 -B -m pytest -q`."), LINT_PATH, command_slots=commands)
+    assert any("${SLOT.TEST_RUNNER}" in finding.suggestions for finding in related.findings)
+    modes = lint.lint_rule(lint_bytes(do="Run `custom --mode format`."), LINT_PATH,
+                           command_slots={"LINTER": "custom --mode lint"})
+    assert "concrete_command" not in lint_codes(modes)
+
+
+def test_lint_real_inventory_matches_runtime_classified_record_paths():
+    from aegis_core.rules import load_rules
+    if not lint.descriptor_supported():
+        pytest.skip("descriptor-relative no-follow reads unavailable")
+    records = load_rules(ROOT).rules
+    results = lint.lint_workspace(ROOT)
+    assert len(results) == len(records)
+    assert {result.path for result in results} == {lint.display_text(rule.path) for rule in records}
+
+
+def test_lint_real_cli_invalid_snapshot_syntax_is_a_fixed_zero_exit_report(tmp_path):
+    import json
+    import subprocess
+    import sys
+
+    root = lint_root(tmp_path)
+    (root / LINT_PATH).write_bytes(lint_bytes(extra="forbid_ast:\n  decorators: [blocked]\n"))
+    (root / "src").mkdir()
+    (root / "src/a.py").write_bytes(b"def (")
+    env = {**os.environ, "PYTHONPATH": str(ROOT)}
+    env.pop("AEGIS_WORKSPACE", None)
+    process = subprocess.run([sys.executable, "-m", "aegis_cli", "rule", "lint", "--json", "--workspace", str(root)],
+                             cwd=tmp_path, env=env, capture_output=True, text=True, timeout=15)
+    assert process.returncode == 0
+    result = json.loads(process.stdout)["results"][0]
+    assert result["gate_hits"] is None
+    assert any(finding["code"] == "source_unavailable" for finding in result["findings"])
+    assert "ASTExtractionError" not in process.stdout + process.stderr
+
+
+@pytest.mark.parametrize("command", [("rule", "list"), ("status",)])
+def test_lint_workspace_hook_preserves_other_real_cli_refusals(tmp_path, command):
+    import subprocess
+    import sys
+    from aegis_core.workspace.binding import denial_message
+
+    env = {**os.environ, "PYTHONPATH": str(ROOT)}
+    env.pop("AEGIS_WORKSPACE", None)
+    root = Path(tmp_path.anchor)
+    process = subprocess.run([sys.executable, "-m", "aegis_cli", "--workspace", str(root),
+                              *command, "--json"], cwd=tmp_path, env=env,
+                             capture_output=True, text=True, timeout=15)
+    assert process.returncode == 1
+    assert process.stdout == ""
+    assert process.stderr == "Error: " + denial_message(root) + "\n"
+
+
+@pytest.mark.parametrize("width", [1, 2, 3, 4, 8])
+@pytest.mark.parametrize("ending", ["\n", "\r\n", "\r"])
+def test_lint_commonmark_multiline_code_spans_find_commands(width, ending):
+    ticks = "`" * width
+    result = lint.lint_rule(lint_bytes(do="Run " + ticks + " pytest" + ending + "-q " + ticks + "."), LINT_PATH)
+    assert any(f.code == "concrete_command" and "${SLOT.TEST_RUNNER}" in f.suggestions for f in result.findings)
+
+
+@pytest.mark.parametrize("operator", ["&&", "||", ";", "|", "&"])
+@pytest.mark.parametrize("fenced", [False, True])
+def test_lint_compound_command_mappings_share_example_tokenization(operator, fenced):
+    command = "make test" + operator + "make check"
+    body = "## Do\nRun `" + command + "`.\n"
+    if fenced:
+        body = "## Do\nUse the project check.\n```sh\n" + command + "\n```\n"
+    result = lint.lint_rule(lint_bytes(body=body), LINT_PATH,
+                            command_slots={"TEST_RUNNER": "make test && make check"})
+    assert any(f.code == "concrete_command" and "${SLOT.TEST_RUNNER}" in f.suggestions for f in result.findings)
+    exact = lint.lint_rule(lint_bytes(body=body), LINT_PATH, command_slots={"TEST_RUNNER": command})
+    assert any("${SLOT.TEST_RUNNER}" in f.suggestions for f in exact.findings)
+    assert "unmapped_command" not in lint_codes(exact)
+
+
+@pytest.mark.parametrize("expression", ["ast.Constant('pytest')", "'mypy'", "[pytest, mypy]",
+                                        "{'pytest': mypy}", "(pytest, mypy)", "{pytest, mypy}",
+                                        "lambda: pytest", "pytest[0]",
+                                        "[x for x in pytest]", "{x for x in mypy}",
+                                        "{x: x for x in pytest}", "(x for x in pytest)"])
+def test_lint_python_literal_examples_are_exempt(expression):
+    result = lint.lint_rule(lint_bytes(do="Preserve `" + expression + "` as an AST literal."), LINT_PATH)
+    assert not any(f.check == 4 for f in result.findings)
+
+
+def test_lint_prose_and_unmapped_nonshell_literals_are_not_command_findings():
+    body = "## Do\nUse the apply_patch tool with pytest -q.\n```python\n`ordinary value`\n```\n"
+    result = lint.lint_rule(lint_bytes(body=body), LINT_PATH)
+    assert not any(f.check == 4 for f in result.findings)
+
+
+@pytest.mark.parametrize("command", ["pytest", "tool.check", "pytest -q", "-pytest", "custom --mode=lint"])
+def test_lint_nonliteral_expression_forms_are_command_candidates(command):
+    result = lint.lint_rule(lint_bytes(do="Run `" + command + "`."), LINT_PATH,
+                            command_slots={"TEST_RUNNER": command})
+    assert any("${SLOT.TEST_RUNNER}" in finding.suggestions for finding in result.findings)
+
+
+def test_lint_normalized_command_models_are_repeatable_in_parallel():
+    from concurrent.futures import ThreadPoolExecutor
+
+    data = lint_bytes(do="Run ``make test\n&& make check``.")
+    commands = {"TEST_RUNNER": "make test && make check"}
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(lint.lint_rule, data, LINT_PATH, command_slots=commands) for _ in range(6)]
+        results = [future.result(timeout=10) for future in futures]
+    assert all(result == results[0] for result in results)
+    assert "concrete_command" in lint_codes(results[0])
+
+
+def test_lint_shell_parentheses_and_quoted_controls_are_not_segment_boundaries():
+    for command in ("echo (pytest)", 'echo "&&" pytest', "echo '|' mypy"):
+        result = lint.lint_rule(lint_bytes(do="Run `" + command + "`."), LINT_PATH)
+        assert "concrete_command" not in lint_codes(result)
+
+
+@pytest.mark.parametrize("filesystem", [False, True])
+@pytest.mark.parametrize("mixed", [False, True])
+def test_lint_unsupported_go_is_incomplete_with_evaluated_hits(tmp_path, filesystem, mixed, monkeypatch):
+    from aegis_core.ast.policy import extract_normalized_ast
+    calls = []
+
+    def extract(path, **kwargs):
+        assert not path.endswith(".go")
+        calls.append(path)
+        return extract_normalized_ast(path, **kwargs)
+
+    monkeypatch.setattr(lint, "extract_normalized_ast", extract)
+    data = lint_bytes(extra="forbid_ast:\n  calls: [panic]\n")
+    sources = {"src/a.go": b'package main\nfunc f() { panic("blocked") }\n', "src/README.md": b"notes\n"}
+    if mixed:
+        sources["src/b.py"] = b"panic('one')\npanic('two')\n"
+    if filesystem:
+        root = lint_root(tmp_path)
+        (root / LINT_PATH).write_bytes(data)
+        (root / "src").mkdir()
+        for path, content in sources.items():
+            (root / path).write_bytes(content)
+        result = lint.lint_workspace(root)[0]
+    else:
+        result = lint.lint_rule(data, LINT_PATH, sources=sources)
+    assert result.gate_hits == (2 if mixed else 0)
+    assert result.checked_files == (1 if mixed else 0)
+    warnings = [f for f in result.findings if f.code == "dry_run_incomplete"]
+    assert len(warnings) == 1 and warnings[0].severity == "warning"
+    assert "1" in warnings[0].message and ".go" in warnings[0].message
+    assert len(calls) == (1 if mixed else 0)
+
+
+@pytest.mark.parametrize("command,code", [("pytest -q", "concrete_command"),
+                                         ("bespoke-check --strict", "unmapped_command")])
+def test_lint_slot_wrappers_preserve_the_command_diagnostic(command, code):
+    for wrapper in ("${SLOT.TOOL_RUN}", "${SLOT.TOOL_RUN} ${SLOT.TOOL_READ}"):
+        result = lint.lint_rule(lint_bytes(do="Run `" + wrapper + " " + command + "`."), LINT_PATH)
+        assert code in lint_codes(result)
+    for suffix in ("", " -q"):
+        result = lint.lint_rule(lint_bytes(do="Run `${SLOT.TEST_RUNNER}" + suffix + "`."), LINT_PATH)
+        assert not any(finding.check == 4 for finding in result.findings)
+
+
+def test_lint_failed_supported_parse_resets_all_snapshot_counts():
+    result = lint.lint_rule(lint_bytes(extra="forbid_ast:\n  calls: [eval]\n"), LINT_PATH,
+                            sources={"src/a.py": b"eval('1')\n", "src/b.py": b"def ("})
+    assert result.gate_hits is None and result.checked_files == 0
+    assert "source_unavailable" in lint_codes(result)
+
+
+@pytest.mark.parametrize("selection", ["all", "large_first", "valid_first"])
+def test_lint_oversized_rule_is_per_file_and_valid_rules_keep_their_results(tmp_path, selection, monkeypatch):
+    from aegis_core.rules import load_rules
+
+    root = lint_root(tmp_path)
+    large_path = ".aegis/rules/traps/large.md"
+    (root / large_path).write_bytes(lint_bytes().replace(b"id: sample", b"id: large") + b"x" * lint.MAX_RULE_BYTES)
+
+    def bounded_load(workspace, **kwargs):
+        assert all(len(entry.content) <= lint.MAX_RULE_BYTES for entry in kwargs["inventory"].entries)
+        return load_rules(workspace, **kwargs)
+
+    monkeypatch.setattr(lint, "load_rules", bounded_load)
+    monkeypatch.setattr(lint, "MAX_RULE_TOTAL", lint.MAX_RULE_BYTES)
+    paths = [] if selection == "all" else ([large_path, LINT_PATH] if selection == "large_first" else [LINT_PATH, large_path])
+    results = lint.lint_workspace(root, paths)
+    assert len(results) == 2
+    by_path = {result.path: result for result in results}
+    assert lint_codes(by_path[large_path]) == {"too_large"}
+    assert by_path[LINT_PATH].ok
+    (root / large_path).unlink()
+    assert lint.lint_workspace(root)[0].ok
+
+
+def test_lint_writer_maximum_body_exposes_a_per_file_cap_mismatch(tmp_path):
+    from aegis_core.lifecycle.creation import MAX_RULE_BODY_BYTES, create_rule
+
+    root = lint_root(tmp_path)
+    path = create_rule("trap", "A maximum body is accepted by the writer.",
+                       id_override="large-created", target_paths=["src/**"], workspace=root,
+                       body="x" * (MAX_RULE_BODY_BYTES - 1) + "\n")
+    assert path.stat().st_size > lint.MAX_RULE_BYTES
+    results = lint.lint_workspace(root)
+    assert len(results) == 2
+    assert next(result for result in results if result.path == LINT_PATH).ok
+    large = next(result for result in results if result.path.endswith("large-created.md"))
+    assert lint_codes(large) == {"too_large"}
+
+
+def test_lint_valid_rule_bytes_still_obey_the_aggregate_parser_budget(tmp_path, monkeypatch):
+    root = lint_root(tmp_path)
+    data = lint_bytes()
+    (root / ".aegis/rules/traps/second.md").write_bytes(data.replace(b"id: sample", b"id: second"))
+    monkeypatch.setattr(lint, "MAX_RULE_TOTAL", len(data))
+    assert lint_codes(lint.lint_workspace(root)[0]) == {"too_large"}
+
+
+@pytest.mark.parametrize("markdown,matched", [
+    ("Check `audit-local --strict` before delivery.", True),
+    ("Check ``audit-local --strict`` before delivery.", True),
+    ("Check ````audit-local --strict```` before delivery.", True),
+    ("Check ``audit-local --strict` before delivery.", False),
+    ("Check `audit-local --strict`` before delivery.", False),
+    ("Keep a bare ` delimiter alongside audit-local --strict.", False),
+    (r"Keep \`audit-local --strict` as escaped punctuation.", False),
+    (r"Check \\`audit-local --strict` before delivery.", True),
+    ("Check ` audit-local --strict ` before delivery.", True),
+    ("Check ``  audit-local --strict  `` before delivery.", True),
+    ("Check ` audit-local --strict` before delivery.", True),
+    ("Check `audit-local --strict ` before delivery.", True),
+    ("Check `audit-local\n--strict` before delivery.", True),
+    ("Check ``audit-local\r\n--strict`` before delivery.", True),
+    ("Check ``audit-local\r--strict`` before delivery.", True),
+    ("Check `audit-local\n\n--strict` before delivery.", False),
+    ("Check `audit-local\n## Detail\n--strict` before delivery.", False),
+    ("Check `audit-local\n- --strict` before delivery.", False),
+    ("Check `audit-local\n> --strict` before delivery.", False),
+    ("Check ``audit-local --strict `annotation` `` before delivery.", True),
+    ('Keep <label title="`audit-local --strict`"> as markup.', False),
+    ("Keep <https://checks.invalid/`audit-local--strict`> as a link.", False),
+])
+def test_lint_independently_written_span_cases_through_public_api(markdown, matched):
+    data = lint_bytes(body="## Do\nUse the project check.\n" + markdown + "\n")
+    result = lint.lint_rule(data, LINT_PATH, command_slots={"TEST_RUNNER": "audit-local --strict"})
+    assert ("concrete_command" in lint_codes(result)) is matched
+
+
+@pytest.mark.parametrize("separator", ["\n\n", "\n## Another heading\n", "\n- ", "\n> "])
+def test_lint_unmatched_ticks_cannot_cross_markdown_blocks(separator):
+    body = "## Do\nKeep a literal backtick: `." + separator + "Run `pytest -q`.\n"
+    result = lint.lint_rule(lint_bytes(body=body), LINT_PATH)
+    assert "concrete_command" in lint_codes(result)
+
+
+def test_lint_escaped_tick_leaves_the_remaining_run_as_a_delimiter():
+    result = lint.lint_rule(lint_bytes(do="Run \\``pytest -q`."), LINT_PATH)
+    assert "concrete_command" in lint_codes(result)
+
+
+@pytest.mark.parametrize("command", [r"C:\tools\pytest.exe -q", r".\venv\Scripts\python.exe -m pytest",
+                                      "/usr/bin/pytest -q", r'"C:\Program Files\pytest.exe" -q'])
+@pytest.mark.parametrize("fenced", [False, True])
+def test_lint_executable_paths_preserve_backslash_separators(command, fenced):
+    body = "## Do\nRun `" + command + "`.\n"
+    if fenced:
+        body = "## Do\nUse the project check.\n```powershell\n" + command + "\n```\n"
+    result = lint.lint_rule(lint_bytes(body=body), LINT_PATH)
+    assert any("${SLOT.TEST_RUNNER}" in finding.suggestions for finding in result.findings)
+
+
+@pytest.mark.parametrize("filesystem", [False, True])
+def test_lint_unregistered_languages_are_counted_as_unevaluated(tmp_path, filesystem):
+    data = lint_bytes(extra="forbid_ast:\n  calls: [abort]\n")
+    sources = {"src/a.c": b"abort();\n", "src/b.java": b"class B {}\n", "src/c.rb": b"abort\n",
+               "src/README.md": b"notes\n", "src/a.py": b"abort()\n"}
+    if filesystem:
+        root = lint_root(tmp_path)
+        (root / LINT_PATH).write_bytes(data)
+        (root / "src").mkdir()
+        for path, content in sources.items():
+            (root / path).write_bytes(content)
+        result = lint.lint_workspace(root)[0]
+    else:
+        result = lint.lint_rule(data, LINT_PATH, sources=sources)
+    assert result.gate_hits == 1 and result.checked_files == 1
+    incomplete = [finding for finding in result.findings if finding.code == "dry_run_incomplete"]
+    assert len(incomplete) == 1 and "3" in incomplete[0].message
+    assert all(ext in incomplete[0].message for ext in (".c", ".java", ".rb"))
+
+
+@pytest.mark.parametrize("name", ["README.md", "readme.c", "LICENSE", "CHANGELOG.custom", "NOTICE",
+                                  "notes.markdown", "notes.rst", "notes.txt", "notes.adoc",
+                                  "asset.png", "asset.jpg", "asset.jpeg", "asset.gif", "asset.svg",
+                                  "asset.webp", "asset.bmp", "asset.ico", "asset.tiff"])
+def test_lint_explicit_documentation_and_assets_do_not_make_a_dry_run_incomplete(name):
+    result = lint.lint_rule(lint_bytes(extra="forbid_ast:\n  calls: [abort]\n"), LINT_PATH,
+                            sources={"src/" + name: b"documentation or asset"})
+    assert result.gate_hits == 0 and result.checked_files == 0
+    assert "dry_run_incomplete" not in lint_codes(result)
+
+
+def test_lint_unevaluated_extension_display_is_canonical_redacted_and_bounded():
+    secret = "ｇ\u200bｈｐ＿" + "Ａ" * 24
+    result = lint.lint_rule(lint_bytes(extra="forbid_ast:\n  calls: [abort]\n"), LINT_PATH,
+                            sources={"src/a." + secret: b"x", "src/b.c\nINJECT": b"x"})
+    finding = next(f for f in result.findings if f.code == "dry_run_incomplete")
+    assert "ghp_" not in finding.message and "Ａ" not in finding.message
+    assert "REDACTED" in finding.message and "\n" not in finding.message
+    assert len(finding.message) <= 240
+
+
+@pytest.mark.parametrize("command", [r"echo foo\ #tag && pytest -q", "echo foo\\\t#tag && pytest -q",
+                                     "echo foo\\\n#tag && pytest -q"])
+@pytest.mark.parametrize("fenced", [False, True])
+def test_lint_escaped_whitespace_does_not_manufacture_a_comment(command, fenced):
+    body = "## Do\nRun `" + command + "`.\n"
+    if fenced:
+        body = "## Do\nUse the project check.\n```sh\n" + command + "\n```\n"
+    result = lint.lint_rule(lint_bytes(body=body), LINT_PATH)
+    assert any("${SLOT.TEST_RUNNER}" in finding.suggestions for finding in result.findings)
+
+
+def test_lint_metadata_fields_are_separate_inline_blocks():
+    data = lint_bytes().replace(b"hypothesis: A bounded check prevents repeated mistakes.",
+                               b"hypothesis: 'A literal backtick `.'").replace(
+                                   b"prediction: Invalid changes are caught before landing.",
+                                   b"prediction: 'Run `pytest -q`.'")
+    assert "concrete_command" in lint_codes(lint.lint_rule(data, LINT_PATH))
+
+
+@pytest.mark.parametrize("filesystem", [False, True])
+@pytest.mark.parametrize("suffix", [".c", ".pyi"])
+def test_lint_unknown_source_extensions_remain_visible_in_exact_scopes(tmp_path, filesystem, suffix):
+    data = lint_bytes(extra="forbid_ast:\n  calls: [abort]\n").replace(b"src/**", ("src/*" + suffix).encode())
+    if filesystem:
+        root = lint_root(tmp_path)
+        (root / LINT_PATH).write_bytes(data)
+        (root / "src").mkdir()
+        (root / ("src/a" + suffix)).write_bytes(b"abort()\n")
+        result = lint.lint_workspace(root)[0]
+    else:
+        result = lint.lint_rule(data, LINT_PATH, sources={"src/a" + suffix: b"abort()\n"})
+    assert result.checked_files == 0
+    assert "dry_run_incomplete" in lint_codes(result)
+
+
+@pytest.mark.parametrize("selected", ["all", "small", "large"])
+def test_lint_oversized_rules_keep_duplicate_id_identity_without_yaml_parsing(tmp_path, monkeypatch, selected):
+    from aegis_core.rules import load_rules
+
+    root = lint_root(tmp_path)
+    other_path = ".aegis/rules/contracts/sample.md"
+    other = root / other_path
+    other.parent.mkdir()
+    other.write_bytes(lint_bytes().replace(b"type: trap", b"type: contract") + b"x" * lint.MAX_RULE_BYTES)
+
+    def bounded_load(workspace, **kwargs):
+        assert all(len(entry.content) <= lint.MAX_RULE_BYTES for entry in kwargs["inventory"].entries)
+        return load_rules(workspace, **kwargs)
+
+    monkeypatch.setattr(lint, "load_rules", bounded_load)
+    paths = [] if selected == "all" else [LINT_PATH if selected == "small" else other_path]
+    results = lint.lint_workspace(root, paths)
+    assert results and all("duplicate" in lint_codes(result) for result in results)
+    if selected != "small":
+        assert "too_large" in lint_codes(next(result for result in results if result.path == other_path))
+    other.unlink()
+    assert lint.lint_workspace(root)[0].ok
+
+
+@pytest.mark.parametrize("body", [
+    "## Do\n`pytest -q`\n",
+    "## Do\n` literal\n\nRun `pytest -q`.\n",
+    "## Do\n```sh\necho foo\\ #tag && C:\\tools\\pytest.exe -q\n```\n",
+])
+def test_lint_block_and_escape_results_are_stable_on_retry_and_concurrent_calls(body):
+    from concurrent.futures import ThreadPoolExecutor
+
+    data = lint_bytes(body=body)
+    first = lint.lint_rule(data, LINT_PATH)
+    assert "concrete_command" in lint_codes(first)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(lint.lint_rule, data, LINT_PATH) for _ in range(6)]
+        assert all(future.result(timeout=10) == first for future in futures)
+    assert lint.lint_rule(data, LINT_PATH) == first
+
+
+@pytest.mark.parametrize("container", ["quote", "list"])
+def test_lint_fences_cannot_consume_examples_outside_their_container(container):
+    prefix = "> ```text\n> literal\n" if container == "quote" else "- ```text\n  literal\n"
+    body = "## Do\n" + prefix + "Run `pytest -q`.\n"
+    assert "concrete_command" in lint_codes(lint.lint_rule(lint_bytes(body=body), LINT_PATH))
+
+
+@pytest.mark.parametrize("command", [r"check foo\ #tag", r'check "a\"b"', r"C:\tools\check.exe -q"])
+def test_lint_configured_commands_share_the_selective_escape_model(command):
+    result = lint.lint_rule(lint_bytes(do="Run `" + command + "`."), LINT_PATH,
+                            command_slots={"TEST_RUNNER": command})
+    assert any("${SLOT.TEST_RUNNER}" in finding.suggestions for finding in result.findings)
+
+
+def test_lint_unescaped_comment_and_escaped_quotes_keep_control_provenance():
+    for command in ("echo foo #comment && pytest -q", r'echo "foo\" && pytest -q"'):
+        result = lint.lint_rule(lint_bytes(do="Run `" + command + "`."), LINT_PATH)
+        assert "concrete_command" not in lint_codes(result)
+
+
+def test_lint_inline_triple_ticks_in_evidence_do_not_hide_following_sections():
+    body = ("## Do\nUse the ${SLOT.TEST_RUNNER} capability.\n## Evidence\n```observed```\n"
+            "## Notes\nRun `Bash` with `pytest -q` and ${SLOT.UNKNOWN}.\n")
+    result = lint.lint_rule(lint_bytes(body=body), LINT_PATH)
+    assert {"unknown_slot", "vendor_name", "concrete_command"} <= lint_codes(result)
+
+
+def test_lint_inline_triple_tick_do_instruction_does_not_leak_evidence():
+    body = "## Do\n```${SLOT.TEST_RUNNER}```\n## Evidence\n`pytest -q` ${SLOT.UNKNOWN}\n"
+    result = lint.lint_rule(lint_bytes(body=body), LINT_PATH)
+    assert result.ok and not {"do_window", "unknown_slot", "concrete_command"} & lint_codes(result)
+
+
+def test_lint_continued_shell_fence_matches_a_multiword_default_mapping():
+    body = "## Do\nUse the project check.\n```sh\nruff \\\n  check src\n```\n"
+    result = lint.lint_rule(lint_bytes(body=body), LINT_PATH)
+    assert any("${SLOT.LINTER}" in finding.suggestions for finding in result.findings)
+
+
+@pytest.mark.parametrize("path", [".aegis/rules/.archive/old.md", ".aegis/rules/README.md"])
+@pytest.mark.parametrize("selected", [False, True])
+def test_lint_oversized_loader_exclusions_are_not_reported(tmp_path, path, selected):
+    root = lint_root(tmp_path)
+    excluded = root / path
+    excluded.parent.mkdir(exist_ok=True)
+    excluded.write_bytes(b"# Documentation\n" + b"x" * lint.MAX_RULE_BYTES)
+    results = lint.lint_workspace(root, [path] if selected else [])
+    assert all(result.path != path for result in results)
+    assert results == () if selected else len(results) == 1 and results[0].ok
+
+
+@pytest.mark.parametrize("separator", ["\n#\n", "\n-\n", "\n1.\n", "\n    code\n"])
+def test_lint_empty_block_markers_and_indented_code_break_tick_pairing(separator):
+    body = "## Do\nUse ` as punctuation." + separator + "Run `pytest -q`.\n"
+    assert "concrete_command" in lint_codes(lint.lint_rule(lint_bytes(body=body), LINT_PATH))
+
+
+def test_lint_stripped_reading_includes_tab_indented_fences():
+    body = "## Do\nUse a neutral capability.\n\n\t```sh\n\tpytest -q\n\t```\n"
+    assert "concrete_command" in lint_codes(lint.lint_rule(lint_bytes(body=body), LINT_PATH))
+
+
+def test_lint_python_compiler_diagnostics_do_not_escape_the_report(recwarn):
+    from concurrent.futures import ThreadPoolExecutor
+    import warnings
+
+    filters = tuple(warnings.filters)
+    data = lint_bytes(do=r'Run `"C:\Program Files\pytest.exe" -q`.',
+                      extra="forbid_ast:\n  calls: [abort]\n")
+    sources = {"src/a.py": b"value = 'bad\\q'\nabort()\n"}
+    result = lint.lint_rule(data, LINT_PATH, sources=sources)
+    assert "concrete_command" in lint_codes(result) and result.gate_hits == 1
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(lint.lint_rule, data, LINT_PATH, sources=sources) for _ in range(6)]
+        assert all(future.result(timeout=10) == result for future in futures)
+    failed = lint.lint_rule(data, LINT_PATH, sources={"src/a.py": b"value = 'bad\\q'\ndef ("})
+    assert failed.gate_hits is None and "source_unavailable" in lint_codes(failed)
+    assert tuple(warnings.filters) == filters
+    assert not recwarn.list
+
+
+@pytest.mark.parametrize("field", ["hypothesis", "prediction"])
+@pytest.mark.parametrize("opener", ["```text", "~~~text", "`", "``"])
+def test_lint_metadata_fences_and_spans_cannot_hide_body_commands(field, opener):
+    data = re.sub(rb"(?m)^" + field.encode() + rb":.*$",
+                  (field + ": '" + opener + "'").encode(),
+                  lint_bytes(do="Run `Bash` with `pytest -q`."))
+    result = lint.lint_rule(data, LINT_PATH)
+    assert {"vendor_name", "concrete_command"} <= lint_codes(result)
+
+
+@pytest.mark.parametrize("opener", ["```text", "~~~text"])
+def test_lint_hypothesis_fence_cannot_hide_prediction_commands(opener):
+    data = lint_bytes().replace(b"hypothesis: A bounded check prevents repeated mistakes.",
+                               ("hypothesis: '" + opener + "'").encode()).replace(
+                                   b"prediction: Invalid changes are caught before landing.",
+                                   b"prediction: 'Run `Bash` with `pytest -q`.'")
+    assert {"vendor_name", "concrete_command"} <= lint_codes(lint.lint_rule(data, LINT_PATH))
+
+
+@pytest.mark.parametrize("marker", ["-", "1."])
+def test_lint_line_local_reading_finds_commands_after_nested_unmatched_ticks(marker):
+    body = ("## Do\n" + marker + " Keep a literal backtick: `\n    "
+            + marker + " Run `pytest -q`.\n")
+    assert "concrete_command" in lint_codes(lint.lint_rule(lint_bytes(body=body), LINT_PATH))
+
+
+@pytest.mark.parametrize("marker", ["> out", "- x", "1. y", "> - 1. out"])
+@pytest.mark.parametrize("language", ["sh", "text", "python", ""])
+@pytest.mark.parametrize("fence", ["```", "~~~"])
+def test_lint_fenced_reading_keeps_commands_after_container_like_content(marker, language, fence):
+    body = "## Do\nUse the project check.\n" + fence + language + "\n" + marker + "\npytest -q\n" + fence + "\n"
+    result = lint.lint_rule(lint_bytes(body=body), LINT_PATH)
+    assert sum(f.code == "concrete_command" for f in result.findings) == 1
+
+
+@pytest.mark.parametrize("container,indent", [("", ""), ("> ", "> "), ("- ", "  ")])
+@pytest.mark.parametrize("marker", ["> out", "- x", "1. y"])
+def test_lint_fence_reading_strips_only_the_enclosing_container(container, indent, marker):
+    body = ("## Do\nUse the project check.\n" + container + "```sh\n" + indent + marker
+            + "\n" + indent + "pytest -q\n" + indent + "```\n")
+    assert "concrete_command" in lint_codes(lint.lint_rule(lint_bytes(body=body), LINT_PATH))
+
+
+@pytest.mark.parametrize("literal,expected", [("`pytest -q`", "concrete_command"),
+                                              ("`Bash`", "vendor_name"),
+                                              ("`ordinary value`", None),
+                                              ("ordinary value", None),
+                                              ("ast.Constant('pytest')", None)])
+def test_lint_nonshell_readings_only_report_configured_command_matches(literal, expected):
+    body = "## Do\nUse the project check.\n```python\n" + literal + "\n```\n"
+    findings = [f for f in lint.lint_rule(lint_bytes(body=body), LINT_PATH).findings if f.check == 4]
+    assert {f.code for f in findings} == ({expected} if expected else set())
+
+
+@pytest.mark.parametrize("language", ["sh", "text"])
+def test_lint_fenced_union_includes_each_physical_line_of_a_continuation(language):
+    body = "## Do\nUse the project check.\n```" + language + "\necho \\\npytest -q\n```\n"
+    assert "concrete_command" in lint_codes(lint.lint_rule(lint_bytes(body=body), LINT_PATH))
+
+
+@pytest.mark.parametrize("value", ['"~~~"', "|\n  ~~~\n  An independent field continuation."])
+@pytest.mark.parametrize("field", ["hypothesis", "prediction"])
+def test_lint_argon_bare_and_multiline_metadata_fences_are_independent(field, value):
+    data = re.sub(rb"(?m)^" + field.encode() + rb":.*$", (field + ": " + value).encode(),
+                  lint_bytes(body="## Do\nRun `Bash` with `pytest -q`.\n"))
+    assert {"vendor_name", "concrete_command"} <= lint_codes(lint.lint_rule(data, LINT_PATH))
+
+
+@pytest.mark.parametrize("body", [
+    "## Do\n- Keep a literal backtick: `.\n    - Run `Bash` with `pytest -q`.\n",
+    "## Do\n- Outer\n    - Middle\n        - Run `Bash` with `pytest -q`.\n",
+])
+def test_lint_argon_nested_list_inputs_keep_both_command_diagnostics(body):
+    assert {"vendor_name", "concrete_command"} <= lint_codes(lint.lint_rule(lint_bytes(body=body), LINT_PATH))
+
+
+@pytest.mark.parametrize("marker", ["- item", "> x"])
+def test_lint_argon_fenced_evidence_heading_cannot_suppress_notes(marker):
+    body = ("## Do\nUse the ${SLOT.TEST_RUNNER} capability.\n```markdown\n" + marker
+            + "\n## Evidence\n```\n## Notes\nRun `Bash` with `pytest -q` and ${SLOT.UNKNOWN}.\n")
+    result = lint.lint_rule(lint_bytes(body=body), LINT_PATH)
+    assert {"vendor_name", "concrete_command", "unknown_slot"} <= lint_codes(result)
+
+
+def test_lint_argon_shell_redirection_cannot_end_a_fence():
+    body = "## Do\nUse the project check.\n```sh\n>2 echo starting\npytest -q\n```\n"
+    assert "concrete_command" in lint_codes(lint.lint_rule(lint_bytes(body=body), LINT_PATH))
+
+
+@pytest.mark.parametrize("path,identity", [
+    (".aegis/rules/contracts/nested/sample.md", "sample"),
+    (".aegis/rules/traps/nested/sample.md", "sample"),
+    (".aegis/rules/sample.md", "sample"),
+    (".aegis/rules/trap/sample.md", "sample"),
+    (".aegis/rules/unknown/sample.md", "sample"),
+    (".aegis/rules/traps/sample.MD", "sample"),
+    (".aegis/rules/traps/README.md", "README"),
+    (".aegis/rules/traps/.hidden.md", ".hidden"),
+    (".aegis/rules/traps/.md", ".md"),
+])
+def test_rule_path_id_public_export_matches_runtime_record_identity(path, identity):
+    import aegis_core.rules as rules
+    from aegis_core.rule_inventory import RuleInventory, RuleInventoryEntry
+
+    data = lint_bytes().replace(b"id: sample", ("id: " + identity).encode())
+    entry = RuleInventoryEntry(path, path, data, "", len(data))
+    records = rules.load_rules("/", inventory=RuleInventory((entry,), "identity-test")).rules
+    assert len(records) == 1 and records[0].id == identity
+    assert rules.rule_path_id(path) == records[0].id
+    assert "rule_path_id" in rules.__all__
+
+
+@pytest.mark.parametrize("other_path", [
+    ".aegis/rules/contracts/nested/sample.md", ".aegis/rules/traps/nested/sample.md",
+    ".aegis/rules/sample.md", ".aegis/rules/trap/sample.md",
+    ".aegis/rules/unknown/sample.md", ".aegis/rules/traps/sample.MD",
+])
+@pytest.mark.parametrize("selected", ["all", "small", "large"])
+def test_lint_oversized_error_records_keep_runtime_duplicate_identity(tmp_path, monkeypatch, other_path, selected):
+    from aegis_core.rules import load_rules
+    from aegis_core.yaml_engine.frontmatter import split_frontmatter
+
+    root = lint_root(tmp_path)
+    other = root / other_path
+    other.parent.mkdir(parents=True, exist_ok=True)
+    other.write_bytes(lint_bytes() + b"x" * lint.MAX_RULE_BYTES)
+    records = load_rules(root).rules
+    assert len(records) == 2 and all("duplicate rule id" in r.error for r in records)
+    calls = []
+
+    def bounded_load(workspace, **kwargs):
+        entries = kwargs["inventory"].entries
+        assert {entry.relative_path for entry in entries} == {LINT_PATH, other_path}
+        assert all(len(entry.content) <= lint.MAX_RULE_BYTES for entry in entries)
+        prefix = next(entry.content for entry in entries if entry.relative_path == other_path)
+        assert prefix.endswith(b"\n")
+        assert not split_frontmatter(prefix.decode("utf-8-sig"))[2].strip()
+        calls.append(entries)
+        return load_rules(workspace, **kwargs)
+
+    monkeypatch.setattr(lint, "load_rules", bounded_load)
+    paths = [] if selected == "all" else [LINT_PATH if selected == "small" else other_path]
+    results = lint.lint_workspace(root, paths)
+    assert {r.path for r in results} == ({LINT_PATH, other_path} if selected == "all" else set(paths))
+    for result in results:
+        assert lint_codes(result) == ({"too_large", "duplicate"} if result.path == other_path else {"duplicate"})
+    assert len(calls) == 1  # Only bounded frontmatter from the oversized rule is loaded.
+    monkeypatch.setattr(lint, "load_rules", load_rules)
+    other.unlink()
+    assert lint.lint_workspace(root)[0].ok
+
+
+@pytest.mark.parametrize("path", [".aegis/rules/traps/README.md", ".aegis/rules/traps/readme.MD",
+                                  ".aegis/rules/README.md", ".aegis/rules/trap/README.md",
+                                  ".aegis/rules/contracts/nested/README.md"])
+@pytest.mark.parametrize("selected", [False, True])
+@pytest.mark.parametrize("malformed", [False, True])
+def test_lint_rule_bearing_readmes_match_runtime_error_records(tmp_path, path, selected, malformed):
+    from aegis_core.rules import load_rules
+
+    root = lint_root(tmp_path)
+    (root / LINT_PATH).unlink()
+    target = root / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"---\nid: [unterminated\n---\n" if malformed else
+                       lint_bytes().replace(b"id: sample", ("id: " + target.stem).encode()))
+    records = load_rules(root).rules
+    assert len(records) == 1 and not records[0].ok
+    results = lint.lint_workspace(root, [path] if selected else [])
+    assert len(results) == 1 and results[0].path == path
+    assert lint_codes(results[0]) == {"loader"}
+
+
+@pytest.mark.parametrize("name", ["README.md", "readme.MD"])
+@pytest.mark.parametrize("content", [b"# Documentation\n", b"---\ntitle: Rule author guide\n---\n# Notes\n"])
+def test_lint_bounded_readme_documentation_keeps_runtime_exclusion(tmp_path, name, content):
+    root = lint_root(tmp_path)
+    path = ".aegis/rules/traps/" + name
+    (root / path).write_bytes(content)
+    assert len(lint.lint_workspace(root)) == 1
+    assert lint.lint_workspace(root, [path]) == ()
+
+
+@pytest.mark.parametrize("path", [".aegis/rules/README.md", ".aegis/rules/traps/README.MD",
+                                  ".aegis/rules/sample.md", ".aegis/rules/trap/sample.md"])
+@pytest.mark.parametrize("ending", [b"", b"\xff", b"\xc3"], ids=["valid", "invalid", "truncated"])
+def test_lint_plain_oversized_documentation_uses_loader_classification_without_yaml(tmp_path, monkeypatch, path, ending):
+    from aegis_core.rules import load_rules
+    from aegis_core.yaml_engine.frontmatter import split_frontmatter
+
+    root = lint_root(tmp_path)
+    target = root / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # Include a multibyte character spanning the lint byte-cap boundary.
+    data = b"# " + b"x" * (lint.MAX_RULE_BYTES - 3) + "é".encode() + b"notes\n"
+    target.write_bytes(data + ending)
+    records = load_rules(root).rules
+    calls = []
+
+    def bounded_load(workspace, **kwargs):
+        entries = kwargs["inventory"].entries
+        assert all(len(entry.content) <= lint.MAX_RULE_BYTES for entry in entries)
+        prefixes = [entry for entry in entries if entry.relative_path == path]
+        assert len(prefixes) == (0 if ending else 1)
+        for entry in prefixes:
+            assert split_frontmatter(entry.content.decode("utf-8-sig"))[0] == "none"
+        calls.append(entries)
+        return load_rules(workspace, **kwargs)
+
+    monkeypatch.setattr(lint, "load_rules", bounded_load)
+    results = lint.lint_workspace(root)
+    by_path = {r.path: r for r in results}
+    assert {r.path for r in records} == set(by_path)
+    if ending:
+        assert "too_large" in lint_codes(by_path[path])
+        if target.stem == "sample":
+            assert all("duplicate" in lint_codes(r) for r in results)
+    else:
+        assert len(results) == 1 and results[0].ok
+    assert len(calls) == 1
+
+
+def test_lint_frontmatter_classification_prefixes_obey_the_aggregate_budget_before_yaml(tmp_path, monkeypatch):
+    root = lint_root(tmp_path)
+    for path in (".aegis/rules/README.md", ".aegis/rules/traps/README.md"):
+        (root / path).write_bytes(b"---\ntitle: " + b"x" * (lint.MAX_RULE_BYTES - 32)
+                                 + b"\n---\n" + b"body" * 32)
+    monkeypatch.setattr(lint, "MAX_RULE_TOTAL", lint.MAX_RULE_BYTES)
+
+    def forbidden_load(*args, **kwargs):
+        pytest.fail("aggregate budget exhausted before rule loading")
+
+    monkeypatch.setattr(lint, "load_rules", forbidden_load)
+    results = lint.lint_workspace(root)
+    assert len(results) == 1 and lint_codes(results[0]) == {"too_large"}
+
+
+def test_lint_rule_bearing_readme_is_reported_by_real_cli(tmp_path):
+    import json
+    import subprocess
+    import sys
+
+    root = lint_root(tmp_path)
+    (root / LINT_PATH).unlink()
+    path = ".aegis/rules/traps/README.md"
+    (root / path).write_bytes(lint_bytes().replace(b"id: sample", b"id: README"))
+    env = {**os.environ, "PYTHONPATH": str(ROOT)}
+    env.pop("AEGIS_WORKSPACE", None)
+    process = subprocess.run([sys.executable, "-m", "aegis_cli", "rule", "lint", "--json", "--workspace", str(root)],
+                             cwd=tmp_path, env=env, capture_output=True, text=True, timeout=15)
+    assert process.returncode == 0
+    result = json.loads(process.stdout)["results"]
+    assert len(result) == 1 and result[0]["path"] == path
+    assert {f["code"] for f in result[0]["findings"]} == {"loader"}
+    assert "No rules found" not in process.stdout + process.stderr
+
+
+@pytest.mark.parametrize("marker", ["-", "*", "+", "1.", "2)"])
+@pytest.mark.parametrize("ending", ["\n", "\r\n", "\r"])
+def test_lint_stripped_reading_recovers_nested_multiline_commands(marker, ending):
+    body = ending.join(["## Do", "Use the project check.", marker + " Keep a literal backtick: `.",
+                        "    " + marker + " Run `pytest", "      -q`.", ""])
+    result = lint.lint_rule(lint_bytes(body=body), LINT_PATH)
+    assert any(f.code == "concrete_command" and "${SLOT.TEST_RUNNER}" in f.suggestions for f in result.findings)
+
+
+@pytest.mark.parametrize("marker", ["-", "*", "+", "1.", "2)"])
+@pytest.mark.parametrize("fence", ["```", "~~~", "````"])
+def test_lint_stripped_reading_recovers_nested_fences(marker, fence):
+    body = ("## Do\nUse the project check.\n" + marker + " Outer\n    " + marker
+            + " Inner\n      " + fence + "sh\n      pytest -q\n      " + fence + "\n")
+    assert "concrete_command" in lint_codes(lint.lint_rule(lint_bytes(body=body), LINT_PATH))
+
+
+@pytest.mark.parametrize("prefix", ["> > - 1. ", "  - > 2) > ", "\t+ > - "])
+def test_lint_stripped_reading_repeatedly_removes_mixed_containers(prefix):
+    body = ("## Do\nUse the project check.\n" + prefix + "```sh\n" + prefix
+            + "pytest -q\n" + prefix + "```\n")
+    assert "concrete_command" in lint_codes(lint.lint_rule(lint_bytes(body=body), LINT_PATH))
+
+
+@pytest.mark.parametrize("marker", ["-", "*", "+", "1.", "2)"])
+def test_lint_stripped_reading_does_not_turn_nested_prose_into_commands(marker):
+    body = ("## Do\nUse the project check.\n" + marker + " Discuss pytest -q in ordinary prose.\n    "
+            + marker + " Keep notes about Bash and project tools.\n")
+    assert not any(f.check == 4 for f in lint.lint_rule(lint_bytes(body=body), LINT_PATH).findings)
+
+
+@pytest.mark.parametrize("blank", ["", "    ", "> ", "    - "])
+def test_lint_stripped_reading_multiline_windows_stop_at_blank_lines(blank):
+    body = "## Do\nUse the project check.\n- Outer\n    - Run `audit-local\n" + blank + "\n      --strict`.\n"
+    result = lint.lint_rule(lint_bytes(body=body), LINT_PATH, command_slots={"TEST_RUNNER": "audit-local --strict"})
+    assert "concrete_command" not in lint_codes(result)
+
+
+@pytest.mark.parametrize("opening,closing,matched", [("```", "```", False), ("```", "````", False),
+                                                    ("~~~", "~~~", False), ("```", "``", True),
+                                                    ("```", "~~~", True)])
+def test_lint_stripped_reading_requires_a_matching_fence_close(opening, closing, matched):
+    body = ("## Do\nUse the project check.\n- Outer\n    - Inner\n      " + opening
+            + "sh\n      " + closing + "\n      pytest -q\n")
+    assert ("concrete_command" in lint_codes(lint.lint_rule(lint_bytes(body=body), LINT_PATH))) is matched
+
+
+@pytest.mark.parametrize("example", ["ordinary words", "ast.Constant('pytest')", "'pytest -q'"])
+def test_lint_stripped_reading_keeps_literal_exemptions_and_unmapped_supplemental_silence(example):
+    body = "## Do\nUse the project check.\n- Outer\n    - Inner\n      ```python\n      " + example + "\n      ```\n"
+    assert not any(f.check == 4 for f in lint.lint_rule(lint_bytes(body=body), LINT_PATH).findings)
+
+
+@pytest.mark.parametrize("body", [
+    "## Do\n- Keep a literal backtick: `.\n    - Run `pytest -q\n      --strict`.\n",
+    "## Do\nUse the project check.\n- Outer\n    - Inner\n      ~~~sh\n      pytest -q\n      ~~~\n",
+    "## Do\nUse the project check.\n- Outer\n    - > ~~~sh\n      > pytest -q\n      > ~~~\n",
+])
+def test_lint_security_nested_container_inputs_have_configured_command_findings(body):
+    assert "concrete_command" in lint_codes(lint.lint_rule(lint_bytes(body=body), LINT_PATH))
+
+
+@pytest.mark.parametrize("fence", ["```", "~~~"])
+@pytest.mark.parametrize("command,code", [("pytest -q", "concrete_command"),
+                                         ("project-audit --strict", "unmapped_command")])
+def test_lint_tab_continuation_preserves_the_primary_fence_reading(fence, command, code):
+    body = "## Do\nUse the project check.\n- " + fence + "sh\n\t" + command + "\n  " + fence + "\n"
+    assert code in lint_codes(lint.lint_rule(lint_bytes(body=body), LINT_PATH))
+
+
+@pytest.mark.parametrize("fence", ["```", "~~~"])
+def test_lint_indent_tab_expansion_preserves_tabs_inside_command_arguments(fence):
+    command = 'audit-local "keep\ttab"'
+    body = "## Do\nUse the project check.\n- " + fence + "sh\n\t" + command + "\n  " + fence + "\n"
+    result = lint.lint_rule(lint_bytes(body=body), LINT_PATH, command_slots={"TEST_RUNNER": command})
+    assert "concrete_command" in lint_codes(result)
+    assert "unmapped_command" not in lint_codes(result)
+
+
+@pytest.mark.parametrize("path", [
+    ".aegis/rules/sample.md", ".aegis/rules/traps/nested/sample.md",
+    ".aegis/rules/contracts/nested/sample.md", ".aegis/rules/unknown/sample.md",
+    ".aegis/rules/traps/.sample.md", ".aegis/rules/traps/sample.MD",
+    ".aegis/rules/traps/README.md", ".aegis/rules/traps/readme.MD", ".aegis/rules/README.md",
+])
+@pytest.mark.parametrize("selected", ["all", "trap", "note"])
+def test_lint_oversized_title_only_documents_keep_runtime_classification(tmp_path, path, selected):
+    from aegis_core.rules import load_rules
+
+    root = lint_root(tmp_path)
+    target = root / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"---\ntitle: Notes\n---\n" + b"x" * lint.MAX_RULE_BYTES)
+    records = load_rules(root).rules
+    assert len(records) == 1 and records[0].path == LINT_PATH and records[0].ok
+    paths = [] if selected == "all" else [LINT_PATH if selected == "trap" else path]
+    results = lint.lint_workspace(root, paths)
+    if selected == "note":
+        assert results == ()
+    else:
+        assert len(results) == 1 and results[0].path == LINT_PATH and results[0].ok
+        assert "duplicate" not in lint_codes(results[0])
+
+
+@pytest.mark.parametrize("metadata", ["type: trap", "target_paths: [src/**]", "forbid_ast:\n  calls: [eval]"])
+@pytest.mark.parametrize("path", [".aegis/rules/sample.md", ".aegis/rules/unknown/sample.md"])
+def test_lint_oversized_frontmatter_rule_signals_still_reserve_runtime_identities(tmp_path, metadata, path):
+    from aegis_core.rules import load_rules
+
+    root = lint_root(tmp_path)
+    target = root / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(("---\n" + metadata + "\n---\n").encode() + b"x" * lint.MAX_RULE_BYTES)
+    records = load_rules(root).rules
+    assert len(records) == 2 and all("duplicate rule id" in r.error for r in records)
+    results = lint.lint_workspace(root)
+    assert len(results) == 2 and all("duplicate" in lint_codes(r) for r in results)
+    assert "too_large" in lint_codes(next(r for r in results if r.path == path))
+
+
+@pytest.mark.parametrize("tail", ["", "    " + "x" * 350, "x" * 350])
+def test_lint_argon_empty_nested_markers_cannot_satisfy_the_do_window(tail):
+    result = lint.lint_rule(lint_bytes(body="## Do\n-\n    -\n" + tail + "\n"), LINT_PATH)
+    assert not result.ok
+    assert sum(f.code == "do_window" for f in result.findings) == 1
+
+
+@pytest.mark.parametrize("command", ["bespoke-check --strict", "bespoke-check"])
+def test_lint_argon_stripped_inline_examples_keep_unmapped_command_warnings(command):
+    body = "## Do\n- Outer\n    - Middle\n        - Run `" + command + "`.\n"
+    result = lint.lint_rule(lint_bytes(body=body), LINT_PATH)
+    assert "unmapped_command" in lint_codes(result)
+
+
+def test_lint_argon_stripped_fence_unknown_commands_remain_supplemental():
+    body = "## Do\nUse the project check.\n- Outer\n    - Middle\n        ```sh\n        bespoke-check --strict\n        ```\n"
+    assert not any(f.check == 4 for f in lint.lint_rule(lint_bytes(body=body), LINT_PATH).findings)
+
+
+@pytest.mark.parametrize("body", [
+    "## Do\n- > ```sh\n  > pytest -q\n  > ```\n",
+    "## Do\n- Use ${SLOT.TEST_RUNNER}.\n    - ```markdown\n      example\n    ```\n  Run `pytest\n  -q`.\n",
+    "## Do\n- Outer\n    - Middle\n        - Run `pytest\n          -q`.\n",
+])
+def test_lint_argon_quote_and_fence_inversion_inputs_are_checked(body):
+    assert "concrete_command" in lint_codes(lint.lint_rule(lint_bytes(body=body), LINT_PATH))
+
+
+@pytest.mark.parametrize("path", [".aegis/rules/README.md", ".aegis/rules/sample.md"])
+@pytest.mark.parametrize("body_size", [65540, 65546])
+@pytest.mark.parametrize("selected", ["all", "trap", "note"])
+def test_lint_argon_oversized_empty_frontmatter_is_documentation(tmp_path, path, body_size, selected):
+    from aegis_core.rules import load_rules
+
+    root = lint_root(tmp_path)
+    (root / path).write_bytes(b"---\n---\n# Documentation\n" + b"a" * body_size)
+    assert len(load_rules(root).rules) == 1
+    paths = [] if selected == "all" else [LINT_PATH if selected == "trap" else path]
+    results = lint.lint_workspace(root, paths)
+    assert results == () if selected == "note" else len(results) == 1 and results[0].ok
+
+
+@pytest.mark.parametrize("direction", ["shrink", "grow"])
+def test_lint_argon_size_changes_between_candidate_and_inventory_are_changed(tmp_path, monkeypatch, direction):
+    root = lint_root(tmp_path)
+    path = root / LINT_PATH
+    small = lint_bytes()
+    large = small + b"x" * lint.MAX_RULE_BYTES
+    initial, final = (large, small) if direction == "shrink" else (small, large)
+    path.write_bytes(initial)
+    inventory = lint.inventory_rules
+    calls = []
+
+    def changed(workspace):
+        if not calls:
+            path.write_bytes(final)
+            calls.append(True)
+        return inventory(workspace)
+
+    monkeypatch.setattr(lint, "inventory_rules", changed)
+    result = lint.lint_workspace(root, [LINT_PATH])
+    assert len(result) == 1 and lint_codes(result[0]) == {"changed"}
+    retry = lint.lint_workspace(root, [LINT_PATH])[0]
+    assert retry.ok if direction == "shrink" else lint_codes(retry) == {"too_large"}
+
+
+@pytest.mark.parametrize("signature", [b"", b"\xef\xbb\xbf"])
+@pytest.mark.parametrize("ending", ["\n", "\r\n"])
+@pytest.mark.parametrize("invalid_tail", [False, True])
+def test_lint_bounded_frontmatter_preserves_unicode_boundaries_and_encoding_errors(tmp_path, signature, ending, invalid_tail):
+    from aegis_core.rules import load_rules
+
+    root = lint_root(tmp_path)
+    path = ".aegis/rules/sample.md"
+    text = ending.join(["---", "title: 文書", "---", "é" * lint.MAX_RULE_BYTES])
+    (root / path).write_bytes(signature + text.encode() + (b"\xff" if invalid_tail else b""))
+    records = load_rules(root).rules
+    results = lint.lint_workspace(root)
+    assert {r.path for r in results} == {r.path for r in records}
+    if invalid_tail:
+        assert len(results) == 2 and all("duplicate" in lint_codes(r) for r in results)
+        assert "too_large" in lint_codes(next(r for r in results if r.path == path))
+    else:
+        assert len(results) == 1 and results[0].ok
+
+
+def test_lint_oversized_gate_does_not_capture_sources_from_its_frontmatter_prefix(tmp_path, monkeypatch):
+    root = lint_root(tmp_path)
+    path = ".aegis/rules/traps/large.md"
+    data = lint_bytes(extra="forbid_ast:\n  calls: [eval]\n").replace(b"id: sample", b"id: large")
+    (root / path).write_bytes(data + b"x" * lint.MAX_RULE_BYTES)
+
+    def forbidden_sources(*args, **kwargs):
+        pytest.fail("oversized rule must be refused before source capture")
+
+    monkeypatch.setattr(lint, "iter_confined_files", forbidden_sources)
+    results = lint.lint_workspace(root, [path])
+    assert len(results) == 1 and lint_codes(results[0]) == {"too_large"}
+
+
+@pytest.mark.parametrize("marker", ["-", "1."])
+@pytest.mark.parametrize("fence", ["```", "~~~"])
+@pytest.mark.parametrize("command,continuation,slots,role", [
+    ("ruff", "check src", None, "LINTER"),
+    ("package", "verify", {"BUILD_TOOL": "package verify"}, "BUILD_TOOL"),
+    ("python3", "-m pytest", None, "TEST_RUNNER"),
+])
+def test_lint_stripped_fences_join_logical_shell_continuations(marker, fence, command, continuation, slots, role):
+    body = ("## Do\nUse the project check.\n" + marker + " Outer\n    " + marker + " Inner\n      "
+            + fence + "sh\n      " + command + " \\\n        " + continuation + "\n      " + fence + "\n")
+    result = lint.lint_rule(lint_bytes(body=body), LINT_PATH, command_slots=slots)
+    assert any(f.code == "concrete_command" and "${SLOT." + role + "}" in f.suggestions for f in result.findings)
+
+
+@pytest.mark.parametrize("path", [
+    ".aegis/rules/sample.md", ".aegis/rules/traps/nested/sample.md",
+    ".aegis/rules/unknown/sample.md", ".aegis/rules/traps/.sample.md",
+    ".aegis/rules/traps/sample.MD", ".aegis/rules/traps/README.md", ".aegis/rules/traps/readme.MD",
+])
+@pytest.mark.parametrize("selected", ["all", "trap", "note"])
+def test_lint_truncated_delimiter_prefixes_keep_runtime_error_identities(tmp_path, path, selected):
+    from aegis_core.rules import load_rules
+
+    root = lint_root(tmp_path)
+    head = b"---\ntitle: Notes\n"
+    data = head + b"\n" * (lint.MAX_RULE_BYTES - len(head) - 3) + b"---not-a-delimiter\n"
+    target = root / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+    records = {r.path: r for r in load_rules(root).rules}
+    assert len(records) == 2 and "unterminated YAML frontmatter" in records[path].error
+    paths = [] if selected == "all" else [LINT_PATH if selected == "trap" else path]
+    results = lint.lint_workspace(root, paths)
+    assert {r.path for r in results} == ({LINT_PATH, path} if selected == "all" else set(paths))
+    for result in results:
+        duplicate = "duplicate rule id" in (records[result.path].error or "")
+        assert ("duplicate" in lint_codes(result)) is duplicate
+        if result.path == path:
+            assert "too_large" in lint_codes(result)
+
+
+@pytest.mark.parametrize("ending", [b"\n", b"\r\n"])
+def test_lint_complete_closing_delimiter_at_the_prefix_limit_stays_documentation(tmp_path, ending):
+    root = lint_root(tmp_path)
+    head = b"---\ntitle: Notes\n"
+    closing = b"---" + ending
+    data = head + b"\n" * (lint.MAX_RULE_BYTES - len(head) - len(closing)) + closing + b"oversized body\n"
+    (root / ".aegis/rules/sample.md").write_bytes(data)
+    results = lint.lint_workspace(root)
+    assert len(results) == 1 and results[0].ok
+
+
+@pytest.mark.parametrize("do", ["Keep `first` pytest -q `second` as prose.",
+                                "Keep ``ast.Constant('`pytest`')`` as data.",
+                                "Keep ``['`pytest`', '`Bash`']`` as data."])
+def test_lint_recognized_spans_are_opaque_to_stripped_reading(do):
+    result = lint.lint_rule(lint_bytes(do=do), LINT_PATH)
+    assert not any(f.check == 4 for f in result.findings)
+
+
+@pytest.mark.parametrize("marker", ["-", "*", "+", "1.", "2)"])
+def test_lint_new_list_items_bound_stripped_inline_windows(marker):
+    body = "## Do\nUse the project check.\n" + marker + " Keep `pytest\n    " + marker + " -q`.\n"
+    assert "concrete_command" not in lint_codes(lint.lint_rule(lint_bytes(body=body), LINT_PATH))
+
+
+@pytest.mark.parametrize("first,second", [("", "> "), ("> ", "> > "), ("> > ", "> ")])
+def test_lint_quote_depth_changes_bound_stripped_inline_windows(first, second):
+    body = "## Do\nUse the project check.\n" + first + "Keep `pytest\n" + second + "-q`.\n"
+    assert "concrete_command" not in lint_codes(lint.lint_rule(lint_bytes(body=body), LINT_PATH))
+
+
+@pytest.mark.parametrize("do", [
+    "In `$" "{SLOT.TOOL_RUN}` Bash runs `$" "{SLOT.TEST_RUNNER}`.",
+    "In `$" "{SLOT.TEST_RUNNER}` pytest -q runs `$" "{SLOT.LINTER}`.",
+    "Use `$" "{SLOT.TOOL_READ}` before calling `$" "{SLOT.TOOL_EDIT}`.",
+    "With `$" "{SLOT.TOOL_READ}` read the header before `$" "{SLOT.TOOL_EDIT}`.",
+    "Use `$" "{SLOT.TOOL_READ}` when inspecting `$" "{SLOT.TOOL_EDIT}` targets.",
+])
+def test_lint_addendum_prose_between_slot_spans_is_not_inspected(do):
+    result = lint.lint_rule(lint_bytes(do=do), LINT_PATH)
+    assert not any(f.check == 4 for f in result.findings)
+
+
+@pytest.mark.parametrize("variant", ["argon", "correctness"])
+def test_lint_addendum_truncated_comment_delimiters_keep_duplicates(tmp_path, variant):
+    from aegis_core.rules import load_rules
+
+    root = lint_root(tmp_path)
+    header = b"---\ntitle: Notes\n# "
+    if variant == "argon":
+        data = header + b"a" * (65536 - len(header) - 4) + b"\n---" + b"x: 1\n"
+    else:
+        data = header + b"x" * (lint.MAX_RULE_BYTES - 23) + b"\n---invalid\n"
+    path = ".aegis/rules/sample.md"
+    (root / path).write_bytes(data)
+    records = load_rules(root).rules
+    assert len(records) == 2 and all("duplicate rule id" in r.error for r in records)
+    results = lint.lint_workspace(root)
+    assert {r.path for r in results} == {LINT_PATH, path}
+    assert all("duplicate" in lint_codes(r) for r in results)
+    assert "too_large" in lint_codes(next(r for r in results if r.path == path))
+
+
+@pytest.mark.parametrize("path", [
+    ".aegis/rules/traps/large.md", ".aegis/rules/large.md",
+    ".aegis/rules/traps/nested/large.md", ".aegis/rules/unknown/large.md",
+    ".aegis/rules/traps/README.md",
+])
+@pytest.mark.parametrize("signature", [b"", b"\xef\xbb\xbf"])
+def test_lint_addendum_headerless_oversized_files_keep_neighbor_results(tmp_path, monkeypatch, path, signature):
+    from aegis_core.rules import load_rules
+
+    root = lint_root(tmp_path)
+    target = root / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(signature + b"x" * 65537)
+    records = load_rules(root).rules
+    monkeypatch.setattr(lint, "MAX_RULE_TOTAL", lint.MAX_RULE_BYTES)
+    results = lint.lint_workspace(root)
+    assert {r.path for r in results} == {r.path for r in records}
+    by_path = {r.path: r for r in results}
+    assert by_path[LINT_PATH].ok
+    if path in by_path:
+        assert lint_codes(by_path[path]) == {"too_large"}
+
+
+@pytest.mark.parametrize("oversized", [False, True])
+def test_lint_addendum_deleted_pre_reads_report_changed(tmp_path, monkeypatch, oversized):
+    root = lint_root(tmp_path)
+    path = root / LINT_PATH
+    if oversized:
+        path.write_bytes(lint_bytes() + b"x" * lint.MAX_RULE_BYTES)
+    inventory = lint.inventory_rules
+
+    def deleted(workspace):
+        path.unlink()
+        return inventory(workspace)
+
+    monkeypatch.setattr(lint, "inventory_rules", deleted)
+    results = lint.lint_workspace(root, [LINT_PATH])
+    assert len(results) == 1 and lint_codes(results[0]) == {"changed"}
+    assert lint_codes(lint.lint_workspace(root, [LINT_PATH])[0]) == {"missing"}
+
+
+@pytest.mark.parametrize("body,code", [
+    ("## Do\n```$" "{SLOT.TEST_RUNNER}```\n## Notes\npytest -q is replaced by $" "{SLOT.TEST_RUNNER}.\n", None),
+    ("## Do\n- ```$" "{SLOT.TEST_RUNNER}```\n- Keep a literal backtick: `.\n    - Run `pytest\n      -q`.\n", "concrete_command"),
+    ("## Do\n- ```$" "{SLOT.TEST_RUNNER}```\n    - Run `pytest\n      -q`.\n", "concrete_command"),
+    ("## Do\n- ```$" "{SLOT.TEST_RUNNER}```\n    - Inner\n      ```\n      pytest -q\n      ```\n", "concrete_command"),
+    ("## Do\n- Outer\n    - Middle\n        - ```bespoke-check --strict```\n", "unmapped_command"),
+])
+def test_lint_addendum_inline_triple_spans_never_open_fences(body, code):
+    result = lint.lint_rule(lint_bytes(body=body), LINT_PATH)
+    if code is None:
+        assert not any(f.check == 4 for f in result.findings)
+    else:
+        assert code in lint_codes(result)
+
+
+@pytest.mark.parametrize("role", ["TEST_RUNNER", "LINTER", "FORMATTER", "TYPE_CHECKER", "BUILD_TOOL"])
+@pytest.mark.parametrize("argument", ["build", "src/read", "src", "tests/unit", "--check"])
+@pytest.mark.parametrize("cue", ["Run ", ""])
+def test_lint_addendum_role_slots_keep_positional_arguments_in_their_command(role, argument, cue):
+    do = cue + "`$" + "{SLOT." + role + "} " + argument + "`."
+    result = lint.lint_rule(lint_bytes(do=do), LINT_PATH)
+    assert not any(f.check == 4 for f in result.findings)
+
+
+@pytest.mark.parametrize("role", ["TEST_RUNNER", "LINTER", "FORMATTER", "TYPE_CHECKER", "BUILD_TOOL"])
+def test_lint_addendum_role_slots_exempt_only_their_control_segment(role):
+    do = "Run `$" + "{SLOT." + role + "} src && pytest -q`."
+    assert "concrete_command" in lint_codes(lint.lint_rule(lint_bytes(do=do), LINT_PATH))
+
+
+def test_lint_addendum_capability_slots_still_unwrap_concrete_commands():
+    do = "Run `$" "{SLOT.TOOL_RUN} pytest -q`."
+    assert "concrete_command" in lint_codes(lint.lint_rule(lint_bytes(do=do), LINT_PATH))

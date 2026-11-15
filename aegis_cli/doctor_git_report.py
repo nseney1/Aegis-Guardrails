@@ -9,6 +9,7 @@ __all__ = [
     'SCHEMA',
     'DISPLAY_MAX',
     'VALUE_MAX',
+    'LINE_BREAKS',
     'NONE',
     'RETRY',
     'NO_DELETE',
@@ -16,6 +17,9 @@ __all__ = [
     'NO_PRUNE',
     'SET_NEVER',
     'SUGGEST',
+    'LEGACY_DETAIL',
+    'GATED_DETAIL',
+    'UNGATED',
     'SIGNERS',
     'DONE',
     'STALE',
@@ -29,18 +33,22 @@ __all__ = [
     'digest',
     'visible',
     'display',
+    'display_target',
+    'gate_detail',
     'row',
     'print_report',
 ]
 
-(NONE, RETRY, NO_DELETE, NO_FOLLOW, NO_PRUNE, SET_NEVER, SUGGEST, SIGNERS, DONE, STALE, DISK, GC,
- INSPECT, RENAME, PLATFORM, OUTSIDE, SCRATCH_ACT) = (
+(NONE, RETRY, NO_DELETE, NO_FOLLOW, NO_PRUNE, SET_NEVER, SUGGEST, LEGACY_DETAIL, GATED_DETAIL, UNGATED,
+ SIGNERS, DONE, STALE, DISK, GC, INSPECT, RENAME, PLATFORM, OUTSIDE, SCRATCH_ACT) = (
     "owner action: none", "owner action: retry aegis doctor",
     "owner action: review the path and remove it yourself (doctor does not delete)",
     "owner action: replace the symlink with a real directory or file (doctor does not follow links)",
     "owner action: git worktree prune once if the count stays above zero (doctor does not prune)",
     "owner action: git config gc.worktreePruneExpire never (doctor does not write git config)",
     "owner action: commit an approvals map with main signature, develop review, release/** review and * none (doctor does not write configuration)",
+    "legacy gating (no map)", "every target keeps the gate",
+    "owner action: set each listed target to signature and configure signers, or accept that weakenings to it need only its mode (doctor does not write configuration)",
     "owner action: add a key to allowed_signers (doctor does not write key material)",
     "owner action: aegis team gc (doctor does not delete leases)",
     "owner action: delete the stale lane branch after the lane is done (doctor does not delete refs)",
@@ -74,11 +82,78 @@ def visible(text):
     shown, code = display(text)
     return text if code is None and shown == text else None
 
-def display(text, *, single_line=True, max_len=DISPLAY_MAX):
-    if not isinstance(text, str): text = str(text)
-    if len(text) > VALUE_MAX: return None, "value_too_long"
-    if single_line and ("\n" in text or "\r" in text or "\x00" in text): return None, "multiline_refused"
-    safe = primitives.sanitize_display(text, max_len=None).encode("utf-8", "backslashreplace").decode("utf-8")
+# Every str.splitlines() separator, plus NUL. Refused before sanitize can join them.
+LINE_BREAKS = frozenset("\n\r\x00\v\f\x1c\x1d\x1e\x85\u2028\u2029")
+_LINE_BREAKS = LINE_BREAKS
+
+def _canonicalize(text):
+    safe = primitives.sanitize_display(text, max_len=None)
+    # Unicode spaces stay spaces so redaction still sees the separator.
+    safe = "".join(" " if char.isspace() else char for char in safe if char.isspace() or char.isprintable())
+    return safe.encode("utf-8", "backslashreplace").decode("utf-8")
+
+def _mode_token(mode):
+    return isinstance(mode, str) and mode.isascii() and mode.isidentifier() and 0 < len(mode) <= 32
+
+def _structured(text):
+    return any(char.isspace() or char in ",;" for char in text)
+
+def gate_detail(pairs):
+    """One display-stable line naming targets that lose the gate, or a fixed fallback."""
+    if pairs is None:
+        return GATED_DETAIL
+    if isinstance(pairs, (str, bytes)) or not hasattr(pairs, "__iter__"):
+        return "targets lose the gate"
+    clean = []
+    for item in pairs:
+        if not isinstance(item, tuple) or len(item) != 2:
+            return "targets lose the gate"
+        target, mode = item
+        if (not isinstance(target, str) or not target or not _mode_token(mode)
+                or display_target(target, max_len=VALUE_MAX) != (target, None) or _structured(target)):
+            return "targets lose the gate"
+        clean.append((target, mode))
+    if not clean:
+        return GATED_DETAIL
+    return _fit_pairs(clean)
+
+def _name_pieces(names, budget):
+    """Keep whole identifiers; digest the longest names only when space requires it."""
+    needed = sum(len(name) for name in names)
+    if needed <= budget:
+        return names
+    pieces = list(names)
+    for index in sorted(range(len(names)), key=lambda index: len(names[index]), reverse=True):
+        token = digest(names[index])
+        if len(token) >= len(names[index]):
+            break
+        needed -= len(names[index]) - len(token)
+        pieces[index] = token
+        if needed <= budget:
+            return pieces
+    return None
+
+def _fit_pairs(pairs):
+    prefix = "lose the gate: "
+    total = len(pairs)
+    for count in range(total, 0, -1):
+        hidden = total - count
+        suffix = f" (+{hidden} more)" if hidden else ""
+        selected = pairs[:count]
+        overhead = len(prefix) + len(suffix) + (2 * (count - 1))
+        overhead += sum(len(mode) + 1 for _target, mode in selected)
+        pieces = _name_pieces([target for target, _mode in selected], DISPLAY_MAX - overhead)
+        if not pieces:
+            continue
+        trial = prefix + ", ".join(f"{piece} {mode}" for piece, (_target, mode) in zip(pieces, selected)) + suffix
+        if len(trial) > DISPLAY_MAX:
+            continue
+        shown, code = display(trial)
+        if code is None and shown == trial:
+            return trial
+    return prefix + f"(+{total} more)"
+
+def _publish(safe, max_len):
     redacted = safe
     for _step in range(max(1, len(safe) + 1)):
         nxt = redact_command_secrets(redacted)
@@ -94,6 +169,23 @@ def display(text, *, single_line=True, max_len=DISPLAY_MAX):
             stop = begin
             break
     return redacted[:max(0, stop)].rstrip() + "...", None
+
+def display(text, *, single_line=True, max_len=DISPLAY_MAX):
+    if not isinstance(text, str): text = str(text)
+    if len(text) > VALUE_MAX: return None, "value_too_long"
+    if single_line and ("\n" in text or "\r" in text or "\x00" in text): return None, "multiline_refused"
+    safe = primitives.sanitize_display(text, max_len=None).encode("utf-8", "backslashreplace").decode("utf-8")
+    return _publish(safe, max_len)
+
+def display_target(text, *, max_len=DISPLAY_MAX):
+    """Bound one approvals-target field: refuse line breaks, then canonicalize, redact, truncate.
+
+    Existing rows keep display(). This path is only for names that lose the gate.
+    """
+    if not isinstance(text, str): text = str(text)
+    if len(text) > VALUE_MAX: return None, "value_too_long"
+    if any(char in _LINE_BREAKS for char in text): return None, "multiline_refused"
+    return _publish(_canonicalize(text), max_len)
 
 def row(row_id, status, code, owner_action, detail):
     row = {"id": row_id, "status": status, "code": code, "owner_action": owner_action, "detail": detail}

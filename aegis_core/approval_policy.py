@@ -25,7 +25,7 @@ from aegis_core.workspace.layout import AEGIS_DIRNAME
 __all__ = ["BaseUnavailable", "InvalidApprovalPolicy", "PolicyUnavailable", "Policy", "parse_policy", "mode_for", "read_policy",
            "resolve_policy", "BaseResolution", "resolve_comparison", "resolve_base", "policy_present", "push_base",
            "guidance_value", "GuidanceMessage", "MessageRow", "finding_message", "receipt_value", "MESSAGE_TEMPLATES",
-           "MESSAGE_OWNERS", "clip_rendered_text"]
+           "MESSAGE_OWNERS", "clip_rendered_text", "ungated_targets"]
 
 CONFIG_PATH = f"{AEGIS_DIRNAME}/config.json"
 MAX_CONFIG_BYTES = 64 * 1024
@@ -613,6 +613,30 @@ class Policy:
         if self.error:
             fields["approval_policy_error"] = self.error
         return fields
+
+
+def ungated_targets(policy: Any):
+    """Sorted targets that lose the gate, using only Policy.permits_unsigned.
+
+    None and an empty map name no target. A value that is not a plain dict, exceeds
+    MAX_PATTERNS, or holds a non-string, empty, overlong, or unknown-mode entry is
+    refused before the predicate is constructed. The refusal is the fixed invalid-policy detail.
+    Names up to 512 characters stay eligible so a later display digest is not a parse error.
+    """
+    if policy is None:
+        return ()
+    if type(policy) is not dict or len(policy) > MAX_PATTERNS:
+        raise InvalidApprovalPolicy(INVALID_DETAIL)
+    items = tuple(policy.items())
+    for target, mode in items:
+        if (type(target) is not str or type(mode) is not str
+                or not 0 < len(target) <= 512 or mode not in MODES):
+            raise InvalidApprovalPolicy(INVALID_DETAIL)
+    found = []
+    for target, mode in items:
+        if Policy(mode=mode).permits_unsigned:
+            found.append((target, mode))
+    return tuple(sorted(found))
 
 
 def resolve_policy(root: Any, base: str, head: str, target: Optional[str]) -> Policy:
