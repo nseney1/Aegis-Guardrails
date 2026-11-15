@@ -249,7 +249,8 @@ def test_text_scan_prints_no_terminal_control_sequences_from_rule_files(slot_ws,
     out = capsys.readouterr().out
     assert rc == 0
     assert "\x1b" not in out and "\x07" not in out
-    assert "Still shown." in out and "\n" in out.strip()  # lines are kept
+    assert "   Detail: guidance withheld: control characters\n" in out
+    assert "Still shown." not in out and "\n" in out.strip()  # other lines are kept
 
 
 # Windows refuses control characters in file names; elsewhere a cloned repository can ship them.
@@ -265,13 +266,14 @@ def test_a_failed_scan_prints_no_terminal_control_sequences_from_rule_file_names
     err = capsys.readouterr().err
     assert "\x1b" not in err and "\x07" not in err
     assert err.startswith("Error: 1 rule file(s) cannot be served") and err.endswith("\n")
-    assert "trap-bad" in err and "malformed YAML frontmatter" in err
+    assert "trap-bad" not in err and "malformed YAML frontmatter" in err
+    assert "guidance_projection_invalid_field" in err
 
-    # JSON keeps the name as it is on disk; json.dumps escapes it.
+    # JSON carries the same projected display name as text output.
     assert main(["scan", "src/app.py", "--json"]) == 1
     out = capsys.readouterr().out
     assert "\x1b" not in out
-    assert [e["path"] for e in json.loads(out)["rule_errors"]] == [f".aegis/rules/traps/trap-bad{_HOSTILE}.md"]
+    assert [e["path"] for e in json.loads(out)["rule_errors"]] == ["guidance_projection_invalid_field"]
 
 
 @posix_names
@@ -283,4 +285,6 @@ def test_a_workspace_error_prints_no_terminal_control_sequences_from_the_directo
     assert main(["scan", "app.py"]) == 2
     err = capsys.readouterr().err
     assert "\x1b" not in err and "\x07" not in err
-    assert "not an Aegis workspace" in err and "clone" in err
+    assert err == ("Error: not an Aegis workspace (no .aegis/ in "
+                   "guidance withheld: control characters); run aegis init\n")
+    assert "clone" not in err
