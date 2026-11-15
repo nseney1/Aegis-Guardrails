@@ -4041,3 +4041,61 @@ def test_grouped_report_preserves_refused_live_lease_lines(field):
     refused = dict(healthy, **{field: "bad\nline"})
     lines = _text({"rows": [refused, healthy]}).splitlines()[1:]
     assert lines == ["  [pass] refused", "  [pass] leases: live 1, expired 0, unreadable 0; " + doctor_git_report.NONE]
+
+
+@pytest.mark.parametrize("code", ["scan_capped", "depth_capped"])
+@pytest.mark.parametrize("name,label", [
+    (None, "."),
+    ("src", "src"),
+    ("ordinary space", "ordinary space"),
+    ("bad\nline", "path " + doctor_git_report.digest("bad\nline")),
+    ("a" * 513, "path " + doctor_git_report.digest("a" * 513)),
+    ("path token", r"path\ token [" + doctor_git_report.digest("path token") + "]"),
+    ("bracket[name]", r"bracket\[name\] [" + doctor_git_report.digest("bracket[name]") + "]"),
+    ("none", None),
+    ("a, b", None),
+    ("a; omitted: 0", None),
+], ids=["root", "safe", "space", "hostile", "oversized", "opaque-prefix", "escaped",
+        "sentinel", "comma", "semicolon"])
+def test_limit_wording_round_trips_producer_to_grouped_report(monkeypatch, code, name, label):
+    sentence = "the revised " + code + " sentence"
+    monkeypatch.setattr(doctor_git_report, "_LIMIT_DETAILS", {**doctor_git_report._LIMIT_DETAILS, code: sentence})
+    parts = () if name is None else (name,)
+    produced = doctor_git_observe._path_refusal(code, parts)
+    captured = "." if name is None else doctor_git_report.location(parts, prefix=sentence + " (", suffix=")")
+    assert produced == {
+        "id": "disk_walk", "status": "warn", "code": code,
+        "owner_action": doctor_git_report.INSPECT,
+        "detail": sentence if name is None else sentence + " (" + captured + ")",
+    }
+    report = {"rows": [produced]}
+    before = _blob(report)
+    expected = (f"  [warn] {code}: 1 findings; locations: {label or 'none'}; "
+                f"omitted: {int(label is None)}; " + doctor_git_report.INSPECT)
+    for _attempt in range(2):
+        assert _text(report).splitlines()[1:] == [expected]
+        assert _blob(report) == before
+
+
+def test_changed_limit_wording_keeps_concurrent_reports_independent(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    monkeypatch.setattr(doctor_git_report, "_LIMIT_DETAILS", {
+        "scan_capped": "revised scan_capped", "depth_capped": "revised depth_capped"})
+    barrier = threading.Barrier(2)
+
+    def produce_and_render(code, name):
+        barrier.wait(timeout=5)
+        report = {"rows": [doctor_git_observe._path_refusal(code, (part,))
+                           for part in ("a; omitted: 0", name)]}
+        before = _blob(report)
+        for _attempt in range(2):
+            assert _text(report).splitlines()[1:] == [
+                f"  [warn] {code}: 2 findings; locations: {name}; omitted: 1; " + doctor_git_report.INSPECT]
+            assert _blob(report) == before
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pending = [pool.submit(produce_and_render, code, name)
+                   for code, name in (("scan_capped", "alpha"), ("depth_capped", "beta"))]
+        for future in pending:
+            future.result(timeout=5)
