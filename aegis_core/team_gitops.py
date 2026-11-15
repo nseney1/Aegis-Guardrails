@@ -58,8 +58,8 @@ from aegis_core.gitops_rows import (GitOpsError, JournalRead, OPS, REFUSALS,
     same_intent as _same_intent, encoded as _encoded, terminal_bytes as _terminal_bytes)
 
 
-def _parse(data):
-    return rows.parse(data, max_lines=MAX_RECORD_LINES, max_row_bytes=MAX_ROW_BYTES)
+def _parse(data, *, capture=False):
+    return rows.parse(data, max_lines=MAX_RECORD_LINES, max_row_bytes=MAX_ROW_BYTES, capture=capture)
 
 
 def display_row(value, _depth=0):
@@ -542,33 +542,12 @@ class GitOpsJournal:
         if not root.is_absolute() or ".." in root.parts:
             raise GitOpsError("unsafe_journal")
         self.common_dir = root
-        self._in_flight = {}
-        self._flight_guard = threading.RLock()
-
-    def _sync_flights(self, pending):
-        current = {row["request_id"]: row for row in pending}
-        with self._flight_guard:
-            self._in_flight = {key: row for key, row in self._in_flight.items()
-                               if key in current and _same_intent(row, current[key])}
-
-    def _flight_update(self, intent, held):
-        with self._flight_guard:
-            if held:
-                self._in_flight[intent["request_id"]] = intent
-            else:
-                self._in_flight.pop(intent["request_id"], None)
-
-    def _forget_flights(self, requests):
-        with self._flight_guard:
-            for request in requests:
-                self._in_flight.pop(request, None)
 
     def _retire_completed_claim(self, directory, intent, effect):
         with self._transaction(write=True, directory_fd=directory) as (_, _, read, _):
             if any(row["kind"] == "tombstone" and _same_intent(row, intent)
                    for row in read.rows):
                 _retire_effect(directory, intent["request_id"], held=effect)
-                self._flight_update(intent, False)
 
     @contextmanager
     def _transaction(self, write=False, *, directory_fd=None):
@@ -611,7 +590,7 @@ class GitOpsJournal:
                         data = _read_fd(fd)
                         if write:
                             data = _quarantine(fd, data)
-                        read = _parse(data)
+                        read = _parse(data, capture=write)
                         yield fd, data, read, directory
 
     def read(self):
@@ -629,15 +608,13 @@ class GitOpsJournal:
     def in_flight(self, lane=None):
         """Read-only live ownership query, including held rows from this reconcile.
 
-        Shared probes never create files or retain execution ownership. Cached
-        facts are bound to the current pending intent and never replace a live
-        probe. A retired/missing name gets one anchored journal refresh.
+        Shared probes never create files or retain execution ownership.
+        A retired/missing name gets one anchored journal refresh.
         """
         if lane is not None and not _identifier(lane, _LANE):
             raise GitOpsError("invalid_request")
         reported = []
         with self._transaction() as (_, _, read, directory):
-            self._sync_flights(_pending(read.rows))
             for intent in _pending(read.rows, lane):
                 request = intent["request_id"]
                 held = _effect_held(directory, request)
@@ -648,7 +625,6 @@ class GitOpsJournal:
                     held = current is not None
                     if current is not None:
                         intent = current
-                self._flight_update(intent, held)
                 if held:
                     reported.append(dict(intent, kind="in_flight", status="in_flight",
                                          next_action=dict(_IN_FLIGHT_ACTION)))
@@ -731,7 +707,6 @@ class GitOpsJournal:
                         raise GitOpsError("result_conflict", result_cause="durable")
                     os.fsync(fd)
                     _release_owner(key)
-                    self._forget_flights([request_id])
                     return rows.as_result(old)
             with _OWNER_GUARD:
                 held = _OWNERS.get(key)
@@ -760,7 +735,6 @@ class GitOpsJournal:
                     row = checkpoint
                 _append(fd, row, len(data))
                 _release_owner(key)
-                self._forget_flights([request_id])
             finally:
                 os.close(effect)
             return row
@@ -813,7 +787,6 @@ class GitOpsJournal:
                     next_generation = _committed_generation(fd, data, read, appended=size - len(data))
                     next_cached = {row["request_id"]: row for row in
                                    _pending(read.rows + recorded, lane)}
-                self._forget_flights(row["request_id"] for row in recorded)
                 return next_cached, next_generation, recorded
             except GitOpsError as error:
                 if (error.code not in ("journal_busy", "journal_io")
@@ -841,7 +814,6 @@ class GitOpsJournal:
         with _refusals(self.common_dir), _directory(self.common_dir, True) as directory:
             with self._transaction(write=True, directory_fd=directory) as (fd, data, read, _):
                 all_pending = _pending(read.rows)
-                self._sync_flights(all_pending)
                 pending = [row for row in all_pending if row["lane"] == lane]
                 cached = {row["request_id"]: row for row in pending}
                 generation = _committed_generation(fd, data, read)
@@ -871,14 +843,10 @@ class GitOpsJournal:
                             current = {row["request_id"]: row for row in _pending(read.rows, lane)}
                             compacted_requests = {row["request_id"] for row in read.rows
                                                   if row["kind"] == "tombstone"}
-                    for intent in unclaimed:
-                        live = current.get(intent["request_id"])
-                        self._flight_update(intent, live is not None and _same_intent(live, intent))
                     observations = []
                     for intent, effect in claimed:
                         live = current.get(intent["request_id"])
                         if live is None or not _same_intent(live, intent):
-                            self._flight_update(intent, False)
                             if intent["request_id"] in compacted_requests:
                                 self._retire_completed_claim(directory, intent, effect)
                             continue
