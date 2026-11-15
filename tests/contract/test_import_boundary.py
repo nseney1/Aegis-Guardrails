@@ -56,7 +56,9 @@ CORE_LAYERS: Dict[str, int] = {
     # STORE-API-1: the confined read/publish boundary storage.confined_file delegates to (stdlib only).
     "aegis_core.storage_confined": 0,
     "aegis_core.storage_shared": 0,
+    "aegis_core.gitops_checkpoint": 0,
     "aegis_core.gitops_fds": 0,
+    "aegis_core.gitops_rows": 0,
     "aegis_core.gitsafe": 0,
     "aegis_core.gitsafe_run": 0,
     "aegis_core.team_claims": 2,
@@ -160,7 +162,9 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.baseline": 2,
     "aegis_core.card": 3,
     "aegis_core.partition": 3,
+    "aegis_core.team_profile_schema": 0,
     "aegis_core.team_publish": 2,
+    "aegis_core.team_qualify": 0,
     "aegis_core.team_queue": 2,
     # Read-only lane status report over lease declarations and the existing tip gate.
     "aegis_core.team_status": 3,

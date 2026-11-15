@@ -13,6 +13,180 @@ from aegis_core import config as profile_config
 from aegis_cli import team as profile_cli
 
 
+@pytest.mark.parametrize("surface", ["validate_resolved", "display_profile"])
+@pytest.mark.parametrize("defect,reason,path", [
+    ("envelope", "invalid value: profile", "profile"),
+    ("native_type", "wrong type: run_config.limits.writers_max", "run_config.limits.writers_max"),
+    ("required_first", "invalid value: supervisor", "supervisor"),
+    ("string_limit", "profile string size limit exceeded", "preset"),
+    ("unknown_host", "unregistered host kind: model_settings.hosts.primary.kind", "model_settings.hosts.primary.kind"),
+])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_schema_extraction_first_refusal_golden(surface, defect, reason, path, reverse):
+    value = profile.resolve()
+    if defect == "envelope":
+        del value["profile"]
+        value["values"] = None
+    elif defect == "native_type":
+        value["profile"]["run_config"]["limits"]["writers_max"] = True
+    elif defect == "required_first":
+        del value["profile"]["supervisor"]["components"]
+        value["profile"]["supervisor"]["pauses"] = ["bad"]
+    elif defect == "string_limit":
+        value["profile"]["preset"] = "x" * 4097
+    else:
+        value["profile"]["model_settings"]["hosts"]["primary"]["kind"] = "private-input"
+    value = _reordered_objects(value, reverse)
+    before = json.dumps(value)
+    for _ in range(2):
+        with pytest.raises(profile.ProfileError) as refused:
+            getattr(profile, surface)(value)
+        error = refused.value
+        assert (str(error), error.layer, error.path, error.exit_code) == (reason, "repo", path, 1)
+        assert json.dumps(value) == before
+    profile.validate_resolved(profile.resolve())
+
+
+@pytest.mark.parametrize("document,reason,path", [
+    ({}, "profile version required", None),
+    ({"version": 1, "run_config": {"limits": {"writers_max": True}}},
+     "wrong type: run_config.limits.writers_max", "run_config.limits.writers_max"),
+    ({"version": 1, "preset": "x" * 4097}, "profile string size limit exceeded", None),
+    ({"version": 1, "model_settings": {"hosts": {"primary": {"kind": "private-input"}}}},
+     "unregistered host kind: model_settings.hosts.primary.kind", "model_settings.hosts.primary.kind"),
+])
+def test_schema_extraction_load_refusal_golden(tmp_path, document, reason, path):
+    root = make_store(tmp_path)
+    target = root.joinpath(*profile.REPO_PATH)
+    target.parent.mkdir(mode=0o700, parents=True)
+    raw = json.dumps(document).encode("utf-8")
+    target.write_bytes(raw)
+    for _ in range(2):
+        with pytest.raises(profile.ProfileError) as refused:
+            profile.load(root, user_root=root)
+        error = refused.value
+        assert (str(error), error.layer, error.path, error.exit_code) == (reason, "repo", path, 1)
+        assert error.file == str(target) and target.read_bytes() == raw
+
+
+def test_profile_schema_validation_is_shared_below_both_facades():
+    import ast
+    from pathlib import Path
+    from aegis_core import team_profile_schema
+
+    assert supervisor_io.validate_input is team_profile_schema.validate_input
+    assert supervisor_io.SupervisorError is team_profile_schema.SupervisorError
+    assert profile.team_profile_schema is team_profile_schema
+    for module in (team_profile_schema, profile, supervisor_io):
+        tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+        definitions = [node for node in ast.walk(tree)
+                       if isinstance(node, ast.FunctionDef) and node.name == "validate_input"]
+        assert len(definitions) == int(module is team_profile_schema)
+        if module is team_profile_schema:
+            imports = []
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imports.extend(alias.name for alias in node.names)
+                elif isinstance(node, ast.ImportFrom):
+                    imports.append(node.module or "")
+                    imports.extend((node.module or "") + "." + alias.name for alias in node.names)
+            assert not {"aegis_core.team_profile", "aegis_core.team_supervisor"}.intersection(imports)
+
+
+def test_schema_validation_budgets_are_isolated_across_concurrent_calls():
+    from concurrent.futures import ThreadPoolExecutor
+
+    valid = profile.resolve()
+    bad = profile.resolve()
+    bad["values"] = {"preset": {"path": ["preset"], "value": "x" * 4097}}
+    before = json.dumps([valid, bad])
+
+    def check(index):
+        for _ in range(2):
+            profile.validate_resolved(valid)
+            shown = profile.display_profile(valid)
+            with pytest.raises(profile.ProfileError) as refused:
+                profile.validate_resolved(bad)
+            assert (str(refused.value), refused.value.layer, refused.value.path) == (
+                "profile string size limit exceeded", "repo", "preset")
+        return shown
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(check, range(6)))
+    assert all(result == results[0] for result in results)
+    assert json.dumps([valid, bad]) == before
+
+
+@pytest.mark.parametrize("operation", ["load", "initialize"])
+@pytest.mark.parametrize("limit,bound,message", [
+    ("bytes", 13, "profile size limit exceeded"),
+    ("depth", 1, "profile nesting limit exceeded"),
+    ("nodes", 151, "profile node limit exceeded"),
+    ("items", 1, "profile container size limit exceeded"),
+    ("string", 7, "profile string size limit exceeded"),
+])
+@pytest.mark.parametrize("over", [False, True])
+def test_json_preflight_boundary_golden(tmp_path, monkeypatch, operation, limit, bound, message, over):
+    root = make_store(tmp_path)
+    target = root.joinpath(*profile.REPO_PATH)
+    target.parent.mkdir(mode=0o700, parents=True)
+    raw = b'{"version":1}'
+    if limit == "nodes":
+        raw = json.dumps({"version": 1, "policy": {"gates": [
+            {"name": "g" + str(i), "runner": "local", "selector": "whole", "must_pass": True}
+            for i in range(16)]}}).encode("utf-8")
+    target.write_bytes(raw)
+    limits = dict(bytes=10000, depth=16, nodes=4096, items=64, string=100)
+    limits[limit] = bound - int(over)
+    monkeypatch.setattr(profile, "MAX_BYTES", limits["bytes"])
+    monkeypatch.setattr(profile, "MAX_DEPTH", limits["depth"])
+    monkeypatch.setattr(profile, "MAX_NODES", limits["nodes"])
+    monkeypatch.setattr(profile, "MAX_ITEMS", limits["items"])
+    monkeypatch.setattr(profile, "MAX_STRING", limits["string"])
+    if over:
+        def forbidden(*args, **kwargs):
+            pytest.fail("JSON tree allocated before the resource refusal")
+        monkeypatch.setattr(profile, "json", SimpleNamespace(loads=forbidden, dumps=json.dumps))
+    def run():
+        if operation == "load":
+            return profile.load(root, user_root=root)
+        return profile.initialize(root, "solo", force=True)
+    if over:
+        for _ in range(2):
+            with pytest.raises(profile.ProfileError) as refused:
+                run()
+            assert (str(refused.value), refused.value.exit_code, refused.value.layer) == (message, 1, "repo")
+            assert target.read_bytes() == raw
+    elif operation == "load":
+        assert run() == {**profile.resolve(repo=json.loads(raw)), "repository_profile_exists": True}
+    else:
+        assert run() == {"version": 1, "preset": "solo"}
+
+
+@pytest.mark.parametrize("operation", ["load", "initialize"])
+@pytest.mark.parametrize("raw,message", [
+    (b"[", "invalid profile JSON"),
+    (b"\xff", "invalid profile JSON"),
+    (b'{"version":NaN}', "invalid profile JSON"),
+    (b'{"version":1,"version":1}', "duplicate key in profile JSON"),
+    (b"{}", "profile version required"),
+])
+def test_json_parse_refusal_golden(tmp_path, operation, raw, message):
+    root = make_store(tmp_path)
+    target = root.joinpath(*profile.REPO_PATH)
+    target.parent.mkdir(mode=0o700, parents=True)
+    target.write_bytes(raw)
+    for _ in range(2):
+        with pytest.raises(profile.ProfileError) as refused:
+            if operation == "load":
+                profile.load(root, user_root=root)
+            else:
+                profile.initialize(root, "solo", force=True)
+        error = refused.value
+        assert (str(error), error.exit_code, error.layer, error.file) == (message, 1, "repo", str(target))
+        assert target.read_bytes() == raw
+
+
 def make_store(root):
     if not profile.descriptor_supported():
         pytest.skip("requires descriptor-relative nofollow operations")

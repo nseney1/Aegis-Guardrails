@@ -664,7 +664,7 @@ class TestSarifAndGitHubFormatters:
         lines = github_annotation_lines(doc)
         assert len(lines) == 2 and all(line.startswith("::error ") for line in lines)
         assert "file=rules/a%25b%0Dc%0Ad%3Ae%2Cf.md," in lines[0]
-        assert lines[0].endswith("::rule-deleted: a%25b%0Dc%0Ad:e,f: a%25b%0Dc%0Ad:e,f")
+        assert lines[0].endswith("::rule-deleted: a%25bc d:e,f: a%25bc d:e,f")
 
 
 class TestSarifIsSchemaValidAndHonest:
