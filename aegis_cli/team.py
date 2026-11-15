@@ -1,16 +1,13 @@
 """aegis team — lane leases for parallel agents (v4.1 spec §1, ADR 0005 AD-7).
 
 The dispatcher runs these; there is no MCP tool for them. ``claim``, ``renew`` and
-``transfer`` print the lane's new lease oid alone on stdout, so a script can pass it to
-the next ``--expect``. With ``--json`` stdout carries one document with ``source``,
-``aegis_version``, ``checked_at`` (UTC) and ``scope``, refusals and errors included.
-
-Host capacity check exits: 0 go, 3 hold, 4 fallback, 5 skip; 1 refused, 2 usage.
-Other exit codes: 0 done; 1 refused (taken, overlap, stale, absent, expired, unreadable) or
-git failed; 2 usage (an invalid lane name, glob, ttl, label or ``--expect``, a base
-that names no commit, no git repository). ``list`` and ``metrics`` change nothing.
-``model`` uses the public model-selection core and always emits JSON, exiting 2
-on refusal. Its MCP counterpart shares the core; neither launches a host.
+``transfer`` print the lane's new lease oid alone on stdout for the next ``--expect``.
+``--json`` carries ``source``, ``aegis_version``, ``checked_at`` (UTC) and ``scope``.
+Host capacity exits: 0 go, 3 hold, 4 fallback, 5 skip; 1 refused, 2 usage.
+Lease refusals exit 1 with ``CLAIM_REFUSALS`` text, the core reason set. Git failure exits 1.
+Exit 2 is usage (invalid lane, glob, ttl, label, ``--expect``, or a base that names no commit).
+``list`` and ``metrics`` change nothing. ``model`` emits JSON, exits 2, and launches no host.
+Renew refuses ``lease_branch_missing`` or ``liveness_unknown``. GC may warn ``expired_with_worktree``.
 """
 from __future__ import annotations
 
@@ -28,6 +25,7 @@ from aegis_cli import sanitize_display
 from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_core import gitsafe, team
 from aegis_core.primitives import utc_stamp
+from aegis_core.redaction import redact_command_secrets
 from aegis_core.team_profile import display_profile as display_profile
 
 __all__ = ["TeamCommand", "run_team"]
@@ -36,6 +34,8 @@ EXIT_OK = 0
 EXIT_REFUSED = 1
 EXIT_USAGE = 2
 ACTIONS = ("claim", "renew", "transfer", "release", "gc", "list", "status", "metrics")
+CLAIM_REFUSALS = {reason: reason + ":" for reason in (
+    "absent", "expired", "legacy_paths", "overlap", "stale", "taken", "unreadable")}
 
 MODEL_REQUIRED = ("bindings", "policy", "history", "task_kind", "role_kind", "subject", "host_kinds")
 MODEL_OPTIONAL = ("intent", "author_family", "lane_family", "review_stage", "record")
@@ -356,6 +356,13 @@ def _claim(args: argparse.Namespace, root: Path, now: int) -> int:
 
 
 def _renew(args: argparse.Namespace, root: Path, now: int) -> int:
+    try:
+        evidence = team.lease_branch_evidence(root, lane=args.lane, expect=args.expect, ttl_s=args.ttl)
+    except gitsafe.GitError:
+        return _liveness_refused(args, root, now, "liveness_unknown")
+    if not all(evidence.values()):
+        return _liveness_refused(args, root, now, "lease_branch_missing")
+    team.verify_lease_repository(root)
     return _changed(args, root, now, team.renew(root, args.lane, args.expect, ttl_s=args.ttl, now=now))
 
 
@@ -369,7 +376,14 @@ def _release(args: argparse.Namespace, root: Path, now: int) -> int:
 
 
 def _gc(args: argparse.Namespace, root: Path, now: int) -> int:
+    try:
+        evidence = team.lease_branch_evidence(root, now=now, worktrees=True)
+    except gitsafe.GitError:
+        return _liveness_refused(args, root, now, "liveness_unknown")
+    team.verify_lease_repository(root)
     result = team.gc(root, now=now)
+    rows = [{"lane": sanitize_display(redact_command_secrets(sanitize_display(c.lane, max_len=None)), max_len=63),
+             "reason": "expired_with_worktree"} for c in result.collected if evidence.get(c.previous)]
     warnings = [line for change in result.collected for line in change.warnings]
     if args.json:
         payload = _team_payload("gc", root, now, refs=team.LANES_REF)
@@ -377,11 +391,12 @@ def _gc(args: argparse.Namespace, root: Path, now: int) -> int:
             "status": "collected" if result.collected else "nothing to collect",
             "collected": [{"lane": c.lane, "previous": c.previous, "caller": c.caller} for c in result.collected],
             "kept": [{"lane": lane, "reason": reason} for lane, reason in result.kept],
-            "warnings": warnings,
+            "warnings": warnings + rows,
         })
         _emit(payload)
         return EXIT_OK
     _warn(warnings)
+    _warn([row["reason"] for row in rows])
     for change in result.collected:
         print(f"collected {change.lane}")
     if not result.collected:
@@ -584,6 +599,17 @@ def _hosts_result(args, resolved, payload):
 
 # ── Failures ─────────────────────────────────────────────────────────────────
 
+def _liveness_refused(args: argparse.Namespace, root: Path, now: int, reason: str) -> int:
+    action = team.lease_next_action(reason)
+    if args.json:
+        payload = _team_payload(args.team_action, root, now)
+        payload.update({"status": "refused", "reason": reason, "message": reason, "next_action": action})
+        _emit(payload)
+    else:
+        print(reason + ("\n" + action if action else ""), file=sys.stderr)
+    return EXIT_REFUSED
+
+
 def _failed(args: argparse.Namespace, root: Path, now: int, message: str, code: int) -> int:
     if args.json:
         payload = _team_payload(args.team_action, root, now)
@@ -595,24 +621,31 @@ def _failed(args: argparse.Namespace, root: Path, now: int, message: str, code: 
 
 
 def _refused(args: argparse.Namespace, root: Path, now: int, exc: team.LeaseRefused) -> int:
-    lease = _view(root, now, exc.current)
+    fixed = CLAIM_REFUSALS.get(exc.reason)
+    message = str(exc)
+    if not fixed or "\n" in message or "\r" in message or not message.startswith(fixed):
+        message = fixed or "refused"
+    canonical = sanitize_display(message, max_len=None)
+    text = sanitize_display(redact_command_secrets(canonical), max_len=None)
+    try:
+        lease = None if exc.reason == "legacy_paths" else _view(root, now, exc.current)
+    except (gitsafe.GitError, team.TeamUsageError, OSError, ValueError):
+        if args.team_action != "claim":
+            raise
+        lease = None
+    if lease and any(char.isspace() for path in lease["paths"] for char in path):
+        lease = None
     if args.json:
         payload = _team_payload(args.team_action, root, now, refs=team.LANES_REF, lane=exc.lane)
-        payload.update({
-            "status": "refused",
-            "reason": exc.reason,
-            "message": str(exc),
-            "current": exc.current,
-            "lanes": list(exc.lanes),
-            "lease": lease,
-            "warnings": list(exc.warnings),
-        })
+        payload.update(status="refused", reason=exc.reason, message=text,
+                       current=exc.current, lanes=list(exc.lanes), lease=lease,
+                       warnings=list(exc.warnings))
         if exc.next_action:
             payload["next_action"] = exc.next_action
         _emit(payload)
         return EXIT_REFUSED
     _warn(list(exc.warnings))
-    print(sanitize_display(str(exc), max_len=None), file=sys.stderr)
+    print(sanitize_display(text, max_len=None), file=sys.stderr)
     if exc.next_action:
         print(sanitize_display(exc.next_action, max_len=None), file=sys.stderr)
     for line in _lease_lines(lease):
@@ -815,13 +848,15 @@ def run_team(args: argparse.Namespace) -> int:
     root = Path(args.ws.root) if getattr(args, "ws", None) is not None else Path(args.workspace)
     now = int(time.time())
     try:
-        return _HANDLERS[action](args, root, now)
+        return (team.lease_operation(root, _HANDLERS[action], args, now, _refused) if action in ("renew", "gc")
+                else _HANDLERS[action](args, root, now))
     except team.LeaseRefused as exc:
         return _refused(args, root, now, exc)
     except team.TeamUsageError as exc:
         return _failed(args, root, now, str(exc), EXIT_USAGE)
     except gitsafe.GitError as exc:
-        return _failed(args, root, now, str(exc), EXIT_REFUSED)
+        return (_liveness_refused(args, root, now, "ambient_git_environment" if exc.code == "ambient_git_environment" else "liveness_unknown")
+                if action in ("renew", "gc") else _failed(args, root, now, str(exc), EXIT_REFUSED))
 
 
 def _configure_model_parser(sub, common):
@@ -913,6 +948,8 @@ class TeamCommand(AegisCommand):
         renew = sub.add_parser(
             "renew", parents=[common], help="Extend a lease; prints the new lease oid",
             description="Renew by compare-and-swap; an expired lease is re-claimed, overlap check included.",
+            epilog="CLI preflight: a missing recorded branch refuses with lease_branch_missing; an attached "
+                   "worktree is not required. Unavailable Git evidence refuses with liveness_unknown.",
         )
         renew.add_argument("lane", metavar="LANE", help=lane_help)
         renew.add_argument("--expect", required=True, metavar="OID", help=expect_help)
@@ -934,7 +971,9 @@ class TeamCommand(AegisCommand):
         release.add_argument("--expect", required=True, metavar="OID", help=expect_help)
 
         sub.add_parser("gc", parents=[common], help="Delete expired leases",
-                       description="Delete every expired lease by compare-and-swap; unreadable leases are kept.")
+                       description="Delete every expired lease by compare-and-swap; unreadable leases are kept.",
+                       epilog="CLI preflight: expired_with_worktree warning rows report attached worktrees; "
+                              "expired leases are still collected. Unavailable Git evidence refuses with liveness_unknown.")
         sub.add_parser("list", parents=[common], help="Show leases (conflict input, not liveness proof)",
                        description=team.LEASE_NOTE)
         status = sub.add_parser("status", parents=[common], help="Inspect every lane, branch and optional tip verdict",

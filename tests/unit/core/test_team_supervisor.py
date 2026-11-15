@@ -7,15 +7,21 @@ import copy
 from concurrent.futures import ThreadPoolExecutor
 import inspect
 import json
+import multiprocessing
 import os
 import stat
 from pathlib import Path
+import queue
+import threading
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 from aegis_core import team_profile as profile
 from aegis_core import team_status
 from aegis_core import team_supervisor
+from aegis_core import storage_confined
 
 
 def supervisor():
@@ -474,48 +480,173 @@ def test_store_does_not_create_a_missing_config_directory(tmp_path):
     assert not (root / ".config").exists()
 
 
+def _publication_states(full_history, round_number):
+    if full_history:
+        return [team_supervisor.empty_state(), _filled_state(team_supervisor, 100)]
+    states = [team_supervisor.empty_state(), team_supervisor.empty_state()]
+    for index, state in enumerate(states):
+        slot = state["components"]["autopilot"]
+        slot["failures"] = [10 + round_number * 2 + index] * (index + 1)
+        slot["delay_s"] = 30 * (index + 1)
+    return states
+
+
+def _publication_round(root, states, previous, control, connection):
+    """Hold both writers at the OS boundary, then read before and after each replace."""
+    arrived = [threading.Event(), threading.Event()]
+    release = [threading.Event(), threading.Event()]
+    pending = [threading.Event(), threading.Event()]
+    finished = [threading.Event(), threading.Event()]
+    errors = queue.Queue()
+    writer = threading.local()
+    real_replace = os.replace
+
+    def replace(source, destination, **kwargs):
+        index = writer.index
+        if control == "worker_exception" and index == 0:
+            raise RuntimeError("planted worker failure")
+        if control == "serial":
+            real_replace(source, destination, **kwargs)
+        else:
+            pending[index].set()
+        arrived[index].set()
+        if control == "timeout" and index == 0:
+            threading.Event().wait()
+        assert release[index].wait(5), "publication release timed out"
+        if control == "torn" and index == 0:
+            torn = copy.deepcopy(states[index])
+            torn["components"]["monitor"]["failures"] = [7]
+            data = json.dumps(torn).encode("utf-8")
+            fd = os.open(source, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW,
+                         dir_fd=kwargs["src_dir_fd"])
+            try:
+                assert os.write(fd, data) == len(data), "planted snapshot write was short"
+            finally:
+                os.close(fd)
+        if control != "serial":
+            real_replace(source, destination, **kwargs)
+            pending[index].clear()
+
+    def publish(index):
+        writer.index = index
+        try:
+            team_supervisor.store_state(states[index], user_root=root)
+        except BaseException as error:
+            errors.put(type(error).__name__)
+            arrived[index].set()
+        finally:
+            finished[index].set()
+
+    def check_errors():
+        if not errors.empty():
+            raise AssertionError("state publication worker failed: " + errors.get_nowait())
+
+    def read_pending(expected, indices):
+        assert all(pending[index].is_set() for index in indices), "no pending publication during read"
+        observed = team_supervisor.load_state(user_root=root)
+        assert all(pending[index].is_set() for index in indices), "publication ended before read completed"
+        assert observed == expected, "torn or unexpected snapshot"
+
+    # Replace this product module's OS reference; never mutate the shared os module.
+    proxy = SimpleNamespace(**{**vars(os), "replace": replace})
+    threads = [threading.Thread(target=publish, args=(index,), daemon=True) for index in range(2)]
+    with patch.object(storage_confined, "os", proxy):
+        try:
+            for thread in threads:
+                thread.start()
+            assert all(event.wait(5) for event in arrived), "publication boundary timed out"
+            check_errors()
+            if connection is not None:
+                connection.send(("started",))
+            read_pending(previous, (0, 1))
+            release[0].set()
+            assert finished[0].wait(5), "first publication timed out"
+            check_errors()
+            read_pending(states[0], (1,))
+            release[1].set()
+            assert finished[1].wait(5), "second publication timed out"
+            check_errors()
+            assert team_supervisor.load_state(user_root=root) == states[1], "torn or unexpected snapshot"
+            assert any(slot["failures"] for slot in states[1]["components"].values())
+        finally:
+            for event in release:
+                event.set()
+            for thread in threads:
+                if thread.ident is not None:
+                    thread.join(0.1)
+        assert all(not thread.is_alive() for thread in threads), "publication worker leaked"
+
+
+def _publication_child(root, full_history, control, connection):
+    try:
+        previous = _publication_states(full_history, 0)[1]
+        team_supervisor.store_state(previous, user_root=root)
+        for round_number in range(10):
+            states = _publication_states(full_history, round_number + 1)
+            _publication_round(root, states, previous, control,
+                               connection if round_number == 0 else None)
+            previous = states[1]
+        connection.send(("ok",))
+    except BaseException as error:
+        # Only fixed harness assertions are rendered; product exceptions report their type.
+        detail = str(error) if type(error) is AssertionError else type(error).__name__
+        connection.send(("error", detail))
+    finally:
+        connection.close()
+
+
+def _run_state_publication(root, full_history, control=None):
+    """Spawn for portable isolation and always terminate/reap before returning a failure."""
+    context = multiprocessing.get_context("spawn")
+    incoming, outgoing = context.Pipe(duplex=False)
+    child = context.Process(target=_publication_child, args=(root, full_history, control, outgoing))
+    try:
+        child.start()
+        outgoing.close()
+        assert incoming.poll(15), "publication child startup timed out"
+        result = incoming.recv()
+        if result == ("started",):
+            if not incoming.poll(0.3 if control == "timeout" else 15):
+                raise AssertionError("state publication worker timed out")
+            result = incoming.recv()
+        if result != ("ok",):
+            raise AssertionError(result[1] if len(result) > 1 else "missing publication result")
+        child.join(5)
+        assert child.exitcode == 0, "publication child did not exit cleanly"
+    finally:
+        outgoing.close()
+        incoming.close()
+        if child.pid is not None:
+            if child.is_alive():
+                child.terminate()
+            child.join(5)
+            if child.is_alive():
+                child.kill()
+                child.join(5)
+            assert not child.is_alive() and child.exitcode is not None, "publication child was not reaped"
+            child.close()
+
+
 def test_concurrent_replace_reads_whole_snapshots(tmp_path):
-    import threading
-    module = supervisor()
     root = make_store(tmp_path)
     _config(root)
-    errors = []
+    _run_state_publication(root, False)
 
-    def write_one(index):
-        state = module.empty_state()
-        if index % 2:
-            state["components"]["autopilot"]["failures"] = [index, index]
-            state["components"]["autopilot"]["delay_s"] = 60
-        else:
-            state["components"]["autopilot"]["failures"] = [index]
-            state["components"]["autopilot"]["delay_s"] = 30
-        try:
-            module.store_state(state, user_root=root)
-        except module.SupervisorError as error:
-            errors.append(str(error))
 
-    def read_some():
-        for _ in range(40):
-            try:
-                state = module.load_state(user_root=root)
-            except module.SupervisorError as error:
-                errors.append(str(error))
-                return
-            slot = state["components"]["autopilot"]
-            failures, delay = slot["failures"], slot["delay_s"]
-            whole = (failures == [] and delay == 30) or (len(failures) == 1 and delay == 30)
-            whole = whole or (len(failures) == 2 and delay == 60 and failures[0] == failures[1])
-            if not whole:
-                errors.append((failures, delay))
-                return
-
-    threads = [threading.Thread(target=write_one, args=(index,)) for index in range(40)]
-    threads.extend(threading.Thread(target=read_some) for _ in range(2))
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(30)
-    assert errors == [] and all(not thread.is_alive() for thread in threads)
+@pytest.mark.parametrize("full_history", [False, True], ids=["short", "full"])
+@pytest.mark.parametrize("control,message", [
+    ("serial", "no pending publication during read"),
+    ("torn", "torn or unexpected snapshot"),
+    ("worker_exception", "state publication worker failed: RuntimeError"),
+    ("timeout", "state publication worker timed out"),
+], ids=["serial", "torn", "worker_exception", "timeout"])
+def test_publication_harness_rejects_planted_failures(tmp_path, full_history, control, message):
+    root = make_store(tmp_path)
+    _config(root)
+    children_before = {child.pid for child in multiprocessing.active_children()}
+    with pytest.raises(AssertionError, match="^" + message + "$"):
+        _run_state_publication(root, full_history, control)
+    assert {child.pid for child in multiprocessing.active_children()} == children_before
 
 
 def test_unsupported_platform_refuses_state_io(tmp_path, monkeypatch):
@@ -856,39 +987,9 @@ def test_max_state_round_trips_and_one_past_is_refused(tmp_path):
 
 
 def test_two_writers_replace_full_history_as_whole_snapshots(tmp_path):
-    import threading
-    module = supervisor()
     root = make_store(tmp_path)
     _config(root)
-    full = _filled_state(module, 100)
-    blank = module.empty_state()
-    errors = []
-
-    def write_one(index):
-        try:
-            module.store_state(full if index % 2 else blank, user_root=root)
-        except module.SupervisorError as error:
-            errors.append(str(error))
-
-    def read_some():
-        for _ in range(20):
-            try:
-                state = module.load_state(user_root=root)
-            except module.SupervisorError as error:
-                errors.append(str(error))
-                return
-            lengths = [len(state["components"][name]["failures"]) for name in module.COMPONENTS]
-            if lengths not in ([0, 0, 0, 0, 0], [100, 100, 100, 100, 100]):
-                errors.append(lengths)
-                return
-
-    threads = [threading.Thread(target=write_one, args=(index,)) for index in range(8)]
-    threads.extend(threading.Thread(target=read_some) for _ in range(2))
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(30)
-    assert errors == [] and all(not thread.is_alive() for thread in threads)
+    _run_state_publication(root, True)
 
 
 def test_state_file_must_be_owner_only(tmp_path):
