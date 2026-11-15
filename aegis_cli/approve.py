@@ -26,8 +26,8 @@ characters. Leading and trailing spaces are trimmed before both review and signi
 Explicit base selectors must also be printable single-line text of at most 4096
 Unicode characters. Both reviews name the resolved base commit and its sanitized
 subject; base commits larger than 1 MiB are refused before reading that subject.
-Review fields retain printable Unicode and visibly escape other Unicode characters
-after the shared ANSI/control filtering, so formatting cannot reorder trusted text.
+Review values escape execution/chain syntax and control/format characters after
+canonicalization and redaction. Sentence punctuation stays in the templates.
 Both flows list governance paths changed from the comparison base to HEAD as review
 context; exemption signing still names only the selected fix commit and reason.
 """
@@ -44,6 +44,7 @@ from aegis_cli import stdin_is_tty as _stdin_is_tty
 from aegis_cli import sanitize_display
 from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_core import approval_policy, gitsafe, governance, human_gate
+from aegis_core.approval_policy import GuidanceMessage, MESSAGE_TEMPLATES
 
 __all__ = ["ApproveCommand", "run_approve"]
 
@@ -62,8 +63,8 @@ def _approval_payload(root: Path, status: str, **fields: Any) -> Dict[str, Any]:
 
 
 class _Refused(Exception):
-    def __init__(self, code: str, message: str) -> None:
-        super().__init__(message)
+    def __init__(self, code: str, message: Any) -> None:
+        super().__init__(message.render() if isinstance(message, GuidanceMessage) else message)
         self.code = code
 
 
@@ -74,13 +75,8 @@ def _review_text(value: object) -> str:
 
 
 def _base_label(value: str) -> str:
-    """Canonicalize, redact, then bound the selector used only for display."""
-    from aegis_core.redaction import redact_insight_text
-
-    if len(value) > _MAX_BASE_CHARS:
-        return "[diagnostic omitted: too_large]"
-    text = sanitize_display(value, max_len=None)
-    return redact_insight_text(text, max_len=max(len(text), _MAX_BASE_CHARS))[:_MAX_BASE_CHARS]
+    """One escaped display; it is never reused as a Git selector."""
+    return approval_policy.guidance_value(value, _MAX_BASE_CHARS, prose=True)
 
 
 def _staged(top: Path) -> bool:
@@ -91,7 +87,7 @@ def _staged(top: Path) -> bool:
 def _uncommitted_governance(top: Path) -> List[str]:
     changed = gitsafe.changed_files(top, "working", untracked=True)
     if changed is None:
-        raise _Refused("git_failed", "git could not list the working tree's changes")
+        raise _Refused("git_failed", GuidanceMessage("git_failed", MESSAGE_TEMPLATES["git_failed"], {}))
     gone = gitsafe.run(["diff-index", "-z", "--name-only", "--diff-filter=D", "HEAD"], top)
     deleted = [os.fsdecode(p) for p in gone.stdout.split(b"\0") if p] if gone.returncode == 0 else []
     return governance.touches_governance(changed, deleted)
@@ -111,14 +107,15 @@ def _base_review(top: Path, base_ref: str, commit: str, merge_base: str) -> str:
         if len(size) > 20 or not size.isdigit():
             raise _Refused("git_failed", error)
         if int(size) > _MAX_BASE_COMMIT_BYTES:
-            raise _Refused("git_failed", f"base commit is too large to review (limit {_MAX_BASE_COMMIT_BYTES} bytes)")
+            raise _Refused("git_failed", GuidanceMessage("git_failed", MESSAGE_TEMPLATES["git_failed_2"],
+                                                         {"limit": _MAX_BASE_COMMIT_BYTES}))
         shown = gitsafe.run(["log", "-1", "--no-show-signature", "--format=%s", "--encoding=UTF-8", commit, "--"], top)
     except gitsafe.GitError as exc:
         raise _Refused("git_failed", error) from exc
     if shown.returncode != 0:
         raise _Refused("git_failed", error)
-    subject = _review_text(shown.stdout.decode("utf-8", "replace").rstrip("\n"))
-    label = f"{_review_text(base_ref)} (= {_review_text(commit)} {subject})"
+    subject = approval_policy.guidance_value(shown.stdout.decode("utf-8", "replace").rstrip("\n"), prose=True)
+    label = f"{_base_label(base_ref)} (= {_review_text(commit)} {subject})"
     if merge_base != commit:
         label += f"; comparison starts at {_review_text(merge_base)}"
     return label
@@ -128,39 +125,35 @@ def _preflight(root: Path, base: Optional[str]) -> Tuple[Path, str, str, str, st
     """(top, base ref, pinned base, merge-base, review label, target), or a refusal."""
     top = gitsafe.toplevel(root)
     if top is None:
-        raise _Refused("not_git", f"{root} is not inside a git work tree")
+        raise _Refused("not_git", GuidanceMessage("not_git", MESSAGE_TEMPLATES["not_git"], {"root": str(root)}))
     head = gitsafe.head_commit(top)
     if not head:
-        raise _Refused("no_head", "the repository has no commit yet")
+        raise _Refused("no_head", GuidanceMessage("no_head", MESSAGE_TEMPLATES["no_head"], {}))
     if base == "":
         base = None
     base_ref = base if base is not None else gitsafe.resolve_base_ref(top)
     if base_ref is None:
-        raise _Refused("no_base", "no base branch found (origin/$GITHUB_BASE_REF, the branch origin/HEAD "
-                                     "names, main, develop or master); pass --base")
+        raise _Refused("no_base", GuidanceMessage("no_base", MESSAGE_TEMPLATES["no_base"], {}))
     try:
         resolved = approval_policy.resolve_comparison(top, base_ref, discovered=base is None)
     except approval_policy.PolicyUnavailable as exc:
-        raise _Refused("invalid_approval_policy", approval_policy.POLICY_UNAVAILABLE_DETAIL) from exc
+        raise _Refused("invalid_approval_policy", GuidanceMessage("invalid_approval_policy", MESSAGE_TEMPLATES["invalid_approval_policy"], {})) from exc
     base_commit = resolved.commit
-    label = _base_label(base_ref)
     if not base_commit:
-        origin = "fetch origin; " if base_ref.startswith(("origin/", "refs/remotes/origin/")) else ""
-        raise _Refused("no_base", f"cannot resolve the base {label!r}; {origin}fetch it or pass the full commit id")
+        raise _Refused("no_base", approval_policy.unresolved_base_hint(base_ref))
     merge_base = gitsafe.merge_base(top, base_commit, head)
     if not merge_base:
-        raise _Refused("no_common_history", "the resolved base and HEAD share no history; pass a base from HEAD's history")
-    return top, label, base_commit, merge_base, _base_review(top, label, base_commit, merge_base), resolved.target
+        raise _Refused("no_common_history", GuidanceMessage("no_common_history", MESSAGE_TEMPLATES["no_common_history"], {}))
+    return top, base_ref, base_commit, merge_base, _base_review(top, base_ref, base_commit, merge_base), resolved.target
 
 
 def _clean(top: Path) -> None:
     """The approval commit stays empty and a person approves only what is committed."""
     if _staged(top):
-        raise _Refused("staged", "changes are staged: an approval commit stays empty, so commit or unstage them first")
+        raise _Refused("staged", GuidanceMessage("staged", MESSAGE_TEMPLATES["staged"], {}))
     dirty = _uncommitted_governance(top)
     if dirty:
-        raise _Refused("uncommitted", "governance files have uncommitted changes "
-                       f"({', '.join(dirty)}): commit them first, then approve the committed state")
+        raise _Refused("uncommitted", GuidanceMessage("uncommitted", MESSAGE_TEMPLATES["uncommitted"], {"paths": dirty}))
 
 
 def _render_review(summary: List[str], warnings: List[str], use_json: bool) -> None:
@@ -178,12 +171,11 @@ def _sign(top: Path, use_json: bool, summary: List[str], what: str, message: str
     commit, then its verification against the base."""
     custody = human_gate.check_key_custody(top)
     if custody.status in ("none", "unsupported"):
-        raise _Refused("no_key", f"{custody.detail}. Set it up with: git config --global gpg.format ssh; "
-                       "git config --global user.signingkey <your key>")
-    warnings = [custody.detail] if custody.status in ("plain_file", "agent", "unknown") else []
+        raise _Refused("no_key", GuidanceMessage("no_key", MESSAGE_TEMPLATES["no_key"], {"detail": custody.detail}))
+    warnings = [approval_policy.guidance_value(custody.detail, prose=True)] \
+        if custody.status in ("plain_file", "agent", "unknown") else []
     if not _stdin_is_tty():
-        raise _Refused("no_terminal", "an approval needs a terminal and a typed y: a person has to look at what is "
-                       "approved, so this does not run from a script or an agent's shell")
+        raise _Refused("no_terminal", GuidanceMessage("no_terminal", MESSAGE_TEMPLATES["no_terminal"], {}))
     _render_review(summary, warnings, use_json)
     head = _review_text((gitsafe.head_commit(top) or '')[:12])
     question = f"Sign {_review_text(what)} on top of {head}? [y/N] "
@@ -195,14 +187,14 @@ def _sign(top: Path, use_json: bool, summary: List[str], what: str, message: str
     except EOFError:
         answer = ""
     if answer.strip().lower() not in ("y", "yes"):
-        raise _Refused("declined", "No approval made.")
+        raise _Refused("declined", GuidanceMessage("declined", MESSAGE_TEMPLATES["declined"], {}))
     try:
         commit = human_gate.signed_empty_commit(top, message, interactive=True)
     except human_gate.HumanGateError as exc:
-        raise _Refused("sign_failed", str(exc)) from exc
+        raise _Refused("sign_failed", GuidanceMessage("sign_failed", MESSAGE_TEMPLATES["sign_failed"], {"detail": str(exc)})) from exc
     verdict = verify(commit)
     return {"commit": commit, **fields, "verified": verdict.valid,
-            "verification": {"code": verdict.code, "reason": verdict.reason},
+            "verification": {"code": verdict.code, "reason": approval_policy.guidance_value(verdict.reason, prose=True)},
             "key_custody": custody.status, "warnings": warnings}
 
 
@@ -214,9 +206,8 @@ def _approve(root: Path, base: Optional[str], use_json: bool) -> Dict[str, Any]:
         detail = (approval_policy.POLICY_UNAVAILABLE_DETAIL if isinstance(exc, approval_policy.PolicyUnavailable)
                   else approval_policy.INVALID_DETAIL)
         raise _Refused("invalid_approval_policy", detail) from exc
-    if policy.mode in ("none", "review"):
-        raise _Refused("not_required", "this target does not require a signed governance approval; "
-                       "next_action: review and merge through the target branch's owner policy")
+    if policy.permits_unsigned:
+        raise _Refused("not_required", GuidanceMessage("not_required", MESSAGE_TEMPLATES["not_required"], {}))
     if policy.error:
         print(policy.error, file=sys.stderr)
     _clean(top)
@@ -225,12 +216,12 @@ def _approve(root: Path, base: Optional[str], use_json: bool) -> Dict[str, Any]:
         before = human_gate.governance_tree_hash(top, merge_base)
         entries = gitsafe.diff_entries(top, merge_base, "HEAD")
     except (human_gate.HumanGateError, gitsafe.GitError) as exc:
-        raise _Refused("git_failed", str(exc)) from exc
+        raise _Refused("git_failed", approval_policy.guidance_value(str(exc), prose=True)) from exc
     if digest == before:
-        raise _Refused("nothing", f"nothing governance-related changed since {base_ref}: there is nothing to approve")
+        raise _Refused("nothing", GuidanceMessage("nothing", MESSAGE_TEMPLATES["nothing"], {"base": base_ref}))
     categories = governance.touches_governance([p for _s, _o, _n, p in entries],
                                                [p for s, _o, _n, p in entries if s == "D"])
-    paths = [_review_text(path) for status, _old, _new, path in entries
+    paths = [approval_policy.guidance_value(path, prose=True) for status, _old, _new, path in entries
              if governance.category_of(path, deleted=status == "D") is not None]
     summary = [f"Governance changed since {base_review}: {', '.join(_review_text(item) for item in categories)}",
                f"Governance tree hash: {_review_text(digest)}",
@@ -238,28 +229,30 @@ def _approve(root: Path, base: Optional[str], use_json: bool) -> Dict[str, Any]:
     return _sign(top, use_json, summary, f"an approval of governance state {digest[:12]}",
                  human_gate.approval_message(digest),
                  lambda commit: human_gate.verify_approval(top, commit, digest, base_commit),
-                 {"governance_tree_hash": digest, "base": base_ref, "categories": categories})
+                 {"governance_tree_hash": digest, "base": _base_label(base_ref), "categories": categories})
 
 
 def _approve_test_exemption(root: Path, base: Optional[str], exempt_commit: str, reason: str, use_json: bool) -> Dict[str, Any]:
     top, base_ref, base_commit, merge_base, base_review, _target = _preflight(root, base)
     fix_commit = gitsafe.resolve_commit(top, exempt_commit.strip())
     if not fix_commit:
-        raise _Refused("unresolved", f"cannot resolve {exempt_commit!r} to a commit in {top}")
+        raise _Refused("unresolved", GuidanceMessage("unresolved", MESSAGE_TEMPLATES["unresolved"],
+                                                     {"commit": exempt_commit, "root": str(top)}))
     _clean(top)
     clean_reason = reason.strip()
     try:
         entries = gitsafe.diff_entries(top, merge_base, "HEAD")
     except gitsafe.GitError as exc:
-        raise _Refused("git_failed", "git could not list governance paths for review") from exc
-    paths = [_review_text(path) for status, _old, _new, path in entries
+        raise _Refused("git_failed", GuidanceMessage("git_failed", MESSAGE_TEMPLATES["git_failed_3"], {})) from exc
+    paths = [approval_policy.guidance_value(path, prose=True) for status, _old, _new, path in entries
              if governance.category_of(path, deleted=status == "D") is not None]
     return _sign(top, use_json, [f"Base: {base_review}", f"Exempting fix commit: {_review_text(fix_commit)}",
-                               f"Reason: {_review_text(clean_reason)}",
+                               f"Reason: {approval_policy.guidance_value(clean_reason, _MAX_REASON_CHARS, prose=True)}",
                                f"Governance paths changed: {', '.join(paths) or 'none'}"],
                  f"a test exemption for {fix_commit[:12]}", human_gate.exemption_message(fix_commit, clean_reason),
                  lambda commit: human_gate.verify_test_exemption(top, commit, fix_commit, base_commit),
-                 {"exempt_commit": fix_commit, "reason": clean_reason, "base": base_ref})
+                 {"exempt_commit": fix_commit, "reason": approval_policy.guidance_value(clean_reason, _MAX_REASON_CHARS, prose=True),
+                  "base": _base_label(base_ref)})
 
 
 @gitsafe.scrubbed()
@@ -316,7 +309,7 @@ def run_approve(args: argparse.Namespace) -> int:
         print(f"Approved governance state {_review_text(result['governance_tree_hash'])} in commit {_review_text(result['commit'])}.")
     if not result["verified"]:
         warning = (f"  warning: it does not verify against {_review_text(human_gate.ALLOWED_SIGNERS)} "
-                   f"on {_review_text(result['base'])} yet ({_review_text(result['verification']['code'])}): "
+                   f"on {_review_text(result['base'])} yet ({approval_policy.guidance_value(result['verification']['code'], prose=True)}): "
                    "CI will not accept it until your key is listed there.")
         print(_review_text(warning))
     print("  Push it with the branch; CI checks the signature against the base branch's keys.")
