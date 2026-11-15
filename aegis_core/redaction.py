@@ -8,13 +8,17 @@ masks with ``TOKEN_REDACTIONS`` and ``is_high_entropy_secret``).
 from __future__ import annotations
 
 import collections
+from dataclasses import dataclass, field
 import math
 import re
+import unicodedata
+from typing import Any
 
 __all__ = [
     "CANDIDATE_TOKEN_RE",
     "MAX_EXCERPT_CHARS",
     "MAX_LINE_LENGTH",
+    "REDACTION_MASK_RE",
     "SECRET_REPLACEMENTS",
     "TOKEN_REDACTIONS",
     "is_high_entropy_secret",
@@ -22,6 +26,14 @@ __all__ = [
     "redact_command_secrets",
     "redact_insight_text",
     "shannon_entropy",
+    "MAX_GUIDANCE_CHARS",
+    "clip_rendered_text",
+    "command_token",
+    "GUIDANCE_ESCAPE_PATTERN",
+    "guidance_field",
+    "guidance_value",
+    "receipt_value",
+    "unresolved_base_hint",
 ]
 
 # The longest text handled whole: redact_insight_text keeps a whole-word head of a longer one
@@ -82,6 +94,27 @@ _TEXT_REDACTIONS = tuple((p, text) for p, _, text in _SECRET_REDACTIONS) + _PII_
 TOKEN_REDACTIONS = tuple((p, text) for p, _, text in _SECRET_REDACTIONS if "\\1" not in text and text != "[REDACTED_PEM]")
 _HEX_UUID_RE = re.compile(r"^(?:[0-9a-fA-F]{7,64}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$")
 CANDIDATE_TOKEN_RE = re.compile(r"[A-Za-z0-9+_=-]{20,}")
+_HIGH_ENTROPY_MASK = "[REDACTED_HIENT]"
+
+
+def _mask_grammar():
+    """Derive literal masks from the shared replacements, without their context."""
+    masks = {_HIGH_ENTROPY_MASK}
+    for replacement in (*[hook for _pattern, hook, _text in _SECRET_REDACTIONS],
+                        *[text for _pattern, text in _TEXT_REDACTIONS]):
+        if replacement.startswith(r"\1"):
+            replacement = replacement[2:]
+            if replacement.endswith("@"):
+                replacement = replacement[:-1]
+        # Bearer is fixed context; only its final opaque token is a mask.
+        # No mask identity includes whitespace separating it from context.
+        masks.add(replacement.split()[-1])
+    return re.compile("|".join(re.escape(mask) for mask in sorted(masks, key=lambda value: (-len(value), value))))
+
+
+# Public grammar over logical text. Consumers decode inert literal escapes only
+# for matching, then carry these spans with the original units through clipping.
+REDACTION_MASK_RE = _mask_grammar()
 
 
 def mask_secret(secret: str) -> str:
@@ -129,19 +162,52 @@ def _bounded_head(text: str, limit: int) -> str:
     return head[:begin].rstrip() if begin != -1 and not re.search(_PEM_TAIL, head[begin:]) else head
 
 
-def redact_insight_text(text: str, max_len: int = MAX_EXCERPT_CHARS) -> str:
+def _sub_replacements(pattern, replacement, text, on_replacements):
+    """Substitute once and report only changed spans, never matched secrets.
+
+    Only explicit backreference context stays outside a replacement interval.
+    Equal characters at a mask edge are still secret source units, not context.
+    """
+    spans = []
+
+    def substitute(match):
+        before = match.group(0)
+        after = replacement(match) if callable(replacement) else match.expand(replacement)
+        if before != after:
+            start, end, payload = match.start(), match.end(), after
+            if isinstance(replacement, str) and replacement.startswith(r"\1"):
+                start = match.end(1)
+                payload = match.expand(replacement[2:])
+                if replacement.endswith("@"):
+                    end -= 1
+                    payload = payload[:-1]
+            spans.append((start, end, payload))
+        return after
+
+    out = pattern.sub(substitute, text)
+    if spans:
+        on_replacements(tuple(spans))
+    return out
+
+
+def redact_insight_text(text: str, max_len: int = MAX_EXCERPT_CHARS, *, on_replacements=None) -> str:
     """Scrub secrets, PII, paths, IPs, and high-entropy tokens from insight text; past
-    ``max(MAX_LINE_LENGTH, 4 * max_len)`` characters only a whole-word head is kept."""
+    ``max(MAX_LINE_LENGTH, 4 * max_len)`` characters only a whole-word head is kept.
+
+    An optional callback receives ordered (start, end, replacement) tuples after
+    each substitution pass, relative to that pass's bounded input. Only changed
+    intervals are reported. Initial bounding and final whitespace/excerpt
+    formatting are not events. Callback failures propagate without a result.
+    """
     if not isinstance(text, str) or not text:
         return ""
     limit = max(MAX_LINE_LENGTH, 4 * max_len)
     out = text if len(text) <= limit else _bounded_head(text, limit)
     for pat, repl in _TEXT_REDACTIONS:
-        out = pat.sub(repl, out)
-    out = CANDIDATE_TOKEN_RE.sub(
-        lambda m: "[REDACTED_HIENT]" if is_high_entropy_secret(m.group(0)) else m.group(0),
-        out,
-    )
+        out = pat.sub(repl, out) if on_replacements is None else _sub_replacements(pat, repl, out, on_replacements)
+    entropy = lambda m: _HIGH_ENTROPY_MASK if is_high_entropy_secret(m.group(0)) else m.group(0)
+    out = CANDIDATE_TOKEN_RE.sub(entropy, out) if on_replacements is None else \
+        _sub_replacements(CANDIDATE_TOKEN_RE, entropy, out, on_replacements)
     out = " ".join(out.split())
     if max_len > 0 and len(out) > max_len:
         sliced = out[:max_len]
@@ -151,3 +217,377 @@ def redact_insight_text(text: str, max_len: int = MAX_EXCERPT_CHARS) -> str:
         else:
             out = sliced
     return out
+
+
+MAX_GUIDANCE_CHARS = 8 * 1024
+_COMMAND_TOKEN = re.compile(r"[A-Za-z0-9._/@+-]+")
+_HEX_ESCAPE = re.compile(r"\\(?:x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U(?:000[0-9a-fA-F]{5}|0010[0-9a-fA-F]{4}))")
+GUIDANCE_ESCAPE_PATTERN = _HEX_ESCAPE.pattern
+
+
+def command_token(value: Any, limit: int = 400) -> bool:
+    """A bounded unchanged token safe to copy in POSIX, PowerShell and cmd."""
+    return (isinstance(value, str) and 0 < len(value) <= limit and not value.startswith("-")
+            and _COMMAND_TOKEN.fullmatch(value) is not None)
+
+
+@dataclass(frozen=True)
+class _DisplayUnit:
+    text: str
+    escaped: bool = False
+    # A replacement's identity travels with its units. Equality compares output
+    # units, so a redactor reporting the same bytes cannot prevent convergence.
+    mask: Any = field(default=None, compare=False)
+    escape_atom: Any = field(default=None, compare=False)
+
+    def __iter__(self):
+        yield self.text
+        yield self.escaped
+
+
+def _escape_units(value: str):
+    """Walk literal escapes atomically; never decode them into shell syntax."""
+    offset = 0
+    while offset < len(value):
+        match = _HEX_ESCAPE.match(value, offset)
+        end = match.end() if match is not None else offset + 1
+        yield _DisplayUnit(value[offset:end], match is not None)
+        offset = end
+
+
+def _literal_escape_units(units):
+    """Keep preserved non-hex forms atomic without changing the matching shadow."""
+    index = 0
+    while index < len(units):
+        unit = units[index]
+        if unit.escaped or unit.text != "\\":
+            index += 1
+            continue
+        end = min(index + 2, len(units))
+        if end == index + 2 and not units[index + 1].escaped and units[index + 1].text in ("x", "u", "U"):
+            bound = min(len(units), index + 2 + {"x": 2, "u": 4, "U": 8}[units[index + 1].text])
+            while end < bound and not units[end].escaped and units[end].text in "0123456789abcdefABCDEF":
+                end += 1
+        atom = object()
+        for offset in range(index, end):
+            current = units[offset]
+            units[offset] = _DisplayUnit(current.text, current.escaped, current.mask, atom)
+        index = end  # Strictly increases; at most len(units) groups are visited.
+    return units
+
+
+def _shares_atom(left, right):
+    return ((left.mask is not None and left.mask is right.mask)
+            or (left.escape_atom is not None and left.escape_atom is right.escape_atom))
+
+
+def _safe_cut_tail(units, *, escape=True):
+    """Do not let a cut prefix and its next atom spell a newly valid escape."""
+    # A preserved hex spelling has at most ten logical characters. Only the
+    # rightmost raw slash can start an escape completed by the following atom.
+    for index in range(len(units) - 1, max(-1, len(units) - 11), -1):
+        unit = units[index]
+        if unit.escaped or unit.text != "\\":
+            continue
+        tail = units[index + 1:]
+        raw = "".join(part.text for part in tail) if not any(part.escaped for part in tail) else None
+        partial = raw is not None and (not raw or raw.isspace() or (
+            raw[0] in ("x", "u", "U") and len(raw) <= {"x": 2, "u": 4, "U": 8}[raw[0]]
+            and all(char in "0123456789abcdefABCDEF" for char in raw[1:])))
+        if partial:
+            if not escape:
+                while index and _shares_atom(units[index - 1], units[index]):
+                    index -= 1
+                return units[:index]
+            units = list(units)
+            units[index] = _DisplayUnit(r"\x5c", True, unit.mask, unit.escape_atom)
+        return units
+    return units
+
+
+def _unit_shadow(units):
+    """Decode for matching only; retain opaque non-whitespace control classes.
+
+    Hex spelling must not create new entropy candidates on a second pass.
+    The decoded shadow is used only by the redactor, never by a shell or by
+    the output path. Opaque non-whitespace controls retain inert markers;
+    escaped whitespace keeps its character class for every redaction pattern.
+    """
+    chars = [chr(int(unit[2:], 16)) if escaped else unit for unit, escaped in units]
+    used = set(chars)
+    next_marker = 0xf0000
+    for index, ((unit, escaped), char) in enumerate(zip(units, chars)):
+        if escaped and not char.isspace() and (not char.isprintable() or unicodedata.category(char) == "Cf"):
+            while chr(next_marker) in used:
+                next_marker += 1
+            marker = chr(next_marker)
+            next_marker += 1
+            used.add(marker)
+            chars[index] = marker
+    return "".join(chars)
+
+
+def _apply_replacements(units, spans):
+    # Coordinates refer to this pass's shadow (one character per unit). Only
+    # unchanged intervals reuse source units; every replacement is a fresh atom.
+    retained, cursor, torn = [], 0, False
+    for start, end, replacement in spans:
+        # A later rule can rewrite only part of an earlier mask. That destroys
+        # its carried boundary; the caller must omit the entire value rather
+        # than expose an orphaned fragment or infer a new boundary from text.
+        torn |= (0 < start < len(units) and units[start].mask is not None
+                 and units[start - 1].mask is units[start].mask)
+        torn |= (0 < end < len(units) and units[end - 1].mask is not None
+                 and units[end - 1].mask is units[end].mask)
+        retained.extend(units[cursor:start])
+        mask = object()
+        end_token = len(replacement.rstrip())
+        tokens = replacement.split()
+        start_token = end_token - len(tokens[-1]) if tokens else end_token
+        retained.extend(_DisplayUnit(char, mask=mask if start_token <= index < end_token else None)
+                        for index, char in enumerate(replacement))
+        cursor = end
+    retained.extend(units[cursor:])
+    units[:] = retained
+    return torn
+
+
+def _existing_mask_units(units):
+    """Attach the redactor's mask spans before any clipping, retaining spelling."""
+    for match in REDACTION_MASK_RE.finditer(_unit_shadow(units)):
+        mask = object()
+        for index in range(match.start(), match.end()):
+            unit = units[index]
+            units[index] = _DisplayUnit(unit.text, unit.escaped, mask, unit.escape_atom)
+    return units
+
+
+def _redact_units(units):
+    """Use reported secret spans; never infer mask structure from its spelling."""
+    units = list(units)
+    torn = [False]
+
+    def apply(spans):
+        if _apply_replacements(units, spans):
+            torn[0] = True
+
+    redact_insight_text(_unit_shadow(units), max_len=10 * MAX_GUIDANCE_CHARS,
+                        on_replacements=apply)
+    return None if torn[0] else units
+
+
+def _identifier_units(units):
+    """The existing receipt rules, with replacement atoms for bounded clipping."""
+    units = list(units)
+    shadow = _unit_shadow(units)
+    for pattern, replacement in (*TOKEN_REDACTIONS, *SECRET_REPLACEMENTS):
+        spans = []
+
+        def substitute(match):
+            after = match.expand(replacement)
+            if after != match.group(0):
+                start, end, payload = match.start(), match.end(), after
+                if replacement.startswith(r"\1"):
+                    start = match.end(1)
+                    payload = match.expand(replacement[2:])
+                    if replacement.endswith("@"):
+                        end -= 1
+                        payload = payload[:-1]
+                spans.append((start, end, payload))
+            return after
+
+        shadow = pattern.sub(substitute, shadow)
+        if _apply_replacements(units, spans):
+            return None
+    return units
+
+
+def _clip_units(units, limit):
+    """Keep a cut replacement whole, reserving room without tearing prior atoms."""
+    if not 0 < limit < len(units):
+        return units[:limit]
+    if not _shares_atom(units[limit - 1], units[limit]):
+        return _safe_cut_tail(units[:limit])
+    start, end = limit, limit
+    # Each scan strictly consumes an index within the bounded unit list. Shared
+    # escape/mask edges also preserve overlapping atoms as one connected range.
+    while start and _shares_atom(units[start - 1], units[start]):
+        start -= 1
+    while end < len(units) and _shares_atom(units[end - 1], units[end]):
+        end += 1
+    if end - start > limit:
+        return _safe_cut_tail(units[:start])
+    boundary = limit - (end - start)
+    while boundary and _shares_atom(units[boundary - 1], units[boundary]):
+        boundary -= 1
+    return _safe_cut_tail(units[:boundary]) + units[start:end]
+
+
+def _stable_units(canonical, limit, redact):
+    """Clip and re-redact with finite fuel; exhaustion returns no source text.
+
+    The strictly decreasing measure is the remaining pass budget (16 down to
+    zero), not a claim that mask text is opaque to every future rule. Even an
+    adversarial/nonconverging redactor therefore fails closed within 17 calls.
+    """
+    units = redact(_existing_mask_units(_literal_escape_units(list(_escape_units(canonical)))))
+    if units is None:
+        return None
+    for _remaining in range(16, 0, -1):
+        clipped = _clip_units(units, limit)
+        redacted = redact(clipped)
+        if redacted is None:
+            return None
+        if redacted == clipped:
+            return clipped
+        units = redacted
+    return None
+
+
+def _redacted_units(canonical: str, limit: int):
+    return _stable_units(canonical, limit, _redact_units)
+
+
+def clip_rendered_text(value: str, limit: int = 400, *, ellipsis: bool = True, canonicalize) -> str:
+    """Cap finished text by wire characters, preserving its template and atoms.
+
+    Callers render/redact their data fields before interpolation. This boundary
+    never escapes template text; it re-redacts cuts that create a new match.
+    Oversized input is omitted before sanitization or unit-list allocation.
+    """
+    limit = min(MAX_GUIDANCE_CHARS, max(0, limit))
+    if len(value) > 10 * MAX_GUIDANCE_CHARS or (len(value) > MAX_GUIDANCE_CHARS
+            and any(index >= MAX_GUIDANCE_CHARS for index, _unit in enumerate(_escape_units(value)))):
+        return "diagnostic_omitted_too_large"[:limit]
+    canonical = canonicalize(value, max_len=None)
+    if len(canonical) <= limit:
+        return canonical
+    suffix = "." * min(3, limit) if ellipsis else ""
+    units = _existing_mask_units(_literal_escape_units(list(_escape_units(canonical))))
+    # A cut can create a redaction match even in already rendered fields, for
+    # example by dropping the x from 1.2.3.4x. The strictly decreasing measure
+    # is the remaining pass budget; exhaustion omits the value within 16 calls.
+    for _remaining in range(16, 0, -1):
+        if sum(len(unit.text) for unit in units) > limit:
+            boundary, size = 0, 0
+            budget = limit - len(suffix)
+            # Strictly increasing indices, bounded by the input and wire budget.
+            while boundary < len(units) and size + len(units[boundary].text) <= budget:
+                size += len(units[boundary].text)
+                boundary += 1
+            # Keep connected escape/mask atoms whole without splicing in later
+            # units. Drop a pending escape rather than expand past the budget.
+            while boundary and boundary < len(units) and _shares_atom(units[boundary - 1], units[boundary]):
+                boundary -= 1
+            units = _safe_cut_tail(units[:boundary], escape=False) + list(_escape_units(suffix))
+        redacted = _redact_units(units)
+        if redacted is None:
+            break
+        if redacted == units:
+            return "".join(unit.text for unit in units)
+        units = redacted
+    return "diagnostic_omitted_too_large"[:limit]
+
+
+def guidance_value(value: str, limit: int = 400, *, prose: bool = False, canonicalize) -> str:
+    """One inert guidance field: bound input, canonicalize, redact, truncate, escape.
+
+    At most 8192 logical units (81920 wire characters) enter the pipeline.
+    Escaping expands each retained unit by at most ten ASCII characters; no value
+    is wrapped in shell quotes. Sentence values escape execution/chain syntax
+    and surviving control/format characters; their other punctuation is kept.
+    This formats values only, never completed sentences or protocol properties.
+    """
+    limit = min(MAX_GUIDANCE_CHARS, max(0, limit))
+    # Bound wire size before lexing, and logical size before canonicalization.
+    # This also accepts the bounded expansion of our own previously shown value.
+    if len(value) > 10 * MAX_GUIDANCE_CHARS or (len(value) > MAX_GUIDANCE_CHARS
+            and any(index >= MAX_GUIDANCE_CHARS for index, _unit in enumerate(_escape_units(value)))):
+        return "diagnostic_omitted_too_large"[:max(0, limit)]
+    canonical = " ".join(canonicalize(value, max_len=None).split())
+    units = _redacted_units(canonical, limit)
+    if units is None:
+        return "diagnostic_omitted_too_large"[:limit]
+    shown = []
+    for index, (char, escaped) in enumerate(units):
+        if escaped:
+            # Preserved \xHH, \uHHHH and valid \UHHHHHHHH spellings are inert
+            # text, never decoded on output. No raw execution character can
+            # survive this display path, including in a Unicode escape.
+            shown.append(char)
+            continue
+        allowed = (char not in "$`\\;&|<>!()'\"" and char.isprintable()
+                   and unicodedata.category(char) != "Cf") if prose else _COMMAND_TOKEN.fullmatch(char)
+        if allowed and not (not prose and index == 0 and char == "-"):
+            shown.append(char)
+        else:
+            codepoint = ord(char)
+            shown.append(f"\\x{codepoint:02x}" if codepoint <= 0xff else
+                         f"\\u{codepoint:04x}" if codepoint <= 0xffff else f"\\U{codepoint:08x}")
+    # A cut after a canonical space must not leave a new trailing space for the
+    # next canonicalization pass to remove.
+    rendered = "".join(shown).rstrip()
+    return re.sub(r":(?=:)", r"\\x3a", rendered)
+
+
+def receipt_value(value: str, limit: int = 120, *, identifier: bool = False, canonicalize=None,
+                  default_canonicalize) -> str:
+    """Bound, canonicalize, redact and clip receipt fields at stable mask units."""
+    limit = min(MAX_GUIDANCE_CHARS, max(0, limit))
+    omitted = "[diagnostic omitted: too_large]"
+    if len(value) > 10 * MAX_GUIDANCE_CHARS or (len(value) > MAX_GUIDANCE_CHARS
+            and any(index >= MAX_GUIDANCE_CHARS for index, _unit in enumerate(_escape_units(value)))):
+        return omitted if len(omitted) <= limit else ""
+    canonical = (canonicalize or default_canonicalize)(value, max_len=None)
+    if not identifier:
+        canonical = " ".join(canonical.split())
+    units = _stable_units(canonical, limit, _identifier_units if identifier else _redact_units)
+    if units is None:
+        return omitted if len(omitted) <= limit else ""
+    shown = []
+    for char, escaped in units:
+        if not escaped and (not char.isprintable() or unicodedata.category(char) == "Cf"):
+            codepoint = ord(char)
+            char = (f"\\x{codepoint:02x}" if codepoint <= 0xff else
+                    f"\\u{codepoint:04x}" if codepoint <= 0xffff else f"\\U{codepoint:08x}")
+        shown.append(char)
+    return "".join(shown).rstrip() if not identifier else "".join(shown)
+
+
+def unresolved_base_hint(selector: str, *, canonicalize) -> str:
+    """Describe a failed comparison without introducing shell-active data."""
+    label = guidance_value(selector, prose=True, canonicalize=canonicalize)
+    origin = "fetch origin. " if selector.startswith(("origin/", "refs/remotes/origin/")) else ""
+    if not command_token(selector, MAX_GUIDANCE_CHARS) or selector != label:
+        return f"cannot resolve the base. {origin}fetch it or pass the full commit id. Base selector: {label}."
+    return f"cannot resolve the base {label}; {origin}fetch it or pass the full commit id"
+
+
+def guidance_field(value, separators=(), *, canonicalize):
+    """Render data once, then prevent it from impersonating a field separator."""
+    shown = guidance_value(value, prose=True, canonicalize=canonicalize)
+    if not separators:
+        return shown
+    pattern = re.compile("|".join(re.escape(token) for token in separators))
+
+    def encode(raw):
+        # Check each source position, including overlapping separators. Existing
+        # inert escapes are separate units and never edited as literal text.
+        parts = []
+        for index, char in enumerate(raw):
+            if pattern.match(raw, index):
+                codepoint = ord(char)
+                char = (f"\\x{codepoint:02x}" if codepoint <= 0xff else
+                        f"\\u{codepoint:04x}" if codepoint <= 0xffff else f"\\U{codepoint:08x}")
+            parts.append(char)
+        return "".join(parts)
+
+    result, literal = [], []
+    for char, escaped in _escape_units(shown):
+        if escaped:
+            result.extend((encode("".join(literal)), char))
+            literal.clear()
+        else:
+            literal.append(char)
+    result.append(encode("".join(literal)))
+    return "".join(result)
