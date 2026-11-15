@@ -79,6 +79,10 @@
     "count": 1,
     "reason": "Explicit user-configured model command boundary."
   },
+  "process:aegis_core/team_supervisor_start.py:_spawn:subprocess.Popen": {
+    "count": 1,
+    "reason": "SUPERVISOR-START-1: explicit owner argv starts only from a lock-held eligible supervisor plan; no shell or repository cwd; close_fds; kernel identity registration and atomic failure/success checkpoints."
+  },
   "process:aegis_core/testexec.py:kill_group:subprocess.run": {
     "count": 1,
     "reason": "Windows process-tree termination with the system taskkill executable."

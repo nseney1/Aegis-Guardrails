@@ -1,21 +1,13 @@
 """aegis team — lane leases for parallel agents (v4.1 spec §1, ADR 0005 AD-7).
 
 The dispatcher runs these; there is no MCP tool for them. ``claim``, ``renew`` and
-``transfer`` print the lane's new lease oid alone on stdout, so a script can pass it to
-the next ``--expect``. With ``--json`` stdout carries one document with ``source``,
-``aegis_version``, ``checked_at`` (UTC) and ``scope``, refusals and errors included.
-
-Host capacity check exits: 0 go, 3 hold, 4 fallback, 5 skip; 1 refused, 2 usage.
-Other exit codes: 0 done; 1 refused (taken, overlap, stale, absent, expired, unreadable) or
-git failed; 2 usage (an invalid lane name, glob, ttl, label or ``--expect``, a base
-that names no commit, no git repository). ``list`` and ``metrics`` change nothing.
-``model`` uses the public model-selection core and always emits JSON, exiting 2
-on refusal. Its MCP counterpart shares the core; neither launches a host.
-
-CLI renew refuses missing recorded branches with ``lease_branch_missing``;
-unavailable evidence refuses with ``liveness_unknown`` (exit 1, no force flag).
-CLI gc still collects expired leases; its warnings may include
-``{"lane": LANE, "reason": "expired_with_worktree"}`` registration observations.
+``transfer`` print the lane's new lease oid alone on stdout for the next ``--expect``.
+``--json`` carries ``source``, ``aegis_version``, ``checked_at`` (UTC) and ``scope``.
+Host capacity exits: 0 go, 3 hold, 4 fallback, 5 skip; 1 refused, 2 usage.
+Lease refusals exit 1 with ``CLAIM_REFUSALS`` text, the core reason set. Git failure exits 1.
+Exit 2 is usage (invalid lane, glob, ttl, label, ``--expect``, or a base that names no commit).
+``list`` and ``metrics`` change nothing. ``model`` emits JSON, exits 2, and launches no host.
+Renew refuses ``lease_branch_missing`` or ``liveness_unknown``. GC may warn ``expired_with_worktree``.
 """
 from __future__ import annotations
 
@@ -42,6 +34,8 @@ EXIT_OK = 0
 EXIT_REFUSED = 1
 EXIT_USAGE = 2
 ACTIONS = ("claim", "renew", "transfer", "release", "gc", "list", "status", "metrics")
+CLAIM_REFUSALS = {reason: reason + ":" for reason in (
+    "absent", "expired", "legacy_paths", "overlap", "stale", "taken", "unreadable")}
 
 MODEL_REQUIRED = ("bindings", "policy", "history", "task_kind", "role_kind", "subject", "host_kinds")
 MODEL_OPTIONAL = ("intent", "author_family", "lane_family", "review_stage", "record")
@@ -627,24 +621,31 @@ def _failed(args: argparse.Namespace, root: Path, now: int, message: str, code: 
 
 
 def _refused(args: argparse.Namespace, root: Path, now: int, exc: team.LeaseRefused) -> int:
-    lease = _view(root, now, exc.current)
+    fixed = CLAIM_REFUSALS.get(exc.reason)
+    message = str(exc)
+    if not fixed or "\n" in message or "\r" in message or not message.startswith(fixed):
+        message = fixed or "refused"
+    canonical = sanitize_display(message, max_len=None)
+    text = sanitize_display(redact_command_secrets(canonical), max_len=None)
+    try:
+        lease = None if exc.reason == "legacy_paths" else _view(root, now, exc.current)
+    except (gitsafe.GitError, team.TeamUsageError, OSError, ValueError):
+        if args.team_action != "claim":
+            raise
+        lease = None
+    if lease and any(char.isspace() for path in lease["paths"] for char in path):
+        lease = None
     if args.json:
         payload = _team_payload(args.team_action, root, now, refs=team.LANES_REF, lane=exc.lane)
-        payload.update({
-            "status": "refused",
-            "reason": exc.reason,
-            "message": str(exc),
-            "current": exc.current,
-            "lanes": list(exc.lanes),
-            "lease": lease,
-            "warnings": list(exc.warnings),
-        })
+        payload.update(status="refused", reason=exc.reason, message=text,
+                       current=exc.current, lanes=list(exc.lanes), lease=lease,
+                       warnings=list(exc.warnings))
         if exc.next_action:
             payload["next_action"] = exc.next_action
         _emit(payload)
         return EXIT_REFUSED
     _warn(list(exc.warnings))
-    print(sanitize_display(str(exc), max_len=None), file=sys.stderr)
+    print(sanitize_display(text, max_len=None), file=sys.stderr)
     if exc.next_action:
         print(sanitize_display(exc.next_action, max_len=None), file=sys.stderr)
     for line in _lease_lines(lease):

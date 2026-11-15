@@ -4,8 +4,10 @@
 returns one, including when no file sets it. `aegis team config init` does not
 write supervisor keys. Command flags cannot set any supervisor field.
 
-This slice plans and reports. It does not start a component, and it does not
-add an MCP tool. Lease `aegis team status` is unchanged.
+The policy module plans and reports. The separate, explicitly invoked
+`aegis_core.team_supervisor_start.start` API starts eligible components. No
+ordinary Codex path invokes it and no MCP tool is added. Lease `aegis team status`
+is unchanged.
 
 `assemble`, `plan`, `supervisor_health`, profile `resolve`, `load` and
 `validate_resolved` use one closed-schema validator before consuming profile
@@ -128,6 +130,106 @@ A bad clock, running set or state returns `status: refused`, a fixed reason,
 reason does not include the offending bytes.
 
 ## State file
+
+### Explicit starter
+
+`start(resolved, commands, user_root=absolute_home, now=integer_seconds, timeout=1)`
+takes a resolved profile and an owner-supplied mapping of component ids to argv.
+The owner must supply these commands independently of repository content. Each
+executable is absolute; there is no shell, PATH discovery, repository working
+directory, or command discovery from a file. The starter uses `/` as cwd and
+closes inherited descriptors. Missing commands leave that component unstarted.
+Commands are bounded before copying (five components, 64 arguments each, 4096
+characters per argument, 32768 characters per command); NULs refuse. Every
+argument, including the executable, must encode with `os.fsencode` before any
+state write; encoding failures return `invalid_commands` and leave state bytes
+unchanged. A corrected command can then start normally. The timeout
+is in `(0, 30]` seconds and bounds identity registration after exec, not service
+readiness or the operating system's exec operation.
+
+Only ids in `plan()['start']` whose row has `action: would_start` are attempted.
+The starter never interprets `starts_nothing` as permission. The resolved typed
+pause union is passed through unchanged; no profile or pause is rewritten or
+deleted. It adds no automatic unpause or recovery operation.
+
+Linux is currently required: recorded identity includes the kernel boot UUID,
+PID namespace, PID and `/proc` start ticks. The boot UUID is read from
+`/proc/sys/kernel/random/boot_id` with a 37-byte cap. The namespace is the
+`pid:[inode]` identity of `/proc/self/ns/pid`: directory components are opened
+without following links, and the kernel's `self` and `pid` links are inspected
+relative to held descriptors. A proc mount whose numeric PID view differs from
+the caller also refuses. Unavailable or malformed boot/namespace sources return
+`identity_unavailable` before any attempt or state write.
+
+Only a record with the current boot and PID namespace may be probed for live
+PID/start ticks; zombies are dead. A previous-boot record is dead and may be
+replaced on a successful start. A same-boot record from another PID namespace
+returns `identity_ambiguous` without probing its PID, starting a duplicate or
+changing state. Unreadable or indeterminate process identity refuses rather than
+treating a PID as dead. Repository paths and PID-only probes are never used as
+liveness evidence.
+
+Before interpreting recorded liveness or attempting a start, the caller's own
+process-table entry must be readable through the same confined `/proc` path.
+A missing recorded PID counts as dead only while this self witness remains
+observable. Missing procfs or an unreadable self entry returns
+`identity_unavailable`, so missing ancestors cannot trigger a duplicate start.
+
+The owner home and every ancestor are opened without following symlinks. The
+existing `.config/aegis` directory must be owned by the current UID and not
+group/other writable. A nonblocking exclusive directory lock covers the complete
+read-plan-start-record transaction. A concurrent caller returns `state_locked`
+or observes the winner's recorded identity. Renaming an ancestor cannot redirect
+reads or atomic writes away from the held directory. Missing directories refuse;
+the starter creates none. The state descriptor is borrowed from the existing
+`storage_confined.confined_file` context for the entire transaction; the starter
+implements no separate directory walker and opens no descriptors directly.
+
+`supervisor-processes.json` is an additional owner-only state leaf beside
+`supervisor-state.json`. It has version 2, a `processes` map of component ids to
+`{boot_id, pid_namespace, pid, start_ticks}` objects, and a `pending` component id
+or null. Version 1 is ambiguous and returns `identity_ambiguous` until the trusted
+owner reconciles it; it is never silently migrated or treated as live/dead. The
+separate `supervisor-state.json` schema remains version 1. Both files
+require bounded reads before JSON parsing, bounded structure, unique keys and
+closed schemas. Unsafe, unreadable, oversized or malformed state refuses with
+code `state_unavailable` and reason `unsafe or unreadable supervisor state`.
+
+Before exec the starter atomically records a pending intent and a conservative
+`note_failure` checkpoint in the existing supervisor state. An exec error or
+registration timeout whose child is confirmed reaped retains that failure,
+clears the intent and respects backoff on the next plan. Constructor failures
+clear custody only for the narrowly recognized CPython exec-error form: an
+`OSError` with errno `ENOENT`, `EACCES`, `ENOEXEC` or `ENOTDIR` and `filename`
+equal to the executable. CPython reaps that failed child before raising the
+exec error; the installed-runtime regression verifies this behavior. Other
+constructor exceptions can occur after fork, even without a returned handle.
+They keep the intent and process record and return `recovery_required`;
+`BaseException` cancellation is re-raised with custody preserved. Unrecognized
+errnos are conservatively treated as unknown, even if a particular instance
+was an exec failure. Pre-check failures still leave state byte-identical.
+Failures after child creation retain conservative recovery custody. If cleanup
+raises from `kill()` or `wait()`, times out, or cannot confirm a reaped child,
+the starter keeps both the pending intent and any existing process record and
+returns `recovery_required`. A later call cannot launch another instance until
+trusted-owner reconciliation. Successful
+identity registration is published before
+`note_success` clears the failure history; only then is the intent cleared.
+Each leaf replacement is atomic, not a transaction spanning both files. A crash
+or write failure leaving an intent returns `recovery_required` on retry, even
+when the recorded child appears dead. This deliberately requires the trusted
+owner to reconcile both state files with the actual child before another start;
+it prevents a duplicate exec across every interrupted-write window.
+
+Results have `status: ok` and `attempts` containing `{id, outcome}` objects,
+where outcome is `started` or `start_failed`. A refusal has `status: refused`,
+a fixed `code`, fixed `reason` and `attempts` completed before the refusal.
+Other codes are `unsupported_platform`, `identity_unavailable`, `identity_ambiguous`, `plan_refused`,
+`invalid_commands` and `invalid_timeout`. Returned reasons never include supplied
+paths, argv, child output or exception diagnostics. Start success proves exec
+and identity registration, not application readiness. Only the owner UID is
+trusted to maintain these records; protection from the owner rewriting run
+controls is outside the v5.0 threat model.
 
 The state leaf is `supervisor-state.json`, beside `team.json`, under the
 resolved owner config directory. The user root must already be absolute. A
