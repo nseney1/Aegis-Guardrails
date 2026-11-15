@@ -146,7 +146,9 @@ def _lane_operation(function):
         if "_runner" in kwargs:
             raise GitRefusal("lane_runner_required")
         try:
-            runner = store._lane if store._temp is not None else gitsafe.lane_runner(store.repo, store.scratch)
+            effect_fds = kwargs.get("effect_fds") if function.__name__ == "cas_fast_forward" else None
+            runner = store._lane if store._temp is not None and effect_fds is None else gitsafe.lane_runner(
+                store.repo, store.scratch, effect_fds=effect_fds, worktree_root=store.repo)
             return function(store, *args, _runner=runner, **kwargs)
         except AegisError as exc:
             raise GitRefusal(_error_code(exc), next_action=getattr(exc, "next_action", None)) from None
@@ -543,7 +545,7 @@ def _publish(store: GitStore, new: str, runner) -> None:
 
 
 @_lane_operation
-def cas_fast_forward(store: GitStore, ref: str, expected: Optional[str], new: str, *, _runner=None) -> str:
+def cas_fast_forward(store: GitStore, ref: str, expected: Optional[str], new: str, *, effect_fds=None, _runner=None) -> str:
     """Sole ref writer: allowlist + expected OID + ancestry, then atomic CAS.
 
     None is create-only. Returns updated or already (including lost acknowledgments
@@ -551,6 +553,11 @@ def cas_fast_forward(store: GitStore, ref: str, expected: Optional[str], new: st
     after validation can leave unreachable objects, but can never overwrite a winner.
     Other failures include cas_mismatch, ref_unreadable, ref_update_failed or ref_update_unknown;
     the latter requires observation by the caller, never a blind retry.
+    effect_fds borrows an active receipt's exported descriptors for this operation
+    only. Its custody holders retain the lock until all effect descendants exit;
+    the caller still owns and closes the receipt. None preserves ordinary calls.
+    With effect_fds, visible indeterminate capture failures stay unknown even if
+    a ref observation could match new; the caller must reconcile under a fresh lock.
     """
     _require_runner(_runner)
     _check_ref(store, ref)
@@ -577,6 +584,10 @@ def cas_fast_forward(store: GitStore, ref: str, expected: Optional[str], new: st
         if code not in ("git_failed", "git_timeout", "ref_update_unknown", "ref_update_failed",
                         "git_cleanup_failed", "git_output_limit"):
             raise GitRefusal(_error_code(exc), next_action=getattr(exc, "next_action", None)) from None
+        if (effect_fds is not None
+                and (code in ("git_timeout", "ref_update_unknown", "git_cleanup_failed", "git_output_limit")
+                     or code == "git_failed" and getattr(exc, "process_started", None) is True)):
+            raise GitRefusal("ref_update_unknown") from None
         observed = _current(store, ref, _runner)
         if observed == new:
             return "already"
