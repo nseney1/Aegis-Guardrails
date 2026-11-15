@@ -316,13 +316,11 @@ def _build_ci_document(report, root: str, reg_report=None, cov_report=None, perf
 
     document = report.as_dict(root)
     if report.owner_review_required:
-        document["owner_review_required"] = [MessageRow({key: _receipt_text(value, 400, identifier=True)
+        document["owner_review_findings"] = [MessageRow({key: _receipt_text(value, 400, identifier=True)
             if key in ("code", "rule", "path") else value for key, value in item.items()})
-            for item in document["owner_review_required"]]
+            for item in document["owner_review_findings"]]
     if report.approval_policy is not None and report.approval_policy.mode is not None:
         policy_fields = report.approval_policy.as_dict(display=_receipt_text)
-        if report.owner_review_required:
-            policy_fields.pop("owner_review_required", None)
         document.update(policy_fields)
         # Receipt identities retain their original token redaction and bounds;
         # they never acquire prose escapes. Completed messages stay untouched.
@@ -414,7 +412,7 @@ def _print_owner_review(report, document, fmt):
     from aegis_core.approval_policy import finding_message, guidance_value as show
 
     if fmt != "github" and report.owner_review_required:
-        for item in document["owner_review_required"]:
+        for item in document["owner_review_findings"]:
             print(f"  [{show(item['code'], prose=True)}] {show(item['rule'], prose=True)} ({show(item['path'], prose=True)}): {finding_message(item, producer='owner_review_required')}")
 
 
