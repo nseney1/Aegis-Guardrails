@@ -1153,6 +1153,139 @@ def test_single_ref_writer_and_no_force_by_construction():
     assert not any(flag in source for flag in ("--force", "--force-with-lease", "+refspec"))
 
 
+@pytest.mark.parametrize("renamed", [False, True])
+@pytest.mark.parametrize("mode", ["valid", "invalid", "absent", "closed"])
+def test_cas_effect_policy_is_independent_of_name(repo, monkeypatch, renamed, mode):
+    from aegis_core import team_gitops
+    if not gitops_fds.descriptor_supported():
+        pytest.skip("effect custody requires Linux child subreaper support")
+    if renamed:
+        monkeypatch.setattr(tg.cas_fast_forward.__wrapped__, "__name__", "renamed_publish")
+    with make_store(repo) as store:
+        head = git(repo, "rev-parse", "HEAD").decode().strip()
+        journal = team_gitops.GitOpsJournal(repo / ".git")
+        seen, original = [], gitsafe_run.LaneRunner.cas
+        def observe(self, *args, **kwargs):
+            seen.append((self, self.effect_fds))
+            return original(self, *args, **kwargs)
+        monkeypatch.setattr(gitsafe_run.LaneRunner, "cas", observe)
+        with journal.record_intent(op="ref_update", lane="lane-1", request_id="policy",
+                                   expected_old=None, expected_new=head, actor="custodian-1") as receipt:
+            descriptors = receipt.inheritable_fds()
+            kwargs = {} if mode == "absent" else {"effect_fds": () if mode == "invalid" else descriptors}
+            if mode == "closed":
+                store.__exit__(None, None, None)
+            if mode in ("invalid", "closed"):
+                before = shared_bytes(repo)
+                def unexpected(*args, **kwargs):
+                    pytest.fail("refused effect policy reached process creation")
+                monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": unexpected}))
+                with pytest.raises(tg.GitRefusal) as caught:
+                    tg.cas_fast_forward(store, "refs/heads/lane/policy", None, head, **kwargs)
+                monkeypatch.setattr(gitsafe_run, "subprocess", subprocess)
+                code = "store_closed" if mode == "closed" else "invalid_effect_descriptor"
+                assert (caught.value.code, str(caught.value)) == (code, "Lane Git operation refused: " + code)
+                assert not seen and shared_bytes(repo) == before
+                if mode == "closed":
+                    store.__enter__()
+                kwargs = {"effect_fds": descriptors}
+            assert tg.cas_fast_forward(store, "refs/heads/lane/policy", None, head, **kwargs) == "updated"
+            assert seen[0][1] == (None if mode == "absent" else descriptors)
+            assert (seen[0][0] is store._lane) == (mode == "absent")
+            assert tg.cas_fast_forward(store, "refs/heads/lane/policy", None, head, **kwargs) == "already"
+            assert os.fstat(descriptors[0])
+            assert not os.get_inheritable(descriptors[0])
+        assert tg.cas_fast_forward(store, "refs/heads/lane/plain-policy", None, head) == "updated"
+        assert seen[-1] == (store._lane, None)
+
+
+def test_store_entry_policy_is_independent_of_name(repo, monkeypatch):
+    monkeypatch.setattr(tg.GitStore.__enter__.__wrapped__, "__name__", "renamed_entry")
+    with new_store(repo) as store:
+        assert store._run(["version"]).returncode == 0
+
+
+@pytest.mark.parametrize("name", ["cas_fast_forward", "__enter__", "ordinary"])
+@pytest.mark.parametrize("descriptors", [None, (), "token=PRIVATE"])
+def test_non_effect_policy_refuses_descriptors_before_spawn_and_retries(repo, monkeypatch, name, descriptors):
+    def operation(store, *, _runner=None):
+        return _runner
+    operation.__name__ = name
+    operation = tg._lane_operation(operation)
+    with new_store(repo) as store:
+        def unexpected(*args, **kwargs):
+            pytest.fail("non-effect operation reached process creation")
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": unexpected}))
+        with pytest.raises(tg.GitRefusal) as caught:
+            operation(store, effect_fds=descriptors)
+        assert (caught.value.code, str(caught.value)) == (
+            "effect_runner_refused", "Lane Git operation refused: effect_runner_refused")
+        with pytest.raises(tg.GitRefusal) as caught:
+            operation(store, _runner=store._lane)
+        assert caught.value.code == "lane_runner_required"
+        assert operation(store) is store._lane
+        store.__exit__(None, None, None)
+        with pytest.raises(tg.GitRefusal) as caught:
+            operation(store)
+        assert caught.value.code == "store_closed"
+        with pytest.raises(tg.GitRefusal) as caught:
+            operation(store, effect_fds=descriptors)
+        assert caught.value.code == "store_closed"
+        monkeypatch.setattr(gitsafe_run, "subprocess", subprocess)
+
+
+def test_renamed_cas_effect_policy_preserves_unknown_refusal(repo, monkeypatch):
+    from aegis_core import team_gitops
+    if not gitops_fds.descriptor_supported():
+        pytest.skip("effect custody requires Linux child subreaper support")
+    monkeypatch.setattr(tg.cas_fast_forward.__wrapped__, "__name__", "renamed_publish")
+    with make_store(repo) as store:
+        head = git(repo, "rev-parse", "HEAD").decode().strip()
+        attempts = []
+        def fail(self, *args, **kwargs):
+            attempts.append(self.effect_fds)
+            raise gitsafe.GitError("token=PRIVATE", code="git_timeout", process_started=True)
+        monkeypatch.setattr(gitsafe_run.LaneRunner, "cas", fail)
+        journal = team_gitops.GitOpsJournal(repo / ".git")
+        with journal.record_intent(op="ref_update", lane="lane-1", request_id="unknown-policy",
+                                   expected_old=None, expected_new=head, actor="custodian-1") as receipt:
+            descriptors = receipt.inheritable_fds()
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.cas_fast_forward(store, "refs/heads/lane/unknown-policy", None, head, effect_fds=descriptors)
+            assert (caught.value.code, str(caught.value)) == (
+                "ref_update_unknown", "Lane Git operation refused: ref_update_unknown")
+            assert attempts == [descriptors]
+            assert os.fstat(descriptors[0])
+
+
+def test_effect_policy_concurrent_calls_keep_runner_custody_local(repo, monkeypatch):
+    from aegis_core import team_gitops
+    if not gitops_fds.descriptor_supported():
+        pytest.skip("effect custody requires Linux child subreaper support")
+    with make_store(repo) as store:
+        head = git(repo, "rev-parse", "HEAD").decode().strip()
+        journal = team_gitops.GitOpsJournal(repo / ".git")
+        barrier = Barrier(2)
+        @tg._lane_operation(effect_aware=True)
+        def renamed_effect(store, *, effect_fds=None, _runner=None):
+            barrier.wait(timeout=5)
+            return _runner
+        @tg._lane_operation
+        def ordinary(store, *, _runner=None):
+            barrier.wait(timeout=5)
+            return _runner
+        with journal.record_intent(op="ref_update", lane="lane-1", request_id="concurrent-policy",
+                                   expected_old=None, expected_new=head, actor="custodian-1") as receipt:
+            descriptors = receipt.inheritable_fds()
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                effect = pool.submit(renamed_effect, store, effect_fds=descriptors)
+                plain = pool.submit(ordinary, store)
+                effect_runner, plain_runner = effect.result(timeout=15), plain.result(timeout=15)
+            assert effect_runner is not store._lane and effect_runner.effect_fds == descriptors
+            assert plain_runner is store._lane and plain_runner.effect_fds is None
+            assert os.fstat(descriptors[0])
+
+
 def test_cas_borrows_receipt_descriptors_without_retaining_them(repo, monkeypatch):
     from aegis_core import team_gitops
     if not gitops_fds.descriptor_supported():
