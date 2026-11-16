@@ -19,6 +19,7 @@ __all__ = ["GitRefusal", "OID_PATTERN", "baseline_requests", "binary_text", "blo
            "index_records", "is_attribute_path", "preserved_paths", "snapshot_attributes", "snapshot_entries", "snapshot_rules"]
 
 OID_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+_CONTROL_BYTES = bytes((*range(8), 11, *range(14, 27), *range(28, 32), 127))
 
 _INDEX_STAT = re.compile(rb"  ctime: ([0-9]{1,20}):([0-9]{1,10})\n  mtime: ([0-9]{1,20}):([0-9]{1,10})\n"
     rb"  dev: ([0-9]{1,20})\tino: ([0-9]{1,20})\n  uid: ([0-9]{1,20})\tgid: ([0-9]{1,20})\n"
@@ -251,7 +252,7 @@ def binary_text(data):
     crlf = data.count(b"\r\n")
     if b"\0" in data or data.count(b"\r") != crlf:
         return True
-    nonprintable = sum(data.count(bytes((c,))) for c in (*range(8), 11, *range(14, 27), *range(28, 32), 127))
+    nonprintable = len(data) - len(data.translate(None, _CONTROL_BYTES))
     printable = len(data) - nonprintable - data.count(b"\r") - data.count(b"\n")
     nonprintable -= data.endswith(b"\x1a")
     return (printable >> 7) < nonprintable
@@ -326,7 +327,7 @@ def index_clean(mode, data, observed, prior, settings, oid_length, index_time):
 def baseline_requests(contents, baseline, rules, *, configured_filters):
     """One batch for CRLF baselines and all attribute blobs when any driver exists."""
     wanted = [baseline[path][1] for path, mode, data, _ in contents if mode != "120000"
-            and b"\r\n" in data and rules[path][0] == "auto" and path in baseline and baseline[path][1]]
+            and data is not None and b"\r\n" in data and rules[path][0] == "auto" and path in baseline and baseline[path][1]]
     if configured_filters:
         wanted.extend(oid for path, (_, oid, _) in baseline.items() if is_attribute_path(path) and oid)
     return wanted
@@ -343,7 +344,7 @@ def snapshot_entries(contents, settings, baseline, rules, preserved, oid_length,
         prior = baseline.get(path, ("100644", None, None))
         prior_mode = prior[0]
         unchanged = index_clean(mode, data, observed, prior, settings, oid_length, index_time)
-        if unchanged:
+        if unchanged is True:
             entries.append((path, prior_mode, prior[1], None))
             continue
         if mode != "120000" and not unchanged:
