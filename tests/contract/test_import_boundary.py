@@ -94,6 +94,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.rule_inventory": 1,
     "aegis_core.yaml_engine": 1,
     "aegis_core.match": 1,
+    "aegis_core.team_writer_binding": 1,
     "aegis_core.telemetry_engine": 1,
     "aegis_core.fitness": 1,
     "aegis_core.ast": 1,
