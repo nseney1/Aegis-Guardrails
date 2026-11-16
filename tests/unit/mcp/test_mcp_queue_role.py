@@ -12,6 +12,7 @@ from conftest import symlink_or_skip
 
 import aegis_mcp.server as server
 import aegis_mcp.queue_role as queue_role
+from aegis_core import team_queue
 from aegis_core._version import __version__
 
 
@@ -511,3 +512,234 @@ def test_ancestor_rename_between_validation_and_read_is_confined(owner_factory, 
     role.issue("alpha")
     with pytest.raises(role.RoleRefusal, match="^role_invalid$"):
         role.bind("alpha")
+
+
+_ROLE_ARGUMENT_NEXT = "Use only id, expect and lane from the queue list and owner policy."
+_QUEUE_ARGUMENT_NEXT = "Use the documented queue arguments and the revision returned by list."
+
+
+def _registration(**lane):
+    options = {"capabilities": ["core"], "branch": "refs/heads/lane/alpha"}
+    options.update(lane)
+    return {"schema": "aegis.mcp.queue-registration/v1", "registration_id": "alpha",
+            "endpoint": "a/orchestrator", "role": "orchestrator", "workspace": "/workspace",
+            "lanes": {"alpha": options}, "ttl_s": 600, "session_ttl_s": 7200}
+
+
+def _calls(seen, real):
+    def spy(*args, **kwargs):
+        seen.append(args[0] if args else None)
+        return real(*args, **kwargs)
+
+    return spy
+
+
+def _seen_valid_key(monkeypatch):
+    seen = []
+    monkeypatch.setattr(queue_role.team_queue, "valid_key", _calls(seen, team_queue.valid_key))
+    return seen
+
+
+def _seen_valid_revision(monkeypatch):
+    seen = []
+    monkeypatch.setattr(queue_role.team_queue, "valid_revision", _calls(seen, team_queue.valid_revision))
+    return seen
+
+
+def _seen_valid_lane(monkeypatch):
+    seen = []
+    monkeypatch.setattr(queue_role.team_queue, "valid_lane", _calls(seen, team_queue.valid_lane))
+    return seen
+
+
+def _seen_check_capabilities(monkeypatch):
+    seen = []
+    monkeypatch.setattr(queue_role.team_queue, "check_capabilities", _calls(seen, team_queue.check_capabilities))
+    return seen
+
+
+def _seen_normalize_branch(monkeypatch):
+    seen = []
+    monkeypatch.setattr(queue_role.team_queue, "normalize_branch", _calls(seen, team_queue.normalize_branch))
+    return seen
+
+
+def _no_role_io(monkeypatch):
+    def unavailable(*args, **kwargs):
+        pytest.fail("role field validation must not touch authority storage")
+
+    # Authority and confinement are this module's own bindings. descriptor_supported
+    # is the public probe team_queue calls before descriptor I/O.
+    monkeypatch.setattr(queue_role, "authority", unavailable)
+    monkeypatch.setattr(queue_role, "storage_confined", SimpleNamespace(
+        confined_file=unavailable, descriptor_supported=unavailable))
+    monkeypatch.setattr(team_queue, "descriptor_supported", unavailable)
+
+
+def _assert_role_refusal(result):
+    rendered = json.dumps(result)
+    assert result["reason"] == "invalid_arguments" and result["error"] == "invalid_arguments"
+    assert result["exit_code"] == 2 and result["refused"] is True and result["status"] == "refused"
+    assert result["next_action"] == _ROLE_ARGUMENT_NEXT
+    assert "\n" not in rendered and "injected" not in rendered and "private-value" not in rendered
+    assert "bad id" not in rendered
+
+
+@pytest.mark.parametrize("identifier,revision,lane,stopped", [
+    ("bad id", "a" * 64, "alpha", "valid_key"),
+    ("ONE\ninjected", "a" * 64, "alpha", "valid_key"),
+    ("", "a" * 64, "alpha", "valid_key"),
+    ("A" * 65, "a" * 64, "alpha", "valid_key"),
+    ("ONE", "A" * 64, "alpha", "valid_revision"),
+    ("ONE", "a" * 63, "alpha", "valid_revision"),
+    ("ONE", "a" * 63 + "\ninjected", "alpha", "valid_revision"),
+    ("ONE", "g" * 64, "alpha", "valid_revision"),
+    ("ONE", None, "alpha", "valid_revision"),
+    ("ONE", "a" * 64, "a..b", "valid_lane"),
+    ("ONE", "a" * 64, "alpha.lock", "valid_lane"),
+    ("ONE", "a" * 64, "Alpha", "valid_lane"),
+    ("ONE", "a" * 64, "alpha\ninjected", "valid_lane"),
+    ("ONE", "a" * 64, "", "valid_lane"),
+], ids=["spaced-id", "multiline-id", "empty-id", "long-id", "upper-revision", "short-revision",
+        "multiline-revision", "nonhex-revision", "revision-type", "parent-lane", "lock-lane",
+        "upper-lane", "multiline-lane", "empty-lane"])
+def test_claim_argument_refusal_uses_public_predicates(monkeypatch, identifier, revision, lane, stopped):
+    seen = {"valid_key": _seen_valid_key(monkeypatch), "valid_revision": _seen_valid_revision(monkeypatch),
+            "valid_lane": _seen_valid_lane(monkeypatch)}
+    _no_role_io(monkeypatch)
+    arguments = {"id": identifier, "expect": revision, "lane": lane}
+    result = queue_role.claim_argument_refusal(arguments)
+    role_seen = {name: list(values) for name, values in seen.items()}
+    operation = team_queue.claim("/workspace", identifier, expect=revision, lane=lane,
+                                 capabilities=["core"], now=100)
+    _assert_role_refusal(result)
+    assert operation["reason"] == "invalid_arguments" and operation["exit_code"] == 2
+    assert operation["next_action"] == _QUEUE_ARGUMENT_NEXT
+    assert role_seen["valid_key"][0] == identifier
+    if stopped == "valid_key":
+        assert role_seen["valid_key"] == [identifier]
+        assert role_seen["valid_revision"] == [] and role_seen["valid_lane"] == []
+    elif stopped == "valid_revision":
+        assert role_seen["valid_key"] == [identifier]
+        assert role_seen["valid_revision"] == [revision] and role_seen["valid_lane"] == []
+    else:
+        assert role_seen["valid_key"] == [identifier, lane]
+        assert role_seen["valid_revision"] == [revision] and role_seen["valid_lane"] == [lane]
+    repaired = queue_role.claim_argument_refusal({"id": "ONE", "expect": "a" * 64, "lane": "alpha"})
+    assert repaired is None
+
+
+def test_claim_arguments_reject_extra_fields_before_predicates(monkeypatch):
+    def explode(*args, **kwargs):
+        raise AssertionError("field predicates ran before the closed claim schema")
+
+    _no_role_io(monkeypatch)
+    monkeypatch.setattr(queue_role.team_queue, "valid_key", explode)
+    monkeypatch.setattr(queue_role.team_queue, "valid_lane", explode)
+    monkeypatch.setattr(queue_role.team_queue, "valid_revision", explode)
+    monkeypatch.setattr(queue_role.team_queue, "check_capabilities", explode)
+    monkeypatch.setattr(queue_role.team_queue, "normalize_branch", explode)
+    result = queue_role.claim_argument_refusal({
+        "id": "ONE", "expect": "a" * 64, "lane": "alpha",
+        "capabilities": ["core", "core"], "branch": "refs/tags/private-value"})
+    _assert_role_refusal(result)
+
+
+@pytest.mark.parametrize("kind,value", [
+    ("lane", "a..b"),
+    ("lane", "alpha.lock"),
+    ("lane", "alpha\ninjected"),
+    ("capabilities", ["core", "core"]),
+    ("capabilities", ["bad id"]),
+    ("capabilities", ["core\ninjected"]),
+    ("capabilities", "core"),
+    ("branch", "refs/tags/private-value"),
+    ("branch", "refs/heads/HEAD"),
+    ("branch", "HEAD"),
+    ("branch", "refs/heads/"),
+    ("branch", "private-value topic"),
+    ("branch", "private-value\ninjected"),
+    ("branch", ""),
+    ("branch", 1),
+], ids=["parent-lane", "lock-lane", "multiline-lane", "duplicate-capabilities", "spaced-capability",
+        "multiline-capability", "capability-type", "tags-branch", "heads-head", "head", "empty-name",
+        "spaced-branch", "multiline-branch", "empty-branch", "branch-type"])
+def test_policy_failures_use_public_predicates_and_retry(monkeypatch, kind, value):
+    lanes = _seen_valid_lane(monkeypatch)
+    capabilities = _seen_check_capabilities(monkeypatch)
+    branches = _seen_normalize_branch(monkeypatch)
+    _no_role_io(monkeypatch)
+    policy = _registration()
+    if kind == "lane":
+        policy["lanes"] = {value: policy["lanes"]["alpha"]}
+    else:
+        policy["lanes"]["alpha"][kind] = value
+    with pytest.raises(queue_role.RoleRefusal, match="^role_invalid$") as caught:
+        queue_role._policy(policy, "alpha")
+    assert str(caught.value) == "role_invalid"
+    assert "private-value" not in str(caught.value) and "injected" not in str(caught.value)
+    assert "\n" not in str(caught.value)
+    if kind == "lane":
+        assert lanes == [value] and capabilities == [] and branches == []
+    elif kind == "capabilities":
+        assert lanes == ["alpha"] and capabilities == [value] and branches == []
+    elif type(value) is not str:
+        assert lanes == ["alpha"] and capabilities == [] and branches == []
+    else:
+        assert lanes == ["alpha"] and capabilities == [["core"]] and branches == [value]
+    restored = _registration()
+    accepted = queue_role._policy(restored, "alpha")
+    assert accepted["lanes"]["alpha"]["branch"] == "refs/heads/lane/alpha"
+    assert accepted["lanes"]["alpha"]["capabilities"] == ["core"]
+
+
+def test_policy_checks_every_lane_and_stops_on_the_first_failure(monkeypatch):
+    lanes = _seen_valid_lane(monkeypatch)
+    capabilities = _seen_check_capabilities(monkeypatch)
+    branches = _seen_normalize_branch(monkeypatch)
+    _no_role_io(monkeypatch)
+    policy = _registration()
+    policy["lanes"]["beta"] = {"capabilities": ["core", "core"], "branch": "private-value\ninjected"}
+    with pytest.raises(queue_role.RoleRefusal, match="^role_invalid$"):
+        queue_role._policy(policy, "alpha")
+    assert lanes == ["alpha", "beta"]
+    assert capabilities == [["core"], ["core", "core"]]
+    assert branches == ["refs/heads/lane/alpha"]
+    policy["lanes"]["beta"] = {"capabilities": ["review"], "branch": "refs/heads/lane/beta"}
+    accepted = queue_role._policy(policy, "alpha")
+    assert list(accepted["lanes"]) == ["alpha", "beta"]
+    assert accepted["lanes"]["beta"]["branch"] == "refs/heads/lane/beta"
+
+
+def test_policy_branch_type_precedes_capabilities(monkeypatch):
+    def explode(*args, **kwargs):
+        raise AssertionError("capabilities must wait until the branch is a string")
+
+    _no_role_io(monkeypatch)
+    monkeypatch.setattr(queue_role.team_queue, "check_capabilities", explode)
+    monkeypatch.setattr(queue_role.team_queue, "normalize_branch", explode)
+    policy = _registration()
+    policy["lanes"]["alpha"]["branch"] = {"name": "private-value\ninjected"}
+    with pytest.raises(queue_role.RoleRefusal, match="^role_invalid$") as caught:
+        queue_role._policy(policy, "alpha")
+    assert "private-value" not in str(caught.value) and "injected" not in str(caught.value)
+
+
+def test_role_predicates_agree_across_threads():
+    from concurrent.futures import ThreadPoolExecutor
+
+    def check(_index):
+        accepted = queue_role._policy(_registration(), "alpha")
+        assert accepted["lanes"]["alpha"]["branch"] == "refs/heads/lane/alpha"
+        for policy in (_registration(capabilities=["core", "core"]),
+                       _registration(branch="private-value\ninjected")):
+            with pytest.raises(queue_role.RoleRefusal, match="^role_invalid$"):
+                queue_role._policy(policy, "alpha")
+        refused = queue_role.claim_argument_refusal({"id": "bad id", "expect": "A" * 64, "lane": "a..b"})
+        assert refused["reason"] == "invalid_arguments" and refused["exit_code"] == 2
+        assert refused["next_action"] == _ROLE_ARGUMENT_NEXT
+        assert "bad id" not in json.dumps(refused)
+        return True
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        assert list(pool.map(check, range(8))) == [True] * 8
