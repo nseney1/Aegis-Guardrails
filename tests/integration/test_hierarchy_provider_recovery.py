@@ -1,9 +1,11 @@
 """Public read-only views; fixture records provide no native authority."""
+import ast
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -13,6 +15,13 @@ import pytest
 from tests.integration.test_hierarchy_lifecycle import Ledger, request
 from tests.integration.test_hierarchy_jobs import kind_shop as kind_shop
 from tests.integration.test_hierarchy_workspace import Workspace
+from tests.integration import provider_recovery_admissions as admissions
+import hierarchy_jobs as process_jobs
+from tests.conftest import symlink_or_skip
+
+
+pytest_plugins = ("tests.integration.provider_recovery_admissions",)
+__all__ = ("kind_shop",)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -240,14 +249,14 @@ def test_unreadable_original_process_is_reported_without_capacity_release(worksp
     folder.mkdir(parents=True)
     (folder / "claim.json").write_text(json.dumps({"job": "pilot/original", "pid": 81001,
                                                    "start": "1", "process_scope": process_scope()}))
-    original = Path.read_text
-
-    def read(path, *args, **kwargs):
-        if str(path) == "/proc/81001/stat":
+    class UnreadableStat:
+        def read_text(self, *args, **kwargs):
             raise PermissionError("visibility denied")
-        return original(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_text", read)
+    def process_path(value):
+        return UnreadableStat() if str(value) == "/proc/81001/stat" else Path(value)
+
+    monkeypatch.setattr(process_jobs, "Path", process_path)
     before = snapshot(workspace.store)
     status = module().job_status(workspace.store, "pilot/original")
     assert status["projection"]["state"] == "evidence_error"
@@ -313,44 +322,41 @@ def test_cli_provider_reference_error_is_exact_json_and_no_effect(ledger):
 @pytest.mark.parametrize("terminal", ["completed", "failed", None], ids=["finished", "failed", "unsettled"])
 @pytest.mark.parametrize("recipes", ["match", "mismatch", "absent"])
 @pytest.mark.parametrize("surface", ["api", "cli-before", "cli-after"])
-def test_planned_job_recipe_matrix(kind_shop, capsys, terminal, recipes, surface):
-    from tests.integration.test_hierarchy_jobs_followups import (ADMISSION_UNVERIFIED_ACTION,
-                                                                recovery_admission_case)
+def test_planned_job_recipe_matrix(planned_admission, capsys, terminal, recipes, surface):
+    from tests.integration.test_hierarchy_jobs_followups import ADMISSION_UNVERIFIED_ACTION
 
-    shop = kind_shop
-    folder = recovery_admission_case(shop, terminal)
-    if recipes == "mismatch":
-        shop.recipes["recipes"]["ok"]["timeout_seconds"] += 1
-        shop.save_recipes()
+    shop = planned_admission
     trusted = None if recipes == "absent" else shop.recipes_path
     candidate = module()
-    before = {p.name: p.read_bytes() for p in folder.iterdir() if p.is_file()}
-    if surface == "api":
-        status = (candidate.job_status(shop.workspace.store, "pilot/job-1") if trusted is None else
-                  candidate.job_status(shop.workspace.store, "pilot/job-1", recipes_path=trusted))
-    else:
-        recipe_args = [] if trusted is None else ["--recipes", str(trusted)]
-        argv = ["--store", str(shop.workspace.store)]
-        argv += (recipe_args + ["job", "--job", "pilot/job-1"] if surface == "cli-before" else
-                 ["job", "--job", "pilot/job-1"] + recipe_args)
-        assert candidate.main(argv) == 0
-        status = json.loads(capsys.readouterr().out)
-    row = status["projection"]
-    expected = "finished" if terminal else {"match": "admitted", "mismatch": "evidence_error",
-                                            "absent": "admission_unverified"}[recipes]
-    assert row["state"] == expected, row
-    assert status["read_only"] is True and status["payload_effect"] == "unknown"
-    if terminal:
-        assert row["result"]["state"] == terminal and row["receipt"] == "match"
-        assert "error" not in row
-    elif recipes == "absent":
-        assert row["source"] == {"state": "unavailable", "reason": "planned recipe bytes unavailable",
-                                 "recipe_bytes_unavailable": True}
-        assert row["next_action"] == ADMISSION_UNVERIFIED_ACTION
-        assert "error" not in row and "detail" not in row
-    elif recipes == "mismatch":
-        assert row["error"] == row["detail"] == "recipes changed after admission"
-    assert {p.name: p.read_bytes() for p in folder.iterdir() if p.is_file()} == before
+    before = admissions.typed_snapshot(shop.root)
+    try:
+        if surface == "api":
+            status = (candidate.job_status(shop.store, "pilot/job-1") if trusted is None else
+                      candidate.job_status(shop.store, "pilot/job-1", recipes_path=trusted))
+        else:
+            recipe_args = [] if trusted is None else ["--recipes", str(trusted)]
+            argv = ["--store", str(shop.store)]
+            argv += (recipe_args + ["job", "--job", "pilot/job-1"] if surface == "cli-before" else
+                     ["job", "--job", "pilot/job-1"] + recipe_args)
+            assert candidate.main(argv) == 0
+            status = json.loads(capsys.readouterr().out)
+        row = status["projection"]
+        expected = "finished" if terminal else {"match": "admitted", "mismatch": "evidence_error",
+                                                "absent": "admission_unverified"}[recipes]
+        assert row["state"] == expected, row
+        assert status["read_only"] is True and status["payload_effect"] == "unknown"
+        if terminal:
+            assert row["result"]["state"] == terminal and row["receipt"] == "match"
+            assert "error" not in row
+        elif recipes == "absent":
+            assert row["source"] == {"state": "unavailable", "reason": "planned recipe path absent",
+                                     "recipe_bytes_unavailable": True}
+            assert row["next_action"] == ADMISSION_UNVERIFIED_ACTION
+            assert "error" not in row and "detail" not in row
+        elif recipes == "mismatch":
+            assert row["error"] == row["detail"] == "recipes changed after admission"
+    finally:
+        admissions.assert_copy_unchanged(shop.root, before, surface)
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="planned job evidence uses Linux /proc")
@@ -453,3 +459,341 @@ def test_provider_missing_derivation_publication_stays_unavailable(kind_shop, ca
     assert status["projection"] == row and row["state"] == "finished" and row["receipt"] == "match"
     assert row["source"]["terminal_source_unverified"] is True
     assert next(blocker for blocker in inventory["blockers"] if blocker.get("job") == row["job"])["reason"] == "source_unavailable"
+
+
+def _admissions_node_name(node):
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, (ast.arg, ast.keyword)):
+        return node.arg
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler)):
+        return node.name
+    if isinstance(node, ast.alias):
+        return node.asname or node.name.rsplit(".", 1)[-1]
+    return None
+
+
+def _admissions_name_violations(source, private_names=()):
+    return _admissions_tree_violations(ast.parse(source), private_names)
+
+
+def _admissions_tree_violations(tree, private_names=()):
+    found = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.alias):
+            continue  # Import statements own alias positions on every supported Python.
+        name = _admissions_node_name(node)
+        if name is not None and (name.startswith("_pra_") or name in private_names):
+            found.append(node.lineno)
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                name = _admissions_node_name(alias)
+                if name is not None and (name.startswith("_pra_") or name in private_names):
+                    found.append(node.lineno)
+        if isinstance(node, ast.ImportFrom) and (node.module or "").endswith("provider_recovery_admissions"):
+            if any(alias.name.startswith("_") for alias in node.names):
+                found.append(node.lineno)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if any(part.startswith("_pra_") and len(part) > len("_pra_")
+                   for part in re.split(r"[/\\]", node.value)):
+                found.append(node.lineno)
+    return sorted(set(found))
+
+
+def _assert_admissions_api(source):
+    tree = ast.parse(source)
+    table = next(node.value for node in tree.body if isinstance(node, ast.Assign)
+                 and any(isinstance(target, ast.Name) and target.id == "PUBLIC_SIGNATURES" for target in node.targets))
+    rows = ast.literal_eval(table)
+    actual = {}
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name.startswith("_"):
+            continue
+        args = node.args
+        positional = args.posonlyargs + args.args
+        defaults = [None] * (len(positional) - len(args.defaults)) + args.defaults
+        fields = tuple((arg.arg, "posonly" if i < len(args.posonlyargs) else "pos",
+                        ast.unparse(arg.annotation) if arg.annotation else None,
+                        ast.unparse(default) if default else None)
+                       for i, (arg, default) in enumerate(zip(positional, defaults)))
+        assert args.vararg is None and args.kwarg is None and not args.kwonlyargs
+        actual[node.name] = (fields, ast.unparse(node.returns) if node.returns else None)
+    assert len(rows) == len({row[0] for row in rows})
+    assert actual == {name: (parameters, returns) for name, parameters, returns, writes in rows}
+    assert all(writes in {"none", "fresh copy only"} for name, parameters, returns, writes in rows)
+
+
+@pytest.mark.skipif(not admissions.supported(), reason="source inspection requires descriptor support")
+def test_admissions_public_signature_table_is_exact():
+    _assert_admissions_api(admissions.read_source(ROOT / "tests", ("integration", "provider_recovery_admissions.py")))
+
+
+@pytest.mark.skipif(not admissions.supported(), reason="source inspection requires descriptor support")
+def test_admissions_signature_table_refuses_an_extra_function():
+    source = admissions.read_source(ROOT / "tests", ("integration", "provider_recovery_admissions.py"))
+    with pytest.raises(AssertionError):
+        _assert_admissions_api(source + "\ndef surplus():\n    pass\n")
+
+
+def test_admissions_private_reference_and_master_path_are_refused():
+    assert _admissions_name_violations("from tests.integration.provider_recovery_admissions import _pra_session\n")
+    assert _admissions_name_violations("import tests.integration.provider_recovery_admissions as owned\nowned._pra_session\n")
+    assert _admissions_name_violations("root / '_pra_master'\n")
+    assert not _admissions_name_violations("from tests.integration.provider_recovery_admissions import typed_snapshot\ntyped_snapshot(root)\n")
+
+
+@pytest.mark.skipif(not admissions.supported(), reason="source inspection requires descriptor support")
+def test_admissions_names_are_confined_to_the_helper_module():
+    base = Path(__file__).resolve().parents[1]
+    admitted = ("integration", "provider_recovery_admissions.py")
+    sources = admissions.source_files(base)
+    private_names = set()
+    for node in ast.walk(ast.parse(sources[admitted])):
+        name = _admissions_node_name(node)
+        if name is not None and name.startswith("_") and not name.startswith("__"):
+            private_names.add(name)
+    violations = []
+    for parts, source in sources.items():
+        if parts != admitted:
+            for line in _admissions_name_violations(source, private_names):
+                violations.append((admissions.source_name(parts), line))
+    assert violations == []
+
+
+@pytest.mark.parametrize("source", [
+    "def test_actor(_pra_session):\n    pass\n",
+    "def _pra_session():\n    pass\n",
+    "async def _pra_session():\n    pass\n",
+    "class _pra_Cache:\n    pass\n",
+    "import os as _pra_os\n",
+    "try:\n    pass\nexcept Exception as _pra_session:\n    pass\n",
+    "invoke(_pra_session=cache)\n",
+])
+def test_admissions_name_ban_covers_identifier_forms(source):
+    assert _admissions_name_violations(source)
+
+
+def test_admissions_name_ban_uses_all_declared_private_names():
+    assert _admissions_name_violations("alias._hidden\n", {"_hidden"})
+
+
+@pytest.mark.parametrize("source,expected", [
+    ("import os as _pra_os\n", [1]),
+    ("from os import (\n    path as _pra_path,\n)\n", [1]),
+    ("\n\nfrom sys import (\n    path as _pra_path,\n)\n", [3]),
+    ("from tests.integration.provider_recovery_admissions import (\n    _pra_session,\n)\n", [1]),
+    ("from tests.integration.provider_recovery_admissions import typed_snapshot\n", []),
+])
+def test_admissions_import_violations_use_statement_positions(source, expected):
+    assert _admissions_name_violations(source) == expected
+
+
+@pytest.mark.parametrize("kind", ["import", "from"])
+def test_admissions_import_aliases_without_positions(kind):
+    alias = ast.alias(name="os", asname="_hidden")
+    if kind == "import":
+        statement = ast.Import(names=[alias], lineno=7, col_offset=0)
+    else:
+        statement = ast.ImportFrom(module="package", names=[alias], level=0, lineno=7, col_offset=0)
+    tree = ast.Module(body=[statement], type_ignores=[])
+    assert not hasattr(alias, "lineno")
+    assert _admissions_tree_violations(tree, {"_hidden"}) == [7]
+
+
+def test_admissions_unsupported_probe_refuses_before_open(tmp_path, monkeypatch):
+    monkeypatch.setattr(admissions, "supported", lambda: False)
+    with pytest.raises(AssertionError, match="^admission descriptors unavailable$"):
+        admissions.typed_snapshot(tmp_path / "missing")
+    with pytest.raises(AssertionError, match="^admission descriptors unavailable$"):
+        admissions.read_source(tmp_path / "missing", ("support.py",))
+    with pytest.raises(AssertionError, match="^admission descriptors unavailable$"):
+        admissions.source_files(tmp_path / "missing")
+
+
+@pytest.mark.skipif(not admissions.supported(), reason="source refusal requires descriptor support")
+@pytest.mark.parametrize("kind", ["fifo", "stream-link", "oversized"])
+def test_admissions_source_contract_refuses_unsafe_sources(tmp_path, kind):
+    base = tmp_path / "tests"
+    integration = base / "integration"
+    integration.mkdir(parents=True)
+    (integration / "provider_recovery_admissions.py").write_text("pass\n", encoding="utf-8")
+    target = base / "support.py"
+    if kind == "fifo":
+        os.mkfifo(target)
+    elif kind == "stream-link":
+        symlink_or_skip("/dev/zero", target)
+    else:
+        with target.open("wb") as output:
+            output.truncate(4 * 1024 * 1024 + 1)
+    source = '''import resource
+import sys
+from tests.integration import test_hierarchy_provider_recovery as candidate
+resource.setrlimit(resource.RLIMIT_AS, (256 * 1024 * 1024, 256 * 1024 * 1024))
+candidate.__file__ = sys.argv[1]
+try:
+    candidate.test_admissions_names_are_confined_to_the_helper_module()
+except AssertionError as error:
+    assert "tests/support.py" in str(error)
+else:
+    raise AssertionError("unsafe source was admitted")
+'''
+    proc = subprocess.run([sys.executable, "-c", source,
+                           str(integration / "test_hierarchy_provider_recovery.py")], cwd=ROOT,
+                          env=dict(os.environ, PYTHONPATH=str(ROOT)), capture_output=True,
+                          text=True, timeout=5)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@pytest.mark.skipif(not admissions.supported(), reason="copy cleanup requires Linux descriptors")
+@pytest.mark.parametrize("kind", ["over-ceiling", "deep"])
+def test_admissions_refused_copy_does_not_block_the_next_surface(tmp_path, kind):
+    source = '''import os
+import resource
+import pytest
+from tests.integration import provider_recovery_admissions as layer
+pytest_plugins = ("tests.integration.provider_recovery_admissions",)
+original_remove = layer._pra_remove
+def limited_remove(parent, name):
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (32, hard))
+    try:
+        return original_remove(parent, name)
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+@pytest.mark.parametrize("terminal,recipes,surface", [(None, "match", "copy-only")])
+def test_leave_refused_copy(planned_admission, terminal, recipes, surface):
+    root = planned_admission.root
+'''
+    if kind == "over-ceiling":
+        source += '''\
+    layer._pra_NODES = len(layer.typed_snapshot(root)) + 16
+    spill = root / "spill"
+    spill.mkdir()
+    for index in range(layer._pra_NODES + 1):
+        (spill / str(index)).touch()
+'''
+    else:
+        source += '''\
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for index in range(96):
+            os.mkdir("deep", dir_fd=fd)
+            child = os.open("deep", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+    finally:
+        os.close(fd)
+    layer._pra_remove = limited_remove
+'''
+    source += '''\
+    with pytest.raises(AssertionError, match="^admission fixture unreadable$"):
+        layer.typed_snapshot(root)
+@pytest.mark.parametrize("terminal,recipes,surface", [(None, "match", "copy-only")])
+def test_next_surface(planned_admission, terminal, recipes, surface):
+    assert not (planned_admission.root / "spill").exists()
+    assert not (planned_admission.root / "deep").exists()
+'''
+    proc = _admissions_actor(tmp_path, source)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "2 passed" in proc.stdout
+
+
+@pytest.mark.parametrize("terminal,recipes,surface", [(None, "match", "copy-only")])
+def test_admissions_surface_can_write_its_copy(planned_admission, terminal, recipes, surface):
+    target = planned_admission.root / "copy-only.txt"
+    target.write_bytes(b"copy-only change")
+    assert target.read_bytes() == b"copy-only change"
+
+
+@pytest.mark.skipif(not admissions.supported() or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                    reason="read-only permission enforcement needs a non-root Linux user")
+def test_admissions_master_write_fails_the_surface_by_name(tmp_path):
+    # The static contract rejects this actor. Replay it separately to exercise the
+    # independent read-only and snapshot boundaries, including a mode bypass.
+    source = '''import os
+import pytest
+pytest_plugins = ("tests.integration.provider_recovery_admissions",)
+@pytest.mark.parametrize("terminal,recipes,surface", [(None, "match", "master-write")])
+def test_master_attack(planned_admission, terminal, recipes, surface):
+    master = planned_admission.root.parent / "_pra_master"
+    target = master / "recipes.json"
+    with pytest.raises(PermissionError):
+        target.write_bytes(b"blocked")
+    os.chmod(target, 0o600)
+    target.write_bytes(b"tampered")
+    os.chmod(target, 0o400)
+'''
+    assert _admissions_name_violations(source)
+    test_file = tmp_path / "test_master_attack.py"
+    test_file.write_text(source, encoding="utf-8")
+    env = dict(os.environ, PYTHONPATH=str(ROOT))
+    proc = subprocess.run([sys.executable, "-m", "pytest", "-q", "-n", "0", "--basetemp",
+                           str(tmp_path / "child-data"), str(test_file)], cwd=ROOT, env=env,
+                          capture_output=True, text=True, timeout=180)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "test_master_attack" in proc.stdout
+    assert "probe master-write mutated cached master" in proc.stdout
+
+
+def _admissions_actor(tmp_path, source):
+    assert _admissions_name_violations(source)
+    test_file = tmp_path / "test_cache_actor.py"
+    test_file.write_text(source, encoding="utf-8")
+    return subprocess.run([sys.executable, "-m", "pytest", "-q", "-n", "0", "--basetemp",
+                           str(tmp_path / "child-data"), str(test_file)], cwd=ROOT,
+                          env=dict(os.environ, PYTHONPATH=str(ROOT)), capture_output=True,
+                          text=True, timeout=180)
+
+
+@pytest.mark.skipif(not admissions.supported(), reason="cache actor requires Linux descriptors")
+def test_admissions_builds_only_the_requested_scenario(tmp_path):
+    source = '''import pytest
+pytest_plugins = ("tests.integration.provider_recovery_admissions",)
+@pytest.mark.parametrize("terminal,recipes,surface", [("completed", "match", "api")])
+def test_first_use(planned_admission, terminal, recipes, surface):
+    cache = planned_admission.root.parent.parent
+    masters = sorted(path.name for path in cache.iterdir()
+                     if path.is_dir() and (path / "_pra_master").is_dir())
+    assert masters == ["finished-match"]
+'''
+    proc = _admissions_actor(tmp_path, source)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "1 passed" in proc.stdout
+
+
+@pytest.mark.skipif(not admissions.supported() or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                    reason="cross-master actor needs a non-root Linux user")
+@pytest.mark.parametrize("attack", ["rewrite", "remove"])
+def test_admissions_session_teardown_names_a_changed_other_master(tmp_path, attack):
+    source = '''import os
+import shutil
+import pytest
+pytest_plugins = ("tests.integration.provider_recovery_admissions",)
+@pytest.mark.parametrize("terminal,recipes,surface", [("completed", "match", "api")])
+def test_original(planned_admission, terminal, recipes, surface):
+    pass
+@pytest.mark.parametrize("terminal,recipes,surface", [("failed", "match", "master-write")])
+def test_other(planned_admission, terminal, recipes, surface):
+    target = planned_admission.root.parent.parent / "finished-match" / "_pra_master" / "recipes.json"
+'''
+    if attack == "rewrite":
+        source += '''\
+    with pytest.raises(PermissionError):
+        target.write_bytes(b"blocked")
+    os.chmod(target, 0o600)
+    target.write_bytes(b"tampered")
+    os.chmod(target, 0o400)
+'''
+    else:
+        source += '''\
+    victim = target.parent.parent
+    for path in victim.rglob("*"):
+        if not path.is_symlink():
+            os.chmod(path, 0o700 if path.is_dir() else 0o600)
+    shutil.rmtree(victim)
+'''
+    proc = _admissions_actor(tmp_path, source)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "cached master finished-match changed at session teardown" in proc.stdout

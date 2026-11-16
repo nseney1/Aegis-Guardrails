@@ -31,7 +31,7 @@ __all__ = [
 MAX_BYTES = 1048576
 MAX_ITEMS = 256
 MAX_FIELDS = 128
-MAX_TEXT = 4096
+MAX_TEXT = team_claims.RECOVERY_TEXT_LIMIT
 MAX_COMPLETED = 8192
 MAX_JSON_DEPTH = 16
 MAX_JSON_NODES = 65536
@@ -398,11 +398,17 @@ def _blockers(item, state, lanes, found, now, queue_paths, *, config_checked=Tru
     return blockers
 
 
+def _item_state(row, now):
+    """Project effective scheduling state and its expiry evidence for every view."""
+    expired = row["state"] == "claimed" and not _live(row, now)
+    return {"state": "queued" if expired else row["state"], "lease_expired": expired,
+            "expires_at": row["expires_at"]}
+
+
 def _view(row, now, blockers=()):
     item = row["item"]
-    expired = row["state"] == "claimed" and not _live(row, now)
     result = {**item, **{key: value for key, value in row.items() if key != "item"},
-            "state": "queued" if expired else row["state"], "lease_expired": expired,
+            **_item_state(row, now),
             "label": _QueueLabel(item["id"], item["title"], row["lane"]),
             "blockers": array(blockers), "conditions_met": not blockers}
     if not _branch_evidence(row.get("branch"))[0]:
@@ -647,7 +653,7 @@ def _lease_findings(state, found, moment):
     return findings
 
 
-def _observe(root, state, verb, moment, lanes, found, queue_paths, capabilities, include_done, leases_checked):
+def _observe(root, state, verb, moment, lanes, found, queue_paths, capabilities, include_done, leases_checked, view):
     rows, findings, item_blockers = [], [], {}
     for identifier in sorted(state["items"]):
         row = state["items"][identifier]
@@ -658,7 +664,8 @@ def _observe(root, state, verb, moment, lanes, found, queue_paths, capabilities,
             continue
         if capabilities is not None and not set(row["item"]["capabilities"]) <= set(capabilities):
             continue
-        rows.append(_view(row, moment, blockers))
+        if view == "full":
+            rows.append(_view(row, moment, blockers))
         if row["state"] == "done" or _live(row, moment):
             continue
         if blockers and all(block["reason"] == "coordinator" for block in blockers):
@@ -666,16 +673,28 @@ def _observe(root, state, verb, moment, lanes, found, queue_paths, capabilities,
         typed = row["item"].get("hold_until", [])
         if typed and blockers and all(block["reason"] == "judgment_hold" for block in blockers):
             findings.append({"item_id": identifier, "code": "CONDITIONS_MET_STILL_HELD", **_block("held_conditions_met", "Review and remove the judgment hold when ready; retain typed conditions for claim-time checks.")})
-    result = {"items": rows}
-    if include_done:
+    result = {"items": rows} if view == "full" else {"view": view}
+    if include_done and view == "full":
         result["completed_ids"] = sorted(state["completed"])
     if verb == "audit":
         result["findings"] = findings + _lease_findings(state, found, moment)
+        if view == "findings":
+            identifiers = sorted({finding["item_id"] for finding in result["findings"]})
+            result.update(
+                affected_items=[{"id": identifier, **{key: state["items"][identifier][key]
+                                for key in ("revision", "lane")},
+                                **_item_state(state["items"][identifier], moment)} for identifier in identifiers],
+                counts={"items": len(state["items"]), "findings": len(result["findings"]),
+                        "affected_items": len(identifiers)}, omitted=["items"],
+                next_action="Run aegis team queue list --include-done --view full --json and read full constraints before changing holds or work.")
     if verb == "list":
         policy = _claim_policy(root)
         claimable = _claimable(state, lanes, found, moment, queue_paths, policy, leases_checked, item_blockers)
         result["claimable_fingerprint"] = team_claims.fingerprint(
             state, found, moment, claimable, dict(lanes) if lanes is not None else None, policy, leases_checked)
+        if view == "fingerprint":
+            result.update(omitted=["items", "completed_ids"],
+                          next_action="After a fingerprint change, run aegis team queue list --view full --json; the fingerprint never authorizes a claim.")
     return result
 
 
@@ -701,6 +720,9 @@ def _arguments(verb, valid_clock, caller, arguments):
     _require(valid_clock, "invalid_arguments")
     include_done = arguments.pop("include_done", False)
     _require(type(include_done) is bool, "invalid_arguments")
+    view = arguments.pop("view", "full")
+    _require(type(view) is str and len(view) <= 11 and view in ("full", {"list": "fingerprint", "audit": "findings"}.get(verb)),
+             "invalid_arguments")
     if verb == "add":
         arguments["item"] = _item(arguments["item"])
     if verb in ("claim", "release", "unclaim", "done"):
@@ -734,7 +756,7 @@ def _arguments(verb, valid_clock, caller, arguments):
             caller = _text(team.default_owner() if caller is None else caller, 200 if verb == "unclaim" else 256)
         except QueueRefusal:
             raise QueueRefusal("invalid_arguments") from None
-    return include_done, capabilities, write, caller
+    return include_done, capabilities, write, caller, view
 
 
 def _project(payload, error=None):
@@ -759,12 +781,12 @@ def _run(root, verb, now=None, caller=None, **arguments):
                                   now=moment if valid_clock else 0)
     payload.update(refused=False, status="done", exit_code=0)
     try:
-        include_done, capabilities, write, caller = _arguments(verb, valid_clock, caller, arguments)
+        include_done, capabilities, write, caller, view = _arguments(verb, valid_clock, caller, arguments)
         root = _root(root)
         with locked(root, timeout=5.0) if write else nullcontext():
             state = _state(root)
             if "unclaim" in state and verb != "unclaim":
-                raise team_claims.recovery_refusal(state["unclaim"])
+                raise team_claims.recovery_refusal(state["unclaim"], root=root)
             if verb == "unclaim":
                 payload.update(_unclaim(root, state, moment, caller, arguments))
                 return _project(payload)
@@ -783,7 +805,7 @@ def _run(root, verb, now=None, caller=None, **arguments):
             if write:
                 payload.update(_mutate(root, state, verb, moment, caller, lanes, found, queue_paths, arguments))
             else:
-                payload.update(_observe(root, state, verb, moment, lanes, found, queue_paths, capabilities, include_done, leases_checked))
+                payload.update(_observe(root, state, verb, moment, lanes, found, queue_paths, capabilities, include_done, leases_checked, view))
     except (QueueRefusal, team_claims.ClaimRefusal, storage.LockTimeoutError,
             OSError, ValueError, RuntimeError, gitsafe.GitError) as error:
         return _project(payload, error)
@@ -794,22 +816,22 @@ def add(root, item, *, now=None, caller=None):
     return _run(root, "add", now, caller=caller, item=item)
 
 
-def list(root, *, capabilities=None, include_done=False, now=None):
+def list(root, *, capabilities=None, include_done=False, view="full", now=None):
     arguments = {"include_done": include_done}
     if capabilities is not None:
         arguments["capabilities"] = capabilities
     invalid = list_argument_refusal(arguments)
     if invalid is not None:
         return invalid
-    return _run(root, "list", now, capabilities=capabilities, include_done=include_done)
+    return _run(root, "list", now, capabilities=capabilities, include_done=include_done, view=view)
 
 
 def compact(root, *, now=None, caller=None):
     return _run(root, "compact", now, caller=caller)
 
 
-def audit(root, *, now=None):
-    return _run(root, "audit", now)
+def audit(root, *, view="full", now=None):
+    return _run(root, "audit", now, view=view)
 
 
 def claim(root, identifier, *, expect, lane, capabilities=(), ttl_s=3600, branch=None, now=None, caller=None):

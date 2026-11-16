@@ -173,6 +173,93 @@ def item(identifier="ONE", **fields):
             "capabilities": ["core"], **fields}
 
 
+def test_partial_views_preserve_full_results_and_skip_item_projection(make_store, monkeypatch):
+    root = make_store
+    revision = add(root, hold="Await decision", hold_until=[{"kind": "lease_free", "paths": ["src/**"]}])
+    full_list = queue.list(root, now=101)
+    full_audit = queue.audit(root, now=101)
+    before = (root / ".aegis/state/team-queue.json").read_bytes()
+    def no_item_projection(*args, **kwargs):
+        pytest.fail("partial observations must not build full item views")
+    monkeypatch.setattr(queue, "_view", no_item_projection)
+    for _ in range(2):
+        small = queue.list(root, view="fingerprint", capabilities=["unrelated"], include_done=True, now=101)
+        assert small == {**{key: value for key, value in full_list.items() if key != "items"},
+                         "view": "fingerprint", "omitted": ["items", "completed_ids"],
+                         "next_action": "After a fingerprint change, run aegis team queue list --view full --json; the fingerprint never authorizes a claim."}
+        audit = queue.audit(root, view="findings", now=101)
+        assert audit["findings"] == full_audit["findings"]
+        assert audit["affected_items"] == [{"id": "ONE", "revision": revision, "lane": None,
+                                            "state": "queued", "lease_expired": False, "expires_at": None}]
+        assert audit["counts"] == {"items": 1, "findings": 1, "affected_items": 1}
+        assert audit["view"] == "findings" and audit["omitted"] == ["items"]
+        assert "aegis team queue list --include-done --view full --json" in audit["next_action"]
+        assert "items" not in audit
+    assert (root / ".aegis/state/team-queue.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("verb,view", [("list", "fingerprint"), ("audit", "findings")])
+def test_partial_view_empty_failure_and_retry(make_store, verb, view):
+    root = make_store
+    observe = getattr(queue, verb)
+    empty = observe(root, view=view, now=100)
+    assert empty["exit_code"] == 0 and "items" not in empty
+    if verb == "audit":
+        assert empty["findings"] == [] and empty["affected_items"] == []
+        assert empty["counts"] == {"items": 0, "findings": 0, "affected_items": 0}
+    add(root)
+    state = root / ".aegis/state/team-queue.json"
+    original = state.read_bytes()
+    for raw in (b"{", b" " * (queue.MAX_BYTES + 1)):
+        state.write_bytes(raw)
+        assert observe(root, view=view, now=101) == observe(root, now=101)
+        assert state.read_bytes() == raw
+    state.write_bytes(original)
+    retried = observe(root, view=view, now=102)
+    assert retried["exit_code"] == 0
+    if verb == "audit":
+        assert retried["findings"] == [] and retried["affected_items"] == []
+        assert retried["counts"] == {"items": 1, "findings": 0, "affected_items": 0}
+    with ThreadPoolExecutor(max_workers=3) as workers:
+        futures = [workers.submit(observe, root, view=view, now=102) for _ in range(3)]
+        assert [future.result(timeout=30) for future in futures] == [retried] * 3
+
+
+@pytest.mark.parametrize("verb,view", [("list", "findings"), ("audit", "fingerprint"),
+                                      ("list", ["full"]), ("audit", "private-value" * 4096)],
+                         ids=["list-wrong-view", "audit-wrong-view", "wrong-type", "oversized"])
+def test_invalid_view_precedes_platform_probe(monkeypatch, verb, view):
+    def unavailable():
+        pytest.fail("invalid view must refuse before platform discovery")
+    monkeypatch.setattr(queue, "descriptor_supported", unavailable)
+    result = getattr(queue, verb)(None, view=view, now=100)
+    assert result["reason"] == "invalid_arguments" and result["exit_code"] == 2
+    assert "private-value" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("verb,view", [("list", "fingerprint"), ("audit", "findings")])
+def test_partial_view_unsupported_platform(tmp_path, monkeypatch, verb, view):
+    monkeypatch.setattr(queue, "descriptor_supported", lambda: False)
+    result = getattr(queue, verb)(tmp_path, view=view, now=100)
+    assert result["reason"] == "unsupported_platform" and result["exit_code"] == 1
+
+
+def test_fingerprint_view_concurrency_expiry_and_revision_authority(make_store):
+    root = make_store
+    revision = add(root)
+    with ThreadPoolExecutor(max_workers=3) as workers:
+        futures = [workers.submit(queue.list, root, view="fingerprint", now=101) for _ in range(3)]
+        results = [future.result(timeout=30) for future in futures]
+    assert results[0] == results[1] == results[2]
+    token = results[0]["claimable_fingerprint"]
+    assert queue.claim(root, "ONE", expect=token, lane="alpha", capabilities=["core"], now=101)["reason"] == "stale_revision"
+    claimed = claim(root, revision)
+    active = queue.list(root, view="fingerprint", now=102)
+    assert active["claimable_fingerprint"] != token
+    assert queue.list(root, view="fingerprint", now=112)["claimable_fingerprint"] != active["claimable_fingerprint"]
+    assert not claimed["refused"]
+
+
 def add(root, identifier="ONE", **fields):
     result = queue.add(root, item(identifier, **fields), now=100)
     assert not result["refused"], result
@@ -1272,6 +1359,39 @@ def stored_branch_item(root, branch, state):
     return path, document["items"]["ONE"]["revision"], second, 112 if state == "expired" else 103
 
 
+@pytest.mark.parametrize("state,effective,expired", [("active", "claimed", False),
+                                                    ("expired", "queued", True),
+                                                    ("completed", "done", False)])
+def test_findings_state_and_expiry_match_full_views_after_retry(make_store, state, effective, expired):
+    root = make_store
+    path, revision, _, moment = stored_branch_item(root, "refs/heads/refs/tags/legacy", state)
+    original = path.read_bytes()
+    full = queue.list(root, include_done=True, view="full", now=moment)
+    expected = next(row for row in full["items"] if row["id"] == "ONE")
+    assert expected["state"] == effective and expected["lease_expired"] is expired
+    assert expected["revision"] == revision and expected["expires_at"] == 111
+    fields = ("id", "revision", "lane", "state", "lease_expired", "expires_at")
+    for _ in range(2):
+        findings = queue.audit(root, view="findings", now=moment)
+        assert findings["exit_code"] == 0 and any(
+            row["code"] == "CLAIM-BRANCH-UNSUPPORTED" for row in findings["findings"])
+        assert findings["affected_items"] == [{key: expected[key] for key in fields}]
+        assert findings["next_action"] == (
+            "Run aegis team queue list --include-done --view full --json and read full constraints before changing holds or work.")
+    if state != "completed":
+        audited = queue.audit(root, view="full", now=moment)
+        assert next(row for row in audited["items"] if row["id"] == "ONE") == expected
+    path.write_bytes(b"{")
+    failed = queue.audit(root, view="findings", now=moment)
+    assert failed["reason"] == "invalid_queue_state" and failed["exit_code"] == 1
+    assert failed == queue.audit(root, view="full", now=moment)
+    path.write_bytes(original)
+    with ThreadPoolExecutor(max_workers=3) as workers:
+        futures = [workers.submit(queue.audit, root, view="findings", now=moment) for _ in range(3)]
+        assert [future.result(timeout=30) for future in futures] == [findings] * 3
+    assert path.read_bytes() == original
+
+
 @pytest.mark.parametrize("branch,unsupported", [
     ("refs/heads/refs/tags/x", True), ("refs/heads/refs/heads/x", True),
     ("refs/heads/refs/remotes/origin/x", True), ("lane/alpha", False),
@@ -1408,12 +1528,31 @@ def test_valid_pending_intent_stays_recoverable(make_store):
     listed = queue.list(make_store, now=101)
     assert listed["reason"] == "unclaim_recovery_required" and listed["exit_code"] == 1
     assert listed["blockers"][0]["reason_text"] == "Waiting"
+    assert "--workspace" in listed["blockers"][0]["next_action"]
+    assert str(make_store) in listed["blockers"][0]["next_action"]
     assert path.read_bytes() == before
     state.pop("unclaim")
     _write_state(path, state)
     restored = queue.list(make_store, now=102)
     assert not restored["refused"], restored
     assert restored["items"][0]["id"] == "ONE"
+    assert "aegis team queue unclaim" not in json.dumps(restored)
+
+
+def test_concurrent_pending_lists_name_the_same_workspace(make_store):
+    path, state, _row = _pending_state(make_store)
+    before = _write_state(path, state)
+    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
+        results = list(pool.map(race_list, [(make_store, 101), (make_store, 102)], timeout=30))
+    assert path.read_bytes() == before
+    commands = []
+    for result in results:
+        assert result["reason"] == "unclaim_recovery_required" and result["exit_code"] == 1
+        blocker = result["blockers"][0]
+        assert (blocker["caller"], blocker["reason_text"]) == ("owner", "Waiting")
+        commands.append(blocker["next_action"])
+    assert commands[0] == commands[1]
+    assert "--workspace" in commands[0] and str(make_store) in commands[0]
 
 
 @pytest.mark.parametrize("shape", [

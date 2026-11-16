@@ -10,6 +10,9 @@ from aegis_core import team
 
 EXIT_OK = 0
 EXIT_USAGE = 2
+_ARGUMENT_NAMES = frozenset(("ITEM", "--item", "--expect", "--lane", "--branch",
+                             "--capability", "--ttl", "--reason", "--workspace", "--view"))
+_VERBS = ("add", "list", "claim", "release", "unclaim", "done", "audit", "compact")
 
 
 def _emit(payload):
@@ -18,6 +21,24 @@ def _emit(payload):
 
 class QueueArgumentError(ValueError):
     """Parser signal that never retains untrusted diagnostic text."""
+
+    def __init__(self, category=None, names=(), verb=None):
+        super().__init__()
+        self.details = None
+        if (category in ("missing_required", "missing_value", "invalid_value", "limit_exceeded")
+                and verb in _VERBS and names and len(names) <= len(_ARGUMENT_NAMES)
+                and all(name in _ARGUMENT_NAMES for name in names)):
+            self.details = {"category": category, "arguments": list(names),
+                            "help_command": "aegis team queue " + verb + " --help"}
+
+
+def _parser_refusal(error=None):
+    from aegis_core import team_queue
+
+    result = team_queue.refusal("invalid_arguments")
+    if error is not None and error.details is not None:
+        result["argument_error"] = error.details
+    return result
 
 
 class _DiscardOutput:
@@ -57,6 +78,7 @@ class QueueErrorPolicy:
         from aegis_core import team_queue
         from aegis_cli.msg import MsgArgumentError
 
+        diagnostic = None
         try:
             with redirect_stderr(_DiscardOutput()):
                 args = parser.parse_args(argv)
@@ -67,9 +89,11 @@ class QueueErrorPolicy:
         except SystemExit as error:
             if error.code == 0:
                 return EXIT_OK
-        except (QueueArgumentError, self.parser_error, MsgArgumentError):
+        except QueueArgumentError as error:
+            diagnostic = error
+        except (self.parser_error, MsgArgumentError):
             pass
-        result = team_queue.refusal("invalid_arguments")
+        result = _parser_refusal(diagnostic)
         if self.output is not None:
             return self.output(result)
         _emit(result)
@@ -95,9 +119,11 @@ def run_queue(args):
         result = (team_queue.refusal(parsed["reason"], verb=verb) if parsed["refused"]
                   else team_queue.add(root, parsed["item"]))
     elif verb == "list":
-        result = team_queue.list(root, capabilities=args.capabilities, include_done=args.include_done)
-    elif verb in ("audit", "compact"):
-        result = getattr(team_queue, verb)(root)
+        result = team_queue.list(root, capabilities=args.capabilities, include_done=args.include_done, view=args.view)
+    elif verb == "audit":
+        result = team_queue.audit(root, view=args.view)
+    elif verb == "compact":
+        result = team_queue.compact(root)
     elif verb == "claim":
         result = team_queue.claim(root, args.item_id, expect=args.expect, lane=args.lane,
                                   capabilities=args.capabilities or [], ttl_s=args.ttl, branch=args.branch)
@@ -116,14 +142,42 @@ def configure_parser(sub, common, parent):
     from aegis_core import team_queue
 
     class QueueParser(type(parent)):
-        def error(self, message):
+        def __init__(self, *args, **kwargs):
+            kwargs["exit_on_error"] = False
+            super().__init__(*args, **kwargs)
+            self.queue_verb = None
+
+        def refuse(self, category=None, names=()):
+            error = QueueArgumentError(category, names, self.queue_verb)
             if getattr(self, "_error_policy", None) is not None:
-                raise QueueArgumentError()
-            _emit(team_queue.refusal("invalid_arguments"))
+                raise error
+            _emit(_parser_refusal(error))
             self.exit(EXIT_USAGE)
 
+        def error(self, message):
+            # Only recognize a bounded, exact required-argument diagnostic.
+            # Names are projected from parser declarations, never copied from argv.
+            prefix = "the following arguments are required: "
+            if len(message) <= 512 and message.startswith(prefix):
+                declared = {action.option_strings[0] if action.option_strings else action.metavar: action
+                            for action in self._actions if action.required}
+                names = message[len(prefix):].split(", ")
+                if all(name in declared and name in _ARGUMENT_NAMES for name in names):
+                    self.refuse("missing_required", [name for name in declared if name in names])
+            self.refuse()
+
+        def _get_value(self, action, arg_string):
+            if action.dest == "view" and len(arg_string) > 11:
+                self.refuse("limit_exceeded", ["--view"])
+            return super()._get_value(action, arg_string)
+
         def parse_known_args(self, args=None, namespace=None):
-            values, extras = super().parse_known_args(args, namespace)
+            try:
+                values, extras = super().parse_known_args(args, namespace)
+            except argparse.ArgumentError as error:
+                names = [name for name in _ARGUMENT_NAMES if name == error.argument_name]
+                category = "missing_value" if error.message == "expected one argument" else "invalid_value"
+                self.refuse(category, names)
             if extras:
                 self.error("")
             raw = getattr(values, "workspace", None)
@@ -135,7 +189,7 @@ def configure_parser(sub, common, parent):
         def __call__(self, parser, namespace, value, option_string=None):
             previous = getattr(namespace, self.dest, None) or []
             if len(previous) >= 128 or len(value) > 64:
-                parser.error("")
+                parser.refuse("limit_exceeded", ["--capability"])
             setattr(namespace, self.dest, previous + [value])
 
     factory = sub._parser_class
@@ -152,8 +206,10 @@ def configure_parser(sub, common, parent):
     add.add_argument("--item", required=True, metavar="JSON", help="Queue item object; no file paths are opened")
     view = verbs.add_parser("list", parents=[common], help="List items, blockers and lane labels", allow_abbrev=False)
     view.add_argument("--capability", dest="capabilities", action=Capabilities, default=None,
-                      help="Filter by a team capability label; repeat for each label")
+                      help="Capabilities available to this team; list items whose requirements are all satisfied. Repeat for each label")
     view.add_argument("--include-done", action="store_true", help="Include completed items hidden by default")
+    view.add_argument("--view", choices=("full", "fingerprint"), default="full",
+                      help="Full item detail (default), or fingerprint only; run the full list after a change")
     claim = verbs.add_parser("claim", parents=[common], help="Claim a current item revision with a lease", allow_abbrev=False)
     claim.add_argument("item_id", metavar="ITEM", help="Stable queue item id")
     claim.add_argument("--expect", required=True, metavar="REVISION", help="Current revision returned by add or list")
@@ -172,8 +228,12 @@ def configure_parser(sub, common, parent):
         if verb == "unclaim":
             action.add_argument("--writer-stopped", action="store_true", help="Acknowledge that the lane's writer and queued jobs are stopped")
             action.add_argument("--reason", default="", help="Single-line noncredential reason for returning the claim and its leases")
-    verbs.add_parser("audit", parents=[common], help="Report held work needing a decision", allow_abbrev=False)
+    audit = verbs.add_parser("audit", parents=[common], help="Report held work needing a decision", allow_abbrev=False)
+    audit.add_argument("--view", choices=("full", "findings"), default="full",
+                       help="Full item detail (default), or findings with affected revisions and counts; inspect full constraints before decisions")
     verbs.add_parser("compact", parents=[common], help="Remove completed items not needed by unfinished dependencies", allow_abbrev=False)
+    for name, action_parser in verbs.choices.items():
+        action_parser.queue_verb = name
 
 
 def _output(args, result):

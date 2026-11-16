@@ -20,6 +20,7 @@ from typing import List, Optional
 import pytest
 
 from aegis_cli.cli import main
+from aegis_cli import team_lease_output
 from aegis_core import events, team, team_queue, team_lease_custody
 from aegis_core import gitsafe as rendering_git
 from aegis_core._version import __version__
@@ -608,6 +609,37 @@ def test_gc_collects_expired_leases(ws: Path, capsys):
     assert payload["kept"] == [{"lane": "junk", "reason": "unreadable"}]
 
 
+@pytest.mark.parametrize("as_json", [False, True])
+def test_gc_separates_event_and_lane_warnings_and_clears_them_on_retry(ws: Path, tmp_path: Path, capsys, as_json):
+    shared = Path(os.path.realpath(ws / ".git")) / "aegis"
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    try:
+        os.symlink(str(elsewhere), str(shared), target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are unavailable")
+    for lane in ("api", "docs"):
+        team.claim(ws, lane, [lane + "/**"], owner="o@h", ttl_s=60, now=NOW, branch="main")
+    if as_json:
+        rc, payload, err = _json(capsys, "gc")
+        assert (rc, err) == (0, "")
+        assert [row["lane"] for row in payload["collected"]] == ["api", "docs"]
+        assert len(payload["warnings"]) == 2
+        assert all(isinstance(warning, str) and warning.startswith("event not recorded: ")
+                   for warning in payload["warnings"])
+        assert payload["lane_warnings"] == [
+            {"lane": lane, "reason": "expired_with_worktree"} for lane in ("api", "docs")]
+    else:
+        rc, out, err = _run(capsys, "gc")
+        assert (rc, out) == (0, "collected api\ncollected docs\n")
+        assert err.count("Warning: event not recorded: ") == 2
+        assert err.endswith("Warning: api: expired_with_worktree\nWarning: docs: expired_with_worktree\n")
+    assert all(_ref(ws, lane) is None for lane in ("api", "docs"))
+    rc, payload, err = _json(capsys, "gc")
+    assert (rc, payload["status"], payload["collected"], err) == (0, "nothing to collect", [], "")
+    assert payload["warnings"] == payload["lane_warnings"] == []
+
+
 # ── list ─────────────────────────────────────────────────────────────────────
 
 def test_list_json_reports_every_plan_field_and_the_statement(ws: Path, capsys):
@@ -933,6 +965,125 @@ def test_lease_liveness_uses_metadata_scratch_without_descriptor_support(ws, cap
     assert seen[1].is_dir() and list(seen[1].iterdir()) == []
 
 
+@pytest.mark.parametrize("action", ["renew", "gc"])
+@pytest.mark.parametrize("failure", ["none", "observation", "cleanup"])
+@pytest.mark.parametrize("as_json", [False, True])
+def test_lease_pending_response_never_captures_other_threads(
+        ws, capsys, monkeypatch, action, failure, as_json):
+    from contextlib import contextmanager
+    from threading import Thread
+    import sys
+
+    old = team.claim(ws, "docs", ["docs/**"], owner="owner", branch="main")
+    original_evidence, original_custody = team.lease_branch_evidence, team.lease_custody
+    observed = []
+
+    def unrelated():
+        print("other stdout")
+        print("other stderr", file=sys.stderr)
+
+    def evidence(*args, **kwargs):
+        worker = Thread(target=unrelated)
+        worker.start()
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        observed.append(capsys.readouterr())
+        if failure == "observation":
+            raise rendering_git.GitError("private-observation-marker")
+        return original_evidence(*args, **kwargs)
+
+    @contextmanager
+    def custody(*args, **kwargs):
+        with original_custody(*args, **kwargs):
+            yield
+        if failure == "cleanup":
+            raise rendering_git.GitError("private-cleanup-marker")
+
+    monkeypatch.setattr(team, "lease_branch_evidence", evidence)
+    monkeypatch.setattr(team, "lease_custody", custody)
+    argv = ["renew", "docs", "--expect", old.oid] if action == "renew" else ["gc"]
+    if as_json:
+        argv.append("--json")
+    code = main(["--workspace", str(ws), "team", *argv])
+    captured = capsys.readouterr()
+    assert observed == [("other stdout\n", "other stderr\n")]
+    assert "other" not in captured.out + captured.err
+    assert "private-" not in captured.out + captured.err
+    assert code == (0 if failure == "none" else 1)
+    if as_json:
+        payload = json.loads(captured.out)
+        assert captured.err == ""
+        if failure == "none":
+            assert payload["status"] == ("renewed" if action == "renew" else "nothing to collect")
+        else:
+            assert payload["reason"] == "liveness_unknown"
+    elif failure != "none":
+        assert captured.out == ""
+        assert captured.err == "liveness_unknown\nRestore private Git metadata, then retry.\n"
+    monkeypatch.setattr(team, "lease_branch_evidence", original_evidence)
+    monkeypatch.setattr(team, "lease_custody", original_custody)
+    current = _ref(ws, "docs")
+    retry = ["renew", "docs", "--expect", current] if action == "renew" else ["gc"]
+    assert main(["--workspace", str(ws), "team", *retry, "--json"]) == 0
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_pending_lease_response_bounds_output_and_retries(ws, capsys, stream):
+    from aegis_cli.team_lease_output import PendingResponse, operation
+
+    def oversized(args, root, now):
+        pending = PendingResponse()
+        pending.write("x" * (2 * 1024 * 1024 + 1), stream)
+        return pending
+
+    with pytest.raises(rendering_git.GitError, match="^liveness_unknown$") as caught:
+        operation(ws, oversized, None, NOW)
+    assert caught.value.code == "git_output_limit"
+    assert capsys.readouterr() == ("", "")
+
+    def retry(args, root, now):
+        pending = PendingResponse()
+        pending.line("one result")
+        return pending
+
+    assert operation(ws, retry, None, NOW) == 0
+    assert capsys.readouterr() == ("one result\n", "")
+
+
+@pytest.mark.parametrize("payload", [
+    None, True, False, 17, -3, 1.25,
+    "plain", '\\"\b\f\n\r\t\0\x1f\x7f\u00e9\U0001f600\ud800',
+    {"key": [None, True, False, 17, -3, 1.25, {}, [], {"nested": "value"}]},
+])
+def test_pending_lease_json_preserves_exact_bytes_and_limit(monkeypatch, capsys, payload):
+    expected = json.dumps(payload, indent=2) + "\n"
+    monkeypatch.setattr(team_lease_output, "_OUTPUT_LIMIT", len(expected))
+    pending = team_lease_output.PendingResponse(1)
+    pending.json(payload)
+    assert pending.publish() == 1
+    assert capsys.readouterr() == (expected, "")
+    monkeypatch.setattr(team_lease_output, "_OUTPUT_LIMIT", len(expected) - 1)
+    with pytest.raises(rendering_git.GitError, match="^liveness_unknown$") as caught:
+        team_lease_output.PendingResponse().json(payload)
+    assert caught.value.code == "git_output_limit"
+    assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.parametrize("value", ["x" * 21, "\x7f" * 4, "\U0001f600" * 2])
+def test_pending_lease_json_refuses_before_escaped_allocation(monkeypatch, value):
+    from types import SimpleNamespace
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("oversized response reached JSON allocation")
+
+    monkeypatch.setattr(team_lease_output, "_OUTPUT_LIMIT", 20)
+    monkeypatch.setattr(team_lease_output, "json", SimpleNamespace(dumps=unexpected))
+    with pytest.raises(rendering_git.GitError, match="^liveness_unknown$") as caught:
+        team_lease_output.PendingResponse().json(value)
+    assert caught.value.code == "git_output_limit"
+
+
 def test_lease_custody_is_absent_from_ordinary_team_import():
     import sys
 
@@ -944,14 +1095,25 @@ def test_lease_custody_is_absent_from_ordinary_team_import():
     assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
 
 
-def test_lease_descriptor_probe_requires_parent_addressable_fds(monkeypatch):
+def test_lease_custody_documents_backend_selection_and_residual():
+    documentation = " ".join(team_lease_custody.__doc__.split())
+    for term in ("descriptor backend", "pathname backend", "storage_confined.descriptor_supported()",
+                 "/proc/self/fd", "/proc/<pid>/fd", "Linux", "macOS", "Windows", "rename race residual"):
+        assert term in documentation
+
+
+@pytest.mark.parametrize("confined", [False, True])
+@pytest.mark.parametrize("proc_fds", [False, True])
+@pytest.mark.parametrize("dev_fds", [False, True])
+def test_lease_descriptor_probe_requires_parent_addressable_fds(monkeypatch, confined, proc_fds, dev_fds):
     from types import SimpleNamespace
     from tests.unit.core.test_storage_confined import ModuleOS
 
-    path = SimpleNamespace(**{**vars(os.path), "isdir": lambda value: value == "/dev/fd"})
+    directories = {"/proc/self/fd": proc_fds, "/dev/fd": dev_fds}
+    path = SimpleNamespace(**{**vars(os.path), "isdir": lambda value: directories.get(value, False)})
     monkeypatch.setattr(team_lease_custody, "os", ModuleOS(path=path))
-    monkeypatch.setattr(team_lease_custody, "storage_confined", SimpleNamespace(descriptor_supported=lambda: True))
-    assert team_lease_custody.descriptor_supported() is False
+    monkeypatch.setattr(team_lease_custody, "storage_confined", SimpleNamespace(descriptor_supported=lambda: confined))
+    assert team_lease_custody.descriptor_supported() is (confined and proc_fds)
 
 
 @pytest.mark.parametrize("action", ["renew", "gc"])
@@ -1388,7 +1550,7 @@ def test_legacy_paths_refusal_survives_view_failure_retry_and_concurrency(ws: Pa
         monkeypatch.setattr(team, "describe", original)
 
     def once(_slot):
-        # Separate processes: lease_operation redirects this process's stdout.
+        # Separate processes exercise independent CLI invocations and Git custody.
         script = "import json,sys\nfrom aegis_cli.cli import main\nsys.exit(main(json.loads(sys.argv[1])))\n"
         result = subprocess.run([sys.executable, "-c", script, json.dumps(
             ["--workspace", str(repo), "team", *argv])], capture_output=True, text=True,

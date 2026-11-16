@@ -76,17 +76,36 @@ repository path leases above. They do not launch sessions or grant execution aut
 The service uses Python 3.9's standard library and requires POSIX descriptor-relative
 no-follow operations. Unsupported platforms return a structured refusal.
 
+Before the first queue claim:
+
+- Initialize the repository and declare the selected lane in `.aegis/team.json`,
+  using the [minimal policy example](#committed-policy-and-provenance). Declaration
+  is required for queue claims; repository path leases can operate without it.
+- Have the owner review policy changes and use `aegis approve` before merge.
+- List the item, read its full constraints, satisfy its dependencies and holds,
+  and use its current revision. Supply all capabilities the item requires.
+- Establish the lane's separate repository path lease and record its branch;
+  queue claims grant neither path leases nor execution authority.
+
 ```sh
 aegis team queue add --item '{"id":"DOCS-1","title":"Update guide","paths":["docs/**"],"capabilities":["docs"]}' --json
 aegis team queue list --capability docs --json
 aegis team queue list --include-done --json
 aegis team queue claim DOCS-1 --lane docs --branch lane/docs --capability docs --expect REVISION --ttl 3600 --json
-aegis team queue release DOCS-1 --lane docs --expect CLAIM_REVISION --json
-aegis team queue unclaim DOCS-1 --lane docs --expect CLAIM_REVISION --writer-stopped --reason 'Waiting for review' --json
 aegis team queue done DOCS-1 --lane docs --expect CLAIM_REVISION --json
 aegis team queue audit --json
 aegis team queue compact --json
 ```
+
+To return unfinished work instead of completing it, use `aegis team queue release
+DOCS-1 --lane docs --expect CLAIM_REVISION --json`. To return its intersecting lane
+leases too, use `aegis team queue unclaim DOCS-1 --lane docs --expect CLAIM_REVISION
+--writer-stopped --reason 'Waiting for review' --json` after stopping the writer.
+
+`list --capability` names capabilities available to the team: list items whose
+requirements are all satisfied. Repeat it to supply multiple capabilities.
+Omitting the option disables this filter; items with empty requirements match
+every supplied set. This filter does not bypass other claim-time checks.
 
 Use the actual `revision` returned by add, list, claim or release in place of the
 example placeholders. Release and done are alternative transitions from a claim;
@@ -151,6 +170,23 @@ release or expiry, completion and clearing a hold change it. A changed digest
 signals callers to inspect the queue again; it grants no claim authority and
 does not replace the revision check. Automatic supervisor retries are separate.
 
+For polling, `aegis team queue list --view fingerprint --json` returns the same
+response envelope and fingerprint without constructing full item views. It marks
+`view: fingerprint`, names omitted `items` and `completed_ids`, and instructs the
+caller to run `aegis team queue list --view full --json` after a change. Display
+filters do not affect the fingerprint. A fingerprint never authorizes a claim.
+
+For triage, `aegis team queue audit --view findings --json` retains findings,
+affected item IDs with their current revisions, states and lanes, the claim expiry
+time and whether each claim expired, and counts of items, findings and affected
+items. States and expiry evidence match the full views. It marks `view: findings`,
+identifies omitted item detail and points to
+`aegis team queue list --include-done --view full --json`, which also displays
+retained completed items. Read full constraints before deciding to change holds
+or work. Both commands default to
+`--view full`; refusal envelopes are unchanged by view selection. These view
+options are available through the CLI and core service; MCP keeps its full list.
+
 Pass the lane's branch explicitly with `claim --branch`; it can be a short local
 name or `refs/heads/` name. Queue claims never infer a lane branch from the shared
 workspace's HEAD. Omitted branches are recorded as unknown. Queue claims use the
@@ -183,6 +219,11 @@ malformed hook arguments, including ones mentioning `team queue`, exit 0 silentl
 to preserve the hook's must-not-block contract. Only a successful parse as `team queue`
 exempts queue data named `model` from the raw model-token policy. Workspace bounds
 apply equally before `team`, between `team` and `queue`, and after `queue` or its verb.
+For a structurally established queue command, parser refusals may also carry
+`argument_error`: a fixed category (`missing_required`, `missing_value`,
+`invalid_value` or `limit_exceeded`), allowlisted argument names, and a concrete
+`help_command`. Unknown tokens and supplied values remain opaque. When the
+command or diagnostic cannot be safely established, the generic refusal remains.
 Empty workspace values, NUL bytes and `..` components refuse before workspace
 resolution, as do values exceeding the length or separator limits.
 CLI and core use one bounded tokenizer independent of Python's Windows path parser.
@@ -321,8 +362,8 @@ compacted IDs to `true`; older records without it load as empty history. Milesto
 list of stable labels in that versioned document; this round adds no milestone
 recording verb. Model inputs and editable files are untrusted. Owner-UID rewriting
 of owner-only state is outside v5.0's threat model. These records supply no OS
-authorization. Renew/gc liveness changes and build-kit wrapper retirement remain
-separate follow-up work.
+authorization. CLI renew/gc preflight rules are described below; build-kit wrapper
+retirement remains separate follow-up work.
 
 ### Owner-bound MCP queue connection
 
@@ -438,7 +479,12 @@ aegis team renew docs --expect LEASE_OID --ttl 3600
 Replace `LEASE_OID` with the ID you received. Renewal prints a new ID; use the
 latest one on the next renewal, transfer or release. Nothing renews automatically,
 and there is no MCP team tool. The default TTL is 3600 seconds, with a maximum of
-86400. A live overlapping claim is refused; for example, this overlaps `docs/**`:
+86400. CLI renewal checks that a recorded branch still exists; a missing recorded
+branch refuses with `lease_branch_missing`. An attached worktree is not required.
+Unavailable Git evidence refuses renew and gc with `liveness_unknown` before
+lease mutation; restore private Git metadata, then retry. GC still collects
+expired leases with attached worktrees and reports them as described below.
+A live overlapping claim is refused; for example, this overlaps `docs/**`:
 
 ```sh
 aegis team claim api --paths 'docs/api/**'
@@ -466,6 +512,12 @@ make it visible to every worktree. The lane name must match
 `[a-z0-9][a-z0-9._-]{0,62}`. An expired lease can be claimed again; `aegis team gc`
 removes expired leases. A timestamp over 300 seconds ahead of the reader is marked
 `clock_skew` and still counts as live.
+
+GC JSON keeps event-recording warnings in `warnings` as strings and reports
+collected lanes with attached worktrees in the additive `lane_warnings` array,
+with rows such as `{"lane": "docs", "reason": "expired_with_worktree"}`. Text mode
+prints `Warning: docs: expired_with_worktree` on stderr. These warnings do not
+retain expired leases; a retry with nothing to collect returns both arrays empty.
 
 A lease is cooperative conflict input, not a lock, not an identity and not proof
 that an agent is alive. Different lanes' claims can race between the overlap read

@@ -236,7 +236,7 @@ Refuse when a live lease of another lane may overlap the paths; otherwise create
 | `--role` | `ROLE` |  | Display label (default: implementer) |
 | `--owner` | `OWNER` |  | Display label (default: <user>@<hostname>) |
 | `--ttl` | `SECONDS` | `3600` | Seconds until the lease expires, at most 86400 |
-| `--branch` | `BRANCH` |  | The lane's branch, recorded for display |
+| `--branch` | `BRANCH` |  | The lane's branch; when recorded, it must exist for CLI renewal |
 
 ### `aegis team config`
 
@@ -270,7 +270,7 @@ Check profile completeness and host CLIs on PATH
 
 Delete expired leases
 
-Delete every expired lease by compare-and-swap; unreadable leases are kept.
+Delete every expired lease by compare-and-swap; unreadable leases are kept. CLI preflight: expired_with_worktree JSON lane_warnings rows report attached worktrees; expired leases are still collected. Unavailable Git evidence refuses with liveness_unknown.
 
 ### `aegis team hosts`
 
@@ -341,6 +341,10 @@ Enqueue a bounded inline JSON item
 
 Report held work needing a decision
 
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--view` | one of `full`, `findings` | `"full"` | Full item detail (default), or findings with affected revisions and counts; inspect full constraints before decisions |
+
 ### `aegis team queue claim`
 
 Claim a current item revision with a lease
@@ -374,8 +378,9 @@ List items, blockers and lane labels
 
 | Argument | Value | Default | Description |
 | --- | --- | --- | --- |
-| `--capability` | `CAPABILITIES` |  | Filter by a team capability label; repeat for each label |
+| `--capability` | `CAPABILITIES` |  | Capabilities available to this team; list items whose requirements are all satisfied. Repeat for each label |
 | `--include-done` |  |  | Include completed items hidden by default |
+| `--view` | one of `full`, `fingerprint` | `"full"` | Full item detail (default), or fingerprint only; run the full list after a change |
 
 ### `aegis team queue release`
 
@@ -414,7 +419,7 @@ Delete a lease by compare-and-swap. Anyone may release; the events log records t
 
 Extend a lease; prints the new lease oid
 
-Renew by compare-and-swap; an expired lease is re-claimed, overlap check included.
+Renew by compare-and-swap; an expired lease is re-claimed, overlap check included. CLI preflight: a missing recorded branch refuses with lease_branch_missing; an attached worktree is not required. Unavailable Git evidence refuses with liveness_unknown.
 
 | Argument | Value | Default | Description |
 | --- | --- | --- | --- |
