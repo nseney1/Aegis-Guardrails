@@ -124,6 +124,10 @@ class _SelectedPayload(dict):
         self.mandatory_count = sum(entry["match"].rule.mandatory for entry in staged)
 
 
+class _SelectionFailure(dict):
+    """A checked refusal envelope, independent of the guidance token budget."""
+
+
 @dataclass(frozen=True)
 class _Projection:
     """Request-local source/fitness snapshot, never serialized or reread from disk."""
@@ -143,8 +147,8 @@ class _Projection:
         try:
             selected = _select_projection(self, registry)
             selected_mandatory = selected.mandatory_count if isinstance(selected, _SelectedPayload) else None
-            payload = finish_payload(selected, preserve_omissions=True,
-                                     staged_mandatory_count=selected_mandatory)
+            payload = selected if isinstance(selected, _SelectionFailure) else finish_payload(
+                selected, preserve_omissions=True, staged_mandatory_count=selected_mandatory)
             if isinstance(selected, _SelectedPayload) and payload is selected:
                 identities = selected.rule_ids
                 mandatory_count = selected.mandatory_count
@@ -231,20 +235,38 @@ def _unstripped_body(rule: Rule) -> str:
     return body if status == "ok" and frontmatter and frontmatter.strip() else WITHHELD_GUIDANCE
 
 
+class _RuleProjectionError(GuidanceProjectionError):
+    """Private attribution from a fixed field boundary, never exception text."""
+
+    def __init__(self, code: str, path: str, field: str) -> None:
+        super().__init__(code)
+        self.code, self.path, self.field = code, path, field
+
+
+def _project_at(rule: Rule, field: str, operation: Callable[..., Any], *args: Any) -> Any:
+    try:
+        return operation(*args)
+    except GuidanceProjectionError as exc:
+        raise _RuleProjectionError(exc.code, rule.path, field) from None
+
+
 def _text(m: _Match, registry: Optional[SlotRegistry] = None) -> str:
     rule = m.rule
     spec = RULE_TYPES.get(rule.type or "")
     emoji = spec.emoji if spec else "📋"
     label = spec.label if spec else str(rule.type).upper()
     out = f"{emoji} [{label}] {rule.id}\n"
-    out += f"   Hypothesis: {field_text(rule.meta.get('hypothesis', ''))}\n"
+    hypothesis = _project_at(rule, "hypothesis", field_text, rule.meta.get("hypothesis", ""))
+    out += f"   Hypothesis: {hypothesis}\n"
     prediction = rule.meta.get("prediction")
     if prediction:
-        out += f"   If violated: {field_text(prediction)}\n"
+        prediction_text = _project_at(rule, "prediction", field_text, prediction)
+        out += f"   If violated: {prediction_text}\n"
     out += f"   Triggered by: {', '.join(m.files[:5])}\n"
-    body = _unstripped_body(rule)
+    body = _project_at(rule, "detail", _unstripped_body, rule)
     if body.strip():
-        out += f"   Detail: {project_detail(body, registry)}\n"
+        detail = _project_at(rule, "detail", project_detail, body, registry)
+        out += f"   Detail: {detail}\n"
     out += f"   Fitness: {_fitness_text(m.fitness)}\n"
     return out
 
@@ -254,15 +276,53 @@ def _entry(m: _Match, registry: Optional[SlotRegistry]) -> Dict[str, Any]:
     # hypothesis/prediction share this one rendering, including invariant text.
     meta = dict(m.rule.meta)
     for key in ("hypothesis", "prediction"):
-        meta[key] = project_field(meta.get(key, ""), registry)
+        meta[key] = _project_at(m.rule, key, project_field, meta.get(key, ""), registry)
     if len(m.files) > 4096:
-        raise GuidanceProjectionError("guidance_projection_limit")
-    display_files = project_display_data({"matched_files": list(m.files)}, registry)["matched_files"]
+        raise _RuleProjectionError("guidance_projection_limit", m.rule.path, "matched_files")
+    display_files = _project_at(m.rule, "matched_files", project_display_data,
+                                {"matched_files": list(m.files)}, registry)["matched_files"]
+    # Entry identifiers belong to the displayed detail boundary. Attribute
+    # their refusals too, preserving earlier failed rules and the first code.
     projected = replace(m, rule=replace(m.rule, meta=meta,
-                                        id=project_identifier(m.rule.id),
-                                        path=project_identifier(m.rule.path)), files=tuple(display_files))
+                                        id=_project_at(m.rule, "detail", project_identifier, m.rule.id),
+                                        path=_project_at(m.rule, "detail", project_identifier, m.rule.path)),
+                        files=tuple(display_files))
     return {"match": m, "item": _item(projected), "text": _text(projected, registry),
             "constraint": _constraint(projected)}
+
+
+def _projection_entries(matches: List[_Match], registry: Optional[SlotRegistry]) -> Tuple[list, Optional[dict]]:
+    """Collect safe locations within the failure envelope's node/character caps."""
+    entries, errors = [], []
+    code, size = None, 0
+    reasons = {"guidance_projection_invalid_field": "invalid_field", "guidance_projection_limit": "limit"}
+    for match in matches:
+        try:
+            entries.append(_entry(match, registry))
+        except GuidanceProjectionError as exc:
+            code = code or exc.code
+            if (not isinstance(exc, _RuleProjectionError) or exc.code not in reasons
+                    or exc.field not in {"hypothesis", "prediction", "detail", "matched_files"}
+                    or 9 + 6 * (len(errors) + 1) > 4096):
+                return [], _failure(code)
+            try:
+                path = project_error_name(exc.path)
+            except GuidanceProjectionError:
+                return [], _failure(code)
+            reason = exc.field + ": " + reasons[exc.code]
+            size += len(path) + len(reason) + len("patherror")
+            if size + len("statusFAILerrorrule_errors") + len(code) > MAX_GUIDANCE_CHARS:
+                return [], _failure(code)
+            errors.append({"path": path, "error": reason})
+    if code is None:
+        return entries, None
+    # The complete schema check is authoritative; its own refusal must never
+    # replace the first selection refusal's documented code.
+    try:
+        checked_result_copy({"status": _STATUS_FAIL, "error": code, "rule_errors": errors}, None)
+    except GuidanceProjectionError:
+        return [], _failure(code)
+    return [], _failure(code, errors)
 
 
 def _constraint(m: _Match) -> Dict[str, Any]:
@@ -711,10 +771,9 @@ def _select_projection(projection: _Projection, registry: Optional[SlotRegistry]
     capped = mandatory[cap:]
     chosen += advisory[:max(0, slots - len(chosen))]
 
-    try:
-        entries = [_entry(m, registry) for m in chosen]
-    except GuidanceProjectionError as exc:
-        return _failure(exc.code)
+    entries, failure = _projection_entries(chosen, registry)
+    if failure is not None:
+        return _SelectionFailure(failure)
     omitted_mandatory = [{"name": project_identifier(m.rule.id), "type": m.rule.type,
                           "reason": "slot_cap"} for m in capped]
 
