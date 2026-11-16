@@ -1528,12 +1528,31 @@ def test_valid_pending_intent_stays_recoverable(make_store):
     listed = queue.list(make_store, now=101)
     assert listed["reason"] == "unclaim_recovery_required" and listed["exit_code"] == 1
     assert listed["blockers"][0]["reason_text"] == "Waiting"
+    assert "--workspace" in listed["blockers"][0]["next_action"]
+    assert str(make_store) in listed["blockers"][0]["next_action"]
     assert path.read_bytes() == before
     state.pop("unclaim")
     _write_state(path, state)
     restored = queue.list(make_store, now=102)
     assert not restored["refused"], restored
     assert restored["items"][0]["id"] == "ONE"
+    assert "aegis team queue unclaim" not in json.dumps(restored)
+
+
+def test_concurrent_pending_lists_name_the_same_workspace(make_store):
+    path, state, _row = _pending_state(make_store)
+    before = _write_state(path, state)
+    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
+        results = list(pool.map(race_list, [(make_store, 101), (make_store, 102)], timeout=30))
+    assert path.read_bytes() == before
+    commands = []
+    for result in results:
+        assert result["reason"] == "unclaim_recovery_required" and result["exit_code"] == 1
+        blocker = result["blockers"][0]
+        assert (blocker["caller"], blocker["reason_text"]) == ("owner", "Waiting")
+        commands.append(blocker["next_action"])
+    assert commands[0] == commands[1]
+    assert "--workspace" in commands[0] and str(make_store) in commands[0]
 
 
 @pytest.mark.parametrize("shape", [
