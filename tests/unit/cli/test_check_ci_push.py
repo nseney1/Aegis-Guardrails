@@ -8,8 +8,10 @@ still compares its base with its head. Real git; no network, no host CLI.
 from __future__ import annotations
 
 import ast
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import fields
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -24,10 +26,11 @@ from aegis_cli import check as check_cli
 from aegis_cli import ci_inputs
 from aegis_cli.ci_inputs import Event
 from aegis_cli.formatters import report as report_formats
-from aegis_core import approval_policy, checkrun, credit, gitsafe, redaction, regression
+from aegis_core import approval_policy, checkrun, credit, diagnostic_messages, gitsafe, redaction, regression
 from aegis_core import config as core_config
 from aegis_core import rule_integrity as ci_integrity
 from aegis_core.verification import coverage_check, perf_check
+from tests.contract.test_process_ratchets import ScopedNames, import_bindings
 from tests import helpers_humangate as hg
 
 needs_git = pytest.mark.skipif(not hg.git_ok(), reason="needs git")
@@ -38,12 +41,145 @@ RULE = ("---\nid: gate-no-eval\ntype: gate\nenforcement: gate\nhypothesis: Never
 NOTE = "nothing was compared"
 PASSED = "PASSED, no rule weakened"
 
-SWEPT_OUTPUT_MODULES = ("aegis_core/redaction.py", "aegis_core/rule_integrity.py", "aegis_core/approval_policy.py", "aegis_cli/check.py",
+SWEPT_OUTPUT_MODULES = ("aegis_core/redaction.py", "aegis_core/diagnostic_messages.py", "aegis_core/rule_integrity.py", "aegis_core/approval_policy.py", "aegis_cli/check.py",
                         "aegis_cli/approve.py", "aegis_cli/formatters/report.py", "aegis_cli/ci_inputs.py")
+MESSAGE_COMPAT_EXPORTS = ("MESSAGE_TEMPLATES", "MESSAGE_OWNERS", "GuidanceMessage", "MessageRow", "finding_message",
+                          "clip_rendered_text", "guidance_value", "receipt_value")
 EXECUTION_MARKERS = ("$(gm1b)", "`gm1b`", ";gm1b", "\n::warning::forged", "\r::warning::forged",
                      "(gm1b)", "gm1b)", "'gm1b'", '"gm1b"')
 EXECUTION_MARKER_IDS = ("substitution", "backtick", "semicolon", "newline", "cr",
                         "parentheses", "close-parenthesis", "single-quote", "double-quote")
+
+
+def test_diagnostic_catalogue_is_immutable_and_owns_compatibility_exports():
+    messages = diagnostic_messages
+    assert set(messages.MESSAGE_CATALOGUE) == set(approval_policy.MESSAGE_TEMPLATES)
+    for name, frame in messages.MESSAGE_CATALOGUE.items():
+        assert frame.template == messages.MESSAGE_TEMPLATES[name]
+        assert (frame.producer, frame.kind) == messages.MESSAGE_OWNERS[name]
+        with pytest.raises(AttributeError):
+            frame.template = "forged"
+    for mapping in (messages.MESSAGE_CATALOGUE, messages.MESSAGE_TEMPLATES, messages.MESSAGE_OWNERS):
+        with pytest.raises(TypeError):
+            mapping["forged"] = "forged"
+    for name in MESSAGE_COMPAT_EXPORTS:
+        assert getattr(approval_policy, name) is getattr(messages, name)
+    assert messages.GuidanceMessage.__module__ == messages.__name__
+    assert messages.MessageRow.__module__ == messages.__name__
+    assert "unresolved_base_hint" not in redaction.__all__
+    assert not hasattr(redaction, "unresolved_base_hint")
+
+
+def test_diagnostic_move_preserves_baseline_bytes_and_refusals():
+    """Golden public outputs captured at the admitted integration tip, without Git history."""
+    messages = diagnostic_messages
+    rows = []
+    probes = ("ordinary", " x\n y\t$(touch marker); token=secret12345", "a" * 81921,
+              ["ordinary", "$(touch marker)"])
+    for name, template in messages.MESSAGE_TEMPLATES.items():
+        producer, kind = messages.MESSAGE_OWNERS[name]
+        for probe in probes:
+            values = {field: probe for _, field, _, _ in Formatter().parse(template) if field}
+            shown = messages.GuidanceMessage(kind, template, values).render()
+            row = messages.MessageRow(code=kind, rule=kind, message=shown)
+            rows.append([name, template, producer, kind, shown, messages.finding_message(row, producer=producer),
+                         messages.finding_message(json.loads(json.dumps(row)), producer=producer),
+                         messages.finding_message(row, producer="external"),
+                         messages.finding_message({**row, "code": "external", "rule": "external"}, producer=producer)])
+    for selector in ("origin/x", "refs/remotes/origin/x", "space selector", "origin/$(touch marker)"):
+        rows.append([selector, approval_policy.unresolved_base_hint(selector)])
+    assert hashlib.sha256(json.dumps(rows, ensure_ascii=True).encode()).hexdigest() == \
+        "f375d36265fbdca3f172df62df74c451377e400d4322ff843418df9712771d45"
+
+
+def _approval_message_imports(source, path):
+    """Resolve ordinary import aliases with the existing lexical census resolver."""
+    tree = ast.parse(source, filename=path)
+    names = ScopedNames(tree, path)
+    moved = {"aegis_core.approval_policy." + name for name in MESSAGE_COMPAT_EXPORTS}
+    sites = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            sites.update((node.lineno, name) for name in import_bindings(node, path).values() if name in moved)
+        if isinstance(node, ast.ImportFrom) and any(alias.name == "*" for alias in node.names):
+            probe = ast.ImportFrom(module=node.module, level=node.level,
+                                   names=[ast.alias(name="MESSAGE_OWNERS", asname=None)])
+            if set(import_bindings(probe, path).values()) & moved:
+                sites.update((node.lineno, name) for name in moved)
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            sites.update((node.lineno, name) for name in names.resolve(node) & moved)
+    return sites
+
+
+def _assert_neutral_message_imports(root):
+    for path in (*SWEPT_OUTPUT_MODULES, "aegis_core/regression.py"):
+        if path == "aegis_core/approval_policy.py":
+            continue  # This is the compatibility exporter, not a consumer.
+        sites = _approval_message_imports((root / path).read_text(encoding="utf-8"), path)
+        if sites:
+            raise AssertionError(path, sorted(sites))
+
+
+def test_diagnostic_producers_import_frames_from_neutral_owner():
+    _assert_neutral_message_imports(Path(__file__).resolve().parents[3])
+
+
+@pytest.mark.parametrize("path", ["aegis_core/diagnostic_messages.py", "aegis_cli/ci_inputs.py", "aegis_core/regression.py"])
+@pytest.mark.parametrize("symbol", MESSAGE_COMPAT_EXPORTS)
+@pytest.mark.parametrize("source", [
+    "from aegis_core.approval_policy import {symbol}",
+    "from aegis_core.approval_policy import {symbol} as message",
+    "from aegis_core import approval_policy\napproval_policy.{symbol}",
+    "from aegis_core import approval_policy as policy\npolicy.{symbol}",
+    "import aegis_core.approval_policy\naegis_core.approval_policy.{symbol}",
+    "import aegis_core.approval_policy as policy\npolicy.{symbol}",
+    "import aegis_core as core\ncore.approval_policy.{symbol}",
+    "from aegis_core.approval_policy import *",
+], ids=["direct", "direct-alias", "module", "from-alias", "qualified", "import-alias", "package-alias", "star"])
+def test_producer_import_census_detects_owner_and_producer_violations(tmp_path, path, symbol, source):
+    for filename in (*SWEPT_OUTPUT_MODULES, "aegis_core/regression.py"):
+        file = tmp_path / filename
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text("", encoding="utf-8")
+    target = tmp_path / path
+    target.write_text(source.format(symbol=symbol), encoding="utf-8")
+    with pytest.raises(AssertionError) as error:
+        _assert_neutral_message_imports(tmp_path)
+    assert error.value.args[0] == path
+    assert "aegis_core.approval_policy." + symbol in {name for _line, name in error.value.args[1]}
+
+
+@pytest.mark.parametrize("source", [
+    "from aegis_core import approval_policy as policy\npolicy.FULL_OID",
+    "import aegis_core.approval_policy\naegis_core.approval_policy.resolve_policy",
+    "from aegis_core.diagnostic_messages import MESSAGE_OWNERS as owners\nowners",
+    "from aegis_core import approval_policy as policy\ndef local(policy):\n    return policy.guidance_value",
+])
+def test_producer_import_census_allows_policy_apis_and_unrelated_local_bindings(source):
+    assert _approval_message_imports(source, "aegis_cli/ci_inputs.py") == set()
+
+
+def test_producer_import_census_resolves_relative_star_imports():
+    sites = _approval_message_imports("from .approval_policy import *", "aegis_core/regression.py")
+    assert {name for _line, name in sites} == {"aegis_core.approval_policy." + name for name in MESSAGE_COMPAT_EXPORTS}
+
+
+def test_diagnostic_catalogue_rendering_is_repeatable_across_threads():
+    messages = diagnostic_messages
+
+    def render(name):
+        template = messages.MESSAGE_TEMPLATES[name]
+        producer, kind = messages.MESSAGE_OWNERS[name]
+        values = {field: "ordinary $(touch marker)" for _, field, _, _ in Formatter().parse(template) if field}
+        shown = messages.GuidanceMessage(kind, template, values).render()
+        row = {"code": kind, "rule": kind, "message": shown}
+        return (shown, messages.finding_message(row, producer=producer),
+                messages.finding_message(row, producer="external"))
+
+    names = list(messages.MESSAGE_TEMPLATES) * 2
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        actual = list(pool.map(render, names))
+    assert actual == [render(name) for name in names]
 
 
 def _message_census():
@@ -1103,13 +1239,15 @@ def test_model_value_clipping_preserves_escape_boundaries():
         _assert_finished_line_is_atomic(line)
 
 
-def test_finished_display_cap_census_requires_atomic_clipping():
-    root = Path(__file__).resolve().parents[3]
+def _assert_atomic_display_caps(root, *, excluded=()):
     identities = {(ast.dump(ast.parse(expression, mode="eval").body), size) for expression, size in (
         ("row['tree']", 12), ("report.merge_base", 10), ("report.head", 10), ("untested.commit", 10),
         ("t_chk['commit']", 10), ("row['commit']", 10), ("untested.source_files", 5),
         ("hashlib.sha256(joined.encode('utf-8', 'surrogatepass')).hexdigest()", 16), ("secret", 2), ("secret", 4))}
-    for filename in ("aegis_cli/check.py", "aegis_cli/formatters/report.py", "aegis_core/approval_policy.py", "aegis_core/redaction.py"):
+    for filename in ("aegis_cli/check.py", "aegis_cli/formatters/report.py", "aegis_core/approval_policy.py",
+                     "aegis_core/diagnostic_messages.py", "aegis_core/redaction.py"):
+        if filename in excluded:
+            continue
         tree = ast.parse((root / filename).read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and getattr(node.func, "id", getattr(node.func, "attr", None)) == "sanitize_display":
@@ -1120,6 +1258,29 @@ def test_finished_display_cap_census_requires_atomic_clipping():
                 stop = node.slice.upper
                 if isinstance(stop, ast.Constant) and type(stop.value) is int and stop.value > 0:
                     assert (ast.dump(node.value), stop.value) in identities, (filename, node.lineno)
+
+
+def test_finished_display_cap_census_requires_atomic_clipping():
+    _assert_atomic_display_caps(Path(__file__).resolve().parents[3])
+
+
+@pytest.mark.parametrize("expression", ["primitives.sanitize_display(value, max_len=80)", "value[:12]"],
+                         ids=["sanitize-cap", "constant-slice"])
+def test_finished_display_cap_census_detects_owner_mutations(tmp_path, expression):
+    root = Path(__file__).resolve().parents[3]
+    owner = "aegis_core/diagnostic_messages.py"
+    for filename in SWEPT_OUTPUT_MODULES:
+        target = tmp_path / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text((root / filename).read_text(encoding="utf-8"), encoding="utf-8")
+    _assert_atomic_display_caps(tmp_path)
+    source = (root / owner).read_text(encoding="utf-8")
+    (tmp_path / owner).write_text(source + "\n\ndef census_mutation(value):\n    return " + expression + "\n",
+                                 encoding="utf-8")
+    _assert_atomic_display_caps(tmp_path, excluded=(owner,))
+    with pytest.raises(AssertionError) as error:
+        _assert_atomic_display_caps(tmp_path)
+    assert str(error.value).splitlines()[0] == str((owner, len(source.splitlines()) + 4))
 
 
 @pytest.fixture(autouse=True)
