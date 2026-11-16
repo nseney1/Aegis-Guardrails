@@ -2034,3 +2034,332 @@ def test_malformed_pending_intent_retries_after_repair(make_store):
     _write_state(path, repaired)
     restored = queue.list(make_store, now=103)
     assert not restored["refused"], restored
+
+
+_PUBLIC_PREDICATES = ("valid_key", "valid_lane", "valid_revision", "check_capabilities", "normalize_branch")
+_QUEUE_ARGUMENT_NEXT = "Use the documented queue arguments and the revision returned by list."
+_ITEM_NEXT = "Supply a bounded queue item with the documented fields and single-line values."
+
+
+def _predicate_result(kind, value):
+    """One public predicate outcome. Refusal codes stay fixed; values are not echoed."""
+    if kind == "key":
+        return queue.valid_key(value)
+    if kind == "lane":
+        return queue.valid_lane(value)
+    if kind == "revision":
+        return queue.valid_revision(value)
+    if kind == "capabilities":
+        try:
+            checked = queue.check_capabilities(value)
+        except queue.QueueRefusal as error:
+            assert error.reason == "invalid_item" and str(error) == "invalid_item"
+            return error.reason
+        assert checked == value
+        return "ok"
+    if kind == "branch":
+        try:
+            return queue.normalize_branch(value)
+        except queue.QueueRefusal as error:
+            assert error.reason == "invalid_arguments" and str(error) == "invalid_arguments"
+            assert type(error) is queue.QueueRefusal
+            return error.reason
+    raise AssertionError(kind)
+
+
+def _predicate_spy(order, name, real):
+    def spy(*args, **kwargs):
+        order.append(name)
+        return real(*args, **kwargs)
+
+    return spy
+
+
+def _watch_predicates(monkeypatch):
+    """Spy the public predicates through literal module attributes."""
+    order = []
+    key, lane = queue.valid_key, queue.valid_lane
+    revision, capabilities = queue.valid_revision, queue.check_capabilities
+    branch = queue.normalize_branch
+    monkeypatch.setattr(queue, "valid_key", _predicate_spy(order, "valid_key", key))
+    monkeypatch.setattr(queue, "valid_lane", _predicate_spy(order, "valid_lane", lane))
+    monkeypatch.setattr(queue, "valid_revision", _predicate_spy(order, "valid_revision", revision))
+    monkeypatch.setattr(queue, "check_capabilities", _predicate_spy(order, "check_capabilities", capabilities))
+    monkeypatch.setattr(queue, "normalize_branch", _predicate_spy(order, "normalize_branch", branch))
+    return order
+
+
+def _refuse_workspace_io(monkeypatch):
+    def unavailable(*args, **kwargs):
+        pytest.fail("field validation must finish before workspace IO")
+
+    # descriptor_supported is the public probe _root calls before any descriptor I/O.
+    monkeypatch.setattr(queue, "descriptor_supported", unavailable)
+
+
+def _assert_fixed_refusal(result, reason, action):
+    rendered = json.dumps(result)
+    assert result["reason"] == reason and result["exit_code"] == 2 and result["refused"] is True
+    assert result["next_action"] == action and result["status"] == "refused"
+    assert "\n" not in rendered and "\r" not in rendered
+    assert "private-value" not in rendered and "injected" not in rendered
+    assert "private-value injected" not in rendered and "private-valueinjected" not in rendered
+    return rendered
+
+
+def test_field_predicates_are_one_public_source():
+    for name in _PUBLIC_PREDICATES:
+        assert name in queue.__all__
+    assert queue._key is queue.valid_key
+    assert queue._lane is queue.valid_lane
+    assert queue._branch_name is queue.normalize_branch
+    assert queue.valid_key("ONE") is True and queue.valid_key("A" * 64) is True
+    assert queue.valid_key("A" * 65) is False and queue.valid_key("bad id") is False
+    assert queue.valid_key("ONE\ninjected") is False and queue.valid_key("") is False
+    assert queue.valid_key(None) is False and queue.valid_key(1) is False
+    assert queue.valid_lane("alpha") is True and queue.valid_lane("Alpha") is False
+    assert queue.valid_lane("a..b") is False and queue.valid_lane("alpha.lock") is False
+    assert queue.valid_lane("a" * 64) is False and queue.valid_lane("alpha\ninjected") is False
+    assert queue.valid_revision("a" * 64) is True and queue.valid_revision("ab" * 32) is True
+    assert queue.valid_revision("A" * 64) is False and queue.valid_revision("a" * 63) is False
+    assert queue.valid_revision("a" * 63 + "\n") is False and queue.valid_revision("g" * 64) is False
+    assert queue.valid_revision(None) is False and queue.valid_revision(b"a" * 64) is False
+    assert queue.check_capabilities(["core", "review"]) == ["core", "review"]
+    assert queue.check_capabilities(["c" + str(i) for i in range(queue.MAX_FIELDS)])
+    with pytest.raises(queue.QueueRefusal, match="^invalid_item$"):
+        queue.check_capabilities(["c" + str(i) for i in range(queue.MAX_FIELDS + 1)])
+    with pytest.raises(queue.QueueRefusal, match="^invalid_item$"):
+        queue.check_capabilities(["core", "core"])
+    with pytest.raises(queue.QueueRefusal, match="^invalid_item$"):
+        queue.check_capabilities(("core",))
+    with pytest.raises(queue.QueueRefusal, match="^invalid_item$"):
+        queue.check_capabilities(["bad id"])
+    with pytest.raises(queue.QueueRefusal, match="^invalid_item$"):
+        queue.check_capabilities(["core\ninjected"])
+    assert queue.normalize_branch(None) is None
+    assert queue.normalize_branch("lane/alpha") == "lane/alpha"
+    assert queue.normalize_branch("refs/heads/lane/alpha") == "lane/alpha"
+    for branch in ("refs/tags/private-value", "refs/heads/HEAD", "HEAD", "refs/heads/",
+                   "private-value topic", "private-value\ninjected", "", 1):
+        with pytest.raises(queue.QueueRefusal, match="^invalid_arguments$") as caught:
+            queue.normalize_branch(branch)
+        assert caught.value.reason == "invalid_arguments"
+        assert "private-value" not in str(caught.value) and "injected" not in str(caught.value)
+        assert "\n" not in str(caught.value)
+
+
+def test_public_predicates_are_stable_across_threads():
+    cases = (
+        ("key", "ONE", True), ("key", "bad id", False), ("key", "ONE\ninjected", False),
+        ("lane", "alpha", True), ("lane", "a..b", False), ("lane", "alpha.lock", False),
+        ("revision", "a" * 64, True), ("revision", "A" * 64, False), ("revision", None, False),
+        ("capabilities", ["core", "review"], "ok"), ("capabilities", ["core", "core"], "invalid_item"),
+        ("capabilities", ["core\ninjected"], "invalid_item"),
+        ("branch", None, None), ("branch", "refs/heads/lane/alpha", "lane/alpha"),
+        ("branch", "refs/tags/private-value", "invalid_arguments"),
+        ("branch", "private-value topic", "invalid_arguments"),
+        ("branch", "private-value\ninjected", "invalid_arguments"),
+    )
+    expected = [_predicate_result(kind, value) == wanted for kind, value, wanted in cases]
+
+    def batch(_index):
+        return [_predicate_result(kind, value) == wanted for kind, value, wanted in cases]
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        assert list(pool.map(batch, range(8))) == [expected] * 8
+
+
+@pytest.mark.parametrize("identifier,revision,lane", [
+    ("bad id", "a" * 64, "alpha"),
+    ("ONE\ninjected", "a" * 64, "alpha"),
+    ("", "a" * 64, "alpha"),
+    ("A" * 65, "a" * 64, "alpha"),
+    ("ONE", "A" * 64, "alpha"),
+    ("ONE", "a" * 63, "alpha"),
+    ("ONE", "a" * 63 + "\ninjected", "alpha"),
+    ("ONE", "g" * 64, "alpha"),
+    ("ONE", None, "alpha"),
+    ("ONE", "a" * 64, "a..b"),
+    ("ONE", "a" * 64, "alpha.lock"),
+    ("ONE", "a" * 64, "Alpha"),
+    ("ONE", "a" * 64, "alpha\ninjected"),
+    ("ONE", "a" * 64, ""),
+], ids=["spaced-id", "multiline-id", "empty-id", "long-id", "upper-revision", "short-revision",
+        "multiline-revision", "nonhex-revision", "revision-type", "parent-lane", "lock-lane",
+        "upper-lane", "multiline-lane", "empty-lane"])
+def test_malformed_claim_fields_share_predicates_before_io(monkeypatch, identifier, revision, lane):
+    key_ok, revision_ok = queue.valid_key(identifier), queue.valid_revision(revision)
+    order = _watch_predicates(monkeypatch)
+    _refuse_workspace_io(monkeypatch)
+    result = queue.claim("/workspace", identifier, expect=revision, lane=lane,
+                         capabilities=["core"], branch="lane/alpha", now=100)
+    _assert_fixed_refusal(result, "invalid_arguments", _QUEUE_ARGUMENT_NEXT)
+    assert order and order[0] == "valid_key"
+    if not key_ok:
+        assert order == ["valid_key"]
+    elif not revision_ok:
+        assert order == ["valid_key", "valid_revision"]
+    else:
+        assert order[:4] == ["valid_key", "valid_revision", "check_capabilities", "valid_lane"]
+        assert "normalize_branch" not in order
+
+
+@pytest.mark.parametrize("branch", ["refs/tags/private-value", "refs/remotes/origin/x", "HEAD",
+    "refs/heads/HEAD", "refs/heads/", "private-value topic", "private-value\ninjected", "", 1],
+    ids=["tags", "remote", "head", "heads-head", "empty-name", "spaces", "multiline", "empty", "type"])
+def test_invalid_branch_uses_public_normalizer_before_io(monkeypatch, branch):
+    order = _watch_predicates(monkeypatch)
+    _refuse_workspace_io(monkeypatch)
+    result = queue.claim("/workspace", "ONE", expect="a" * 64, lane="alpha", capabilities=["core"],
+                         branch=branch, now=100)
+    _assert_fixed_refusal(result, "invalid_arguments", _QUEUE_ARGUMENT_NEXT)
+    assert order[-1] == "normalize_branch"
+    assert queue.normalize_branch("refs/heads/lane/alpha") == "lane/alpha"
+
+
+def test_duplicate_capabilities_precede_lane_branch_and_io(monkeypatch):
+    order = _watch_predicates(monkeypatch)
+    _refuse_workspace_io(monkeypatch)
+    result = queue.claim("/workspace", "ONE", expect="a" * 64, lane="a..b", capabilities=["core", "core"],
+                         branch="refs/tags/private-value", now=100)
+    _assert_fixed_refusal(result, "invalid_arguments", _QUEUE_ARGUMENT_NEXT)
+    assert order == ["valid_key", "valid_revision", "check_capabilities"]
+    listed = queue.list("/workspace", capabilities=["core", "core"], now=100)
+    _assert_fixed_refusal(listed, "invalid_arguments", _QUEUE_ARGUMENT_NEXT)
+    assert order[-1] == "check_capabilities"
+    added = queue.add("/workspace", item(capabilities=["core", "core"]), now=100)
+    _assert_fixed_refusal(added, "invalid_item", _ITEM_NEXT)
+
+
+def test_invalid_ttl_precedes_branch_normalization(monkeypatch):
+    order = _watch_predicates(monkeypatch)
+    _refuse_workspace_io(monkeypatch)
+    result = queue.claim("/workspace", "ONE", expect="a" * 64, lane="alpha", capabilities=["core"],
+                         branch="refs/tags/private-value", ttl_s=0, now=100)
+    _assert_fixed_refusal(result, "invalid_arguments", _QUEUE_ARGUMENT_NEXT)
+    assert "normalize_branch" not in order and "valid_lane" in order
+
+
+@pytest.mark.parametrize("verb", ["claim", "release", "unclaim", "done"])
+def test_mutation_verbs_use_public_key_before_io(monkeypatch, verb):
+    order = _watch_predicates(monkeypatch)
+    _refuse_workspace_io(monkeypatch)
+    arguments = {"expect": "a" * 64, "now": 100}
+    if verb == "claim":
+        arguments.update(lane="alpha", capabilities=["core"])
+    elif verb == "unclaim":
+        arguments.update(lane="alpha", writer_stopped=True, reason="private-value\ninjected")
+    elif verb == "done":
+        arguments.update(lane="alpha")
+    result = getattr(queue, verb)("/workspace", "bad id", **arguments)
+    _assert_fixed_refusal(result, "invalid_arguments", _QUEUE_ARGUMENT_NEXT)
+    assert order == ["valid_key"]
+
+
+def test_capability_refusal_keeps_caller_category(monkeypatch):
+    _refuse_workspace_io(monkeypatch)
+    secret = "sk-" + "a" * 24
+    added = queue.add("/workspace", item(capabilities=[secret]), now=100)
+    claimed = queue.claim("/workspace", "ONE", expect="a" * 64, lane="alpha",
+                          capabilities=[secret], now=100)
+    listed = queue.list("/workspace", capabilities=[secret], now=100)
+    assert added["reason"] == "invalid_item" and added["exit_code"] == 2
+    assert claimed["reason"] == "invalid_arguments" and claimed["exit_code"] == 2
+    assert listed["reason"] == "invalid_arguments" and listed["exit_code"] == 2
+    rendered = json.dumps((added, claimed, listed))
+    assert secret not in rendered and "\n" not in rendered
+
+
+def test_valid_predicates_hit_unsupported_platform_probe(tmp_path, monkeypatch):
+    probed = []
+
+    def unsupported():
+        probed.append("platform")
+        return False
+
+    monkeypatch.setattr(queue, "descriptor_supported", unsupported)
+    assert queue.valid_key("ONE") and queue.valid_lane("alpha") and queue.valid_revision("a" * 64)
+    assert queue.check_capabilities(["core"]) == ["core"]
+    assert queue.normalize_branch("refs/heads/lane/alpha") == "lane/alpha"
+    result = queue.claim(tmp_path, "ONE", expect="a" * 64, lane="alpha", capabilities=["core"],
+                         branch="refs/heads/lane/alpha", now=100)
+    assert result["reason"] == "unsupported_platform" and result["exit_code"] == 1
+    assert probed == ["platform"]
+    assert "refs/heads/lane/alpha" not in json.dumps(result)
+    assert result["next_action"]
+
+
+def test_predicate_failures_leave_state_and_retry(make_store):
+    revision = add(make_store)
+    path = make_store / ".aegis" / "state" / "team-queue.json"
+    before = path.read_bytes()
+    refusals = [
+        {"identifier": "bad id"},
+        {"identifier": "ONE\ninjected"},
+        {"expect": "A" * 64},
+        {"expect": "a" * 63 + "\ninjected"},
+        {"lane": "a..b"},
+        {"lane": "alpha\ninjected"},
+        {"capabilities": ["core", "core"]},
+        {"branch": "refs/tags/private-value"},
+        {"branch": "private-value topic"},
+        {"branch": "private-value\ninjected"},
+    ]
+    for override in refusals:
+        arguments = {"identifier": "ONE", "expect": revision, "lane": "alpha", "capabilities": ["core"],
+                     "branch": "lane/alpha", "now": 101}
+        arguments.update(override)
+        identifier = arguments.pop("identifier")
+        result = queue.claim(make_store, identifier, **arguments)
+        _assert_fixed_refusal(result, "invalid_arguments", _QUEUE_ARGUMENT_NEXT)
+        assert path.read_bytes() == before
+    claimed = queue.claim(make_store, "ONE", expect=revision, lane="alpha", capabilities=["core"],
+                          branch="refs/heads/lane/alpha", now=101)
+    assert not claimed["refused"], claimed
+    assert claimed["item"]["branch"] == "lane/alpha"
+    released = queue.release(make_store, "ONE", expect=claimed["item"]["revision"], lane="alpha", now=102)
+    assert not released["refused"], released
+    again = queue.claim(make_store, "ONE", expect=released["item"]["revision"], lane="alpha",
+                        capabilities=["core", "review"], branch="lane/alpha", now=103)
+    assert not again["refused"] and again["item"]["branch"] == "lane/alpha"
+
+
+def race_public_predicate_claim(arguments):
+    root, revision, mode = arguments
+    if mode == "accept":
+        result = queue.claim(root, "ONE", expect=revision, lane="alpha", capabilities=["core"],
+                             branch="refs/heads/lane/alpha", ttl_s=10, now=101)
+    elif mode == "id":
+        result = queue.claim(root, "bad id", expect=revision, lane="alpha", capabilities=["core"], now=101)
+    elif mode == "revision":
+        result = queue.claim(root, "ONE", expect="A" * 64, lane="alpha", capabilities=["core"], now=101)
+    elif mode == "lane":
+        result = queue.claim(root, "ONE", expect=revision, lane="alpha\ninjected", capabilities=["core"], now=101)
+    elif mode == "capabilities":
+        result = queue.claim(root, "ONE", expect=revision, lane="alpha", capabilities=["core", "core"], now=101)
+    elif mode == "branch":
+        result = queue.claim(root, "ONE", expect=revision, lane="alpha", capabilities=["core"],
+                             branch="private-value\ninjected", now=101)
+    else:
+        raise AssertionError(mode)
+    item_view = result.get("item")
+    return {"refused": result["refused"], "reason": result.get("reason"), "exit_code": result.get("exit_code"),
+            "branch": None if item_view is None else item_view.get("branch")}
+
+
+def test_concurrent_predicate_refusals_leave_one_claim(make_store):
+    revision = add(make_store)
+    modes = ["accept", "id", "revision", "lane", "capabilities", "branch"]
+    results = _spawn_race(race_public_predicate_claim, [(make_store, revision, mode) for mode in modes])
+    rendered = json.dumps(results)
+    assert "private-value" not in rendered and "injected" not in rendered and "\n" not in rendered
+    refused = [row for row in results if row["refused"]]
+    accepted = [row for row in results if not row["refused"]]
+    assert [row["reason"] for row in refused] == ["invalid_arguments"] * 5
+    assert [row["exit_code"] for row in refused] == [2] * 5
+    assert accepted == [{"refused": False, "reason": None, "exit_code": 0, "branch": "lane/alpha"}]
+    stored = queue.list(make_store, now=102)["items"][0]
+    assert stored["branch"] == "lane/alpha" and stored["state"] == "claimed"
+    retry = queue.claim(make_store, "ONE", expect=stored["revision"], lane="alpha",
+                        capabilities=["core"], branch="lane/alpha", now=112)
+    assert not retry["refused"] and retry["item"]["branch"] == "lane/alpha"
