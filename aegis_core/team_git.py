@@ -284,7 +284,8 @@ def _attribute_stamp(observed):
     return (observed.st_dev, observed.st_ino, observed.st_size, observed.st_mtime_ns, observed.st_ctime_ns)
 
 
-def _read_path(root_fd: int, raw: bytes, remaining: int, *, attribute=False, attribute_charges=None):
+def _read_path(root_fd: int, raw: bytes, remaining: int, *, attribute=False, attribute_charges=None,
+               prior=None, settings=None, oid_length=40, index_time=None):
     """Walk every parent by descriptor; never follow a symlink in any component."""
     parts = _path_parts(raw)
     opened = []
@@ -328,8 +329,10 @@ def _read_path(root_fd: int, raw: bytes, remaining: int, *, attribute=False, att
         limit = min(MAX_FILE_BYTES, before.st_size if charged else remaining)
         if before.st_size > limit:
             raise GitRefusal("size_limit")
+        mode = "100755" if before.st_mode & 0o100 else "100644"
+        clean = prior is not None and _index_clean(mode, None, before, prior, settings, oid_length, index_time) is True
         chunks, total = [], 0
-        while True:
+        while not clean:
             chunk = os.read(fd, min(65536, limit + 1 - total))
             if not chunk:
                 break
@@ -340,8 +343,7 @@ def _read_path(root_fd: int, raw: bytes, remaining: int, *, attribute=False, att
         after = os.fstat(fd)
         if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
             raise GitRefusal("worktree_changed")
-        mode = "100755" if before.st_mode & 0o100 else "100644"
-        return mode, b"".join(chunks), before
+        return mode, None if clean else b"".join(chunks), before
     except FileNotFoundError:
         if observed and not attribute:
             raise GitRefusal("worktree_changed") from None
@@ -435,21 +437,26 @@ def _snapshot_contents(store, root_fd, paths, baseline, rules, settings, oid_len
     for path in paths:
         if baseline.get(path, ("100644", None, None))[0] == "160000":
             raise GitRefusal("unsupported_file")
+        is_attribute = team_git_snapshot.is_attribute_path(path)
+        # Auto rules need current bytes to select baselines and preserve batch refusals.
+        reuse = not is_attribute and rules[path][0] != "auto"
         entry = _read_path(root_fd, path, MAX_SNAPSHOT_BYTES - total,
-                           attribute=bool(filters) and team_git_snapshot.is_attribute_path(path))
+                           attribute=bool(filters) and is_attribute,
+                           prior=baseline.get(path) if reuse else None, settings=settings,
+                           oid_length=oid_length, index_time=index_time)
         if entry is None:
             continue
         mode, data, observed = entry
-        if team_git_snapshot.is_attribute_path(path):
+        if is_attribute:
             attributes.append(data)
             if filters:
                 attribute_charges.add(_attribute_stamp(observed))
-        original_size = len(data)
-        if mode != "120000" and rules[path][3]:
+        original_size = observed.st_size if data is None else len(data)
+        if data is not None and mode != "120000" and rules[path][3]:
             prior = baseline.get(path, ("100644", None, None))
             if not _index_clean(mode, data, observed, prior, settings, oid_length, index_time):
                 data = _decode_worktree(data, rules[path], min(MAX_FILE_BYTES, MAX_SNAPSHOT_BYTES - total))
-        total += max(original_size, len(data))
+        total += max(original_size, len(data) if data is not None else 0)
         if total > MAX_SNAPSHOT_BYTES:
             raise GitRefusal("size_limit")
         contents.append((path, mode, data, observed))
@@ -711,23 +718,31 @@ def plan_merge(store: GitStore, tip: str, head: str, *, _runner=None) -> Plan:
     return _merge(store, tip, head)
 
 
-def _parents(store: GitStore, commit: str) -> Tuple[str, ...]:
-    data = store.object(_oid(commit), "commit")
+def _parents(store: GitStore, commit: str, *, records=None) -> Tuple[str, ...]:
+    commit = _oid(commit)
+    if records is not None and commit in records:
+        return records[commit][0]
+    data = store.object(commit, "commit")
     end = data.find(b"\n\n", 0, MAX_MESSAGE_BYTES + 1)
     if end < 0:
         raise GitRefusal("invalid_object")
     try:
-        return tuple(_oid(line[7:].decode("ascii")) for line in data[:end].splitlines() if line.startswith(b"parent "))
+        parents = tuple(_oid(line[7:].decode("ascii")) for line in data[:end].splitlines() if line.startswith(b"parent "))
     except UnicodeError:
         raise GitRefusal("invalid_object") from None
+    if records is not None:
+        # Keep only bounded message bytes; refusal remains after the merge/conflict.
+        limit = MAX_MESSAGE_BYTES - len("\n\n(cherry picked from commit " + commit + ")\n")
+        records[commit] = (parents, data[end + 2:] if len(data) - end - 2 <= limit else None)
+    return parents
 
 
-def _pick_sources(store: GitStore, sources: Sequence[str]) -> Tuple[str, ...]:
+def _pick_sources(store: GitStore, sources: Sequence[str], records) -> Tuple[str, ...]:
     if not isinstance(sources, (tuple, list)) or not 1 <= len(sources) <= MAX_PICKS:
         raise GitRefusal("invalid_picks")
     expanded = []
     for source in sources:
-        parents = _parents(store, source)
+        parents = _parents(store, source, records=records)
         if len(parents) > 2 or not parents:
             raise GitRefusal("invalid_picks")
         if len(parents) == 2:
@@ -755,21 +770,20 @@ def plan_pick(store: GitStore, tip: str, sources: Sequence[str], identity: Commi
     _require_runner(_runner)
     _oid(tip)
     _identity(identity)
-    commits = []
-    for source in _pick_sources(store, sources):
-        parents = _parents(store, source)
+    commits, records = [], {}
+    for source in _pick_sources(store, sources, records):
+        parents = _parents(store, source, records=records)
         if len(parents) != 1:
             raise GitRefusal("invalid_picks")
         plan = _merge(store, tip, source, base=parents[0])
         if plan.status == "conflict":
             return plan
-        data = store.object(source, "commit")
-        start = data.find(b"\n\n", 0, MAX_MESSAGE_BYTES + 1) + 2
+        data = records[source][1]
         trailer = "\n\n(cherry picked from commit " + source + ")\n"
-        if start < 2 or len(data) - start > MAX_MESSAGE_BYTES - len(trailer):
+        if data is None:
             raise GitRefusal("invalid_message")
         try:
-            message = data[start:].decode("utf-8")
+            message = data.decode("utf-8")
         except UnicodeError:
             raise GitRefusal("invalid_message") from None
         message = message.rstrip("\n") + trailer
