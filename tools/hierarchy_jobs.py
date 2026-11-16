@@ -534,26 +534,32 @@ def checked_paths(packet, recipe, checkout):
     return paths
 
 
-def refuse_paths_outside_commit(checkout, commit, paths):
+def read_environment(overrides=None, *, inherit_config=False, planned=None):
+    """Only an explicitly unplanned caller retains the inherited host environment."""
+    environment = object_read_env(overrides, inherit_config=inherit_config)
+    return hierarchy_hosts.child_environment(environment, "no-host") if planned is not False else environment
+
+
+def refuse_paths_outside_commit(checkout, commit, paths, *, planned=None):
     """For a require_clean recipe: every path is in the packet's commit. The job runs on an export of that commit, where
     any other path would be missing, so this only turns a confusing run over nothing into a clear refusal. Ignored files
     under a named folder need no check of their own: the export does not hold them."""
-    refuse_partial_clone(checkout)
+    refuse_partial_clone(checkout, planned=planned)
     for path in paths:
         name = path.partition("::")[0]
         # `<commit>:` names the root tree; `<commit>:.` is refused by git, so "." would never pass.
         inside = "" if name.rstrip("/") in ("", ".") else name.rstrip("/")
         # Replace refs are ignored as in the export, so a replaced tree cannot make a path look present.
-        found = object_git(checkout, "cat-file", "-e", "%s:%s" % (commit, inside))
+        found = object_git(checkout, "cat-file", "-e", "%s:%s" % (commit, inside), planned=planned)
         require(found.returncode == 0, "path %s is not in commit %s" % (name, commit[:12]))
 
 
-def refuse_partial_clone(checkout):
+def refuse_partial_clone(checkout, *, planned=None):
     """A partial clone fetches a missing object on read, running whatever its remote config names, so its commit is not
     read at all. Read with includes, as Git itself reads them."""
-    partial = object_git(checkout, "config", "--local", "--includes", "--get", "extensions.partialClone")
+    partial = object_git(checkout, "config", "--local", "--includes", "--get", "extensions.partialClone", planned=planned)
     promisors = object_git(checkout, "config", "--local", "--includes", "--type=bool", "--get-regexp",
-                           r"^remote\..*\.promisor$")
+                           r"^remote\..*\.promisor$", planned=planned)
     # Exit 1 is "not set"; anything else, such as a promisor value that is no boolean, is refused as unreadable.
     require(partial.returncode in (0, 1) and promisors.returncode in (0, 1),
             "could not read the local config of " + str(checkout))
@@ -570,14 +576,14 @@ def plain_entry(path):
 EXPORT_MODES = {"100644": 0o444, "100755": 0o555, "120000": None}
 
 
-def commit_entries(checkout, commit, tree):
+def commit_entries(checkout, commit, tree, *, planned=None):
     """The commit's blobs and symlinks in tree order, as (path, mode, id). A gitlink is refused: its content is not in
     the commit. Replace refs are ignored here and in the export, so the ids are the commit's own."""
-    refuse_partial_clone(checkout)
-    found = object_git(checkout, "rev-parse", "--verify", "--quiet", commit + "^{tree}")
+    refuse_partial_clone(checkout, planned=planned)
+    found = object_git(checkout, "rev-parse", "--verify", "--quiet", commit + "^{tree}", planned=planned)
     actual = found.stdout.decode().strip() if found.returncode == 0 else "nothing readable"
     require(actual == tree, "commit %s has tree %s, not the packet's tree %s" % (commit[:12], actual[:12], tree[:12]))
-    listed = object_git(checkout, "ls-tree", "-r", "-z", "-l", "--full-tree", tree)
+    listed = object_git(checkout, "ls-tree", "-r", "-z", "-l", "--full-tree", tree, planned=planned)
     require(listed.returncode == 0, "could not list the tree of commit " + commit[:12])
     entries, size = [], 0
     for row in listed.stdout.split(b"\0"):
@@ -701,7 +707,7 @@ def write_git_stub(root, commit):
     os.chmod(stub, 0o555)
 
 
-def export_commit(checkout, commit, tree, target, git_stub=False):
+def export_commit(checkout, commit, tree, target, git_stub=False, *, planned=None):
     """Materialise exactly the packet's commit at target, read-only, and return its record for the result.
 
     The entries come from `ls-tree` of the commit's tree and their bytes from one `git cat-file --batch`, which applies
@@ -709,12 +715,12 @@ def export_commit(checkout, commit, tree, target, git_stub=False):
     export holds exactly the committed bytes. A symlink that resolves outside the export is refused, not run."""
     # One deadline for the whole export, from the tree listing to the last link checked.
     deadline = time.monotonic() + EXPORT_SECONDS
-    entries = commit_entries(checkout, commit, tree)
+    entries = commit_entries(checkout, commit, tree, planned=planned)
     os.mkdir(target, 0o700)
     root = os.fsencode(os.path.realpath(target))
     folders, size, expired = {b""}, 0, []
     with tempfile.TemporaryFile() as errors:
-        process = subprocess.Popen(object_read_argv("cat-file", "--batch"), cwd=checkout, env=object_read_env(),
+        process = subprocess.Popen(object_read_argv("cat-file", "--batch"), cwd=checkout, env=read_environment(planned=planned),
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors)
         # The kill ends any read or write that waits on git once the deadline passes.
         timer = threading.Timer(max(0, deadline - time.monotonic()), lambda: (expired.append(True), process.kill()))
@@ -783,34 +789,35 @@ def path_fingerprint(path, name):
     return b"file:" + (b"x" if info.st_mode & 0o111 else b"-") + b":" + digest.hexdigest().encode()
 
 
-def refuse_submodules(checkout, revisions=()):
+def refuse_submodules(checkout, revisions=(), *, planned=None):
     """A submodule's bytes and revision live in another repository, and the parent's status shows the same ` M sub`
     for any of them, while a clean or uninitialized one shows nothing. None can be bound to a packet, so all are
     refused by path. The submodule itself is never read, so nothing outside the checkout is followed. A merge also
     names commits that are not checked out, so their trees are read as well."""
-    listed = object_git(checkout, "ls-files", "--stage", "-z")
+    listed = object_git(checkout, "ls-files", "--stage", "-z", planned=planned)
     require(listed.returncode == 0, "could not read the index of " + str(checkout))
     gitlinks = [entry.partition(b"\t")[2] for entry in listed.stdout.split(b"\0") if entry.startswith(b"160000 ")]
     for revision in revisions:
-        tree = object_git(checkout, "ls-tree", "-r", "-z", "--full-tree", revision)
+        tree = object_git(checkout, "ls-tree", "-r", "-z", "--full-tree", revision, planned=planned)
         require(tree.returncode == 0, "could not read the tree of " + revision)
         gitlinks += [entry.partition(b"\t")[2] for entry in tree.stdout.split(b"\0") if entry.startswith(b"160000 ")]
     require(not gitlinks, "submodules are not supported, because their content cannot be witnessed byte for byte: "
             + ", ".join(sorted({os.fsdecode(path) for path in gitlinks}))[:1024])
 
 
-def object_git(checkout, *args):
+def object_git(checkout, *args, planned=None):
     """Raw object reads; these must never inherit the mutation runner's Git policy."""
-    return subprocess.run(object_read_argv(*args), cwd=checkout, env=object_read_env(), capture_output=True, timeout=120)
+    return subprocess.run(object_read_argv(*args), cwd=checkout, env=read_environment(planned=planned),
+                          capture_output=True, timeout=120)
 
 
-def pinned_git(checkout, *args, stdin=None, env=PINNED_GIT_ENV):
+def pinned_git(checkout, *args, stdin=None, env=PINNED_GIT_ENV, planned=None):
     """A read with the config the merge steps see, so what admit refuses and what the merge does agree."""
     return subprocess.run(object_read_argv(*args), cwd=checkout, input=stdin,
-                          env=object_read_env(env), capture_output=True, timeout=120)
+                          env=read_environment(env, planned=planned), capture_output=True, timeout=120)
 
 
-def refuse_attributes(checkout, paths, revisions):
+def refuse_attributes(checkout, paths, revisions, *, planned=None):
     """A filter (LFS and the like) runs outside Git's merge and would run again on checkout, and a merge driver other than
     the built-in text or binary, union included, can turn a conflict into a result that looks clean. Each path is read as
     each side's own attributes describe it, because either side can add the attribute."""
@@ -819,7 +826,7 @@ def refuse_attributes(checkout, paths, revisions):
     flagged = set()
     for revision in revisions:
         found = pinned_git(checkout, "check-attr", "-z", "--stdin", "--source", revision, "filter", "merge",
-                           stdin=b"".join(path + b"\0" for path in paths))
+                           stdin=b"".join(path + b"\0" for path in paths), planned=planned)
         require(found.returncode == 0, "could not read the attributes of the paths the merge changes")
         parts = found.stdout.split(b"\0")
         for index in range(0, len(parts) - 2, 3):
@@ -830,39 +837,39 @@ def refuse_attributes(checkout, paths, revisions):
             "built-in text or binary: " + ", ".join(sorted(flagged))[:1024])
 
 
-def head_ref(checkout):
+def head_ref(checkout, *, planned=None):
     """The branch HEAD points at, or None when HEAD is detached: what a merge's swap would move."""
-    found = pinned_git(checkout, "symbolic-ref", "-q", "HEAD")
+    found = pinned_git(checkout, "symbolic-ref", "-q", "HEAD", planned=planned)
     require(found.returncode in (0, 1), "could not read which branch HEAD points at")
     return found.stdout.decode().strip() or None
 
 
-def merge_refusals(checkout, commit, merge):
+def merge_refusals(checkout, commit, merge, *, planned=None):
     """J2's refusals that Git objects, attributes and config alone decide, before a merge job runs. `commit` is HEAD by now."""
     # An unspecified merge attribute uses merge.default, and a configured driver named text or binary wins over the
     # built-in one, so either brings back the union or custom-driver merge the attribute check below refuses.
-    configured = pinned_git(checkout, "config", "--get-regexp", r"^merge\.(default|.+\.driver)$")
+    configured = pinned_git(checkout, "config", "--get-regexp", r"^merge\.(default|.+\.driver)$", planned=planned)
     require(configured.returncode in (0, 1), "could not read the merge config")
     keys = sorted({line.partition(" ")[0] for line in configured.stdout.decode(errors="replace").splitlines() if line})
     require(not keys, "a merge job refuses merge.default and merge.<driver>.driver in the repository's config, because they "
             "can merge a changed path by union or by a command; send this merge to an integrator lane: " + ", ".join(keys)[:1024])
-    found = pinned_git(checkout, "rev-parse", "--verify", "--quiet", "--end-of-options", merge + "^{commit}")
+    found = pinned_git(checkout, "rev-parse", "--verify", "--quiet", "--end-of-options", merge + "^{commit}", planned=planned)
     require(found.returncode == 0 and found.stdout.decode().strip() == merge, "merge %s is not a commit in this repository" % merge)
-    contained = pinned_git(checkout, "merge-base", "--is-ancestor", merge, commit)
+    contained = pinned_git(checkout, "merge-base", "--is-ancestor", merge, commit, planned=planned)
     require(contained.returncode in (0, 1), "could not tell whether merge is already in commit")
     require(contained.returncode == 1, "merge %s is already contained in commit %s, so it would make no change" % (merge, commit))
-    found = pinned_git(checkout, "merge-base", "--all", commit, merge)
+    found = pinned_git(checkout, "merge-base", "--all", commit, merge, planned=planned)
     bases = found.stdout.decode().split()
     require(found.returncode in (0, 1), "could not find the merge base")
     require(bool(bases), "commit and merge have no merge base: unrelated histories are not merged")
-    refuse_submodules(checkout, (commit, merge))
+    refuse_submodules(checkout, (commit, merge), planned=planned)
     changed = set()
     for base in bases:
         for side in (commit, merge):
-            listed = pinned_git(checkout, "diff-tree", "-r", "-z", "--name-only", "--no-renames", base, side)
+            listed = pinned_git(checkout, "diff-tree", "-r", "-z", "--name-only", "--no-renames", base, side, planned=planned)
             require(listed.returncode == 0, "could not list the paths changed on either side")
             changed.update(name for name in listed.stdout.split(b"\0") if name)
-    refuse_attributes(checkout, sorted(changed), (commit, merge))
+    refuse_attributes(checkout, sorted(changed), (commit, merge), planned=planned)
     # A .gitattributes change can give a filter or merge driver to paths neither side changed, which the per-path check
     # above never reads; the merge would run, and only the post-run check would catch it, after HEAD had moved.
     edited = sorted({os.fsdecode(name) for name in changed if name.rsplit(b"/", 1)[-1] == b".gitattributes"})
@@ -870,13 +877,14 @@ def merge_refusals(checkout, commit, merge):
             "neither side changed are filtered or merged; send this merge to an integrator lane: " + ", ".join(edited)[:1024])
 
 
-def uncommitted_content(checkout, view=None):
+def uncommitted_content(checkout, view=None, *, planned=None):
     """Git status names the paths that differ, not their bytes, so one status can hide different content. `view` overrides
     part of the environment, as a merge's checks do to read status the way its steps do."""
     status = subprocess.run(object_read_argv("status", "--porcelain=v1", "-z", "--untracked-files=all"),
-                            cwd=checkout, env=object_read_env(view, inherit_config=True), capture_output=True, timeout=120)
+                            cwd=checkout, env=read_environment(view, inherit_config=True, planned=planned),
+                            capture_output=True, timeout=120)
     require(status.returncode == 0, "could not read the status of " + str(checkout))
-    refuse_submodules(checkout)
+    refuse_submodules(checkout, planned=planned)
     tokens = status.stdout.split(b"\0")
     digest = hashlib.sha256()
     count = index = 0
@@ -896,39 +904,40 @@ def uncommitted_content(checkout, view=None):
     return digest.hexdigest(), count
 
 
-def source_identity(checkout, *arguments):
+def source_identity(checkout, *arguments, planned=None):
     """The mailbox witness contract, with the job reader's no-fetch/no-replacement policy."""
     try:
         result = subprocess.run(object_read_argv(*arguments), cwd=checkout, capture_output=True, text=True,
-                                env=object_read_env(inherit_config=True), timeout=5)
+                                env=read_environment(inherit_config=True, planned=planned), timeout=5)
     except subprocess.TimeoutExpired as exc:
         raise ValueError("git identity check timed out") from exc
     require(result.returncode == 0, "git identity check failed")
     return result.stdout.rstrip("\r\n")
 
 
-def source_state(mailbox, checkout, view=None):
+def source_state(mailbox, checkout, view=None, *, planned=None):
     # Keep the persisted mailbox witness fields and its ordinary ignore view; only the content digest uses `view`.
     # The pinned, standalone mailbox implementation cannot depend on the shared Git policy module.
     checkout = safe_path(checkout)
     try:
         status = subprocess.run(object_read_argv("status", "--porcelain=v1", "-z", "--untracked-files=all"),
-                                cwd=checkout, capture_output=True, env=object_read_env(inherit_config=True),
+                                cwd=checkout, capture_output=True, env=read_environment(inherit_config=True, planned=planned),
                                 timeout=GIT_STATUS_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired as exc:
         raise ValueError("git identity check timed out") from exc
     require(status.returncode == 0, "git identity check failed")
-    return {"worktree": str(checkout), "source_revision": source_identity(checkout, "rev-parse", "HEAD"),
-            "source_tree": source_identity(checkout, "rev-parse", "HEAD^{tree}"),
+    return {"worktree": str(checkout), "source_revision": source_identity(checkout, "rev-parse", "HEAD", planned=planned),
+            "source_tree": source_identity(checkout, "rev-parse", "HEAD^{tree}", planned=planned),
             "dirty_state_sha256": hashlib.sha256(status.stdout).hexdigest(), "dirty_entries": status_entries(status.stdout),
-            "dirty_content_sha256": uncommitted_content(checkout, view)[0]}
+            "dirty_content_sha256": uncommitted_content(checkout, view, planned=planned)[0]}
 
 
-def source_digest(checkout):
+def source_digest(checkout, *, planned=None):
     """What an orchestrator needs for a packet. A lane with a shell can run this and report it."""
     path = safe_path(text(checkout, "checkout"))
-    digest, count = uncommitted_content(path)
-    return 0, {"commit": source_identity(path, "rev-parse", "HEAD"), "tree": source_identity(path, "rev-parse", "HEAD^{tree}"),
+    digest, count = uncommitted_content(path, planned=planned)
+    return 0, {"commit": source_identity(path, "rev-parse", "HEAD", planned=planned),
+               "tree": source_identity(path, "rev-parse", "HEAD^{tree}", planned=planned),
                "dirty_content_sha256": digest, "dirty_entries": count}
 
 
@@ -1301,6 +1310,7 @@ def admit(ledger, initiative, message, mailbox, recipes, store=None, job=None):
         if saved is not None:
             require(saved["host_plan"] == host_plan, "host plan changed after admission")
     checkout = absolute(packet["checkout"], "checkout")
+    planned = job.planned if job is not None else None
     require(checkout in initiative["checkouts"], "checkout is not registered for this initiative: " + checkout)
     matching(packet["commit"], GIT_ID, "commit")
     matching(packet["tree"], GIT_ID, "tree")
@@ -1340,13 +1350,13 @@ def admit(ledger, initiative, message, mailbox, recipes, store=None, job=None):
         matching(packet["merge"], GIT_ID, "merge")
         require(packet["merge"] != packet["commit"], "merge equals commit, so it would make no change")
         # Clean before, so that afterward the checkout can be compared with exactly the merged tree.
-        count = uncommitted_content(checkout, MERGE_VIEW_ENV)[1]
+        count = uncommitted_content(checkout, MERGE_VIEW_ENV, planned=planned)[1]
         require(count == 0, "a merge needs a clean worktree, and this one has %d uncommitted entries, read as the merge steps "
                 "read them: without the owner's global excludes" % count)
         require(dirty == EMPTY_STATUS, "a merge needs a clean worktree, so dirty_content_sha256 must be the empty digest")
     require(recipe["sandbox"] == "none" or shutil.which("bwrap") is not None,
             "this recipe needs bubblewrap, which is not available")
-    witness = source_state(mailbox, checkout, MERGE_VIEW_ENV if kind == "merge" else None)
+    witness = source_state(mailbox, checkout, MERGE_VIEW_ENV if kind == "merge" else None, planned=planned)
     if derive and "dirty_content_sha256" not in packet:
         dirty = saved["dirty_content_sha256"] if saved is not None else witness["dirty_content_sha256"]
     # Named before the plain mismatch, so a packet that claimed a clean checkout learns why it cannot run.
@@ -1354,7 +1364,7 @@ def admit(ledger, initiative, message, mailbox, recipes, store=None, job=None):
     require((witness["source_revision"], witness["source_tree"], witness["dirty_content_sha256"]) ==
             (packet["commit"], packet["tree"], dirty), "source does not match the packet")
     if recipe.get("require_clean", False):
-        refuse_paths_outside_commit(checkout, packet["commit"], paths)
+        refuse_paths_outside_commit(checkout, packet["commit"], paths, planned=planned)
     admitted = {**packet, "dirty_content_sha256": dirty, "paths": paths}
     if derive:
         if saved is not None:
@@ -1365,7 +1375,7 @@ def admit(ledger, initiative, message, mailbox, recipes, store=None, job=None):
         job.admission_owned = True
         derived = derive_commit_tree(admitted, recipes, job, host_plan)
         tree = derived["expected_tree"]
-        require(source_state(mailbox, checkout) == witness, "source changed during derivation")
+        require(source_state(mailbox, checkout, planned=planned) == witness, "source changed during derivation")
         require(tree != packet["tree"], "this commit would make no change")
         require("expected_tree" not in packet or packet["expected_tree"] == tree,
                 "the derived tree %s is not the expected tree %s" % (tree, packet.get("expected_tree")))
@@ -1377,9 +1387,9 @@ def admit(ledger, initiative, message, mailbox, recipes, store=None, job=None):
                      "derivation_sha256": file_sha256(job.folder / "derivation.json")}) + b"\n")
         job.validated_admission()
     if kind == "merge":
-        merge_refusals(checkout, packet["commit"], packet["merge"])
+        merge_refusals(checkout, packet["commit"], packet["merge"], planned=planned)
         # The witness binds the revision and tree, not the branch, so the branch is held here and checked again at run time.
-        admitted["head_ref"] = head_ref(checkout)
+        admitted["head_ref"] = head_ref(checkout, planned=planned)
     return admitted, raw
 
 
@@ -2550,9 +2560,10 @@ def refuse(store, job, reason, wait, recipes_sha256=None, *, outside_policy=None
     return settle(store, job, wait)
 
 
-def git_folders(checkout):
+def git_folders(checkout, *, planned=None):
     found = subprocess.run(object_read_argv("rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"),
-                            cwd=checkout, env=object_read_env(inherit_config=True), capture_output=True, text=True, timeout=30)
+                            cwd=checkout, env=read_environment(inherit_config=True, planned=planned),
+                            capture_output=True, text=True, timeout=30)
     require(found.returncode == 0, "could not locate the checkout's Git data")
     return sorted(set(found.stdout.splitlines()))
 
@@ -2576,13 +2587,13 @@ def sandbox_prefix(recipes, recipe, job, checkout, export=None):
     if export is not None:
         # Empty tmpfs over the live checkout and its Git data, so not even an absolute path reaches an ignored file there.
         # Before the job folder's bind, so an export below either of them is mounted again on top.
-        for folder in [checkout] + [path for path in git_folders(checkout) if not path.startswith(checkout + os.sep)]:
+        for folder in [checkout] + [path for path in git_folders(checkout, planned=job.planned) if not path.startswith(checkout + os.sep)]:
             argv += ["--tmpfs", folder]
     else:
         writes_git = recipe["kind"] in ("commit", "merge")
         # A merge brings the working tree forward itself, so it writes the checkout as well as the Git data.
         argv += ["--bind" if recipe.get("writable_checkout") or recipe["kind"] == "merge" else "--ro-bind", checkout, checkout]
-        for folder in git_folders(checkout):
+        for folder in git_folders(checkout, planned=job.planned):
             argv += ["--bind" if writes_git else "--ro-bind", folder, folder]
     # The job folder itself stays read-only inside, so a job cannot write its own result, claim or logs, nor its export.
     argv += ["--ro-bind", str(job.folder), str(job.folder)]
@@ -2928,16 +2939,17 @@ def execute(job, recipe, packet, recipes, on_start, details, export=None, *, pla
     return _ExecutionResult(rows, reason, exit_code, created, failed_launch)
 
 
-def checkout_state(checkout, commit, created, view):
+def checkout_state(checkout, commit, created, view, *, planned=None):
     """Where a commit or merge left the checkout once HEAD may have moved: what HEAD names, which tree the index holds,
     and how many entries status shows against HEAD."""
     try:
-        found = pinned_git(checkout, "rev-parse", "--verify", "--quiet", "HEAD")
+        found = pinned_git(checkout, "rev-parse", "--verify", "--quiet", "HEAD", planned=planned)
         head = found.stdout.decode().strip() if found.returncode == 0 else "nothing readable"
         role = {commit: "the packet's commit", created: "the new commit"}.get(head, "neither the packet's commit nor the new one")
         index = next((name for revision, name in ((created, "the new commit"), (commit, "the packet's commit"))
-                      if pinned_git(checkout, "diff-index", "--cached", "--quiet", revision, "--").returncode == 0), "neither commit")
-        count = uncommitted_content(checkout, view)[1]
+                      if pinned_git(checkout, "diff-index", "--cached", "--quiet", revision, "--",
+                                    planned=planned).returncode == 0), "neither commit")
+        count = uncommitted_content(checkout, view, planned=planned)[1]
     except ERRORS as exc:
         return "The checkout's state could not be read afterward: " + str(exc)[:512]
     return ("Afterward HEAD names %s (%s), the index holds the tree of %s, and status shows %d uncommitted entries against "
@@ -2999,8 +3011,8 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
             write_result(job, "refused", None, reason=str(exc)[:2048], **provenance)
             return settle(store, job, wait)
     try:
-        before = source_state(mailbox, checkout, view)
-        branch = head_ref(checkout) if recipe["kind"] == "merge" else None
+        before = source_state(mailbox, checkout, view, planned=job.planned)
+        branch = head_ref(checkout, planned=job.planned) if recipe["kind"] == "merge" else None
     except ERRORS as exc:
         write_result(job, "refused", None, reason="could not witness the source: " + str(exc)[:2048], **provenance)
         return settle(store, job, wait)
@@ -3016,7 +3028,7 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
     if recipe.get("require_clean", False):
         # An ignored file changes no status, so one added while the job waited is looked for again here.
         try:
-            refuse_paths_outside_commit(checkout, packet["commit"], packet["paths"])
+            refuse_paths_outside_commit(checkout, packet["commit"], packet["paths"], planned=job.planned)
         except ERRORS as exc:
             write_result(job, "refused", None, reason=str(exc)[:2048], **provenance)
             return settle(store, job, wait)
@@ -3047,7 +3059,7 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
         try:
             remove_work_folders(job, (EXPORT_FOLDER,))
             extra["source_export"] = export_commit(checkout, packet["commit"], packet["tree"], export,
-                                                   git_stub=recipe.get("export_git", False))
+                                                   git_stub=recipe.get("export_git", False), planned=job.planned)
         except ERRORS as exc:
             try:
                 remove_work_folders(job, (EXPORT_FOLDER,))
@@ -3066,7 +3078,7 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
         # Without a confirmed stop there is no honest result, so the job keeps its slot until root resolves it.
         row = {"job": job.id, "state": "abandoned", "process_group": exc.group, "process_alive": True, "error": str(exc)}
         if details.get("new_commit"):
-            row["checkout_state"] = checkout_state(checkout, packet["commit"], details["new_commit"], view)
+            row["checkout_state"] = checkout_state(checkout, packet["commit"], details["new_commit"], view, planned=job.planned)
         return row
     except ERRORS as exc:
         execution = _ExecutionResult(reason="the job could not run: " + str(exc)[:2048], exit_code=NO_VERDICT_EXIT)
@@ -3084,7 +3096,7 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
             extra["source_export"]["removed"] = False
             cleanup_error = str(exc)[:512]
     try:
-        after = source_state(mailbox, checkout, view)
+        after = source_state(mailbox, checkout, view, planned=job.planned)
     except ERRORS as exc:
         # Without this the job would have no result, and so no receipt, and would hold its slot.
         after = None
@@ -3101,7 +3113,7 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
     moved = details.get("new_commit")
     if reason and moved:
         # Once the swap may have run, "failed" no longer means "untouched", so the reason says where everything is.
-        reason += " " + checkout_state(checkout, packet["commit"], moved, view)
+        reason += " " + checkout_state(checkout, packet["commit"], moved, view, planned=job.planned)
     if not reason:
         commit = created
     else:
@@ -4466,7 +4478,7 @@ def recovery_source(job, mailbox, result, recipes_path=None, *, recipe_evidence=
     checkout = absolute(packet["checkout"], "checkout")
     require(checkout in job.initiative["checkouts"], "checkout is no longer registered for this initiative")
     view = MERGE_VIEW_ENV if "merge" in packet else None
-    observed = source_state(mailbox, checkout, view)
+    observed = source_state(mailbox, checkout, view, planned=job.planned)
     expected = {"source_revision": packet["commit"], "source_tree": packet["tree"],
                 "dirty_content_sha256": packet.get("dirty_content_sha256", EMPTY_STATUS)}
     # A terminal result retains its own source witness. Current recipes cannot invalidate history.
@@ -4739,7 +4751,7 @@ def main(argv=None):
     try:
         require(args.command == "source-digest" or args.store is not None, "--store is required")
         if args.command == "source-digest":
-            code, result = source_digest(args.checkout)
+            code, result = source_digest(args.checkout, planned=None)
         elif args.command == "recovery-status":
             code, result = recovery_status(args.store, args.initiative, args.recipes)
         elif args.command == "resolve":
