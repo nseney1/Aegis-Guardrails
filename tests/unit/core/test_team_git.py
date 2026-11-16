@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 from aegis_core import gitsafe, gitsafe_run, gitops_fds, team_git as tg, team_git_snapshot
+from aegis_core import team, team_lease_custody
 from tests.unit.core.test_gitsafe import LANE_MODULES, strict_program, strict_program_guard
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
@@ -25,6 +26,250 @@ IDENTITY = tg.CommitIdentity("Lane", "lane@example.com", "1700000000 +0000")
 
 ENV_REDIRECTS = ("GIT_TRACE", "GIT_TRACE2", "GIT_TRACE2_EVENT", "GIT_TRACE2_PERF",
                  "GIT_CONFIG", "GIT_DIR", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY")
+
+
+@pytest.mark.parametrize("phase", ["custody", "verify"])
+@pytest.mark.parametrize("case", ["selector", "config", "several", "many", "count", "value", "name", "retained"])
+def test_lease_ambient_names_are_bounded_without_values_and_retry(repo, monkeypatch, phase, case):
+    secret = "ghp_" + "a" * 36
+    keys = {"selector": ["GIT_DIR"], "config": ["GIT_CONFIG_KEY_0"],
+            "several": ["GIT_WORK_TREE", "GIT_DIR", "GIT_CONFIG_KEY_0"],
+            "many": ["GIT_CONFIG_KEY_%02d" % index for index in reversed(range(20))],
+            "count": ["VARIABLE_%03d" % index for index in reversed(range(600))],
+            "value": ["LARGE_VALUE"], "name": ["N" * 129],
+            "retained": ["GIT_CUSTOM_%02d" % index for index in reversed(range(57))]}[case]
+    environment = dict.fromkeys(keys, secret)
+    if case == "value":
+        environment[keys[0]] = secret + "x" * (70 * 1024)
+    before = shared_bytes(repo)
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    try:
+        def refused(_slot):
+            with pytest.raises(gitsafe.GitError) as caught:
+                if phase == "custody":
+                    with team.lease_custody(repo):
+                        pytest.fail("ambient environment reached the effect body")
+                else:
+                    team.verify_lease_repository(repo)
+            exc = caught.value
+            assert exc.code == "ambient_git_environment"
+            if case in ("count", "value", "name", "retained"):
+                label = "<non-standard Git variable name>"
+                remaining = len(keys) - 1
+            else:
+                label = ", ".join(sorted(keys)[:16])
+                remaining = max(0, len(keys) - 16)
+            if remaining:
+                label += " (+%d more)" % remaining
+            assert str(exc) == "Ambient Git environment refused: " + label + "."
+            assert exc.next_action == "Unset " + label + " in the environment, then retry."
+            assert team.lease_next_action(exc.code) == exc.next_action
+            assert secret not in str(exc) + exc.next_action
+            return str(exc), exc.next_action
+        expected = refused(0)
+        assert refused(1) == expected
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert list(pool.map(refused, range(2))) == [expected, expected]
+    finally:
+        monkeypatch.setattr(team_lease_custody, "os", os)
+    assert shared_bytes(repo) == before
+    with team.lease_custody(repo):
+        team.verify_lease_repository(repo)
+
+
+def test_lease_ambient_name_diagnostics_mask_nonstandard_names(repo, monkeypatch):
+    secret = "ghp_" + "b" * 36
+    key = "GIT_CONFIG_KEY_\x1b[31m" + secret + "_" + "z" * 300
+    environment = {key: "never-display-this-value"}
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        with team.lease_custody(repo):
+            pytest.fail("unsafe environment accepted")
+    label = "<non-standard Git variable name>"
+    for field in (str(caught.value), caught.value.next_action, team.lease_next_action(caught.value.code)):
+        assert label in field
+        assert secret not in field and "\x1b" not in field and "never-display-this-value" not in field
+
+
+@pytest.mark.parametrize("phase", ["custody", "verify"])
+@pytest.mark.parametrize("prefix", ["GIT_CONFIG_KEY_REDACTEDx", "GIT_CONFIG_VALUE_REDACTEDx", "GIT_CUSTOM_REDACTEDx"])
+@pytest.mark.parametrize("kind", ["github", "aws", "pem", "entropy"])
+def test_lease_ambient_embedded_credentials_are_never_displayed(repo, monkeypatch, phase, prefix, kind):
+    samples = {"github": "".join(("gh", "p_", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8")),
+               "aws": "".join(("AK", "IA", "9F8E7D6C5B4A3210")),
+               "pem": "".join(("-----BEGIN ", "RSA ", "PRIVATE KEY-----")),
+               "entropy": "".join(("aB9zQ2mL7xK4", "pR6vT1nH8jF3", "sW5cD0yG9uE2"))}
+    secret = samples[kind]
+    key = prefix + secret
+    environment = {key: "private-value"}
+    retained = prefix.startswith("GIT_CUSTOM_")
+    if retained:
+        environment.update({"GIT_PADDING_%02d" % index: "private-value" for index in range(56)})
+    label = "<non-standard Git variable name>" + (" (+56 more)" if retained else "")
+    before = shared_bytes(repo)
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    try:
+        def refused(_slot):
+            with pytest.raises(gitsafe.GitError) as caught:
+                if phase == "custody":
+                    with team.lease_custody(repo):
+                        pytest.fail("unsafe environment accepted")
+                else:
+                    team.verify_lease_repository(repo)
+            assert caught.value.code == "ambient_git_environment"
+            fields = str(caught.value), caught.value.next_action, team.lease_next_action(caught.value.code)
+            assert fields == ("Ambient Git environment refused: " + label + ".",
+                              "Unset " + label + " in the environment, then retry.",
+                              "Unset " + label + " in the environment, then retry.")
+            assert all(secret not in field and key not in field and "private-value" not in field for field in fields)
+            return fields
+        expected = refused(0)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert list(pool.map(refused, range(2))) == [expected, expected]
+        assert refused(1) == expected
+    finally:
+        monkeypatch.setattr(team_lease_custody, "os", os)
+    assert shared_bytes(repo) == before
+    with team.lease_custody(repo):
+        team.verify_lease_repository(repo)
+
+
+@pytest.mark.parametrize("key,shown", [
+    ("GIT_DIR", True), ("GIT_NAMESPACE", True), ("GIT_CONFIG_PARAMETERS", True),
+    ("GIT_NO_REPLACE_OBJECTS", True), ("PATH", True), ("HOME", True),
+    ("USERPROFILE", True), ("XDG_CONFIG_HOME", True), ("GIT_CONFIG_KEY_0", True),
+    ("GIT_CONFIG_VALUE_000001", True), ("GIT_CONFIG_KEY_123456", True),
+    ("GIT_CONFIG_KEY_1234567", False), ("GIT_CONFIG_VALUE_", False),
+    ("GIT_CONFIG_KEY_12extra", False), ("GIT_CONFIG_KEY_0\n", False),
+    ("GIT_CONFIG_VALUE_\u0661", False), ("git_dir", False),
+])
+def test_lease_ambient_only_exact_reviewed_names_are_disclosed(tmp_path, monkeypatch, key, shown):
+    environment = {key: "x" * 65537}
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        team.verify_lease_repository(tmp_path)
+    label = key if shown else "<non-standard Git variable name>"
+    assert caught.value.code == "ambient_git_environment"
+    assert str(caught.value) == "Ambient Git environment refused: " + label + "."
+    assert caught.value.next_action == "Unset " + label + " in the environment, then retry."
+
+
+def test_lease_ambient_masked_names_are_deduplicated_and_counted(repo, monkeypatch):
+    keys = ["GIT_CONFIG_KEY_bad-b", "GIT_DIR", "GIT_CONFIG_VALUE_123456", "GIT_CONFIG_KEY_bad-a"]
+    environment = dict.fromkeys(keys, "private-value")
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        with team.lease_custody(repo):
+            pytest.fail("unsafe environment accepted")
+    label = "<non-standard Git variable name>, GIT_CONFIG_VALUE_123456, GIT_DIR (+1 more)"
+    assert caught.value.code == "ambient_git_environment"
+    assert str(caught.value) == "Ambient Git environment refused: " + label + "."
+    assert caught.value.next_action == "Unset " + label + " in the environment, then retry."
+
+
+@pytest.mark.parametrize("selector", ["GIT_DIR", "GIT_CONFIG_KEY_0", "PATH"])
+def test_lease_ambient_primary_offenders_precede_retained_overflow(repo, monkeypatch, selector):
+    environment = {"GIT_A%02d" % index: "1" for index in range(56)}
+    environment[selector] = "x" * 70000 if selector == "PATH" else "private-value"
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    try:
+        def refused(_slot):
+            with pytest.raises(gitsafe.GitError) as caught:
+                team.verify_lease_repository(repo)
+            label = selector + ", <non-standard Git variable name> (+55 more)"
+            assert caught.value.code == "ambient_git_environment"
+            assert str(caught.value) == "Ambient Git environment refused: " + label + "."
+            assert caught.value.next_action == "Unset " + label + " in the environment, then retry."
+            assert team.lease_next_action(caught.value.code) == caught.value.next_action
+            return str(caught.value), caught.value.next_action
+        expected = refused(0)
+        assert refused(1) == expected
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert list(pool.map(refused, range(2))) == [expected, expected]
+    finally:
+        monkeypatch.setattr(team_lease_custody, "os", os)
+    with team.lease_custody(repo):
+        team.verify_lease_repository(repo)
+
+
+@pytest.mark.parametrize("key,selector", [("\x07", True), ("   ", False)])
+def test_lease_ambient_empty_canonical_names_are_fixed_placeholders(repo, monkeypatch, key, selector):
+    environment = {key: "x" * 70000}
+    if selector:
+        environment["GIT_DIR"] = "private-value"
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        team.verify_lease_repository(repo)
+    label = "<non-standard Git variable name>" + (", GIT_DIR" if selector else "")
+    assert caught.value.code == "ambient_git_environment"
+    assert str(caught.value) == "Ambient Git environment refused: " + label + "."
+    assert caught.value.next_action == "Unset " + label + " in the environment, then retry."
+
+
+def test_lease_ambient_environment_emptied_during_diagnostics_is_unavailable_and_retries(repo, monkeypatch):
+    class EmptyingEnvironment(dict):
+        inspections = 0
+        def items(self):
+            self.inspections += 1
+            if self.inspections > 1:
+                self.clear()
+            return super().items()
+    environment = EmptyingEnvironment(GIT_DIR="private-value")
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    try:
+        with pytest.raises(gitsafe.GitError) as caught:
+            with team.lease_custody(repo):
+                pytest.fail("changing environment accepted")
+        assert caught.value.code == "ambient_git_environment"
+        assert str(caught.value) == "Ambient Git environment refused: variable names unavailable during inspection."
+        assert caught.value.next_action == "Stabilize the Git environment, then retry."
+        assert team.lease_next_action(caught.value.code) == caught.value.next_action
+    finally:
+        monkeypatch.setattr(team_lease_custody, "os", os)
+    with team.lease_custody(repo):
+        team.verify_lease_repository(repo)
+
+
+@pytest.mark.parametrize("failure", [KeyError, RuntimeError])
+def test_lease_ambient_diagnostic_snapshot_failure_keeps_refusal_and_retry(repo, monkeypatch, failure):
+    class ChangingEnvironment(dict):
+        inspections = 0
+        def items(self):
+            self.inspections += 1
+            if self.inspections > 1:
+                raise failure("private-environment-input")
+            return super().items()
+    environment = ChangingEnvironment(GIT_DIR="private-value")
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    try:
+        with pytest.raises(gitsafe.GitError) as caught:
+            with team.lease_custody(repo):
+                pytest.fail("changing environment accepted")
+        assert caught.value.code == "ambient_git_environment"
+        assert str(caught.value) == "Ambient Git environment refused: variable names unavailable during inspection."
+        assert caught.value.next_action == "Stabilize the Git environment, then retry."
+        assert team.lease_next_action(caught.value.code) == caught.value.next_action
+    finally:
+        monkeypatch.setattr(team_lease_custody, "os", os)
+    with team.lease_custody(repo):
+        team.verify_lease_repository(repo)
+
+
+def test_lease_ambient_unbounded_key_is_not_parsed(repo, monkeypatch):
+    key = "GIT_CONFIG_KEY_" + "x" * 65537
+    calls = []
+    def forbidden_formatter(names):
+        calls.append(tuple(names))
+        pytest.fail("lease diagnostics reached the shared redacting formatter")
+    monkeypatch.setattr(team_lease_custody, "gitsafe_policy", SimpleNamespace(format_ambient_names=forbidden_formatter))
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": {key: "private-value"}}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        with team.lease_custody(repo):
+            pytest.fail("oversized name accepted")
+    assert caught.value.code == "ambient_git_environment"
+    assert str(caught.value) == "Ambient Git environment refused: <non-standard Git variable name>."
+    assert caught.value.next_action == "Unset <non-standard Git variable name> in the environment, then retry."
+    assert calls == []
 
 
 @pytest.mark.parametrize("key", ENV_REDIRECTS)

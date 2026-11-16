@@ -16,7 +16,7 @@ from aegis_core.guidance_grammar import (
 from aegis_core.taxonomy import JIT_DEFAULT_MAX_TOKENS, RULE_TYPES, WORDS_TO_TOKENS_FACTOR
 
 __all__ = ["CONTROL_GUIDANCE", "GuidanceProjectionError", "GuidanceResult", "MAX_GUIDANCE_CHARS",
-           "SLOT_REF_PATTERN", "WITHHELD_GUIDANCE", "checked_result_copy",
+           "SLOT_REF_PATTERN", "WITHHELD_GUIDANCE", "checked_result_copy", "projection_refusal_copy",
            "assembled_text", "project_assembled", "contains_control_characters", "estimate_tokens", "field_text", "finish_payload",
            "instruction_body", "normalize_layout", "redact_clean_text", "project_detail", "detail_instruction_visible", "project_display_data",
            "project_envelope_fields", "project_field", "project_identifier", "project_rule_entries",
@@ -395,11 +395,16 @@ def project_identifier(value: Any, registry: Optional[_Slots] = None) -> str:
 
 
 def project_error_name(value: Any) -> str:
-    """A diagnostic name is either a safe whole identifier or its fixed refusal."""
+    """Redact a diagnostic name to a fixed point within the input character cap."""
     try:
-        return project_identifier(value)
+        for _ in range(MAX_GUIDANCE_CHARS):
+            projected = project_identifier(value)
+            if projected == value:
+                return projected
+            value = projected
     except _InvalidField:
         return _InvalidField.code
+    return _InvalidField.code
 
 
 # Schemas admit structure only at these envelope keys. Unknown keys are text,
@@ -614,6 +619,36 @@ def checked_result_copy(result: Dict[str, Any], registry: Optional[_Slots]) -> D
         return copied
 
     return mapping(result)
+
+
+def projection_refusal_copy(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Recognize a bounded canonical refusal before compatibility budgeting.
+
+    Plain/JSON copies have no private marker. Only the exact refusal shape,
+    fixed field/reason tokens and already projected paths receive the exemption.
+    Other envelopes still take the ordinary projection and budgeting route.
+    """
+    if type(result) is not dict or len(result) not in (2, 3):
+        return None
+    if any(type(key) is not str for key in result):
+        return None
+    if set(result) not in ({"status", "error"}, {"status", "error", "rule_errors"}):
+        return None
+    if type(result["status"]) is not str or type(result["error"]) is not str:
+        return None
+    if result["status"] != "FAIL" or result["error"] not in {
+            "guidance_projection_invalid_field", "guidance_projection_limit"}:
+        return None
+    snapshot = checked_result_copy(result, None)
+    reasons = {field + ": " + reason for field in ("hypothesis", "prediction", "detail", "matched_files")
+               for reason in ("invalid_field", "limit")}
+    # Bounds/type validation precedes inspection; eligibility uses the original
+    # reason so Evidence removal cannot manufacture a canonical refusal token.
+    for row in result.get("rule_errors", []):
+        if (set(row) != {"path", "error"} or type(row["error"]) is not str
+                or row["error"] not in reasons or project_error_name(row["path"]) != row["path"]):
+            return None
+    return snapshot
 
 
 def _stamp_tokens(result: Dict[str, Any]) -> int:
