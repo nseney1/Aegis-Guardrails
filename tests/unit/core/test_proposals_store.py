@@ -2359,6 +2359,150 @@ def test_real_redaction_at_the_kind_boundary_is_atomic():
     assert candidate(kind=text).kind == "x" * 58
 
 
+def test_proposal_text_keeps_integration_tip_escape_clipping_goldens():
+    """Moving the cleaner preserves literal escape prefixes at every cut."""
+    samples = (("abcd\\x41efgh", 4), ("abcd\\u0041ef", 6), ("abcd\\U00000041ef", 10))
+    for text, atom in samples:
+        start = text.index("\\")
+        end = start + atom
+        for limit in range(start + 1, end):
+            clipped = model_module.clean_text(text, limit)
+            assert clipped == text[:limit]
+            assert model_module.clean_text(clipped, limit) == clipped
+        whole = model_module.clean_text(text, end)
+        assert whole == text[:end]
+        assert model_module.clean_text(whole, end) == whole
+
+
+@pytest.mark.parametrize("text,limit,expected", [
+    ("https://[2001:db8::1]/job?sig=hidden", 3, "htt"),
+    ("https://[2001:db8::1]/job?sig=hidden", 64, "https://[2001:db8::1]/job"),
+    ("https://[2001:db8::1]/job?sig=hidden", 17, ""),
+    ("https://[2001:db8::1]:443/job?sig=hidden", 64, "https://[2001:db8::1]:443/job"),
+], ids=["short-scheme", "ipv6", "inside-ipv6", "ipv6-port"])
+def test_proposal_url_authority_keeps_integration_tip_goldens(text, limit, expected):
+    assert model_module.clean_text(text, limit) == expected
+    assert model_module.clean_text(expected, limit) == expected
+
+
+def test_shared_cleaner_matches_proposal_goldens_and_refuses_without_echo():
+    """Any-scheme URLs, trailing spaces and mask edges stay stable; failures do not publish."""
+    from aegis_core.redaction import (
+        REDACTION_MARKER_RE, RedactionRefusal, clip_atomic_text, remove_url_credentials,
+    )
+
+    for scheme in ("ftp", "SSH", "git", "s3", "Custom+v1", "HTTPS"):
+        raw = scheme + "://u:pass@ci.example/path?sig=hidden#private"
+        assert remove_url_credentials(raw, limit=300) == scheme + "://ci.example/path"
+        assert model_module.clean_text(raw) == scheme.lower() + "://ci.example/path"
+        assert "pass" not in model_module.clean_text(raw) and "hidden" not in model_module.clean_text(raw)
+    assert model_module.clean_text("a" * 63 + " ", 64) == "a" * 63
+    assert clip_atomic_text("a" * 63 + " ", 64) == "a" * 63
+    marker = "[REDACTED_IP]"
+    text = "x" * 10 + marker + " tail"
+    start = text.index(marker)
+    for limit in range(start + 1, start + len(marker)):
+        clipped = clip_atomic_text(text, limit)
+        assert clipped == "x" * 10
+        assert "[REDACTED" not in clipped
+        assert REDACTION_MARKER_RE.fullmatch(marker)
+    assert clip_atomic_text("a\nb", 10) == "a\nb"
+    secret = "hunter2"
+    try:
+        remove_url_credentials("https://user:" + secret + "@h/p?" + secret, limit=0)
+    except RedactionRefusal as denied:
+        assert denied.code == "too_large"
+        assert secret not in str(denied) and "https://" not in str(denied)
+    else:
+        raise AssertionError("oversized URL stream was returned")
+    for bad in (None, b"text", 1, ["text"]):
+        try:
+            remove_url_credentials(bad, limit=32)
+        except RedactionRefusal as denied:
+            assert denied.code == "invalid" and str(denied) == "invalid"
+        else:
+            raise AssertionError("malformed input was cleaned")
+    try:
+        clip_atomic_text("ok", -1)
+    except RedactionRefusal as denied:
+        assert denied.code == "invalid" and "ok" not in str(denied)
+    else:
+        raise AssertionError("negative clip limit was accepted")
+    expanding = " ".join(["https://["] * 300)
+    try:
+        remove_url_credentials(expanding, limit=model_module.MAX_TEXT)
+    except RedactionRefusal as denied:
+        assert denied.code == "too_large" and "https://[" not in str(denied)
+    else:
+        raise AssertionError("expanding URL stream was returned")
+    assert remove_url_credentials("https://h/p", limit=model_module.MAX_TEXT) == "https://h/p"
+    with refusal("too_large"):
+        model_module.clean_text(expanding)
+    assert model_module.clean_text("https://h/p") == "https://h/p"
+
+    def once(index):
+        cleaned = remove_url_credentials("ftp://u:pass@h/p?q=1", limit=100)
+        clipped = clip_atomic_text("x" * 10 + "[REDACTED_URL] tail", 12)
+        return index, cleaned, clipped
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        rows = list(pool.map(once, range(8)))
+    assert rows == [(index, "ftp://h/p", "x" * 10) for index in range(8)]
+
+
+def test_expanding_url_credentials_refuse_before_proposal_publication(tmp_path):
+    store = make_store(tmp_path)
+    before = snapshot(tmp_path)
+    expanding = " ".join(["https://["] * 300)
+    with refusal("too_large"):
+        candidate(hypothesis=expanding)
+    assert snapshot(tmp_path) == before
+    saved = store.write(candidate())
+    after = snapshot(tmp_path)
+    with refusal("too_large"):
+        store.write(candidate(hypothesis=expanding))
+    assert snapshot(tmp_path) == after
+    assert store.read(saved.proposal.id) == saved
+
+
+_GUIDANCE_MASK_GOLDENS = (
+    ("HTTPS://u:pass@ci.example/path?sig=hidden#private",
+     "HTTPS://u:[REDACTED]@ci.example/path?sig=hidden#private"),
+    ("ftp://u:pass@ci.example/path?sig=hidden#private",
+     "ftp://u:[REDACTED]@ci.example/path?sig=hidden#private"),
+    ("SSH://u:pass@ci.example/path?sig=hidden#private",
+     "SSH://u:[REDACTED]@ci.example/path?sig=hidden#private"),
+    ("git://u:pass@ci.example/path?sig=hidden#private",
+     "git://u:[REDACTED]@ci.example/path?sig=hidden#private"),
+    ("s3://u:pass@ci.example/path?sig=hidden#private",
+     "s3://u:[REDACTED]@ci.example/path?sig=hidden#private"),
+    ("Custom+v1://u:pass@ci.example/path?sig=hidden#private",
+     "Custom+v1://u:[REDACTED]@ci.example/path?sig=hidden#private"),
+    ("http://192.0.2.1", "http://192.0.2.1"),
+    ("https://ci.example/job?sig=(hunter2)", "https://ci.example/job?sig=(hunter2)"),
+    ("redis://:hunter2@localhost/0", "redis://:hunter2@localhost/0"),
+    ("token=[REDACTED]", "token=REDACTED"),
+)
+
+
+def test_guidance_projection_keeps_its_recorded_masks_for_the_same_inputs():
+    """Guidance's named URL policy preserves its recorded masks and structure."""
+    from aegis_core.guidance_projection import (
+        GuidanceProjectionError, redact_clean_text, project_display_text,
+    )
+
+    for text, expected in _GUIDANCE_MASK_GOLDENS:
+        assert redact_clean_text(text) == expected
+        assert project_display_text(text, 300) == expected
+    shown = "x" * 58 + " 192.0.2.1"
+    assert project_display_text(shown, 64) == "x" * 58 + " 19..."
+    payload = "Z" * (1024 * 1024 + 1)
+    with pytest.raises(GuidanceProjectionError) as failure:
+        redact_clean_text(payload)
+    assert failure.value.code == "guidance_projection_limit"
+    assert "Z" not in str(failure.value)
+
+
 def test_generated_parameter_grammar_preserves_literals_at_every_clip_boundary():
     rng = Random(1835)
     for index in range(96):
