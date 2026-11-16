@@ -12293,15 +12293,12 @@ def test_r2_exec_staging_outcome_refuses_without_descriptors(tmp_path, monkeypat
     assert list(tmp_path.iterdir()) == []
 
 
-@pytest.mark.parametrize("surface", ["root", "child"])
-def test_r2_exec_staging_matrix_preserves_capability_skip(tmp_path, monkeypatch, surface):
-    if surface == "child":
-        require_r2_indirect_exit(pidfd=True)
+def test_r2_exec_staging_matrix_preserves_capability_skip(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "tests.integration.test_hierarchy_launcher_stop_ownership._r2_exec_staging_descriptors_available",
         lambda: False)
     with pytest.raises(pytest.skip.Exception, match="^" + _R2_EXEC_STAGING_DESCRIPTORS_UNAVAILABLE + "$"):
-        test_r2_exec_staging_scope_matrix(tmp_path, surface, True, "skip")
+        test_r2_exec_staging_identity_scope_matrix(tmp_path, "skip")
     assert list(tmp_path.iterdir()) == []
 
 
@@ -12536,27 +12533,29 @@ def test_r2_exec_staging_anonymous_capture_bounds_and_replaces_invalid_utf8():
 
 
 @pytest.mark.parametrize("surface", ["root", "child"])
-@pytest.mark.parametrize("identity", [False, True], ids=["non-identity", "identity"])
 @pytest.mark.parametrize("outcome", ["pass", "fail", "skip"])
-def test_r2_exec_staging_scope_matrix(tmp_path, surface, identity, outcome):
-    """{root, child} x {non-identity, identity} x {pass, fail, skip}."""
+def test_r2_exec_staging_scope_matrix(tmp_path, surface, outcome):
+    """Non-identity custody covers {root, child} x {pass, fail, skip}."""
     if surface == "child":
         require_r2_indirect_exit(pidfd=True)
-    if identity and not _r2_exec_staging_descriptors_available():
+    if outcome == "fail":
+        with pytest.raises(AssertionError, match="^R2 fixture: modelled in-process failure$"):
+            _r2_exec_staging_inprocess_outcome(tmp_path, "fail", surface=surface)
+    elif outcome == "skip":
+        with pytest.raises(pytest.skip.Exception, match="^R2 fixture: modelled in-process skip$"):
+            _r2_exec_staging_inprocess_outcome(tmp_path, "skip", surface=surface)
+    else:
+        _r2_exec_staging_inprocess_outcome(tmp_path, "pass", surface=surface)
+    assert R2Custody.quarantine_report is None
+    assert not (tmp_path / "initiatives").exists()
+    _r2_exec_staging_assert_next_admits(tmp_path / "next")
+
+
+@pytest.mark.parametrize("outcome", ["pass", "fail", "skip"])
+def test_r2_exec_staging_identity_scope_matrix(tmp_path, outcome):
+    """Identity routing uses one real probe child for each outcome."""
+    if not _r2_exec_staging_descriptors_available():
         pytest.skip(_R2_EXEC_STAGING_DESCRIPTORS_UNAVAILABLE)
-    if not identity:
-        if outcome == "fail":
-            with pytest.raises(AssertionError, match="^R2 fixture: modelled in-process failure$"):
-                _r2_exec_staging_inprocess_outcome(tmp_path, "fail", surface=surface)
-        elif outcome == "skip":
-            with pytest.raises(pytest.skip.Exception, match="^R2 fixture: modelled in-process skip$"):
-                _r2_exec_staging_inprocess_outcome(tmp_path, "skip", surface=surface)
-        else:
-            _r2_exec_staging_inprocess_outcome(tmp_path, "pass", surface=surface)
-        assert R2Custody.quarantine_report is None
-        assert not (tmp_path / "initiatives").exists()
-        _r2_exec_staging_assert_next_admits(tmp_path / "next")
-        return
     if outcome == "fail":
         with pytest.raises(AssertionError, match="^" + _R2_EXEC_STAGING_CHILD_FAILED) as caught:
             _r2_exec_staging_child_scope(tmp_path, _R2_EXEC_STAGING_PROBE, probe="fail")
