@@ -4,13 +4,18 @@ the git toplevel, and a HOLD with a machine-readable reason when sources disagre
 """
 from __future__ import annotations
 
+import ast
 import json
 import os
 import shutil
 import subprocess
+import sys
+from argparse import Namespace
 from pathlib import Path
 
 import pytest
+
+from tests.conftest import symlink_or_skip
 
 from aegis_core.errors import WorkspaceNotFoundError
 from aegis_core.workspace.binding import (
@@ -631,3 +636,518 @@ def test_cli_a_target_through_a_symlink_loop_is_a_workspace_error_or_itself(home
         assert "cannot be resolved" in str(exc)
     else:  # Python 3.13+ resolves a loop leniently: the target names itself
         assert not (root / ".aegis").is_dir()
+
+
+# Contract before WORKSPACE-DIAGNOSTIC-CORE: compare actual resolver sentences to
+# adapter output, rather than copying a third set of sentence templates here.
+_MCP_WORDING_REASONS = {
+    "pin_conflicts_with_host_root": "pin_conflicts_with_host_root",
+    "pin_conflicts_with_registry": "pin_conflicts_with_registry",
+    "host_root_conflicts_with_registry": "host_root_conflicts_with_registry",
+    "host_root_conflicts_with_registry_outside": "host_root_conflicts_with_registry",
+    "ambiguous_host_roots": "ambiguous_host_roots",
+    "cwd_conflicts_with_registry": "cwd_conflicts_with_registry",
+    "ambiguous_registry_selection": "ambiguous_registry_selection",
+    "host_roots_not_governed": "host_roots_not_governed",
+    "no_workspace": "no_workspace",
+    "pin_missing": "pin_missing",
+    "pin_missing_directory": "pin_missing",
+    "pin_not_a_workspace": "pin_not_a_workspace",
+    "pin_denied": "pin_denied",
+    "pin_denied_root": "pin_denied",
+}
+_CLI_HOLD_REASONS = {"pin_conflicts_with_target", "pin_conflicts_with_cwd"}
+
+
+@pytest.fixture
+def wording_paths(home, tmp_path):
+    a = _governed(_git_marker(tmp_path / "a"))
+    b = _governed(_git_marker(tmp_path / "b"))
+    plain = _git_marker(tmp_path / "plain")
+    for root in (a, b):
+        (root / "shared.py").write_text("", encoding="ascii")
+    # Ordinary temp files suffice except for the guarded resolution-error cases.
+    _registry(home, [a, b])
+    return a, b, plain
+
+
+def _wording_resolution_path(where):
+    loop = where / "unresolvable"
+    symlink_or_skip(loop, loop)
+    try:
+        loop.resolve()
+    except (OSError, RuntimeError):
+        return loop
+    pytest.skip("non-strict path resolution does not reject symlink loops")
+
+
+def _mcp_wording_inputs(case, home, paths):
+    a, b, plain = paths
+    host = lambda *roots: [Attested("mcp_roots", str(root)) for root in roots]
+    cases = {
+        "pin_conflicts_with_host_root": {"pin": str(a), "attested": host(b, plain)},
+        "pin_conflicts_with_registry": {"pin": str(a), "files": [str(b / "new.py")]},
+        "host_root_conflicts_with_registry": {"attested": host(a), "files": [str(b / "new.py")]},
+        "host_root_conflicts_with_registry_outside": {"attested": host(plain), "files": [str(b / "new.py")]},
+        "ambiguous_host_roots": {"attested": host(a, b)},
+        "cwd_conflicts_with_registry": {"cwd": plain, "files": ["shared.py"]},
+        "ambiguous_registry_selection": {"files": ["shared.py"]},
+        "host_roots_not_governed": {"attested": host(plain)},
+        "no_workspace": {},
+        "pin_missing": {"pin": str(plain / "unresolvable")},
+        "pin_missing_directory": {"pin": str(a / "shared.py")},
+        "pin_not_a_workspace": {"pin": str(plain)},
+        "pin_denied": {"pin": str(home)},
+        "pin_denied_root": {"pin": home.anchor},
+    }
+    # The cwd must be governed but lack shared.py, while both registered roots
+    # contain it. This also checks the comma-separated candidates sentence.
+    if case == "cwd_conflicts_with_registry":
+        _governed(plain)
+    inputs = {"cwd": home, "registry": read_registry(), **cases[case]}
+    if case == "pin_missing":
+        inputs["pin"] = str(_wording_resolution_path(plain))
+    return inputs
+
+
+def _wording_environment(pin):
+    env = dict(os.environ)
+    env.pop("AEGIS_WORKSPACE", None)
+    env.pop("AEGIS_MANAGER_CONFIG", None)
+    env.pop("AEGIS_MANAGER_CONFIG_SHA256", None)
+    if pin:
+        env["AEGIS_WORKSPACE"] = pin
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[3])
+    return env
+
+
+@pytest.mark.parametrize("case", _MCP_WORDING_REASONS)
+def test_mcp_binding_wording_equals_resolver(home, wording_paths, case):
+    inputs = _mcp_wording_inputs(case, home, wording_paths)
+    canonical = resolve_binding(**inputs)
+    assert canonical.reason == _MCP_WORDING_REASONS[case]
+    frames = [{"jsonrpc": "2.0", "id": 0, "method": "initialize",
+               "params": {"clientInfo": {"name": "codex-mcp-client", "version": "1"}}}]
+    roots = {item.path: {} for item in inputs.get("attested", ())}
+    for req_id in (1, 2):  # A retry must retain both the reason and full wording.
+        frames.append({
+            "jsonrpc": "2.0", "id": req_id, "method": "tools/call",
+            "params": {"name": "aegis_list_rules", "arguments": {"files": inputs.get("files", [])},
+                       "_meta": {"x-codex-turn-metadata": {"workspaces": roots}}},
+        })
+    run = subprocess.run(
+        [sys.executable, "-m", "aegis_mcp"], cwd=inputs["cwd"], env=_wording_environment(inputs.get("pin")),
+        input="".join(json.dumps(frame) + "\n" for frame in frames),
+        text=True, capture_output=True, timeout=15,
+    )
+    assert run.returncode == 0, run.stderr
+    responses = {frame["id"]: frame for frame in map(json.loads, run.stdout.splitlines()) if "id" in frame}
+    for req_id in (1, 2):
+        response = responses[req_id]
+        result = response["result"]
+        assert result["isError"] is True
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["binding"]["reason"] == canonical.reason
+        assert payload["binding"]["message"] == canonical.message, case
+        assert payload["binding"]["message"] != "workspace binding refused", case
+        if canonical.status != "unbound":
+            assert payload["error"] == canonical.message, case
+
+
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("case", [
+    "pin_conflicts_with_target", "pin_conflicts_with_cwd", "pin_missing_directory",
+    "pin_not_a_workspace", "pin_denied", "pin_denied_root", "home", "root",
+    "pin_resolution", "target_resolution",
+])
+def test_cli_binding_wording_equals_resolver(home, wording_paths, case, json_mode):
+    a, b, plain = wording_paths
+    pin, explicit, cwd = None, None, plain
+    if case in _CLI_HOLD_REASONS:
+        pin = str(a)
+        if case == "pin_conflicts_with_target":
+            explicit = str(b)
+        else:
+            cwd = b
+    elif case in ("home", "root"):
+        explicit = str(home) if case == "home" else home.anchor
+    elif case.endswith("resolution"):
+        target = _wording_resolution_path(plain)
+        if case == "pin_resolution":
+            pin = str(target)
+        else:
+            explicit = str(target)
+    else:
+        pin = {"pin_missing_directory": str(a / "shared.py"), "pin_not_a_workspace": str(plain),
+               "pin_denied": str(home), "pin_denied_root": home.anchor}[case]
+    with pytest.raises((WorkspaceHold, WorkspaceNotFoundError)) as caught:
+        resolve_cli_root(explicit=explicit, cwd=cwd, pin=pin)
+    canonical = caught.value
+    expected = str(canonical)
+    if case.endswith("resolution"):
+        # binding.py:_cli_path includes the OS-error suffix; scan deliberately
+        # omits that untrusted suffix, preserving exactly this fixed sentence.
+        prefix = "AEGIS_WORKSPACE " if pin else "--workspace "
+        expected = prefix + (pin or explicit) + " cannot be resolved"
+        cause = canonical.__cause__
+        assert isinstance(cause, OSError)
+        assert str(canonical) == expected + ": " + str(cause.__cause__ or cause)
+    argv = ["scan", "app.py"]
+    if explicit:
+        argv += ["--workspace", explicit]
+    if json_mode:
+        argv.append("--json")
+    for _ in range(2):
+        run = subprocess.run([sys.executable, "-m", "aegis_cli", *argv], cwd=cwd,
+                             env=_wording_environment(pin), text=True, capture_output=True, timeout=15)
+        assert run.returncode == 2, run.stderr
+        if isinstance(canonical, WorkspaceHold) and json_mode:
+            payload = json.loads(run.stdout)
+            assert run.stderr == ""
+            assert payload["reason"] == canonical.binding.reason
+            assert payload["message"] == canonical.binding.message
+        else:
+            assert run.stdout == ""
+            prefix = f"Hold ({canonical.binding.reason}): " if isinstance(canonical, WorkspaceHold) else "Error: "
+            assert run.stderr == prefix + expected + "\n", case
+        assert "workspace binding refused" not in run.stdout + run.stderr, case
+
+
+_REASON_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+
+
+def _reason_scope_nodes(scope):
+    pending = [scope]
+    while pending:
+        node = pending.pop()
+        yield node
+        if node is scope or not isinstance(node, _REASON_SCOPES):
+            pending.extend(ast.iter_child_nodes(node))
+
+
+def _reason_bindings(nodes):
+    # Only a unique simple assignment proves a returned tuple or pin-helper
+    # result. Every other write (including loop targets) invalidates that proof.
+    simple = {}
+    for node in nodes:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            simple[id(node.targets[0])] = node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            simple[id(node.target)] = node.value
+    bindings = {}
+    for node in nodes:
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bindings.setdefault(node.id, []).append(simple.get(id(node)))
+    return bindings
+
+
+def _unsupported_binding_reason(filename, node):
+    raise AssertionError(f"{filename}:{node.lineno}: unsupported binding reason form")
+
+
+def _assigned_reason_value(value, bindings, filename, site):
+    seen = set()
+    while isinstance(value, ast.Name):
+        choices = bindings.get(value.id, [])
+        if value.id in seen or len(choices) != 1 or choices[0] is None:
+            _unsupported_binding_reason(filename, site)
+        assigned = choices[0]
+        if (assigned.lineno, assigned.col_offset) >= (value.lineno, value.col_offset):
+            _unsupported_binding_reason(filename, site)
+        seen.add(value.id)
+        value = assigned
+    return value
+
+
+def _literal_binding_reason(value, filename, site):
+    if not isinstance(value, ast.Constant) or not isinstance(value.value, str) or not value.value:
+        _unsupported_binding_reason(filename, site)
+    return value.value
+
+
+def _binding_call_reason(node, bindings, filename):
+    values = ([node.args[1]] if len(node.args) > 1 else [])
+    values += [keyword.value for keyword in node.keywords if keyword.arg == "reason"]
+    if (len(values) != 1 or any(isinstance(arg, ast.Starred) for arg in node.args)
+            or any(keyword.arg is None for keyword in node.keywords)):
+        _unsupported_binding_reason(filename, node)
+    value = values[0]
+    # The resolver's sole dynamic reason is problem[0], where problem was
+    # assigned _pin_problem(...); its possible reasons come from that helper.
+    if (isinstance(value, ast.Subscript) and isinstance(value.value, ast.Name)
+            and isinstance(value.slice, ast.Constant) and type(value.slice.value) is int and value.slice.value == 0):
+        assigned = _assigned_reason_value(value.value, bindings, filename, node)
+        if isinstance(assigned, ast.Call) and isinstance(assigned.func, ast.Name) and assigned.func.id == "_pin_problem":
+            return None
+    return _literal_binding_reason(value, filename, node)
+
+
+def _check_binding_constructor(node, scope, bindings, filename):
+    name = getattr(scope, "name", None)
+    keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+    # These two constructors forward the status/reason supplied by the producers
+    # we inspect. A new constructor or a changed reason forwarder needs review.
+    if (name == "_bound" and len(node.args) == 4 and not node.keywords
+            and isinstance(node.args[0], ast.Name) and node.args[0].id == "BOUND"):
+        return
+    reason = keywords.get("reason")
+    if (name == "_not_bound" and len(node.args) == 1 and None not in keywords
+            and isinstance(node.args[0], ast.Name) and node.args[0].id == "status"
+            and isinstance(reason, ast.Name) and reason.id == "reason" and "reason" not in bindings
+            and "reason" in {arg.arg for arg in scope.args.args}):
+        return
+    _unsupported_binding_reason(filename, node)
+
+
+def _reason_identifier_fields(node):
+    for field, value in ast.iter_fields(node):
+        values = value if isinstance(value, list) else [value]
+        for name in values:
+            if isinstance(name, str):
+                yield field, name.split(".")
+
+
+def _check_reason_producer_loads(tree, filename):
+    producers = {"_not_bound", "WorkspaceBinding", "_pin_problem"}
+    nodes = list(ast.walk(tree))
+    parents = {child: node for node in nodes for child in ast.iter_child_nodes(node)}
+    direct_calls = {node.func for node in nodes if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+    postponed = any(isinstance(node, ast.ImportFrom) and node.module == "__future__"
+                    and any(alias.name == "annotations" for alias in node.names) for node in tree.body)
+    type_nodes = set()
+    if postponed:
+        # binding.py uses postponed WorkspaceBinding annotations. These are type
+        # metadata, not evaluated producer loads; defaults/decorators still are.
+        for node in nodes:
+            annotation = None
+            if isinstance(node, (ast.arg, ast.AnnAssign)):
+                annotation = node.annotation
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                annotation = node.returns
+            if annotation is not None:
+                type_nodes.update(ast.walk(annotation))
+    # The resolver exports its class name as inert metadata. A read of __all__
+    # makes those strings potential lookup keys, so that use is not exempt.
+    export_reads = any("__all__" in parts for node in nodes
+                       if not (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store))
+                       for _, parts in _reason_identifier_fields(node))
+    export_nodes = set()
+    if not export_reads:
+        for node in tree.body:
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "__all__"
+                    and isinstance(node.value, (ast.List, ast.Tuple))
+                    and all(isinstance(part, ast.Constant) and isinstance(part.value, str) for part in node.value.elts)):
+                export_nodes.update(node.value.elts)
+    for node in nodes:
+        if node in direct_calls or node in type_nodes or node in export_nodes:
+            continue
+        # Check identifier fields themselves, including alias/keyword names and
+        # literal lookup keys, instead of maintaining a list of AST node types.
+        for field, parts in _reason_identifier_fields(node):
+            if field == "name" and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue  # The producer's own declaration.
+            if producers.intersection(parts):
+                # Python 3.9 import aliases have no independent source position.
+                site = node if hasattr(node, "lineno") else parents[node]
+                _unsupported_binding_reason(filename, site)
+
+
+def _binding_reason_sites(source, filename):
+    tree = ast.parse(source, filename=filename)
+    _check_reason_producer_loads(tree, filename)
+    scopes = [tree] + [node for node in ast.walk(tree) if isinstance(node, _REASON_SCOPES)]
+    reasons = set()
+    for scope in scopes:
+        nodes = list(_reason_scope_nodes(scope))
+        bindings = _reason_bindings(nodes)
+        for node in nodes:
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "WorkspaceBinding":
+                _check_binding_constructor(node, scope, bindings, filename)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_not_bound":
+                reason = _binding_call_reason(node, bindings, filename)
+                if reason is not None:
+                    reasons.add(reason)
+            if getattr(scope, "name", None) == "_pin_problem" and isinstance(node, ast.Return):
+                if node.value is None or isinstance(node.value, ast.Constant) and node.value.value is None:
+                    continue  # A successful pin has no refusal reason.
+                value = _assigned_reason_value(node.value, bindings, filename, node)
+                if (not isinstance(value, ast.Tuple) or len(value.elts) != 2
+                        or any(isinstance(part, ast.Starred) for part in value.elts)):
+                    _unsupported_binding_reason(filename, node)
+                reasons.add(_literal_binding_reason(value.elts[0], filename, node))
+    return reasons
+
+
+def _assert_binding_wording_reasons(reasons):
+    covered = set(_MCP_WORDING_REASONS.values()) | _CLI_HOLD_REASONS
+    if reasons != covered:
+        raise AssertionError(f"binding wording reasons without contract cases: {sorted(reasons - covered)}")
+
+
+def test_binding_wording_matrix_covers_every_resolver_reason():
+    from aegis_core.workspace import binding
+
+    path = Path(binding.__file__)
+    _assert_binding_wording_reasons(_binding_reason_sites(path.read_text(encoding="utf-8"), str(path)))
+
+
+@pytest.mark.parametrize("source", [
+    '_not_bound(HOLD, "new_reason", "refusal")',
+    '_not_bound(HOLD, reason="new_reason", message="refusal")',
+    'def _pin_problem(pin):\n    return "new_reason", "refusal"',
+    'def _pin_problem(pin):\n    refusal = ("new_reason", "refusal")\n    return refusal',
+    'def _pin_problem(pin):\n    refusal: tuple = ("new_reason", "refusal")\n    return refusal',
+    'def _pin_problem(pin):\n    refusal = ("new_reason", "refusal")\n    alias = refusal\n    return alias',
+    'def _pin_problem(pin):\n    return "new_reason", "refusal"\n'
+    'def resolve():\n    problem = _pin_problem(None)\n    return _not_bound(HOLD, problem[0], problem[1])',
+], ids=["positional", "keyword", "tuple", "assigned_tuple", "annotated_tuple", "tuple_alias", "pin_forwarding"])
+def test_binding_reason_forms_require_a_wording_case(source):
+    reasons = _binding_reason_sites(source, "binding_fixture.py")
+    assert reasons == {"new_reason"}
+    covered = set(_MCP_WORDING_REASONS.values()) | _CLI_HOLD_REASONS
+    with pytest.raises(AssertionError) as caught:
+        _assert_binding_wording_reasons(covered | reasons)
+    assert str(caught.value) == "binding wording reasons without contract cases: ['new_reason']"
+
+
+@pytest.mark.parametrize("source,line", [
+    ('_not_bound(HOLD, choose_reason(), "refusal")', 1),
+    ('_not_bound(HOLD, reason=choose_reason(), message="refusal")', 1),
+    ('def _pin_problem(pin):\n    return choose_refusal()', 2),
+    ('def _pin_problem(pin):\n    return reason, "refusal"', 2),
+    ('def _pin_problem(pin):\n    refusal = choose_refusal()\n    return refusal', 3),
+    ('def _pin_problem(pin):\n    refusal = ("first", "refusal")\n    refusal = ("second", "refusal")\n    return refusal', 4),
+    ('def _pin_problem(pin):\n    first = second\n    second = first\n    return first', 4),
+    ('def resolve():\n    problem = other_problem()\n    return _not_bound(HOLD, problem[0], problem[1])', 3),
+    ('_not_bound(HOLD, message="refusal")', 1),
+    ('_not_bound(*parts)', 1),
+    ('WorkspaceBinding(HOLD, reason="new_reason", message="refusal")', 1),
+    ('def _not_bound(status, reason, message):\n    return WorkspaceBinding(status, reason=choose_reason())', 2),
+    ('def _pin_problem(pin):\n    return ()', 2),
+    ('def _pin_problem(pin):\n    refusal = ("new_reason", "refusal")\n    for refusal in others:\n        pass\n    return refusal', 5),
+    ('_not_bound(HOLD, "first", reason="second", message="refusal")', 1),
+], ids=["dynamic_positional", "dynamic_keyword", "dynamic_tuple", "dynamic_tuple_reason",
+        "dynamic_assignment", "reassigned_tuple", "cyclic_assignment", "unknown_forwarding",
+        "missing_reason", "starred_arguments", "direct_constructor", "changed_forwarder",
+        "empty_tuple", "loop_rebinding", "duplicate_reason"])
+def test_binding_reason_discovery_refuses_unsupported_forms(source, line):
+    with pytest.raises(AssertionError) as caught:
+        _binding_reason_sites(source, "binding_fixture.py")
+    assert str(caught.value) == f"binding_fixture.py:{line}: unsupported binding reason form"
+
+
+@pytest.mark.parametrize("producer,alias", [
+    ("_not_bound", "refuse"), ("WorkspaceBinding", "Binding"), ("_pin_problem", "pin_problem"),
+])
+@pytest.mark.parametrize("source,line", [
+    ('def resolve():\n    {alias} = {producer}\n'
+     '    return {alias}(HOLD, reason="new_reason", message="refusal")', 2),
+    ('{alias}: object = {producer}', 1),
+    ('first = second = {producer}', 1),
+    ('({alias} := {producer})', 1),
+    ('consume({producer})', 1),
+    ('consume(factory={producer})', 1),
+    ('factories = [{producer}]', 1),
+    ('factories = dict(refuse={producer})', 1),
+    ('def resolve():\n    return {producer}', 2),
+    ('def resolve(factory={producer}):\n    pass', 1),
+    ('@{producer}\ndef resolve():\n    pass', 1),
+    ('def resolve() -> {producer}:\n    pass', 1),
+    ('module.{producer}', 1),
+    ('module.{producer}(HOLD, reason="new_reason", message="refusal")', 1),
+    ('from __future__ import annotations\n{alias} = {producer}', 2),
+    ('from __future__ import annotations\ndef resolve(factory={producer}):\n    pass', 2),
+    ('from __future__ import annotations\nresult: WorkspaceBinding = {producer}', 2),
+], ids=["alias_call", "annotated_alias", "chained_alias", "named_alias", "argument",
+        "keyword_argument", "list", "mapping", "returned", "default", "decorator", "evaluated_annotation",
+        "qualified_reference", "qualified_call", "postponed_alias", "postponed_default", "postponed_value"])
+def test_binding_reason_discovery_refuses_producer_references(producer, alias, source, line):
+    source = source.format(producer=producer, alias=alias)
+    with pytest.raises(AssertionError) as caught:
+        _binding_reason_sites(source, "binding_fixture.py")
+    assert str(caught.value) == f"binding_fixture.py:{line}: unsupported binding reason form"
+
+
+def test_binding_reason_discovery_preserves_postponed_type_annotations():
+    source = ('from __future__ import annotations\n'
+              'def resolve(binding: WorkspaceBinding) -> WorkspaceBinding:\n'
+              '    result: WorkspaceBinding = _not_bound(HOLD, reason="new_reason", message="refusal")\n'
+              '    return result')
+    assert _binding_reason_sites(source, "binding_fixture.py") == {"new_reason"}
+
+
+@pytest.mark.parametrize("producer,alias", [
+    ("_not_bound", "refuse"), ("WorkspaceBinding", "Binding"), ("_pin_problem", "pin_problem"),
+])
+@pytest.mark.parametrize("source,line", [
+    ('def resolve():\n    from aegis_core.workspace.binding import {producer} as {alias}\n'
+     '    return {alias}(HOLD, reason="new_reason", message="refusal")', 2),
+    ('from aegis_core.workspace.binding import {producer}', 1),
+    ('from module import other as {producer}', 1),
+    ('import {producer} as {alias}', 1),
+    ('import module as {producer}', 1),
+    ('import package.{producer} as {alias}', 1),
+    ('from package.{producer} import other', 1),
+    ('getattr(module, "{producer}")', 1),
+    ('setattr(module, "{producer}", replacement)', 1),
+    ('builtins.getattr(module, "{producer}")', 1),
+    ('builtins.setattr(module, "{producer}", replacement)', 1),
+    ('consume({producer}=replacement)', 1),
+    ('{producer} = replacement', 1),
+    ('del {producer}', 1),
+    ('def resolve({producer}):\n    pass', 1),
+    ('global {producer}', 1),
+    ('try:\n    pass\nexcept Exception as {producer}:\n    pass', 3),
+    ('key = "{producer}"\ngetattr(module, key)', 1),
+    ('consume(**dict.fromkeys(["{producer}"], replacement))', 1),
+    ('__all__ = ["{producer}"]\ngetattr(module, __all__[0])', 1),
+    ('__all__ = ["{producer}"]\ngetattr(module, getattr(module, "__all__")[0])', 1),
+], ids=["from_alias_call", "from_import", "from_asname", "import_name", "import_asname",
+        "dotted_import", "from_module", "getattr", "setattr", "qualified_getattr", "qualified_setattr",
+        "keyword", "assignment", "deletion", "parameter", "global", "exception_target",
+        "assigned_getattr_key", "stored_keyword_key", "consumed_export", "reflected_export"])
+def test_binding_reason_discovery_refuses_producer_identifiers(producer, alias, source, line):
+    with pytest.raises(AssertionError) as caught:
+        _binding_reason_sites(source.format(producer=producer, alias=alias), "binding_fixture.py")
+    assert str(caught.value) == f"binding_fixture.py:{line}: unsupported binding reason form"
+
+
+def test_binding_reason_discovery_preserves_definitions_and_export_metadata():
+    source = ('from __future__ import annotations\n'
+              '__all__ = ["WorkspaceBinding"]\n'
+              'class WorkspaceBinding:\n    pass\n'
+              'def _not_bound(status, reason, message) -> WorkspaceBinding:\n'
+              '    return WorkspaceBinding(status, reason=reason, message=message)\n'
+              'def _pin_problem(pin):\n    return "new_reason", "refusal"\n'
+              'def resolve() -> WorkspaceBinding:\n'
+              '    return _not_bound(HOLD, reason="new_reason", message="refusal")')
+    assert _binding_reason_sites(source, "binding_fixture.py") == {"new_reason"}
+
+
+@pytest.mark.parametrize("producer", ["_not_bound", "WorkspaceBinding", "_pin_problem"])
+def test_binding_reason_import_diagnostic_without_alias_locations(producer):
+    tree = ast.Module(body=[ast.ImportFrom(
+        module="aegis_core.workspace.binding", names=[ast.alias(name=producer, asname="factory")],
+        level=0, lineno=2,
+    )], type_ignores=[])
+    with pytest.raises(AssertionError) as caught:
+        _binding_reason_sites(tree, "binding_fixture.py")
+    assert str(caught.value) == "binding_fixture.py:2: unsupported binding reason form"
+
+
+def test_cli_preserves_core_pin_missing_sentence(home, wording_paths, capsys):
+    import aegis_cli.cli as cli
+
+    inputs = _mcp_wording_inputs("pin_missing", home, wording_paths)
+    canonical = resolve_binding(**inputs)
+    assert canonical.reason == "pin_missing"
+    # The CLI's own _cli_path normally raises a different sentence (covered
+    # above). Exercise the formatter with the shared resolver's real refusal to
+    # also pin its "which cannot be resolved" template without patching a caller.
+    args = Namespace(command="scan", _workspace_pin=inputs["pin"])
+    for _ in range(2):
+        assert cli._DefaultErrorPolicy().workspace_error(args, WorkspaceNotFoundError(canonical.message)) == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == "Error: " + canonical.message + "\n"
