@@ -5,21 +5,17 @@ use the strictest declared mode; no map preserves the legacy gate.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field as field
-from functools import lru_cache
+from dataclasses import dataclass
 import json
 import re
-from string import Formatter
-import unicodedata as unicodedata
-from types import MappingProxyType
 from typing import Any, Mapping, Optional
 
 from aegis_core import gitsafe, human_gate, primitives
-from aegis_core.redaction import (
-    MAX_GUIDANCE_CHARS, clip_rendered_text as _clip_rendered_text, command_token as command_token,
-    GUIDANCE_ESCAPE_PATTERN, guidance_field, guidance_value as _guidance_value,
-    receipt_value as _receipt_value, unresolved_base_hint as _unresolved_base_hint,
+from aegis_core.diagnostic_messages import (
+    MESSAGE_TEMPLATES, MESSAGE_OWNERS, GuidanceMessage, MessageRow, finding_message,
+    clip_rendered_text, guidance_value, receipt_value,
 )
+from aegis_core.redaction import MAX_GUIDANCE_CHARS, command_token as command_token
 from aegis_core.workspace.layout import AEGIS_DIRNAME
 
 __all__ = ["BaseUnavailable", "InvalidApprovalPolicy", "PolicyUnavailable", "Policy", "parse_policy", "mode_for", "read_policy",
@@ -48,243 +44,13 @@ POLICY_UNAVAILABLE_ACTION = "fetch or repair the repository objects and re-run"
 POLICY_UNAVAILABLE_DETAIL = f"invalid_approval_policy: cannot read {CONFIG_PATH}; next_action: {POLICY_UNAVAILABLE_ACTION}"
 
 
-# Source-owned message frames; decoded documents cannot supply templates.
-MESSAGE_TEMPLATES = MappingProxyType({
-    "approval_policy_introduced": "approval policy introduced without base signers; owner review required",
-    "approval_mode_lowered": "approval mode lowered from {prior} to {candidate}; owner review required",
-    "coverage": "no longer applies to {path}, which the reviewed version covered",
-    "forbid_ast": "forbid_ast was removed",
-    "deleted": "the rule is gone from the branch (a deletion or an archive, with no same-id rule in its place)",
-    "deleted_2": "the rule no longer loads: {error} (a deletion or an archive, with no same-id rule in its place)",
-    "legacy_value": "{detail}",
-    "coverage_2": "it no longer applies to test files, which the reviewed version covered",
-    "coverage_3": "target pattern '{pattern}' is no longer kept; files it covered, including files this branch adds, may lose the rule",
-    "rank": "binds less: rank {prior_rank} ({prior}) became rank {rank} ({mode})",
-    "unknown_key": "new or changed key '{key}' is not one Aegis knows, so it is treated as a weakening",
-    "detect": "detect is not an exact superset of the reviewed version",
-    "forbid_ast_2": "{kind} '{pattern}' is no longer forbidden",
-    "applies_to": "applies_to changed",
-    "mandatory_cap": "a mandatory rule added where {count} already apply (to {path}); a scan gives mandatory rules at most {cap} slots, so this one crowds out the others",
-    "forbid_ast_3": "call '{name}' is no longer forbidden everywhere it was (its where or builtin was narrowed)",
-    "forbid_ast_4": "call '{name}' is no longer forbidden",
-    "git_failed": "git could not list the working tree's changes",
-    "not_git": "{root} is not inside a git work tree",
-    "no_head": "the repository has no commit yet",
-    "no_base": "no base branch found (origin/$GITHUB_BASE_REF, the branch origin/HEAD names, main, develop or master); pass --base",
-    "no_common_history": "the resolved base and HEAD share no history; pass a base from HEAD's history",
-    "staged": "changes are staged: an approval commit stays empty, so commit or unstage them first",
-    "uncommitted": "governance files have uncommitted changes ({paths}): commit them first, then approve the committed state",
-    "no_key": "{detail}. Set it up with: git config --global gpg.format ssh; git config --global user.signingkey <your key>",
-    "no_terminal": "an approval needs a terminal and a typed y: a person has to look at what is approved, so this does not run from a script or an agent's shell",
-    "declined": "No approval made.",
-    "not_required": "this target does not require a signed governance approval; next_action: review and merge through the target branch's owner policy",
-    "nothing": "nothing governance-related changed since {base}: there is nothing to approve",
-    "unresolved": "cannot resolve {commit} to a commit in {root}",
-    "git_failed_2": "base commit is too large to review (limit {limit} bytes)",
-    "invalid_approval_policy": "invalid_approval_policy: cannot read .aegis/config.json; next_action: fetch or repair the repository objects and re-run",
-    "sign_failed": "{detail}",
-    "git_failed_3": "git could not list governance paths for review",
-    "base_unavailable": "fetch the push's before commit (fetch-depth) and re-run",
-    "comparison_unavailable": "pass --base that is a proper ancestor of the head",
-    "invalid_ci_event": "invalid_ci_event: invalid event data; next_action: provide a valid CI event or run locally with --base",
-    "layer1": "{detail}",
-    "layer1_forbidden_call": "Forbidden {name}() call",
-    "strict_no_driver": "Strict mode: no-driver coverage blocks; a verification driver is unavailable.",
-    "regression_prefix": "fix commit {commit} ({subject})",
-    "regression_unverified": ": regression tests unverified ({reason})",
-    "regression_rejected": " (its test exemption was rejected: {exemption})",
-    "regression_note": " (Aegis-No-Test: '{note}' is an explanation only; exemption requires human_gate approval)",
-    "regression_timeout": ": the test run timed out",
-    "regression_no_test_changes": " modifies source without adding or updating a test",
-    "regression_no_tests_collected": ": no tests were collected from the changed test files",
-    "regression_failed_on_head": ": the changed test files failed or errored on the pull request head",
-    "regression_passed_on_base": ": no test failed on base and passed on head (tests passed on base too)",
-})
-
-
-# A frame belongs to a producer and finding kind, never to matching text alone.
-# Producer names are supplied by the rendering call site/document path, not by
-# a field in an ingested row. Free-value frames provide no reconstructable text.
-MESSAGE_OWNERS = MappingProxyType({
-    "approval_policy_introduced": ("owner_review_required", "approval_policy_introduced"),
-    "approval_mode_lowered": ("owner_review_required", "approval_mode_lowered"),
-    "coverage": ("weakenings", "coverage"),
-    "forbid_ast": ("weakenings", "forbid_ast"),
-    "deleted": ("weakenings", "deleted"),
-    "deleted_2": ("weakenings", "deleted"),
-    "legacy_value": ("weakenings", None),
-    "coverage_2": ("weakenings", "coverage"),
-    "coverage_3": ("weakenings", "coverage"),
-    "rank": ("weakenings", "rank"),
-    "unknown_key": ("weakenings", "unknown_key"),
-    "detect": ("weakenings", "detect"),
-    "forbid_ast_2": ("weakenings", "forbid_ast"),
-    "applies_to": ("weakenings", "applies_to"),
-    "mandatory_cap": ("weakenings", "mandatory_cap"),
-    "forbid_ast_3": ("weakenings", "forbid_ast"),
-    "forbid_ast_4": ("weakenings", "forbid_ast"),
-    "git_failed": ("approve", "git_failed"),
-    "not_git": ("approve", "not_git"),
-    "no_head": ("approve", "no_head"),
-    "no_base": ("approve", "no_base"),
-    "no_common_history": ("approve", "no_common_history"),
-    "staged": ("approve", "staged"),
-    "uncommitted": ("approve", "uncommitted"),
-    "no_key": ("approve", "no_key"),
-    "no_terminal": ("approve", "no_terminal"),
-    "declined": ("approve", "declined"),
-    "not_required": ("approve", "not_required"),
-    "nothing": ("approve", "nothing"),
-    "unresolved": ("approve", "unresolved"),
-    "git_failed_2": ("approve", "git_failed"),
-    "invalid_approval_policy": ("approve", "invalid_approval_policy"),
-    "sign_failed": ("approve", "sign_failed"),
-    "git_failed_3": ("approve", "git_failed"),
-    "base_unavailable": ("ci", "base_unavailable"),
-    "comparison_unavailable": ("ci", "comparison_unavailable"),
-    "invalid_ci_event": ("ci", "invalid_ci_event"),
-    "layer1": ("layer1", "layer1"),
-    "layer1_forbidden_call": ("layer1", "layer1_forbidden_call"),
-    "strict_no_driver": ("findings", "strict:no-driver"),
-    "regression_prefix": ("regression", "regression_prefix"),
-    "regression_unverified": ("regression", "regression_unverified"),
-    "regression_rejected": ("regression", "regression_rejected"),
-    "regression_note": ("regression", "regression_note"),
-    "regression_timeout": ("regression", "regression_timeout"),
-    "regression_no_test_changes": ("regression", "regression_no_test_changes"),
-    "regression_no_tests_collected": ("regression", "regression_no_tests_collected"),
-    "regression_failed_on_head": ("regression", "regression_failed_on_head"),
-    "regression_passed_on_base": ("regression", "regression_passed_on_base"),
-})
-
-
-def clip_rendered_text(value: str, limit: int = 400, *, ellipsis: bool = True) -> str:
-    """Cap finished text by wire characters, preserving its template and atoms.
-
-    Callers render/redact their data fields before interpolation. This boundary
-    never escapes template text; it re-redacts cuts that create a new match.
-    Oversized input is omitted before sanitization or unit-list allocation.
-    """
-    return _clip_rendered_text(value, limit, ellipsis=ellipsis, canonicalize=primitives.sanitize_display)
-
-
-def guidance_value(value: str, limit: int = 400, *, prose: bool = False) -> str:
-    """One inert guidance field: bound input, canonicalize, redact, truncate, escape.
-
-    At most 8192 logical units (81920 wire characters) enter the pipeline.
-    Escaping expands each retained unit by at most ten ASCII characters; no value
-    is wrapped in shell quotes. Sentence values escape execution/chain syntax
-    and surviving control/format characters; their other punctuation is kept.
-    This formats values only, never completed sentences or protocol properties.
-    """
-    return _guidance_value(value, limit, prose=prose, canonicalize=primitives.sanitize_display)
-
-
-def receipt_value(value: str, limit: int = 120, *, identifier: bool = False, canonicalize=None) -> str:
-    """Bound, canonicalize, redact and clip receipt fields at stable mask units."""
-    return _receipt_value(value, limit, identifier=identifier, canonicalize=canonicalize,
-                          default_canonicalize=primitives.sanitize_display)
-
-
 def unresolved_base_hint(selector: str) -> str:
     """Describe a failed comparison without introducing shell-active data."""
-    return _unresolved_base_hint(selector, canonicalize=primitives.sanitize_display)
-
-
-@dataclass(frozen=True)
-class GuidanceMessage:
-    """Trusted wording and unrendered data, kept separate until a human boundary.
-
-    Templates are source literals. Values never become part of a template and
-    are formatted exactly once, independently of the surrounding punctuation.
-    Machine identities are stored by findings separately from this message.
-    """
-    kind: str
-    template: str
-    values: Mapping[str, Any]
-
-    def render(self) -> str:
-        return self.template.format_map({key: _frame_list_value(value, self.template)
-                                         if isinstance(value, (list, tuple)) else _frame_value(str(value), self.template)
-                                         for key, value in self.values.items()})
-
-
-def _frame_list_value(values, template):
-    """Bound before joining, then render the entire list as one scalar field."""
-    size = 2 * max(0, len(values) - 1)
-    if size > _MAX_BASE_CHARS:  # Separators alone already exceed the logical limit.
-        return _frame_value("diagnostic_omitted_too_large", template)
-    parts = []
-    for value in values:
-        text = str(value)
-        size += len(text)
-        if size > 10 * _MAX_BASE_CHARS:
-            return _frame_value("diagnostic_omitted_too_large", template)
-        parts.append(text)
-    return _frame_value(", ".join(parts), template)
-
-
-@lru_cache(maxsize=64)
-def _frame_separators(template):
-    """Only separators which prose could otherwise reproduce need disarming."""
-    parts = list(Formatter().parse(template))
-    tokens = {literal.strip() for index, (literal, field, _spec, _conversion) in enumerate(parts)
-              if index and field is not None and parts[index - 1][1] is not None and literal.strip()
-              and guidance_value(literal.strip(), prose=True) == literal.strip()}
-    return tuple(sorted(tokens, key=lambda value: (-len(value), value)))
-
-
-def _frame_value(value, template):
-    """Render a value using only this source frame's separators."""
-    return guidance_field(value, _frame_separators(template), canonicalize=primitives.sanitize_display)
-
-
-class MessageRow(dict):
-    """A serialized finding whose message has crossed the rendering boundary.
-
-    The marker stays out of JSON. Formatters receiving legacy plain dictionaries
-    instead treat their free-text message as data, rather than trusting it as a
-    source template. Identity properties remain ordinary unchanged dict values.
-    """
-
-
-@lru_cache(maxsize=1)
-def _message_patterns():
-    # These are bounded source-owned frames, never templates from a document.
-    # Escape tokens have a unique spelling and raw execution characters cannot
-    # enter a capture. Each capture is limited to one displayed field's units.
-    char = r"[^\s$`\\;&|<>!()'\"\x00-\x1f\x7f-\x9f]"
-    unit = "(?:" + GUIDANCE_ESCAPE_PATTERN + "|" + char + r"| (?! ))"
-    # Empty is canonical too. Nonempty captures cannot start/end with a space
-    # or contain double spaces; the engine must select a canonical partition.
-    patterns = []
-    for name, template in MESSAGE_TEMPLATES.items():
-        parts = list(Formatter().parse(template))
-        if not any(literal for literal, _field, _spec, _conversion in parts):
-            continue  # A free-text field provides no trusted framing.
-        forbidden = "|".join(re.escape(token) for token in (*_frame_separators(template), "::"))
-        canonical_unit = "(?!(?:" + forbidden + "))" + unit
-        capture = "((?:(?! )(?:" + canonical_unit + r"){1,400}(?<! ))?)"
-        pattern = "".join(re.escape(literal) + (capture if field is not None else "")
-                          for literal, field, _spec, _conversion in parts)
-        patterns.append((*MESSAGE_OWNERS[name], template, re.compile(pattern)))
-    return tuple(patterns)
-
-
-def finding_message(row: Mapping[str, Any], *, producer: Optional[str] = None, display=None) -> str:
-    message = row["message"]
-    # JSON drops the Python marker. Recognize only exact source-owned frames
-    # with already inert value captures, preserving their literal punctuation.
-    # Bound the complete message before applying any of the bounded patterns.
-    if producer is not None and len(message) <= 64 * 1024:
-        kind = row.get("rule" if producer == "findings" else "code")
-        for owner, owned_kind, template, pattern in _message_patterns():
-            if (producer, kind) != (owner, owned_kind):
-                continue
-            match = pattern.fullmatch(message)
-            if match is not None and all(_frame_value(value, template) == value for value in match.groups()):
-                return message
-    return display(message) if display is not None else guidance_value(message, prose=True)
+    label = guidance_value(selector, prose=True)
+    origin = "fetch origin. " if selector.startswith(("origin/", "refs/remotes/origin/")) else ""
+    if not command_token(selector, MAX_GUIDANCE_CHARS) or selector != label:
+        return f"cannot resolve the base. {origin}fetch it or pass the full commit id. Base selector: {label}."
+    return f"cannot resolve the base {label}; {origin}fetch it or pass the full commit id"
 
 
 class BaseUnavailable(ValueError):

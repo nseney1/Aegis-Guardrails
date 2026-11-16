@@ -136,18 +136,26 @@ def _display(raw: bytes) -> str:
     return sanitize_display(redacted, max_len=240)
 
 
-def _lane_operation(function):
-    """Inject a transferable runner; callers cannot supply their own capability."""
+def _lane_operation(function=None, *, effect_aware=False, requires_active=True):
+    """Declare runner policy; undeclared effects refuse as effect_runner_refused.
+
+    Only store entry opts out of the active-store check. Callers cannot supply
+    their own runner capability; effect-aware operations borrow descriptors.
+    """
+    if function is None:
+        return lambda target: _lane_operation(target, effect_aware=effect_aware, requires_active=requires_active)
     @wraps(function)
     def wrapped(store, *args, **kwargs):
         if not isinstance(store, GitStore):
             raise GitRefusal("store_closed")
-        if function.__name__ != "__enter__":
+        if requires_active:
             _require_active(store)
         if "_runner" in kwargs:
             raise GitRefusal("lane_runner_required")
+        if "effect_fds" in kwargs and not effect_aware:
+            raise GitRefusal("effect_runner_refused")
         try:
-            effect_fds = kwargs.get("effect_fds") if function.__name__ == "cas_fast_forward" else None
+            effect_fds = kwargs.get("effect_fds") if effect_aware else None
             runner = store._lane if store._temp is not None and effect_fds is None else gitsafe.lane_runner(
                 store.repo, store.scratch, effect_fds=effect_fds, worktree_root=store.repo)
             return function(store, *args, _runner=runner, **kwargs)
@@ -178,7 +186,7 @@ class GitStore:
         self.env = {}
         self._snapshot_lock = Lock()
 
-    @_lane_operation
+    @_lane_operation(requires_active=False)
     def __enter__(self, *, _runner=None) -> GitStore:
         _require_runner(_runner)
         try:
@@ -616,7 +624,7 @@ def _publish(store: GitStore, new: str, runner) -> None:
         raise GitRefusal("git_failed")
 
 
-@_lane_operation
+@_lane_operation(effect_aware=True)
 def cas_fast_forward(store: GitStore, ref: str, expected: Optional[str], new: str, *, effect_fds=None, _runner=None) -> str:
     """Sole ref writer: allowlist + expected OID + ancestry, then atomic CAS.
 
