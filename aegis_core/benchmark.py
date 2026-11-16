@@ -40,7 +40,7 @@ from aegis_core.hosts import GENERIC
 from aegis_core.primitives import aegis_import_root, safe_parts
 from aegis_core.scan import estimate_tokens
 from aegis_core.scan import scan as run_scan
-from aegis_core.skills.slots import render_scan_result
+from aegis_core.skills.slots import scan_registry
 from aegis_core.verification import runner
 from aegis_core.workspace.layout import RULES_RELDIR
 
@@ -194,15 +194,15 @@ def materialize(corpus: Corpus, dest: Path) -> None:
 # ── the measurements ─────────────────────────────────────────────────────────
 
 def measure_scan(root: Path, corpus: Corpus, runs: int, clock: Callable[[], float] = time.perf_counter) -> Dict[str, Any]:
-    """The scan answer for ``corpus.scan_files``: what the MCP tool builds (scan, slot rendering,
-    JSON), timed over ``runs`` runs after a first, cold run that is reported apart."""
+    """The production scan answer: registry loading, one bound selection and JSON,
+    timed over ``runs`` runs after a first, cold run that is reported apart."""
 
     def once() -> Tuple[str, int]:
-        result = run_scan(str(root), changed_files=list(corpus.scan_files))
+        result = run_scan(str(root), changed_files=list(corpus.scan_files), registry=scan_registry(GENERIC, root))
         if result.get("status") == "FAIL":
             raise BenchmarkError(f"the scan failed on the fixture workspace: {result.get('error')}")
         served = len(result.get("relevant_rules") or [])
-        return json.dumps(render_scan_result(result, GENERIC, root)), served
+        return json.dumps(result), served
 
     first, (payload, served) = _timed(clock, once)
     timings = [_timed(clock, once)[0] for _ in range(runs)]
@@ -351,6 +351,7 @@ def event_detail(result: Mapping[str, Any]) -> Dict[str, Any]:
     detail = {
         "runs": result["runs"],
         "corpus_sha256": result["corpus"]["sha256"],
+        "scan_method": "bound-single-selection",
         "scan_p50_ms": result["scan"]["latency_ms"]["p50"],
         "scan_p95_ms": result["scan"]["latency_ms"]["p95"],
         "scan_payload_bytes": result["scan"]["payload_bytes"],
