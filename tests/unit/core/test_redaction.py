@@ -13,6 +13,8 @@ import ast
 import json
 import os
 from pathlib import Path
+import runpy
+import shutil
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -22,11 +24,15 @@ import unicodedata
 import pytest
 
 from aegis_cli.hooks.redaction import redact_secrets
+from aegis_core.gitsafe_policy import LOCAL_ENV
 from aegis_core.insights import redact_insight_text
 from aegis_core.verification.scanners import TIER_A_PATTERNS, scan_secrets_text
 
 REPO = Path(__file__).resolve().parents[3]
 PACKAGES = ("aegis_cli", "aegis_core", "aegis_mcp", "aegis_sdk")
+# Reviewed parse-cost ratchet: retain headroom for ordinary source additions.
+# Increasing this ceiling requires review; failures list all parsed paths.
+REDACTION_PARSE_CEILING = 72
 
 
 def _tok(*parts: str) -> str:
@@ -198,35 +204,197 @@ def private_imports(sources: Iterable[Tuple[str, str]]) -> List[str]:
         # Python normalizes identifiers with NFKC before exposing them in the AST.
         if "redaction" not in text and (text.isascii() or "redaction" not in unicodedata.normalize("NFKC", text)):
             continue
-        for node in ast.walk(ast.parse(text)):
+        for node in ast.walk(ast.parse(text, filename=label)):
             if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module == "aegis_core.redaction":
                 found += [f"{label}:{node.lineno}: aegis_core.redaction.{a.name}" for a in node.names
                           if a.name.startswith("_")]
     return found
 
 
-def _python_sources() -> List[Tuple[str, str]]:
-    roots = [REPO / name for name in (*PACKAGES, "tests")] + [REPO / ".github" / "scripts"]
-    return [(path.relative_to(REPO).as_posix(), path.read_text(encoding="utf-8"))
-            for root in roots for path in sorted(root.rglob("*.py")) if "__pycache__" not in path.parts]
+def _git_environment() -> Dict[str, str]:
+    """Git must use the intended checkout, independently of the caller's repository."""
+    return {key: value for key, value in os.environ.items() if key not in LOCAL_ENV}
 
 
-def test_no_module_imports_a_private_name_of_redaction(monkeypatch: pytest.MonkeyPatch):
+def _reviewed_python_paths() -> Tuple[str, ...]:
+    roots = (*PACKAGES, "tests", ".github/scripts")
+    if (REPO / ".git").exists():
+        # The index needs no Git history and excludes other workers' untracked files.
+        listed = subprocess.run(
+            ["git", "-c", "core.fsmonitor=false", "ls-files", "--cached", "-z", "--", *roots],
+            cwd=REPO, env=_git_environment(), check=True, capture_output=True, timeout=10,
+        )
+        paths = [os.fsdecode(name) for name in listed.stdout.split(b"\0") if name]
+    else:
+        # A committed, history-less checkout has no index. Freeze its initial
+        # inventory during collection, before tests can create temporary sources.
+        paths = [path.relative_to(REPO).as_posix()
+                 for name in roots for path in (REPO / name).rglob("*.py")]
+    return tuple(sorted({name for name in paths
+                         if name.endswith(".py") and "__pycache__" not in Path(name).parts}))
+
+
+_REVIEWED_PYTHON_PATHS = _reviewed_python_paths()
+
+
+def _python_sources(root: Path = REPO) -> List[Tuple[str, str]]:
+    # Freeze membership, not contents: edited or missing reviewed sources still fail.
+    return [(name, (root / name).read_text(encoding="utf-8")) for name in _REVIEWED_PYTHON_PATHS]
+
+
+def test_no_module_imports_a_private_name_of_redaction(monkeypatch: pytest.MonkeyPatch, sources=None):
     real_parse = ast.parse
     parse_count = 0
+    parsed = []
 
-    def counted_parse(text):
+    def counted_parse(text, filename):
         nonlocal parse_count
         parse_count += 1
-        return real_parse(text)
+        parsed.append(filename)
+        return real_parse(text, filename=filename)
 
     counted_ast = SimpleNamespace(**vars(ast))
     counted_ast.parse = counted_parse
     monkeypatch.setattr(sys.modules[__name__], "ast", counted_ast)
-    assert private_imports(_python_sources()) == []
-    # Bounds the parse cost of the substring prefilter. Headroom over the 65 files that mention
-    # redaction once gitsafe_policy lands; FLAKE-REDACTION-PARSE-CEILING replaces it with a ratchet.
-    assert 0 < parse_count <= 72, parse_count
+    assert private_imports(_python_sources() if sources is None else sources) == []
+    assert 0 < parse_count <= REDACTION_PARSE_CEILING, (
+        f"redaction parse census: {parse_count} files; reviewed ceiling {REDACTION_PARSE_CEILING}. "
+        "Review source additions before raising the ceiling. Parsed files:\n" + "\n".join(parsed)
+    )
+
+
+@pytest.mark.parametrize("indexed", [True, False], ids=["git-index", "committed-checkout"])
+def test_private_import_census_ignores_files_created_after_collection(tmp_path: Path, indexed: bool):
+    """Both source inventories stay fixed across parallel-test writes and repeated scans."""
+    module = tmp_path / "tests" / "unit" / "core" / "test_redaction.py"
+    module.parent.mkdir(parents=True)
+    shutil.copyfile(Path(__file__), module)
+    reviewed = tmp_path / "aegis_core" / "reviewed.py"
+    reviewed.parent.mkdir()
+    reviewed.write_text("from aegis_core.redaction import SECRET_REPLACEMENTS\n", encoding="utf-8")
+    scripts = tmp_path / ".github" / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "reviewed script.py").write_text("# redaction\n", encoding="utf-8")
+    ignored = tmp_path / "tools"
+    ignored.mkdir()
+    (ignored / "outside_census.py").write_text("redaction syntax (\n", encoding="utf-8")
+    cache = reviewed.parent / "__pycache__"
+    cache.mkdir()
+    (cache / "cached.py").write_text("redaction syntax (\n", encoding="utf-8")
+    if indexed:
+        subprocess.run(["git", "init", "-q", str(tmp_path)], env=_git_environment(), check=True, timeout=10)
+        subprocess.run(["git", "add", "."], cwd=tmp_path, env=_git_environment(), check=True, timeout=10)
+        (tmp_path / "tests" / "untracked_before_collection.py").write_text(
+            "from aegis_core.redaction import _unreviewed\n", encoding="utf-8")
+    scan = runpy.run_path(str(module))["_python_sources"]
+    initial = scan()
+    assert {"aegis_core/reviewed.py", ".github/scripts/reviewed script.py"} <= {label for label, _ in initial}
+    assert not any("untracked_before_collection" in label for label, _ in initial)
+    assert not any("outside_census" in label or "__pycache__" in label for label, _ in initial)
+    # Interleave a worker's write with a source read, without patching pathlib globally.
+    during_scan = tmp_path / "tests" / "created_during_scan.py"
+
+    class InterleavedPath(type(tmp_path)):
+        def read_text(self, *args, **kwargs):
+            during_scan.write_text("from aegis_core.redaction import _late\n", encoding="utf-8")
+            return super().read_text(*args, **kwargs)
+
+    assert scan(InterleavedPath(tmp_path)) == initial
+    assert during_scan.is_file()
+    # Another worker can create, replace and remove these between census attempts.
+    for directory in (reviewed.parent, tmp_path / "tests", scripts):
+        late = directory / "late.py"
+        for source in ("from aegis_core.redaction import _late\n", "redaction syntax (\n"):
+            late.write_text(source, encoding="utf-8")
+            assert scan() == initial
+        late.unlink()
+        assert scan() == initial
+    reviewed.write_text("from aegis_core.redaction import _changed\n", encoding="utf-8")
+    assert "aegis_core/reviewed.py:1: aegis_core.redaction._changed" in private_imports(scan())
+    reviewed.unlink()
+    with pytest.raises(FileNotFoundError):
+        scan()
+
+
+def test_private_import_census_refuses_an_unreadable_index(tmp_path: Path):
+    module = tmp_path / "tests" / "unit" / "core" / "test_redaction.py"
+    module.parent.mkdir(parents=True)
+    shutil.copyfile(Path(__file__), module)
+    (tmp_path / ".git").write_text("not a git directory\n", encoding="utf-8")
+    for _ in range(2):
+        with pytest.raises(subprocess.CalledProcessError):
+            runpy.run_path(str(module))
+
+
+@pytest.mark.parametrize("count", [1, 66, 72])
+def test_private_import_census_accepts_additions_within_reviewed_ceiling(monkeypatch, count):
+    sources = [(f"tests/reviewed_{index}.py", "# redaction\n") for index in range(count)]
+    test_no_module_imports_a_private_name_of_redaction(monkeypatch, sources)
+
+
+def test_private_import_census_ceiling_failure_lists_every_parsed_file(monkeypatch):
+    sources = [(f"tests/reviewed_{index}.py", "# redaction\n") for index in range(73)]
+    with pytest.raises(AssertionError) as failure:
+        test_no_module_imports_a_private_name_of_redaction(monkeypatch, sources)
+    message = str(failure.value)
+    assert "73" in message and "72" in message
+    assert all(label in message for label, _ in sources)
+
+
+@pytest.fixture
+def redaction_selector_checkout(tmp_path: Path):
+    """An own index with a violation and an external index captured before it existed."""
+    checkout = tmp_path / "checkout"
+    module = checkout / "tests" / "unit" / "core" / "test_redaction.py"
+    module.parent.mkdir(parents=True)
+    shutil.copyfile(Path(__file__), module)
+    package = checkout / "aegis_core"
+    package.mkdir()
+    (package / "reviewed.py").write_text("# redaction\n", encoding="utf-8")
+    env = {key: value for key, value in os.environ.items() if key not in LOCAL_ENV}
+    subprocess.run(["git", "init", "-q", str(checkout)], env=env, check=True, timeout=10)
+    subprocess.run(["git", "add", "."], cwd=checkout, env=env, check=True, timeout=10)
+    external_index = tmp_path / "external-index"
+    shutil.copyfile(checkout / ".git" / "index", external_index)
+    (package / "violating.py").write_text("from aegis_core.redaction import _violation\n", encoding="utf-8")
+    subprocess.run(["git", "add", "aegis_core/violating.py"], cwd=checkout, env=env, check=True, timeout=10)
+    external = tmp_path / "external"
+    subprocess.run(["git", "init", "-q", str(external)], env=env, check=True, timeout=10)
+    return module, external_index, external
+
+
+@pytest.mark.parametrize("selector", ["GIT_INDEX_FILE", "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "combined", "all-local"])
+@pytest.mark.parametrize("operation", ["census", "fixture"])
+def test_private_import_census_and_fixture_ignore_inherited_git_selectors(
+        tmp_path: Path, redaction_selector_checkout, selector: str, operation: str):
+    module, external_index, external = redaction_selector_checkout
+    env = {key: value for key, value in os.environ.items() if key not in LOCAL_ENV}
+    if selector == "all-local":
+        env.update({key: "invalid-inherited-selector" for key in LOCAL_ENV})
+    env["GIT_INDEX_FILE"] = str(external_index)
+    redirects = {"GIT_DIR": str(external / ".git"), "GIT_WORK_TREE": str(external),
+                 "GIT_COMMON_DIR": str(external / ".git")}
+    env.update(redirects if selector in ("combined", "all-local") else
+               {key: value for key, value in redirects.items() if key == selector})
+    before = external_index.read_bytes()
+    program = (
+        "import json, runpy, sys\n"
+        "from pathlib import Path\n"
+        "scope = runpy.run_path(sys.argv[1])\n"
+        "if sys.argv[3] == 'census':\n"
+        "    print(json.dumps(scope['private_imports'](scope['_python_sources']())))\n"
+        "else:\n"
+        "    scope['test_private_import_census_ignores_files_created_after_collection'](Path(sys.argv[2]), True)\n"
+    )
+    for attempt in range(2):
+        result = subprocess.run(
+            [sys.executable, "-c", program, str(module), str(tmp_path / f"fixture_{attempt}"), operation],
+            cwd=REPO, env=env, capture_output=True, timeout=30, check=False,
+        )
+        assert external_index.read_bytes() == before, "fixture changed the caller's external index"
+        assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+        if operation == "census":
+            assert json.loads(result.stdout) == ["aegis_core/violating.py:1: aegis_core.redaction._violation"]
 
 
 def test_an_import_of_a_private_redaction_name_is_named_with_its_line():
@@ -279,3 +447,141 @@ def test_the_hook_adapter_loads_no_scanner_stack(tmp_path: Path):
                      "aegis_core.errors"}
     assert sorted(loaded & scanner_stack) == []
     assert len(loaded) <= 7, sorted(loaded)
+
+
+def test_url_credential_removal_and_atomic_clip_live_only_in_redaction():
+    """URL removal and atomic clipping are defined once, in aegis_core.redaction."""
+    import aegis_core.redaction as redaction
+    from aegis_core import guidance_grammar
+    from aegis_core.proposals import model as proposal_model
+
+    model_tree = ast.parse((REPO / "aegis_core" / "proposals" / "model.py").read_text(encoding="utf-8"))
+    defined = {node.name for node in model_tree.body if isinstance(node, ast.FunctionDef)}
+    assert {"_strip_url_secrets", "_clip_text", "_ambiguous_authority"}.isdisjoint(defined)
+    redaction_tree = ast.parse((REPO / "aegis_core" / "redaction.py").read_text(encoding="utf-8"))
+    redaction_defined = {node.name for node in redaction_tree.body if isinstance(node, ast.FunctionDef)}
+    assert {"remove_url_credentials", "clip_atomic_text"}.issubset(redaction_defined)
+    assert redaction.remove_url_credentials.__module__ == "aegis_core.redaction"
+    assert redaction.clip_atomic_text.__module__ == "aegis_core.redaction"
+    assert "remove_url_credentials" in redaction.__all__
+    assert "clip_atomic_text" in redaction.__all__
+    source = (REPO / "aegis_core" / "proposals" / "model.py").read_text(encoding="utf-8")
+    assert "remove_url_credentials" in source and "clip_atomic_text" in source
+    assert proposal_model.remove_url_credentials is redaction.remove_url_credentials
+    assert proposal_model.clip_atomic_text is redaction.clip_atomic_text
+    assert guidance_grammar.clip_atomic_text is redaction.clip_atomic_text
+    assert guidance_grammar.remove_url_credentials is redaction.remove_url_credentials
+    assert proposal_model.clean_text("https://ci.example/path", 64) == "https://ci.example/path"
+
+
+@pytest.mark.parametrize("name", ["remove_url_credentials", "clip_atomic_text"])
+@pytest.mark.parametrize("policy", ["proposal", "guidance"])
+@pytest.mark.parametrize("bad", [None, b"text", 1, ["text"]],
+                         ids=["none", "bytes", "number", "list"])
+def test_shared_cleaners_refuse_malformed_text_then_retry(name, policy, bad):
+    from aegis_core import redaction
+
+    cleaner = getattr(redaction, name)
+    for _ in range(2):
+        with pytest.raises(redaction.RedactionRefusal, match="^invalid$") as caught:
+            cleaner(bad, limit=32, policy=policy)
+        assert caught.value.code == "invalid"
+        assert cleaner("plain", limit=32, policy=policy) == "plain"
+
+
+@pytest.mark.parametrize("name", ["remove_url_credentials", "clip_atomic_text"])
+@pytest.mark.parametrize("policy", ["proposal", "guidance"])
+@pytest.mark.parametrize("limit", [-1, True, None, 1.5, "32"])
+def test_shared_cleaners_refuse_invalid_limits_then_retry(name, policy, limit):
+    from aegis_core import redaction
+
+    cleaner = getattr(redaction, name)
+    with pytest.raises(redaction.RedactionRefusal, match="^invalid$") as caught:
+        cleaner("private input", limit=limit, policy=policy)
+    assert caught.value.code == "invalid"
+    assert cleaner("plain", limit=32, policy=policy) == "plain"
+
+
+@pytest.mark.parametrize("name", ["remove_url_credentials", "clip_atomic_text"])
+def test_shared_cleaner_input_ceiling_and_concurrent_refusal_recovery(name):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core import redaction
+
+    cleaner = getattr(redaction, name)
+    text = "z" * redaction.MAX_GUIDANCE_CHARS
+    assert cleaner(text, limit=len(text)) == text
+
+    def refusing_then_retry(_):
+        with pytest.raises(redaction.RedactionRefusal, match="^too_large$") as caught:
+            cleaner(text + "z", limit=3)
+        assert caught.value.code == "too_large"
+        return cleaner("plain", limit=32)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(refusing_then_retry, range(6))) == ["plain"] * 6
+
+
+@pytest.mark.parametrize("policy", ["proposal", "guidance"])
+def test_named_cleaner_policies_preserve_url_and_whitespace_contracts(policy):
+    from aegis_core.redaction import clip_atomic_text, remove_url_credentials
+
+    masked = "ftp://u:[REDACTED]@ci.example/p?q=hidden#private"
+    expected = "ftp://ci.example/p" if policy == "proposal" else masked
+    assert remove_url_credentials(masked, limit=300, policy=policy) == expected
+    assert remove_url_credentials(expected, limit=300, policy=policy) == expected
+    expected = "plain" if policy == "proposal" else "plain "
+    assert clip_atomic_text("plain tail", 6, policy=policy) == expected
+    assert clip_atomic_text(expected, 6, policy=policy) == expected
+    expected = "xxghp_" if policy == "proposal" else "xx"
+    assert clip_atomic_text("xxghp_REDACTED tail", 6, policy=policy) == expected
+
+
+@pytest.mark.parametrize("name", ["remove_url_credentials", "clip_atomic_text"])
+@pytest.mark.parametrize("policy", ["guidance", "proposal"])
+def test_named_cleaner_policies_bound_input_and_retry_concurrently(name, policy):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core import redaction
+
+    cleaner = getattr(redaction, name)
+    ceiling = 1024 * 1024 if policy == "guidance" else redaction.MAX_GUIDANCE_CHARS
+    text = "z" * ceiling
+    assert cleaner(text, limit=ceiling, policy=policy) == text
+    oversized = text + "z"
+
+    def refusing_then_retry(_):
+        with pytest.raises(redaction.RedactionRefusal, match="^too_large$") as caught:
+            cleaner(oversized, limit=3, policy=policy)
+        assert caught.value.code == "too_large"
+        return cleaner("plain", limit=32, policy=policy)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(refusing_then_retry, range(6))) == ["plain"] * 6
+
+
+@pytest.mark.parametrize("name", ["remove_url_credentials", "clip_atomic_text"])
+@pytest.mark.parametrize("policy", [None, [], True, "unknown"],
+                         ids=["none", "list", "bool", "unknown"])
+def test_shared_cleaners_refuse_unknown_policy_without_echo(name, policy):
+    from aegis_core import redaction
+
+    cleaner = getattr(redaction, name)
+    with pytest.raises(redaction.RedactionRefusal, match="^invalid$") as caught:
+        cleaner("private input", limit=32, policy=policy)
+    assert caught.value.code == "invalid"
+    assert cleaner("plain", limit=32, policy="guidance") == "plain"
+
+
+def test_guidance_wrappers_use_the_shared_named_policy():
+    from aegis_core import guidance_grammar as grammar
+
+    assert grammar.clip_redacted("plain tail", 6) == "plain "
+    assert grammar.redact_labeled("plain", [0] * 5, 32) == ("plain", [0] * 5)
+    text = "ftp://u:pass@ci.example/p?q=hidden#private"
+    expected = "ftp://u:[REDACTED]@ci.example/p?q=hidden#private"
+    assert grammar.redact_labeled(text, [0] * len(text), 300) == (expected, [0] * len(expected))
+    assert grammar.clip_redacted("xxghp_REDACTED tail", 6) == "xx"
+    with pytest.raises(ValueError, match="^guidance_projection_limit$"):
+        grammar.clip_redacted("plain", -1)
+    with pytest.raises(ValueError, match="^guidance_projection_limit$"):
+        grammar.redact_labeled("plain", None, 3)
+    assert grammar.clip_redacted("retry", 32) == "retry"

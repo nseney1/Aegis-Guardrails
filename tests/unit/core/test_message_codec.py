@@ -1,16 +1,20 @@
 """Public MC-1 contracts: hostile inputs first, then lossless views and storage."""
+from concurrent.futures import TimeoutError as FutureTimeoutError
 import copy
 import hashlib
 import json
+import multiprocessing
 import os
 import stat
 from pathlib import Path
 import sys
+import threading
 import errno
 import tracemalloc
 from itertools import combinations
 from contextlib import contextmanager
 from types import SimpleNamespace
+from unittest.mock import patch as codec_patch
 
 import pytest
 from conftest import symlink_or_skip
@@ -18,6 +22,8 @@ from conftest import symlink_or_skip
 from aegis_core import message_codec as codec
 from aegis_core import message_codec_format as codec_format
 from aegis_core import message_codec_store as codec_store
+from aegis_core import primitives
+from aegis_core.redaction import redact_command_secrets
 
 
 MARKER = "HOSTILE_MARKER"
@@ -31,6 +37,815 @@ MESSAGES = {
     "E_SPAN": "invalid span selection",
     "E_AUTH": "store access refused: unsafe directory or platform lacks anchored file operations; use a supported real directory",
 }
+
+
+# Process launch, including an injected delay, is outside the readiness clock.
+_LAUNCH_LIMIT = 20
+# Same readiness allowance the queue races use. It starts when the helper
+# publishes, after the readers are launched.
+_READY_LIMIT = 5
+# A terminal skip, redacted error, or EOF can arrive after that startup
+# deadline has expired. Joining the child uses this bound, then the diagnostic.
+_EXIT_LIMIT = 2
+# A peer waiting for the blocked reader must outlast that allowance.
+_PEER_LIMIT = _READY_LIMIT + 5
+# Reader join after release. The rescue watchdog uses this same bound.
+_JOIN_LIMIT = 10
+# Assertions and the retry read run before finish().
+_FINISH_MARGIN = 3
+# In-process observation does not wait for a spawned interpreter. The hold
+# crosses this startup bound and stays under fault + cleanup.
+_PROMPT_STARTUP = 0.5
+_PROMPT_HOLD = 0.9
+
+
+class _PhaseStart:
+    """The instant a helper begins its readiness wait."""
+
+    def __init__(self):
+        from threading import Event
+        self.event = Event()
+        self.instant = None
+        self.accepted = Event()
+        self.ready = Event()
+        self.t_ready = None
+        # Wakes the unset wait on publication or finish. Not a readiness signal.
+        self.wake = Event()
+        # Per-call hooks. Unset on the normal path. Not a module global.
+        self.before_ready = None
+        self.after_ready = None
+        self.hold_cancel = None
+
+    def publish(self):
+        from time import monotonic
+        if self.instant is None:
+            self.instant = monotonic()
+        self.event.set()
+
+    def wait(self, timeout):
+        return self.event.wait(timeout)
+
+
+def _latch_ready(ready, phase):
+    """Publish the helper latch once. t_ready is recorded in this same block.
+
+    A helper stalled for longer than fault + cleanup between observation and
+    publication is a hang by definition.
+    """
+    from time import monotonic
+    if ready is not None and ready.is_set():
+        return
+    hook = None if phase is None else phase.before_ready
+    if hook is not None:
+        hook[0].set()
+        hook[1].wait(30)
+    if phase is not None and phase.t_ready is None:
+        phase.t_ready = monotonic()
+    if ready is not None:
+        ready.set()
+    if phase is not None:
+        phase.wake.set()
+
+
+def _publish_ready(source, ready, phase):
+    """Set the helper latch once, at the moment this helper observes source.
+
+    A helper stalled for longer than fault + cleanup between observation and
+    publication is a hang by definition.
+    """
+    if phase is not None:
+        phase.publish()
+    if not source.wait(_READY_LIMIT):
+        return False
+    _latch_ready(ready, phase)
+    hook = None if phase is None else phase.after_ready
+    if hook is not None:
+        hook[0].set()
+        hook[1].wait(30)
+    return True
+
+
+def _start_phased_watchdog(release, *, launch, startup, fault, cleanup, phase):
+    """Rescue only after the full grace bound, never at startup expiry alone.
+
+    While phase.ready is unset this waits startup + fault + cleanup from the
+    published instant. Once the helper publishes, the deadline is phase.t_ready
+    + fault + cleanup. t_ready is recorded in the same block as the publication.
+    This never decides readiness itself. finish() wakes the wait and does not
+    set the latch.
+    """
+    from threading import Event, Thread
+    from time import monotonic
+    done, rescued = Event(), Event()
+    ready = phase.ready
+
+    def rescue():
+        phase.wait(launch)
+        if done.is_set() or phase.instant is None:
+            if phase.instant is None and not done.is_set():
+                rescued.set()
+            release.set()
+            return
+        total = startup + fault + cleanup
+        remaining = total - (monotonic() - phase.instant)
+        if remaining < 0:
+            remaining = 0
+        phase.wake.wait(remaining)
+        if not ready.is_set():
+            if not done.is_set():
+                rescued.set()
+            release.set()
+            return
+        phase.accepted.set()
+        limit = phase.t_ready + fault + cleanup - monotonic()
+        if limit < 0:
+            limit = 0
+        if not done.wait(limit):
+            rescued.set()
+        release.set()
+
+    def finish():
+        done.set()
+        phase.event.set()
+        phase.wake.set()
+
+    watchdog = Thread(target=rescue, daemon=True)
+    watchdog.start()
+    return finish, rescued, ready, watchdog
+
+
+def _join_started(thread, timeout):
+    """Join a thread only when start() succeeded."""
+    if thread is not None and thread.ident is not None:
+        thread.join(timeout)
+
+
+def _release_publication_hold(phase, thread):
+    """Clear this call's hook and finish its pause thread."""
+    cancel = phase.hold_cancel
+    phase.hold_cancel = None
+    hook = phase.before_ready
+    phase.before_ready = None
+    if cancel is not None:
+        cancel.set()
+    if hook is not None:
+        hook[0].set()
+        hook[1].set()
+    _join_started(thread, 2)
+
+
+def _arm_pre_publication_hold(phase, bound):
+    """Suspend the helper after observation and before it publishes the latch.
+
+    The hook lives on this phase. Installation and thread start share one
+    cleanup, so a start failure leaves no hook and no thread.
+    """
+    from threading import Event, Thread
+    saw, hold, cancel = Event(), Event(), Event()
+
+    def pause():
+        try:
+            if saw.wait(30):
+                cancel.wait(bound)  # Crosses startup expiry; shorter than fault + cleanup.
+        finally:
+            hold.set()
+
+    thread = Thread(target=pause, daemon=True)
+    try:
+        phase.hold_cancel = cancel
+        phase.before_ready = (saw, hold)
+        thread.start()
+    except BaseException:
+        phase.before_ready = None
+        phase.hold_cancel = None
+        cancel.set()
+        saw.set()
+        hold.set()
+        _join_started(thread, 1)
+        raise
+    return hold, thread
+
+
+def _concurrent_reads(context, references, *, budget=None, timeout=10, release=None,
+                      join_timeout=_JOIN_LIMIT, entered=None, launch_delay=0, phase=None):
+    """Release controlled waits before joining the daemon readers."""
+    from concurrent.futures import FIRST_EXCEPTION, Future, wait
+    from threading import Event, Thread
+    from time import monotonic
+    release = release if release is not None else Event()
+    references = list(references)
+    futures = [Future() for _ in references]
+    workers = []
+
+    def read(offset):
+        for index in range(offset, len(references), 2):
+            if release.is_set():
+                return
+            try:
+                value = context.read(references[index], _budget=budget)
+            except BaseException as error:
+                futures[index].set_exception(error)
+            else:
+                futures[index].set_result(value)
+
+    try:
+        if launch_delay:
+            Event().wait(launch_delay)  # Injected launch time, before the readiness wait.
+        deadline = monotonic() + timeout
+        for offset in range(min(2, len(references))):
+            worker = Thread(target=read, args=(offset,), daemon=True)
+            worker.start()
+            workers.append(worker)
+        if phase is not None and entered is None:
+            raise AssertionError("controlled reader did not enter")
+        if entered is not None:
+            latch = None if phase is None else phase.ready
+            if not _publish_ready(entered, latch, phase):
+                raise AssertionError("controlled reader did not enter")
+            origin = monotonic()
+            if phase is not None and phase.t_ready is not None:
+                origin = phase.t_ready
+            deadline = origin + timeout
+        completed, incomplete = wait(futures, timeout=max(0, deadline - monotonic()),
+                                     return_when=FIRST_EXCEPTION)
+        for future in completed:
+            if future.exception() is not None:
+                future.result()
+        if incomplete:
+            raise FutureTimeoutError()
+        return [future.result() for future in futures]
+    finally:
+        release.set()
+        deadline = monotonic() + join_timeout
+        for worker in workers:
+            worker.join(max(0, deadline - monotonic()))
+        for worker in workers:
+            assert not worker.is_alive(), "read worker did not stop after release"
+
+
+def _codec_process(scenario, root, writer, exit_hold=0):
+    from queue import Empty, Queue
+    from threading import Event, Thread
+    messages = Queue(maxsize=8)  # Thread-local only; never shared across processes.
+
+    def report():
+        # This thread alone owns the writer, including its close.
+        try:
+            for _ in range(8):
+                message, terminal = messages.get(timeout=30)
+                writer.send_bytes(message)
+                if terminal:
+                    return
+        except (Empty, OSError):
+            return
+        finally:
+            writer.close()
+
+    def notify(message):
+        assert message in {"blocked", "teardown", "unblocked"}, "invalid codec progress"
+        messages.put_nowait((message.encode("ascii"), False))
+
+    reporter = Thread(target=report, daemon=True)
+    try:
+        reporter.start()
+    except BaseException:
+        writer.close()
+        raise
+    try:
+        scenario(root, Event(), notify)
+    except pytest.skip.Exception:
+        message, code = b"skip", 0
+    except BaseException as error:
+        try:
+            detail = redact_command_secrets(primitives.sanitize_display(
+                type(error).__name__ + ": " + str(error), max_len=None))[:512]
+            message = b"error:" + detail.encode("utf-8", errors="backslashreplace")
+        except BaseException:
+            message = b"error:codec scenario failed while formatting its diagnostic"
+        code = 1
+    else:
+        message, code = b"ok", 0
+    messages.put_nowait((message, True))
+    reporter.join(1)
+    if reporter.is_alive():
+        raise SystemExit(1)
+    if exit_hold:
+        from threading import Event
+        Event().wait(exit_hold)  # Still exiting after the terminal message.
+    raise SystemExit(code)
+
+
+def _run_codec_scenario(scenario, root, *, timeout=10, observed=None, requires_store=False,
+                        restart_on_blocked=False, exit_hold=0):
+    """Supervise assertions and Store teardown in one killable spawned child.
+
+    timeout is measured from start unless restart_on_blocked is set. The child
+    "blocked" message is readiness: the deadline then restarts so spawn latency
+    is not part of the fault bound. The default remains 10s.
+    """
+    from concurrent.futures import Future
+    from threading import Event, Thread
+    from time import monotonic
+    blocked, arrived = Event(), Event()
+    if requires_store and not _store_supported():
+        pytest.skip("anchored store operations unavailable on this platform (end-of-build platform pass)")
+    context = multiprocessing.get_context("spawn")
+    reader, writer, process = None, None, None
+    future, threads = Future(), []
+
+    def receive():
+        try:
+            for _ in range(8):
+                message = reader.recv_bytes(4096)
+                if message in {b"blocked", b"teardown", b"unblocked"}:
+                    if message == b"blocked":
+                        blocked.set()
+                    if observed is not None:
+                        observed.append(message.decode("ascii"))
+                    arrived.set()
+                    continue
+                assert message in {b"ok", b"skip"} or message.startswith(b"error:"), "invalid codec outcome"
+                future.set_result(message)
+                return
+            raise AssertionError("too many codec progress messages")
+        except EOFError:
+            future.set_exception(AssertionError("codec child exited without an outcome"))
+        except BaseException:
+            future.set_exception(AssertionError("invalid codec child outcome"))
+        finally:
+            arrived.set()
+
+    try:
+        deadline = monotonic() + timeout
+        reader, writer = context.Pipe(duplex=False)
+        process = context.Process(target=_codec_process, args=(scenario, root, writer, exit_hold))
+        process.start()
+        writer.close()
+        thread = Thread(target=receive, daemon=True)
+        threads.append(thread)
+        thread.start()
+        if restart_on_blocked:
+            # A terminal child outcome wakes this wait. It is not the fault deadline.
+            ready_deadline = monotonic() + _READY_LIMIT
+            while not blocked.is_set() and not future.done():
+                remaining = ready_deadline - monotonic()
+                if remaining <= 0:
+                    break
+                if not arrived.wait(remaining):
+                    break
+                if not blocked.is_set() and not future.done():
+                    arrived.clear()
+            if not blocked.is_set() and not future.done():
+                raise AssertionError("controlled reader did not enter")
+            if blocked.is_set():
+                deadline = monotonic() + timeout
+            elif future.done():
+                # Independent of the startup-inclusive deadline, which a slow
+                # start may already have expired. Then surface the diagnostic.
+                deadline = monotonic() + _EXIT_LIMIT
+        message = future.result(timeout=max(0, deadline - monotonic()))
+        process.join(max(0, deadline - monotonic()))
+        if process.is_alive():
+            raise FutureTimeoutError()
+        if message == b"skip" and process.exitcode == 0:
+            pytest.skip("anchored store operations unavailable in spawned scenario")
+        if message.startswith(b"error:"):
+            detail = redact_command_secrets(primitives.sanitize_display(
+                message[6:].decode("utf-8"), max_len=None))[:512]
+            raise AssertionError("codec child failed: " + detail)
+        assert message == b"ok" and process.exitcode == 0, "codec child exit disagrees with outcome"
+    finally:
+        try:
+            if process is not None and process.pid is not None:
+                if process.is_alive():
+                    process.terminate()
+                process.join(0.5)
+                if process.is_alive():
+                    process.kill()
+                process.join(2)
+            for thread in threads:
+                if thread.ident is not None:
+                    thread.join(2)
+            assert process is None or not process.is_alive(), "codec child survived kill"
+            assert not any(thread.is_alive() for thread in threads), "codec outcome reader did not stop"
+        finally:
+            if reader is not None:
+                reader.close()
+            if writer is not None:
+                writer.close()
+            if process is not None and not process.is_alive():
+                process.close()
+
+
+def _unreleased_store_reader(root, release, notify):
+    from threading import Event
+    entered = Event()
+    store = make_store(root)
+    try:
+        value = record(body="blocked real reader")
+        rid = store.write(value)
+        context = codec.ReadContext(store, lambda reference: {"author": value["meta"], "kind": "text"})
+        original = codec_store.Store._read_bytes
+
+        def blocked(self, *args, **kwargs):
+            entered.set()
+            notify("blocked")
+            Event().wait(30)  # Deliberately ignores the scenario's release event.
+            notify("unblocked")
+            return original(self, *args, **kwargs)
+
+        with codec_patch.object(codec_store.Store, "_read_bytes", blocked):
+            try:
+                _concurrent_reads(context, [rid], timeout=0.05, release=release,
+                                  join_timeout=0.05, entered=entered)
+            finally:
+                notify("teardown")
+                store.close()
+    finally:
+        store.close()
+
+
+def _unreleased_portable_reader(root, release, notify):
+    from threading import Event, Lock
+    lock, entered = Lock(), Event()
+
+    def blocked(reference, **kwargs):
+        with lock:
+            entered.set()
+            notify("blocked")
+            Event().wait(30)  # Deliberately ignores release, like the Store control.
+            notify("unblocked")
+            return reference
+
+    try:
+        _concurrent_reads(SimpleNamespace(read=blocked), ["blocked"], timeout=0.05,
+                          release=release, join_timeout=0.05, entered=entered)
+    finally:
+        notify("teardown")
+        with lock:  # Models close waiting for a stuck reader on every platform.
+            pass
+
+
+def _sigterm_resistant_codec_scenario(scenario, root, release, notify):
+    import signal
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    scenario(root, release, notify)
+
+
+@pytest.mark.parametrize("portable", [False, True])
+@pytest.mark.parametrize("ignore_sigterm", [False, True])
+def test_codec_scenario_reaps_reader_ignoring_release(tmp_path, monkeypatch, ignore_sigterm, portable):
+    from functools import partial
+    if ignore_sigterm and os.name != "posix":
+        pytest.skip("requires POSIX SIGTERM handlers")
+    if portable:
+        monkeypatch.setattr("tests.unit.core.test_message_codec._store_supported", lambda: False)
+    observed = []
+    scenario = _unreleased_store_reader if _store_supported() else _unreleased_portable_reader
+    if ignore_sigterm:
+        scenario = partial(_sigterm_resistant_codec_scenario, scenario)
+    with pytest.raises(FutureTimeoutError):
+        _run_codec_scenario(scenario, tmp_path, timeout=2, observed=observed,
+                            restart_on_blocked=True)
+    assert "blocked" in observed
+    assert "teardown" in observed
+    assert "unblocked" not in observed
+    assert multiprocessing.active_children() == []
+
+
+def _failing_codec_scenario(root, release, notify):
+    raise AssertionError("\x1b[31mtoken=SCENARIO_SECRET\x1b[0m\n " + "x" * 4096)
+
+
+def _successful_codec_scenario(root, release, notify):
+    release.set()
+    assert release.is_set()
+
+
+def test_store_scenario_skips_before_spawn_when_probe_is_unavailable(tmp_path, monkeypatch):
+    monkeypatch.setattr("tests.unit.core.test_message_codec._store_supported", lambda: False)
+    monkeypatch.setattr("tests.unit.core.test_message_codec.multiprocessing", SimpleNamespace(
+        get_context=lambda method: pytest.fail("unsupported Store scenario attempted spawn")))
+    with pytest.raises(pytest.skip.Exception, match="^anchored store operations unavailable"):
+        _run_codec_scenario(_successful_codec_scenario, tmp_path, requires_store=True)
+
+
+def _skip_before_blocked(root, release, notify):
+    pytest.skip("spawned scenario skipped before readiness")
+
+
+def _error_before_blocked(root, release, notify):
+    raise RuntimeError("token=SCENARIO_SECRET\nbad child")
+
+
+def _exit_before_blocked(root, release, notify):
+    os._exit(3)
+
+
+def test_codec_scenario_surfaces_skip_before_blocked(tmp_path):
+    """A skip that arrives before readiness is not hidden behind the startup wait."""
+    with pytest.raises(pytest.skip.Exception, match="^anchored store operations unavailable in spawned scenario$"):
+        _run_codec_scenario(_skip_before_blocked, tmp_path, timeout=2, restart_on_blocked=True)
+    assert multiprocessing.active_children() == []
+
+
+def test_codec_scenario_surfaces_error_before_blocked(tmp_path):
+    """A child error before readiness is the redacted diagnostic, at once."""
+    with pytest.raises(AssertionError, match="^codec child failed: ") as caught:
+        _run_codec_scenario(_error_before_blocked, tmp_path, timeout=2, restart_on_blocked=True)
+    message = str(caught.value)
+    assert "did not enter" not in message
+    assert "SCENARIO_SECRET" not in message and "\n" not in message
+    assert multiprocessing.active_children() == []
+
+
+def test_codec_scenario_surfaces_exit_before_blocked(tmp_path):
+    """EOF before readiness is the child-outcome error, not a startup timeout."""
+    with pytest.raises(AssertionError, match="^codec child exited without an outcome$"):
+        _run_codec_scenario(_exit_before_blocked, tmp_path, timeout=2, restart_on_blocked=True)
+    assert multiprocessing.active_children() == []
+
+
+def _slow_skip_before_blocked(root, release, notify):
+    from threading import Event
+    Event().wait(3)  # Inside _READY_LIMIT; past the fault timeout of 2.
+    pytest.skip("spawned scenario skipped before readiness")
+
+
+def _slow_error_before_blocked(root, release, notify):
+    from threading import Event
+    Event().wait(3)  # Inside _READY_LIMIT; past the fault timeout of 2.
+    raise RuntimeError("token=SCENARIO_SECRET\nbad child")
+
+
+def test_codec_scenario_surfaces_slow_start_skip_before_blocked(tmp_path):
+    """A skip after a slow start still surfaces once the child finishes exiting."""
+    assert 2 < 3 < _READY_LIMIT and 0.75 < _EXIT_LIMIT
+    with pytest.raises(pytest.skip.Exception, match="^anchored store operations unavailable in spawned scenario$"):
+        _run_codec_scenario(_slow_skip_before_blocked, tmp_path, timeout=2,
+                            restart_on_blocked=True, exit_hold=0.75)
+    assert multiprocessing.active_children() == []
+
+
+def test_codec_scenario_surfaces_slow_start_error_before_blocked(tmp_path):
+    """A redacted error after a slow start is not a startup-deadline timeout."""
+    assert 2 < 3 < _READY_LIMIT and 0.75 < _EXIT_LIMIT
+    with pytest.raises(AssertionError, match="^codec child failed: ") as caught:
+        _run_codec_scenario(_slow_error_before_blocked, tmp_path, timeout=2,
+                            restart_on_blocked=True, exit_hold=0.75)
+    message = str(caught.value)
+    assert "did not enter" not in message
+    assert "SCENARIO_SECRET" not in message and "\n" not in message
+    assert multiprocessing.active_children() == []
+
+
+def test_phase_without_entered_is_refused():
+    """A phase without a readiness signal must not publish an empty latch."""
+    from threading import Event
+    release = Event()
+    phase = _PhaseStart()
+    finish, rescued, _seen, watchdog = _start_phased_watchdog(
+        release, launch=_LAUNCH_LIMIT, startup=_PROMPT_STARTUP, fault=1,
+        cleanup=1, phase=phase)
+    try:
+        with pytest.raises(AssertionError, match="^controlled reader did not enter$"):
+            _concurrent_reads(SimpleNamespace(read=lambda ref, **kw: ref), [1],
+                              timeout=1, release=release, entered=None, phase=phase)
+        assert phase.instant is None, "missing readiness published a startup instant"
+        assert not phase.ready.is_set(), "missing readiness published the helper latch"
+        assert not rescued.is_set(), "missing readiness marked a rescue"
+    finally:
+        finish()
+        release.set()
+        watchdog.join(_PROMPT_STARTUP + 1 + 1 + 1)
+        assert not watchdog.is_alive()
+
+
+def test_codec_scenario_reports_bounded_redacted_assertions_and_allows_retry(tmp_path):
+    with pytest.raises(AssertionError, match="^codec child failed: AssertionError:") as caught:
+        _run_codec_scenario(_failing_codec_scenario, tmp_path)
+    message = str(caught.value)
+    assert "SCENARIO_SECRET" not in message and "\x1b" not in message and "\n" not in message
+    assert len(message) <= len("codec child failed: ") + 512
+    assert multiprocessing.active_children() == []
+    _run_codec_scenario(_successful_codec_scenario, tmp_path)
+    assert multiprocessing.active_children() == []
+
+
+@pytest.mark.parametrize("failure,startup_delay,launch_delay,settle_delay", [
+    ("timeout", 0, 0, 0), ("timeout", 3, 0, 0), ("timeout", 3, 3, 0),
+    ("timeout", 0, 0, 3), ("raise", 0, 0, 0), ("raise-later", 0, 0, 0),
+    ("raise", 1.2, 0, 0), ("raise-later", 1.2, 0, 0),
+    ("raise", 3, 0, 0), ("raise-later", 3, 0, 0)])
+def test_concurrent_reads_release_blocked_workers_and_allow_retry(failure, startup_delay,
+                                                                  launch_delay, settle_delay):
+    from threading import Event, current_thread
+    entered, release, finished = (Event() for _ in range(3))
+    readers = []
+    timeout = 2 if failure == "timeout" else 1
+    phase = _PhaseStart()
+    finish, rescued, _seen, watchdog = _start_phased_watchdog(
+        release, launch=_LAUNCH_LIMIT, startup=_READY_LIMIT, fault=timeout,
+        cleanup=_JOIN_LIMIT + _FINISH_MARGIN, phase=phase)
+
+    def read(reference, **kwargs):
+        readers.append(current_thread())
+        if reference == "blocked":
+            if startup_delay:
+                Event().wait(startup_delay)  # Injected before readiness; the fault clock starts later.
+            entered.set()
+            try:
+                assert release.wait(30), "control was not released"
+                if settle_delay:
+                    Event().wait(settle_delay)  # Finishes inside the helper join allowance.
+                return reference
+            finally:
+                finished.set()
+        assert entered.wait(_PEER_LIMIT), "blocked peer did not enter"
+        raise ValueError("read control failed")
+
+    try:
+        references = (["blocked"] if failure == "timeout" else
+                      ["blocked", "raise"] if failure == "raise-later" else ["raise", "blocked"])
+        expected = FutureTimeoutError if failure == "timeout" else ValueError
+        message = None if failure == "timeout" else "^read control failed$"
+        with pytest.raises(expected, match=message):
+            _concurrent_reads(SimpleNamespace(read=read), references,
+                              timeout=timeout, release=release, join_timeout=_JOIN_LIMIT,
+                              entered=entered, launch_delay=launch_delay, phase=phase)
+        assert not rescued.is_set(), "reader shutdown waited for the blocked worker"
+        assert finished.is_set()
+        assert all(reader.daemon and not reader.is_alive() for reader in readers)
+        assert _concurrent_reads(SimpleNamespace(read=lambda ref, **kw: ref), [1, 2, 3, 4]) == [1, 2, 3, 4]
+    finally:
+        finish()
+        release.set()
+        watchdog.join(_READY_LIMIT + 2)
+        assert not watchdog.is_alive()
+
+
+@pytest.mark.parametrize("failure", ["timeout", "raise", "raise-later"])
+def test_rescue_grace_on_concurrent_reads(failure):
+    """Startup expiry before publication is not a rescue for a controlled read."""
+    from threading import Event, current_thread
+    fault = 2 if failure == "timeout" else 1
+    cleanup = _JOIN_LIMIT + _FINISH_MARGIN
+    assert _PROMPT_STARTUP < _PROMPT_HOLD < fault + cleanup
+    entered, release, finished = (Event() for _ in range(3))
+    readers = []
+    phase = _PhaseStart()
+    paused = None
+    finish = None
+    watchdog = None
+
+    def read(reference, **kwargs):
+        readers.append(current_thread())
+        if reference == "blocked":
+            entered.set()
+            try:
+                assert release.wait(30), "control was not released"
+                return reference
+            finally:
+                finished.set()
+        assert entered.wait(_PEER_LIMIT), "blocked peer did not enter"
+        raise ValueError("read control failed")
+
+    try:
+        _hold, paused = _arm_pre_publication_hold(phase, _PROMPT_HOLD)
+        finish, rescued, _seen, watchdog = _start_phased_watchdog(
+            release, launch=_LAUNCH_LIMIT, startup=_PROMPT_STARTUP, fault=fault,
+            cleanup=cleanup, phase=phase)
+        references = (["blocked"] if failure == "timeout" else
+                      ["blocked", "raise"] if failure == "raise-later" else ["raise", "blocked"])
+        expected = FutureTimeoutError if failure == "timeout" else ValueError
+        message = None if failure == "timeout" else "^read control failed$"
+        with pytest.raises(expected, match=message):
+            _concurrent_reads(SimpleNamespace(read=read), references, timeout=fault,
+                              release=release, join_timeout=_JOIN_LIMIT, entered=entered,
+                              phase=phase)
+        assert phase.accepted.wait(2), "watchdog did not accept the helper latch"
+        assert not rescued.is_set(), "startup expiry before publication marked a rescue"
+        assert finished.is_set()
+        assert all(reader.daemon and not reader.is_alive() for reader in readers)
+        assert _concurrent_reads(SimpleNamespace(read=lambda ref, **kw: ref), [1, 2, 3, 4]) == [1, 2, 3, 4]
+    finally:
+        _release_publication_hold(phase, paused)
+        if finish is not None:
+            finish()
+        release.set()
+        _join_started(watchdog, _PROMPT_STARTUP + fault + cleanup + 1)
+        assert watchdog is None or not watchdog.is_alive()
+
+
+def test_preemption_between_readiness_wait_and_latch_is_not_a_false_rescue():
+    """A timed stall before publication must not rescue a live fault."""
+    from threading import Event
+    fault, cleanup = 2, _JOIN_LIMIT + _FINISH_MARGIN
+    assert _PROMPT_STARTUP < _PROMPT_HOLD < fault + cleanup
+    entered, release = Event(), Event()
+    phase = _PhaseStart()
+    paused = None
+    finish = None
+    watchdog = None
+
+    def read(reference, **kwargs):
+        entered.set()
+        assert release.wait(30), "control was not released"
+        return reference
+
+    try:
+        _hold, paused = _arm_pre_publication_hold(phase, _PROMPT_HOLD)
+        finish, rescued, _seen, watchdog = _start_phased_watchdog(
+            release, launch=_LAUNCH_LIMIT, startup=_PROMPT_STARTUP, fault=fault,
+            cleanup=cleanup, phase=phase)
+        with pytest.raises(FutureTimeoutError):
+            _concurrent_reads(SimpleNamespace(read=read), ["blocked"], timeout=fault,
+                              release=release, join_timeout=_JOIN_LIMIT, entered=entered,
+                              phase=phase)
+        assert phase.accepted.wait(2), "watchdog did not accept the helper latch"
+        assert not rescued.is_set(), "preemption before publication marked a rescue"
+    finally:
+        _release_publication_hold(phase, paused)
+        if finish is not None:
+            finish()
+        release.set()
+        _join_started(watchdog, _PROMPT_STARTUP + fault + cleanup + 1)
+        assert watchdog is None or not watchdog.is_alive()
+
+
+def test_rescue_grace_on_blocked_reader():
+    """Startup expiry before publication is not a rescue for one blocked reader."""
+    from threading import Event
+    fault, cleanup = 2, _JOIN_LIMIT + _FINISH_MARGIN
+    assert _PROMPT_STARTUP < _PROMPT_HOLD < fault + cleanup
+    entered, release = Event(), Event()
+    phase = _PhaseStart()
+    paused = None
+    finish = None
+    watchdog = None
+
+    def read(reference, **kwargs):
+        entered.set()
+        assert release.wait(30), "control was not released"
+        return reference
+
+    try:
+        _hold, paused = _arm_pre_publication_hold(phase, _PROMPT_HOLD)
+        finish, rescued, _seen, watchdog = _start_phased_watchdog(
+            release, launch=_LAUNCH_LIMIT, startup=_PROMPT_STARTUP, fault=fault,
+            cleanup=cleanup, phase=phase)
+        with pytest.raises(FutureTimeoutError):
+            _concurrent_reads(SimpleNamespace(read=read), ["blocked"], timeout=fault,
+                              release=release, join_timeout=_JOIN_LIMIT, entered=entered,
+                              phase=phase)
+        assert phase.accepted.wait(2), "watchdog did not accept the helper latch"
+        assert not rescued.is_set(), "startup expiry before publication marked a rescue"
+    finally:
+        _release_publication_hold(phase, paused)
+        if finish is not None:
+            finish()
+        release.set()
+        _join_started(watchdog, _PROMPT_STARTUP + fault + cleanup + 1)
+        assert watchdog is None or not watchdog.is_alive()
+
+
+@pytest.mark.parametrize("caller,fail_at", [
+    ("grace-concurrent", 1), ("grace-concurrent", 2), ("grace-concurrent", 3),
+    ("grace-preemption", 1), ("grace-preemption", 2),
+    ("grace-blocked-reader", 1), ("grace-blocked-reader", 2)])
+def test_setup_start_failure_leaves_no_hook_or_thread(monkeypatch, caller, fail_at):
+    """Thread.start raising RuntimeError rolls back the phase hook and live threads.
+
+    fail_at 1 is the pre-publication pause thread. Later indexes are the
+    watchdog and then a reader, so a partial start still finishes what began.
+    """
+    from time import monotonic
+    original = threading.Thread.start
+    seen = {"n": 0}
+
+    def start(self):
+        seen["n"] += 1
+        if seen["n"] == fail_at:
+            raise RuntimeError("start failed")
+        return original(self)
+
+    monkeypatch.setattr("tests.unit.core.test_message_codec.threading.Thread.start", start)
+    before = {thread.ident for thread in threading.enumerate() if thread.is_alive()}
+    with pytest.raises(RuntimeError, match="^start failed$"):
+        if caller == "grace-concurrent":
+            test_rescue_grace_on_concurrent_reads("timeout")
+        elif caller == "grace-preemption":
+            test_preemption_between_readiness_wait_and_latch_is_not_a_false_rescue()
+        else:
+            test_rescue_grace_on_blocked_reader()
+    living = {thread.ident for thread in threading.enumerate() if thread.is_alive()}
+    assert living <= before
+    ready = threading.Event()
+    phase = _PhaseStart()
+    started = monotonic()
+    _latch_ready(ready, phase)
+    assert ready.is_set() and phase.before_ready is None
+    assert monotonic() - started < 1
 
 
 def test_read_context_denial_precedes_payload_and_retry_is_request_scoped(tmp_path, monkeypatch):
@@ -116,8 +931,7 @@ def test_read_context_failure_accounting_and_repair(tmp_path, failure):
         store.close()
 
 
-def test_read_context_concurrent_cache_and_closed_reader_boundary(tmp_path, monkeypatch):
-    from concurrent.futures import ThreadPoolExecutor
+def _scenario_concurrent_cache_and_closed_reader_boundary(tmp_path, release, notify):
     store = make_store(tmp_path)
     try:
         value = record(body="child")
@@ -129,22 +943,25 @@ def test_read_context_concurrent_cache_and_closed_reader_boundary(tmp_path, monk
             reads.append(args[0])
             return original(self, *args, **kwargs)
 
-        monkeypatch.setattr(codec_store.Store, "_read_bytes", counted)
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            assert list(pool.map(context.read, [rid] * 4)) == [value] * 4
-        assert reads == [rid] and context.io.used == len(raw(value))
-        parent = dict(record(), refs={"child": rid})
-        assert codec.read_view(parent, store=context) == codec.read_view(parent, store=store)
-        class Reader:
-            read = context.read
-            describe = context.describe
-        class Derived(codec.ReadContext):
-            pass
-        for reader in (Reader(), Derived(store, lambda reference: {})):
-            assert_error("E_REF", lambda: codec.read_view(parent, store=reader))
-            assert_error("E_REF", lambda: codec.ReadContext(reader, lambda reference: {}))
+        with codec_patch.object(codec_store.Store, "_read_bytes", counted):
+            assert _concurrent_reads(context, [rid] * 4) == [value] * 4
+            assert reads == [rid] and context.io.used == len(raw(value))
+            parent = dict(record(), refs={"child": rid})
+            assert codec.read_view(parent, store=context) == codec.read_view(parent, store=store)
+            class Reader:
+                read = context.read
+                describe = context.describe
+            class Derived(codec.ReadContext):
+                pass
+            for reader in (Reader(), Derived(store, lambda reference: {})):
+                assert_error("E_REF", lambda: codec.read_view(parent, store=reader))
+                assert_error("E_REF", lambda: codec.ReadContext(reader, lambda reference: {}))
     finally:
         store.close()
+
+
+def test_read_context_concurrent_cache_and_closed_reader_boundary(tmp_path):
+    _run_codec_scenario(_scenario_concurrent_cache_and_closed_reader_boundary, tmp_path, requires_store=True)
 
 
 @pytest.mark.parametrize("options,code", [({"selectors": ["body.bad"]}, "E_SELECTOR"),
@@ -209,8 +1026,7 @@ def test_read_context_budget_aliases_preserve_verification_and_exact_charges(tmp
         store.close()
 
 
-def test_read_context_concurrent_distinct_records_share_an_ancestor_once(tmp_path):
-    from concurrent.futures import ThreadPoolExecutor
+def _scenario_concurrent_distinct_records_share_an_ancestor_once(tmp_path, release, notify):
     store = make_store(tmp_path)
     try:
         values = [record(body=body) for body in ("one", "two")]
@@ -220,12 +1036,14 @@ def test_read_context_concurrent_distinct_records_share_an_ancestor_once(tmp_pat
         context = codec.ReadContext(store, lambda reference: {"author": values[0]["meta"], "kind": "text"})
         context.io.limit, context.io.parent = total, ancestor
         view = codec.Budget(total, parent=ancestor)
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [pool.submit(context.read, rid, _budget=view) for rid in ids]
-            assert [future.result(timeout=10) for future in futures] == values
+        assert _concurrent_reads(context, ids, budget=view) == values
         assert context.io.used == view.used == ancestor.used == total
     finally:
         store.close()
+
+
+def test_read_context_concurrent_distinct_records_share_an_ancestor_once(tmp_path):
+    _run_codec_scenario(_scenario_concurrent_distinct_records_share_an_ancestor_once, tmp_path, requires_store=True)
 
 
 @pytest.mark.parametrize("alias", ["direct", "descendant", "ancestor"])
@@ -341,10 +1159,14 @@ def test_r9_replay_refusal_does_not_partially_charge_a_view_chain(tmp_path):
         store.close()
 
 
-def make_store(root, *, fixture_owned=False):
+def _store_supported():
     capabilities = {function.__name__ for function in os.supports_dir_fd}
-    if not ({"open", "stat", "link", "unlink"} <= capabilities and
-            hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")):
+    return ({"open", "stat", "link", "unlink"} <= capabilities and
+            hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY"))
+
+
+def make_store(root, *, fixture_owned=False):
+    if not _store_supported():
         pytest.skip("anchored store operations unavailable on this platform (end-of-build platform pass)")
     store = codec.Store(root)
     complete = False

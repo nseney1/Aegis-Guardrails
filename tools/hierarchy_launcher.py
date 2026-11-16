@@ -30,6 +30,7 @@ from contextlib import contextmanager, nullcontext, ExitStack
 from datetime import datetime, timezone
 import errno
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -1062,6 +1063,10 @@ def resume_locked(launches, endpoint, identifier, dry_run, admission):
     if code == 2:
         details["error"] = (answer.get("error") if isinstance(answer.get("error"), str) else
                             "the wake tool exited %d" % ran.returncode)
+    elif code == 3:
+        binding_reason = _validated_binding_refusal(answer.get("error"))
+        if binding_reason is not None:
+            details["error"] = binding_reason
     # Reacquire the same inherited description, which may still be locked after failed admission.
     # A fresh descriptor would deadlock with that lock. The pre-spawn obligation stays durable until
     # the normal immutable outcome is committed, preserving the existing public history format.
@@ -1073,7 +1078,8 @@ def resume_locked(launches, endpoint, identifier, dry_run, admission):
                                not dry_run and answer.get("_admission_attempted") is not False,
                                spawn_failed=answer.get("_spawn_failed") is True)
     except (OSError, ValueError):
-        launches.refuse(endpoint, identifier, "resume", "resume admission publication failed; preserve admission evidence and run stop", **known)
+        launches.refuse(endpoint, identifier, "resume", **known, **_binding_recovery_details(
+            details.get("error"), "resume admission publication failed; preserve admission evidence and run stop"))
     try:
         admission.check()
         record = launches.record(endpoint, identifier, "resume", state, **known, **details)
@@ -1093,7 +1099,8 @@ def resume_locked(launches, endpoint, identifier, dry_run, admission):
                 clear_running_wake(launches.base, endpoint, current)
         except (OSError, ValueError, TypeError):
             details.update(wake={**result, "state": "stop_unconfirmed"},
-                           error="running wake retirement unavailable; preserve its evidence and run stop")
+                           **_binding_recovery_details(details.get("error"),
+                               "running wake retirement unavailable; preserve its evidence and run stop"))
             try:
                 return 3, launches.record(endpoint, launches.new_id(), "resume", "resumed_unread", **known, **details)
             except (OSError, ValueError) as failure:
@@ -1185,6 +1192,219 @@ def fenced_wake_turn(launches, endpoint, fence, known, wake, namespace, running,
     return admitted_turn
 
 
+_BINDING_PREFIX = "writer binding refused: "
+_BINDING_CODES = frozenset({
+    "unsupported_platform", "state_unavailable", "state_locked", "identity_unavailable",
+    "identity_ambiguous", "lease_unavailable", "invalid_lane", "source_unavailable",
+})
+_BINDING_TEXT_LIMIT = len(_BINDING_PREFIX) + max(len(code) for code in _BINDING_CODES)
+_BINDING_LOCK_TRIES = 3
+_BINDING_LOCK_WAIT_S = 0.05
+
+
+def _binding_text(code):
+    if code not in _BINDING_CODES:
+        code = "state_unavailable"
+    return _BINDING_PREFIX + code
+
+
+def _validated_binding_refusal(refusal):
+    if (type(refusal) is not str or len(refusal) > _BINDING_TEXT_LIMIT
+            or not refusal.startswith(_BINDING_PREFIX)):
+        return None
+    if refusal[len(_BINDING_PREFIX):] not in _BINDING_CODES:
+        return None
+    return refusal
+
+
+def _binding_recovery_details(error, diagnostic):
+    """A fixed recovery diagnostic accompanies, never replaces, a validated binding reason."""
+    reason = _validated_binding_refusal(error)
+    return {"error": diagnostic} if reason is None else {"error": reason, "recovery_error": diagnostic}
+
+
+def _binding_refusal_text(launches):
+    return _validated_binding_refusal(getattr(launches, "writer_binding_refusal", None))
+
+
+def expose_binding_refusal(launches, code, answer):
+    """Surface a typed binding refusal on the resume answer. Other text stays put."""
+    refusal = _binding_refusal_text(launches)
+    if refusal is None:
+        return code, answer
+    return 2, {**answer, "error": refusal}
+
+
+def _plan_state(launches, endpoint):
+    """Authorize only the reviewed governing plan; discovery alone grants nothing."""
+    base = getattr(launches, "base", None)
+    if base is None:
+        return None
+    local = bootstrap_plan_present(base)
+    setup = getattr(launches, "setup", None)
+    mailbox = setup.get("mailbox_root") if isinstance(setup, dict) else None
+    if type(mailbox) is not str or not mailbox or "\x00" in mailbox:
+        return None
+    governing = bootstrap_plan_present(Path(mailbox).parent)
+    if local is None or governing is None:
+        return None
+    if local is False and governing is False:
+        return False
+    plan = hierarchy_hosts.governing_plan(base, mailbox, endpoint.split("/")[0])
+    if plan is None:
+        return None  # Discovery changed; absence is no longer proven.
+    host, _ = hierarchy_hosts.plan_host(plan, endpoint)
+    return host is not None
+
+
+class _VerifiedMissing:
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        raise ModuleNotFoundError(module.__name__)
+
+
+class _VerifiedAegisFinder:
+    """Load aegis_core only from one verified source root. Never fall through."""
+
+    def __init__(self, root):
+        self.root = root
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != "aegis_core" and not fullname.startswith("aegis_core."):
+            return None
+        spec = _verified_aegis_spec(self.root, fullname)
+        if spec is not None:
+            return spec
+        return importlib.util.spec_from_loader(fullname, _VerifiedMissing())
+
+
+class _VerifiedAegisLoader:
+    def __init__(self, raw, filename):
+        self.raw, self.filename = raw, filename
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        module.__dict__["__builtins__"] = __builtins__
+        exec(compile(self.raw, self.filename, "exec"), module.__dict__)  # aegis: allow[sec-py-eval-exec] verified source, confined bounded read
+
+
+def _verified_module_bytes(root, parts):
+    """Read only a regular, bounded source file through retained no-follow ancestors."""
+    try:
+        with bootstrap_directory(root.joinpath(*parts[:-1])) as (directory, check):
+            fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+            try:
+                info = os.fstat(fd)
+                require(stat.S_ISREG(info.st_mode) and info.st_size <= 1048576, "invalid binding source")
+                raw = bytearray()
+                while len(raw) <= 1048576:
+                    block = os.read(fd, min(65536, 1048577 - len(raw)))
+                    if not block:
+                        break
+                    raw.extend(block)
+                require(len(raw) <= 1048576, "invalid binding source")
+                check()
+                return bytes(raw)
+            finally:
+                os.close(fd)
+    except FileNotFoundError:
+        return None
+
+
+def _verified_aegis_spec(root, fullname):
+    parts = fullname.split(".")
+    require(all(part.isidentifier() for part in parts), "invalid binding module")
+    for relative, package in ((*parts, "__init__.py"), True), ((*parts[:-1], parts[-1] + ".py"), False):
+        raw = _verified_module_bytes(root, relative)
+        if raw is not None:
+            filename = str(root.joinpath(*relative))
+            return importlib.util.spec_from_file_location(
+                fullname, filename, loader=_VerifiedAegisLoader(raw, filename),
+                submodule_search_locations=[str(root.joinpath(*parts))] if package else None)
+    return None
+
+
+@contextmanager
+def _load_verified_bind(source):
+    """Keep verified imports active for the entire bind, including retries and lazy imports."""
+    if type(source) is not str or not source or "\x00" in source or len(source) > 32740:
+        yield None
+        return
+    root = Path(source)
+    if not root.is_absolute():
+        yield None
+        return
+    finder = _VerifiedAegisFinder(root)
+    saved = {key: sys.modules.pop(key) for key in list(sys.modules)
+             if key == "aegis_core" or key.startswith("aegis_core.")}
+    sys.meta_path.insert(0, finder)
+    try:
+        try:
+            module = importlib.import_module("aegis_core.team_writer_binding")
+            bind = getattr(module, "bind", None)
+        except Exception:
+            bind = None
+        yield bind if callable(bind) else None
+    finally:
+        sys.meta_path.remove(finder)
+        for key in list(sys.modules):
+            if key == "aegis_core" or key.startswith("aegis_core."):
+                sys.modules.pop(key, None)
+        sys.modules.update(saved)
+
+
+def _passwd_home():
+    """Passwd home of the current uid. Callers do not read $HOME."""
+    import pwd
+    return pwd.getpwuid(os.getuid()).pw_dir
+
+
+def bind_writer_process(launches, endpoint, profile, pid):
+    """Publish the resume child's binding, or a typed refusal string. None lets the child continue."""
+    try:
+        if type(endpoint) is not str or type(pid) is not int:
+            return None
+        parts = endpoint.split("/")
+        if len(parts) != 3 or parts[1] != "lane" or not parts[0] or not parts[2]:
+            return None
+        definition = launches.mailbox.endpoint(endpoint)
+        if type(definition) is not dict or definition.get("kind") != "implementer":
+            return None
+        plan = _plan_state(launches, endpoint)
+        if plan is False:
+            return None
+        if plan is None:
+            return _binding_text("state_unavailable")
+        body = read_json(profile)
+        cwd = body.get("cwd") if type(body) is dict else None
+        if type(cwd) is not str:
+            return _binding_text("state_unavailable")
+        setup = getattr(launches, "setup", None)
+        source = setup.get("source") if isinstance(setup, dict) else None
+        with _load_verified_bind(source) as bind:
+            if bind is None:
+                return _binding_text("source_unavailable")
+            home = _passwd_home()
+            lane = parts[0] + "-" + parts[2]
+            last = None
+            for attempt in range(_BINDING_LOCK_TRIES):
+                last = bind(home, cwd, lane, pid)
+                locked = type(last) is dict and last.get("status") == "refused" and last.get("code") == "state_locked"
+                if not locked or attempt + 1 == _BINDING_LOCK_TRIES:
+                    break
+                time.sleep(_BINDING_LOCK_WAIT_S)
+            if type(last) is dict and last.get("status") == "ok":
+                return None
+            code = last.get("code") if type(last) is dict else None
+            return _binding_text(code if type(code) is str else "state_unavailable")
+    except Exception:
+        return _binding_text("state_unavailable")
+
+
 def admitted_wake_locked(launches, endpoint, fence, wake_source, dry_run):
     import fcntl
 
@@ -1210,6 +1430,14 @@ def admitted_wake_locked(launches, endpoint, fence, wake_source, dry_run):
         # turn successful process creation into the no-child failed-spawn path.
         children.append(process)
         fence.check()
+        refusal = bind_writer_process(launches, endpoint, profile, process.pid)
+        if refusal is not None:
+            launches.writer_binding_refusal = refusal
+            try:
+                stop_group(process)
+            except Exception:
+                pass
+            raise ValueError("writer binding refused")
         write_running_wake(launches, endpoint, known, running[0]["wake_id"], process.pid, expected=running[0])
     def check_process():
         fence.check()
@@ -1247,6 +1475,7 @@ def admitted_wake_locked(launches, endpoint, fence, wake_source, dry_run):
                 pass  # Unconfirmed exit retains admission and returns stop_unconfirmed below.
     if spawn_value_failure:
         code, answer = 2, {"error": spawn_value_failure[-1]}
+    code, answer = expose_binding_refusal(launches, code, answer)
     if running and code != 2:
         answer = {**answer, "wake_id": running[0]["wake_id"]}
     # Only the producer's two explicit no-launch outcomes rule out admission. Missing/malformed
@@ -1255,8 +1484,9 @@ def admitted_wake_locked(launches, endpoint, fence, wake_source, dry_run):
               not spawn_failed and answer.get("state") not in ("nothing_unread", "dry_run"),
               "_spawn_failed": bool(spawn_failed)}
     if running and not confirmed:
-        reason = "running wake admission or group exit is unconfirmed; preserve its evidence and run stop"
-        return 3, {**answer, "state": "stop_unconfirmed", "error": reason}
+        refusal = _binding_refusal_text(launches)
+        reason = refusal or "running wake admission or group exit is unconfirmed; preserve its evidence and run stop"
+        return expose_binding_refusal(launches, 3, {**answer, "state": "stop_unconfirmed", "error": reason})
     if confirmed:
         answer = {**answer, "_admission_exit": dict(wake_id=running[0]["wake_id"],
                   driver_pid=running[0]["driver_pid"], host_pid=children[0].pid)}

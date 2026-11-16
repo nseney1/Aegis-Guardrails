@@ -61,7 +61,7 @@ DEFAULT_HARDENING = ("-c", f"core.hooksPath={os.devnull}", *HARDENING_KEEP_HOOKS
 _LANE_OPTIONS = ("-c", "gc.auto=0", "-c", "maintenance.auto=false", "-c", "core.splitIndex=false",
                  "-c", "core.untrackedCache=false", "-c", "core.sparseCheckout=false",
                  "-c", "merge.renormalize=false", "-c", "commit.gpgsign=false")
-_FIXED_CONFIG = frozenset((*DEFAULT_HARDENING[1::2], *_LANE_OPTIONS[1::2], "core.safecrlf=false"))
+_FIXED_CONFIG = frozenset((*DEFAULT_HARDENING[1::2], *_LANE_OPTIONS[1::2], "core.safecrlf=false", "core.attributesFile="))
 def _command(argv, cwd, stdin, grant=None):
     """Prove the closed command grammar before repository discovery can spawn."""
     position, pairs = 1, set()
@@ -75,6 +75,7 @@ def _command(argv, cwd, stdin, grant=None):
     if args == ("update-ref", "--no-deref", "-z", "--stdin"):
         if grant != (tuple(argv), str(cwd), stdin): strict_refuse()
     elif not read_shape(args): strict_refuse()
+    if (args[:4] == ("check-attr", "-z", "--stdin", "--source")) != ("core.attributesFile=" in pairs): strict_refuse()
     return args, pairs
 def _argv(args, program, hardening, policy):
     argv = [program, *hardening, *args]
@@ -83,6 +84,8 @@ def _argv(args, program, hardening, policy):
         while position + 1 < len(argv) and argv[position] == "-c":
             position += 2
         extra = _LANE_OPTIONS if policy.strict_lane else ("-c", "gc.auto=0", "-c", "maintenance.auto=false")
+        if policy.strict_lane and tuple(argv[position:position + 4]) == ("check-attr", "-z", "--stdin", "--source"):
+            extra = (*extra, "-c", "core.attributesFile=")
         argv[position:position] = ["-c", f"core.hooksPath={os.devnull}", *extra]
     return argv
 def request_environment(source=None, *, profile="ordinary", scope=None, overrides=None, base=None,
@@ -329,6 +332,8 @@ class LaneRunner:
         if real_index and tuple(args) not in READ_SHAPES or real_index and args[0] not in ("ls-files", "check-attr"): strict_refuse()
         effective = {k: v for k, v in self._lane_binding.base.items() if k in LOCATION_ENV}
         effective.update(supplied)
+        if args[:4] == ("check-attr", "-z", "--stdin", "--source"):
+            effective["GIT_ATTR_NOSYSTEM"] = "1"
         if shared: effective["GIT_OBJECT_DIRECTORY"] = str(self._lane_binding.paths[0] / "objects")
         if real_index: effective["GIT_INDEX_FILE"] = str(self._lane_binding.paths[2])
         if tuple(args) == ("rev-parse", "--git-path", "index"): effective.pop("GIT_INDEX_FILE")

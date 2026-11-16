@@ -24,7 +24,8 @@ from aegis_core.workspace.layout import AEGIS_DIRNAME
 
 __all__ = [
     "MAX_BYTES", "MAX_ITEMS", "MAX_FIELDS", "MAX_TEXT", "MAX_COMPLETED", "QueueRefusal",
-    "descriptor_supported", "valid_workspace_spelling", "parse_item", "list_argument_refusal", "refusal", "add", "list", "claim",
+    "descriptor_supported", "valid_workspace_spelling", "valid_key", "valid_lane", "valid_revision",
+    "check_capabilities", "normalize_branch", "parse_item", "list_argument_refusal", "refusal", "add", "list", "claim",
     "release", "unclaim", "done", "audit", "compact",
 ]
 
@@ -118,14 +119,25 @@ def _require(condition, reason="invalid_item"):
         raise QueueRefusal(reason)
 
 
-def _key(value):
+def valid_key(value):
+    """Whether value is one bounded single-line queue identifier. Performs no I/O."""
     return (type(value) is str and len(value) <= 64 and _KEY.fullmatch(value) is not None
             and primitives.sanitize_display(value, max_len=None) == value
             and redact_command_secrets(value) == value)
 
 
-def _lane(value):
-    return (_key(value) and team.valid_lane(value))
+def valid_lane(value):
+    """Whether value is a queue lane the team grammar also accepts. Performs no I/O."""
+    return valid_key(value) and team.valid_lane(value)
+
+
+def valid_revision(value):
+    """Whether value is 64 lowercase hex characters. Performs no I/O."""
+    return type(value) is str and len(value) == 64 and _REVISION.fullmatch(value) is not None
+
+
+_key = valid_key
+_lane = valid_lane
 
 
 def _text(value, limit=MAX_TEXT, empty=False):
@@ -157,12 +169,17 @@ def _strings(value, *, paths=False):
     return value
 
 
+def check_capabilities(value):
+    """Validate one capability list. QueueRefusal carries a fixed code and performs no I/O."""
+    return _strings(value)
+
+
 def _item(value):
     _require(type(value) is dict and len(value) <= 10)
     required = {"id", "title", "paths", "capabilities"}
     allowed = required | {"after", "hold", "hold_until", "scope_rulings", "invariants", "brief_paths"}
     _require(required <= value.keys() and value.keys() <= allowed)
-    _require(_key(value["id"]))
+    _require(valid_key(value["id"]))
     _text(value["title"], 256)
     _strings(value["paths"], paths=True)
     _require(bool(value["paths"]))
@@ -171,7 +188,7 @@ def _item(value):
     for path in value.get("brief_paths", []):
         _require(not path.startswith("/") and not any(char in path for char in "*?[]"))
         _require(team_paths.first_match(scope, path) is not None, "brief_outside_scope")
-    _strings(value["capabilities"])
+    check_capabilities(value["capabilities"])
     _strings(value.get("after", []))
     _require(value["id"] not in value.get("after", []))
     _text(value.get("hold", ""), empty=True)
@@ -235,7 +252,7 @@ def list_argument_refusal(arguments):
         _require(arguments.keys() <= {"capabilities", "include_done"})
         _require(type(arguments.get("include_done", False)) is bool)
         if "capabilities" in arguments:
-            _strings(arguments["capabilities"])
+            check_capabilities(arguments["capabilities"])
     except QueueRefusal:
         return refusal("invalid_arguments", verb="list")
     return None
@@ -301,9 +318,9 @@ def _decode_state(raw):
             _require(type(row) is dict and required <= row.keys() <= required | {"branch"})
             _item(row["item"])
             _require(key == row["item"]["id"])
-            _require(type(row["revision"]) is str and _REVISION.fullmatch(row["revision"]) is not None)
+            _require(valid_revision(row["revision"]))
             _require(type(row["state"]) is str and row["state"] in ("queued", "claimed", "done"))
-            _require(row["lane"] is None or _lane(row["lane"]))
+            _require(row["lane"] is None or valid_lane(row["lane"]))
             # _json already bounds stored metadata. Preserve branch evidence
             # under older claim rules; an unsupported value is an item finding,
             # never a reason to disable the queue or its recovery commands.
@@ -416,8 +433,8 @@ def _view(row, now, blockers=()):
     return result
 
 
-def _branch_name(value):
-    """Use lease labels and normalize one optional local-ref prefix; never infer HEAD."""
+def normalize_branch(value):
+    """Return one optional local branch, or QueueRefusal('invalid_arguments'). Performs no I/O."""
     try:
         value = team._check_branch(value)
     except team.TeamUsageError:
@@ -425,10 +442,13 @@ def _branch_name(value):
     if value is None:
         return None
     prefix = "refs/heads/"
-    _require(not value.startswith("refs/") or value.startswith(prefix))
+    _require(not value.startswith("refs/") or value.startswith(prefix), "invalid_arguments")
     name = value[len(prefix):] if value.startswith(prefix) else value
-    _require(bool(name) and name != "HEAD" and not name.startswith("refs/"))
+    _require(bool(name) and name != "HEAD" and not name.startswith("refs/"), "invalid_arguments")
     return name
+
+
+_branch_name = normalize_branch
 
 
 def _branch_evidence(value):
@@ -534,7 +554,8 @@ def _claimable(state, lanes, found, moment, queue_paths, policy, leases_checked,
     if not leases_checked or not policy["valid"]:
         return result
     index = _claim_index(state, found, moment)
-    lane_names = sorted(lanes or {})
+    eligible = {lane for lane in (lanes or {})
+                if lane not in index["busy"] and _capacity(index, lane, policy)}
     for identifier, row in sorted(state["items"].items()):
         if row["state"] == "done" or _live(row, moment):
             continue
@@ -542,12 +563,11 @@ def _claimable(state, lanes, found, moment, queue_paths, policy, leases_checked,
                                          item_blockers[identifier])
         if constraints["blockers"] or constraints["overlaps"] or found.unreadable:
             continue
-        for lane in lane_names:
-            if (lane in index["busy"] or _foreign_lease(constraints["covering"], lane, found)
-                    or not _capacity(index, lane, policy)):
-                continue
+        # No covering lease permits any eligible lane; one requires that lane.
+        # Multiple covering lanes always imply a foreign lease for every lane.
+        covering = constraints["covering"]
+        if eligible and (not covering or (len(covering) == 1 and covering <= eligible)):
             result.append([identifier, row["revision"]])
-            break
     return result
 
 
@@ -726,19 +746,19 @@ def _arguments(verb, valid_clock, caller, arguments):
     if verb == "add":
         arguments["item"] = _item(arguments["item"])
     if verb in ("claim", "release", "unclaim", "done"):
-        _require(_key(arguments.get("identifier")), "invalid_arguments")
+        _require(valid_key(arguments.get("identifier")), "invalid_arguments")
         expected = arguments.get("expect")
-        _require(type(expected) is str and len(expected) == 64 and _REVISION.fullmatch(expected) is not None, "invalid_arguments")
+        _require(valid_revision(expected), "invalid_arguments")
     capabilities = arguments.get("capabilities")
     _require(verb != "claim" or capabilities is not None, "invalid_arguments")
     if capabilities is not None:
         try:
-            _strings(capabilities)
+            check_capabilities(capabilities)
         except QueueRefusal:
             raise QueueRefusal("invalid_arguments") from None
     if verb in ("claim", "release", "unclaim", "done"):
         lane = arguments.get("lane")
-        _require((lane is None and verb not in ("claim", "unclaim")) or _lane(lane), "invalid_arguments")
+        _require((lane is None and verb not in ("claim", "unclaim")) or valid_lane(lane), "invalid_arguments")
     if verb == "unclaim":
         _require(type(arguments.get("writer_stopped")) is bool, "invalid_arguments")
         _require(arguments["writer_stopped"], "writer_not_stopped")
@@ -747,7 +767,7 @@ def _arguments(verb, valid_clock, caller, arguments):
         lane, ttl = arguments.get("lane"), arguments.get("ttl_s")
         _require(type(ttl) is int and 1 <= ttl <= team.MAX_TTL_S, "invalid_arguments")
         try:
-            arguments["branch"] = _branch_name(arguments.get("branch"))
+            arguments["branch"] = normalize_branch(arguments.get("branch"))
         except QueueRefusal:
             raise QueueRefusal("invalid_arguments") from None
     write = verb not in ("list", "audit")

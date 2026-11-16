@@ -24,6 +24,7 @@ import time
 
 from hierarchy_mailbox import GIT_ID, fields, require, text
 from hierarchy_git import object_read_argv, object_read_env
+import hierarchy_hosts
 
 
 GIT_TIMEOUT_SECONDS = 30
@@ -76,8 +77,9 @@ def rendered_size(value):
 
 
 class SourceViews:
-    def __init__(self, repository):
+    def __init__(self, repository, *, planned=None):
         self.repository = repository
+        self.planned = planned
         self._show_cache = None
         top = self.git("rev-parse", "--show-toplevel", check=False)
         require(top.returncode == 0, "--source-repo is not a git repository: " + str(repository))
@@ -89,10 +91,14 @@ class SourceViews:
     def argv(self, *arguments):
         return object_read_argv("-C", str(self.repository), *GIT_SETTINGS, *arguments)
 
+    def read_environment(self):
+        environment = object_read_env()
+        return hierarchy_hosts.child_environment(environment, "no-host") if self.planned is not False else environment
+
     def git(self, *arguments, check=True):
         try:
             result = subprocess.run(self.argv(*arguments), capture_output=True, timeout=GIT_TIMEOUT_SECONDS,
-                                    env=object_read_env(), check=False)
+                                    env=self.read_environment(), check=False)
         except subprocess.TimeoutExpired as exc:
             raise ValueError(TIMED_OUT) from exc
         require(not check or result.returncode == 0, "git failed in the source repository")
@@ -105,7 +111,7 @@ class SourceViews:
         exits 1, as for no match, even when it could not read an object, so any error line is a failure."""
         errors = tempfile.TemporaryFile()
         process = subprocess.Popen(self.argv(*arguments), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                   stderr=errors, env=object_read_env())
+                                   stderr=errors, env=self.read_environment())
         deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
         chunks, size, cut = [], 0, False
         try:

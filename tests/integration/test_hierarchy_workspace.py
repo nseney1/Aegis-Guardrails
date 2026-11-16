@@ -3,6 +3,8 @@
 Git repositories and Aegis leases here are real. Initiative labels are fixtures: nothing
 in this file observes a host session, and a simulated run proves no host behavior.
 """
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import errno
 import hashlib
 import json
@@ -132,6 +134,89 @@ def workspace(tmp_path):
     space = Workspace(tmp_path)
     space.run("init", {"writer_limit": 3, "heavy_limit": 1})
     return space
+
+
+def make_refusal_workspace(tmp_path, workspace_type=Workspace):
+    """Only setup is in-process; refusal assertions still run the isolated CLI."""
+    space = workspace_type(tmp_path)
+    for command, body in (
+        ("init", {"writer_limit": 3, "heavy_limit": 1}),
+        ("register", {"id": "a1", "project": "aegis", "repository": "aegis", "priority": 10,
+                      "target_branch": "develop"}),
+    ):
+        argv = space.argv(command, body)
+        code, result = controller.run(SimpleNamespace(store=str(space.store), command=command, request=argv[-1]))
+        assert code == 0, result
+    return space
+
+
+@contextmanager
+def unchanged_refusal_store(space):
+    def snapshot():
+        return {path.relative_to(space.store).as_posix(): path.read_bytes()
+                for path in space.store.rglob("*") if path.is_file()}
+
+    before = snapshot()
+    try:
+        yield space
+    finally:
+        if snapshot() != before:
+            raise AssertionError("refusal case changed the workspace store")
+
+
+@pytest.fixture
+def refusal_workspace(tmp_path):
+    with unchanged_refusal_store(make_refusal_workspace(tmp_path)) as space:
+        yield space
+
+
+def test_workspace_refusal_setup_never_launches_children(tmp_path):
+    class NoChildrenWorkspace(Workspace):
+        def run(self, *args, **kwargs):
+            pytest.fail("refusal setup must not launch children")
+
+    space = make_refusal_workspace(tmp_path, workspace_type=NoChildrenWorkspace)
+    ledger = controller.Store(space.store).load()
+    assert ledger.seq == 2
+    assert set(ledger.initiatives) == {"a1"}
+    assert not (space.store / ".write.lock").exists()
+
+
+@pytest.mark.parametrize("damage", ["rewrite", "remove", "extra", "lock"])
+def test_workspace_refusal_store_guard_detects_writes(tmp_path, damage):
+    space = make_refusal_workspace(tmp_path)
+    event = space.store / "events" / "00000002.json"
+    with pytest.raises(AssertionError, match="^refusal case changed the workspace store$"):
+        with unchanged_refusal_store(space):
+            if damage == "remove":
+                event.unlink()
+            elif damage == "rewrite":
+                event.write_bytes(b"{}")
+            else:
+                (space.store / (".write.lock" if damage == "lock" else "extra")).write_bytes(b"fixture")
+
+
+def test_workspace_refusal_store_guard_preserves_failure_and_allows_retry(refusal_workspace):
+    with pytest.raises(RuntimeError, match="^fixture case failure$"):
+        with unchanged_refusal_store(refusal_workspace):
+            raise RuntimeError("fixture case failure")
+    with unchanged_refusal_store(refusal_workspace):
+        assert controller.Store(refusal_workspace.store).load().seq == 2
+
+
+def test_workspace_refusal_setup_isolates_concurrent_cases(tmp_path):
+    roots = [tmp_path / name for name in ("first", "second")]
+    for root in roots:
+        root.mkdir()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        spaces = list(executor.map(make_refusal_workspace, roots))
+    assert spaces[0].store != spaces[1].store
+    for space in spaces:
+        with unchanged_refusal_store(space):
+            assert controller.Store(space.store).load().seq == 2
+    event = spaces[0].store / "events" / "00000002.json"
+    with unchanged_refusal_store(spaces[1]):
+        event.unlink()
 
 
 def memo_store(space):
@@ -1974,7 +2059,7 @@ _CREDENTIAL_CORPUS += [(prefix, prefix + "A" * size, prefix + "A" * size) for pr
 
 
 @pytest.mark.parametrize("label,value,credential", _CREDENTIAL_CORPUS, ids=[row[0] for row in _CREDENTIAL_CORPUS])
-def test_workspace_credential_grammar_parity_and_public_refusal(workspace, label, value, credential):
+def test_workspace_credential_grammar_parity_and_public_refusal(refusal_workspace, label, value, credential):
     assert [(pattern.pattern, pattern.flags, replacement) for pattern, replacement, _ in controller._SECRET_REDACTIONS] == [
         (pattern.pattern, pattern.flags, replacement) for pattern, replacement in SECRET_REPLACEMENTS]
     reference = redact_command_secrets(value)
@@ -1982,13 +2067,12 @@ def test_workspace_credential_grammar_parity_and_public_refusal(workspace, label
     with pytest.raises(ValueError) as error:
         controller.Ledger().initiative(value)
     assert str(error.value) == "initiative is not registered: " + fingerprint(value)
-    workspace.register("a1")
     invalid = "../" + value
-    expected = claim_path_refusal(workspace, [invalid])
+    expected = claim_path_refusal(refusal_workspace, [invalid])
     with pytest.raises(ValueError) as error:
-        controller.check_paths(controller.Store(workspace.store).load(), "a1", [invalid])
+        controller.check_paths(controller.Store(refusal_workspace.store).load(), "a1", [invalid])
     assert str(error.value) == expected
-    result = subprocess.run(workspace.argv("check-paths", {"initiative": "a1", "paths": [invalid]}),
+    result = subprocess.run(refusal_workspace.argv("check-paths", {"initiative": "a1", "paths": [invalid]}),
                             capture_output=True, timeout=30)
     assert result.returncode == 2 and result.stderr == b""
     refusal = json.loads(result.stdout)
@@ -2159,7 +2243,6 @@ def test_workspace_known_cli_refusal_preserves_validated_identifier(workspace):
 
 def assert_path_refusal_fingerprints_raw_value(workspace, value):
     value = "../" + value
-    workspace.register("a1")
     ledger = controller.Store(workspace.store).load()
     # Echoed refusal slots still fingerprint the entire original value. Path
     # validation itself now uses the claim's trusted, non-echoing diagnostic.
@@ -2184,30 +2267,30 @@ _SEPARATORS = [pytest.param("\t", id="tab"), pytest.param("\r", id="cr"),
 
 @pytest.mark.parametrize("scheme", _AUTH_SCHEMES)
 @pytest.mark.parametrize("separator", _SEPARATORS)
-def test_workspace_scheme_separators_fingerprint_whole_raw_path(workspace, scheme, separator):
-    assert_path_refusal_fingerprints_raw_value(workspace, "/" + scheme + separator + "SYNTHETIC_OPAQUE_1234567890")
+def test_workspace_scheme_separators_fingerprint_whole_raw_path(refusal_workspace, scheme, separator):
+    assert_path_refusal_fingerprints_raw_value(refusal_workspace, "/" + scheme + separator + "SYNTHETIC_OPAQUE_1234567890")
 
 
 @pytest.mark.parametrize("key", ["password", "passwd", "pwd", "secret", "token", "api key", "private key"])
 @pytest.mark.parametrize("separator", _SEPARATORS)
 @pytest.mark.parametrize("position", ["before-is", "after-is", "both"])
-def test_workspace_prose_separators_fingerprint_whole_raw_path(workspace, key, separator, position):
+def test_workspace_prose_separators_fingerprint_whole_raw_path(refusal_workspace, key, separator, position):
     before = separator if position in ("before-is", "both") else " "
     after = separator if position in ("after-is", "both") else " "
-    assert_path_refusal_fingerprints_raw_value(workspace, "/the " + key + before + "is" + after + "SYNTHETIC_PASSWORD")
+    assert_path_refusal_fingerprints_raw_value(refusal_workspace, "/the " + key + before + "is" + after + "SYNTHETIC_PASSWORD")
 
 
 @pytest.mark.parametrize("scheme", _AUTH_SCHEMES)
 @pytest.mark.parametrize("size", [513, 1025, 1536])
-def test_workspace_oversize_scheme_fingerprints_tail_too(workspace, scheme, size):
-    assert_path_refusal_fingerprints_raw_value(workspace, "/" + scheme + " " + "A" * size + "SYNTHETIC_TAIL")
+def test_workspace_oversize_scheme_fingerprints_tail_too(refusal_workspace, scheme, size):
+    assert_path_refusal_fingerprints_raw_value(refusal_workspace, "/" + scheme + " " + "A" * size + "SYNTHETIC_TAIL")
 
 
 @pytest.mark.parametrize("scheme", _AUTH_SCHEMES)
 @pytest.mark.parametrize("label,token,credential", _CREDENTIAL_CORPUS[6:7] + _CREDENTIAL_CORPUS[10:],
                          ids=[row[0] for row in _CREDENTIAL_CORPUS[6:7] + _CREDENTIAL_CORPUS[10:]])
-def test_workspace_embedded_tokens_cannot_expose_scheme_suffix(workspace, scheme, label, token, credential):
-    assert_path_refusal_fingerprints_raw_value(workspace, "/" + scheme + " " + token + "/SYNTHETIC_SUFFIX")
+def test_workspace_embedded_tokens_cannot_expose_scheme_suffix(refusal_workspace, scheme, label, token, credential):
+    assert_path_refusal_fingerprints_raw_value(refusal_workspace, "/" + scheme + " " + token + "/SYNTHETIC_SUFFIX")
 
 
 @pytest.mark.parametrize("value", [
@@ -2342,8 +2425,8 @@ def test_workspace_clean_conflict_paths_have_bounded_display_cost(workspace, mon
     "/authorization=Bearer SYNTHETIC:OPAQUE_1234567890",
     "/Bearer SYNTHETIC:OPAQUE_1234567890",
 ], ids=["prose-boundary", "assignment-prefix-33", "colon-header", "colon-assignment", "colon-bearer"])
-def test_workspace_argon_variants_fingerprint_the_complete_raw_path(workspace, value):
-    assert_path_refusal_fingerprints_raw_value(workspace, value)
+def test_workspace_argon_variants_fingerprint_the_complete_raw_path(refusal_workspace, value):
+    assert_path_refusal_fingerprints_raw_value(refusal_workspace, value)
 
 
 @pytest.mark.parametrize("glob", ["src/**", "docs/{a,b}/*.md", "tests/[ab]?_x.py", "!vendor/**"])
@@ -2367,6 +2450,7 @@ def test_workspace_clean_globs_echo_unchanged_in_cli_refusal_and_conflict(worksp
                          ids=[row[0] for row in _CREDENTIAL_CORPUS[6:7] + _CREDENTIAL_CORPUS[10:]])
 def test_workspace_token_globs_fingerprint_whole_in_cli_refusal_and_conflict(workspace, label, token, credential):
     glob = "src/*/" + token + "/**"
+    workspace.register("a1")
     assert_path_refusal_fingerprints_raw_value(workspace, "/" + glob)
     workspace.register("owner", touched_paths=[glob])
     request_id = workspace.ask("owner")

@@ -11,16 +11,16 @@ from typing import Any, Dict, Optional, Protocol
 
 from aegis_core.guidance_grammar import (
     bounded_rule_text, clip_redacted, copy_retained_items, guidance_token_estimate,
-    heading_has_slot, raw_evidence_span, redact_labeled,
+    heading_has_slot, raw_do_instruction_span, raw_evidence_span, redact_labeled,
 )
 from aegis_core.taxonomy import JIT_DEFAULT_MAX_TOKENS, RULE_TYPES, WORDS_TO_TOKENS_FACTOR
 
 __all__ = ["CONTROL_GUIDANCE", "GuidanceProjectionError", "GuidanceResult", "MAX_GUIDANCE_CHARS",
            "SLOT_REF_PATTERN", "WITHHELD_GUIDANCE", "checked_result_copy",
            "assembled_text", "project_assembled", "contains_control_characters", "estimate_tokens", "field_text", "finish_payload",
-           "instruction_body", "normalize_layout", "redact_clean_text", "project_detail", "project_display_data",
+           "instruction_body", "normalize_layout", "redact_clean_text", "project_detail", "detail_instruction_visible", "project_display_data",
            "project_envelope_fields", "project_field", "project_identifier", "project_rule_entries",
-           "project_text", "project_display_text", "project_error_name", "raw_rule_text"]
+           "project_text", "project_diagnostic", "project_display_text", "project_error_name", "raw_rule_text"]
 
 MAX_GUIDANCE_CHARS = 1024 * 1024
 MAX_GUIDANCE_ITEMS = 256
@@ -30,6 +30,10 @@ WITHHELD_GUIDANCE = "guidance withheld: ambiguous structure"
 CONTROL_GUIDANCE = "guidance withheld: control characters"
 MAX_IDENTIFIER_ITEMS = 4096
 _IDENTIFIER_FIELDS = frozenset({"id", "name", "path", "_path", "matched_files", "files"})
+_DIAGNOSTIC_ESCAPES = re.compile(
+    r"(?<!\\)(?:(?P<slashes>(?:\\\\)*\\)(?:(?P<space>[tnrvf])|(?P<point>x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8})"
+    r"|N\{(?P<name>[^{}]*)(?P<closed>\}|(?=\{)|$))|\\+)"
+)
 
 
 class _Slots(Protocol):
@@ -205,6 +209,55 @@ def project_detail(body: str, registry: Optional[_Slots] = None) -> str:
     return shown[:boundary][:300]
 
 
+def detail_instruction_visible(body: str, prefix: Optional[str], registry: Optional[_Slots] = None) -> bool:
+    """Whether scan serves the complete prefix ending at the first instruction.
+
+    Require raw and rendered grammar decisions to select the same source span,
+    then render the uncapped prefix with Detail's exact flattening and cleaning
+    semantics and compare against the normal served Detail. Missing instructions,
+    divergence, structural/control refusals and resource/type limits return False.
+    Neither input nor exception text is returned.
+    """
+    if prefix is None:
+        return False
+    try:
+        raw_span = raw_do_instruction_span([prefix], heading_has_slot, contains_control_characters)
+        if raw_span[0] != 1:
+            return False
+        text = _expanded_text(prefix, registry)
+        if text in {WITHHELD_GUIDANCE, CONTROL_GUIDANCE}:
+            return False
+        span = raw_do_instruction_span([text], heading_has_slot, contains_control_characters)
+        if span[:2] != raw_span[:2]:
+            return False
+        # Map each rendered boundary back to its raw boundary by transforming
+        # the complete raw prefix at that boundary. Prefix equality proves the
+        # attribution without duplicating expansion or layout transformations.
+        mapped = tuple(raw_offset if _expanded_text(prefix[:raw_offset], registry) == text[:offset] else -1
+                       for offset, raw_offset in zip(span[2:], raw_span[2:]))
+        if (span[0], span[1], *mapped) != raw_span:
+            return False
+        instruction_line = text.count("\n", 0, span[2])
+        text = text.rstrip()
+        pieces, labels = [], []
+        for number, line in enumerate(text.split("\n")):
+            fragment = line.strip()
+            if not pieces and not fragment:
+                continue
+            if pieces:
+                pieces.append(" ")
+                labels.append(number)
+            pieces.append(fragment)
+            labels.extend([number] * len(fragment))
+        required, labels = _redact_labeled("".join(pieces), labels)
+        if not any(label == instruction_line and not char.isspace() for char, label in zip(required, labels)):
+            return False
+        detail = project_detail(body, registry)
+        return bool(required) and detail not in {WITHHELD_GUIDANCE, CONTROL_GUIDANCE} and detail.startswith(required)
+    except GuidanceProjectionError:
+        return False
+
+
 def project_field(value: Any, registry: Optional[_Slots] = None, *, body: bool = False) -> str | list[str]:
     if value is None:
         return ""
@@ -267,6 +320,56 @@ def project_display_text(text: str, max_len: Optional[int] = 1024) -> str:
         return clip_redacted(shown, max_len - 3) + "..."
     except GuidanceProjectionError as exc:
         return exc.code
+
+
+def _diagnostic_space(char: str) -> bool:
+    """Use repr's non-printable boundary, together with diagnostic whitespace."""
+    return char.isspace() or not char.isprintable()
+
+
+def _diagnostic_escape(match) -> str:
+    """Preserve repr's literal pairs; only an odd trailing slash can escape."""
+    slashes = match["slashes"]
+    if slashes is None:
+        # A literal run must not consume a following apparent escape body.
+        return match[0]
+    literal = slashes[:-1]
+    if match["space"] is not None:
+        return literal + " "
+    if match["point"] is not None:
+        point = int(match["point"][1:], 16)
+        if point > 0x10FFFF:
+            return match[0]
+        char = chr(point)
+    else:
+        if match["closed"] != "}" or "\\" in match["name"] or not match["name"].isascii():
+            raise _InvalidField(_InvalidField.code)
+        try:
+            char = unicodedata.lookup(match["name"])
+        except KeyError:
+            raise _InvalidField(_InvalidField.code) from None
+    return literal + " " if any(_diagnostic_space(c) for c in char) else match[0]
+
+
+def project_diagnostic(text: str, *, escaped: bool = True) -> str:
+    """Bound, canonicalize, redact and clip diagnostics; literal parts use escaped=False."""
+    if type(text) is not str or type(escaped) is not bool:
+        return "guidance_projection_invalid_field"
+    if len(text) > MAX_GUIDANCE_CHARS:
+        return GuidanceProjectionError.code
+    try:
+        canonical = "".join(" " if _diagnostic_space(ch) else ch for ch in text)
+        # Each run starts once; named escapes end at the next brace or input end.
+        literal = (_DIAGNOSTIC_ESCAPES.sub(_diagnostic_escape, normalize_layout(canonical, single_line=True))
+                   if escaped else normalize_layout(canonical, single_line=True))
+        literal = normalize_layout(literal, single_line=True)
+        # Malformed nesting may create a fresh escape. Refuse it rather than recursively reparsing.
+        if escaped and any(_diagnostic_escape(match) != match[0] for match in _DIAGNOSTIC_ESCAPES.finditer(literal)):
+            return "guidance_projection_invalid_field"
+        shown = redact_clean_text(literal)
+        return shown if len(shown) <= 1024 else clip_redacted(shown, 1021) + "..."
+    except GuidanceProjectionError as error:
+        return error.code
 
 
 def assembled_text(value: str) -> str:
