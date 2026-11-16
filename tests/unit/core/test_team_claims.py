@@ -1,5 +1,6 @@
 """Recoverable unclaim transitions through the public queue service."""
 from concurrent.futures import ProcessPoolExecutor
+import hashlib
 import json
 import os
 from pathlib import PureWindowsPath
@@ -784,8 +785,10 @@ def test_large_fingerprint_observation_has_linear_evaluation_budget(make_store, 
     assert len(raw) <= queue.MAX_BYTES
     path.write_bytes(raw)
     lease = team.claim(make_store, "l3999", ["src/**"], owner="owner", now=100)
-    counts = {"items": 0, "holds": 0, "overlaps": 0, "live_checks": 0}
+    counts = {"items": 0, "holds": 0, "overlaps": 0, "live_checks": 0,
+              "foreign_lease": 0, "capacity": 0}
     original_blockers, original_live, paths = queue._blockers, queue._live, queue.team_paths
+    original_foreign, original_capacity = queue._foreign_lease, queue._capacity
 
     def blockers(item, *args, **kwargs):
         counts["items"] += 1
@@ -803,8 +806,18 @@ def test_large_fingerprint_observation_has_linear_evaluation_budget(make_store, 
         assert counts["live_checks"] <= 4 * (count * holds + count * lane_count), counts
         return original_live(*args)
 
+    def foreign(*args):
+        counts["foreign_lease"] += 1
+        return original_foreign(*args)
+
+    def capacity(*args):
+        counts["capacity"] += 1
+        return original_capacity(*args)
+
     monkeypatch.setattr(queue, "_blockers", blockers)
     monkeypatch.setattr(queue, "_live", live)
+    monkeypatch.setattr(queue, "_foreign_lease", foreign)
+    monkeypatch.setattr(queue, "_capacity", capacity)
     monkeypatch.setattr(queue, "team_paths", SimpleNamespace(**{**vars(paths), "overlap": overlap}))
     started = time.monotonic()
     result = queue.list(make_store, now=102)
@@ -814,9 +827,13 @@ def test_large_fingerprint_observation_has_linear_evaluation_budget(make_store, 
     assert elapsed < 30, (elapsed, counts)
     record_property("observation_budget", json.dumps({**counts, "seconds": elapsed,
         "config_bytes": len(config_raw), "queue_bytes": len(raw), "lanes": lane_count, "items": count}))
+    assert counts["foreign_lease"] == 0, counts
+    assert counts["capacity"] <= lane_count, counts
     monkeypatch.setattr(queue, "_blockers", original_blockers)
     monkeypatch.setattr(queue, "_live", original_live)
     monkeypatch.setattr(queue, "team_paths", paths)
+    monkeypatch.setattr(queue, "_foreign_lease", original_foreign)
+    monkeypatch.setattr(queue, "_capacity", original_capacity)
     revision = result["items"][0]["revision"]
     claimed = queue.claim(make_store, "I000", expect=revision, lane="l3999", now=102)
     assert claimed["refused"] is (case == "holds")
@@ -879,6 +896,127 @@ def test_round_two_fingerprint_golden(make_store, monkeypatch, record_property, 
     assert not result["refused"], result
     record_property("round_two_golden", json.dumps({case: result["claimable_fingerprint"]}))
     assert result["claimable_fingerprint"] == ROUND_TWO_FINGERPRINTS[case]
+
+
+# Public full-list response hashes captured at d896c4db before product edits.
+LANE_ELIGIBILITY_GOLDENS = {
+    "empty": "e1395b2bd419e1e2aeb537041a844ef9266fa7de16bf874b8641f2734ec26787",
+    "cover-alpha": "2f43411ae899098a532d6949ecc3d62e50589cece06a7f7a08477bc0bdefb380",
+    "cover-beta": "ece667d317c79e2fd0bd18df6f0f185bf04501f96977c05e31a4c41dd495f344",
+    "cover-two": "cca91a8d827952b90274355a4592a700b64e0963a11d92f395cf25e85dab14e8",
+    "cover-unconfigured": "03a3a521a094a759def2001e0350d256f7689e8f7b7d80b627f1076b9d28b155",
+    "busy-cover": "186c01a4b25b2d4cdd4932eda7d06d4738bfb73b58514219458d20cceab90659",
+    "busy-other": "9063f30b3d7f83dc50fe90212f0f4fe37b4ae469d971557fa4ce632eb7fd7f24",
+    "busy-all": "27783ed7d5fbe427bfd0b1cdd3026a534ea382b5a913f4c045bef2e54c4b724a",
+    "capacity-cover": "11b4dae0dfeba1f5ced56bf649156215ad9fa690381a4ed23a0c1508a02baab9",
+    "capacity-empty": "f4e907d8122600c044fdc039a762e70d637f6b178ddc1246c7124dcb3393a7dd",
+    "over-capacity": "e840265df73173094d71b60c38dd2950a15d50b90567eefc7a79bc02ef967915",
+    "invalid-profile": "b3797bbdb6aa1642bc30bef6685feb0f71545f4ebf742eeb6cec8c30b4af41a9",
+    "unchecked": "ca32255d9472dee8c9956f9601ee77925a6897d943dfa64c7b2d92fd4fcb710a",
+    "unreadable": "812da6d72e931a910078d9aa72da9be24b7156afc78fbdd0bada968f226df834",
+    "done": "8107aa3525fd39fe96e9c01037ebaabe64f33c065397d9c813f56bc02294c197",
+    "live": "099dd4b9c8acb5e4f2b5deea46d752f631ba4bc56c65c5875622dd518a20372e",
+    "expired": "c5d8679843f9c195682bd1b3de8de843efa19b362fa41b32367157fac0fa9420",
+    "no-lanes": "5c0899720345c4107f16946d81b9ef32d6895058a9b80b307e57c02d618e5790",
+}
+
+
+@pytest.mark.parametrize("case,claimable", [
+    ("empty", True), ("cover-alpha", True), ("cover-beta", True),
+    ("cover-two", False), ("cover-unconfigured", False),
+    ("busy-cover", False), ("busy-other", True), ("busy-all", False),
+    ("capacity-cover", True), ("capacity-empty", False), ("over-capacity", False),
+    ("invalid-profile", False), ("unchecked", False), ("unreadable", False),
+    ("done", False), ("live", False), ("expired", True), ("no-lanes", False),
+])
+def test_list_lane_eligibility_matrix(make_store, monkeypatch, record_property, case, claimable):
+    row = {"item": {"id": "ONE", "title": "Work", "paths": ["src/**"], "capabilities": []},
+        "state": "queued", "revision": "1" * 64, "lane": None, "expires_at": None}
+    state = {"version": 1, "items": {"ONE": row}, "milestones": [], "completed": {}}
+    lanes = {"alpha": ["src/**"], "beta": ["docs/**"]}
+    lease_specs = {
+        "cover-alpha": [("alpha", "src/**")], "cover-beta": [("beta", "src/**")],
+        "cover-two": [("alpha", "src/**"), ("beta", "src/**")],
+        "cover-unconfigured": [("foreign", "src/**")],
+        "busy-cover": [("alpha", "src/**")], "busy-other": [("alpha", "src/**")],
+        "capacity-cover": [("alpha", "src/**")], "capacity-empty": [("foreign", "docs/**")],
+        "over-capacity": [("alpha", "src/**"), ("beta", "docs/**")],
+    }
+    leases = tuple(team.Lease(lane, "implementer", "owner", "0" * 16, 1, None,
+                             (scope,), 100, 3600, str(index + 1) * 40)
+                   for index, (lane, scope) in enumerate(lease_specs.get(case, [])))
+    unreadable = ((team.Unreadable("foreign", team.lane_ref("foreign"), "b" * 40, "invalid"),)
+                  if case == "unreadable" else ())
+    found, checked = team.LeaseSet(leases, unreadable), case != "unchecked"
+    if case in ("busy-cover", "busy-other", "busy-all"):
+        busy_lanes = ("alpha", "beta") if case == "busy-all" else (
+            "beta" if case == "busy-other" else "alpha",)
+        for lane in busy_lanes:
+            state["items"][lane] = {"item": {"id": lane, "title": "Busy", "paths": ["busy/**"],
+                "capabilities": []}, "state": "claimed", "revision": "2" * 64,
+                "lane": lane, "expires_at": 200}
+    if case == "done":
+        row["state"] = "done"
+    elif case in ("live", "expired"):
+        row.update(state="claimed", lane="alpha", expires_at=103 if case == "live" else 102)
+    elif case == "no-lanes":
+        lanes = {}
+        (make_store / ".aegis" / "team.json").write_text('{"v":1,"lanes":{}}', encoding="utf-8")
+    limit = 1 if case.startswith("capacity-") or case == "over-capacity" else 2
+    policy = {"valid": True, "writers_max": limit} if case != "invalid-profile" else {"valid": False}
+    profile = make_store / ".aegis" / "team" / "profile.json"
+    profile.parent.mkdir()
+    profile.write_text(json.dumps({"version": 1, "run_config": {"limits": {"writers_max": limit}}})
+                       if policy["valid"] else "{}", encoding="utf-8")
+    path = make_store / ".aegis" / "state" / "team-queue.json"
+    path.parent.mkdir()
+    path.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
+    before = path.read_bytes()
+    monkeypatch.setattr(team_claims, "observe_leases", lambda root: (found, checked))
+    expected = team_claims.fingerprint(state, found, 102,
+        [["ONE", row["revision"]]] if claimable else [], lanes or None, policy, checked)
+    for _ in range(2):
+        result = queue.list(make_store, now=102, include_done=True)
+        assert not result["refused"], result
+        assert result["claimable_fingerprint"] == expected
+        assert queue.list(make_store, now=102, view="fingerprint")["claimable_fingerprint"] == expected
+        assert path.read_bytes() == before
+    # Exclude the release version so a version bump does not invalidate the fixture.
+    payload = {key: value for key, value in result.items() if key != "aegis_version"}
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("ascii")).hexdigest()
+    record_property("lane_eligibility_golden", json.dumps({case: digest}))
+    assert digest == LANE_ELIGIBILITY_GOLDENS[case]
+
+
+@pytest.mark.parametrize("view", ["full", "fingerprint"])
+def test_list_lane_eligibility_unsupported_platform(tmp_path, monkeypatch, view):
+    monkeypatch.setattr(queue, "descriptor_supported", lambda: False)
+    result = queue.list(tmp_path, now=102, view=view)
+    assert result["refused"] and result["reason"] == "unsupported_platform"
+    assert result["exit_code"] == 1
+
+
+def test_list_lane_eligibility_uses_one_lease_snapshot_and_refreshes(make_store, monkeypatch):
+    added = queue.add(make_store, {"id": "ONE", "title": "Work", "paths": ["src/**"],
+                                 "capabilities": []}, now=100)
+    assert not added["refused"], added
+    before = queue.list(make_store, now=102)
+    original, published = queue._capacity, []
+
+    def publish_during_observation(*args):
+        if not published:
+            published.append(team.claim(make_store, "foreign", ["src/**"], owner="owner", now=100))
+        return original(*args)
+
+    monkeypatch.setattr(queue, "_capacity", publish_during_observation)
+    assert queue.list(make_store, now=102) == before
+    assert len(published) == 1
+    after = queue.list(make_store, now=102)
+    assert not after["refused"], after
+    assert after["claimable_fingerprint"] != before["claimable_fingerprint"]
+    assert queue.list(make_store, now=102) == after
+    team.release(make_store, "foreign", published[0].oid, caller="owner")
+    assert queue.list(make_store, now=102) == before
 
 
 def plant_pending(root, monkeypatch):

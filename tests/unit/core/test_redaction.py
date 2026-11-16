@@ -447,3 +447,141 @@ def test_the_hook_adapter_loads_no_scanner_stack(tmp_path: Path):
                      "aegis_core.errors"}
     assert sorted(loaded & scanner_stack) == []
     assert len(loaded) <= 7, sorted(loaded)
+
+
+def test_url_credential_removal_and_atomic_clip_live_only_in_redaction():
+    """URL removal and atomic clipping are defined once, in aegis_core.redaction."""
+    import aegis_core.redaction as redaction
+    from aegis_core import guidance_grammar
+    from aegis_core.proposals import model as proposal_model
+
+    model_tree = ast.parse((REPO / "aegis_core" / "proposals" / "model.py").read_text(encoding="utf-8"))
+    defined = {node.name for node in model_tree.body if isinstance(node, ast.FunctionDef)}
+    assert {"_strip_url_secrets", "_clip_text", "_ambiguous_authority"}.isdisjoint(defined)
+    redaction_tree = ast.parse((REPO / "aegis_core" / "redaction.py").read_text(encoding="utf-8"))
+    redaction_defined = {node.name for node in redaction_tree.body if isinstance(node, ast.FunctionDef)}
+    assert {"remove_url_credentials", "clip_atomic_text"}.issubset(redaction_defined)
+    assert redaction.remove_url_credentials.__module__ == "aegis_core.redaction"
+    assert redaction.clip_atomic_text.__module__ == "aegis_core.redaction"
+    assert "remove_url_credentials" in redaction.__all__
+    assert "clip_atomic_text" in redaction.__all__
+    source = (REPO / "aegis_core" / "proposals" / "model.py").read_text(encoding="utf-8")
+    assert "remove_url_credentials" in source and "clip_atomic_text" in source
+    assert proposal_model.remove_url_credentials is redaction.remove_url_credentials
+    assert proposal_model.clip_atomic_text is redaction.clip_atomic_text
+    assert guidance_grammar.clip_atomic_text is redaction.clip_atomic_text
+    assert guidance_grammar.remove_url_credentials is redaction.remove_url_credentials
+    assert proposal_model.clean_text("https://ci.example/path", 64) == "https://ci.example/path"
+
+
+@pytest.mark.parametrize("name", ["remove_url_credentials", "clip_atomic_text"])
+@pytest.mark.parametrize("policy", ["proposal", "guidance"])
+@pytest.mark.parametrize("bad", [None, b"text", 1, ["text"]],
+                         ids=["none", "bytes", "number", "list"])
+def test_shared_cleaners_refuse_malformed_text_then_retry(name, policy, bad):
+    from aegis_core import redaction
+
+    cleaner = getattr(redaction, name)
+    for _ in range(2):
+        with pytest.raises(redaction.RedactionRefusal, match="^invalid$") as caught:
+            cleaner(bad, limit=32, policy=policy)
+        assert caught.value.code == "invalid"
+        assert cleaner("plain", limit=32, policy=policy) == "plain"
+
+
+@pytest.mark.parametrize("name", ["remove_url_credentials", "clip_atomic_text"])
+@pytest.mark.parametrize("policy", ["proposal", "guidance"])
+@pytest.mark.parametrize("limit", [-1, True, None, 1.5, "32"])
+def test_shared_cleaners_refuse_invalid_limits_then_retry(name, policy, limit):
+    from aegis_core import redaction
+
+    cleaner = getattr(redaction, name)
+    with pytest.raises(redaction.RedactionRefusal, match="^invalid$") as caught:
+        cleaner("private input", limit=limit, policy=policy)
+    assert caught.value.code == "invalid"
+    assert cleaner("plain", limit=32, policy=policy) == "plain"
+
+
+@pytest.mark.parametrize("name", ["remove_url_credentials", "clip_atomic_text"])
+def test_shared_cleaner_input_ceiling_and_concurrent_refusal_recovery(name):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core import redaction
+
+    cleaner = getattr(redaction, name)
+    text = "z" * redaction.MAX_GUIDANCE_CHARS
+    assert cleaner(text, limit=len(text)) == text
+
+    def refusing_then_retry(_):
+        with pytest.raises(redaction.RedactionRefusal, match="^too_large$") as caught:
+            cleaner(text + "z", limit=3)
+        assert caught.value.code == "too_large"
+        return cleaner("plain", limit=32)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(refusing_then_retry, range(6))) == ["plain"] * 6
+
+
+@pytest.mark.parametrize("policy", ["proposal", "guidance"])
+def test_named_cleaner_policies_preserve_url_and_whitespace_contracts(policy):
+    from aegis_core.redaction import clip_atomic_text, remove_url_credentials
+
+    masked = "ftp://u:[REDACTED]@ci.example/p?q=hidden#private"
+    expected = "ftp://ci.example/p" if policy == "proposal" else masked
+    assert remove_url_credentials(masked, limit=300, policy=policy) == expected
+    assert remove_url_credentials(expected, limit=300, policy=policy) == expected
+    expected = "plain" if policy == "proposal" else "plain "
+    assert clip_atomic_text("plain tail", 6, policy=policy) == expected
+    assert clip_atomic_text(expected, 6, policy=policy) == expected
+    expected = "xxghp_" if policy == "proposal" else "xx"
+    assert clip_atomic_text("xxghp_REDACTED tail", 6, policy=policy) == expected
+
+
+@pytest.mark.parametrize("name", ["remove_url_credentials", "clip_atomic_text"])
+@pytest.mark.parametrize("policy", ["guidance", "proposal"])
+def test_named_cleaner_policies_bound_input_and_retry_concurrently(name, policy):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core import redaction
+
+    cleaner = getattr(redaction, name)
+    ceiling = 1024 * 1024 if policy == "guidance" else redaction.MAX_GUIDANCE_CHARS
+    text = "z" * ceiling
+    assert cleaner(text, limit=ceiling, policy=policy) == text
+    oversized = text + "z"
+
+    def refusing_then_retry(_):
+        with pytest.raises(redaction.RedactionRefusal, match="^too_large$") as caught:
+            cleaner(oversized, limit=3, policy=policy)
+        assert caught.value.code == "too_large"
+        return cleaner("plain", limit=32, policy=policy)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(refusing_then_retry, range(6))) == ["plain"] * 6
+
+
+@pytest.mark.parametrize("name", ["remove_url_credentials", "clip_atomic_text"])
+@pytest.mark.parametrize("policy", [None, [], True, "unknown"],
+                         ids=["none", "list", "bool", "unknown"])
+def test_shared_cleaners_refuse_unknown_policy_without_echo(name, policy):
+    from aegis_core import redaction
+
+    cleaner = getattr(redaction, name)
+    with pytest.raises(redaction.RedactionRefusal, match="^invalid$") as caught:
+        cleaner("private input", limit=32, policy=policy)
+    assert caught.value.code == "invalid"
+    assert cleaner("plain", limit=32, policy="guidance") == "plain"
+
+
+def test_guidance_wrappers_use_the_shared_named_policy():
+    from aegis_core import guidance_grammar as grammar
+
+    assert grammar.clip_redacted("plain tail", 6) == "plain "
+    assert grammar.redact_labeled("plain", [0] * 5, 32) == ("plain", [0] * 5)
+    text = "ftp://u:pass@ci.example/p?q=hidden#private"
+    expected = "ftp://u:[REDACTED]@ci.example/p?q=hidden#private"
+    assert grammar.redact_labeled(text, [0] * len(text), 300) == (expected, [0] * len(expected))
+    assert grammar.clip_redacted("xxghp_REDACTED tail", 6) == "xx"
+    with pytest.raises(ValueError, match="^guidance_projection_limit$"):
+        grammar.clip_redacted("plain", -1)
+    with pytest.raises(ValueError, match="^guidance_projection_limit$"):
+        grammar.redact_labeled("plain", None, 3)
+    assert grammar.clip_redacted("retry", 32) == "retry"

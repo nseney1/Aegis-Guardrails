@@ -1,16 +1,352 @@
 """Queue behaviour through its service, with real storage and process races."""
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 import json
 import multiprocessing
 import os
 import shutil
 import subprocess
 from types import SimpleNamespace
+from unittest.mock import patch as queue_patch
 
 import pytest
 
 from conftest import symlink_or_skip
 from aegis_core import atomicio, primitives, storage, storage_confined, team, team_queue as queue
+from aegis_core.redaction import redact_command_secrets
+
+
+_RACE_CONTROL = SimpleNamespace()
+
+
+class _PipeReadiness:
+    """A one-byte readiness message, with no lock shared with a worker."""
+    def __init__(self, reader, writer):
+        self.reader, self.writer = reader, writer
+        self.pause = None
+        self.signaled = False
+
+    def set(self):
+        self.writer.send_bytes(b"r")
+        if self.pause is not None:
+            self.pause.wait(30)
+
+    def wait(self, timeout):
+        return self.signaled or self.reader.poll(timeout)
+
+    def is_set(self):
+        if not self.signaled and self.reader.poll(0):
+            try:
+                self.signaled = self.reader.recv_bytes(1) == b"r"
+            except (EOFError, OSError):
+                return False
+        return self.signaled
+
+
+class _PipeRelease:
+    """Closing the parent writer releases every polling child reader."""
+    def __init__(self, *, reader=None, writer=None, waiting=None):
+        self.reader, self.writer, self.waiting = reader, writer, waiting
+
+    def set(self):
+        self.writer.close()
+
+    def wait(self, timeout):
+        if self.waiting is not None:
+            self.waiting.send_bytes(b"w")
+        return self.reader.poll(timeout)
+
+
+class _PipeControls:
+    def __init__(self, context):
+        self.connections = []
+        try:
+            reader, writer = context.Pipe(duplex=False)
+            self.connections.extend((reader, writer))
+            self.entered = _PipeReadiness(reader, writer)
+            reader, writer = context.Pipe(duplex=False)
+            self.connections.extend((reader, writer))
+            self.release = _PipeRelease(writer=writer)
+            # A worker receives no release writer, so parent close means EOF.
+            self.worker_release = _PipeRelease(reader=reader)
+        except BaseException:
+            self.close()
+            raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *error):
+        self.close()
+
+    def close(self):
+        for connection in self.connections:
+            connection.close()
+
+
+def _readiness_pause_worker(entered, release, action):
+    if action == "terminate-ready":
+        entered.pause = release
+    entered.set()
+    release.wait(30)
+
+
+def _readiness_probe(action):
+    from threading import Thread
+    context = multiprocessing.get_context("spawn")
+    connections = []
+    process = None
+    watchdog = None
+    try:
+        ready_reader, ready_writer = context.Pipe(duplex=False)
+        connections.extend((ready_reader, ready_writer))
+        release_reader, release_writer = context.Pipe(duplex=False)
+        connections.extend((release_reader, release_writer))
+        waiting_reader, waiting_writer = context.Pipe(duplex=False)
+        connections.extend((waiting_reader, waiting_writer))
+        entered = _PipeReadiness(ready_reader, ready_writer)
+        release = _PipeRelease(writer=release_writer)
+        worker_release = _PipeRelease(reader=release_reader, waiting=waiting_writer)
+        process = context.Process(target=_readiness_pause_worker,
+            args=(entered, worker_release, action))
+        process.start()
+        assert waiting_reader.poll(5), "worker did not enter the readiness/release wait"
+        assert waiting_reader.recv_bytes(1) == b"w"
+        if action == "kill-waiter":
+            process.kill()
+        else:
+            process.terminate()
+        process.join(0.5)
+        if process.is_alive():
+            process.kill()
+        process.join(2)
+        assert not process.is_alive()
+        watchdog = Thread(target=release.set, daemon=True)
+        watchdog.start()
+        watchdog.join(1)
+        assert not watchdog.is_alive()
+        return entered.is_set()
+    finally:
+        if process is not None and process.pid is not None:
+            if process.is_alive():
+                process.terminate()
+            process.join(0.5)
+            if process.is_alive():
+                process.kill()
+            process.join(2)
+            if not process.is_alive():
+                process.close()
+        for connection in connections:
+            connection.close()
+
+
+@pytest.mark.parametrize("action", ["terminate-ready", "kill-waiter"])
+def test_pipe_controls_survive_terminated_readiness_and_killed_waiter(action):
+    assert _spawn_race(_readiness_probe, [action], timeout=8) == [True]
+    assert multiprocessing.active_children() == []
+
+
+def _race_process(worker, argument, writer, initializer, initargs, after_send):
+    try:
+        try:
+            if initializer is not None:
+                initializer(*initargs)
+            outcome = {"status": "ok", "value": worker(argument)}
+            message = json.dumps(outcome, ensure_ascii=True).encode("ascii")
+            if len(message) > 65536:
+                raise AssertionError("spawned race result exceeds 65536 bytes")
+        except BaseException as error:
+            try:
+                kind = redact_command_secrets(primitives.sanitize_display(
+                    type(error).__name__, max_len=None))[:80]
+                detail = redact_command_secrets(primitives.sanitize_display(
+                    str(error), max_len=None))[:512]
+            except BaseException:
+                kind, detail = "AssertionError", "race worker failed while formatting its diagnostic"
+            outcome = {"status": "error", "kind": kind, "message": detail}
+            message = json.dumps(outcome, ensure_ascii=True).encode("ascii")
+        try:
+            writer.send_bytes(message)
+        except OSError:
+            raise SystemExit(1) from None
+        if outcome["status"] != "ok":
+            raise SystemExit(1)
+        if after_send is not None:
+            after_send()
+    finally:
+        writer.close()
+
+
+def _spawn_race(worker, arguments, *, timeout=30, initializer=None, initargs=(), after_send=None):
+    """Own each spawned worker and escalate cleanup without unbounded joins."""
+    from concurrent.futures import FIRST_EXCEPTION, Future, wait
+    from threading import Thread
+    from time import monotonic
+    context = multiprocessing.get_context("spawn")
+    processes, connections, readers, pending = [], [], [], []
+
+    def receive(reader, future):
+        try:
+            raw = reader.recv_bytes(65536)
+            text = primitives.json_preflight(raw, max_bytes=65536, max_depth=32,
+                max_nodes=4096, max_items=4096, max_string=65536)
+            outcome = primitives.strict_loads(text)
+            assert isinstance(outcome, dict), "invalid spawned race outcome"
+            if outcome.get("status") == "ok" and set(outcome) == {"status", "value"}:
+                future.set_result(outcome["value"])
+                return
+            assert set(outcome) == {"status", "kind", "message"}, "invalid spawned race failure"
+            assert outcome["status"] == "error", "invalid spawned race failure status"
+            kind, message = outcome["kind"], outcome["message"]
+            assert isinstance(kind, str) and len(kind) <= 80, "invalid spawned race error kind"
+            assert isinstance(message, str) and len(message) <= 512, "invalid spawned race error message"
+            error_type = {"ValueError": ValueError, "TimeoutError": FutureTimeoutError}.get(kind, AssertionError)
+            future.set_exception(error_type(message))
+        except EOFError:
+            future.set_exception(FutureTimeoutError("spawned race worker exited without a result"))
+        except BaseException:
+            future.set_exception(AssertionError("invalid spawned race outcome"))
+
+    try:
+        deadline = monotonic() + timeout
+        for argument in arguments:
+            reader, writer = context.Pipe(duplex=False)
+            connections.extend((reader, writer))
+            process = context.Process(target=_race_process,
+                args=(worker, argument, writer, initializer, initargs, after_send))
+            processes.append(process)
+            process.start()
+            writer.close()
+            future = Future()
+            pending.append(future)
+            thread = Thread(target=receive, args=(reader, future), daemon=True)
+            readers.append(thread)
+            thread.start()
+        completed, incomplete = wait(pending, timeout=max(0, deadline - monotonic()),
+                                     return_when=FIRST_EXCEPTION)
+        for future in completed:
+            if future.exception() is not None:
+                future.result()
+        if incomplete:
+            raise FutureTimeoutError()
+        for process in processes:
+            process.join(max(0, deadline - monotonic()))
+            if process.is_alive():
+                raise FutureTimeoutError()
+            if process.exitcode != 0:
+                raise AssertionError("race worker exited with status " + str(process.exitcode))
+        return [future.result() for future in pending]
+    finally:
+        try:
+            for process in processes:
+                if process.pid is not None and process.is_alive():
+                    process.terminate()
+            deadline = monotonic() + 0.5
+            for process in processes:
+                if process.pid is not None:
+                    process.join(max(0, deadline - monotonic()))
+            for process in processes:
+                if process.pid is not None and process.is_alive():
+                    process.kill()
+            deadline = monotonic() + 2
+            for process in processes:
+                if process.pid is not None:
+                    process.join(max(0, deadline - monotonic()))
+            deadline = monotonic() + 2
+            for thread in readers:
+                if thread.ident is not None:
+                    thread.join(max(0, deadline - monotonic()))
+            assert not any(process.is_alive() for process in processes), "race worker survived kill"
+            assert not any(thread.is_alive() for thread in readers), "race result reader did not stop"
+        finally:
+            for connection in connections:
+                connection.close()
+            for process in processes:
+                if not process.is_alive():
+                    process.close()
+
+
+def _hang_after_race_result():
+    from threading import Event, Thread
+    Thread(target=Event().wait, args=(30,), daemon=False).start()
+
+
+def _exit_after_race_result():
+    raise SystemExit(7)
+
+
+@pytest.mark.parametrize("shutdown", ["hang", "exit"])
+def test_spawn_race_requires_clean_exit_after_result(shutdown):
+    callback = _hang_after_race_result if shutdown == "hang" else _exit_after_race_result
+    expected = FutureTimeoutError if shutdown == "hang" else AssertionError
+    message = None if shutdown == "hang" else "^race worker exited with status 7$"
+    with pytest.raises(expected, match=message):
+        _spawn_race(_race_control_worker, ["return"], timeout=5, after_send=callback)
+    assert multiprocessing.active_children() == []
+    assert _spawn_race(_race_control_worker, ["return"]) == ["spawn"]
+    assert multiprocessing.active_children() == []
+
+
+def _race_control_init(entered, release):
+    _RACE_CONTROL.entered, _RACE_CONTROL.release = entered, release
+
+
+def _race_control_worker(action):
+    if action == "return":
+        return multiprocessing.get_start_method()
+    if action == "raise":
+        assert _RACE_CONTROL.entered.wait(10), "blocked peer did not enter"
+        raise ValueError("race control failed")
+    if action == "exit":
+        assert _RACE_CONTROL.entered.wait(10), "blocked peer did not enter"
+        os._exit(7)
+    if action == "ignore":
+        import signal
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    _RACE_CONTROL.entered.set()
+    assert _RACE_CONTROL.release.wait(60), "control was not released"
+    if action == "ignore":
+        os._exit(0)
+    return "released"
+
+
+@pytest.mark.parametrize("action,timeout", [("blocked", 30), ("exit", 10), ("raise", 10),
+                                         ("raise-later", 10), ("ignore", 5)])
+def test_spawn_race_failure_reaps_workers_before_retry(action, timeout):
+    from threading import Event, Thread
+    if action == "ignore" and os.name != "posix":
+        pytest.skip("requires POSIX SIGTERM handlers")
+    context = multiprocessing.get_context("spawn")
+    with _PipeControls(context) as controls:
+        entered, release = controls.entered, controls.release
+        done, rescued = Event(), Event()
+
+        def rescue():
+            if not done.wait(timeout + 8):
+                rescued.set()
+            release.set()
+
+        watchdog = Thread(target=rescue, daemon=True)
+        try:
+            watchdog.start()
+            expected = ValueError if action in {"raise", "raise-later"} else FutureTimeoutError
+            message = "^race control failed$" if action in {"raise", "raise-later"} else None
+            actions = (["ignore"] * 2 if action == "ignore" else
+                       ["raise", "blocked"] if action == "raise" else
+                       ["blocked", "raise"] if action == "raise-later" else ["blocked", action])
+            with pytest.raises(expected, match=message):
+                _spawn_race(_race_control_worker, actions, timeout=timeout,
+                            initializer=_race_control_init, initargs=(entered, controls.worker_release))
+            assert entered.is_set(), "failure control never reached its blocked worker"
+            assert not rescued.is_set(), "pool shutdown waited for the blocked worker"
+            assert multiprocessing.active_children() == []
+            assert _spawn_race(_race_control_worker, ["return"] * 2) == ["spawn"] * 2
+            assert multiprocessing.active_children() == []
+        finally:
+            done.set()
+            if watchdog.ident is not None:
+                watchdog.join(10)
+            assert not watchdog.is_alive()
 
 
 @pytest.mark.parametrize("limit,bound", [("bytes", 0), ("depth", 2), ("nodes", 11),
@@ -96,13 +432,9 @@ def test_shared_json_byte_limit_is_utf8_before_parsing(raw, as_bytes):
         primitives.json_preflight(value, **limits)
 
 
-def test_json_preflight_callers_share_no_concurrent_state(make_store):
+def _threaded_json_preflight(arguments):
     from aegis_core import team_profile
-    root = make_store
-    target = root.joinpath(*team_profile.REPO_PATH)
-    target.parent.mkdir(mode=0o700, parents=True)
-    target.write_bytes(b'{"version":1}')
-    expected = team_profile.load(root, user_root=root)
+    root, expected = arguments
     def observe(index):
         raw = json.dumps(item()) if index % 2 else "["
         inline = queue.parse_item(raw)
@@ -111,6 +443,16 @@ def test_json_preflight_callers_share_no_concurrent_state(make_store):
         return inline["refused"]
     with ThreadPoolExecutor(max_workers=3) as workers:
         assert list(workers.map(observe, range(24))) == [i % 2 == 0 for i in range(24)]
+
+
+def test_json_preflight_callers_share_no_concurrent_state(make_store):
+    from aegis_core import team_profile
+    root = make_store
+    target = root.joinpath(*team_profile.REPO_PATH)
+    target.parent.mkdir(mode=0o700, parents=True)
+    target.write_bytes(b'{"version":1}')
+    expected = team_profile.load(root, user_root=root)
+    _spawn_race(_threaded_json_preflight, [(root, expected)])
 
 
 @pytest.mark.parametrize("verb", ["add", "list", "audit", "compact", "claim", "release", "unclaim", "done"])
@@ -220,6 +562,12 @@ def test_partial_view_empty_failure_and_retry(make_store, verb, view):
     if verb == "audit":
         assert retried["findings"] == [] and retried["affected_items"] == []
         assert retried["counts"] == {"items": 1, "findings": 0, "affected_items": 0}
+    _spawn_race(_threaded_partial_view_retry, [(root, verb, view, retried)])
+
+
+def _threaded_partial_view_retry(arguments):
+    root, verb, view, retried = arguments
+    observe = getattr(queue, verb)
     with ThreadPoolExecutor(max_workers=3) as workers:
         futures = [workers.submit(observe, root, view=view, now=102) for _ in range(3)]
         assert [future.result(timeout=30) for future in futures] == [retried] * 3
@@ -244,12 +592,17 @@ def test_partial_view_unsupported_platform(tmp_path, monkeypatch, verb, view):
     assert result["reason"] == "unsupported_platform" and result["exit_code"] == 1
 
 
-def test_fingerprint_view_concurrency_expiry_and_revision_authority(make_store):
-    root = make_store
-    revision = add(root)
+def _threaded_fingerprint_views(root):
     with ThreadPoolExecutor(max_workers=3) as workers:
         futures = [workers.submit(queue.list, root, view="fingerprint", now=101) for _ in range(3)]
         results = [future.result(timeout=30) for future in futures]
+    return results
+
+
+def test_fingerprint_view_concurrency_expiry_and_revision_authority(make_store):
+    root = make_store
+    revision = add(root)
+    results = _spawn_race(_threaded_fingerprint_views, [root])[0]
     assert results[0] == results[1] == results[2]
     token = results[0]["claimable_fingerprint"]
     assert queue.claim(root, "ONE", expect=token, lane="alpha", capabilities=["core"], now=101)["reason"] == "stale_revision"
@@ -329,8 +682,7 @@ def test_claim_cas_expiry_release_done_and_retry(make_store):
 def test_concurrent_process_claims_have_one_winner(make_store):
     root = make_store
     revision = add(root)
-    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
-        results = list(pool.map(race_claim, [(root, revision)] * 2, timeout=30))
+    results = _spawn_race(race_claim, [(root, revision)] * 2)
     assert sorted(result["refused"] for result in results) == [False, True]
     assert next(result for result in results if result["refused"])["reason"] == "stale_revision"
 
@@ -431,9 +783,8 @@ def test_concurrent_overlapping_lease_scopes_have_one_winner(make_store):
     root = make_store
     first = add(root, paths=["/src/one.py"])
     second = add(root, "TWO", paths=["/src/*.txt"])
-    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
-        results = list(pool.map(race_scoped_claim, [(root, first, "ONE", "alpha"),
-                                                  (root, second, "TWO", "beta")], timeout=30))
+    results = _spawn_race(race_scoped_claim, [(root, first, "ONE", "alpha"),
+                                            (root, second, "TWO", "beta")])
     assert sorted(row["refused"] for row in results) == [False, True]
     loser = next(row for row in results if row["refused"])
     assert loser["reason"] == "blocked"
@@ -850,8 +1201,7 @@ def test_concurrent_finishes_emit_one_transition(make_store, verb):
     from aegis_core import events
     revision = add(make_store)
     claimed = claim(make_store, revision)
-    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
-        results = list(pool.map(race_finish, [(make_store, verb, claimed["item"]["revision"])] * 2, timeout=30))
+    results = _spawn_race(race_finish, [(make_store, verb, claimed["item"]["revision"])] * 2)
     assert sorted(result["refused"] for result in results) == [False, True]
     assert next(result for result in results if result["refused"])["reason"] == "stale_revision"
     receipts = [row["detail"] for row in events.read(make_store).rows
@@ -894,9 +1244,8 @@ def test_added_dependencies_and_unobserved_lease_conditions_are_visible(make_sto
 def test_concurrent_disjoint_claims_enforce_writer_capacity(make_store):
     first = add(make_store, paths=["/src/one.py"])
     second = add(make_store, "TWO", paths=["/docs/one.md"])
-    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
-        results = list(pool.map(race_scoped_claim, [(make_store, first, "ONE", "alpha"),
-            (make_store, second, "TWO", "beta")], timeout=30))
+    results = _spawn_race(race_scoped_claim, [(make_store, first, "ONE", "alpha"),
+                                            (make_store, second, "TWO", "beta")])
     assert sorted(result["refused"] for result in results) == [False, True]
     assert next(result for result in results if result["refused"])["reason"] == "capacity_full"
 
@@ -1039,8 +1388,7 @@ def test_compaction_concurrency_failure_and_retry(make_store, monkeypatch):
     assert "private-value" not in json.dumps(refused)
     assert path.read_bytes() == before
     monkeypatch.setattr(queue, "atomic_write_bytes", atomicio.atomic_write_bytes)
-    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
-        results = list(pool.map(race_compact, [make_store] * 2, timeout=30))
+    results = _spawn_race(race_compact, [make_store] * 2)
     assert all(not row["refused"] for row in results)
     assert sorted(row["removed_count"] for row in results) == [0, 1]
     assert queue.list(make_store, include_done=True, now=104)["items"] == []
@@ -1221,9 +1569,8 @@ def race_branch_claim(arguments):
 
 def test_concurrent_claims_record_only_the_winners_branch(make_store):
     revision = add(make_store)
-    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
-        results = list(pool.map(race_branch_claim, [(make_store, revision, "lane/a"),
-                                                  (make_store, revision, "lane/b")], timeout=30))
+    results = _spawn_race(race_branch_claim, [(make_store, revision, "lane/a"),
+                                            (make_store, revision, "lane/b")])
     assert sorted(result["refused"] for result in results) == [False, True]
     winner = next(result for result in results if not result["refused"])
     assert next(result for result in results if result["refused"])["reason"] == "stale_revision"
@@ -1386,10 +1733,15 @@ def test_findings_state_and_expiry_match_full_views_after_retry(make_store, stat
     assert failed["reason"] == "invalid_queue_state" and failed["exit_code"] == 1
     assert failed == queue.audit(root, view="full", now=moment)
     path.write_bytes(original)
+    _spawn_race(_threaded_audit_findings, [(root, moment, findings)])
+    assert path.read_bytes() == original
+
+
+def _threaded_audit_findings(arguments):
+    root, moment, findings = arguments
     with ThreadPoolExecutor(max_workers=3) as workers:
         futures = [workers.submit(queue.audit, root, view="findings", now=moment) for _ in range(3)]
         assert [future.result(timeout=30) for future in futures] == [findings] * 3
-    assert path.read_bytes() == original
 
 
 @pytest.mark.parametrize("branch,unsupported", [
@@ -1522,6 +1874,47 @@ def race_list(arguments):
     return queue.list(root, now=moment)
 
 
+def _blocked_race_list(arguments):
+    original = queue._read
+
+    def blocked(*args, **kwargs):
+        _RACE_CONTROL.entered.set()
+        assert _RACE_CONTROL.release.wait(30), "queue.list read was not released"
+        return original(*args, **kwargs)
+
+    with queue_patch.object(queue, "_read", blocked):
+        return race_list(arguments)
+
+
+def test_race_list_blocked_inside_queue_list_is_reaped(make_store):
+    from threading import Event, Thread
+    add(make_store)
+    context = multiprocessing.get_context("spawn")
+    with _PipeControls(context) as controls:
+        entered, release = controls.entered, controls.release
+        done, rescued = Event(), Event()
+
+        def rescue():
+            if not done.wait(13):
+                rescued.set()
+            release.set()
+
+        watchdog = Thread(target=rescue, daemon=True)
+        try:
+            watchdog.start()
+            with pytest.raises(FutureTimeoutError):
+                _spawn_race(_blocked_race_list, [(make_store, 101), (make_store, 102)], timeout=5,
+                            initializer=_race_control_init, initargs=(entered, controls.worker_release))
+            assert entered.is_set(), "queue.list did not reach the read boundary"
+            assert not rescued.is_set(), "queue.list cleanup waited for the blocked read"
+            assert multiprocessing.active_children() == []
+        finally:
+            done.set()
+            if watchdog.ident is not None:
+                watchdog.join(2)
+            assert not watchdog.is_alive()
+
+
 def test_valid_pending_intent_stays_recoverable(make_store):
     path, state, _row = _pending_state(make_store)
     before = _write_state(path, state)
@@ -1542,8 +1935,7 @@ def test_valid_pending_intent_stays_recoverable(make_store):
 def test_concurrent_pending_lists_name_the_same_workspace(make_store):
     path, state, _row = _pending_state(make_store)
     before = _write_state(path, state)
-    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
-        results = list(pool.map(race_list, [(make_store, 101), (make_store, 102)], timeout=30))
+    results = _spawn_race(race_list, [(make_store, 101), (make_store, 102)])
     assert path.read_bytes() == before
     commands = []
     for result in results:
@@ -1633,8 +2025,7 @@ def test_malformed_pending_intent_retries_after_repair(make_store):
     path, state, _row = _pending_state(make_store)
     state["unclaim"] = "private-value"
     before = _write_state(path, state)
-    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
-        results = list(pool.map(race_list, [(make_store, 101), (make_store, 102)], timeout=30))
+    results = _spawn_race(race_list, [(make_store, 101), (make_store, 102)])
     assert [result["reason"] for result in results] == ["invalid_queue_state", "invalid_queue_state"]
     assert all("private-value" not in json.dumps(result) for result in results)
     assert path.read_bytes() == before
