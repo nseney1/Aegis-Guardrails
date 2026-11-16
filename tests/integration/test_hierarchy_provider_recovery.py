@@ -349,7 +349,7 @@ def test_planned_job_recipe_matrix(planned_admission, capsys, terminal, recipes,
             assert row["result"]["state"] == terminal and row["receipt"] == "match"
             assert "error" not in row
         elif recipes == "absent":
-            assert row["source"] == {"state": "unavailable", "reason": "planned recipe bytes unavailable",
+            assert row["source"] == {"state": "unavailable", "reason": "planned recipe path absent",
                                      "recipe_bytes_unavailable": True}
             assert row["next_action"] == ADMISSION_UNVERIFIED_ACTION
             assert "error" not in row and "detail" not in row
