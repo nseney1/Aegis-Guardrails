@@ -12,7 +12,10 @@ import json
 import re
 import unicodedata
 
-from aegis_core.redaction import redact_insight_text
+from aegis_core.redaction import (
+    REDACTION_MARKER_RE, RedactionRefusal, clip_atomic_text, redact_insight_text,
+    remove_url_credentials,
+)
 from aegis_core.primitives import sanitize_display
 from aegis_core.taxonomy import CANONICAL_RULE_TYPES
 from aegis_core.yaml_engine.frontmatter import split_frontmatter
@@ -36,7 +39,6 @@ TERMINAL = ("reject", "snooze", "merge-into-rule", "noise", "accept")
 _ID = re.compile(r"[a-z0-9][a-z0-9_-]{1,63}\Z")
 _INSIGHT_ID = re.compile(r"ins-[0-9a-f]{12}\Z")
 _KEY = re.compile(r"[A-Za-z0-9_.:/@+-]{1,256}\Z")
-_REDACTION_MARKER = re.compile(r"\[REDACTED(?:_[A-Z]+)*\]")
 _LEGACY_FIELDS = {"id", "type", "status", "enforcement", "kind", "hypothesis", "target_paths", "insight_ids"}
 
 
@@ -97,68 +99,9 @@ def _strip_parameters(value):
                 index = start + 1
                 break
             group = value[start:index]
-            if _REDACTION_MARKER.fullmatch(group):
+            if REDACTION_MARKER_RE.fullmatch(group):
                 kept.append(group)
     return "".join(kept)
-
-
-def _ambiguous_authority(authority):
-    """Recognize indeterminate hosts without parsing or changing their spelling."""
-    host = authority.rsplit("@", 1)[-1]
-    # Shared masks are opaque host atoms, not malformed IPv6 brackets.
-    host = _REDACTION_MARKER.sub("masked", host)
-    host = host.rstrip(")}>.,;:!?`'\"")
-    if not host:
-        return True
-    if host.startswith("["):
-        close = host.find("]")
-        if close <= 1 or "[" in host[1:close]:
-            return True
-        tail = host[close + 1:].rstrip("]")
-        return bool(tail and (not tail.startswith(":") or not tail[1:].isdigit()))
-    host = host.rstrip("]")
-    return not host or host.startswith(":") or "[" in host or "]" in host or host.count(":") > 1
-
-
-def _strip_url_secrets(value):
-    """Remove URL structure only from text the public redactor already masked."""
-    closers = ")]}>.,;:!?`'\""
-
-    def token(raw):
-        marker = raw.find("://")
-        if marker < 0:
-            return raw
-        start = marker + 3
-        boundaries = [position for position in (raw.find("/", start), raw.find("?", start),
-                                                raw.find("#", start)) if position >= 0]
-        authority_end = min(boundaries, default=len(raw))
-        if raw.count("://") > 1 or _ambiguous_authority(raw[start:authority_end]):
-            return "[REDACTED_URL]"
-        cuts = [position for position in (raw.find("?", start), raw.find("#", start)) if position >= 0]
-        cut = min(cuts, default=len(raw))
-        end = len(raw)
-        if cuts:
-            while end > cut and raw[end - 1] in closers:
-                # A mask's closing bracket belongs to its opaque atom, not to
-                # the punctuation restored after a removed query/fragment.
-                opening = raw.rfind("[", cut, end)
-                if opening >= cut and _REDACTION_MARKER.fullmatch(raw[opening:end]):
-                    break
-                end -= 1
-            # A restored '?' would introduce another query on the next pass.
-            end = max(end, raw.rfind("?", cut) + 1)
-        at = raw.rfind("@", start, authority_end)
-        head = raw[:cut] if at < 0 else raw[:start] + raw[at + 1:cut]
-        return head + raw[end:]
-
-    parts, size = [], 0
-    for word in value.split():
-        cleaned = token(word)
-        size += len(cleaned) + bool(parts)
-        if size > MAX_TEXT:
-            raise ProposalError("too_large")
-        parts.append(cleaned)
-    return " ".join(parts)
 
 
 def _compose_redaction(value):
@@ -166,16 +109,11 @@ def _compose_redaction(value):
     value = redact_insight_text(value, max_len=0)
     if len(value) > MAX_TEXT:
         raise ProposalError("too_large")
-    return redact_insight_text(_strip_url_secrets(value), max_len=0)
-
-
-def _clip_text(value, limit):
-    """Clip bounded, cleaned text without splitting a complete redaction atom."""
-    for marker in _REDACTION_MARKER.finditer(value):
-        if marker.start() < limit < marker.end():
-            limit = marker.start()
-            break
-    return value[:limit].rstrip()
+    try:
+        value = remove_url_credentials(value, limit=MAX_TEXT, policy="proposal")
+    except RedactionRefusal as refusal:
+        raise ProposalError(refusal.code) from None
+    return redact_insight_text(value, max_len=0)
 
 
 def clean_text(value, limit=300):
@@ -213,7 +151,10 @@ def clean_text(value, limit=300):
     value = scrub(value)
     size = min(len(value), limit)
     while True:
-        result = _clip_text(value, size)
+        try:
+            result = clip_atomic_text(value, size, policy="proposal")
+        except RedactionRefusal as refusal:
+            raise ProposalError(refusal.code) from None
         checked = scrub(result)
         if checked == result:
             return result
