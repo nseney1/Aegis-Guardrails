@@ -3,7 +3,8 @@
 Every text Aegis persists or echoes goes through this table: the hook command log
 (``redact_command_secrets``, through aegis_cli.hooks.redaction), stored insight text
 (``redact_insight_text``) and the snippet of a secret finding (aegis_core.verification.scanners
-masks with ``TOKEN_REDACTIONS`` and ``is_high_entropy_secret``).
+masks with ``TOKEN_REDACTIONS`` and ``is_high_entropy_secret``). URL credential removal
+(``remove_url_credentials``) and atomic clipping (``clip_atomic_text``) live here as well.
 """
 from __future__ import annotations
 
@@ -28,6 +29,10 @@ __all__ = [
     "shannon_entropy",
     "MAX_GUIDANCE_CHARS",
     "clip_rendered_text",
+    "clip_atomic_text",
+    "remove_url_credentials",
+    "REDACTION_MARKER_RE",
+    "RedactionRefusal",
     "command_token",
     "GUIDANCE_ESCAPE_PATTERN",
     "guidance_field",
@@ -581,3 +586,125 @@ def guidance_field(value, separators=(), *, canonicalize):
             literal.append(char)
     result.append(encode("".join(literal)))
     return "".join(result)
+
+
+# Bound the shared helpers before tokenization or matching. Proposal callers
+# additionally enforce their smaller MAX_TEXT input and expansion budgets.
+_CLEANER_INPUT_MAX = max(MAX_LINE_LENGTH, MAX_GUIDANCE_CHARS)
+_CLEANER_GUIDANCE_INPUT_MAX = 1024 * 1024
+_URL_CLOSERS = ")]}>.,;:!?`'\""
+
+
+class RedactionRefusal(ValueError):
+    """Shared-cleaner refusal. The message is ``invalid`` or ``too_large``, never input."""
+
+    def __init__(self, code):
+        self.code = code
+        super().__init__(code)
+
+
+# Complete ``[REDACTED...]`` atoms. Clipping and proposal parameter stripping share it.
+REDACTION_MARKER_RE = re.compile(r"\[REDACTED(?:_[A-Z]+)*\]")
+
+
+def _refuse_cleaner(code):
+    raise RedactionRefusal(code)
+
+
+def _check_cleaner(value, limit, policy):
+    if (type(value) is not str or type(limit) is not int or limit < 0
+            or type(policy) is not str or policy not in ("proposal", "guidance")):
+        _refuse_cleaner("invalid")
+    ceiling = _CLEANER_GUIDANCE_INPUT_MAX if policy == "guidance" else _CLEANER_INPUT_MAX
+    if len(value) > ceiling:
+        _refuse_cleaner("too_large")
+
+
+def _ambiguous_url_authority(authority):
+    """Recognize indeterminate hosts without parsing or changing their spelling."""
+    host = authority.rsplit("@", 1)[-1]
+    # Shared masks are opaque host atoms, not malformed IPv6 brackets.
+    host = REDACTION_MARKER_RE.sub("masked", host)
+    # A final IPv6 bracket belongs to the host. URL query punctuation below has
+    # a different closer set; sharing that set would change legacy host parsing.
+    host = host.rstrip(")}>.,;:!?`'\"")
+    if not host:
+        return True
+    if host.startswith("["):
+        close = host.find("]")
+        if close <= 1 or "[" in host[1:close]:
+            return True
+        tail = host[close + 1:].rstrip("]")
+        return bool(tail and (not tail.startswith(":") or not tail[1:].isdigit()))
+    host = host.rstrip("]")
+    return not host or host.startswith(":") or "[" in host or "]" in host or host.count(":") > 1
+
+
+def remove_url_credentials(value, *, limit, policy="proposal"):
+    """Apply the caller's URL policy alongside shared-table masking.
+
+    The proposal policy drops userinfo/query/fragment and joins whitespace.
+    Guidance retains URL structure and whitespace byte for byte. Input is
+    bounded before tokenization; the result is bounded before publication.
+    Unknown policies, non-string values and invalid limits refuse as invalid.
+    This boundary never formats signed trailers.
+    """
+    _check_cleaner(value, limit, policy)
+    if policy == "guidance":
+        if len(value) > limit:
+            _refuse_cleaner("too_large")
+        return value
+
+    def token(raw):
+        marker = raw.find("://")
+        if marker < 0:
+            return raw
+        start = marker + 3
+        boundaries = [position for position in (raw.find("/", start), raw.find("?", start),
+                                                raw.find("#", start)) if position >= 0]
+        authority_end = min(boundaries, default=len(raw))
+        if raw.count("://") > 1 or _ambiguous_url_authority(raw[start:authority_end]):
+            return "[REDACTED_URL]"
+        cuts = [position for position in (raw.find("?", start), raw.find("#", start)) if position >= 0]
+        cut = min(cuts, default=len(raw))
+        end = len(raw)
+        if cuts:
+            while end > cut and raw[end - 1] in _URL_CLOSERS:
+                # A mask's closing bracket belongs to its opaque atom, not to
+                # the punctuation restored after a removed query/fragment.
+                opening = raw.rfind("[", cut, end)
+                if opening >= cut and REDACTION_MARKER_RE.fullmatch(raw[opening:end]):
+                    break
+                end -= 1
+            # A restored '?' would introduce another query on the next pass.
+            end = max(end, raw.rfind("?", cut) + 1)
+        at = raw.rfind("@", start, authority_end)
+        head = raw[:cut] if at < 0 else raw[:start] + raw[at + 1:cut]
+        return head + raw[end:]
+
+    parts, size = [], 0
+    for word in value.split():
+        cleaned = token(word)
+        size += len(cleaned) + bool(parts)
+        if size > limit:
+            _refuse_cleaner("too_large")
+        parts.append(cleaned)
+    return " ".join(parts)
+
+
+def clip_atomic_text(value, limit, *, policy="proposal"):
+    """Clip with the caller's existing mask grammar and whitespace policy.
+
+    Proposal cuts preserve literal escape prefixes and strip trailing space.
+    Guidance cuts retain whitespace and the shared table's replacement atoms.
+    Input is bounded before allocating pattern lists or matching.
+    """
+    _check_cleaner(value, limit, policy)
+    patterns = (tuple(pattern for pattern, _ in SECRET_REPLACEMENTS) + (REDACTION_MASK_RE,)
+                if policy == "guidance" else (REDACTION_MARKER_RE,))
+    cut = min(limit, len(value))
+    for pattern in patterns:
+        for marker in pattern.finditer(value):
+            if marker.start() < cut < marker.end():
+                cut = marker.start()
+    return value[:cut] if policy == "guidance" else value[:cut].rstrip()
