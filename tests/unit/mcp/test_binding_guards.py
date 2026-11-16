@@ -16,6 +16,7 @@ from __future__ import annotations
 import io
 import json
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -100,6 +101,20 @@ def _serve(monkeypatch, capsys, lines):
     assert server.run_stdio_server() == 0
     frames = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
     return {f.get("id"): f for f in frames if "method" not in f}
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PR_GET_DUMPABLE is Linux-only")
+def test_in_process_stdio_preserves_worker_dumpability(home, monkeypatch, capsys):
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    before = libc.prctl(3, 0, 0, 0, 0)  # PR_GET_DUMPABLE
+    assert before >= 0
+
+    frames = _serve(monkeypatch, capsys, [_frame(1, "ping")])
+
+    assert frames[1]["result"] == {}
+    assert libc.prctl(3, 0, 0, 0, 0) == before
 
 
 def _list_rules(monkeypatch, capsys, client: str, roots_uri=None):

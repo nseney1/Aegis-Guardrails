@@ -14,11 +14,12 @@ import zlib
 from aegis_core import gitsafe
 from aegis_core.workspace.git_objects import object_id
 
-__all__ = ["GitRefusal", "OID_PATTERN", "baseline_requests", "binary_text", "blob_pack", "clean_bytes",
-           "clean_eol", "conversion_settings", "decode_worktree", "eol_rule", "index_clean", "index_matches",
-           "index_records", "preserved_paths", "snapshot_attributes", "snapshot_entries", "snapshot_rules"]
+__all__ = ["GitRefusal", "OID_PATTERN", "baseline_requests", "binary_text", "blob_pack", "check_filter_bytes", "check_filter_sources", "clean_bytes",
+           "clean_eol", "conversion_settings", "decode_worktree", "eol_rule", "filter_drivers", "index_clean", "index_matches",
+           "index_records", "is_attribute_path", "preserved_paths", "snapshot_attributes", "snapshot_entries", "snapshot_rules"]
 
 OID_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+_CONTROL_BYTES = bytes((*range(8), 11, *range(14, 27), *range(28, 32), 127))
 
 _INDEX_STAT = re.compile(rb"  ctime: ([0-9]{1,20}):([0-9]{1,10})\n  mtime: ([0-9]{1,20}):([0-9]{1,10})\n"
     rb"  dev: ([0-9]{1,20})\tino: ([0-9]{1,20})\n  uid: ([0-9]{1,20})\tgid: ([0-9]{1,20})\n"
@@ -137,7 +138,56 @@ def snapshot_attributes(out, paths):
     return out.split(b"\0")
 
 
-def snapshot_rules(paths, attrs, settings, *, native_crlf):
+def filter_drivers(raw, status):
+    """Any effective driver key configures it, regardless of the key's value."""
+    if type(raw) is not bytes or len(raw) > 65536 or raw.count(b"\0") > 4096:
+        _index_refuse()
+    if status not in (0, 1) or bool(raw) != (status == 0) or raw and not raw.endswith(b"\0"):
+        _index_refuse()
+    drivers = set()
+    for key in raw.split(b"\0")[:-1]:
+        section, separator, variable = key.rpartition(b".")
+        if (not key.startswith(b"filter.") or not separator
+                or re.fullmatch(rb"[a-z][a-z0-9-]*", variable) is None):
+            _index_refuse()
+        if section != b"filter":
+            drivers.add(section[7:])
+    return drivers
+
+
+def is_attribute_path(path):
+    path = path.lower()
+    return path == b".gitattributes" or path.endswith(b"/.gitattributes")
+
+
+def _filter_tokens(data):
+    """Raw filter and macro markers only; no attribute syntax parsing."""
+    return b"filter" in data or b"[attr]" in data
+
+
+def check_filter_bytes(data):
+    """Apply the same raw marker refusal to every captured attribute source."""
+    if _filter_tokens(data):
+        raise GitRefusal("conversion_unavailable")
+
+
+def check_filter_sources(attributes, baseline, objects, *, configured_filters):
+    """With any configured driver, captured and indexed filter/macro tokens refuse."""
+    if not configured_filters:
+        return
+    for data in attributes:
+        check_filter_bytes(data)
+    for path, (_, oid, cache) in baseline.items():
+        if not is_attribute_path(path):
+            continue
+        # The baseline chooses stage 2 for conflicts; other attribute stages are unproven.
+        if cache is None or cache[9] & 0x3000 or oid and oid not in objects:
+            raise GitRefusal("conversion_unavailable")
+        if oid:
+            check_filter_bytes(objects[oid][1])
+
+
+def snapshot_rules(paths, attrs, settings, *, native_crlf, configured_filters):
     names = ("filter", "text", "eol", "ident", "working-tree-encoding", "crlf")
     rules = {}
     for index, path in enumerate(paths):
@@ -148,7 +198,8 @@ def snapshot_rules(paths, attrs, settings, *, native_crlf):
             if found != path or attribute != name.encode():
                 raise GitRefusal("conversion_unavailable")
             values[name] = value
-        if values["filter"] not in (b"unspecified", b"unset"):
+        # Git also prints "unspecified" for a literal driver with that name.
+        if configured_filters and (values["filter"] != b"unspecified" or values["filter"] in configured_filters):
             raise GitRefusal("conversion_unavailable")
         rules[path] = eol_rule(values, settings, native_crlf=native_crlf)
     return rules
@@ -201,7 +252,7 @@ def binary_text(data):
     crlf = data.count(b"\r\n")
     if b"\0" in data or data.count(b"\r") != crlf:
         return True
-    nonprintable = sum(data.count(bytes((c,))) for c in (*range(8), 11, *range(14, 27), *range(28, 32), 127))
+    nonprintable = len(data) - len(data.translate(None, _CONTROL_BYTES))
     printable = len(data) - nonprintable - data.count(b"\r") - data.count(b"\n")
     nonprintable -= data.endswith(b"\x1a")
     return (printable >> 7) < nonprintable
@@ -273,10 +324,13 @@ def index_clean(mode, data, observed, prior, settings, oid_length, index_time):
     return index_matches(cache, observed, settings, index_time) if prior_oid and same_mode else False
 
 
-def baseline_requests(contents, baseline, rules):
-    """Only automatic CRLF conversion needs captured baseline object payloads."""
-    return [baseline[path][1] for path, mode, data, _ in contents if mode != "120000"
-            and b"\r\n" in data and rules[path][0] == "auto" and path in baseline and baseline[path][1]]
+def baseline_requests(contents, baseline, rules, *, configured_filters):
+    """One batch for CRLF baselines and all attribute blobs when any driver exists."""
+    wanted = [baseline[path][1] for path, mode, data, _ in contents if mode != "120000"
+            and data is not None and b"\r\n" in data and rules[path][0] == "auto" and path in baseline and baseline[path][1]]
+    if configured_filters:
+        wanted.extend(oid for path, (_, oid, _) in baseline.items() if is_attribute_path(path) and oid)
+    return wanted
 
 
 def preserved_paths(baseline, objects):
@@ -290,7 +344,7 @@ def snapshot_entries(contents, settings, baseline, rules, preserved, oid_length,
         prior = baseline.get(path, ("100644", None, None))
         prior_mode = prior[0]
         unchanged = index_clean(mode, data, observed, prior, settings, oid_length, index_time)
-        if unchanged:
+        if unchanged is True:
             entries.append((path, prior_mode, prior[1], None))
             continue
         if mode != "120000" and not unchanged:
