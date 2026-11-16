@@ -44,7 +44,7 @@ from aegis_cli import stdin_is_tty as _stdin_is_tty
 from aegis_cli import sanitize_display
 from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_core import approval_policy, gitsafe, governance, human_gate
-from aegis_core.approval_policy import GuidanceMessage, MESSAGE_TEMPLATES
+from aegis_core.diagnostic_messages import GuidanceMessage, MESSAGE_TEMPLATES, guidance_value
 
 __all__ = ["ApproveCommand", "run_approve"]
 
@@ -76,7 +76,7 @@ def _review_text(value: object) -> str:
 
 def _base_label(value: str) -> str:
     """One escaped display; it is never reused as a Git selector."""
-    return approval_policy.guidance_value(value, _MAX_BASE_CHARS, prose=True)
+    return guidance_value(value, _MAX_BASE_CHARS, prose=True)
 
 
 def _staged(top: Path) -> bool:
@@ -114,7 +114,7 @@ def _base_review(top: Path, base_ref: str, commit: str, merge_base: str) -> str:
         raise _Refused("git_failed", error) from exc
     if shown.returncode != 0:
         raise _Refused("git_failed", error)
-    subject = approval_policy.guidance_value(shown.stdout.decode("utf-8", "replace").rstrip("\n"), prose=True)
+    subject = guidance_value(shown.stdout.decode("utf-8", "replace").rstrip("\n"), prose=True)
     label = f"{_base_label(base_ref)} (= {_review_text(commit)} {subject})"
     if merge_base != commit:
         label += f"; comparison starts at {_review_text(merge_base)}"
@@ -172,7 +172,7 @@ def _sign(top: Path, use_json: bool, summary: List[str], what: str, message: str
     custody = human_gate.check_key_custody(top)
     if custody.status in ("none", "unsupported"):
         raise _Refused("no_key", GuidanceMessage("no_key", MESSAGE_TEMPLATES["no_key"], {"detail": custody.detail}))
-    warnings = [approval_policy.guidance_value(custody.detail, prose=True)] \
+    warnings = [guidance_value(custody.detail, prose=True)] \
         if custody.status in ("plain_file", "agent", "unknown") else []
     if not _stdin_is_tty():
         raise _Refused("no_terminal", GuidanceMessage("no_terminal", MESSAGE_TEMPLATES["no_terminal"], {}))
@@ -194,7 +194,7 @@ def _sign(top: Path, use_json: bool, summary: List[str], what: str, message: str
         raise _Refused("sign_failed", GuidanceMessage("sign_failed", MESSAGE_TEMPLATES["sign_failed"], {"detail": str(exc)})) from exc
     verdict = verify(commit)
     return {"commit": commit, **fields, "verified": verdict.valid,
-            "verification": {"code": verdict.code, "reason": approval_policy.guidance_value(verdict.reason, prose=True)},
+            "verification": {"code": verdict.code, "reason": guidance_value(verdict.reason, prose=True)},
             "key_custody": custody.status, "warnings": warnings}
 
 
@@ -216,12 +216,12 @@ def _approve(root: Path, base: Optional[str], use_json: bool) -> Dict[str, Any]:
         before = human_gate.governance_tree_hash(top, merge_base)
         entries = gitsafe.diff_entries(top, merge_base, "HEAD")
     except (human_gate.HumanGateError, gitsafe.GitError) as exc:
-        raise _Refused("git_failed", approval_policy.guidance_value(str(exc), prose=True)) from exc
+        raise _Refused("git_failed", guidance_value(str(exc), prose=True)) from exc
     if digest == before:
         raise _Refused("nothing", GuidanceMessage("nothing", MESSAGE_TEMPLATES["nothing"], {"base": base_ref}))
     categories = governance.touches_governance([p for _s, _o, _n, p in entries],
                                                [p for s, _o, _n, p in entries if s == "D"])
-    paths = [approval_policy.guidance_value(path, prose=True) for status, _old, _new, path in entries
+    paths = [guidance_value(path, prose=True) for status, _old, _new, path in entries
              if governance.category_of(path, deleted=status == "D") is not None]
     summary = [f"Governance changed since {base_review}: {', '.join(_review_text(item) for item in categories)}",
                f"Governance tree hash: {_review_text(digest)}",
@@ -244,14 +244,14 @@ def _approve_test_exemption(root: Path, base: Optional[str], exempt_commit: str,
         entries = gitsafe.diff_entries(top, merge_base, "HEAD")
     except gitsafe.GitError as exc:
         raise _Refused("git_failed", GuidanceMessage("git_failed", MESSAGE_TEMPLATES["git_failed_3"], {})) from exc
-    paths = [approval_policy.guidance_value(path, prose=True) for status, _old, _new, path in entries
+    paths = [guidance_value(path, prose=True) for status, _old, _new, path in entries
              if governance.category_of(path, deleted=status == "D") is not None]
     return _sign(top, use_json, [f"Base: {base_review}", f"Exempting fix commit: {_review_text(fix_commit)}",
-                               f"Reason: {approval_policy.guidance_value(clean_reason, _MAX_REASON_CHARS, prose=True)}",
+                               f"Reason: {guidance_value(clean_reason, _MAX_REASON_CHARS, prose=True)}",
                                f"Governance paths changed: {', '.join(paths) or 'none'}"],
                  f"a test exemption for {fix_commit[:12]}", human_gate.exemption_message(fix_commit, clean_reason),
                  lambda commit: human_gate.verify_test_exemption(top, commit, fix_commit, base_commit),
-                 {"exempt_commit": fix_commit, "reason": approval_policy.guidance_value(clean_reason, _MAX_REASON_CHARS, prose=True),
+                 {"exempt_commit": fix_commit, "reason": guidance_value(clean_reason, _MAX_REASON_CHARS, prose=True),
                   "base": _base_label(base_ref)})
 
 
@@ -309,7 +309,7 @@ def run_approve(args: argparse.Namespace) -> int:
         print(f"Approved governance state {_review_text(result['governance_tree_hash'])} in commit {_review_text(result['commit'])}.")
     if not result["verified"]:
         warning = (f"  warning: it does not verify against {_review_text(human_gate.ALLOWED_SIGNERS)} "
-                   f"on {_review_text(result['base'])} yet ({approval_policy.guidance_value(result['verification']['code'], prose=True)}): "
+                   f"on {_review_text(result['base'])} yet ({guidance_value(result['verification']['code'], prose=True)}): "
                    "CI will not accept it until your key is listed there.")
         print(_review_text(warning))
     print("  Push it with the branch; CI checks the signature against the base branch's keys.")
