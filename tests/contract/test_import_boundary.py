@@ -40,6 +40,7 @@ PACKAGES = ("aegis_core", "aegis_cli", "aegis_mcp", "aegis_sdk")
 # own __init__ (version only) is L0; it is not a prefix, so a new module has no layer.
 CORE_LAYERS: Dict[str, int] = {
     "aegis_core._version": 0,
+    "aegis_core.diagnostic_messages": 0,
     "aegis_core.errors": 0,
     "aegis_core.taxonomy": 0,
     # Canonical message records and untrusted views (stdlib only).
