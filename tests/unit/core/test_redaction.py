@@ -23,16 +23,966 @@ import unicodedata
 
 import pytest
 
+import tests.helpers_reviewed_sources as reviewed_helper
+from tests.conftest import symlink_or_skip
+from tests.helpers_reviewed_sources import (
+    census_guard, check_census_rows, run_census_fixture,
+    git_environment as _git_environment, reviewed_python_paths, run_isolated_test as _run_isolated,
+)
+
 from aegis_cli.hooks.redaction import redact_secrets
+from aegis_core import insights as insight_module
 from aegis_core.gitsafe_policy import LOCAL_ENV
 from aegis_core.insights import redact_insight_text
+from aegis_core.primitives import real_path
 from aegis_core.verification.scanners import TIER_A_PATTERNS, scan_secrets_text
 
-REPO = Path(__file__).resolve().parents[3]
-PACKAGES = ("aegis_cli", "aegis_core", "aegis_mcp", "aegis_sdk")
+REPO = Path(real_path(__file__)).parents[3]
 # Reviewed parse-cost ratchet: retain headroom for ordinary source additions.
 # Increasing this ceiling requires review; failures list all parsed paths.
 REDACTION_PARSE_CEILING = 72
+
+
+def assignment_values(statement):
+    """Index ordinary annotated and nested tuple/list bindings conservatively."""
+    def targets(target, value):
+        if isinstance(value, ast.Starred):
+            value = value.value
+        if isinstance(target, ast.Name):
+            yield target.id, value
+        elif isinstance(target, ast.Starred):
+            yield from targets(target.value, value)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            values = (value.elts if isinstance(value, (ast.Tuple, ast.List))
+                      and not any(isinstance(part, ast.Starred) for part in (*target.elts, *value.elts))
+                      and len(value.elts) == len(target.elts) else [value] * len(target.elts))
+            for child, origin in zip(target.elts, values):
+                yield from targets(child, origin)
+
+    if isinstance(statement, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)) and statement.value is not None:
+        for target in statement.targets if isinstance(statement, ast.Assign) else [statement.target]:
+            yield from targets(target, statement.value)
+    elif (isinstance(statement, ast.Call) and isinstance(statement.func, ast.Attribute)
+          and isinstance(statement.func.value, ast.Name) and statement.func.attr in {"append", "extend", "insert"}):
+        for value in statement.args:
+            yield statement.func.value.id, value
+
+
+def census_dependencies(tree, roots):
+    """Conservative lexical closure for honest module, class and callback helpers.
+
+    Follow references as well as calls: a callback passed to map or an executor
+    is still a dependency. Local value aliases retain their lexical scope.
+    """
+    module_values = {}
+    methods = {}
+    statements = list(tree.body)
+    while statements:
+        node = statements.pop()
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+            module_values[node.name] = [node]
+            if isinstance(node, ast.ClassDef):
+                for method in node.body:
+                    if isinstance(method, ast.FunctionDef):
+                        methods.setdefault(method.name, []).append(method)
+        else:
+            for name, value in assignment_values(node):
+                module_values.setdefault(name, []).append(value)
+            statements.extend(ast.iter_child_nodes(node))
+    local_values = {}
+    pending = list(roots)
+    seen = set()
+    found = []
+    while pending:
+        node, scope = pending.pop()
+        identity = (id(node), id(scope))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        found.append((node, scope))
+        if scope not in local_values:
+            values = {}
+            statements = list(scope.body) if isinstance(scope, (ast.FunctionDef, ast.ClassDef)) else []
+            while statements:
+                statement = statements.pop()
+                if isinstance(statement, (ast.FunctionDef, ast.ClassDef)):
+                    values.setdefault(statement.name, []).append(statement)
+                    continue
+                for name, value in assignment_values(statement):
+                    values.setdefault(name, []).append(value)
+                statements.extend(ast.iter_child_nodes(statement))
+            local_values[scope] = values
+        for reference in ast.walk(node):
+            if isinstance(reference, ast.Name) and isinstance(reference.ctx, ast.Load):
+                local = local_values[scope].get(reference.id)
+                for value in local if local is not None else module_values.get(reference.id, []):
+                    owner = scope if local is not None else tree
+                    if isinstance(value, (ast.FunctionDef, ast.ClassDef)):
+                        owner = value
+                    pending.append((value, owner))
+            elif isinstance(reference, ast.Attribute):
+                pending.extend((method, method) for method in methods.get(reference.attr, []))
+    return found
+
+
+def has_live_tree_enumeration(node, tree):
+    imports = {}
+    for statement in ast.walk(tree):
+        if isinstance(statement, ast.Import):
+            imports.update({alias.asname or alias.name: alias.name for alias in statement.names})
+        elif isinstance(statement, ast.ImportFrom) and statement.module:
+            imports.update({alias.asname or alias.name: statement.module + "." + alias.name
+                            for alias in statement.names})
+    for reference in ast.walk(node):
+        if isinstance(reference, ast.Attribute) and reference.attr in {"rglob", "glob", "iglob", "iterdir"}:
+            return True
+        parts = []
+        base = reference
+        while isinstance(base, ast.Attribute):
+            parts.insert(0, base.attr)
+            base = base.value
+        if isinstance(base, ast.Name):
+            qualified = ".".join([imports.get(base.id, base.id), *parts])
+            if qualified in {"os.walk", "os.fwalk", "os.listdir", "os.scandir", "glob.glob", "glob.iglob"}:
+                return True
+    return False
+
+
+def source_uses_frozen_inventory(tree, expression, scope):
+    """Trace returned source values, binding ordinary function/method callbacks.
+
+    Unknown source producers refuse. Reading the inventory as an unused local
+    or passing it to a helper that discards the argument is not provenance.
+    """
+    scopes = {}
+    methods = {}
+    for definition in tree.body:
+        if isinstance(definition, ast.ClassDef):
+            for method in definition.body:
+                if isinstance(method, ast.FunctionDef):
+                    methods.setdefault(method.name, []).append(method)
+
+    def values(owner):
+        if owner in scopes:
+            return scopes[owner]
+        bindings = {}
+        if isinstance(owner, (ast.FunctionDef, ast.Lambda)):
+            arguments = [*owner.args.posonlyargs, *owner.args.args]
+            for argument, default in zip(arguments[len(arguments) - len(owner.args.defaults):], owner.args.defaults):
+                bindings[argument.arg] = [default]
+        statements = [] if isinstance(owner, ast.Lambda) else list(owner.body)
+        while statements:
+            statement = statements.pop()
+            if isinstance(statement, (ast.FunctionDef, ast.ClassDef)):
+                bindings.setdefault(statement.name, []).append(statement)
+                continue
+            for name, value in assignment_values(statement):
+                bindings.setdefault(name, []).append(value)
+            statements.extend(ast.iter_child_nodes(statement))
+        scopes[owner] = bindings
+        return bindings
+
+    def resolve(node, owner, arguments, seen=frozenset()):
+        key = (id(node), id(owner))
+        if key in seen:
+            return []
+        if isinstance(node, ast.Name):
+            if node.id in arguments:
+                return resolve(*arguments[node.id], seen | {key})
+            local = values(owner).get(node.id)
+            definitions = local if local is not None else values(tree).get(node.id, [])
+            if definitions and node.id != "_REVIEWED_PYTHON_PATHS":
+                defining_scope = owner if local is not None else tree
+                return [result for value in definitions
+                        for result in resolve(value, defining_scope, arguments, seen | {key})]
+        elif isinstance(node, ast.Attribute) and node.attr in methods:
+            return [(method, method, {}) for method in methods[node.attr]]
+        return [(node, owner, arguments)]
+
+    def returned(function):
+        if isinstance(function, ast.Lambda):
+            return [function.body]
+        results = []
+        statements = list(function.body)
+        while statements:
+            statement = statements.pop()
+            if isinstance(statement, ast.Return):
+                results.append(statement.value)
+            elif not isinstance(statement, (ast.FunctionDef, ast.ClassDef, ast.Lambda)):
+                statements.extend(ast.iter_child_nodes(statement))
+        return results
+
+    def frozen(node, owner, arguments, active=frozenset()):
+        key = (id(node), id(owner))
+        if key in active:
+            return False
+        active = active | {key}
+        if isinstance(node, ast.Name):
+            if node.id == "_REVIEWED_PYTHON_PATHS" and node.id not in arguments and node.id not in values(owner):
+                return True
+            origins = resolve(node, owner, arguments)
+            return bool(origins) and all(value is not node and frozen(value, source, bound, active)
+                                         for value, source, bound in origins)
+        if isinstance(node, ast.IfExp):
+            test = node.test
+            if (isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.ops[0], ast.Is)
+                    and isinstance(test.comparators[0], ast.Constant) and test.comparators[0].value is None):
+                choices = resolve(test.left, owner, arguments)
+                if choices and all(isinstance(value, ast.Constant) and value.value is None
+                                   for value, _, _ in choices):
+                    return frozen(node.body, owner, arguments, active)
+            return frozen(node.body, owner, arguments, active) and frozen(node.orelse, owner, arguments, active)
+        if isinstance(node, (ast.ListComp, ast.GeneratorExp)):
+            return bool(node.generators) and frozen(node.generators[0].iter, owner, arguments, active)
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id in {"list", "tuple", "sorted", "iter", "map", "filter"}:
+                return bool(node.args) and frozen(node.args[-1], owner, arguments, active)
+            targets = resolve(node.func, owner, arguments)
+            results = []
+            for function, _, captured in targets:
+                if not isinstance(function, (ast.FunctionDef, ast.Lambda)):
+                    return False
+                parameters = [*function.args.posonlyargs, *function.args.args]
+                if parameters and parameters[0].arg in {"self", "cls"}:
+                    parameters = parameters[1:]
+                bound = dict(captured)
+                bound.update({parameter.arg: (argument, owner, arguments)
+                              for parameter, argument in zip(parameters, node.args)})
+                bound.update({keyword.arg: (keyword.value, owner, arguments)
+                              for keyword in node.keywords if keyword.arg is not None})
+                outputs = returned(function)
+                results.append(bool(outputs) and all(frozen(value, function, bound, active) for value in outputs))
+            return bool(results) and all(results)
+        if isinstance(node, ast.Subscript):
+            return frozen(node.value, owner, arguments, active)
+        return False
+
+    return frozen(expression, scope, {})
+
+
+@pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
+def test_live_censuses_use_one_index_helper(caller, source=None):
+    tree = ast.parse((REPO / "tests" / "unit" / "core" / caller).read_text(encoding="utf-8")
+                     if source is None else source)
+    imports = [node for node in tree.body if isinstance(node, ast.ImportFrom)
+               and node.module == "tests.helpers_reviewed_sources"]
+    assert any(alias.name == "reviewed_python_paths" for node in imports for alias in node.names)
+    frozen = [node.value for node in tree.body if isinstance(node, ast.Assign)
+              and any(isinstance(target, ast.Name) and target.id == "_REVIEWED_PYTHON_PATHS"
+                      for target in node.targets)]
+    assert len(frozen) == 1
+    assert ast.dump(frozen[0]) == ast.dump(ast.parse("reviewed_python_paths(REPO)", mode="eval").body)
+    assert not any(isinstance(node, ast.FunctionDef) and node.name == "_reviewed_python_paths"
+                   for node in tree.body)
+    helper = ast.parse((REPO / "tests" / "helpers_reviewed_sources.py").read_text(encoding="utf-8"))
+    entry_name = ("test_no_module_imports_a_private_name_of_redaction" if caller == "test_redaction.py"
+                  else "test_every_name_in_insights_all_is_used_outside_the_module")
+    entry = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == entry_name)
+    reachable = census_dependencies(tree, [(entry, entry)])
+    assert not any(has_live_tree_enumeration(node, tree) for node, _ in reachable), (
+        "live-tree census enumeration is forbidden")
+    assert not has_live_tree_enumeration(helper, helper), "live-tree census enumeration is forbidden"
+    source_positions = {"private_imports": 0, "_defined_names_referenced_outside": 1}
+    inputs = [(call.args[source_positions[call.func.id]], scope)
+              for node, scope in reachable for call in ast.walk(node)
+              if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+              and call.func.id in source_positions]
+    assert inputs, "live census must check source input"
+    for expression, scope in inputs:
+        assert source_uses_frozen_inventory(tree, expression, scope), (
+            "source input must use the shared frozen inventory")
+    runner = next(node for node in helper.body if isinstance(node, ast.FunctionDef) and node.name == "git")
+    timeouts = [kw.value for node in ast.walk(runner) if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute) and node.func.attr == "run"
+                for kw in node.keywords if kw.arg == "timeout"]
+    assert len(timeouts) == 1 and ast.dump(timeouts[0]) == ast.dump(ast.Name(id="GIT_TIMEOUT", ctx=ast.Load()))
+    ceiling = next(node.value.value for node in helper.body if isinstance(node, ast.Assign)
+                   and any(isinstance(target, ast.Name) and target.id == "GIT_TIMEOUT" for target in node.targets))
+    assert 0 < ceiling <= 60
+
+
+def census_source_variant(caller, replacement, extra="", prelude=""):
+    source = (REPO / "tests" / "unit" / "core" / caller).read_text(encoding="utf-8")
+    entry = ("test_no_module_imports_a_private_name_of_redaction" if caller == "test_redaction.py"
+             else "test_every_name_in_insights_all_is_used_outside_the_module")
+    function = next(node for node in ast.parse(source).body
+                    if isinstance(node, ast.FunctionDef) and node.name == entry)
+    lines = source.splitlines(keepends=True)
+    body = "".join(lines[function.lineno - 1:function.end_lineno])
+    original = "_python_sources() if sources is None else sources"
+    assert body.count(original) == 1
+    body = body.replace(original, replacement)
+    body = body.replace("    real_parse = ast.parse", prelude + "    real_parse = ast.parse", 1)
+    return ("".join(lines[:function.lineno - 1]) + body
+            + "".join(lines[function.end_lineno:]) + extra)
+
+
+def run_census_variant(tmp_path, caller, source, checkout=None):
+    """Execute the real entry point in a child with its own module namespace."""
+    variant = tmp_path / caller if checkout is None else checkout / "tests" / "unit" / "core" / caller
+    variant.parent.mkdir(parents=True, exist_ok=True)
+    variant.write_text(source, encoding="utf-8")
+    program = (
+        "import importlib\nfrom pathlib import Path\nimport pytest\n"
+        "module = importlib.import_module('tests.unit.core.' + sys.argv[2][:-3])\n"
+        "if sys.argv[4] == 'fixture':\n"
+        "    module.__file__ = sys.argv[3]\n"
+        "    sys.path.insert(0, str(Path(module.__file__).parents[3]))\n"
+        "exec(compile(Path(sys.argv[3]).read_text(encoding='utf-8'), module.__file__, 'exec'), module.__dict__)\n"
+        "entry = ('test_no_module_imports_a_private_name_of_redaction' if sys.argv[2] == 'test_redaction.py'\n"
+        "         else 'test_every_name_in_insights_all_is_used_outside_the_module')\n"
+        "with pytest.MonkeyPatch.context() as patcher:\n"
+        "    if hasattr(module, 'round4_other_test'):\n"
+        "        getattr(module, entry)(patcher)\n"
+        "        try:\n            module.round4_other_test()\n"
+        "        except AssertionError:\n            pass\n"
+        "    getattr(module, entry)(patcher)\n"
+        "    if hasattr(module, 'round4_after_census'):\n        module.round4_after_census()\n"
+    )
+    return _run_isolated(program, caller, variant, "fixture" if checkout is not None else "variant")
+
+
+@pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
+@pytest.mark.parametrize("binding", [
+    'if (REPO / "aegis_core").is_dir():\n    core_files = list((REPO / "aegis_core").rglob("*.py"))',
+    '*core_files, = (REPO / "aegis_core").rglob("*.py")',
+])
+def test_round4_precheck_indexes_compound_and_starred_bindings(caller, binding):
+    source = census_source_variant(
+        caller, "_python_sources() if sources is None else sources", "\n" + binding + "\n",
+        "    assert len(core_files) == sum(name.startswith('aegis_core/') for name in _REVIEWED_PYTHON_PATHS)\n",
+    )
+    with pytest.raises(AssertionError, match="live-tree census enumeration is forbidden"):
+        test_live_censuses_use_one_index_helper(caller, source)
+
+
+@pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
+@pytest.mark.parametrize("location", ["compound-import", "starred-import", "other-test", "after-last-census"])
+def test_round4_runtime_records_the_whole_module_lifetime(tmp_path, caller, location):
+    if location == "compound-import":
+        extra = ('\nif (REPO / "aegis_core").is_dir():\n'
+                 '    core_files = list((REPO / "aegis_core").rglob("*.py"))\n')
+    elif location == "starred-import":
+        extra = '\n*core_files, = (REPO / "aegis_core").rglob("*.py")\n'
+    else:
+        name = "round4_other_test" if location == "other-test" else "round4_after_census"
+        extra = ('\ndef ' + name + '():\n'
+                 '    return list((REPO / "aegis_core").iterdir())\n')
+    prelude = ("    assert len(core_files) == sum(name.startswith('aegis_core/') for name in _REVIEWED_PYTHON_PATHS)\n"
+               if location in {"compound-import", "starred-import"} else "")
+    source = census_source_variant(caller, "_python_sources() if sources is None else sources", extra, prelude)
+    result = run_census_variant(tmp_path, caller, source)
+    assert result.returncode != 0, "census forgot an enumeration before its call"
+    assert b"live-tree census enumeration is forbidden" in result.stderr, result.stderr.decode()
+    assert str(REPO).encode() in result.stderr
+
+
+@pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
+@pytest.mark.parametrize("rebind", ["filter", "slice", "concatenate", "unchanged"])
+def test_round4_retains_membership_and_detects_tracked_bad_sources(tmp_path, caller, rebind):
+    checkout = tmp_path / "checkout"
+    if caller == "test_redaction.py":
+        benign, bad = "# redaction\n", "from aegis_core.redaction import _private\n"
+    else:
+        benign = "from aegis_core.insights import " + ", ".join(insight_module.__all__) + "\n"
+        bad = "insights syntax (\n"
+    reviewed_helper.freeze_fixture_sources(checkout, [("aegis_core/reviewed.py", benign), ("tests/bad.py", bad)])
+    extra = {
+        "filter": "\n_REVIEWED_PYTHON_PATHS: tuple = tuple(p for p in _REVIEWED_PYTHON_PATHS if not p.startswith('tests/'))\n",
+        "slice": "\n_REVIEWED_PYTHON_PATHS: tuple = _REVIEWED_PYTHON_PATHS[:1]\n",
+        "concatenate": "\n_REVIEWED_PYTHON_PATHS: tuple = _REVIEWED_PYTHON_PATHS[:1] + _REVIEWED_PYTHON_PATHS[:1]\n",
+        "unchanged": "",
+    }[rebind]
+    source = census_source_variant(caller, "_python_sources() if sources is None else sources", extra)
+    result = run_census_variant(tmp_path, caller, source, checkout=checkout)
+    assert result.returncode != 0, "census accepted a caller-rebound reference inventory"
+    if rebind == "unchanged":
+        assert (b"AssertionError" if caller == "test_redaction.py" else b"SyntaxError") in result.stderr
+    else:
+        assert b"census rows must equal the frozen inventory" in result.stderr, result.stderr.decode()
+
+
+def test_round4_package_shape_uses_the_frozen_inventory():
+    source = (REPO / "tests/unit/core/test_insights.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    entry = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                 and node.name == "test_insights_is_a_package_of_four_modules")
+    assert not has_live_tree_enumeration(entry, tree), "package-shape census must use the frozen inventory"
+
+
+def test_round4_helper_retains_the_first_index_even_after_later_staging(tmp_path):
+    retained = reviewed_helper.freeze_fixture_sources(tmp_path, [("tests/first.py", "# retained\n")])
+    (tmp_path / "tests/later.py").write_text("# later\n", encoding="utf-8")
+    reviewed_helper.git(tmp_path, "add", ".")
+    assert reviewed_python_paths(tmp_path) is retained
+    assert retained == ("tests/first.py",)
+
+
+@pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
+@pytest.mark.parametrize("binding", [
+    'core_files = []\ncore_files += list((REPO / "aegis_core").rglob("*.py"))',
+    'if (core_files := list((REPO / "aegis_core").rglob("*.py"))):\n    pass',
+    'core_files = []\ncore_files.append(list((REPO / "aegis_core").rglob("*.py")))',
+    'core_files = []\ncore_files.extend((REPO / "aegis_core").rglob("*.py"))',
+    'core_files = []\ncore_files.insert(0, list((REPO / "aegis_core").rglob("*.py")))',
+    '*core_files, last = ([], *(REPO / "aegis_core").rglob("*.py"))',
+])
+def test_round4_correctness_precheck_indexes_accumulation(caller, binding):
+    source = census_source_variant(
+        caller, "_python_sources() if sources is None else sources", "\n" + binding + "\n",
+        "    assert len(core_files) == sum(name.startswith('aegis_core/') for name in _REVIEWED_PYTHON_PATHS)\n")
+    with pytest.raises(AssertionError, match="live-tree census enumeration is forbidden"):
+        test_live_censuses_use_one_index_helper(caller, source)
+
+
+def test_round4_correctness_external_glob_avoids_windows39_resolve(monkeypatch, tmp_path):
+    class Windows39Path(type(tmp_path)):
+        def resolve(self, *args, **kwargs):
+            if "*" in str(self):
+                raise OSError(123, "Windows 3.9 rejects wildcard resolution")
+            return super().resolve(*args, **kwargs)
+
+    monkeypatch.setattr(reviewed_helper, "Path", Windows39Path)
+    monkeypatch.setattr(reviewed_helper, "sys", SimpleNamespace(**{**vars(sys), "version_info": (3, 9)}))
+    with census_guard(REPO):
+        sys.audit("glob.glob", str(tmp_path / "*.py"), False)
+
+
+def test_round4_correctness_primary_glob_event_defers_to_root_dir():
+    if sys.version_info < (3, 10):
+        pytest.skip("glob root_dir audit event requires Python 3.10")
+    with census_guard(REPO):
+        sys.audit("glob.glob", str(REPO / "*.py"), False)
+
+
+def test_round4_correctness_windows_extended_long_and_rooted_globs(tmp_path):
+    if os.name != "nt":
+        pytest.skip("Windows drive and extended-length path spellings")
+    program = (
+        "import glob, os, pytest\nfrom pathlib import Path\n"
+        "from tests.helpers_reviewed_sources import census_guard\n"
+        "root, outside = Path(sys.argv[2]), Path(sys.argv[3])\n"
+        "with census_guard(root):\n"
+        "    assert glob.glob(str(outside / ('a' * 180) / ('b' * 180) / '*.py')) == []\n"
+        "extended = '\\\\\\\\?\\\\' + str(root)\n"
+        "with pytest.raises(AssertionError, match='live-tree census enumeration is forbidden'):\n"
+        "    with census_guard(Path(extended)):\n        os.listdir(str(Path(extended)))\n"
+        "if sys.version_info >= (3, 10):\n"
+        "    drive, tail = os.path.splitdrive(str(root))\n"
+        "    other = next(value for value in ('C:', 'D:', 'E:') if value.lower() != drive.lower())\n"
+        "    with census_guard(root):\n"
+        "        assert glob.glob(os.path.join(tail, '*.py'), root_dir=other + '\\\\outside') == []\n"
+    )
+    result = _run_isolated(program, REPO, tmp_path)
+    assert result.returncode == 0, result.stderr.decode()
+
+
+@pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
+def test_round4_correctness_local_uncached_checkout_import_passes(tmp_path, caller):
+    checkout = tmp_path / "checkout"
+    text = "# redaction\n" if caller == "test_redaction.py" else (
+        "from aegis_core.insights import " + ", ".join(insight_module.__all__) + "\n")
+    reviewed_helper.freeze_fixture_sources(checkout, [("aegis_core/reviewed.py", text)])
+    package = checkout / "fixture_uncached" / "nested"
+    package.mkdir(parents=True)
+    (package.parent / "__init__.py").write_text("", encoding="utf-8")
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    prelude = ("    listed = []\n"
+               "    def watch_import(event, args):\n"
+               "        if event == 'os.listdir':\n            listed.append(str(args[0]))\n"
+               "    sys.addaudithook(watch_import)\n"
+               "    import fixture_uncached.nested\n"
+               "    assert any(os.path.normcase(str(REPO)) in os.path.normcase(name) for name in listed), 'fixture did not exercise FileFinder'\n")
+    source = census_source_variant(caller, "_python_sources() if sources is None else sources", prelude=prelude)
+    result = run_census_variant(tmp_path, caller, source, checkout=checkout)
+    assert result.returncode == 0, result.stderr.decode()
+
+
+@pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
+def test_round4_correctness_import_frame_names_do_not_grant_an_exception(tmp_path, caller):
+    extra = ("\ndef _fill_cache():\n    return os.listdir(REPO)\n"
+             "def find_spec():\n    return _fill_cache()\n")
+    source = census_source_variant(caller, "_python_sources() if sources is None else sources", extra,
+                                   "    find_spec()\n")
+    result = run_census_variant(tmp_path, caller, source)
+    assert result.returncode != 0
+    assert b"live-tree census enumeration is forbidden" in result.stderr, result.stderr.decode()
+
+
+@pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
+@pytest.mark.parametrize("bypass", ["inline", "swallowed-mismatch"])
+def test_round4_correctness_requires_a_successful_checker(tmp_path, caller, bypass):
+    if bypass == "inline":
+        source = census_source_variant(caller, "_python_sources() if sources is None else sources")
+        entry_name = ("test_no_module_imports_a_private_name_of_redaction" if caller == "test_redaction.py"
+                      else "test_every_name_in_insights_all_is_used_outside_the_module")
+        entry = next(node for node in ast.parse(source).body
+                     if isinstance(node, ast.FunctionDef) and node.name == entry_name)
+        lines = source.splitlines(keepends=True)
+        source = ("".join(lines[:entry.lineno])
+                  + "    for label, text in _python_sources():\n        ast.parse(text, filename=str(label))\n"
+                  + "".join(lines[entry.end_lineno:]))
+        message = b"census did not check its source rows"
+    else:
+        call = ("private_imports(fabricated)" if caller == "test_redaction.py" else
+                "_defined_names_referenced_outside(Path(core_insights.__file__), fabricated, set())")
+        prelude = ("    original = _python_sources()\n"
+                   "    fabricated = ((original[0][0], '# fabricated\\n'), *original[1:])\n"
+                   "    try:\n        " + call + "\n    except AssertionError:\n        pass\n")
+        source = census_source_variant(caller, "_python_sources() if sources is None else sources", prelude=prelude)
+        message = b"census rows must equal the frozen inventory"
+    result = run_census_variant(tmp_path, caller, source)
+    assert result.returncode != 0, "census passed without a successful complete source check"
+    assert message in result.stderr, result.stderr.decode()
+
+
+@pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
+@pytest.mark.parametrize("binding", [
+    'core_files: list = list((REPO / "aegis_core").rglob("*.py"))',
+    'core_files, = (list((REPO / "aegis_core").rglob("*.py")),)',
+    '[core_files] = [list((REPO / "aegis_core").rglob("*.py"))]',
+])
+def test_live_census_precheck_indexes_annotated_and_destructured_bindings(caller, binding):
+    source = census_source_variant(
+        caller, "_python_sources() if sources is None else sources", "\n" + binding + "\n",
+        "    assert len(core_files) == sum(name.startswith('aegis_core/') for name in _REVIEWED_PYTHON_PATHS)\n",
+    )
+    with pytest.raises(AssertionError, match="live-tree census enumeration is forbidden"):
+        test_live_censuses_use_one_index_helper(caller, source)
+
+
+@pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
+@pytest.mark.parametrize("operation", [
+    "annotated-rglob", "typed-walk-extend", "glob", "iglob", "listdir", "scandir", "iterdir",
+    "relative-listdir", "bytes-listdir", "thread-callback", "caught-refusal",
+])
+def test_live_census_runtime_rejects_reviewer_enumerations(tmp_path, caller, operation):
+    extra = "\nimport glob\nfrom concurrent.futures import ThreadPoolExecutor\n"
+    replacement = "_python_sources() if sources is None else sources"
+    if operation == "annotated-rglob":
+        prelude = (
+            '    core_files: list = list((REPO / "aegis_core").rglob("*.py"))\n'
+            "    assert len(core_files) == sum(name.startswith('aegis_core/') for name in _REVIEWED_PYTHON_PATHS)\n"
+        )
+    elif operation == "typed-walk-extend":
+        extra += "\nfrom typing import Callable\nwalk_sources: Callable = os.walk\n"
+        prelude = (
+            "    rows = list(_python_sources()) if sources is None else sources\n"
+            "    rows.extend((Path(d) / n, '') for d, _, names in walk_sources(REPO / 'tests' / 'new_consumers')\n"
+            "                for n in names if n.endswith('.py'))\n"
+        )
+        replacement = "rows"
+    else:
+        prelude = {
+            "glob": "    glob.glob(str(REPO / '*.py'))\n",
+            "iglob": "    list(glob.iglob(str(REPO / '*.py')))\n",
+            "listdir": "    os.listdir(REPO)\n",
+            "scandir": "    with os.scandir(REPO) as entries:\n        list(entries)\n",
+            "iterdir": "    list(REPO.iterdir())\n",
+            "relative-listdir": "    os.listdir('.')\n",
+            "bytes-listdir": "    os.listdir(os.fsencode(REPO))\n",
+            "thread-callback": ("    with ThreadPoolExecutor(max_workers=1) as pool:\n"
+                                "        pool.submit(os.listdir, REPO).result(timeout=5)\n"),
+            "caught-refusal": "    try:\n        os.listdir(REPO)\n    except AssertionError:\n        pass\n",
+        }[operation]
+    result = run_census_variant(tmp_path, caller, census_source_variant(caller, replacement, extra, prelude))
+    assert result.returncode != 0, "live census accepted checkout enumeration"
+    assert b"live-tree census enumeration is forbidden" in result.stderr, result.stderr.decode()
+    assert str(REPO).encode() in result.stderr
+
+
+@pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
+@pytest.mark.parametrize("mutation", ["extend", "append", "concatenate", "omit", "duplicate"])
+def test_live_census_runtime_requires_exact_frozen_rows(tmp_path, caller, mutation):
+    prelude = "    rows = list(_python_sources())\n"
+    row = "('tests/unreviewed.py', '')" if caller == "test_redaction.py" else "(REPO / 'tests/unreviewed.py', '')"
+    prelude += {
+        "extend": f"    rows.extend([{row}])\n",
+        "append": f"    rows.append({row})\n",
+        "concatenate": f"    rows = tuple(rows) + ({row},)\n",
+        "omit": "    rows.pop()\n",
+        "duplicate": "    rows.append(rows[0])\n",
+    }[mutation]
+    result = run_census_variant(tmp_path, caller, census_source_variant(caller, "rows", prelude=prelude))
+    assert result.returncode != 0, "live census accepted changed inventory membership"
+    assert b"census rows must equal the frozen inventory" in result.stderr, result.stderr.decode()
+
+
+@pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
+@pytest.mark.parametrize("binding", [
+    'EXTRA_PATHS: list = list((REPO / "aegis_core").rglob("*.py"))',
+    'EXTRA_PATHS, = (list((REPO / "aegis_core").rglob("*.py")),)',
+])
+def test_live_census_argon_extra_paths_are_prechecked(caller, binding):
+    source = census_source_variant(
+        caller, "tuple(row for row in _python_sources() for extra in EXTRA_PATHS)", "\n" + binding + "\n")
+    with pytest.raises(AssertionError, match="live-tree census enumeration is forbidden"):
+        test_live_censuses_use_one_index_helper(caller, source)
+
+
+@pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
+@pytest.mark.parametrize("fabrication", ["filter", "slice", "map", "parameter", "fake-text", "repeated"])
+def test_live_census_argon_rejects_fabricated_rows(tmp_path, caller, fabrication):
+    prelude = "    original_rows = _python_sources()\n    first = original_rows[0][0]\n"
+    fake = "(row[0], '# benign fixture\\n') if row[0] == first else row"
+    replacement = {
+        "filter": "tuple(row for row in original_rows if row[0] != first)",
+        "slice": "original_rows[1:]",
+        "map": f"tuple(map(lambda row: {fake}, original_rows))",
+        "parameter": "_python_sources() if sources is None else sources",
+        "fake-text": f"tuple({fake} for row in original_rows)",
+        "repeated": "(original_rows[0],) * len(original_rows)",
+    }[fabrication]
+    if fabrication == "parameter":
+        prelude += f"    sources = tuple({fake} for row in original_rows)\n"
+    result = run_census_variant(tmp_path, caller, census_source_variant(caller, replacement, prelude=prelude))
+    assert result.returncode != 0, "live census accepted fabricated source rows"
+    assert b"census rows must equal the frozen inventory" in result.stderr, result.stderr.decode()
+
+
+@pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
+@pytest.mark.parametrize("argument", ["fabricated", "*[fabricated]", "**{'sources': fabricated}"])
+def test_live_census_argon_rejects_nonempty_wrappers(tmp_path, caller, argument):
+    prelude = ("    original_rows = _python_sources()\n"
+               "    fabricated = ((original_rows[0][0], '# benign fixture\\n'), *original_rows[1:])\n")
+    source = census_source_variant(caller, "_python_sources() if sources is None else sources", prelude=prelude)
+    entry_name = ("test_no_module_imports_a_private_name_of_redaction" if caller == "test_redaction.py"
+                  else "test_every_name_in_insights_all_is_used_outside_the_module")
+    entry = next(node for node in ast.parse(source).body
+                 if isinstance(node, ast.FunctionDef) and node.name == entry_name)
+    sink_name = "private_imports" if caller == "test_redaction.py" else "_defined_names_referenced_outside"
+    sink = next(node for node in ast.walk(entry) if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name) and node.func.id == sink_name)
+    sink_source = ast.get_source_segment(source, sink)
+    lines = source.splitlines(keepends=True)
+    body = "".join(lines[entry.lineno - 1:entry.end_lineno])
+    body = body.replace(sink_source, f"_run_census({argument})", 1)
+    source = "".join(lines[:entry.lineno - 1]) + body + "".join(lines[entry.end_lineno:])
+    source += "\ndef _run_census(sources=None):\n    return " + sink_source + "\n"
+    result = run_census_variant(tmp_path, caller, source)
+    assert result.returncode != 0, "live census accepted a wrapper's fabricated explicit argument"
+    assert b"census rows must equal the frozen inventory" in result.stderr, result.stderr.decode()
+
+
+@pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
+def test_live_census_runtime_allows_external_globs_and_resets(tmp_path, caller):
+    extra = "\nimport glob\nexternal_files = glob.glob(" + repr(str(tmp_path / "*.py")) + ")\n"
+    prelude = "    glob.glob(" + repr(str(tmp_path / "*.py")) + ")\n"
+    if sys.version_info >= (3, 10):
+        prelude += "    glob.glob('*.py', root_dir=" + repr(str(tmp_path)) + ")\n"
+    source = census_source_variant(caller, "_python_sources() if sources is None else sources", extra, prelude)
+    result = run_census_variant(tmp_path, caller, source)
+    assert result.returncode == 0, result.stderr.decode()
+
+
+@pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
+def test_live_census_source_rows_are_immutable(caller):
+    import importlib
+
+    module = importlib.import_module("tests.unit.core." + caller[:-3])
+    assert isinstance(module._REVIEWED_PYTHON_PATHS, tuple)
+    assert isinstance(module._python_sources(), tuple)
+
+
+def test_live_census_runtime_flag_resets_after_refusal_and_other_errors():
+    program = (
+        "import os, pytest\nfrom pathlib import Path\n"
+        "from tests.helpers_reviewed_sources import census_guard\n"
+        "root = Path(sys.argv[2])\n"
+        "for failure in (AssertionError, ValueError):\n"
+        "    with pytest.raises(failure):\n"
+        "        with census_guard(root):\n"
+        "            if failure is ValueError:\n                raise ValueError('fixture error')\n"
+        "            os.listdir(root)\n"
+        "    assert 'tests' in os.listdir(root)\n"
+    )
+    result = _run_isolated(program, REPO)
+    assert result.returncode == 0, result.stderr.decode()
+
+
+def test_live_census_runtime_installs_one_hook_across_reimports():
+    program = (
+        "import importlib, os, runpy\nfrom pathlib import Path\n"
+        "seen = []\n"
+        "def observe(event, args):\n"
+        "    if event == 'sys.addaudithook':\n        seen.append(event)\n"
+        "sys.addaudithook(observe)\n"
+        "from tests import helpers_reviewed_sources as helper\n"
+        "importlib.reload(helper)\n"
+        "runpy.run_path(helper.__file__)\n"
+        "assert len(seen) == 1, seen\n"
+        "for attempt in range(2):\n"
+        "    try:\n"
+        "        with helper.census_guard(Path(sys.argv[2])):\n            os.listdir(sys.argv[2])\n"
+        "    except AssertionError as exc:\n"
+        "        assert 'live-tree census enumeration is forbidden' in str(exc)\n"
+        "    else:\n        raise AssertionError('reimport disabled the audit hook')\n"
+        "    assert 'tests' in os.listdir(sys.argv[2])\n"
+    )
+    result = _run_isolated(program, REPO)
+    assert result.returncode == 0, result.stderr.decode()
+
+
+@pytest.mark.parametrize("external", [False, True])
+@pytest.mark.parametrize("operation", ["listdir", "scandir", "glob-dir-fd"])
+def test_live_census_runtime_resolves_descriptor_paths(tmp_path, external, operation):
+    if os.name != "posix" or not Path("/proc/self/fd").is_dir():
+        pytest.skip("descriptor physical-path probe requires POSIX procfs")
+    if operation == "glob-dir-fd" and sys.version_info < (3, 10):
+        pytest.skip("glob dir_fd requires Python 3.10")
+    program = (
+        "import glob, os, pytest\nfrom pathlib import Path\n"
+        "from tests.helpers_reviewed_sources import census_guard\n"
+        "root, directory, operation, external = Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4], sys.argv[5] == 'True'\n"
+        "descriptor = os.open(directory, os.O_RDONLY)\n"
+        "try:\n"
+        "    def enumerate_directory():\n"
+        "        if operation == 'listdir':\n            return os.listdir(descriptor)\n"
+        "        if operation == 'scandir':\n"
+        "            with os.scandir(descriptor) as entries:\n                return list(entries)\n"
+        "        return glob.glob('*.py', dir_fd=descriptor)\n"
+        "    if external:\n"
+        "        with census_guard(root):\n            assert enumerate_directory() == []\n"
+        "    else:\n"
+        "        with pytest.raises(AssertionError, match='live-tree census enumeration is forbidden'):\n"
+        "            with census_guard(root):\n                enumerate_directory()\n"
+        "finally:\n    os.close(descriptor)\n"
+    )
+    result = _run_isolated(program, REPO, tmp_path if external else REPO, operation, external)
+    assert result.returncode == 0, result.stderr.decode()
+
+
+def test_live_census_runtime_refuses_an_unsupported_descriptor_probe(monkeypatch):
+    def unsupported_readlink(path):
+        raise OSError("physical descriptor paths unavailable")
+
+    monkeypatch.setattr(reviewed_helper, "os", SimpleNamespace(**{**vars(os), "readlink": unsupported_readlink}))
+    with pytest.raises(AssertionError, match="live-tree census enumeration is forbidden: cannot resolve 77"):
+        with census_guard(REPO):
+            sys.audit("os.listdir", 77)
+
+
+@pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
+@pytest.mark.parametrize("enumeration", [
+    '(REPO / "aegis_core").rglob("*.py")',
+    'os.walk(REPO)',
+    'glob.glob(str(REPO / "**" / "*.py"), recursive=True)',
+    'glob.iglob(str(REPO / "**" / "*.py"), recursive=True)',
+])
+@pytest.mark.parametrize("dependency", ["inline", "function", "class", "callback"])
+def test_live_census_guard_rejects_enumeration_from_entrypoints(caller, enumeration, dependency):
+    extra = "\nimport glob\n"
+    if dependency == "inline":
+        replacement = enumeration
+    elif dependency == "function":
+        extra += "\ndef round2_sources():\n    return " + enumeration + "\n"
+        replacement = "round2_sources()"
+    elif dependency == "class":
+        extra += "\nclass Round2Sources:\n    def collect(self):\n        return " + enumeration + "\n"
+        replacement = "Round2Sources().collect()"
+    else:
+        extra += ("\ndef round2_sources():\n    return " + enumeration + "\n"
+                  "def round2_callback(reader):\n    return reader()\n")
+        replacement = "round2_callback(round2_sources)"
+    source = census_source_variant(caller, replacement, extra)
+    for _ in range(2):
+        with pytest.raises(AssertionError, match="live-tree census enumeration is forbidden"):
+            test_live_censuses_use_one_index_helper(caller, source)
+
+
+@pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
+def test_live_census_guard_requires_frozen_source_input(caller):
+    source = census_source_variant(caller, "[]")
+    for _ in range(2):
+        with pytest.raises(AssertionError, match="source input must use the shared frozen inventory"):
+            test_live_censuses_use_one_index_helper(caller, source)
+
+
+@pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
+@pytest.mark.parametrize("replacement,extra", [
+    ("round2_sources()", "\ndef round2_sources():\n    return _python_sources()\n"),
+    ("Round2Sources().collect()", "\nclass Round2Sources:\n    def collect(self):\n        return _python_sources()\n"),
+    ("round2_callback(_python_sources)", "\ndef round2_callback(reader):\n    return reader()\n"),
+    ("round2_sources()", "\ndef round2_sources():\n    reader = _python_sources\n    return reader()\n"),
+    ("round2_callback(Round2Sources().collect)",
+     "\nclass Round2Sources:\n    def collect(self):\n        return _python_sources()\n"
+     "def round2_callback(reader):\n    return reader()\n"),
+], ids=["function", "method", "callback", "local-alias", "method-callback"])
+def test_live_census_guard_accepts_frozen_helpers_and_callbacks(caller, replacement, extra):
+    test_live_censuses_use_one_index_helper(caller, census_source_variant(caller, replacement, extra))
+
+
+@pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
+@pytest.mark.parametrize("replacement,extra", [
+    ("enumerate_sources(REPO)", "\nfrom os import walk as enumerate_sources\n"),
+    ("enumerate_sources(str(REPO / '**' / '*.py'))", "\nfrom glob import iglob as enumerate_sources\n"),
+    ("round2_sources()", "\ndef round2_sources():\n    reader = (REPO / 'tests').rglob\n    return reader('*.py')\n"),
+], ids=["walk-alias", "glob-alias", "bound-callback"])
+def test_live_census_guard_rejects_enumeration_aliases(caller, replacement, extra):
+    source = census_source_variant(caller, replacement, extra)
+    with pytest.raises(AssertionError, match="live-tree census enumeration is forbidden"):
+        test_live_censuses_use_one_index_helper(caller, source)
+
+
+@pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
+def test_live_census_guard_rejects_unused_frozen_input(caller):
+    # A separate frozen read in the census body must not bless another source input.
+    source = census_source_variant(caller, "round2_sources()", "\ndef round2_sources():\n    return []\n",
+                                   prelude="    unused = _python_sources()\n")
+    with pytest.raises(AssertionError, match="source input must use the shared frozen inventory"):
+        test_live_censuses_use_one_index_helper(caller, source)
+
+
+@pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
+@pytest.mark.parametrize("replacement,extra", [
+    ("round2_sources()", "\ndef round2_sources():\n    unused = _python_sources()\n    return []\n"),
+    ("round2_sources(_python_sources())", "\ndef round2_sources(unused):\n    return []\n"),
+    ("round2_callback(_python_sources)", "\ndef round2_callback(unused):\n    return []\n"),
+], ids=["unused-local", "unused-argument", "unused-callback"])
+def test_live_census_guard_rejects_discarded_frozen_inputs(caller, replacement, extra):
+    source = census_source_variant(caller, replacement, extra)
+    for _ in range(2):
+        with pytest.raises(AssertionError, match="source input must use the shared frozen inventory"):
+            test_live_censuses_use_one_index_helper(caller, source)
+
+
+@pytest.fixture(scope="module", params=["parent", "competing-tests"])
+def redaction_import_path(request, tmp_path_factory):
+    paths = list(sys.path)
+    if request.param == "competing-tests":
+        root = tmp_path_factory.mktemp("competing-tests-redaction")
+        package = root / "tests"
+        package.mkdir()
+        (package / "__init__.py").write_text("# Installed regular tests package.\n", encoding="utf-8")
+        paths.insert(0, str(root))
+    return paths
+
+
+def test_redaction_isolated_import_bootstrap(redaction_import_path):
+    program = (
+        "from pathlib import Path\n"
+        "import tests\n"
+        "assert Path(tests.__path__[0]) == Path(sys.argv[2])\n"
+        "assert 'tests.conftest' not in sys.modules\n"
+        "from tests.unit.core import test_redaction\n"
+        "assert Path(test_redaction.__file__).resolve() == Path(sys.argv[3])\n"
+    )
+    result = _run_isolated(program, REPO / "tests", Path(__file__).resolve(), import_path=redaction_import_path)
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+
+
+@pytest.fixture(params=["test_redaction.py", "test_insights.py"])
+def reviewed_census_checkout(tmp_path_factory, request):
+    source = REPO / "tests" / "unit" / "core" / request.param
+    # Retained inventories outlive a test. Keep each fixture checkout alive for
+    # the session so passed-test cleanup cannot recycle its canonical identity.
+    checkout = tmp_path_factory.mktemp(f"reviewed-census-{source.stem}") / "checkout"
+    module = checkout / "tests" / "unit" / "core" / source.name
+    module.parent.mkdir(parents=True)
+    shutil.copyfile(source, module)
+    reviewed = ("aegis_core/reviewed.py", ".github/scripts/reviewed script.py")
+    for name in reviewed:
+        path = checkout / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# reviewed\n", encoding="utf-8")
+    expected = tuple(sorted((*reviewed, module.relative_to(checkout).as_posix())))
+    env = {key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")}
+    env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+    subprocess.run(["git", "init", "-q", str(checkout)], env=env, check=True, capture_output=True, timeout=60)
+    subprocess.run(["git", "add", "."], cwd=checkout, env=env, check=True, capture_output=True, timeout=60)
+    return checkout, module, env, expected
+
+
+def test_both_censuses_freeze_the_index_and_retry_missing_sources(reviewed_census_checkout):
+    checkout, module, env, expected = reviewed_census_checkout
+    late = checkout / "tests" / "untracked.py"
+    late.write_text("invalid syntax (\n", encoding="utf-8")
+    scope = runpy.run_path(str(module))
+    assert scope["_REVIEWED_PYTHON_PATHS"] == expected
+    scan = scope["_python_sources"]
+    initial = scan()
+    assert ".github/scripts/reviewed script.py" in scope["_REVIEWED_PYTHON_PATHS"]
+    assert "tests/untracked.py" not in scope["_REVIEWED_PYTHON_PATHS"]
+    # A parallel worker may even stage a new file after collection.
+    subprocess.run(["git", "add", "."], cwd=checkout, env=env, check=True, capture_output=True, timeout=60)
+    for _ in range(2):
+        assert scan() == initial
+    reviewed = checkout / "aegis_core" / "reviewed.py"
+    reviewed.unlink()
+    for _ in range(2):
+        with pytest.raises(FileNotFoundError) as failure:
+            scan()
+        assert failure.value.filename == str(reviewed)
+    reviewed.write_text("# restored\n", encoding="utf-8")
+    assert scan() != initial
+
+
+def test_both_censuses_ignore_all_inherited_git_controls(reviewed_census_checkout, redaction_import_path):
+    checkout, module, env, expected = reviewed_census_checkout
+    assert runpy.run_path(str(module))["_REVIEWED_PYTHON_PATHS"] == expected
+    env.update({"GIT_DIR": str(checkout / "absent"), "GIT_INDEX_FILE": str(checkout / "absent-index"),
+                "GIT_CONFIG_COUNT": "invalid", "GIT_CONFIG_GLOBAL": str(checkout / "absent-config"),
+                "git_dir": "invalid"})
+    program = (
+        "import json, os, runpy, sys\n"
+        "def clean_git(event, args):\n"
+        "    if event == 'subprocess.Popen' and 'ls-files' in args[1]:\n"
+        "        actual = {key: value for key, value in args[3].items() if key.upper().startswith('GIT_')}\n"
+        "        assert actual == {'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1',\n"
+        "                          'GIT_TERMINAL_PROMPT': '0', 'GIT_OPTIONAL_LOCKS': '0'}, actual\n"
+        "sys.addaudithook(clean_git)\n"
+        "for attempt in range(2):\n"
+        "    print(json.dumps(runpy.run_path(sys.argv[2])['_REVIEWED_PYTHON_PATHS']))\n"
+    )
+    result = _run_isolated(program, module, env=env, import_path=redaction_import_path)
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    assert [json.loads(line) for line in result.stdout.splitlines()] == [list(expected)] * 2
+
+
+def test_both_censuses_accept_gitfiles_without_history(reviewed_census_checkout):
+    checkout, module, _, expected = reviewed_census_checkout
+    assert runpy.run_path(str(module))["_REVIEWED_PYTHON_PATHS"] == expected
+    metadata = checkout / ".git"
+    metadata.rename(checkout / "metadata")
+    metadata.write_text("gitdir: metadata\n", encoding="utf-8")
+    for _ in range(2):
+        assert runpy.run_path(str(module))["_REVIEWED_PYTHON_PATHS"] == expected
+
+
+@pytest.mark.parametrize("marker", ["missing", "dangling"])
+def test_both_censuses_refuse_absent_indexes(reviewed_census_checkout, marker):
+    checkout, module, _, _ = reviewed_census_checkout
+    metadata = checkout / ".git"
+    metadata.rename(checkout / "metadata")
+    if marker == "dangling":
+        symlink_or_skip(checkout / "absent", metadata, target_is_directory=True)
+    for _ in range(2):
+        with pytest.raises(subprocess.CalledProcessError) as failure:
+            runpy.run_path(str(module))
+        assert failure.value.returncode == 128
+
+
+def test_both_censuses_propagate_git_timeout(reviewed_census_checkout, redaction_import_path):
+    checkout, module, env, _ = reviewed_census_checkout
+    # Inject an OS process-boundary failure in an isolated interpreter. No shared
+    # subprocess module or pytest teardown dependency is monkeypatched.
+    program = (
+        "import runpy, subprocess, sys\n"
+        "def timed_out(event, args):\n"
+        "    if event == 'subprocess.Popen' and 'ls-files' in args[1]:\n"
+        "        raise subprocess.TimeoutExpired(args[1], 60)\n"
+        "sys.addaudithook(timed_out)\n"
+        "for attempt in range(2):\n"
+        "    try:\n"
+        "        runpy.run_path(sys.argv[2])\n"
+        "    except subprocess.TimeoutExpired as failure:\n"
+        "        assert failure.timeout == 60\n"
+        "        assert 'ls-files' in failure.cmd\n"
+        "    else:\n"
+        "        raise AssertionError('Git timeout did not propagate')\n"
+    )
+    result = _run_isolated(program, module, env=env, import_path=redaction_import_path)
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
 
 
 def _tok(*parts: str) -> str:
@@ -199,6 +1149,8 @@ def test_scanners_defines_no_redaction_table_and_no_redactor():
 
 def private_imports(sources: Iterable[Tuple[str, str]]) -> List[str]:
     """``label:line: aegis_core.redaction._name`` for each import of an underscore name of the module."""
+    sources = tuple(sources)
+    check_census_rows(sources)
     found = []
     for label, text in sources:
         # Python normalizes identifiers with NFKC before exposing them in the AST.
@@ -211,37 +1163,15 @@ def private_imports(sources: Iterable[Tuple[str, str]]) -> List[str]:
     return found
 
 
-def _git_environment() -> Dict[str, str]:
-    """Git must use the intended checkout, independently of the caller's repository."""
-    return {key: value for key, value in os.environ.items() if key not in LOCAL_ENV}
+_REVIEWED_PYTHON_PATHS = reviewed_python_paths(REPO)
 
 
-def _reviewed_python_paths() -> Tuple[str, ...]:
-    roots = (*PACKAGES, "tests", ".github/scripts")
-    if (REPO / ".git").exists():
-        # The index needs no Git history and excludes other workers' untracked files.
-        listed = subprocess.run(
-            ["git", "-c", "core.fsmonitor=false", "ls-files", "--cached", "-z", "--", *roots],
-            cwd=REPO, env=_git_environment(), check=True, capture_output=True, timeout=10,
-        )
-        paths = [os.fsdecode(name) for name in listed.stdout.split(b"\0") if name]
-    else:
-        # A committed, history-less checkout has no index. Freeze its initial
-        # inventory during collection, before tests can create temporary sources.
-        paths = [path.relative_to(REPO).as_posix()
-                 for name in roots for path in (REPO / name).rglob("*.py")]
-    return tuple(sorted({name for name in paths
-                         if name.endswith(".py") and "__pycache__" not in Path(name).parts}))
-
-
-_REVIEWED_PYTHON_PATHS = _reviewed_python_paths()
-
-
-def _python_sources(root: Path = REPO) -> List[Tuple[str, str]]:
+def _python_sources(root: Path = REPO) -> tuple:
     # Freeze membership, not contents: edited or missing reviewed sources still fail.
-    return [(name, (root / name).read_text(encoding="utf-8")) for name in _REVIEWED_PYTHON_PATHS]
+    return tuple((name, (root / name).read_text(encoding="utf-8")) for name in _REVIEWED_PYTHON_PATHS)
 
 
+@census_guard(REPO, module_file=__file__)
 def test_no_module_imports_a_private_name_of_redaction(monkeypatch: pytest.MonkeyPatch, sources=None):
     real_parse = ast.parse
     parse_count = 0
@@ -263,7 +1193,7 @@ def test_no_module_imports_a_private_name_of_redaction(monkeypatch: pytest.Monke
     )
 
 
-@pytest.mark.parametrize("indexed", [True, False], ids=["git-index", "committed-checkout"])
+@pytest.mark.parametrize("indexed", [True, False], ids=["git-index", "gitfile-index"])
 def test_private_import_census_ignores_files_created_after_collection(tmp_path: Path, indexed: bool):
     """Both source inventories stay fixed across parallel-test writes and repeated scans."""
     module = tmp_path / "tests" / "unit" / "core" / "test_redaction.py"
@@ -281,11 +1211,13 @@ def test_private_import_census_ignores_files_created_after_collection(tmp_path: 
     cache = reviewed.parent / "__pycache__"
     cache.mkdir()
     (cache / "cached.py").write_text("redaction syntax (\n", encoding="utf-8")
-    if indexed:
-        subprocess.run(["git", "init", "-q", str(tmp_path)], env=_git_environment(), check=True, timeout=10)
-        subprocess.run(["git", "add", "."], cwd=tmp_path, env=_git_environment(), check=True, timeout=10)
-        (tmp_path / "tests" / "untracked_before_collection.py").write_text(
-            "from aegis_core.redaction import _unreviewed\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(tmp_path)], env=_git_environment(), check=True, timeout=60)
+    subprocess.run(["git", "add", "."], cwd=tmp_path, env=_git_environment(), check=True, timeout=60)
+    if not indexed:
+        (tmp_path / ".git").rename(tmp_path / "metadata")
+        (tmp_path / ".git").write_text("gitdir: metadata\n", encoding="utf-8")
+    (tmp_path / "tests" / "untracked_before_collection.py").write_text(
+        "from aegis_core.redaction import _unreviewed\n", encoding="utf-8")
     scan = runpy.run_path(str(module))["_python_sources"]
     initial = scan()
     assert {"aegis_core/reviewed.py", ".github/scripts/reviewed script.py"} <= {label for label, _ in initial}
@@ -327,16 +1259,17 @@ def test_private_import_census_refuses_an_unreadable_index(tmp_path: Path):
 
 
 @pytest.mark.parametrize("count", [1, 66, 72])
-def test_private_import_census_accepts_additions_within_reviewed_ceiling(monkeypatch, count):
+def test_private_import_census_accepts_additions_within_reviewed_ceiling(tmp_path, count):
     sources = [(f"tests/reviewed_{index}.py", "# redaction\n") for index in range(count)]
-    test_no_module_imports_a_private_name_of_redaction(monkeypatch, sources)
+    result = run_census_fixture(tmp_path, "test_redaction.py", sources)
+    assert result.returncode == 0, result.stderr.decode()
 
 
-def test_private_import_census_ceiling_failure_lists_every_parsed_file(monkeypatch):
+def test_private_import_census_ceiling_failure_lists_every_parsed_file(tmp_path):
     sources = [(f"tests/reviewed_{index}.py", "# redaction\n") for index in range(73)]
-    with pytest.raises(AssertionError) as failure:
-        test_no_module_imports_a_private_name_of_redaction(monkeypatch, sources)
-    message = str(failure.value)
+    result = run_census_fixture(tmp_path, "test_redaction.py", sources)
+    assert result.returncode != 0
+    message = result.stderr.decode()
     assert "73" in message and "72" in message
     assert all(label in message for label, _ in sources)
 
@@ -351,7 +1284,7 @@ def redaction_selector_checkout(tmp_path: Path):
     package = checkout / "aegis_core"
     package.mkdir()
     (package / "reviewed.py").write_text("# redaction\n", encoding="utf-8")
-    env = {key: value for key, value in os.environ.items() if key not in LOCAL_ENV}
+    env = _git_environment()
     subprocess.run(["git", "init", "-q", str(checkout)], env=env, check=True, timeout=10)
     subprocess.run(["git", "add", "."], cwd=checkout, env=env, check=True, timeout=10)
     external_index = tmp_path / "external-index"
@@ -366,9 +1299,9 @@ def redaction_selector_checkout(tmp_path: Path):
 @pytest.mark.parametrize("selector", ["GIT_INDEX_FILE", "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "combined", "all-local"])
 @pytest.mark.parametrize("operation", ["census", "fixture"])
 def test_private_import_census_and_fixture_ignore_inherited_git_selectors(
-        tmp_path: Path, redaction_selector_checkout, selector: str, operation: str):
+        tmp_path: Path, redaction_selector_checkout, selector: str, operation: str, redaction_import_path):
     module, external_index, external = redaction_selector_checkout
-    env = {key: value for key, value in os.environ.items() if key not in LOCAL_ENV}
+    env = _git_environment()
     if selector == "all-local":
         env.update({key: "invalid-inherited-selector" for key in LOCAL_ENV})
     env["GIT_INDEX_FILE"] = str(external_index)
@@ -380,17 +1313,15 @@ def test_private_import_census_and_fixture_ignore_inherited_git_selectors(
     program = (
         "import json, runpy, sys\n"
         "from pathlib import Path\n"
-        "scope = runpy.run_path(sys.argv[1])\n"
-        "if sys.argv[3] == 'census':\n"
+        "scope = runpy.run_path(sys.argv[2])\n"
+        "if sys.argv[4] == 'census':\n"
         "    print(json.dumps(scope['private_imports'](scope['_python_sources']())))\n"
         "else:\n"
-        "    scope['test_private_import_census_ignores_files_created_after_collection'](Path(sys.argv[2]), True)\n"
+        "    scope['test_private_import_census_ignores_files_created_after_collection'](Path(sys.argv[3]), True)\n"
     )
     for attempt in range(2):
-        result = subprocess.run(
-            [sys.executable, "-c", program, str(module), str(tmp_path / f"fixture_{attempt}"), operation],
-            cwd=REPO, env=env, capture_output=True, timeout=30, check=False,
-        )
+        result = _run_isolated(program, module, tmp_path / f"fixture_{attempt}", operation,
+                               env=env, import_path=redaction_import_path)
         assert external_index.read_bytes() == before, "fixture changed the caller's external index"
         assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
         if operation == "census":
