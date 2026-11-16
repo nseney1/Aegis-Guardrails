@@ -2110,6 +2110,12 @@ PROOF_REGISTRATION_GROUPS = {
         ((0, 1, 2), 'BL-16g round-4 C2 pins terminal width and color for byte goldens (COLUMNS=80, NO_COLOR=1, PYTHON_COLORS=0; clears FORCE_COLOR); pytest restores the environment. No shared process-module attribute is patched.'),
     ('tests/unit/cli/test_cli_team_queue.py', 'test_public_operation_byte_goldens', 'fixture', 'monkeypatch.delenv', False):
         ((0,), 'BL-16g round-4 C2 pins terminal width and color for byte goldens (COLUMNS=80, NO_COLOR=1, PYTHON_COLORS=0; clears FORCE_COLOR); pytest restores the environment. No shared process-module attribute is patched.'),
+    ('tests/unit/core/test_team_git.py', 'filter_home', 'fixture', 'monkeypatch.setenv', False):
+        ((0, 1), 'GM-5b points HOME and USERPROFILE at the test-owned global Git config; pytest restores the fixture environment.'),
+    ('tests/unit/core/test_team_git.py', 'test_snapshot_filter_config_redirection_is_refused_before_spawn', 'fixture', 'monkeypatch.context', False):
+        ((0,), 'GM-5b redirect-refusal context restores the fixture environment before the retry; its body is independently censused.'),
+    ('tests/unit/core/test_team_git.py', 'test_snapshot_filter_config_redirection_is_refused_before_spawn', 'fixture', 'scoped.setenv', False):
+        ((0,), 'GM-5b temporarily supplies one test-owned Git config redirect, verifies zero lane process spawns, and restores it for retry.'),
     ('tests/unit/mcp/test_mcp_queue_role.py', 'owner_factory.create', 'fixture', 'monkeypatch.setenv', False):
         ((0, 1), 'BL-16c sets HOME and USERPROFILE to the test-owned account fixture for hermetic queue/profile IO; monkeypatch restores both. Product authority still comes from the separately patched account-database boundary.'),
     ('tests/unit/mcp/test_mcp_queue_role.py', 'test_ordinary_connection_has_no_grant', 'fixture', 'monkeypatch.setenv', False):

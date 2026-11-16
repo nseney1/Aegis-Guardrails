@@ -20,7 +20,7 @@ __all__ = ["CONTROL_GUIDANCE", "GuidanceProjectionError", "GuidanceResult", "MAX
            "assembled_text", "project_assembled", "contains_control_characters", "estimate_tokens", "field_text", "finish_payload",
            "instruction_body", "normalize_layout", "redact_clean_text", "project_detail", "project_display_data",
            "project_envelope_fields", "project_field", "project_identifier", "project_rule_entries",
-           "project_text", "project_display_text", "project_error_name", "raw_rule_text"]
+           "project_text", "project_diagnostic", "project_display_text", "project_error_name", "raw_rule_text"]
 
 MAX_GUIDANCE_CHARS = 1024 * 1024
 MAX_GUIDANCE_ITEMS = 256
@@ -30,6 +30,10 @@ WITHHELD_GUIDANCE = "guidance withheld: ambiguous structure"
 CONTROL_GUIDANCE = "guidance withheld: control characters"
 MAX_IDENTIFIER_ITEMS = 4096
 _IDENTIFIER_FIELDS = frozenset({"id", "name", "path", "_path", "matched_files", "files"})
+_DIAGNOSTIC_ESCAPES = re.compile(
+    r"(?<!\\)(?:(?P<slashes>(?:\\\\)*\\)(?:(?P<space>[tnrvf])|(?P<point>x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8})"
+    r"|N\{(?P<name>[^{}]*)(?P<closed>\}|(?=\{)|$))|\\+)"
+)
 
 
 class _Slots(Protocol):
@@ -267,6 +271,56 @@ def project_display_text(text: str, max_len: Optional[int] = 1024) -> str:
         return clip_redacted(shown, max_len - 3) + "..."
     except GuidanceProjectionError as exc:
         return exc.code
+
+
+def _diagnostic_space(char: str) -> bool:
+    """Use repr's non-printable boundary, together with diagnostic whitespace."""
+    return char.isspace() or not char.isprintable()
+
+
+def _diagnostic_escape(match) -> str:
+    """Preserve repr's literal pairs; only an odd trailing slash can escape."""
+    slashes = match["slashes"]
+    if slashes is None:
+        # A literal run must not consume a following apparent escape body.
+        return match[0]
+    literal = slashes[:-1]
+    if match["space"] is not None:
+        return literal + " "
+    if match["point"] is not None:
+        point = int(match["point"][1:], 16)
+        if point > 0x10FFFF:
+            return match[0]
+        char = chr(point)
+    else:
+        if match["closed"] != "}" or "\\" in match["name"] or not match["name"].isascii():
+            raise _InvalidField(_InvalidField.code)
+        try:
+            char = unicodedata.lookup(match["name"])
+        except KeyError:
+            raise _InvalidField(_InvalidField.code) from None
+    return literal + " " if any(_diagnostic_space(c) for c in char) else match[0]
+
+
+def project_diagnostic(text: str, *, escaped: bool = True) -> str:
+    """Bound, canonicalize, redact and clip diagnostics; literal parts use escaped=False."""
+    if type(text) is not str or type(escaped) is not bool:
+        return "guidance_projection_invalid_field"
+    if len(text) > MAX_GUIDANCE_CHARS:
+        return GuidanceProjectionError.code
+    try:
+        canonical = "".join(" " if _diagnostic_space(ch) else ch for ch in text)
+        # Each run starts once; named escapes end at the next brace or input end.
+        literal = (_DIAGNOSTIC_ESCAPES.sub(_diagnostic_escape, normalize_layout(canonical, single_line=True))
+                   if escaped else normalize_layout(canonical, single_line=True))
+        literal = normalize_layout(literal, single_line=True)
+        # Malformed nesting may create a fresh escape. Refuse it rather than recursively reparsing.
+        if escaped and any(_diagnostic_escape(match) != match[0] for match in _DIAGNOSTIC_ESCAPES.finditer(literal)):
+            return "guidance_projection_invalid_field"
+        shown = redact_clean_text(literal)
+        return shown if len(shown) <= 1024 else clip_redacted(shown, 1021) + "..."
+    except GuidanceProjectionError as error:
+        return error.code
 
 
 def assembled_text(value: str) -> str:

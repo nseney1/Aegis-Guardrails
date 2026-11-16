@@ -379,12 +379,13 @@ def _gc(args: argparse.Namespace, root: Path, now: int) -> lease_output.PendingR
             "status": "collected" if result.collected else "nothing to collect",
             "collected": [{"lane": c.lane, "previous": c.previous, "caller": c.caller} for c in result.collected],
             "kept": [{"lane": lane, "reason": reason} for lane, reason in result.kept],
-            "warnings": warnings + rows,
+            "warnings": warnings,
+            "lane_warnings": rows,
         })
         response.json(payload)
         return response
     response.warn(warnings)
-    response.warn([row["reason"] for row in rows])
+    response.warn([f"{row['lane']}: {row['reason']}" for row in rows])
     for change in result.collected:
         response.line(f"collected {change.lane}")
     if not result.collected:
@@ -761,12 +762,12 @@ class TeamCommand(AegisCommand):
         claim.add_argument("--owner", default=None, help="Display label (default: <user>@<hostname>)")
         claim.add_argument("--ttl", type=int, default=team.DEFAULT_TTL_S, metavar="SECONDS",
                            help=f"Seconds until the lease expires, at most {team.MAX_TTL_S}")
-        claim.add_argument("--branch", default=None, help="The lane's branch, recorded for display")
+        claim.add_argument("--branch", default=None, help="The lane's branch; when recorded, it must exist for CLI renewal")
 
         renew = sub.add_parser(
             "renew", parents=[common], help="Extend a lease; prints the new lease oid",
-            description="Renew by compare-and-swap; an expired lease is re-claimed, overlap check included.",
-            epilog="CLI preflight: a missing recorded branch refuses with lease_branch_missing; an attached "
+            description="Renew by compare-and-swap; an expired lease is re-claimed, overlap check included. "
+                   "CLI preflight: a missing recorded branch refuses with lease_branch_missing; an attached "
                    "worktree is not required. Unavailable Git evidence refuses with liveness_unknown.",
         )
         renew.add_argument("lane", metavar="LANE", help=lane_help)
@@ -789,8 +790,8 @@ class TeamCommand(AegisCommand):
         release.add_argument("--expect", required=True, metavar="OID", help=expect_help)
 
         sub.add_parser("gc", parents=[common], help="Delete expired leases",
-                       description="Delete every expired lease by compare-and-swap; unreadable leases are kept.",
-                       epilog="CLI preflight: expired_with_worktree warning rows report attached worktrees; "
+                       description="Delete every expired lease by compare-and-swap; unreadable leases are kept. "
+                              "CLI preflight: expired_with_worktree JSON lane_warnings rows report attached worktrees; "
                               "expired leases are still collected. Unavailable Git evidence refuses with liveness_unknown.")
         sub.add_parser("list", parents=[common], help="Show leases (conflict input, not liveness proof)",
                        description=team.LEASE_NOTE)

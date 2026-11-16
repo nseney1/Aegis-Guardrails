@@ -2065,11 +2065,13 @@ def test_cli_liveness_gc_collects_expired_with_worktree_warning_and_retry(repo, 
     code, payload, err = lease_cli("gc")
     assert (code, payload["status"], err) == (0, "collected", "")
     assert [(row["lane"], row["previous"]) for row in payload["collected"]] == [("docs", old.oid)]
-    assert payload["warnings"] == [{"lane": "docs", "reason": "expired_with_worktree"}]
+    assert payload["warnings"] == []
+    assert payload["lane_warnings"] == [{"lane": "docs", "reason": "expired_with_worktree"}]
     assert _ref(repo, "docs") is None and _ref(repo, "api") == live.oid
     assert worktree.is_dir()
     code, payload, err = lease_cli("gc")
     assert (code, payload["collected"], payload["warnings"], err) == (0, [], [], "")
+    assert payload["lane_warnings"] == []
 
 
 @pytest.mark.parametrize("branch", [None, "missing", "main"])
@@ -2077,13 +2079,14 @@ def test_cli_liveness_gc_expiry_is_independent_of_branch_and_worktree(repo, leas
     old = team.claim(repo, "docs", ["docs/**"], branch=branch, owner="o@h", ttl_s=60, now=lease_now - 100)
     code, payload, err = lease_cli("gc")
     assert (code, payload["collected"][0]["previous"], err) == (0, old.oid, "")
-    assert payload["warnings"] == ([{"lane": "docs", "reason": "expired_with_worktree"}] if branch == "main" else [])
+    assert payload["warnings"] == []
+    assert payload["lane_warnings"] == ([{"lane": "docs", "reason": "expired_with_worktree"}] if branch == "main" else [])
 
 
 def test_cli_liveness_gc_text_warns_without_retaining_expired_lease(repo, worktree, lease_cli, lease_now):
     team.claim(repo, "docs", ["docs/**"], branch="lane/other", owner="o@h", ttl_s=60, now=lease_now - 100)
     code, out, err = lease_cli("gc", as_json=False)
-    assert (code, out, err) == (0, "collected docs\n", "Warning: expired_with_worktree\n")
+    assert (code, out, err) == (0, "collected docs\n", "Warning: docs: expired_with_worktree\n")
     assert _ref(repo, "docs") is None
 
 
@@ -2117,6 +2120,7 @@ def test_cli_liveness_gc_does_not_warn_about_a_concurrently_renewed_lease(repo, 
     monkeypatch.setattr(gitsafe, "run", renew_during_probe)
     code, payload, _ = lease_cli("gc")
     assert (code, payload["collected"], payload["warnings"]) == (0, [], [])
+    assert payload["lane_warnings"] == []
     assert _ref(repo, "docs") == replacement[0]
 
 

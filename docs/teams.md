@@ -362,8 +362,8 @@ compacted IDs to `true`; older records without it load as empty history. Milesto
 list of stable labels in that versioned document; this round adds no milestone
 recording verb. Model inputs and editable files are untrusted. Owner-UID rewriting
 of owner-only state is outside v5.0's threat model. These records supply no OS
-authorization. Renew/gc liveness changes and build-kit wrapper retirement remain
-separate follow-up work.
+authorization. CLI renew/gc preflight rules are described below; build-kit wrapper
+retirement remains separate follow-up work.
 
 ### Owner-bound MCP queue connection
 
@@ -479,7 +479,12 @@ aegis team renew docs --expect LEASE_OID --ttl 3600
 Replace `LEASE_OID` with the ID you received. Renewal prints a new ID; use the
 latest one on the next renewal, transfer or release. Nothing renews automatically,
 and there is no MCP team tool. The default TTL is 3600 seconds, with a maximum of
-86400. A live overlapping claim is refused; for example, this overlaps `docs/**`:
+86400. CLI renewal checks that a recorded branch still exists; a missing recorded
+branch refuses with `lease_branch_missing`. An attached worktree is not required.
+Unavailable Git evidence refuses renew and gc with `liveness_unknown` before
+lease mutation; restore private Git metadata, then retry. GC still collects
+expired leases with attached worktrees and reports them as described below.
+A live overlapping claim is refused; for example, this overlaps `docs/**`:
 
 ```sh
 aegis team claim api --paths 'docs/api/**'
@@ -507,6 +512,12 @@ make it visible to every worktree. The lane name must match
 `[a-z0-9][a-z0-9._-]{0,62}`. An expired lease can be claimed again; `aegis team gc`
 removes expired leases. A timestamp over 300 seconds ahead of the reader is marked
 `clock_skew` and still counts as live.
+
+GC JSON keeps event-recording warnings in `warnings` as strings and reports
+collected lanes with attached worktrees in the additive `lane_warnings` array,
+with rows such as `{"lane": "docs", "reason": "expired_with_worktree"}`. Text mode
+prints `Warning: docs: expired_with_worktree` on stderr. These warnings do not
+retain expired leases; a retry with nothing to collect returns both arrays empty.
 
 A lease is cooperative conflict input, not a lock, not an identity and not proof
 that an agent is alive. Different lanes' claims can race between the overlap read
