@@ -92,11 +92,27 @@ def run_scan(args: argparse.Namespace) -> int:
         print(json.dumps(result, indent=2, default=str))
     elif failed:
         _error(result.get("error", ""), projected=True)
+        _projection_errors(result)
     else:
         print(_served_text(result.get("guidance", "")))
         for warning in result.get("warnings") or []:
             print("Warning: " + _served_text(warning, max_len=1024), file=sys.stderr)
     return EXIT_UNSERVED if failed else EXIT_SCANNED
+
+
+def _projection_errors(result: dict) -> None:
+    repairs = {
+        "guidance_projection_invalid_field": "Fix the field type and run `aegis rule lint <path>`.",
+        "guidance_projection_limit": "Shorten the instruction or slot expansion and run `aegis rule lint <path>`.",
+    }
+    repair = repairs.get(result.get("error"))
+    if repair is None or not result.get("rule_errors"):
+        return
+    for row in result["rule_errors"]:
+        suffix = ": " + row["error"]
+        path = _served_text(row["path"], max_len=1024 - len(suffix))
+        _error(path + suffix, projected=True)
+    print(repair, file=sys.stderr)
 
 
 def _record_scan(root: Path, raw_files: List[str]) -> None:
