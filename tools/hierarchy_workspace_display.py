@@ -118,13 +118,13 @@ class _Refusal(ValueError):
 
 
 def require(condition, message):
-    """Local refusals already display request values at their individual sites.
+    """Accept fixed text or a diagnostic callable evaluated only on refusal.
 
     Preserve validated ids and fixed diagnostic text when crossing the CLI
     boundary, rather than redacting the entire assembled diagnostic again.
     """
     if not condition:
-        raise _Refusal(message, displayed=True)
+        raise _Refusal(message() if callable(message) else message, displayed=True)
 
 
 class _ArgumentParser(argparse.ArgumentParser):
@@ -159,22 +159,30 @@ _UNTRUSTED_DISPLAY_FIELDS = frozenset(("lane", "owner", "paths", "checkout", "er
                                        "holder", "reference", "source", "reserved_paths"))
 
 
-def _display_fields(value, field=None):
-    """Display request/lease text without rewriting validated ids or enum states."""
+def _display_fields(value, field=None, *, _memo=None):
+    """Decide trust per field, then reuse screening only within this traversal."""
+    if _memo is None:
+        _memo = {}
     if isinstance(value, dict):
-        return {key: _display_fields(item, key) for key, item in value.items()}
+        return {key: _display_fields(item, key, _memo=_memo) for key, item in value.items()}
     if isinstance(value, list):
-        return [_display_fields(item, field) for item in value]
-    if isinstance(value, str) and field in ("initiative", "assigned_to", "blocked_by", "declared_overlaps"):
+        return [_display_fields(item, field, _memo=_memo) for item in value]
+    if not isinstance(value, str):
+        return value
+    if field in ("initiative", "assigned_to", "blocked_by", "declared_overlaps"):
         # Blocker strings are not SLUG-checked by validate_lists. Preserve valid
         # identifiers, but do not grant arbitrary request text that exemption.
-        return value if SLUG.fullmatch(value) else _display(value)
-    if isinstance(value, str) and field == "request_id":
+        if SLUG.fullmatch(value):
+            return value
+    elif field == "request_id":
         # Old event reducers do not validate the request id's format on replay.
-        return value if re.fullmatch(r"req-[0-9]{8}", value) else _display(value)
-    if isinstance(value, str) and field in _UNTRUSTED_DISPLAY_FIELDS:
-        return _display(value)
-    return value
+        if re.fullmatch(r"req-[0-9]{8}", value):
+            return value
+    elif field not in _UNTRUSTED_DISPLAY_FIELDS:
+        return value
+    if value not in _memo:
+        _memo[value] = _display(value)
+    return _memo[value]
 
 
 def _display_response(function):

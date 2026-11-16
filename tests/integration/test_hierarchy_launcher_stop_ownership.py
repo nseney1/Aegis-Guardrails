@@ -9585,24 +9585,27 @@ def test_proven_codex_terminator_keeps_option_shaped_positionals(launch, childre
 # is never accepted as native CLI grammar. These tests intentionally do not reuse present_argv/global patches.
 class R2Case:
     def __init__(self, launch):
+        from contextlib import ExitStack
+        from tests.integration.test_hierarchy_launcher import _release_r2_test_descriptors
+
         self.launch = launch
-        self.custody = R2Custody(launch.tmp / "r2-physical", launch.tmp.parent / "r2-physical-UNKNOWN.json")
-        try:
+        with ExitStack() as setup:
+            self.custody = R2Custody(launch.tmp / "r2-physical", launch.tmp.parent / "r2-physical-UNKNOWN.json")
+            setup.callback(_release_r2_test_descriptors, self.custody)
+            setup.callback(self.custody.close)
             self.projection = R2Processes(launch.tmp / "r2-projection")
-        except BaseException:
-            self.custody.close()
-            raise
-        self.script = launch.tmp / "r2-actor.py"
-        self.script.write_text(R2_ACTOR_BOOTSTRAP, encoding="utf-8")
-        self.children, self.configs, self.exec_children = [], [], {}
-        self.home = launch.tmp / "r2-home"
-        self.home.mkdir(mode=0o700)
-        self.env = {key: value for key, value in launch.env().items()
-                    if key not in ("CLAUDECODE", "CLAUDE_PID") and not key.startswith("CLAUDE_CODE_")}
-        self.env.update(HOME=str(self.home), CODEX_HOME=str(self.home / "codex"),
-                        CLAUDE_CONFIG_DIR=str(self.home / "claude"), PYTHONDONTWRITEBYTECODE="1")
-        launch.stop_case = self
-        launch.stop_projection = self.projection
+            self.script = launch.tmp / "r2-actor.py"
+            self.script.write_text(R2_ACTOR_BOOTSTRAP, encoding="utf-8")
+            self.children, self.configs, self.exec_children = [], [], {}
+            self.home = launch.tmp / "r2-home"
+            self.home.mkdir(mode=0o700)
+            self.env = {key: value for key, value in launch.env().items()
+                        if key not in ("CLAUDECODE", "CLAUDE_PID") and not key.startswith("CLAUDE_CODE_")}
+            self.env.update(HOME=str(self.home), CODEX_HOME=str(self.home / "codex"),
+                            CLAUDE_CONFIG_DIR=str(self.home / "claude"), PYTHONDONTWRITEBYTECODE="1")
+            launch.stop_case = self
+            launch.stop_projection = self.projection
+            setup.pop_all()
 
     def bind(self, host, session):
         return self.launch.add_role(REVIEW, host, session=session, cwd=str(self.launch.source))
@@ -11668,37 +11671,282 @@ def test_r2_exited_actor_does_not_spin_pending_runner_wait(r2_case, monkeypatch,
 
 
 
-@pytest.mark.parametrize("surface,scenario", [
-    (surface, scenario)
-    for surface in ("root", "child")
-    for scenario in ("ready-exit", "zombie", "delayed-exit", "missing", "lookup", "conflict", "permission",
-                     "birth", "uid", "euid", "ready-birth", "ready-permission", "ready-lost", "pending-missing",
-                     "pending-birth", "pending-uid", "pending-euid", "pending-permission", "pending-conflict")
-    if surface == "child" or not scenario.startswith("pending-") and scenario != "ready-lost"
-])
-def test_r2_exec_staging_reconciles_exit_and_preserves_identity_loss(launch, tmp_path, request, surface, scenario):
+# Identity loss latches R2Custody.quarantine_report in the process that observed it.
+# Those 20 cases keep one child scope. The other 11 run in-process and must leave
+# the latch clear, with no live child. The parent builds no Launch for a child scope.
+_R2_EXEC_STAGING_IDENTITY = frozenset({
+    "conflict", "permission", "birth", "uid", "euid",
+    "ready-birth", "ready-permission", "ready-lost",
+    "pending-birth", "pending-uid", "pending-euid",
+    "pending-permission", "pending-conflict",
+})
+_R2_EXEC_STAGING_OUTCOME_LIMIT = 65536
+_R2_EXEC_STAGING_TEXT_LIMIT = 4096
+_R2_EXEC_STAGING_NODE_PREFIX = "tests/integration/test_hierarchy_launcher_stop_ownership.py::"
+_R2_EXEC_STAGING_SCOPE_DIR = "scope"
+_R2_EXEC_STAGING_PROBE = _R2_EXEC_STAGING_NODE_PREFIX + "test_r2_exec_staging_scope_probe"
+_R2_EXEC_STAGING_CHILD_FAILED = "R2 fixture: staging scope child failed"
+_R2_EXEC_STAGING_CHILD_SKIPPED = "R2 fixture: staging scope child skipped"
+_R2_EXEC_STAGING_OUTCOME_REFUSED = "R2 fixture: staging scope outcome refused"
+_R2_EXEC_STAGING_OUTCOME_UNAVAILABLE = "R2 fixture: staging scope outcome unavailable"
+_R2_EXEC_STAGING_DESCRIPTORS_UNAVAILABLE = "R2 fixture: staging scope descriptors unavailable"
+
+
+def _r2_exec_staging_is_identity(scenario):
+    return scenario in _R2_EXEC_STAGING_IDENTITY
+
+
+def _r2_exec_staging_cases():
+    scenarios = ("ready-exit", "zombie", "delayed-exit", "missing", "lookup", "conflict", "permission",
+                 "birth", "uid", "euid", "ready-birth", "ready-permission", "ready-lost", "pending-missing",
+                 "pending-birth", "pending-uid", "pending-euid", "pending-permission", "pending-conflict")
+    return [(surface, scenario)
+            for surface in ("root", "child")
+            for scenario in scenarios
+            if surface == "child" or not scenario.startswith("pending-") and scenario != "ready-lost"]
+
+
+def _r2_exec_staging_route(scenario, node, scope):
+    """A child scope only when this process is not already that identity case."""
+    if _r2_exec_staging_is_identity(scenario) and scope != node:
+        return "child"
+    return "inprocess"
+
+
+def _r2_exec_staging_node_accepted(node):
+    if not isinstance(node, str) or not node.startswith(_R2_EXEC_STAGING_NODE_PREFIX):
+        return False
+    if len(node) > 400 or any(character in node for character in "\n\r\u2028\u2029"):
+        return False
+    rest = node[len(_R2_EXEC_STAGING_NODE_PREFIX):]
+    name, separator, param = rest.partition("[")
+    if not name.isidentifier():
+        return False
+    if not separator:
+        return True
+    if not param.endswith("]") or "[" in param[:-1]:
+        return False
+    body = param[:-1]
+    if not body or len(body) > 200:
+        return False
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_., -")
+    return all(character in allowed for character in body)
+
+
+def _r2_exec_staging_descriptors_available():
+    return os.name == "posix" and hasattr(os, "killpg") and Path("/dev/fd").is_dir()
+
+
+def _r2_exec_staging_failure_message(stdout, stderr):
+    from tests.integration.test_hierarchy_launcher import _r2_untrusted_text
+
+    def field(value):
+        if not isinstance(value, str):
+            return ""
+        # Canonicalize, redact, then truncate inside _r2_untrusted_text. Do not join lines.
+        return _r2_untrusted_text(value, _R2_EXEC_STAGING_TEXT_LIMIT)
+
+    return (_R2_EXEC_STAGING_CHILD_FAILED + "\nstdout:\n" + field(stdout) +
+            "\nstderr:\n" + field(stderr))
+
+
+def _r2_exec_staging_apply_child_outcome(result, raw):
+    import xml.etree.ElementTree as ElementTree
+
+    if result.returncode != 0:
+        raise AssertionError(_r2_exec_staging_failure_message(result.stdout, result.stderr))
+    if (not isinstance(raw, bytes) or len(raw) > _R2_EXEC_STAGING_OUTCOME_LIMIT or
+            b"<!DOCTYPE" in raw or b"<!ENTITY" in raw or b"\x00" in raw):
+        raise AssertionError(_R2_EXEC_STAGING_OUTCOME_REFUSED)
+    try:
+        cases = list(ElementTree.fromstring(raw.decode("utf-8", errors="replace")).iter("testcase"))
+    except (ElementTree.ParseError, ValueError, RecursionError):
+        raise AssertionError(_R2_EXEC_STAGING_OUTCOME_UNAVAILABLE) from None
+    if len(cases) != 1:
+        raise AssertionError(_R2_EXEC_STAGING_OUTCOME_UNAVAILABLE)
+    case = cases[0]
+    if case.find("failure") is not None or case.find("error") is not None:
+        raise AssertionError(_r2_exec_staging_failure_message(result.stdout, result.stderr))
+    if case.find("skipped") is not None:
+        pytest.skip(_R2_EXEC_STAGING_CHILD_SKIPPED)
+
+
+def _r2_exec_staging_reap(process):
+    # The unreaped leader reserves this pgid even after exit. Refuse lost ownership.
+    try:
+        os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+    except ChildProcessError:
+        raise AssertionError(_R2_EXEC_STAGING_CHILD_FAILED) from None
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait(timeout=30)
+
+
+def _r2_exec_staging_run(command, env, *, popen=None, temporary_file=None, timeout=180):
+    from contextlib import ExitStack
+    import tempfile
+    import time
+
+    popen = subprocess.Popen if popen is None else popen
+    temporary_file = tempfile.TemporaryFile if temporary_file is None else temporary_file
+    try:
+        with ExitStack() as files:
+            stdout = files.enter_context(temporary_file())
+            stderr = files.enter_context(temporary_file())
+            junit = files.enter_context(temporary_file())
+            command = [*command, "--junitxml=/dev/fd/%d" % junit.fileno()]
+            timed_out = False
+            with ExitStack() as child:
+                process = popen(command, cwd=str(ROOT), env=env, stdin=subprocess.DEVNULL,
+                                stdout=stdout, stderr=stderr, start_new_session=True,
+                                pass_fds=(stdout.fileno(), stderr.fileno(), junit.fileno()))
+                child.callback(_r2_exec_staging_reap, process)
+                deadline = time.monotonic() + timeout
+                while os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        timed_out = True
+                        break
+                    time.sleep(min(0.01, remaining))
+            captured = []
+            for stream in (stdout, stderr, junit):
+                stream.seek(0)
+                captured.append(stream.read(_R2_EXEC_STAGING_OUTCOME_LIMIT + 1))
+            result = subprocess.CompletedProcess(
+                command, process.returncode,
+                captured[0][:_R2_EXEC_STAGING_OUTCOME_LIMIT].decode("utf-8", errors="replace"),
+                captured[1][:_R2_EXEC_STAGING_OUTCOME_LIMIT].decode("utf-8", errors="replace"))
+            if timed_out:
+                raise AssertionError(_r2_exec_staging_failure_message(result.stdout, result.stderr))
+            return result, captured[2]
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
+        raise AssertionError(_R2_EXEC_STAGING_CHILD_FAILED) from None
+
+
+def _r2_exec_staging_child_scope(tmp_path, node, *, probe=None):
+    """One nested pytest; only inherited anonymous descriptors carry its output."""
+    if not _r2_exec_staging_descriptors_available():
+        pytest.skip(_R2_EXEC_STAGING_DESCRIPTORS_UNAVAILABLE)
+    if not _r2_exec_staging_node_accepted(node) or probe not in (None, "pass", "fail", "skip"):
+        raise AssertionError(_R2_EXEC_STAGING_CHILD_FAILED)
+    command = [sys.executable, "-m", "pytest", "-n", "0", "-q", "--tb=line",
+               "--basetemp", str(tmp_path / _R2_EXEC_STAGING_SCOPE_DIR), node]
+    env = {key: value for key, value in os.environ.items()
+           if key not in ("R2_LTH2_PROBE", "PYTEST_CURRENT_TEST", "PYTEST_ADDOPTS")}
+    env["R2_LTH2_SCOPE"] = node
+    if probe is not None:
+        env["R2_LTH2_PROBE"] = probe
+    result, raw = _r2_exec_staging_run(command, env)
+    _r2_exec_staging_apply_child_outcome(result, raw)
+
+
+def _r2_exec_staging_release(case, *, identity, timeout=60):
+    """Reconcile all owned slots; a typed refusal retains its case for recovery."""
+    import time
     from tests.integration.test_hierarchy_launcher import (
-        R2IdentityConflict, R2OwnedChild, R2Processes, WitnessedPopen,
-        _release_r2_test_descriptors, _r2_untrusted_text,
+        _clear_r2_quarantine, _release_r2_test_descriptors,
     )
 
+    case.staging_custody_retained = True
+    try:
+        try:
+            if case.custody.report is None:
+                case.close()
+        except R2CleanupUnknown:
+            pass
+        deadline = time.monotonic() + timeout
+        while True:
+            pending = [slot for slot, entry in case.custody.entries.items()
+                       if not entry.get("lost") and case.custody.observe(slot) is None]
+            remaining = deadline - time.monotonic()
+            if not pending or remaining <= 0:
+                break
+            case.custody._block_for_notifications(pending, min(remaining, 0.05))
+    finally:
+        if not identity:
+            had_report = R2Custody.quarantine_report is case.custody.report and case.custody.report is not None
+            _clear_r2_quarantine(case.custody, expected_unknown=True)
+            if had_report and R2Custody.quarantine_report is None:
+                case.custody.quarantine.unlink()
+    unproven = any(entry.get("lost") or entry.get("exit") is None for entry in case.custody.entries.values())
+    if pending or not identity and (unproven or R2Custody.quarantine_report is case.custody.report):
+        refused = R2CleanupUnknown(case.custody.report)
+        refused.recovery_case = case
+        raise refused
+    if not unproven:
+        _release_r2_test_descriptors(case.custody)
+        case.staging_custody_retained = False
+
+
+def _r2_exec_staging_assert_next_admits(folder, *, quarantine=None):
+    folder.mkdir(mode=0o700)
+    custody = R2Custody(folder / "custody", quarantine or folder / "quarantine.json")
+    try:
+        custody.admit_check()
+        report = custody.close()
+        assert report["state"] == "CLOSED"
+        assert R2Custody.quarantine_report is None
+    finally:
+        from tests.integration.test_hierarchy_launcher import _release_r2_test_descriptors
+        try:
+            if custody.report is None:
+                custody.close()
+        finally:
+            _release_r2_test_descriptors(custody)
+
+
+def _r2_exec_staging_inprocess_outcome(tmp_path, outcome, *, surface="root", quarantine=None):
+    """Real root/indirect-child custody, including failure with a proven UNKNOWN latch."""
+    from types import SimpleNamespace
+    from tests.integration.test_hierarchy_launcher import R2OwnedChild
+
+    case = R2Case(SimpleNamespace(tmp=tmp_path, env=lambda: dict(os.environ)))
+    try:
+        case.custody.quarantine = quarantine or tmp_path / "case-UNKNOWN.json"
+        family = case.spawn(["codex", "resume", str(uuid.uuid4())], tree=surface == "child")
+        if surface == "child":
+            assert isinstance(family["W"], R2OwnedChild)
+            assert len(case.custody.entries) == 3
+        if outcome == "fail":
+            case.custody.control_unknown = True
+            with pytest.raises(R2CleanupUnknown):
+                case.close()
+            assert R2Custody.quarantine_report is case.custody.report
+            assert case.custody.quarantine.exists()
+            raise AssertionError("R2 fixture: modelled in-process failure")
+        if outcome == "skip":
+            pytest.skip("R2 fixture: modelled in-process skip")
+        assert case.close()["state"] == "CLOSED"
+    finally:
+        _r2_exec_staging_release(case, identity=False)
+        assert R2Custody.quarantine_report is None
+        assert all(process.poll() is not None for process in case.children)
+
+
+@pytest.mark.parametrize("surface,scenario", _r2_exec_staging_cases())
+def test_r2_exec_staging_reconciles_exit_and_preserves_identity_loss(tmp_path, request, surface, scenario):
     if surface == "child":
         require_r2_indirect_exit(pidfd=True)
     node = request.node.nodeid
-    if os.environ.get("R2_LTH2_SCOPE") != node:
-        completed = subprocess.run(
-            [sys.executable, "-m", "pytest", "-n", "0", "-q", "--tb=short",
-             "--basetemp=" + str(tmp_path / "scope"), node],
-            cwd=str(ROOT), env={**os.environ, "R2_LTH2_SCOPE": node},
-            capture_output=True, text=True, timeout=180,
-        )
-        assert completed.returncode == 0, _r2_untrusted_text(completed.stdout + completed.stderr, 12000)
+    scope = os.environ.get("R2_LTH2_SCOPE")
+    identity = _r2_exec_staging_is_identity(scenario)
+    if _r2_exec_staging_route(scenario, node, scope) == "child":
+        # A mismatched scope is already a child. Do not spawn another one.
+        if scope:
+            raise AssertionError(_R2_EXEC_STAGING_CHILD_FAILED)
+        _r2_exec_staging_child_scope(tmp_path, node)
+        assert not (tmp_path / "initiatives").exists()
         return
 
+    from tests.integration.test_hierarchy_launcher import (
+        R2IdentityConflict, R2OwnedChild, R2Processes, WitnessedPopen,
+    )
+
+    launch = request.getfixturevalue("launch")
+
     state = {"injected": False, "ready_calls": 0}
-    identity = scenario in ("conflict", "permission", "birth", "uid", "euid",
-                            "ready-birth", "ready-permission", "ready-lost", "pending-birth", "pending-uid",
-                            "pending-euid", "pending-permission", "pending-conflict")
 
     def is_target(process):
         return isinstance(process, R2OwnedChild) if surface == "child" else isinstance(process, WitnessedPopen)
@@ -11798,7 +12046,8 @@ def test_r2_exec_staging_reconciles_exit_and_preserves_identity_loss(launch, tmp
             return super().service_exec_children(sample=sample)
 
     case = RaceCase(launch)
-    case.projection = RaceProjection(launch.tmp / "race-projection")
+    if not identity:
+        case.custody.quarantine = tmp_path / "case-UNKNOWN.json"
     command = [sys.executable, "-c", "import os; os.read(%d,1)" % case.custody.safety_read]
     expected = b"\0".join(os.fsencode(word) for word in command) + b"\0"
     # READY's second sample must be independently classifiable even if the child exits afterward.
@@ -11833,6 +12082,7 @@ def test_r2_exec_staging_reconciles_exit_and_preserves_identity_loss(launch, tmp
         return root
 
     try:
+        case.projection = RaceProjection(launch.tmp / "race-projection")
         if identity:
             with pytest.raises(R2CleanupUnknown) as caught:
                 try:
@@ -11861,14 +12111,463 @@ def test_r2_exec_staging_reconciles_exit_and_preserves_identity_loss(launch, tmp
                 assert case.exec_children[slot]["state"] == "EXITED"
             assert case.close()["state"] == "CLOSED"
     finally:
-        if case.custody.report is None:
+        _r2_exec_staging_release(case, identity=identity)
+    if not identity:
+        assert R2Custody.quarantine_report is None
+        assert all(process.poll() is not None for process in case.children)
+        assert not (tmp_path / _R2_EXEC_STAGING_SCOPE_DIR).exists()
+
+
+@pytest.mark.parametrize("raw", [
+    b"<testsuite><testcase><skipped message='a > b\nline2'/></testcase></testsuite>",
+    b"<testsuite><testcase><skipped>Bearer\nsupersecrettokenvalue12345</skipped></testcase></testsuite>",
+], ids=["attribute-newline", "bearer-newline"])
+def test_r2_exec_staging_skip_publishes_only_fixed_token(raw):
+    result = subprocess.CompletedProcess([], 0, "token=supersecretvalue", "")
+    with pytest.raises(pytest.skip.Exception) as skipped:
+        _r2_exec_staging_apply_child_outcome(result, raw)
+    assert str(skipped.value) == _R2_EXEC_STAGING_CHILD_SKIPPED
+
+
+def test_r2_exec_staging_proven_unknown_does_not_poison_next_case(tmp_path):
+    quarantine = tmp_path / "case-UNKNOWN.json"
+    first = tmp_path / "first"
+    first.mkdir()
+    with pytest.raises(AssertionError, match="^R2 fixture: modelled in-process failure$"):
+        _r2_exec_staging_inprocess_outcome(first, "fail", quarantine=quarantine)
+    assert R2Custody.quarantine_report is None
+    assert not quarantine.exists()
+    _r2_exec_staging_assert_next_admits(tmp_path / "next", quarantine=quarantine)
+
+
+@pytest.mark.parametrize("consumer", ["inprocess", "staging"])
+@pytest.mark.parametrize("ending", ["exit", "deadline"])
+def test_r2_exec_staging_release_recovers_every_custody_entry(tmp_path, request, monkeypatch, consumer, ending):
+    import errno
+
+    require_r2_indirect_exit(pidfd=True)
+    state = {"case": None, "slot": None, "rescue": None, "release_calls": 0}
+    release, base_case = _r2_exec_staging_release, R2Case
+
+    class HeldCustody(R2Custody):
+        pending, hold = None, True
+
+        def kill_owned(self, slot):
+            if slot != self.pending or not self.hold:
+                return super().kill_owned(slot)
+
+        def _block_for_notifications(self, slots, remaining, **kwargs):
+            if self.report is not None and ending == "exit":
+                self.hold = False
+                self.kill_owned(self.pending)
+            return super()._block_for_notifications(slots, remaining, **kwargs)
+
+    class PendingCase(base_case):
+        def __init__(self, launch):
+            super().__init__(launch)
+            state["case"] = self
+            self.prepared = False
+
+        def hold_child(self, root, slot):
+            entry = self.custody.entries[slot]
+            state["slot"], state["handle"] = slot, entry["fd"]
+            # Rescue authority is only for teardown after a regression assertion fails.
+            state["rescue"] = os.dup(entry["fd"])
+            signal.pidfd_send_signal(entry["fd"], signal.SIGSTOP)
+            wait_until(lambda: r2_kernel_process(entry["pid"])["state"].startswith("T"))
+            self.custody.pending, self.custody.LIMIT = slot, 0.01
+            for name in self.custody.entries:
+                if name != slot:
+                    self.custody.kill_owned(name)
+            root.wait(timeout=60)
+
+        def spawn(self, *args, **kwargs):
+            family = super().spawn(*args, **kwargs)
+            slot = next(name for name, row in self.custody.entries.items() if row["pid"] == family["M"].pid)
+            self.hold_child(family["H"], slot)
+            return family
+
+        def close(self):
+            if consumer == "staging" and not self.prepared:
+                from tests.integration.hierarchy_fake_wrapper import python_argv
+
+                self.prepared = True
+                child = [sys.executable, "-c", "import os; os.read(%d,1)" % self.custody.safety_read]
+                target = self.launch.tmp / "release-parent.py"
+                target.write_text("import subprocess\nsubprocess.run(%r)\n" % child, encoding="utf-8")
+                prefix = python_argv("codex", ROOT / "tests/integration/test_hierarchy_launcher.py",
+                                     self.launch.tmp, "r2_captured_entry")
+                command = [*prefix, str(target), "script"]
+                root = base_case.spawn_exec(self, command, None, command,
+                    captured=[{"argv": child, "expected_argv": child, "logical_argv": None}], target=(target, "script"))
+                wait_until(lambda: self.service_exec_children() and
+                           all(row["state"] == "READY" for row in self.exec_children.values()))
+                slot = next(iter(self.exec_children))
+                assert self.custody.entries[slot]["pid"] not in {process.pid for process in self.children}
+                self.hold_child(root, slot)
+            return super().close()
+
+    def bounded_release(case, *, identity):
+        assert case is state["case"] and not identity
+        state["release_calls"] += 1
+        return release(case, identity=identity, timeout=0.01 if ending == "deadline" else 60)
+
+    monkeypatch.setattr("tests.integration.test_hierarchy_launcher_stop_ownership.R2Custody", HeldCustody)
+    monkeypatch.setattr("tests.integration.test_hierarchy_launcher_stop_ownership.R2Case", PendingCase)
+    monkeypatch.setattr("tests.integration.test_hierarchy_launcher_stop_ownership._r2_exec_staging_release", bounded_release)
+    try:
+        expected = R2CleanupUnknown if ending == "deadline" or consumer == "staging" else AssertionError
+        with pytest.raises(expected) as caught:
+            if consumer == "inprocess":
+                _r2_exec_staging_inprocess_outcome(tmp_path, "fail", surface="child")
+            else:
+                test_r2_exec_staging_reconciles_exit_and_preserves_identity_loss(
+                    tmp_path, request, "root", "ready-exit")
+        case, slot = state["case"], state["slot"]
+        assert state["release_calls"] == 1
+        entry = case.custody.entries[slot]
+        if ending == "deadline":
+            os.fstat(state["handle"])
+            assert entry["fd"] == state["handle"] and entry["exit"] is None
+            assert caught.value.recovery_case is case and case.staging_custody_retained
+            assert R2Custody.quarantine_report is case.custody.report and case.custody.quarantine.exists()
+            case.custody.hold = False
+            case.custody.kill_owned(slot)
+            release(caught.value.recovery_case, identity=False)
+        elif consumer == "inprocess":
+            assert str(caught.value) == "R2 fixture: modelled in-process failure"
+        assert entry["exit"] is not None
+        assert entry["exit"]["proof"] == "original_pidfd_exit" and not entry["lost"]
+        assert not case.staging_custody_retained
+        with pytest.raises(OSError) as closed:
+            os.fstat(state["handle"])
+        assert closed.value.errno == errno.EBADF
+        assert R2Custody.quarantine_report is None and not case.custody.quarantine.exists()
+        _r2_exec_staging_assert_next_admits(tmp_path / "next", quarantine=case.custody.quarantine)
+    finally:
+        if state["rescue"] is not None:
             try:
-                case.close()
-            except R2CleanupUnknown:
+                signal.pidfd_send_signal(state["rescue"], signal.SIGKILL)
+            except ProcessLookupError:
                 pass
-        for process in case.children:
-            process.wait(timeout=60)
-        _release_r2_test_descriptors(case.custody)
+            finally:
+                os.close(state["rescue"])
+        case = state["case"]
+        if case is not None and state["slot"] is not None and case.custody.entries[state["slot"]]["fd"] is not None:
+            case.custody.hold = False
+            release(case, identity=False)
+
+
+def test_r2_exec_staging_scope_probe():
+    """Child-scope stand-in. The full file run, with no probe env, passes."""
+    probe = os.environ.get("R2_LTH2_PROBE", "")
+    if probe == "skip":
+        pytest.skip("R2 fixture: modelled staging child skip")
+    if probe == "fail":
+        raise AssertionError("R2 fixture: modelled staging child failure")
+    if probe not in ("", "pass"):
+        raise AssertionError("R2 fixture: staging scope probe refused")
+
+
+def test_r2_exec_staging_scope_partition_matches_the_case_matrix():
+    cases = _r2_exec_staging_cases()
+    identity = [case for case in cases if _r2_exec_staging_is_identity(case[1])]
+    assert len(cases) == 31
+    assert len(identity) == 20
+    assert len(cases) - len(identity) == 11
+    assert sum(surface == "root" for surface, _scenario in cases) == 12
+    assert sum(surface == "child" for surface, _scenario in cases) == 19
+    for surface, scenario in cases:
+        assert _r2_exec_staging_route(scenario, "node", None) == (
+            "child" if _r2_exec_staging_is_identity(scenario) else "inprocess")
+        assert _r2_exec_staging_route(scenario, "node", "node") == "inprocess"
+        assert surface in ("root", "child")
+
+
+def test_r2_exec_staging_outcome_refuses_without_descriptors(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "tests.integration.test_hierarchy_launcher_stop_ownership._r2_exec_staging_descriptors_available",
+        lambda: False)
+    with pytest.raises(pytest.skip.Exception, match="^" + _R2_EXEC_STAGING_DESCRIPTORS_UNAVAILABLE + "$"):
+        _r2_exec_staging_child_scope(tmp_path, _R2_EXEC_STAGING_PROBE)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_r2_exec_staging_matrix_preserves_capability_skip(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "tests.integration.test_hierarchy_launcher_stop_ownership._r2_exec_staging_descriptors_available",
+        lambda: False)
+    with pytest.raises(pytest.skip.Exception, match="^" + _R2_EXEC_STAGING_DESCRIPTORS_UNAVAILABLE + "$"):
+        test_r2_exec_staging_identity_scope_matrix(tmp_path, "skip")
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("consumer,failure", [
+    (consumer, failure) for consumer in ("inprocess", "staging") for failure in ("r2-actor.py", "r2-home")
+] + [("staging", "race-projection")])
+def test_r2_exec_staging_constructor_failure_releases_descriptors(launch, tmp_path, request, monkeypatch,
+                                                               consumer, failure):
+    import errno
+
+    class FailingPath(type(tmp_path)):
+        def write_text(self, *args, **kwargs):
+            if self.name == failure:
+                raise OSError("modelled case setup failure")
+            return super().write_text(*args, **kwargs)
+
+        def mkdir(self, *args, **kwargs):
+            if self.name == failure and failure != "race-projection":
+                raise OSError("modelled case setup failure")
+            return super().mkdir(*args, **kwargs)
+
+        def open(self, *args, **kwargs):
+            if self.parent.name == failure:
+                raise OSError("modelled case setup failure")
+            return super().open(*args, **kwargs)
+
+    custodies, descriptors = [], []
+
+    class RecordingCustody(R2Custody):
+        def __init__(self, *args):
+            super().__init__(*args)
+            custodies.append(self)
+            descriptors.extend((self.folder_fd, self.safety_read, self.safety_write,
+                                self.report_read, self.report_write))
+
+    monkeypatch.setattr(
+        "tests.integration.test_hierarchy_launcher_stop_ownership.R2Custody", RecordingCustody)
+    monkeypatch.setattr(launcher_notifications, "Path", FailingPath)
+    launch.tmp = FailingPath(launch.tmp)
+    try:
+        with pytest.raises(OSError, match="^modelled case setup failure$"):
+            if consumer == "inprocess":
+                _r2_exec_staging_inprocess_outcome(FailingPath(tmp_path), "pass")
+            else:
+                test_r2_exec_staging_reconciles_exit_and_preserves_identity_loss(
+                    tmp_path, request, "root", "ready-exit")
+        assert len(custodies) == 1 and len(descriptors) == 5
+        for fd in descriptors:
+            with pytest.raises(OSError) as caught:
+                os.fstat(fd)
+            assert caught.value.errno == errno.EBADF
+    finally:
+        for custody in custodies:
+            custody.close()
+            launcher_notifications._release_r2_test_descriptors(custody)
+
+
+@pytest.mark.parametrize("descendant,setup_failure,extra_output", [
+    (False, None, False), (True, None, False), (True, "pidfd", False), (True, "interrupt", False),
+    (True, None, True), (True, "pidfd", True), (True, "interrupt", True),
+], ids=["leader", "descendant", "pidfd-failure", "setup-interrupt",
+        "descendant-extra", "pidfd-failure-extra", "setup-interrupt-extra"])
+def test_r2_exec_staging_cleanup_keeps_leader_until_group_retired(monkeypatch, descendant, setup_failure, extra_output):
+    from contextlib import ExitStack
+    import select
+
+    if not _r2_exec_staging_descriptors_available():
+        pytest.skip(_R2_EXEC_STAGING_DESCRIPTORS_UNAVAILABLE)
+    if descendant:
+        require_r2_indirect_exit(pidfd=True)
+    processes, handles, signalled = [], [], []
+    real_os = os
+
+    def popen(command, **kwargs):
+        script = ("import os,time\npid=os.fork()\nif pid == 0:\n time.sleep(60)\n"
+                  "else:\n print(pid, flush=True)\n") if descendant else "pass"
+        if extra_output:
+            script += " print('probe output', flush=True)\n"
+        with ExitStack() as setup:
+            process = subprocess.Popen([sys.executable, "-c", script], **kwargs)
+            setup.callback(_r2_exec_staging_reap, process)
+            processes.append(process)
+
+            def exited():
+                info = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+                if info is not None and setup_failure == "interrupt":
+                    kwargs["stdout"].seek(0)
+                    handles.append(real_os.pidfd_open(int(kwargs["stdout"].readline(100))))
+                    raise KeyboardInterrupt()
+                return info
+
+            wait_until(exited)
+            if descendant:
+                kwargs["stdout"].seek(0)
+                os.pidfd_open(int(kwargs["stdout"].readline(100)))
+            setup.pop_all()
+            return process
+
+    def pidfd_open(pid):
+        fd = real_os.pidfd_open(pid)
+        handles.append(fd)
+        if setup_failure == "pidfd":
+            raise OSError("modelled descendant pidfd setup failure")
+        return fd
+
+    def killpg(pid, sig):
+        # A reaped leader must never reach this boundary, even if its PID still exists.
+        os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+        signalled.append(pid)
+        return real_os.killpg(pid, sig)
+
+    monkeypatch.setattr("tests.integration.test_hierarchy_launcher_stop_ownership.os",
+                        R2Facade(os, killpg=killpg, pidfd_open=pidfd_open))
+    try:
+        if setup_failure is not None:
+            expected = KeyboardInterrupt if setup_failure == "interrupt" else AssertionError
+            with pytest.raises(expected):
+                _r2_exec_staging_run([], dict(os.environ), popen=popen)
+        else:
+            result, _raw = _r2_exec_staging_run([], dict(os.environ), popen=popen)
+            assert result.returncode == 0
+        assert signalled == [processes[0].pid]
+        assert bool(handles) == descendant
+        if descendant:
+            assert handles
+            poller = select.poll()
+            poller.register(handles[0], select.POLLIN)
+            events = poller.poll(5000)
+            assert (events and events[0][0] == handles[0] and
+                    events[0][1] & select.POLLIN), "descendant survived group cleanup"
+    finally:
+        for fd in handles:
+            try:
+                signal.pidfd_send_signal(fd, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            finally:
+                os.close(fd)
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=30)
+
+
+@pytest.mark.parametrize("raw", [
+    b"x" * (_R2_EXEC_STAGING_OUTCOME_LIMIT + 1),
+    b"<!DOCTYPE testsuite><testsuite><testcase/></testsuite>",
+    b"<!ENTITY x 'expanded'><testsuite><testcase/></testsuite>",
+    b"\x00<testsuite><testcase/></testsuite>",
+], ids=["oversize", "doctype", "entity", "nul"])
+def test_r2_exec_staging_outcome_refuses_unsafe_xml(raw):
+    result = subprocess.CompletedProcess([], 0, "", "")
+    with pytest.raises(AssertionError, match="^" + _R2_EXEC_STAGING_OUTCOME_REFUSED + "$"):
+        _r2_exec_staging_apply_child_outcome(result, raw)
+
+
+@pytest.mark.parametrize("raw", [b"", b"<broken", b"<testsuite/>",
+                                 b"<testsuite><testcase/><testcase/></testsuite>"])
+def test_r2_exec_staging_outcome_requires_one_case(raw):
+    with pytest.raises(AssertionError, match="^" + _R2_EXEC_STAGING_OUTCOME_UNAVAILABLE + "$"):
+        _r2_exec_staging_apply_child_outcome(subprocess.CompletedProcess([], 0, "", ""), raw)
+
+
+@pytest.mark.parametrize("returncode", [0, 1])
+def test_r2_exec_staging_child_failure_redacts_and_bounds_output(returncode):
+    result = subprocess.CompletedProcess([], returncode, "ｔｏｋｅｎ=supersecretvalue\n" + "x" * 70000,
+                                         "Bearer supersecrettokenvalue12345")
+    raw = b"<testsuite><testcase><failure/></testcase></testsuite>"
+    with pytest.raises(AssertionError, match="^" + _R2_EXEC_STAGING_CHILD_FAILED) as caught:
+        _r2_exec_staging_apply_child_outcome(result, raw)
+    message = str(caught.value)
+    assert "supersecret" not in message and "REDACTED" in message
+    assert len(message) <= 2 * _R2_EXEC_STAGING_TEXT_LIMIT + 100
+
+
+@pytest.mark.parametrize("failure", ["allocation", "spawn", "timeout", "interrupt"])
+def test_r2_exec_staging_anonymous_files_close_on_failure(failure, monkeypatch):
+    import tempfile
+
+    if not _r2_exec_staging_descriptors_available():
+        pytest.skip(_R2_EXEC_STAGING_DESCRIPTORS_UNAVAILABLE)
+    streams, processes = [], []
+
+    def temporary_file():
+        if failure == "allocation" and len(streams) == 1:
+            raise OSError("token=supersecretvalue")
+        stream = tempfile.TemporaryFile()
+        streams.append(stream)
+        return stream
+
+    def popen(command, **kwargs):
+        assert len(streams) == 3 and all(not stream.closed for stream in streams)
+        assert kwargs["pass_fds"] == tuple(stream.fileno() for stream in streams)
+        if failure == "spawn":
+            raise OSError("token=supersecretvalue")
+        command = [sys.executable, "-c", "import time; time.sleep(60)"]
+        process = subprocess.Popen(command, **kwargs)
+        processes.append(process)
+        return process
+
+    if failure == "interrupt":
+        real_os, interrupted = os, []
+
+        def waitid(*args):
+            if not interrupted:
+                interrupted.append(True)
+                raise KeyboardInterrupt()
+            return real_os.waitid(*args)
+
+        monkeypatch.setattr("tests.integration.test_hierarchy_launcher_stop_ownership.os", R2Facade(os, waitid=waitid))
+
+    expected = KeyboardInterrupt if failure == "interrupt" else AssertionError
+    with pytest.raises(expected):
+        _r2_exec_staging_run([], dict(os.environ), popen=popen, temporary_file=temporary_file, timeout=0.01)
+    assert streams and all(stream.closed for stream in streams)
+    assert all(process.poll() is not None for process in processes)
+
+
+def test_r2_exec_staging_anonymous_capture_bounds_and_replaces_invalid_utf8():
+    if not _r2_exec_staging_descriptors_available():
+        pytest.skip(_R2_EXEC_STAGING_DESCRIPTORS_UNAVAILABLE)
+
+    def popen(command, **kwargs):
+        script = ("import os; os.write(1, b'x'*65535+b'\\xc3'); os.write(2, b'bad\\xff'); "
+                  "os.write(%d, b'<testsuite><testcase/></testsuite>')" % kwargs["pass_fds"][2])
+        return subprocess.Popen([sys.executable, "-c", script], **kwargs)
+
+    result, raw = _r2_exec_staging_run([], dict(os.environ), popen=popen)
+    assert result.stdout == "x" * 65535 + "\ufffd"
+    assert result.stderr == "bad\ufffd"
+    _r2_exec_staging_apply_child_outcome(result, raw)
+
+
+@pytest.mark.parametrize("surface", ["root", "child"])
+@pytest.mark.parametrize("outcome", ["pass", "fail", "skip"])
+def test_r2_exec_staging_scope_matrix(tmp_path, surface, outcome):
+    """Non-identity custody covers {root, child} x {pass, fail, skip}."""
+    if surface == "child":
+        require_r2_indirect_exit(pidfd=True)
+    if outcome == "fail":
+        with pytest.raises(AssertionError, match="^R2 fixture: modelled in-process failure$"):
+            _r2_exec_staging_inprocess_outcome(tmp_path, "fail", surface=surface)
+    elif outcome == "skip":
+        with pytest.raises(pytest.skip.Exception, match="^R2 fixture: modelled in-process skip$"):
+            _r2_exec_staging_inprocess_outcome(tmp_path, "skip", surface=surface)
+    else:
+        _r2_exec_staging_inprocess_outcome(tmp_path, "pass", surface=surface)
+    assert R2Custody.quarantine_report is None
+    assert not (tmp_path / "initiatives").exists()
+    _r2_exec_staging_assert_next_admits(tmp_path / "next")
+
+
+@pytest.mark.parametrize("outcome", ["pass", "fail", "skip"])
+def test_r2_exec_staging_identity_scope_matrix(tmp_path, outcome):
+    """Identity routing uses one real probe child for each outcome."""
+    if not _r2_exec_staging_descriptors_available():
+        pytest.skip(_R2_EXEC_STAGING_DESCRIPTORS_UNAVAILABLE)
+    if outcome == "fail":
+        with pytest.raises(AssertionError, match="^" + _R2_EXEC_STAGING_CHILD_FAILED) as caught:
+            _r2_exec_staging_child_scope(tmp_path, _R2_EXEC_STAGING_PROBE, probe="fail")
+        assert "supersecretvalue" not in str(caught.value)
+    elif outcome == "skip":
+        with pytest.raises(pytest.skip.Exception, match="^" + _R2_EXEC_STAGING_CHILD_SKIPPED + "$"):
+            _r2_exec_staging_child_scope(tmp_path, _R2_EXEC_STAGING_PROBE, probe="skip")
+    else:
+        _r2_exec_staging_child_scope(tmp_path, _R2_EXEC_STAGING_PROBE, probe="pass")
+    assert not (tmp_path / "initiatives").exists()
+    assert R2Custody.quarantine_report is None
+    _r2_exec_staging_assert_next_admits(tmp_path / "next")
 
 
 def test_r2_exec_fixture_closes_an_actual_exec_on_ready_failure(r2_case, monkeypatch):
