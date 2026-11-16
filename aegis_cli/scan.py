@@ -28,7 +28,10 @@ import uuid
 from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_core.errors import WorkspaceError
 from aegis_core.guidance_grammar import clip_redacted
-from aegis_core.guidance_projection import CONTROL_GUIDANCE, contains_control_characters, project_display_text
+from aegis_core.guidance_projection import (
+    CONTROL_GUIDANCE, MAX_GUIDANCE_CHARS, GuidanceProjectionError,
+    contains_control_characters, project_diagnostic,
+)
 from aegis_core.hosts import GENERIC
 from aegis_core.workspace.layout import is_aegis_workspace
 
@@ -56,14 +59,19 @@ def run_scan(args: argparse.Namespace) -> int:
     try:
         # Discovery walks up from a missing path, so its error would name a parent.
         if raw_ws and not os.path.exists(raw_ws):
-            _error(f"workspace path does not exist: {_terminal_text(str(raw_ws), max_len=1024)}", projected=True)
+            _error(f"workspace path does not exist: {_terminal_text(str(raw_ws), max_len=1024, escaped=False)}", projected=True)
             return EXIT_USAGE
         root = Workspace.resolve(raw_ws).root.resolve()
+        try:
+            governed = is_aegis_workspace(root)
+        except OSError:
+            _error("workspace validation could not be completed")
+            return EXIT_USAGE
     except (WorkspaceError, OSError, RuntimeError, ValueError) as exc:
         _error(str(exc))
         return EXIT_USAGE
-    if not is_aegis_workspace(root):
-        displayed_root = _terminal_text(str(root), max_len=1024)
+    if not governed:
+        displayed_root = _terminal_text(str(root), max_len=1024, escaped=False)
         _error(f"not an Aegis workspace (no .aegis/ in {displayed_root}); run aegis init", projected=True)
         return EXIT_USAGE
 
@@ -128,9 +136,14 @@ def _served_text(text: str, *, max_len: int | None = None) -> str:
     return text
 
 
-def _terminal_text(text: str, *, max_len: int | None = None) -> str:
+def _terminal_text(text: str, *, max_len: int | None = None, escaped: bool = True) -> str:
     """Project untrusted text, refusing whole values with non-layout controls."""
-    return project_display_text(text, max_len=max_len)
+    if len(text) > MAX_GUIDANCE_CHARS:
+        return GuidanceProjectionError.code
+    shown = project_diagnostic(CONTROL_GUIDANCE if contains_control_characters(text) else text, escaped=escaped)
+    if max_len is not None and (type(max_len) is not int or max_len < 3):
+        return "guidance_projection_invalid_field"
+    return shown if max_len is None or len(shown) <= max_len else clip_redacted(shown, max_len - 3) + "..."
 
 
 class ScanCommand(AegisCommand):
