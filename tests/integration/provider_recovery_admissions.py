@@ -34,12 +34,17 @@ _pra_REFUSAL = "admission fixture unreadable"
 _pra_STATE = _pra_pytest.StashKey[object]()
 
 
-def supported() -> bool:
-    return bool(_pra_sys.platform.startswith("linux") and _pra_fcntl is not None
-                and hasattr(_pra_os, "O_NOFOLLOW") and hasattr(_pra_os, "O_DIRECTORY")
+def source_supported() -> bool:
+    return bool(_pra_os.name == "posix"
+                and all(hasattr(_pra_os, flag) for flag in
+                        ("O_NOFOLLOW", "O_DIRECTORY", "O_CLOEXEC", "O_NONBLOCK"))
                 and _pra_os.open in _pra_os.supports_dir_fd
                 and _pra_os.stat in _pra_os.supports_dir_fd
                 and _pra_os.scandir in _pra_os.supports_fd)
+
+
+def supported() -> bool:
+    return bool(_pra_sys.platform.startswith("linux") and _pra_fcntl is not None and source_supported())
 
 
 def _pra_name(name):
@@ -226,7 +231,7 @@ def _pra_source_root(root):
 
 
 def read_source(root, parts) -> str:
-    if not supported():
+    if not source_supported():
         raise AssertionError("admission descriptors unavailable")
     _pra_source_parts(parts)
     parent = None
@@ -292,7 +297,7 @@ def _pra_source_inventory(fd):
 
 
 def source_files(root) -> dict:
-    if not supported():
+    if not source_supported():
         raise AssertionError("admission descriptors unavailable")
     try:
         with _pra_source_root(root) as fd:
@@ -565,7 +570,16 @@ def _pra_freeze(parent, name):
                     try:
                         if _pra_stamp(_pra_os.fstat(opened)) != _pra_stamp(info):
                             raise AssertionError(_pra_REFUSAL)
-                        _pra_os.fchmod(opened, _pra_stat.S_IMODE(info.st_mode) & ~0o222)
+                        mode = _pra_stat.S_IMODE(info.st_mode) & ~0o222
+                        if info.st_nlink > 1:
+                            # Shop shares immutable Git objects with the seed.
+                            # Even chmod of an unchanged mode changes their ctime;
+                            # detach them before freezing this independent master.
+                            data = _pra_read(fd, child, _pra_stamp(info))
+                            _pra_write(fd, "_pra_detached", data, mode)
+                            _pra_os.replace("_pra_detached", child, src_dir_fd=fd, dst_dir_fd=fd)
+                        else:
+                            _pra_os.fchmod(opened, mode)
                     finally:
                         _pra_close(opened)
             _pra_os.fchmod(fd, _pra_stat.S_IMODE(_pra_os.fstat(fd).st_mode) & ~0o222)
@@ -599,7 +613,18 @@ def _pra_lock(parent, name):
 
 
 def _pra_digest(records):
-    return _pra_hashlib.sha256(repr(sorted(records.items())).encode("utf-8")).hexdigest()
+    digest = _pra_hashlib.sha256()
+    for parts, row in sorted(records.items()):
+        # Frame metadata and raw bytes separately; repr of repository/pack bytes
+        # allocates an escaped copy of the entire fixture on every verification.
+        header = repr((parts, row[:2])).encode("utf-8")
+        body = row[2] if len(row) > 2 else b""
+        if isinstance(body, str):
+            body = _pra_os.fsencode(body)
+        for chunk in (header, body):
+            digest.update(len(chunk).to_bytes(8, "big"))
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _pra_metrics():
@@ -662,8 +687,12 @@ class _pra_Cache:
                 shop.recipes["recipes"]["ok"]["timeout_seconds"] += 1
                 shop.save_recipes()
             info = _pra_os.stat("copy", dir_fd=slot, follow_symlinks=False)
-            records = _pra_snapshot(slot, "copy", (info.st_dev, info.st_ino))
-            _pra_materialize(slot, "_pra_master", records)
+            _pra_snapshot(slot, "copy", (info.st_dev, info.st_ino))
+            # Generated records embed the fixed copy path. Promote the completed
+            # tree, then restore that path with a fresh writable copy per probe.
+            # A failed publication is retried under the same scenario lock.
+            _pra_remove(slot, "_pra_master")
+            _pra_os.rename("copy", "_pra_master", src_dir_fd=slot, dst_dir_fd=slot)
             _pra_freeze(slot, "_pra_master")
             info = _pra_os.stat("_pra_master", dir_fd=slot, follow_symlinks=False)
             expected = {"identity": [info.st_dev, info.st_ino], "digest":
@@ -822,6 +851,7 @@ PUBLIC_SIGNATURES = (
     ("source_name", (("parts", "pos", None, None),), "str", "none"),
     ("read_source", (("root", "pos", None, None), ("parts", "pos", None, None)), "str", "none"),
     ("source_files", (("root", "pos", None, None),), "dict", "none"),
+    ("source_supported", (), "bool", "none"),
     ("pytest_configure", (("config", "pos", None, None),), "None", "none"),
     ("supported", (), "bool", "none"),
     ("typed_snapshot", (("root", "pos", None, None),), "dict", "none"),
