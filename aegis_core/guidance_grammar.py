@@ -3,27 +3,28 @@ from __future__ import annotations
 
 import codecs
 import re
-from aegis_core.redaction import REDACTION_MASK_RE, SECRET_REPLACEMENTS
+from aegis_core.redaction import (
+    SECRET_REPLACEMENTS, RedactionRefusal, clip_atomic_text, remove_url_credentials,
+)
 
 __all__ = ["bounded_rule_text", "clip_redacted", "copy_retained_items",
            "guidance_token_estimate", "heading_has_slot", "raw_evidence_span", "redact_labeled"]
 
 
 def clip_redacted(text, limit):
-    """Cut already-redacted text without splitting one replacement atom."""
-    boundary = min(limit, len(text))
-    for pattern, _ in SECRET_REPLACEMENTS:
-        for match in pattern.finditer(text):
-            if match.start() < boundary < match.end():
-                boundary = match.start()
-    for match in REDACTION_MASK_RE.finditer(text):
-        if match.start() < boundary < match.end():
-            boundary = match.start()
-    return text[:boundary]
+    """Apply the shared cleaner with the existing guidance clipping policy."""
+    try:
+        return clip_atomic_text(text, limit, policy="guidance")
+    except RedactionRefusal:
+        raise ValueError("guidance_projection_limit") from None
 
 
 def redact_labeled(text, labels, limit):
     """One canonical redaction pass; retain only line/item attribution."""
+    try:
+        text = remove_url_credentials(text, limit=limit, policy="guidance")
+    except RedactionRefusal:
+        raise ValueError("guidance_projection_limit") from None
     for pattern, replacement in SECRET_REPLACEMENTS:
         parts, attributed, end, size = [], [], 0, 0
         for match in pattern.finditer(text):
