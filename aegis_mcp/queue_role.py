@@ -96,8 +96,8 @@ def claim_argument_refusal(arguments):
             arguments.keys() != {"id", "expect", "lane"}):
         return refusal("invalid_arguments")
     revision, lane = arguments["expect"], arguments["lane"]
-    if (not team_queue._key(arguments["id"]) or type(revision) is not str or len(revision) != 64 or
-            team_queue._REVISION.fullmatch(revision) is None or not team_queue._lane(lane)):
+    if (not team_queue.valid_key(arguments["id"]) or not team_queue.valid_revision(revision) or
+            not team_queue.valid_lane(lane)):
         return refusal("invalid_arguments")
     return None
 
@@ -266,13 +266,13 @@ def _policy(value, registration):
     lanes = value["lanes"]
     require(type(lanes) is dict and 1 <= len(lanes) <= MAX_LANES)
     for lane, options in lanes.items():
-        require(team_queue._lane(lane))
+        require(team_queue.valid_lane(lane))
         require(type(options) is dict and options.keys() == {"capabilities", "branch"})
         capabilities, branch = options["capabilities"], options["branch"]
         require(type(branch) is str)
         try:
-            team_queue._strings(capabilities)
-            team_queue._branch_name(branch)
+            team_queue.check_capabilities(capabilities)
+            team_queue.normalize_branch(branch)
         except team_queue.QueueRefusal:
             raise RoleRefusal("role_invalid") from None
     return value
