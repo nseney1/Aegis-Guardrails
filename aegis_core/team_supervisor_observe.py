@@ -11,7 +11,9 @@ from copy import deepcopy
 import os
 from pathlib import Path
 
-from aegis_core import gitsafe, storage_confined, team, team_hosts, team_profile, team_queue
+from aegis_core import (
+    gitsafe, storage_confined, team, team_hosts, team_profile, team_queue, team_writer_binding,
+)
 from aegis_core.primitives import sanitize_display
 from aegis_core.redaction import redact_command_secrets
 
@@ -121,20 +123,21 @@ def _leases(root, identity, now):
         if (not isinstance(found, team.LeaseSet) or type(found.leases) is not tuple
                 or type(found.unreadable) is not tuple
                 or len(found.leases) + len(found.unreadable) > MAX_LEASES):
-            return _unknown("leases_unavailable")
+            return _unknown("leases_unavailable"), None
         live = expired = 0
         for lease in found.leases:
             if not isinstance(lease, team.Lease):
-                return _unknown("leases_unavailable")
+                return _unknown("leases_unavailable"), None
             if lease.expired(now):
                 expired += 1
             else:
                 live += 1
         # No labels, paths, OIDs or diagnostics from a lease are displayed.
-        return {"state": "unknown" if found.unreadable else "known", "live": live,
-                "expired": expired, "unreadable": len(found.unreadable)}
+        summary = {"state": "unknown" if found.unreadable else "known", "live": live,
+                   "expired": expired, "unreadable": len(found.unreadable)}
+        return summary, found
     except Exception:
-        return _unknown("leases_unavailable")
+        return _unknown("leases_unavailable"), None
 
 
 def _audit(root, identity, now):
@@ -155,7 +158,26 @@ def _audit(root, identity, now):
         return _unknown("audit_unavailable")
 
 
-def _workspace_observations(root, now, floor):
+def _bound_writer(user_root, summary, found):
+    """None keeps today's row. A judge failure stays unknown and keeps the lease counts."""
+    if user_root is None or found is None:
+        return _writer(summary)
+    try:
+        row = team_writer_binding.judge(user_root, found, summary)
+    except Exception:
+        row = None
+    reason = row.get("reason") if type(row) is dict else None
+    lanes = row.get("lanes") if type(row) is dict else None
+    if (type(row) is not dict or row.get("leases") != summary or row.get("state") not in ("unknown", "dead")
+            or type(reason) is not str or len(reason) > 80 or any(char in reason for char in "\r\n")
+            or ("lanes" in row and (type(lanes) is not list or len(lanes) > MAX_LEASES))):
+        fallback = _writer(summary)
+        fallback["reason"] = "bindings_unavailable"
+        return fallback
+    return row
+
+
+def _workspace_observations(root, now, floor, user_root=None):
     try:
         if not descriptor_supported():
             reason = "unsupported_platform"
@@ -168,7 +190,8 @@ def _workspace_observations(root, now, floor):
             if reason is not None:
                 writer, audit = _writer(_unknown(reason)), _unknown(reason)
             else:
-                writer = _writer(_leases(root, identity, now))
+                summary, found = _leases(root, identity, now)
+                writer = _bound_writer(user_root, summary, found)
                 audit = _audit(root, identity, now)
         return disk, writer, audit
     except Exception:
@@ -226,7 +249,7 @@ def _hosts(resolved, adapter):
         return _unknown("usage_unavailable"), _unknown("capacity_unavailable")
 
 
-def observe(resolved, *, workspace_root, now, usage_adapter=None):
+def observe(resolved, *, workspace_root, now, usage_adapter=None, user_root=None):
     """Observe once from a validated resolved-profile envelope and trusted root.
 
     Invalid clocks/profiles return fixed refusals before any probe. Each source
@@ -246,7 +269,7 @@ def observe(resolved, *, workspace_root, now, usage_adapter=None):
         return _refused("invalid_profile")
     usage, capacity = _hosts(resolved, usage_adapter)
     floor = resolved["profile"]["supervisor"]["health"]["disk_floor_mib"]
-    disk, writer, audit = _workspace_observations(workspace_root, now, floor)
+    disk, writer, audit = _workspace_observations(workspace_root, now, floor, user_root)
     return {"schema": SCHEMA, "status": "ok", "starts_nothing": True, "writes_nothing": True,
             "observations": {"writer_dead": writer, "disk": disk, "capacity": capacity,
                              "usage": usage, "audit": audit}}
