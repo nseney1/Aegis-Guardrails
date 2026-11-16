@@ -31,7 +31,7 @@ __all__ = [
 MAX_BYTES = 1048576
 MAX_ITEMS = 256
 MAX_FIELDS = 128
-MAX_TEXT = 4096
+MAX_TEXT = team_claims.RECOVERY_TEXT_LIMIT
 MAX_COMPLETED = 8192
 MAX_JSON_DEPTH = 16
 MAX_JSON_NODES = 65536
@@ -786,7 +786,7 @@ def _run(root, verb, now=None, caller=None, **arguments):
         with locked(root, timeout=5.0) if write else nullcontext():
             state = _state(root)
             if "unclaim" in state and verb != "unclaim":
-                raise team_claims.recovery_refusal(state["unclaim"])
+                raise team_claims.recovery_refusal(state["unclaim"], root=root)
             if verb == "unclaim":
                 payload.update(_unclaim(root, state, moment, caller, arguments))
                 return _project(payload)
