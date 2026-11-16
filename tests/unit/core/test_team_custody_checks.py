@@ -1,5 +1,6 @@
 """Ordered custody refusals through the public precondition boundary."""
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -19,11 +20,12 @@ from tests.conftest import symlink_or_skip
 from tests.unit.core.test_team_git import IDENTITY, commit, git, make_store, shared_bytes
 
 
-@pytest.fixture
-def rig(tmp_path):
+@pytest.fixture(scope="module")
+def rig_template(tmp_path_factory):
+    """Build once per worker; tests only receive independent copies of these bytes."""
     if shutil.which("git") is None:
         pytest.skip("needs git")
-    repo = tmp_path / "repo"
+    repo = tmp_path_factory.mktemp("custody-template") / "repo"
     repo.mkdir()
     git(repo, "init", "-q", "-b", "lane/work")
     context = make_store(repo)  # Capability guard before descriptor-only work.
@@ -31,8 +33,6 @@ def rig(tmp_path):
         pytest.skip("qualification requires descriptor custody")
     (repo / "src").mkdir()
     head = commit(repo, "src/a.py", b"base\n")
-    policy = team.parse_team(json.dumps({"v": 1, "shared": ["shared.txt"],
-                                       "lanes": {"work": ["src/**"]}}).encode())
     lease = team.claim(repo, "work", ["/src/**", "/shared.txt"], owner="team-1",
                        branch="lane/work", now=100, ttl_s=60)
     (repo / "src/a.py").write_bytes(b"tested\n")
@@ -42,17 +42,38 @@ def rig(tmp_path):
         item = team_qualify.QualificationResult(tree, "unit", head, "run-1", True)
         team_qualify.record_pass(store, item, expected=None, identity=IDENTITY,
                                 journal=journal, lane="work", request_id="pass-1", actor="custodian")
+    # PASS publication includes the snapshot objects; no builder scratch survives.
+    template = SimpleNamespace(repo=repo, head=head, tree=tree, lease=lease)
+    template.baseline = state(template)
+    yield template
+    assert state(template) == template.baseline
+
+
+@contextmanager
+def copied_rig(template, directory):
+    repo = directory / "repo"
+    shutil.copytree(template.repo, repo)
+    assert state(SimpleNamespace(repo=repo)) == template.baseline
+    policy = team.parse_team(json.dumps({"v": 1, "shared": ["shared.txt"],
+                                       "lanes": {"work": ["src/**"]}}).encode())
+    with make_store(repo) as store:
         def paths(old, new):
             # Trusted adapter sees the private object directory. No repository history needed.
             return tuple(p.decode() for p in git(repo, "diff-tree", "-r", "--no-renames",
                                                 "--name-only", "-z", old, new,
                                                 env=store.env).split(b"\0") if p)
-        options = dict(lane="work", owner="team-1", expected_head=head, tested_tree=tree,
+        options = dict(lane="work", owner="team-1", expected_head=template.head, tested_tree=template.tree,
                        required_legs=("unit",), message="Implement work\n\nDetails.\n", now=101,
                        read_branch=lambda: git(repo, "symbolic-ref", "--short", "HEAD").decode().strip(),
                        read_head=lambda: git(repo, "rev-parse", "HEAD").decode().strip(),
                        read_paths=paths, read_policy=lambda: policy)
-        yield SimpleNamespace(repo=repo, store=store, options=options, lease=lease, policy=policy)
+        yield SimpleNamespace(repo=repo, store=store, options=options, lease=template.lease, policy=policy)
+
+
+@pytest.fixture
+def rig(tmp_path, rig_template):
+    with copied_rig(rig_template, tmp_path) as candidate:
+        yield candidate
 
 
 def state(rig):
@@ -77,11 +98,28 @@ def refusal(rig, code, **changes):
     return caught.value
 
 
-def test_success_and_retry_preserve_shared_bytes(rig):
+def test_success_and_retry_preserve_shared_bytes(rig, rig_template, tmp_path):
+    # A test borrows repository bytes, never the builder's populated private index.
+    assert git(rig.repo, "ls-files", "--stage", env=rig.store.env) == b""
     before = state(rig)
     assert run(rig) == rig.options["tested_tree"]
     assert run(rig) == rig.options["tested_tree"]
     assert state(rig) == before
+    with copied_rig(rig_template, tmp_path / "sibling") as sibling:
+        assert state(sibling) == before
+        assert sibling.store is not rig.store and sibling.store.scratch != rig.store.scratch
+        assert git(sibling.repo, "ls-files", "--stage", env=sibling.store.env) == b""
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert list(pool.map(run, (rig, sibling))) == [rig_template.tree, rig_template.tree]
+        team.transfer(sibling.repo, "work", expect=sibling.lease.oid, owner="team-2", now=102)
+        refusal(sibling, "lease_not_live")
+        refusal(sibling, "lease_not_live")
+        assert run(rig) == rig.options["tested_tree"]
+        assert state(rig) == before
+        assert state(rig_template) == rig_template.baseline
+    with pytest.raises(team_git.GitRefusal) as caught:
+        team_git.ref_oid(sibling.store, "refs/aegis/lanes/work")
+    assert caught.value.code == "store_closed"
 
 
 @pytest.mark.parametrize("changes", [{"now": 160}, {"owner": "another-team"}, {"lane": "missing"},
