@@ -20,12 +20,37 @@ from typing import Mapping, Optional
 from aegis_core.errors import AegisError
 from aegis_core.primitives import sanitize_display, key_within, real_key
 from aegis_core.redaction import redact_insight_text
-__all__ = ["BASE_ENV", "DEFAULT_HARDENING", "HARDENING_KEEP_HOOKS_PATH", "LOCAL_ENV",
-           "capture", "checked", "completed", "custody", "custody_active",
-           "execute", "memo_context", "output", "query_result",
-           "private_headers", "private_object", "private_objects", "scrubbed", "text", "update_once",
-           "strict_active", "lane_update_ref", "validate_update_input", "find_executable", "git_path",
-           "LaneRunner", "hashed_blob", "check_ref_name", "CustodyRefusal", "request_environment", "Environment", "outside_roots", "AMBIENT_ENV", "custody_inputs", "merge_inputs", "transport_services"]
+from aegis_core import gitsafe_policy
+from aegis_core.gitsafe_policy import (
+    BASE_ENV,
+    LOCAL_ENV,
+    GitError,
+    outside_roots,
+    OID,
+    READ_SHAPES,
+    strict_refuse,
+    bounded_args,
+    strict_root,
+    strict_environment,
+    full_oid,
+    ref_name,
+    read_shape,
+    IDENTITY_ENV,
+    ENVIRON_TYPE,
+    classify_ambient,
+    AMBIENT_ENV,
+    LOCATION_ENV,
+    Environment,
+    environment_refusal,
+    environment_layer,
+    merge_inputs,
+    identity_environment,
+    private_headers,
+    private_object,
+    private_objects,
+)
+# Existing ChangingEnvironment tests patch the facade's ambient-type boundary.
+_ENVIRON_TYPE = ENVIRON_TYPE
 HARDENING_KEEP_HOOKS_PATH = (
     "-c", "core.fsmonitor=false", "-c", "protocol.allow=never",
     "-c", "core.sshCommand=false", "-c", "credential.helper=",
@@ -33,22 +58,51 @@ HARDENING_KEEP_HOOKS_PATH = (
     "-c", f"gpg.openpgp.program={os.devnull}", "-c", f"gpg.x509.program={os.devnull}",
 )
 DEFAULT_HARDENING = ("-c", f"core.hooksPath={os.devnull}", *HARDENING_KEEP_HOOKS_PATH)
-BASE_ENV = {"GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0", "GIT_NO_REPLACE_OBJECTS": "1",
-            "GIT_ALLOW_PROTOCOL": "", "GIT_NO_LAZY_FETCH": "1", "LC_ALL": "C"}
-LOCAL_ENV = frozenset((
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
-    "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE",
-    "GIT_INDEX_FILE", "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX", "GIT_SHALLOW_FILE",
-    "GIT_COMMON_DIR",
-))
+_LANE_OPTIONS = ("-c", "gc.auto=0", "-c", "maintenance.auto=false", "-c", "core.splitIndex=false",
+                 "-c", "core.untrackedCache=false", "-c", "core.sparseCheckout=false",
+                 "-c", "merge.renormalize=false", "-c", "commit.gpgsign=false")
+_FIXED_CONFIG = frozenset((*DEFAULT_HARDENING[1::2], *_LANE_OPTIONS[1::2], "core.safecrlf=false"))
+def _command(argv, cwd, stdin, grant=None):
+    """Prove the closed command grammar before repository discovery can spawn."""
+    position, pairs = 1, set()
+    while position + 1 < len(argv) and argv[position] == "-c":
+        pair = argv[position + 1]
+        if pair not in _FIXED_CONFIG and not re.fullmatch(r"filter\.[A-Za-z0-9_.-]+\.(?:(?:clean|smudge|process)=|required=false)", pair): strict_refuse()
+        pairs.add(pair)
+        position += 2
+    if not set((*DEFAULT_HARDENING[1::2], *_LANE_OPTIONS[1::2])) <= pairs: strict_refuse()
+    args = tuple(argv[position:])
+    if args == ("update-ref", "--no-deref", "-z", "--stdin"):
+        if grant != (tuple(argv), str(cwd), stdin): strict_refuse()
+    elif not read_shape(args): strict_refuse()
+    return args, pairs
+def _argv(args, program, hardening, policy):
+    argv = [program, *hardening, *args]
+    if policy is not None:
+        position = len(hardening) + 1
+        while position + 1 < len(argv) and argv[position] == "-c":
+            position += 2
+        extra = _LANE_OPTIONS if policy.strict_lane else ("-c", "gc.auto=0", "-c", "maintenance.auto=false")
+        argv[position:position] = ["-c", f"core.hooksPath={os.devnull}", *extra]
+    return argv
+def request_environment(source=None, *, profile="ordinary", scope=None, overrides=None, base=None,
+                        roots=(), root=None, repository=None, bindings=None, error=GitError, scrub=False, allowed=None, kind=None):
+    """Snapshot the facade's ambient source; all request rules live below transport."""
+    return gitsafe_policy.request_environment(os.environ if source is None else source,
+        profile=profile, scope=scope, overrides=overrides, base=base, roots=roots, root=root,
+        repository=repository, bindings=bindings, error=error, scrub=scrub, allowed=allowed, kind=kind,
+        ambient=source is None or type(source) is _ENVIRON_TYPE, environ_type=_ENVIRON_TYPE)
+__all__ = ["BASE_ENV", "DEFAULT_HARDENING", "HARDENING_KEEP_HOOKS_PATH", "LOCAL_ENV",
+           "capture", "checked", "completed", "custody", "custody_active",
+           "execute", "memo_context", "output", "query_result",
+           "private_headers", "private_object", "private_objects", "scrubbed", "text", "update_once",
+           "strict_active", "lane_update_ref", "validate_update_input", "find_executable", "git_path",
+           "LaneRunner", "hashed_blob", "check_ref_name", "CustodyRefusal", "request_environment", "Environment", "outside_roots", "AMBIENT_ENV", "custody_inputs", "merge_inputs", "transport_services"]
 _SCRUB = contextvars.ContextVar("aegis_git_scrub", default=False)
 _CUSTODY = contextvars.ContextVar("aegis_git_custody", default=None)
 _MAX_CAPTURE = 128 * 1024 * 1024
 _MAX_INPUT = 128 * 1024 * 1024
 _CHUNK = 65536
-class GitError(AegisError):
-    """The facade's error hierarchy, shared before any runner can be issued."""
-    __module__ = "aegis_core.gitsafe"
 CustodyRefusal = GitError
 @dataclass(frozen=True)
 class _LaneServices:
@@ -56,13 +110,6 @@ class _LaneServices:
     error: object
     conflict: object
     executable: object
-def outside_roots(path, roots):
-    """Check both spellings; an unresolved executable or fence fails closed."""
-    if type(path) is not str or not 0 < len(path) <= 16384 or not os.path.isabs(path): return False
-    target = real_key(path)
-    spelling = os.path.normcase(os.path.abspath(path))
-    return target is not None and all(not key_within(candidate, root)
-        for root in roots for candidate in (target, spelling))
 def _program_supported():
     return os.name == "posix" and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY") and {"open", "readlink", "stat"} <= {f.__name__ for f in os.supports_dir_fd} and os.path.isdir("/proc/self/fd")
 def _pin_program(path, roots, error, stack):
@@ -70,8 +117,8 @@ def _pin_program(path, roots, error, stack):
     import stat
     from aegis_core import storage_confined
     if not _program_supported():
-        _environment_refusal(error, "unsupported_effect_platform")
-    if type(path) is not str or not 0 < len(path) <= 16384 or not os.path.isabs(path): _environment_refusal(error, "effect_command_refused")
+        environment_refusal(error, "unsupported_effect_platform")
+    if type(path) is not str or not 0 < len(path) <= 16384 or not os.path.isabs(path): environment_refusal(error, "effect_command_refused")
     pending, directory = path.split("/")[1:], "/"
     try:
         for _ in range(512):
@@ -79,12 +126,12 @@ def _pin_program(path, roots, error, stack):
             component, pending = pending[0], pending[1:]
             if component in ("", "."): continue
             candidate = os.path.normpath(os.path.join(directory, component))
-            if any(key_within(candidate, root) for root in roots): _environment_refusal(error, "effect_command_refused")
+            if any(key_within(candidate, root) for root in roots): environment_refusal(error, "effect_command_refused")
             with storage_confined.confined_file(directory, ("aegis-program",)) as parent:
                 info = os.stat(component, dir_fd=parent._parent, follow_symlinks=False)
                 if stat.S_ISLNK(info.st_mode):
                     target = os.readlink(component, dir_fd=parent._parent)
-                    if len(target) > 16384 or len(pending) + target.count("/") + 1 > 512: _environment_refusal(error, "effect_command_refused")
+                    if len(target) > 16384 or len(pending) + target.count("/") + 1 > 512: environment_refusal(error, "effect_command_refused")
                     pending = target.split("/") + pending
                     directory = "/" if target.startswith("/") else directory
                     continue
@@ -93,14 +140,14 @@ def _pin_program(path, roots, error, stack):
                     continue
                 fd = os.open(component, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0), dir_fd=parent._parent)
                 stack.callback(os.close, fd)
-                if not stat.S_ISREG(os.fstat(fd).st_mode) or not os.access(f"/proc/self/fd/{fd}", os.X_OK): _environment_refusal(error, "effect_command_refused")
-                if os.pread(fd, 4, 0) != b"\x7fELF": _environment_refusal(error, "effect_command_refused", path)
+                if not stat.S_ISREG(os.fstat(fd).st_mode) or not os.access(f"/proc/self/fd/{fd}", os.X_OK): environment_refusal(error, "effect_command_refused")
+                if os.pread(fd, 4, 0) != b"\x7fELF": environment_refusal(error, "effect_command_refused", path)
                 return fd
     except FileNotFoundError:
-        _environment_refusal(error, "git_failed")
+        environment_refusal(error, "git_failed")
     except (OSError, ValueError, UnicodeError, storage_confined.ConfinedFileError):
-        _environment_refusal(error, "effect_command_refused")
-    _environment_refusal(error, "effect_command_refused")
+        environment_refusal(error, "effect_command_refused")
+    environment_refusal(error, "effect_command_refused")
 def find_executable(cache, environ, lookup, *, error, profile="ordinary", cwd=None, missing_ok=False, stack=None):
     """Sole resolver; callbacks retain the facade's program-specific PATH lookup."""
     environ = request_environment(environ, profile=profile, base={}, root=cwd, error=error) if not isinstance(environ, Environment) else request_environment(environ, profile="strict/effect", error=error)
@@ -114,7 +161,7 @@ def find_executable(cache, environ, lookup, *, error, profile="ordinary", cwd=No
         if missing_ok: return None
         raise error("git is not installed or not on PATH")
     if roots and (not outside_roots(found, roots) or os.name == "nt" and os.path.splitext(found)[1].upper() not in (environ.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD").upper().split(os.pathsep)):
-        _environment_refusal(error, "effect_command_refused")
+        environment_refusal(error, "effect_command_refused")
     cache[key] = found
     if roots:
         with ExitStack() as temporary:
@@ -140,7 +187,7 @@ def hashed_blob(cwd, data, write, *, runner, hasher, error):
     args = ["hash-object", *(["-w"] if write else []), "--no-filters", "--stdin"]
     out = runner(args, cwd, stdin=bytes(data))
     oid = (out or b"").strip().decode("ascii", "replace")
-    if not _OID.match(oid): raise error(f"git hash-object {'-w ' if write else ''}failed in {cwd}")
+    if not OID.match(oid): raise error(f"git hash-object {'-w ' if write else ''}failed in {cwd}")
     if hasher(bytes(data), len(oid)) != oid: raise error(f"git named the blob {oid}, which does not hash its content")
     return oid
 def check_ref_name(cwd, ref, what, *, runner, error, ref_error):
@@ -174,20 +221,20 @@ def scrubbed():
 def custody(*, scratch: Path, env: Optional[Mapping[str, str]] = None,
             stdout_limit: int = 16 * 1024 * 1024, stderr_limit: int = 65536, strict_lane: bool = False, _services=None, worktree_root=None, _boundary=None):
     """Bound a dynamic scope to existing owner-controlled scratch; nested scopes replace env."""
-    if not isinstance(strict_lane, bool): raise AegisError("invalid custody mode", code="invalid_custody")
+    if not isinstance(strict_lane, bool): raise GitError("invalid custody mode", code="invalid_custody")
     strict_lane = strict_lane or strict_active()
-    if strict_lane and env is not None: env = _strict_environment(env, 64)
+    if strict_lane and env is not None: env = strict_environment(env, 64, environ_type=_ENVIRON_TYPE)
     for cap in (stdout_limit, stderr_limit):
-        if isinstance(cap, bool) or not isinstance(cap, int) or not 0 <= cap <= _MAX_CAPTURE: raise AegisError("invalid custody limit", code="invalid_custody")
-    if not isinstance(scratch, (str, Path)) or not str(scratch) or len(str(scratch)) > 16384 or "\0" in str(scratch): raise AegisError("invalid custody scratch", code="invalid_custody")
+        if isinstance(cap, bool) or not isinstance(cap, int) or not 0 <= cap <= _MAX_CAPTURE: raise GitError("invalid custody limit", code="invalid_custody")
+    if not isinstance(scratch, (str, Path)) or not str(scratch) or len(str(scratch)) > 16384 or "\0" in str(scratch): raise GitError("invalid custody scratch", code="invalid_custody")
     path = Path(scratch)
-    if not path.is_absolute() or ".." in path.parts: raise AegisError("invalid custody scratch", code="invalid_custody")
-    if env is not None and (not isinstance(env, Mapping) or len(env) > 64): raise AegisError("invalid custody environment", code="invalid_custody")
+    if not path.is_absolute() or ".." in path.parts: raise GitError("invalid custody scratch", code="invalid_custody")
+    if env is not None and (not isinstance(env, Mapping) or len(env) > 64): raise GitError("invalid custody environment", code="invalid_custody")
     copied = {}
     for key, value in (env or {}).items():
         if (not isinstance(key, str) or not isinstance(value, str) or len(key) > 128 or len(value) > 65536
                 or "\0" in key or "\0" in value or "=" in key):
-            raise AegisError("invalid custody environment", code="invalid_custody")
+            raise GitError("invalid custody environment", code="invalid_custody")
         copied[key] = value
     token = _CUSTODY.set(_Policy(path, MappingProxyType(copied), stdout_limit, stderr_limit, strict_lane, _services, worktree_root, _boundary or ("lane" if strict_lane else "git")))
     try:
@@ -204,274 +251,16 @@ def custody_active() -> bool:
 def strict_active() -> bool:
     policy = _CUSTODY.get()
     return policy is not None and policy.strict_lane
-_LANE_OPTIONS = ("-c", "gc.auto=0", "-c", "maintenance.auto=false", "-c", "core.splitIndex=false",
-                 "-c", "core.untrackedCache=false", "-c", "core.sparseCheckout=false",
-                 "-c", "merge.renormalize=false", "-c", "commit.gpgsign=false")
-_FIXED_CONFIG = frozenset((*DEFAULT_HARDENING[1::2], *_LANE_OPTIONS[1::2], "core.safecrlf=false"))
-_OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
-_READ_SHAPES = frozenset((
-    ("version",), ("read-tree", "--empty"), ("write-tree",),
-    ("ls-files", "--cached", "--others", "--exclude-standard", "-z"),
-    ("update-index", "-z", "--index-info"),
-    ("ls-files", "--stage", "--debug", "-z"),
-    ("pack-objects", "--stdout"), ("unpack-objects", "-q", "--strict"),
-    ("cat-file", "--batch"), ("cat-file", "--batch-check"),
-    ("rev-parse", "--verify", "--quiet", "HEAD"), ("rev-parse", "--show-object-format"),
-    ("rev-parse", "--git-path", "index"),
-    ("rev-parse", "--git-common-dir", "--show-prefix", "--is-shallow-repository", "--show-toplevel"),
-    *(("rev-parse", option) for option in ("--git-common-dir", "--show-prefix", "--show-toplevel")),
-    ("check-attr", "-z", "--stdin", "filter", "text", "eol", "ident", "working-tree-encoding", "crlf"),
-    ("config", "--null", "--get-regexp", r"^core\.(autocrlf|safecrlf|filemode|symlinks|eol|trustctime|checkstat)$"),
-    ("config", "--null", "--name-only", "--get-regexp", r"^filter\."),
-    ("config", "--show-scope", "--null", "--name-only", "--get-regexp", r"^merge\..+\.driver$"),
-))
-def _strict_refuse():
-    raise CustodyRefusal("Strict lane Git command refused.", code="git_custody_refused",
-        next_action="Use the lane Git APIs or the CAS fast-forward writer.", process_started=False)
-def _bounded_args(args):
-    from itertools import islice
-    if type(args) not in (tuple, list) or len(args) > 512: _strict_refuse()
-    frozen = args if type(args) is tuple else tuple(islice(args, 513))
-    if len(frozen) > 512 or any(type(a) is not str or len(a) > 16384 or "\0" in a for a in frozen): _strict_refuse()
-    return frozen
-def _strict_root(cwd):
-    if type(cwd) not in (str, type(Path())): _strict_refuse()
-    text = str(cwd)
-    if len(text) > 16384 or "\0" in text or not os.path.isabs(text) or ".." in Path(text).parts: _strict_refuse()
-    return text
-def _strict_environment(env, limit=512):
-    frozen, refusal = _classify_ambient(env, limit=limit, refuse_keys=False)
-    if refusal is not None: _strict_refuse()
-    return frozen
-def _full_oid(value):
-    return type(value) is str and len(value) in (40, 64) and _OID.fullmatch(value) is not None
-def _ref_name(value):
-    return (type(value) is str and len(value) <= 240 and value.startswith("refs/")
-            and not any(ord(c) < 33 or ord(c) > 126 or c in "~^:?*[\\" for c in value)
-            and ".." not in value and "@{" not in value
-            and all(p and not p.startswith(".") and not p.endswith((".", ".lock")) for p in value.split("/")))
-def _literal_path(value):
-    if value.startswith(":(literal)"): value = value[len(":(literal)"):]
-    return (bool(value) and not value.startswith("/") and len(value) <= 4096
-            and all(p not in ("", ".", "..", ".git") for p in value.split("/")))
-def _read_shape(args):
-    if args in _READ_SHAPES: return True
-    if len(args) == 2 and args[0] == "read-tree": return _full_oid(args[1])
-    if len(args) == 2 and args[0] == "check-ref-format": return _ref_name(args[1])
-    if len(args) == 3 and args[0] == "cat-file" and args[1] in ("blob", "tree", "commit", "-t"): return _full_oid(args[2])
-    if len(args) == 3 and args[:2] == ("for-each-ref", "--format=%(objectname)%00%(symref)%00%(refname)"): return _ref_name(args[2])
-    if len(args) == 4 and args[:2] == ("merge-base", "--is-ancestor"): return all(_full_oid(x) for x in args[2:])
-    if args[:1] == ("ls-tree",):
-        if len(args) == 3 and args[1] == "-r": return _full_oid(args[2])
-        rest = args[2:] if args[1:2] == ("-z",) else args[1:]
-        return len(rest) == 3 and _full_oid(rest[0]) and rest[1] == "--" and _literal_path(rest[2])
-    if args[:1] == ("hash-object",):
-        return (len(args) == 4 and args[1:3] == ("-w", "--stdin")
-                and args[3].startswith("--path=") and _literal_path(args[3][7:]))
-    if args[:1] == ("commit-tree",):
-        return (4 <= len(args) <= 18 and len(args) % 2 == 0 and _full_oid(args[1])
-                and all(args[i] == "-p" and _full_oid(args[i + 1]) for i in range(2, len(args), 2)))
-    if args[:3] == ("rev-list", "--objects", "--no-object-names"): return len(args) == 6 and _full_oid(args[3]) and args[4:] == ("--not", "--all")
-    if args[:4] == ("rev-list", "--reverse", "--topo-order", "--no-merges"): return len(args) == 5 and len(args[4].split("..")) == 2 and all(_full_oid(x) for x in args[4].split(".."))
-    if args[:4] == ("merge-tree", "--write-tree", "--name-only", "-z"):
-        rest = args[4:]
-        if rest and rest[0].startswith("--merge-base="):
-            if not _full_oid(rest[0][13:]): return False
-            rest = rest[1:]
-        return len(rest) == 2 and all(_full_oid(x) for x in rest)
-    return False
-def _command(argv, cwd, stdin, grant=None):
-    """Prove the closed command grammar before repository discovery can spawn."""
-    position, pairs = 1, set()
-    while position + 1 < len(argv) and argv[position] == "-c":
-        pair = argv[position + 1]
-        if pair not in _FIXED_CONFIG and not re.fullmatch(r"filter\.[A-Za-z0-9_.-]+\.(?:(?:clean|smudge|process)=|required=false)", pair): _strict_refuse()
-        pairs.add(pair)
-        position += 2
-    if not set((*DEFAULT_HARDENING[1::2], *_LANE_OPTIONS[1::2])) <= pairs: _strict_refuse()
-    args = tuple(argv[position:])
-    if args == ("update-ref", "--no-deref", "-z", "--stdin"):
-        if grant != (tuple(argv), str(cwd), stdin): _strict_refuse()
-    elif not _read_shape(args): _strict_refuse()
-    return args, pairs
 def _strict_argv(argv, cwd, env, stdin, *, lane, grant=None, effect_context=None):
-    _bounded_args(argv)
-    if any(env.get(k) != v for k, v in BASE_ENV.items() if k != "GIT_ALLOW_PROTOCOL"): _strict_refuse()
-    if _strict_root(cwd) != _strict_root(lane.cwd) or not argv or argv[0] != lane._lane_binding.program: _strict_refuse()
+    bounded_args(argv)
+    if any(env.get(k) != v for k, v in BASE_ENV.items() if k != "GIT_ALLOW_PROTOCOL"): strict_refuse()
+    if strict_root(cwd) != strict_root(lane.cwd) or not argv or argv[0] != lane._lane_binding.program: strict_refuse()
     args, pairs = _command(argv, cwd, stdin, grant)
     shared = args[0] in ("update-ref", "unpack-objects") and grant == (tuple(argv), str(cwd), stdin) if args else False
     real_index = args[0] in ("ls-files", "check-attr") and env.get("GIT_INDEX_FILE") == str(lane._lane_binding.paths[2])
-    identity = {k: v for k, v in env.items() if k in _IDENTITY_ENV}
-    if env != lane.environment(identity, args=args, real_index=bool(real_index), shared=shared, effect_context=effect_context): _strict_refuse()
+    identity = {k: v for k, v in env.items() if k in IDENTITY_ENV}
+    if env != lane.environment(identity, args=args, real_index=bool(real_index), shared=shared, effect_context=effect_context): strict_refuse()
     return args, pairs
-def _argv(args, program, hardening, policy):
-    argv = [program, *hardening, *args]
-    if policy is not None:
-        position = len(hardening) + 1
-        while position + 1 < len(argv) and argv[position] == "-c":
-            position += 2
-        extra = _LANE_OPTIONS if policy.strict_lane else ("-c", "gc.auto=0", "-c", "maintenance.auto=false")
-        argv[position:position] = ["-c", f"core.hooksPath={os.devnull}", *extra]
-    return argv
-_IDENTITY_ENV = frozenset("GIT_" + role + "_" + field for role in ("AUTHOR", "COMMITTER")
-                          for field in ("NAME", "EMAIL", "DATE"))
-_AMBIENT_REDIRECTS = LOCAL_ENV - {"GIT_NO_REPLACE_OBJECTS", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"}
-_ENVIRON_TYPE = type(os.environ)
-def _classify_ambient(env, *, limit=512, refuse_keys=True):
-    """Pure bounded snapshot and deterministic refusal; values never enter diagnostics."""
-    from itertools import islice
-    if type(env) not in (dict, MappingProxyType, _ENVIRON_TYPE, Environment): return {}, ("git_custody_refused", "Strict lane Git command refused.", "Use the lane Git APIs or the CAS fast-forward writer.")
-    if len(env) > limit: return {}, ("ambient_environment_too_large", "Ambient environment has too many variables.", "Reduce the environment to at most 512 variables, then retry.")
-    try:
-        frozen = dict(islice(env.items(), limit + 1))
-    except (KeyError, RuntimeError):
-        return {}, ("ambient_environment_changed", "Ambient environment changed during inspection.", "Stabilize the environment, then retry.")
-    if len(frozen) > limit: return {}, ("ambient_environment_too_large", "Ambient environment has too many variables.", "Reduce the environment to at most 512 variables, then retry.")
-    if any(type(k) is not str or type(v) is not str for k, v in frozen.items()): return {}, ("git_custody_refused", "Strict lane Git command refused.", "Use the lane Git APIs or the CAS fast-forward writer.")
-    if any(len(key) > 256 for key in frozen): return {}, ("ambient_environment_too_large", "Ambient environment variable name exceeds its limit.", "Shorten every environment variable name to at most 256 characters, then retry.")
-    if any(len(value) > 65536 for value in frozen.values()): return {}, ("ambient_environment_too_large", "Ambient environment value exceeds its limit.", "Reduce every environment value to at most 65,536 characters, then retry.")
-    if any("\0" in key or "\0" in value for key, value in frozen.items()): return {}, ("git_custody_refused", "Strict lane Git command refused.", "Use the lane Git APIs or the CAS fast-forward writer.")
-    names = sorted(key for key in frozen if refuse_keys and (key.upper().startswith("GIT_TRACE") or key.upper() in _AMBIENT_REDIRECTS))
-    if not names: return frozen, None
-    displayed = []
-    for key in names:
-        canonical = sanitize_display(key, max_len=None)
-        shown = sanitize_display(redact_insight_text(canonical, max_len=max(1, len(canonical))), max_len=256)
-        displayed.append("GIT_TRACE* (" + shown + ")" if key.upper().startswith("GIT_TRACE") and key.upper() not in ("GIT_TRACE", "GIT_TRACE2", "GIT_TRACE2_EVENT", "GIT_TRACE2_PERF") else shown)
-    label = ", ".join(displayed)
-    return {}, ("ambient_git_environment", "Ambient Git environment refused: " + label + ".", "Unset " + label + " in the environment, then retry.")
-AMBIENT_ENV = frozenset(("HOME", "PATH", "SSH_AUTH_SOCK", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TZ", "TMPDIR"))
-_PROGRAM_ENV = frozenset(("GIT_CONFIG", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_SSH_VARIANT", "GIT_EXEC_PATH", "GIT_ASKPASS", "GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS", "GIT_PAGER", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "GIT_PROXY_COMMAND", "PAGER", "EDITOR", "VISUAL", "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "GH_PAGER", "GH_BROWSER", "GH_EDITOR", "GH_CONFIG_DIR", "BROWSER", "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONINSPECT", "PYTHONBREAKPOINT", "PYTHONWARNINGS", "BASH_ENV", "ENV", "PERL5OPT", "PERL5LIB", "RUBYOPT", "RUBYLIB", "NODE_OPTIONS", "NODE_PATH", "JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS", "GCONV_PATH", "LOCPATH", "OPENSSL_CONF", "OPENSSL_MODULES", "MALLOC_TRACE"))
-_LOCATION_ENV = LOCAL_ENV - {"GIT_NO_REPLACE_OBJECTS", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"} | {"GIT_NAMESPACE"}
-_EFFECT_ENV = dict(GIT_CONFIG_NOSYSTEM="1", GIT_ASKPASS="", SSH_ASKPASS="", SSH_ASKPASS_REQUIRE="never", GIT_PAGER="", PAGER="", GIT_EDITOR="false", GIT_SEQUENCE_EDITOR="false", GIT_SSH_VARIANT="ssh")
-class Environment(dict):
-    """Mutable input envelope, with immutable transport-issued binding provenance."""
-    __slots__ = ("__proof",)
-    def __init__(self, values, proof):
-        super().__init__(values)
-        self.__proof = MappingProxyType(proof)
-    @property
-    def _proof(self): return self.__proof
-    @property
-    def roots(self): return self._proof["roots"]
-    @property
-    def root(self): return self.roots[0]
-    @property
-    def source(self): return self._proof["source"]
-    @property
-    def repository(self): return self._proof["repository"]
-    @property
-    def origin(self): return self._proof["origin"]
-    def with_vars(self, values, *, replace=False):
-        # This is an untrusted edit, not fresh provenance or a validation bypass.
-        values = _environment_layer(values, allowed=None, error=GitError, code="git_custody_refused")
-        if len(self) > 512 or not replace and len(self) + sum(k not in self for k in values) > 512: _strict_refuse()
-        changed = Environment({} if replace else self, dict(self._proof))
-        changed.update(values)
-        return changed
-def _environment_refusal(error, code, path=None):
-    messages = {"effect_command_refused": ("Git operation effect command refused.", "Select an executable outside every custody root; no effect process started.") if path is None else ("strict effects require a native executable: " + sanitize_display(redact_insight_text(sanitize_display(path, max_len=None), max_len=16384), max_len=256) + " is a script; configure the real binary", "Configure the real native binary outside every custody root; no effect process started."),
-        "git_failed": ("Git operation executable is unavailable.", "Restore the selected executable installation; no effect process started."),
-        "unsupported_effect_platform": ("Descriptor-bound execution is unavailable on this platform.", "Use a platform with descriptor-relative no-follow opens and procfs execution; no effect process started."),
-        "effect_environment_limit": ("Git operation effect environment exceeds supported limits.", "Reduce the supplied environment to bounded string entries; no effect process started."),
-        "ambient_git_environment": ("Ambient Git environment refused.", "Unset Git program and repository selectors, then retry."),
-        "git_custody_refused": ("Strict lane Git command refused.", "Use the lane Git APIs or the CAS fast-forward writer.")}
-    message, action = messages[code]
-    raise error(message, code=code, next_action=action, process_started=False, effect_process_started=False) from None
-def _environment_layer(source, *, allowed, error, code):
-    """Validate retained strings before copying; selector keys are never filtered away."""
-    if type(source) not in (dict, MappingProxyType, _ENVIRON_TYPE, Environment): _environment_refusal(error, "effect_environment_limit")
-    result = {}
-    try:
-        for key, value in source.items():
-            if type(key) is not str: _environment_refusal(error, "effect_environment_limit")
-            upper = key[:256].upper()
-            if upper in _PROGRAM_ENV | _LOCATION_ENV or upper.startswith(("GIT_TRACE", "GIT_CONFIG_", "LD_", "DYLD_", "BASH_FUNC_")):
-                _environment_refusal(error, code)
-            if allowed is not None and key not in allowed: continue
-            if (len(result) >= 512 or type(value) is not str or not key or len(key) > 256 or len(value) > 65536 or "\0" in key or "\0" in value or "=" in key):
-                _environment_refusal(error, "effect_environment_limit")
-            try:
-                os.fsencode(key)
-                os.fsencode(value)
-            except UnicodeError:
-                _environment_refusal(error, "effect_environment_limit")
-            result[key] = value
-    except (KeyError, RuntimeError):
-        _environment_refusal(error, "effect_environment_limit")
-    return result
-def merge_inputs(*sources, error):
-    """Bound combined input maps before inserting any additional entry."""
-    merged = {}
-    for source in sources:
-        for key, value in source.items():
-            if key not in merged and len(merged) >= 512: _environment_refusal(error, "effect_environment_limit")
-            merged[key] = value
-    return merged
-def request_environment(source=None, *, profile="ordinary", scope=None, overrides=None, base=None,
-                        roots=(), root=None, repository=None, bindings=None, error=GitError, scrub=False, allowed=None, kind=None):
-    """The sole constructor: ordinary compatibility or strict/effect provenance."""
-    if profile not in ("ordinary", "strict/effect"): _strict_refuse()
-    ambient = source is None or type(source) is _ENVIRON_TYPE
-    source = os.environ if source is None else source
-    if profile == "ordinary":
-        if type(source) is Environment: _strict_refuse()
-        result = {k: v for k, v in source.items() if not (scrub and k.upper() in LOCAL_ENV)}
-        result.update(BASE_ENV if base is None else base)
-        result.update(scope or {})
-        result.update(overrides or {})
-        result.update(bindings or {})
-        return result
-    inherited = source._proof if type(source) is Environment else None
-    if inherited and kind is not None and kind != inherited["kind"]: _strict_refuse()
-    kind = kind or (inherited["kind"] if inherited else "git")
-    if kind not in ("git", "lane", "gh"): _strict_refuse()
-    if type(roots) not in (tuple, list) or len(roots) > 64: _environment_refusal(error, "effect_environment_limit")
-    for path in (*((root,) if root is not None else ()), *roots):
-        _strict_root(path)
-        if real_key(path) is None: _strict_refuse()
-    fences = tuple(dict.fromkeys(value for path in ((root,) if root is not None else ()) + tuple(roots)
-        for value in (os.path.normcase(os.path.abspath(path)), real_key(path)) if value is not None))
-    if not fences and not inherited: _strict_refuse()
-    if inherited:
-        checked, refusal = _classify_ambient(source, refuse_keys=False)
-        if refusal: _environment_refusal(error, "effect_environment_limit")
-        changes = {k: v for k, v in checked.items() if inherited["values"].get(k) != v}
-        values = _environment_layer({k: v for k, v in source.source.items() if k in checked}, allowed=allowed, error=error, code="ambient_git_environment")
-        values = merge_inputs(values, _environment_layer(changes, allowed=allowed, error=error, code="git_custody_refused"), error=error)
-        fences = tuple(dict.fromkeys((*fences, *inherited["roots"]))) if repository is not None else tuple(dict.fromkeys((*inherited["roots"], *fences)))
-        repository = repository if repository is not None else inherited["repository"]
-    else:
-        if repository is None:
-            checked, refusal = _classify_ambient(source)
-            if refusal:
-                code, message, action = refusal
-                raise error(message, code=code, next_action=action, process_started=False)
-            source = checked
-        values = _environment_layer(source, allowed=AMBIENT_ENV if ambient and allowed is None else allowed, error=error, code="ambient_git_environment")
-    for layer in (scope, overrides):
-        if layer is not None: values = merge_inputs(values, _environment_layer(layer, allowed=None, error=error, code="git_custody_refused"), error=error)
-    if len(values) > 512: _environment_refusal(error, "effect_environment_limit")
-    values["PATH"] = os.pathsep.join(p for p in values.get("PATH", os.defpath).split(os.pathsep) if outside_roots(p, fences))
-    if "TMPDIR" in values and not outside_roots(values["TMPDIR"], fences):
-        del values["TMPDIR"]
-    owner = inherited["bindings"] if inherited and bindings is None else bindings or {}
-    locations = dict(GIT_DIR=repository["dirs"][0], GIT_WORK_TREE=fences[0]) if repository is not None and kind in ("git", "lane") else {}
-    fixed = {k: v for k, v in (BASE_ENV if base is None else base).items() if k != "GIT_ALLOW_PROTOCOL"}
-    result = merge_inputs({"GIT_ALLOW_PROTOCOL": ""}, values, locations, owner, _EFFECT_ENV, fixed, error=error)
-    proof = {"roots": fences, "source": MappingProxyType(values), "bindings": MappingProxyType(dict(owner)),
-             "values": MappingProxyType(dict(result)), "repository": MappingProxyType(dict(repository)) if repository is not None else None,
-             "origin": inherited["origin"] if inherited else object(), "kind": kind, "outside": outside_roots}
-    return Environment(result, proof)
-def _identity_environment(env, args):
-    supplied = {} if env is None else _strict_environment(env, 6)
-    if supplied and (not args or args[0] != "commit-tree" or set(supplied) != _IDENTITY_ENV): _strict_refuse()
-    for key, value in supplied.items():
-        if (not value or len(value) > 256 or any(ord(c) < 32 or 127 <= ord(c) < 160
-                or 0xD800 <= ord(c) <= 0xDFFF or c in "<>\u2028\u2029" for c in value)
-                or key.endswith("DATE") and not re.fullmatch(r"[0-9]{1,12} [+-](?:[01][0-9]|2[0-3])[0-5][0-9]", value)):
-            _strict_refuse()
-    return supplied
 @dataclass(frozen=True)
 class _LaneBinding:
     cwd: Path
@@ -488,7 +277,7 @@ class _LaneBinding:
 def issue_runner(cwd, scratch, services, effect_fds=None, *, environ=None, write_roots=(), worktree_root=None):
     if type(write_roots) not in (tuple, list) or len(write_roots) > 15: raise services.error("Git operation effect roots unavailable.", code="effect_environment_unavailable", process_started=False, next_action="Supply at most fifteen write roots; no effect process started.")
     write_roots = tuple(write_roots)
-    cwd, scratch = Path(_strict_root(cwd)), Path(_strict_root(scratch))
+    cwd, scratch = Path(strict_root(cwd)), Path(strict_root(scratch))
     if effect_fds is not None:
         from aegis_core import gitops_fds
         gitops_fds.pass_through(effect_fds, error=services.error)
@@ -497,9 +286,9 @@ def issue_runner(cwd, scratch, services, effect_fds=None, *, environ=None, write
         base = request_environment(environ, profile="strict/effect", root=worktree_root or cwd, roots=(*write_roots, scratch), scope=custody_inputs(), error=services.error, kind="lane")
     base = request_environment(base, profile="strict/effect", bindings={}, error=services.error)
     code = getattr(services.program, "__code__", None)
-    if code is None or not (code.co_flags & _VAR_KEYWORDS or "environ" in code.co_varnames[code.co_posonlyargcount:code.co_argcount + code.co_kwonlyargcount]): _strict_refuse()
+    if code is None or not (code.co_flags & _VAR_KEYWORDS or "environ" in code.co_varnames[code.co_posonlyargcount:code.co_argcount + code.co_kwonlyargcount]): strict_refuse()
     program, values = services.program(cwd, environ=base), []
-    if type(program) is not str or not program: _strict_refuse()
+    if type(program) is not str or not program: strict_refuse()
     policy = _Policy(scratch, MappingProxyType({}), 16384, 65536, False, boundary="lane")
     try:
         for args in (("--absolute-git-dir",), ("--git-common-dir",), ("--show-toplevel",), ("--git-path", "index")):
@@ -512,7 +301,7 @@ def issue_runner(cwd, scratch, services, effect_fds=None, *, environ=None, write
         resolved = scratch.resolve()
         if resolved.is_relative_to(common) or resolved.is_relative_to(top): raise services.error("Lane scratch refused.", code="unsafe_scratch")
         alternate = os.fsencode(str(common / "objects"))
-        if len(alternate) > 16383: _strict_refuse()
+        if len(alternate) > 16383: strict_refuse()
         owned = dict(GIT_DIR=str(git_dir), GIT_COMMON_DIR=str(common), GIT_WORK_TREE=str(top),
             GIT_OBJECT_DIRECTORY=str(scratch / "objects"), GIT_INDEX_FILE=str(scratch / "index"),
             GIT_ALTERNATE_OBJECT_DIRECTORIES='"' + ''.join('\\%03o' % c for c in alternate) + '"')
@@ -536,9 +325,9 @@ class LaneRunner:
                 or self.scratch is not self._lane_binding.scratch or self.services is not self._lane_binding.services):
             raise error("Strict lane Git command refused.", code="git_custody_refused", process_started=False)
     def environment(self, env=None, *, args=(), real_index=False, shared=False, effect_context=None):
-        supplied = _identity_environment(env, args)
-        if real_index and tuple(args) not in _READ_SHAPES or real_index and args[0] not in ("ls-files", "check-attr"): _strict_refuse()
-        effective = {k: v for k, v in self._lane_binding.base.items() if k in _LOCATION_ENV}
+        supplied = identity_environment(env, args, environ_type=_ENVIRON_TYPE)
+        if real_index and tuple(args) not in READ_SHAPES or real_index and args[0] not in ("ls-files", "check-attr"): strict_refuse()
+        effective = {k: v for k, v in self._lane_binding.base.items() if k in LOCATION_ENV}
         effective.update(supplied)
         if shared: effective["GIT_OBJECT_DIRECTORY"] = str(self._lane_binding.paths[0] / "objects")
         if real_index: effective["GIT_INDEX_FILE"] = str(self._lane_binding.paths[2])
@@ -551,9 +340,9 @@ class LaneRunner:
         return _Policy(Path(self.scratch), MappingProxyType({}), stdout_limit, stderr_limit, True, boundary="lane")
     def run(self, args, cwd=None, timeout=60, stdin=None, _hardening=DEFAULT_HARDENING,
             _env=None, tty=False, *, stdout_limit=16 * 1024 * 1024, stderr_limit=65536, options=(), real_index=False, effect_fds=None, _effect_context=None):
-        if cwd is not None and _strict_root(cwd) != _strict_root(self.cwd): _strict_refuse()
-        args, options, hardening = _bounded_args(args), _bounded_args(options), _bounded_args(_hardening)
-        if hardening != DEFAULT_HARDENING or tty is not False or type(real_index) is not bool or len(args) + len(options) > 450: _strict_refuse()
+        if cwd is not None and strict_root(cwd) != strict_root(self.cwd): strict_refuse()
+        args, options, hardening = bounded_args(args), bounded_args(options), bounded_args(_hardening)
+        if hardening != DEFAULT_HARDENING or tty is not False or type(real_index) is not bool or len(args) + len(options) > 450: strict_refuse()
         policy = self.policy(stdout_limit, stderr_limit)
         argv = _argv((*options, *args), self._lane_binding.program, hardening, policy)
         return capture(argv, cwd=self.cwd, env=self.environment(_env, args=args, real_index=real_index, effect_context=_effect_context), stdin=stdin, timeout=timeout,
@@ -575,7 +364,7 @@ class LaneRunner:
             driver = key[len(b"filter."):].rpartition(b".")[0] if key.startswith(b"filter.") else b""
             if not driver or len(driver) > 256 or re.fullmatch(rb"[A-Za-z0-9_.-]+", driver) is None: raise self.services.error("Lane conversion observation refused.", code=code)
             if driver in drivers: continue
-            if len(flags) + 8 > 512 - len(argv): _strict_refuse()
+            if len(flags) + 8 > 512 - len(argv): strict_refuse()
             drivers.add(driver)
             flags.extend(x for name in ("clean", "smudge", "process", "required") for x in
                          ("-c", "filter." + driver.decode("ascii") + "." + name + ("=false" if name == "required" else "=")))
@@ -590,12 +379,12 @@ class LaneRunner:
     def paths(self):
         return self._lane_binding.paths
     def read_ref(self, cwd, ref, *, effect_fds=None):
-        if not _ref_name(ref) or self.run(["check-ref-format", ref], cwd, effect_fds=effect_fds).returncode: raise self.services.error("Lane ref observation refused.", code="ref_unreadable")
+        if not ref_name(ref) or self.run(["check-ref-format", ref], cwd, effect_fds=effect_fds).returncode: raise self.services.error("Lane ref observation refused.", code="ref_unreadable")
         result = self.run_checked(["for-each-ref", "--format=%(objectname)%00%(symref)%00%(refname)", ref],
                                   cwd, stdout_limit=65536, effect_fds=effect_fds)
         for line in result.stdout.splitlines():
             fields = line.split(b"\0")
-            if len(fields) != 3 or fields[1] or not _full_oid(fields[0].decode("ascii", "replace")): raise self.services.error("Lane ref observation refused.", code="ref_unreadable")
+            if len(fields) != 3 or fields[1] or not full_oid(fields[0].decode("ascii", "replace")): raise self.services.error("Lane ref observation refused.", code="ref_unreadable")
             if fields[2] == ref.encode("ascii"): return fields[0].decode("ascii")
         return None
     def private_object_headers(self, cwd, oids, *, env=None, scratch=None):
@@ -609,14 +398,14 @@ class LaneRunner:
             env=env, scratch=scratch, headers=self.private_object_headers, runner=self.run_checked,
             batch=["cat-file", "--batch"], custody=None, error=self.services.error, lane=self)
     def publish(self, pack, *, shared=False, effect_fds=None):
-        if type(shared) is not bool: _strict_refuse()
+        if type(shared) is not bool: strict_refuse()
         args, policy = ("unpack-objects", "-q", "--strict"), self.policy()
         argv = tuple(_argv(args, self._lane_binding.program, DEFAULT_HARDENING, policy))
         return capture(argv, cwd=self.cwd, env=self.environment(args=args, shared=shared), stdin=pack, timeout=60,
             error=self.services.error, _lane=self, _policy=policy, _grant=(argv, str(self.cwd), pack) if shared else None, effect_fds=self.effect_fds if effect_fds is None else effect_fds, worktree_root=self._lane_binding.worktree_root, write_roots=self._lane_binding.write_roots)
     def cas(self, ref, new, old, *, effect_fds=None):
-        if not _ref_name(ref) or not ref.startswith(("refs/aegis/", "refs/heads/lane/")): raise self.services.error("ref not allowed", code="ref_not_allowed")
-        if not _full_oid(new) or old is not None and not _full_oid(old): raise self.services.error("invalid ref object", code="invalid_oid")
+        if not ref_name(ref) or not ref.startswith(("refs/aegis/", "refs/heads/lane/")): raise self.services.error("ref not allowed", code="ref_not_allowed")
+        if not full_oid(new) or old is not None and not full_oid(old): raise self.services.error("invalid ref object", code="invalid_oid")
         current = self.read_ref(self.cwd, ref, effect_fds=effect_fds)
         if current != old and current != new: raise self.services.conflict("ref compare-and-swap mismatch", ref=ref, expected=old, current=current)
         for oid in (new,) if old is None else (new, old):
@@ -736,19 +525,19 @@ def _finish(process, *, stop):
                 failed = True
     return failed
 def _capture_limits(policy, timeout, stdin, error):
-    if policy is not None and policy.strict_lane and stdin is not None and type(stdin) is not bytes: _strict_refuse()
+    if policy is not None and policy.strict_lane and stdin is not None and type(stdin) is not bytes: strict_refuse()
     if (policy is None or isinstance(timeout, bool) or not isinstance(timeout, (int, float))
             or not 0 < timeout <= 300 or not math.isfinite(timeout)):
         raise error("invalid custody capture", code="invalid_custody")
     if stdin is not None and (not isinstance(stdin, bytes) or len(stdin) > _MAX_INPUT): raise error("git custody input limit exceeded", code="git_input_limit")
-def capture(argv, *, cwd, env, stdin, timeout, error=AegisError, _lane=None, _policy=None, _grant=None, effect_fds=None, _tty=False, write_roots=(), worktree_root=None):
+def capture(argv, *, cwd, env, stdin, timeout, error=GitError, _lane=None, _policy=None, _grant=None, effect_fds=None, _tty=False, write_roots=(), worktree_root=None):
     policy = _CUSTODY.get() if _policy is None else _policy
     error = _lane.services.error if _lane is not None else (GitError if policy is not None and policy.strict_lane else error)
     source_envelope = type(env) is Environment
     if policy is not None and policy.strict_lane and _lane is None:
-        argv = _bounded_args(argv)
+        argv = bounded_args(argv)
         _command(argv, cwd, stdin, _grant)
-        if not source_envelope: env = _environment_layer(_strict_environment(env), allowed=None, error=error, code="git_custody_refused")
+        if not source_envelope: env = environment_layer(strict_environment(env, environ_type=_ENVIRON_TYPE), allowed=None, error=error, code="git_custody_refused", environ_type=_ENVIRON_TYPE)
     if effect_fds is not None:
         from aegis_core import gitops_fds
         if _lane is not None and _lane._lane_binding.worktree_root is None: gitops_fds.refuse(error, "effect_environment_unavailable")
@@ -756,14 +545,14 @@ def capture(argv, *, cwd, env, stdin, timeout, error=AegisError, _lane=None, _po
     process, discovery_started, effect_deadline = None, False, time.monotonic() + timeout if effect_fds is not None else None
     try:
         if _lane is not None or policy is not None and policy.strict_lane:
-            argv = _bounded_args(argv)
+            argv = bounded_args(argv)
             if effect_fds is None and _lane is not None and _lane._lane_binding.ambient: request_environment(profile="strict/effect", root=env.root, error=error)
             env = request_environment(env, profile="strict/effect", root=worktree_root or policy.worktree_root or cwd, roots=(*write_roots, policy.scratch), kind=policy.boundary, scope=policy.env if policy is not None and (_policy is None or not source_envelope) else None, error=error)
-            cwd = _strict_root(cwd)
-            if policy is not None and policy.strict_lane and _classify_ambient(policy.env)[1] is not None: _strict_refuse()
+            cwd = strict_root(cwd)
+            if policy is not None and policy.strict_lane and classify_ambient(policy.env, environ_type=_ENVIRON_TYPE)[1] is not None: strict_refuse()
             if _lane is None:
                 services = policy.services
-                if services is None or not argv or argv[0] != services.program(cwd, environ=env): _strict_refuse()
+                if services is None or not argv or argv[0] != services.program(cwd, environ=env): strict_refuse()
                 args, _ = _command(argv, cwd, stdin, _grant)
         if not isinstance(env, Environment):
             env = request_environment(env, profile="ordinary", base={})
@@ -810,15 +599,15 @@ def execute(args, cwd, *, executable, legacy_runner, error, environ, timeout, st
         gitops_fds.pass_through(effect_fds, error=error)
         gitops_fds.effect_inputs(args, stdin, timeout, effect_fds, error=error, hardening=hardening)
         return gitops_fds.execute_effect(args, cwd, environ, env, hardening, _CUSTODY.get(), timeout, stdin, tty, effect_fds,
-            error=error, observe=capture, scope=custody, build=_argv, base=BASE_ENV, resolver=executable, issue=issue_runner, identity=_identity_environment, write_roots=write_roots, worktree_root=worktree_root, preflight=lambda argv: _command(argv, cwd, stdin) if tty is False and tuple(hardening) == DEFAULT_HARDENING and len(args) <= 450 else _strict_refuse(), transport=transport_services())
+            error=error, observe=capture, scope=custody, build=_argv, base=BASE_ENV, resolver=executable, issue=issue_runner, identity=lambda values, command: identity_environment(values, command, environ_type=_ENVIRON_TYPE), write_roots=write_roots, worktree_root=worktree_root, preflight=lambda argv: _command(argv, cwd, stdin) if tty is False and tuple(hardening) == DEFAULT_HARDENING and len(args) <= 450 else strict_refuse(), transport=transport_services())
     policy = _CUSTODY.get()
     if strict_active():
         services = policy.services
-        if services is None or executable is not services.executable: _strict_refuse()
-        args, hardening, cwd = _bounded_args(args), _bounded_args(hardening), _strict_root(cwd)
-        if hardening != DEFAULT_HARDENING or tty is not False or len(args) > 450: _strict_refuse()
+        if services is None or executable is not services.executable: strict_refuse()
+        args, hardening, cwd = bounded_args(args), bounded_args(hardening), strict_root(cwd)
+        if hardening != DEFAULT_HARDENING or tty is not False or len(args) > 450: strict_refuse()
         _command(_argv(args, "git", hardening, policy), cwd, stdin)
-        supplied = _identity_environment({**policy.env, **({} if env is None else _strict_environment(env, 6))}, args)
+        supplied = identity_environment({**policy.env, **({} if env is None else strict_environment(env, 6, environ_type=_ENVIRON_TYPE))}, args, environ_type=_ENVIRON_TYPE)
         effective = request_environment(environ, profile="strict/effect", kind="lane", root=worktree_root or policy.worktree_root or cwd,
             roots=(*write_roots, policy.scratch), scope=policy.env, overrides=env, error=error)
         _capture_limits(policy, timeout, stdin, GitError)
@@ -908,92 +697,13 @@ def validate_update_input(single_attempt, new, old, *, error):
     """Original public update_ref validation; strict mode has a fixed refusal."""
     if not isinstance(single_attempt, bool): raise error("invalid single-attempt option", code="invalid_custody")
     if new is None and old is None:
-        if strict_active(): _strict_refuse()
+        if strict_active(): strict_refuse()
         raise ValueError("update_ref needs a new value, an expected old value, or both")
 
 def lane_update_ref(cwd, ref, new, old):
     """Compatibility entry for the facade's existing explicit strict scopes."""
     policy = _CUSTODY.get()
     services = None if policy is None else policy.services
-    if policy is None or not policy.strict_lane or services is None: _strict_refuse()
+    if policy is None or not policy.strict_lane or services is None: strict_refuse()
     runner = issue_runner(cwd, policy.scratch, services)
     return runner.cas(ref, new, old)
-
-def _private_capture(args, cwd, *, env, scratch, limit, stdin, runner, custody, lane):
-    if lane is not None:
-        if env is not None or scratch is not None: _strict_refuse()
-        return lane.run_checked(args, cwd, _env=env, stdout_limit=limit, stdin=stdin)
-    with custody(scratch=scratch, env=env, stdout_limit=limit):
-        return runner(args, cwd, stdin=stdin)
-
-def private_headers(cwd, oids, *, env, scratch, runner, batch, custody, error, lane=None):
-    """Bound and verify mixed object metadata; missing is an explicit query result."""
-    if type(oids) not in (tuple, list) or len(oids) > 20000: raise error("invalid private object request", code="invalid_object")
-    if any(not _full_oid(oid) for oid in oids): raise error("invalid private object request", code="invalid_object")
-    wanted = list(dict.fromkeys(oids))
-    if not wanted: return {}
-    limit = sum(len(oid) + 33 for oid in wanted)
-    out = _private_capture(batch, cwd, env=env, scratch=scratch, limit=limit,
-        stdin=("\n".join(wanted) + "\n").encode("ascii"), runner=runner, custody=custody, lane=lane).stdout
-    if len(out) > limit: raise error("invalid private object", code="invalid_object")
-    lines = out.split(b"\n")
-    if len(lines) != len(wanted) + 1 or lines[-1]: raise error("invalid private object", code="invalid_object")
-    result = {}
-    for oid, line in zip(wanted, lines):
-        if len(line) > len(oid) + 32: raise error("invalid private object", code="invalid_object")
-        fields = line.split()
-        if fields == [oid.encode("ascii"), b"missing"]:
-            result[oid] = None
-        elif (len(fields) == 3 and fields[0] == oid.encode("ascii")
-              and fields[1] in (b"blob", b"tree", b"commit")
-              and len(fields[2]) <= 20 and fields[2].isdigit()):
-            result[oid] = (fields[1].decode("ascii"), int(fields[2]))
-        else:
-            raise error("invalid private object", code="invalid_object")
-    return result
-
-def private_object(cwd, oid, *, kind, max_bytes, env, scratch, headers, runner, custody, error, lane=None):
-    """One typed object, with a bounded preflight before payload capture."""
-    from aegis_core.workspace import git_objects
-    if (kind not in ("blob", "tree", "commit") or isinstance(max_bytes, bool)
-            or not isinstance(max_bytes, int) or not 0 <= max_bytes <= 128 * 1024 * 1024):
-        raise error("invalid private object request", code="invalid_object")
-    info = headers(cwd, [oid], env=env, scratch=scratch)[oid]
-    if info is None or info[0] != kind: raise error("invalid private object", code="invalid_object")
-    size = info[1]
-    if size > max_bytes: raise error("private object size limit exceeded", code="git_object_limit")
-    data = _private_capture(["cat-file", kind, oid], cwd, env=env, scratch=scratch, limit=size,
-        stdin=None, runner=runner, custody=custody, lane=lane).stdout
-    if len(data) != size or git_objects.object_id(data, len(oid), kind) != oid: raise error("invalid private object", code="invalid_object")
-    return data
-
-def private_objects(cwd, oids, *, max_bytes, max_object_bytes, env, scratch, headers,
-                    runner, batch, custody, error, lane=None):
-    """Batch publication preflight, then exact ordered type, size and hash validation."""
-    from aegis_core.workspace import git_objects
-    if any(isinstance(cap, bool) or not isinstance(cap, int) or not 0 <= cap <= 128 * 1024 * 1024
-           for cap in (max_bytes, max_object_bytes)):
-        raise error("invalid private object request", code="invalid_object")
-    info = headers(cwd, oids, env=env, scratch=scratch)
-    if not info: return {}
-    if any(value is None for value in info.values()): raise error("invalid private object", code="invalid_object")
-    total = sum(value[1] for value in info.values())
-    wire_limit = total + sum(len(oid) + 34 for oid in info)
-    if (total > max_bytes or wire_limit > 128 * 1024 * 1024
-            or any(value[1] > max_object_bytes for value in info.values())):
-        raise error("private object size limit exceeded", code="git_object_limit")
-    out = _private_capture(batch, cwd, env=env, scratch=scratch, limit=wire_limit,
-        stdin=("\n".join(info) + "\n").encode("ascii"), runner=runner, custody=custody, lane=lane).stdout
-    objects, position = {}, 0
-    for oid, (kind, size) in info.items():
-        header = (oid + " " + kind + " " + str(size) + "\n").encode("ascii")
-        start = position + len(header)
-        if (out[position:start] != header or size > len(out) - start - 1
-                or out[start + size:start + size + 1] != b"\n"):
-            raise error("invalid private object", code="invalid_object")
-        data = out[start:start + size]
-        if git_objects.object_id(data, len(oid), kind) != oid: raise error("invalid private object", code="invalid_object")
-        objects[oid] = (kind, data)
-        position = start + size + 1
-    if position != len(out): raise error("invalid private object", code="invalid_object")
-    return objects

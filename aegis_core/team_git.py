@@ -7,8 +7,9 @@ objects and updates a ref; callers must journal that effect before calling it.
 Unacknowledged writes are observed, never retried here. Qualification, lease and
 identity authorization belong to the caller, not this low-level library.
 
-Snapshots apply Git text conversions to descriptor-read bytes. External filters
-(including LFS) refuse explicitly instead of executing configured programs. Unsupported descriptor platforms refuse snapshots, but can plan and
+Snapshots apply Git text conversions to descriptor-read bytes. Filter attributes
+(including LFS) are inert only with zero configured drivers; otherwise filter
+states and attribute-source tokens refuse. Unsupported descriptor platforms refuse snapshots, but can plan and
 commit already supplied trees. Submodules and special files refuse explicitly.
 All refusals have a stable code and a constant, input-free message. Conflict paths
 are display-only, canonicalized, redacted, then truncated; never use them as paths.
@@ -279,7 +280,11 @@ def _close_descriptors(descriptors):
         raise GitRefusal("descriptor_cleanup_failed") from None
 
 
-def _read_path(root_fd: int, raw: bytes, remaining: int):
+def _attribute_stamp(observed):
+    return (observed.st_dev, observed.st_ino, observed.st_size, observed.st_mtime_ns, observed.st_ctime_ns)
+
+
+def _read_path(root_fd: int, raw: bytes, remaining: int, *, attribute=False, attribute_charges=None):
     """Walk every parent by descriptor; never follow a symlink in any component."""
     parts = _path_parts(raw)
     opened = []
@@ -299,6 +304,8 @@ def _read_path(root_fd: int, raw: bytes, remaining: int):
             opened.append(current)
         before = os.stat(parts[-1], dir_fd=current, follow_symlinks=False)
         observed = True
+        if attribute and not stat.S_ISREG(before.st_mode):
+            raise GitRefusal("conversion_unavailable")
         if stat.S_ISDIR(before.st_mode):
             return None  # The old file is now a directory; its children are listed separately.
         if stat.S_ISLNK(before.st_mode):
@@ -315,8 +322,10 @@ def _read_path(root_fd: int, raw: bytes, remaining: int):
         opened.append(fd)
         before = os.fstat(fd)
         if not stat.S_ISREG(before.st_mode):
-            raise GitRefusal("unsupported_file")
-        limit = min(MAX_FILE_BYTES, remaining)
+            raise GitRefusal("conversion_unavailable" if attribute else "unsupported_file")
+        # Metadata deduplicates the budget charge, never the descriptor read.
+        charged = attribute and attribute_charges is not None and _attribute_stamp(before) in attribute_charges
+        limit = min(MAX_FILE_BYTES, before.st_size if charged else remaining)
         if before.st_size > limit:
             raise GitRefusal("size_limit")
         chunks, total = [], 0
@@ -334,10 +343,14 @@ def _read_path(root_fd: int, raw: bytes, remaining: int):
         mode = "100755" if before.st_mode & 0o100 else "100644"
         return mode, b"".join(chunks), before
     except FileNotFoundError:
-        if observed:
+        if observed and not attribute:
             raise GitRefusal("worktree_changed") from None
         return None
     except OSError as exc:
+        if attribute:
+            if exc.errno == errno.ENOTDIR:
+                return None
+            raise GitRefusal("conversion_unavailable") from None
         code = "unsafe_path" if exc.errno in (errno.ELOOP, errno.ENOTDIR) else "path_unreadable"
         raise GitRefusal(code) from None
     finally:
@@ -360,6 +373,19 @@ def _index_stamp(store):
 _CONFIG_QUERY = r"^core\.(autocrlf|safecrlf|filemode|symlinks|eol|trustctime|checkstat)$"
 
 
+def _snapshot_filters(store):
+    try:
+        result = store._run(["config", "--null", "--name-only", "--get-regexp", r"^filter\."],
+                            allowed=(0, 1), stdout_limit=65536)
+    except OSError:
+        raise GitRefusal("conversion_unavailable") from None
+    except AegisError as exc:
+        if _error_code(exc) not in ("git_failed", "git_timeout", "git_output_limit", "git_cleanup_failed"):
+            raise
+        raise GitRefusal("conversion_unavailable") from None
+    return team_git_snapshot.filter_drivers(result.stdout, result.returncode)
+
+
 def _snapshot_rules(store, paths):
     for path in paths:
         _path_parts(path)
@@ -370,20 +396,54 @@ def _snapshot_rules(store, paths):
     attrs = team_git_snapshot.snapshot_attributes(out, paths)
     raw = store._run(["config", "--null", "--get-regexp", _CONFIG_QUERY], allowed=(0, 1), stdout_limit=4096).stdout
     settings = _conversion_settings(raw)
-    rules = team_git_snapshot.snapshot_rules(paths, attrs, settings, native_crlf=os.name == "nt")
+    filters = _snapshot_filters(store)
+    rules = team_git_snapshot.snapshot_rules(paths, attrs, settings, native_crlf=os.name == "nt",
+                                             configured_filters=filters)
     length = 64 if store._run(["rev-parse", "--show-object-format"]).stdout.strip() == b"sha256" else 40
-    return settings, rules, length
+    return settings, rules, length, filters
 
 
-def _snapshot_contents(store, root_fd, paths, baseline, rules, settings, oid_length, index_time):
-    contents, total = [], 0
+def _snapshot_attribute_candidates(root_fd, contents, paths, remaining, attribute_charges):
+    """Read and scan each candidate; only its budget charge may be reused."""
+    name = b".gitattributes"
+    seen = set(paths)
+    directories = set()
+    for path in [b""] + [entry[0] for entry in contents]:
+        directory = path.rpartition(b"/")[0]
+        while directory not in directories:
+            if len(directory) + bool(directory) + len(name) > MAX_PATH_BYTES:
+                raise GitRefusal("conversion_unavailable")
+            directories.add(directory)
+            candidate = (directory + b"/" if directory else b"") + name
+            if candidate not in seen:
+                seen.add(candidate)
+                entry = _read_path(root_fd, candidate, remaining, attribute=True, attribute_charges=attribute_charges)
+                if entry is not None:
+                    stamp = _attribute_stamp(entry[2])
+                    if stamp not in attribute_charges:
+                        remaining -= len(entry[1])
+                        attribute_charges.add(stamp)
+                    team_git_snapshot.check_filter_bytes(entry[1])
+            if not directory:
+                break
+            directory = directory.rpartition(b"/")[0]
+
+
+def _snapshot_contents(store, root_fd, paths, baseline, rules, settings, oid_length, index_time, *, filters):
+    contents, attributes, total = [], [], 0
+    attribute_charges = set()
     for path in paths:
         if baseline.get(path, ("100644", None, None))[0] == "160000":
             raise GitRefusal("unsupported_file")
-        entry = _read_path(root_fd, path, MAX_SNAPSHOT_BYTES - total)
+        entry = _read_path(root_fd, path, MAX_SNAPSHOT_BYTES - total,
+                           attribute=bool(filters) and team_git_snapshot.is_attribute_path(path))
         if entry is None:
             continue
         mode, data, observed = entry
+        if team_git_snapshot.is_attribute_path(path):
+            attributes.append(data)
+            if filters:
+                attribute_charges.add(_attribute_stamp(observed))
         original_size = len(data)
         if mode != "120000" and rules[path][3]:
             prior = baseline.get(path, ("100644", None, None))
@@ -393,16 +453,19 @@ def _snapshot_contents(store, root_fd, paths, baseline, rules, settings, oid_len
         if total > MAX_SNAPSHOT_BYTES:
             raise GitRefusal("size_limit")
         contents.append((path, mode, data, observed))
-    return contents
+    if filters:
+        _snapshot_attribute_candidates(root_fd, contents, paths, MAX_SNAPSHOT_BYTES - total, attribute_charges)
+    return contents, attributes
 
 
-def _snapshot_baselines(store, contents, baseline, rules, runner):
+def _snapshot_baselines(store, contents, baseline, rules, runner, *, filters, attributes):
     _require_runner(runner)
-    wanted = team_git_snapshot.baseline_requests(contents, baseline, rules)
+    wanted = team_git_snapshot.baseline_requests(contents, baseline, rules, configured_filters=filters)
     objects = runner.read_private_objects(store.repo, wanted, max_bytes=MAX_SNAPSHOT_BYTES,
         max_object_bytes=MAX_OBJECT_BYTES)
     if any(kind != "blob" for kind, _ in objects.values()):
         raise GitRefusal("invalid_object")
+    team_git_snapshot.check_filter_sources(attributes, baseline, objects, configured_filters=filters)
     return team_git_snapshot.preserved_paths(baseline, objects)
 
 
@@ -465,14 +528,16 @@ def snapshot_tree(store: GitStore, *, _runner=None) -> str:
                         raise GitRefusal("size_limit")
                     paths.add(path)
         paths = sorted(paths)
-        settings, rules, length = _snapshot_rules(store, paths)
-        contents = _snapshot_contents(store, root_fd, paths, baseline, rules, settings, length,
-                                      index_stamp[3] if index_stamp else None)
-        preserved = _snapshot_baselines(store, contents, baseline, rules, _runner)
+        settings, rules, length, filters = _snapshot_rules(store, paths)
+        contents, attributes = _snapshot_contents(store, root_fd, paths, baseline, rules, settings, length,
+                                                   index_stamp[3] if index_stamp else None, filters=filters)
+        preserved = _snapshot_baselines(store, contents, baseline, rules, _runner, filters=filters, attributes=attributes)
         entries = _snapshot_entries(contents, settings, baseline, rules, preserved, length,
                                     index_stamp[3] if index_stamp else None)
         if _index_stamp(store) != index_stamp:
             raise GitRefusal("worktree_changed")
+        if _snapshot_filters(store) != filters:
+            raise GitRefusal("conversion_unavailable")
         store._run(["read-tree", "--empty"])
         return _write_snapshot(store, entries, _runner)
     except OSError:
