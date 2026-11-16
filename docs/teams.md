@@ -508,6 +508,12 @@ make it visible to every worktree. The lane name must match
 removes expired leases. A timestamp over 300 seconds ahead of the reader is marked
 `clock_skew` and still counts as live.
 
+GC JSON keeps event-recording warnings in `warnings` as strings and reports
+collected lanes with attached worktrees in the additive `lane_warnings` array,
+with rows such as `{"lane": "docs", "reason": "expired_with_worktree"}`. Text mode
+prints `Warning: docs: expired_with_worktree` on stderr. These warnings do not
+retain expired leases; a retry with nothing to collect returns both arrays empty.
+
 A lease is cooperative conflict input, not a lock, not an identity and not proof
 that an agent is alive. Different lanes' claims can race between the overlap read
 and their writes. `owner` and `role` are display labels; anyone may release a lease

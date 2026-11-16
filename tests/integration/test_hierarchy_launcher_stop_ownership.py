@@ -12,6 +12,7 @@ import uuid
 
 import pytest
 
+import tests.integration.test_hierarchy_launcher as launcher_notifications
 from tests.integration.test_hierarchy_launcher import (
     r2_exited_test_entry, r2_pending_test_entry, require_r2_indirect_exit, Launch, REVIEW,
                                                        R2_STOP_TIMEOUT_SECONDS, R2Processes, R2Custody, R2CleanupError,
@@ -50,7 +51,7 @@ def r33_retained_orphan(case, capsys):
     case.projection.path_view(module, unreadable_worker)
     code, answer = case.stop(module, capsys, 0)
     assert code == 3 and worker.pid in answer["unresolved_pids"]
-    assert host.wait(timeout=5) == -signal.SIGKILL
+    assert host.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
     wait_until(lambda: middle.poll() == "CONFIRMED_EXIT")
     assert worker.poll() is None and all(pid != worker.pid for pid, _ in case.projection.events)
     launches = module.Launches(str(case.launch.base))
@@ -112,7 +113,7 @@ def test_r33_terminal_custody_requires_current_honest_exit_proof(r2_case, capsys
     before, effects = path.read_bytes(), list(r2_case.projection.events)
     r2_case.configs[0].with_suffix(".exit").touch()
     if physical == "absent":
-        assert held.wait(timeout=5) == 0
+        assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
     else:
         wait_until(lambda: r2_kernel_process(held.pid)["state"].startswith("Z"))
     module = r2_case.module(False)
@@ -131,7 +132,7 @@ def test_r33_terminal_custody_requires_current_honest_exit_proof(r2_case, capsys
     control = handoff_module()
     control.hierarchy_launcher = module
     assert run_main(control, r2_case.launch, spec_for(r2_case.launch), capsys, 0)["entries"][0]["generation"] == 2
-    assert held.wait(timeout=5) == 0
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
 
 
 @pytest.mark.parametrize("mutation", ["changed-birth", "birthless-esrch"])
@@ -388,7 +389,7 @@ def test_r32_transient_pidfd_failure_keeps_custody_without_numeric_delivery(r2_c
     if stage == "root":
         monkeypatch.setattr(module.os, "pidfd_open", opening)
         assert r2_case.stop(module, capsys, 0)[0] == 0
-        assert host.wait(timeout=5) == -signal.SIGKILL
+        assert host.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
         assert not json.loads(path.read_text())["active"]
 
 
@@ -412,7 +413,7 @@ def test_r32_numeric_delivery_requires_established_pidfd_absence(r2_case, capsys
     code, answer = r2_case.stop(module, capsys, 0)
     if missing == "open":
         assert code == 0 and answer["pids"] == [actor.pid]
-        assert actor.wait(timeout=5) == -signal.SIGTERM
+        assert actor.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     else:
         assert code == 3 and answer["state"] == "stop_failed" and answer["pids"] == []
         assert actor.poll() is None and r2_case.projection.events == []
@@ -558,7 +559,7 @@ def test_r31_new_records_keep_origin_through_same_namespace_retirement(r2_case, 
                                        "wake-" + uuid.uuid4().hex, actor.pid)
     assert record["schema"] == "aegis.hierarchy-running-wake/v3" and record["pid_namespace"] == origin
     r2_case.configs[-1].with_suffix(".exit").touch()
-    assert actor.wait(timeout=5) == 0
+    assert actor.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
     assert r2_case.stop(module, capsys, 0)[0] == 0
     saved = json.loads(path.read_text())
     assert saved["pid_namespace"] == origin and not saved["active"]
@@ -662,7 +663,7 @@ def test_r31_unqualified_running_wake_is_readable_but_never_retired(r2_case, cap
     actor = r2_case.spawn(None)
     if not alive:
         r2_case.configs[-1].with_suffix(".exit").touch()
-        assert actor.wait(timeout=5) == 0
+        assert actor.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
     module = r2_case.module(False)
     launches = module.Launches(str(r2_case.launch.base))
     record = dict(schema="aegis.hierarchy-running-wake/v%d" % version,
@@ -712,10 +713,8 @@ from pathlib import Path
 configuration=json.loads(Path(os.environ["R2_LEGACY_CONFIG"]).read_text())
 runpy.run_path(configuration["helper"])["r2_legacy_child_gate"](configuration,os.environ["R2_LEGACY_SLOT"])
 Path(os.environ["R30_READY"]).write_text(json.dumps({"pid":os.getpid(),"cwd":os.getcwd(),"executable":str(Path(sys.argv[0]).resolve())}))
-deadline=time.monotonic()+10
-while not Path(os.environ["R30_FINISH"]).exists():
-    if time.monotonic()>=deadline: raise RuntimeError("fixture parent did not release the completed executable")
-    time.sleep(0.01)
+runpy.run_path(configuration["helper"])["r2_wait_marker"](
+    configuration["exit_directory"], "r30-child/finish")
 ''')
         executable.chmod(0o700)
     path = ("" if lookup == "empty" else "bin") + os.pathsep + str(support)
@@ -792,7 +791,7 @@ while not Path(os.environ["R30_FINISH"]).exists():
         assert admission["admission_attempted"] is False and admission["failure"] == "host spawn failed"
     else:
         assert answer["wake"]["state"] == "woken_unread" and answer["wake"]["exit_code"] == 0
-        assert len(actors) == 1 and actors[0].wait(timeout=5) == 0 and len(identities) == 1
+        assert len(actors) == 1 and actors[0].wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0 and len(identities) == 1
         assert identities[0]["snapshot"] is not None and identities[0]["host_pid"] == actors[0].pid
         assert json.loads(ready.read_text()) == dict(pid=actors[0].pid,cwd=str(cwd),executable=str(executable))
         assert admission["admission_attempted"] is True and "failure" not in admission
@@ -843,7 +842,7 @@ def test_r29_log_close_after_creation_keeps_the_admitted_child(r2_case, capsys, 
             abandoned.append(process.pid)
             if outcome == "settled":
                 r2_case.configs[-1].with_suffix(".exit").touch()
-                assert process.wait(timeout=5) == 0
+                assert process.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
                 return
             raise PermissionError(errno.EPERM, "modelled child cannot yet be abandoned")
         wake.abandon_turn = abandon
@@ -877,14 +876,14 @@ def test_r29_log_close_after_creation_keeps_the_admitted_child(r2_case, capsys, 
     stopped, receipt = r2_case.stop(module, capsys, 0)
     if outcome == "owned":
         assert stopped == 0 and receipt["state"] == "stopped" and receipt["pids"] == [actors[0].pid]
-        assert actors[0].wait(timeout=5) == -signal.SIGTERM
+        assert actors[0].wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     else:
         assert stopped == 3 and receipt["state"] == "stop_failed" and receipt["pids"] == []
         assert receipt["unresolved_pids"] == [actors[0].pid] and actors[0].poll() is None
         assert module.read_running_wake(launches.base, REVIEW) == running
         assert not r2_case.projection.events
         r2_case.configs[-1].with_suffix(".exit").touch()
-        assert actors[0].wait(timeout=5) == 0
+        assert actors[0].wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
         assert r2_case.stop(module, capsys, 0)[0] == 0
     assert module.read_running_wake(launches.base, REVIEW) is None
     assert module.process_group_exited(actors[0].pid)
@@ -999,7 +998,7 @@ def test_r28_start_revalidates_namespace_at_the_actual_bind_boundary(r2_case, ca
     request = r2_case.launch.start_request(cwd=str(r2_case.launch.source))
     code = module.main(["--base", str(r2_case.launch.base), "start", "--request", str(request)])
     answer = json.loads(capsys.readouterr().out)
-    assert executed and executed[0].wait(timeout=5) == 0 and changed
+    assert executed and executed[0].wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0 and changed
     assert r2_case.launch.binding() is None, "the start bound after its endpoint namespace changed"
     assert code == 2 and answer["error"] == "endpoint namespace changed; preserve custody and retry"
 
@@ -1170,7 +1169,7 @@ def test_r28_replaced_unbound_cleanup_fence_never_deletes_a_live_starts_worktree
                 receipt = pending.result(timeout=R2_STOP_TIMEOUT_SECONDS)
                 observations.append((actor.poll(), worktree.is_dir(), receipt))
                 r2_case.custody.kill_owned(slot)
-                actor.wait(timeout=5)
+                actor.wait(timeout=R2_STOP_TIMEOUT_SECONDS)
                 return actor
             module.subprocess = R2Facade(module.subprocess, Popen=create)
             request = r2_case.launch.start_request(cwd=str(worktree))
@@ -1187,7 +1186,7 @@ def test_r28_replaced_unbound_cleanup_fence_never_deletes_a_live_starts_worktree
                 if actor.poll() is None:
                     slot = next(slot for slot, row in r2_case.custody.entries.items() if row["pid"] == actor.pid)
                     r2_case.custody.kill_owned(slot)
-                    actor.wait(timeout=5)
+                    actor.wait(timeout=R2_STOP_TIMEOUT_SECONDS)
             pending.result(timeout=R2_STOP_TIMEOUT_SECONDS)
             probe.close()
 
@@ -1202,16 +1201,19 @@ def test_r28_host_exec_to_nonhost_helper_loses_signal_authority_but_keeps_custod
     ready, host_ready, exiting = (r2_case.launch.tmp / name for name in ("r28-helper-ready", "r28-host-ready", "r28-helper-exit"))
     helper = r2_case.launch.tmp / "r28-nonhost.py"
     trigger = r2_case.launch.tmp / "r28-exec-trigger"
-    helper.write_text("import os,signal,time\nfrom pathlib import Path\n"
+    helper.write_text("import json,os,runpy,signal\nfrom pathlib import Path\n"
+        "configuration=json.loads(Path(os.environ['R2_LEGACY_CONFIG']).read_text())\n"
+        "wait_marker=runpy.run_path(configuration['helper'])['r2_wait_marker']\n"
         "signal.signal(signal.SIGTERM,signal.SIG_IGN)\nPath(%r).touch()\n"
-        "while not Path(%r).exists(): time.sleep(.01)\n" % (str(ready), str(exiting)))
+        "wait_marker(configuration['exit_directory'],%r)\n" % (str(ready), exiting.name))
     body = ("import os,signal,time\nfrom pathlib import Path\n"
+        "wait_marker=runpy.run_path(configuration['helper'])['r2_wait_marker']\n"
         "def changed(number,frame): os.execv(%r,%r)\n"
         "signal.signal(signal.SIGTERM,%s)\nPath(%r).touch()\n" %
         (sys.executable, [sys.executable, str(helper)],
          "changed" if boundary == "after-term" else "signal.SIG_IGN", str(host_ready)))
     body += ("while True: signal.pause()\n" if boundary == "after-term" else
-             "while not Path(%r).exists(): time.sleep(.01)\nchanged(None,None)\n" % str(trigger))
+             "wait_marker(configuration['exit_directory'],%r)\nchanged(None,None)\n" % trigger.name)
     logical = ["claude", "--resume", session] if host == "claude-code" else ["codex", "exec", "resume", session]
     held = r2_case.spawn_legacy([sys.executable], logical, body, {})
     wait_until(host_ready.exists)
@@ -1277,7 +1279,7 @@ def test_r28_host_exec_to_nonhost_helper_loses_signal_authority_but_keeps_custod
         assert held.poll() is None and r2_case.projection.events == [(held.pid, signal.SIGTERM)]
     finally:
         exiting.touch()
-        held.wait(timeout=5)
+        held.wait(timeout=R2_STOP_TIMEOUT_SECONDS)
     # The original child is now reaped; a new observer uses the admitted numeric exit proof.
     assert r2_case.stop(r2_case.module(False), capsys, 0)[0] == 0
 
@@ -1312,7 +1314,7 @@ def test_r27_partial_zombie_with_replacement_uid_cannot_commit_original_exit(r2_
     try:
         assert r2_case.stop(module, capsys, 0)[0] == 3 and witnessed
     finally:
-        assert actor.wait(timeout=5) == -signal.SIGKILL
+        assert actor.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
     assert r2_case.stop(r2_case.module(False), capsys, 0)[0] == 3
     saved = json.loads(custody.path.read_text())
     assert saved["active"] and saved["entries"][0]["identity_lost"] and saved["entries"][0]["resolved"] is None
@@ -1366,7 +1368,7 @@ def test_r27_descendant_exec_metadata_before_term_keeps_instance(r2_case, capsys
     assert changed and code == 3 and answer["state"] == "stop_failed"
     assert answer["pids"] == sorted([host.pid, middle.pid]) and worker.pid in answer["unresolved_pids"]
     assert all(pid != worker.pid for pid, _ in r2_case.projection.events)
-    assert worker.poll() is None and host.wait(timeout=5) == -signal.SIGKILL
+    assert worker.poll() is None and host.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
     path = module.Launches(str(r2_case.launch.base)).folder(REVIEW) / ".stop-custody/state.json"
     entry = next(row for row in json.loads(path.read_text())["entries"] if row["pid"] == worker.pid)
     assert entry["resolved"] is None and not entry["identity_lost"]
@@ -1383,7 +1385,7 @@ def test_r27_filtered_partial_uid_witness_survives_later_absence(r2_case, capsys
         if pid == actor.pid and not witnessed:
             witnessed.append(True)
             r2_case.configs[0].with_suffix(".exit").touch()
-            assert actor.wait(timeout=5) == 0
+            assert actor.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
             return module.ProcessObservation("UNAVAILABLE", pid, reason="modelled partial replacement UID",
                 partial={"pid": pid, "coherent_birth": True, "start_time": physical["birth"], field: physical[field] + 1})
         return reading(pid, *args)
@@ -1482,7 +1484,7 @@ def test_r27_real_producer_wrapper_exec_keeps_its_admitted_instance(r2_case, cap
     with ThreadPoolExecutor(max_workers=1) as pool:
         pending = pool.submit(module.resume, launches, REVIEW, False)
         try:
-            assert created.wait(timeout=10), "real producer did not publish and exec its captured host"
+            assert created.wait(timeout=R2_STOP_TIMEOUT_SECONDS), "real producer did not publish and exec its captured host"
             def admission_is_free():
                 try:
                     with module.stop_endpoint_lock(launches.mailbox.root, REVIEW):
@@ -1499,11 +1501,11 @@ def test_r27_real_producer_wrapper_exec_keeps_its_admitted_instance(r2_case, cap
             # Acquisition in the real stop waits only for admission's final explicit unlock.
             code, answer = r2_case.stop(module, capsys, 0)
             assert code == 0 and answer["state"] == "stopped" and answer["pids"] == [actors[0].pid]
-            assert actors[0].wait(timeout=5) == -signal.SIGTERM
+            assert actors[0].wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
         finally:
             if actors and actors[0].poll() is None:
                 r2_case.custody.kill_owned(slot)
-                actors[0].wait(timeout=5)
+                actors[0].wait(timeout=R2_STOP_TIMEOUT_SECONDS)
         assert pending.result(timeout=R2_STOP_TIMEOUT_SECONDS)[0] == 3
     facts = module.StopCustody.decode(admitted[0]["snapshot"])
     assert facts == dict(pid=actors[0].pid, start_time=original[0]["birth"],
@@ -1534,7 +1536,7 @@ def test_r27_replacement_identity_latches_birth_and_each_uid(r2_case, capsys, fi
     entry = next(e for e in json.loads(path.read_text())["entries"] if e["pid"] == actor.pid)
     assert entry["identity_lost"] is True and entry["blocked"] is True
     r2_case.configs[-1].with_suffix(".exit").touch()
-    assert actor.wait(timeout=5) == 0
+    assert actor.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
     assert r2_case.stop(r2_case.module(False), capsys, 0)[0] == 3
     assert json.loads(path.read_text())["active"] is True
 
@@ -1672,7 +1674,7 @@ def test_r27_unlinked_unreadable_instance_does_not_claim_its_long_lived_group(r2
     saved = json.loads(path.read_text())
     assert os.getpgrp() not in saved.get("groups", [])
     r2_case.configs[-1].with_suffix(".exit").touch()
-    assert actor.wait(timeout=5) == 0
+    assert actor.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
     assert r2_case.stop(r2_case.module(False), capsys, 0)[0] == 0
     assert json.loads(path.read_text())["active"] is False
     os.killpg(os.getpgrp(), 0)  # The unrelated caller group still exists after successful discharge.
@@ -1724,7 +1726,7 @@ def test_r26_captured_resume_requires_no_installed_host_cli(r2_case, capsys, mon
     assert module.main(["--base", str(r2_case.launch.base), "resume", "--endpoint", REVIEW]) == 3
     answer = json.loads(capsys.readouterr().out)
     assert answer["state"] == "resumed_unread" and answer["wake"]["state"] == "woken_unread"
-    assert len(actors) == 1 and actors[0].wait(timeout=5) == 0
+    assert len(actors) == 1 and actors[0].wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
     assert module.read_running_wake(r2_case.launch.base, REVIEW) is None
     assert module.process_group_exited(actors[0].pid)
 
@@ -1761,7 +1763,7 @@ def test_r25_empty_census_never_discharges_a_retained_group(r2_case, capsys, pro
         assert custody.read()[0]["active"] is True
     # An independent invocation must retain group scope even with no discovered PID.
     actor.send_signal(signal.SIGTERM)
-    assert actor.wait(timeout=5) == -signal.SIGTERM
+    assert actor.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     module.os.killpg = os.killpg
     code, answer = r2_case.stop(module, capsys, 0)
     assert code == 0 and answer["state"] == "not_running"
@@ -1778,7 +1780,7 @@ def test_r25_wake_retirement_requires_kernel_group_absence(r2_case):
                   host_pid=actor.pid, binding=r2_case.launch.binding())
     assert module.running_wake_group_exited(record) is False
     actor.send_signal(signal.SIGTERM)
-    assert actor.wait(timeout=5) == -signal.SIGTERM
+    assert actor.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     assert module.running_wake_group_exited(record) is True
 
 
@@ -1843,7 +1845,7 @@ def test_r25_fork_and_exit_between_final_enumeration_and_inspection(r2_case, cap
                         assert str(leaf.pid) not in lists[-1]
                         born.append(leaf)
                         os.write(release_write, b"X")
-                        assert select.select([reaped_read], [], [], 5)[0]
+                        assert select.select([reaped_read], [], [], R2_STOP_TIMEOUT_SECONDS)[0]
                         assert os.read(reaped_read, 1) == b"C"  # Native wait for C completed before inspection.
                 yield from names
         module.Path = FinalCensusPath
@@ -1853,7 +1855,7 @@ def test_r25_fork_and_exit_between_final_enumeration_and_inspection(r2_case, cap
         assert born[0].poll() is None and not r2_case.projection.events
         assert module.read_running_wake(launches.base, REVIEW) == record
         r2_case.custody.kill_owned("gap-D")
-        assert select.select([reaped_read], [], [], 5)[0]
+        assert select.select([reaped_read], [], [], R2_STOP_TIMEOUT_SECONDS)[0]
         proof = json.loads(os.read(reaped_read, 4096))
         assert proof["pid"] == born[0].pid and os.WIFSIGNALED(proof["status"])
         if probe != "native":
@@ -2050,7 +2052,7 @@ def test_r25_argon_replacement_birth_survives_filtering_and_recovery(r2_case, ca
     def exit_replacement():
         if not exited:
             replacement.send_signal(signal.SIGTERM)
-            assert replacement.wait(timeout=5) == -signal.SIGTERM
+            assert replacement.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
             exited.append(True)
     def sampled(pid, *args, **kwargs):
         observation = reading(pid, *args, **kwargs)
@@ -2081,7 +2083,7 @@ def test_r25_argon_replacement_birth_survives_filtering_and_recovery(r2_case, ca
     assert entry["identity_lost"] is True and entry["resolved"] is None
     assert answer["unresolved_groups"] == [survivor.pid]
     survivor.send_signal(signal.SIGTERM)
-    assert survivor.wait(timeout=5) == -signal.SIGTERM
+    assert survivor.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     # Even later ESRCH for P AND G cannot undo a witnessed loss of the original identity.
     code, answer = r2_case.stop(module, capsys, 0)
     assert code == 3 and "original process identity lost" in answer["error"]
@@ -2144,7 +2146,7 @@ def test_r25_an_owned_host_sharing_the_callers_group_keeps_group_custody(r2_case
     group = r2_kernel_process(actor.pid)["pgid"]
     assert group == os.getpgrp() and group > 0
     code, answer = r2_case.stop(r2_case.module(False), capsys, 0)
-    assert actor.wait(timeout=5) == -signal.SIGTERM
+    assert actor.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     # The invoker keeps this actual group nonempty after the owned instance has exited.
     assert code == 3 and answer["state"] == "stop_failed" and answer["unresolved_groups"] == [group]
     assert answer["pids"] == [actor.pid]
@@ -2165,7 +2167,7 @@ def test_r25_unreaped_zombie_keeps_group_custody(r2_case, capsys):
     code, answer = r2_case.stop(module, capsys, 0)
     assert code == 3 and answer["unresolved_groups"] == [actor.pid]
     assert module.read_running_wake(launches.base, REVIEW) is not None
-    assert actor.wait(timeout=5) == -signal.SIGTERM
+    assert actor.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     assert r2_case.stop(module, capsys, 0)[0] == 0
 
 
@@ -2277,7 +2279,7 @@ def test_r23_fdopen_failure_closes_every_transferred_descriptor(r2_case, capsys,
         held = r2_case.spawn(["codex", "exec", "resume", r2_case.launch.binding()["session"]])
         if surface == "custody-read":
             assert r2_case.stop(module, capsys, 0)[0] == 0
-            assert held.wait(timeout=5) == -signal.SIGTERM
+            assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     before = list(r2_case.projection.events)
     opening, transferred = module.os.fdopen, []
     def failed(fd, mode, *args, **kwargs):
@@ -2345,7 +2347,7 @@ def test_r23_fork_selected_session_cannot_escape_stop_or_handoff(r2_case, capsys
     if surface == "stop":
         code, answer = r2_case.stop(module, capsys, 0)
         assert code == 0 and answer["state"] == "stopped" and answer["pids"] == [held.pid]
-        assert held.wait(timeout=5) == -signal.SIGTERM
+        assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     else:
         control = handoff_module()
         control.hierarchy_launcher = module
@@ -2561,7 +2563,7 @@ def test_r23_cleanup_rechecks_custody_after_its_fenced_stop(r2_case, capsys, oth
     try:
         code = control.main(["cleanup", "--probe-root", str(probe.root)])
         answer = json.loads(capsys.readouterr().out)["cleanup"]
-        assert held.wait(timeout=5) == -signal.SIGKILL
+        assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
         assert not json.loads(journal.read_text())["active"]
         assert answer["auth_removed"] and answer["leftover_processes"] == []
         if other_failure:
@@ -2598,7 +2600,7 @@ def test_r22_unidentified_admitted_wrapper_is_not_absence(r2_case, capsys, host)
     assert code == 3 and answer["state"] == "stop_failed" and held.pid in answer["unresolved_pids"]
     assert held.poll() is None and not r2_case.projection.events and path.read_bytes() == before
     r2_case.configs[-1].with_suffix(".exit").touch()
-    assert held.wait(timeout=5) == 0
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
     code, answer = r2_case.stop(module, capsys, 0)
     assert code == 0 and answer["state"] == "not_running" and not path.exists()
 
@@ -2659,15 +2661,16 @@ def test_r22_blocked_same_birth_exits_or_explains_reconciliation(r2_case, capsys
         ready = r2_case.launch.tmp / "r22-exec-ready"
         exiting = r2_case.launch.tmp / "r22-exec-exit"
         script = r2_case.launch.tmp / "r22-replacement.py"
-        script.write_text("import pathlib,sys,time\n"
+        script.write_text("import json,os,pathlib,runpy,sys\n"
+                          "configuration=json.loads(pathlib.Path(os.environ['R2_LEGACY_CONFIG']).read_text())\n"
                           "pathlib.Path(sys.argv[2]).touch()\n"
-                          "deadline=time.monotonic()+30\n"
-                          "while not pathlib.Path(sys.argv[1]).exists() and time.monotonic()<deadline: time.sleep(.01)\n")
+                          "runpy.run_path(configuration['helper'])['r2_wait_marker']("
+                          "configuration['exit_directory'],pathlib.Path(sys.argv[1]).name)\n")
         replacement = [sys.executable, str(script), str(exiting), str(ready)]
-        body = ("import os,time\nfrom pathlib import Path\n"
-                "deadline=time.monotonic()+10\n"
-                "while not Path(%r).exists() and time.monotonic()<deadline: time.sleep(.01)\n"
-                "os.execv(%r, %r)\n") % (str(trigger), sys.executable, replacement)
+        body = ("import os\n"
+                "runpy.run_path(configuration['helper'])['r2_wait_marker']("
+                "configuration['exit_directory'],%r)\n"
+                "os.execv(%r, %r)\n") % (trigger.name, sys.executable, replacement)
         held = r2_case.spawn_legacy([sys.executable], ["claude", "--resume", session], body, {})
         birth = r2_kernel_process(held.pid)["birth"]
         reading, physical = module.read_process, launcher_module().read_process
@@ -2722,10 +2725,10 @@ def test_r22_blocked_same_birth_exits_or_explains_reconciliation(r2_case, capsys
             assert "stop custody unresolved" in refusal and "stop --endpoint " + REVIEW in refusal
     exiting.touch()
     if change == "exec-during-census":
-        assert held.wait(timeout=5) == 0  # Reaped direct child supplies actual qualified ESRCH.
+        assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0  # Reaped direct child supplies actual qualified ESRCH.
     else:
         wait_until(lambda: held.poll() == "CONFIRMED_EXIT")
-        assert family["H"].wait(timeout=5) == -signal.SIGTERM
+        assert family["H"].wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     code, answer = r2_case.stop(r2_case.module(False), capsys, 0)
     if change == "setuid-descendant":
         assert code == 3 and held.pid in answer["unresolved_pids"]
@@ -2762,7 +2765,7 @@ def r22_admitted_orphan(case, module, evidence):
         for label in ("H", "M"):
             slot = next(slot for slot, row in case.custody.entries.items() if row["pid"] == family[label].pid)
             case.custody.kill_owned(slot)
-        assert family["H"].wait(timeout=5) == -signal.SIGKILL
+        assert family["H"].wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
         wait_until(lambda: family["M"].poll() == "CONFIRMED_EXIT")
         assert family["W"].poll() is None
 
@@ -2872,7 +2875,7 @@ def test_r23_census_cohort_preserves_its_own_unavailable_actors(r2_case, capsys,
     code, answer = r2_case.stop(module, capsys, 0)
     if fault_scope == "other-case":
         assert code == 0 and answer["state"] == "stopped" and answer["pids"] == [held.pid]
-        assert held.wait(timeout=5) == -signal.SIGTERM
+        assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
         assert r2_case.projection.events == [(held.pid, signal.SIGTERM)]
     else:
         assert code == 3 and answer["state"] == "stop_failed" and answer["pids"] == []
@@ -2935,7 +2938,7 @@ def test_r23_census_includes_new_ready_receipts_from_a_captured_child(r2_case, c
     receiving.receipts.setdefault(str(held.pid), dict(sending.receipts[str(held.pid)]))
     code, answer = r2_case.stop(module, capsys, 0)
     assert code == 0 and answer["state"] == "stopped" and answer["pids"] == [held.pid]
-    assert held.wait(timeout=5) == -signal.SIGTERM
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     assert receiving.events == [(held.pid, signal.SIGTERM)] and not sending.events
 
 
@@ -2994,14 +2997,14 @@ def test_r23_running_birth_survives_an_unavailable_census(r2_case, capsys):
         if pid == held.pid and calls:
             if replacement:
                 r2_case.configs[-1].with_suffix(".exit").touch()
-                assert held.wait(timeout=5) == 0
+                assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
             else:
                 replacement.append(True)
         return read(pid, *args)
     module.process_census = unavailable
     module.read_process = replacement_then_absence
     code, answer = r2_case.stop(module, capsys, 0)
-    assert replacement and held.wait(timeout=5) == 0
+    assert replacement and held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
     assert code == 3 and answer["state"] == "stop_failed" and answer["pids"] == []
     assert answer["error"] == module.custody_refusal(launches.base, REVIEW, "original process identity lost")
     assert not r2_case.projection.events and (launches.folder(REVIEW) / ".running-wake").is_file()
@@ -3043,7 +3046,7 @@ def test_r23_resume_persists_admission_before_creating_the_host(r2_case, capsys,
     monkeypatch.setattr(module, "load_wake", load)
     code = module.main(["--base", str(r2_case.launch.base), "resume", "--endpoint", REVIEW])
     answer = json.loads(capsys.readouterr().out)
-    assert code == 3 and answer["state"] == "resumed_unread" and actors[0].wait(timeout=5) == 0
+    assert code == 3 and answer["state"] == "resumed_unread" and actors[0].wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
     admission, records, before_spawn_syncs = observations[0]
     assert admission is not None and admission["host_pid"] is None and admission["snapshot"] is None
     assert admission["binding"]["host"] == host and admission["wake_id"] == answer["wake"]["wake_id"]
@@ -3071,7 +3074,7 @@ def test_r23_failed_publication_and_abandonment_keep_the_unknown_group(r2_case, 
             for label in ("H", "M"):
                 slot = next(slot for slot, row in r2_case.custody.entries.items() if row["pid"] == family[label].pid)
                 r2_case.custody.kill_owned(slot)
-            assert family["H"].wait(timeout=5) == -signal.SIGKILL
+            assert family["H"].wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
             wait_until(lambda: family["M"].poll() == "CONFIRMED_EXIT")
             return family["H"]
         def killpg(group, number):
@@ -3177,7 +3180,7 @@ def test_r23_parent_outcome_failure_keeps_admission_until_a_later_stop(r2_case, 
     monkeypatch.setattr(module.Launches, "write", failed)
     assert module.main(["--base", str(r2_case.launch.base), "resume", "--endpoint", REVIEW]) == 2
     answer = json.loads(capsys.readouterr().out)
-    assert observations and observations[0] is not None and actors[0].wait(timeout=5) == 0
+    assert observations and observations[0] is not None and actors[0].wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
     assert answer["error"] == "[Errno 5] Input/output error"
     assert "modelled parent outcome" not in json.dumps(answer)
     launches = module.Launches(str(r2_case.launch.base))
@@ -3290,7 +3293,7 @@ def test_r23_refused_resume_requires_a_later_stop(r2_case, capsys, monkeypatch, 
     monkeypatch.setattr(module, "load_wake", load)
     assert module.main(["--base", str(r2_case.launch.base), "resume", "--endpoint", REVIEW]) == 2
     answer = json.loads(capsys.readouterr().out)
-    assert faults == [True] and answer["state"] == "refused" and actors[0].wait(timeout=5) == 0
+    assert faults == [True] and answer["state"] == "refused" and actors[0].wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
     path = module.Launches(str(r2_case.launch.base)).paths(REVIEW)[-1]
     assert module.read_resume_admission(r2_case.launch.base, REVIEW, path.stem)["admission_attempted"] is True
     expected = ("[Errno 5] Input/output error" if failure is OSError else
@@ -3380,7 +3383,7 @@ def test_r22_running_wake_enospc_cleans_publication_and_marker(r2_case, capsys, 
     module.os.fdopen = fdopen
     code = module.main(["--base", str(r2_case.launch.base), "resume", "--endpoint", REVIEW])
     answer = json.loads(capsys.readouterr().out)
-    assert faults == [True] and actors and actors[0].wait(timeout=5) == -signal.SIGTERM
+    assert faults == [True] and actors and actors[0].wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     assert code == 3 and answer["wake"]["state"] == "failed_to_start"
     launches = module.Launches(str(r2_case.launch.base))
     assert not list(launches.folder(REVIEW).glob(".running-wake*"))
@@ -3405,7 +3408,7 @@ def test_r22_failed_group_cleanup_retains_the_running_wake(r2_case, capsys, monk
             for label in ("H", "M"):
                 slot = next(slot for slot, row in r2_case.custody.entries.items() if row["pid"] == family[label].pid)
                 r2_case.custody.kill_owned(slot)
-            assert family["H"].wait(timeout=5) == -signal.SIGKILL
+            assert family["H"].wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
             wait_until(lambda: family["M"].poll() == "CONFIRMED_EXIT")
             return family["H"]
         def killpg(group, number):
@@ -3551,7 +3554,7 @@ def test_r21_mid_stop_retirement_commits_terminal_custody(r2_case, capsys):
                                         actual.unavailable)
         return actual
     module.process_census = observed
-    r2_case.projection.after_signal.append(lambda pid, number: held.wait(timeout=5) if pid == held.pid else None)
+    r2_case.projection.after_signal.append(lambda pid, number: held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) if pid == held.pid else None)
     code, answer = r2_case.stop(module, capsys, 0)
     assert code == 0 and answer["state"] == "stopped" and answer["pids"] == [held.pid]
     assert answer["absence_evidence"] == [{"pid": held.pid, "proof": "qualified_namespace_ESRCH"}]
@@ -3577,14 +3580,14 @@ def test_r21_new_birth_during_escalation_receives_term_first(r2_case, capsys):
     module.process_census = observed
     def settled(pid, number):
         if pid == replacement.pid and number == signal.SIGTERM:
-            replacement.wait(timeout=5)
+            replacement.wait(timeout=R2_STOP_TIMEOUT_SECONDS)
     r2_case.projection.after_signal.append(settled)
     code, answer = r2_case.stop(module, capsys, 0)
     assert code == 0 and answer["state"] == "stopped"
     delivered = [number for pid, number in r2_case.projection.events if pid == replacement.pid]
     assert delivered == [signal.SIGTERM]
-    assert replacement.wait(timeout=5) == -signal.SIGTERM
-    assert first.wait(timeout=5) == -signal.SIGKILL
+    assert replacement.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
+    assert first.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
 
 
 @pytest.mark.parametrize("host,plan", [("claude-code", True), ("codex-cli", True), ("codex-cli", False)])
@@ -3617,7 +3620,7 @@ def test_r21_resume_can_be_stopped_mid_turn(r2_case, capsys, monkeypatch, host, 
                     options["pass_fds"][0], str(r2_case.launch.source / "tools/hierarchy_wake.py"), False,
                     command[command.index("--admission-namespace") + 1])
                 return SimpleNamespace(returncode=code, stdout=json.dumps(result))
-            spawn().wait(timeout=10)
+            spawn().wait(timeout=R2_STOP_TIMEOUT_SECONDS)
             return SimpleNamespace(returncode=3, stdout='{"state":"woken_unread"}')
         return run(command, **options)
     module.subprocess = R2Facade(module.subprocess, run=external)
@@ -3636,7 +3639,7 @@ def test_r21_resume_can_be_stopped_mid_turn(r2_case, capsys, monkeypatch, host, 
     with ThreadPoolExecutor(max_workers=1) as pool:
         pending = pool.submit(module.resume, module.Launches(str(r2_case.launch.base)), REVIEW, False)
         try:
-            assert started.wait(timeout=5), "resume did not reach the host turn"
+            assert started.wait(timeout=R2_STOP_TIMEOUT_SECONDS), "resume did not reach the host turn"
             # Observe actual lock availability before making one public stop call.
             descriptor = os.open(r2_case.launch.root / "bindings" / REVIEW, os.O_RDONLY | os.O_DIRECTORY)
             try:
@@ -3652,7 +3655,7 @@ def test_r21_resume_can_be_stopped_mid_turn(r2_case, capsys, monkeypatch, host, 
                 os.close(descriptor)
             code, answer = r2_case.stop(module, capsys, 0)
             assert code == 0 and answer["state"] == "stopped" and actors[0].pid in answer["pids"]
-            assert actors[0].wait(timeout=5) == -signal.SIGTERM
+            assert actors[0].wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
         finally:
             for config in r2_case.configs:
                 config.with_suffix(".exit").touch()
@@ -3669,7 +3672,7 @@ def test_r21_stop_retires_a_crashed_resumes_running_record(r2_case, capsys):
     known = {key: r2_case.launch.binding()[key] for key in ("host", "session", "generation")}
     module.write_running_wake(launches, REVIEW, known, "wake-" + uuid.uuid4().hex, held.pid)
     code, answer = r2_case.stop(module, capsys, 0)
-    assert code == 0 and answer["state"] == "stopped" and held.wait(timeout=5) == -signal.SIGTERM
+    assert code == 0 and answer["state"] == "stopped" and held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     assert not (launches.folder(REVIEW) / ".running-wake").exists()
 
 
@@ -3720,7 +3723,7 @@ def test_r21_running_wake_cleanup_failure_is_a_stop_failure(r2_case, capsys):
     code, answer = r2_case.stop(module, capsys, 0)
     assert code == 3 and answer["state"] == "stop_failed"
     assert answer["error"] == "running wake cleanup unavailable"
-    assert held.wait(timeout=5) == -signal.SIGTERM
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     assert (launches.folder(REVIEW) / ".running-wake").is_file()
 
 
@@ -3832,7 +3835,7 @@ def test_r20_resolved_pid_does_not_hide_a_fresh_physical_instance(r2_case, capsy
     old = r2_case.spawn()
     previous = module.read_process(old.pid).snapshot
     r2_case.configs[-1].with_suffix(".exit").touch()
-    assert old.wait(timeout=5) == 0
+    assert old.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
     time.sleep(2 / os.sysconf("SC_CLK_TCK"))
     family = r2_case.spawn(["claude", "--resume", session], tree=descendant)
     current = family["W"] if descendant else family
@@ -4014,9 +4017,9 @@ def test_r22_cleanup_never_stops_or_deletes_a_successor(r2_case, capsys, moment,
         for child, exit_path in children:
             if child.poll() is None:
                 exit_path.touch()
-                assert child.wait(timeout=5) == 0
+                assert child.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
             else:
-                child.wait(timeout=5)
+                child.wait(timeout=R2_STOP_TIMEOUT_SECONDS)
         probe.close()
 
 
@@ -4089,7 +4092,7 @@ def test_r20_probe_busy_precheck_still_invokes_its_fenced_stop(r2_case, capsys):
         code = control.main(["cleanup", "--probe-root", str(probe.root)])
         answer = json.loads(capsys.readouterr().out)
         assert faults and calls and all(words[0] == "stop" for _, words in calls)
-        assert held.wait(timeout=5) == -signal.SIGTERM
+        assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
         assert code == 3 and not answer["cleanup"]["worktree_removed"]
         assert Path(plan["worktree"]).is_dir() and answer["cleanup"]["unresolved_custody"]
     finally:
@@ -4105,7 +4108,7 @@ def test_r20_reused_root_retains_the_original_orphan_group(r2_case, capsys):
     for label in ("H", "M"):
         slot = next(slot for slot, entry in r2_case.custody.entries.items() if entry["pid"] == old[label].pid)
         r2_case.custody.kill_owned(slot)
-    assert old["H"].wait(timeout=5) == -signal.SIGKILL
+    assert old["H"].wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
     wait_until(lambda: old["M"].poll() == "CONFIRMED_EXIT")
     assert old["W"].poll() is None
     new = r2_case.spawn(["claude", "--resume", session])
@@ -4139,7 +4142,7 @@ def test_r20_initial_foreign_uid_descendant_is_held_without_a_signal(r2_case, ca
     assert worker.poll() is None and answer["pids"] == [host.pid]
     assert worker.pid not in answer.get("spared_descendants", [])
     assert all(pid != worker.pid for pid, _ in r2_case.projection.events)
-    assert host.wait(timeout=5) == -signal.SIGTERM
+    assert host.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
 
 
 @pytest.mark.parametrize("check", ["boot", "marker", "diagnostic"])
@@ -4218,7 +4221,7 @@ def test_r20_readonly_consumer_accepts_qualified_absence_with_an_unavailable_boo
     held = r2_case.spawn(["claude", "--resume", session])
     row = module.read_process(held.pid).snapshot
     code, answer = r2_case.stop(module, capsys, 0)
-    assert code == 0 and held.wait(timeout=5) == -signal.SIGTERM
+    assert code == 0 and held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     launches = module.Launches(str(r2_case.launch.base))
     binding = {key: r2_case.launch.binding()[key] for key in ("host", "session", "generation")}
     observed = dict(candidates={held.pid: row}, initial_unavailable={}, blocked=set(), identity_lost=set(),
@@ -4326,7 +4329,7 @@ def test_r20_lossy_census_cannot_clear_attempts_even_after_original_exit(r2_case
     def exited(pid, number):
         if pid == held.pid and number == signal.SIGTERM:
             r2_case.configs[-1].with_suffix(".exit").touch()
-            assert held.wait(timeout=5) == 0
+            assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
             gone.append(True)
             r2_case.ps(module, None, [])
             if not complete:
@@ -4446,7 +4449,7 @@ def test_stop_matches_the_bound_hosts_program(launch, children, host, program):
 
     assert stopped["state"] == "stopped" and stopped["pids"] == [owned.pid]
     assert stopped["host"] == host and stopped["session"] == session
-    assert owned.wait(timeout=5) == -signal.SIGTERM
+    assert owned.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
 
 
 @pytest.mark.parametrize("surface", ["census", "stop", "handoff"])
@@ -4482,7 +4485,7 @@ def test_r19_empty_discovery_observation_is_rechecked(r2_case, capsys, surface, 
         if transition != "restored":
             r2_case.configs[0].with_suffix(".exit").touch()
             if transition == "gone":
-                assert held.wait(timeout=5) == 0
+                assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
             else:
                 wait_until(lambda: r2_kernel_process(held.pid)["state"] == "Z")
             exits.append(True)
@@ -4509,9 +4512,9 @@ def test_r19_empty_discovery_observation_is_rechecked(r2_case, capsys, surface, 
         assert r2_case.projection.events == []
     assert emptied
     if transition != "restored":
-        assert exits and held.wait(timeout=5) == 0
+        assert exits and held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
     elif surface == "stop":
-        assert held.wait(timeout=5) == -signal.SIGTERM
+        assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     else:
         assert held.poll() is None
 
@@ -4617,7 +4620,7 @@ def test_r18_resolved_exit_survives_recovery_with_a_reused_pid(r2_case, capsys):
         if pid == host.pid and number == signal.SIGTERM:
             slot = next(s for s, e in r2_case.custody.entries.items() if e["pid"] == host.pid)
             r2_case.custody.kill_owned(slot)
-            assert host.wait(timeout=5) == -signal.SIGKILL
+            assert host.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
 
     def denied(path, raw):
         if (worker.pid, signal.SIGTERM) in r2_case.projection.events and str(path) == "/proc/%d/cmdline" % worker.pid:
@@ -4678,7 +4681,7 @@ def test_r18_hold_lineage_is_accounted_even_without_the_session(r2_case, capsys,
 
     def host_ended(pid, number):
         if pid == host.pid and number == signal.SIGTERM:
-            assert host.wait(timeout=5) == -signal.SIGTERM
+            assert host.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
             if exits:
                 r2_case.configs[0].with_suffix(".exit").touch()
                 wait_until(lambda: worker.poll() == "CONFIRMED_EXIT")
@@ -4703,7 +4706,7 @@ def test_r18_hold_intermediate_keeps_its_subtree_and_orphan_unresolved(r2_case, 
     r2_case.projection.after_present.append(intermediate)
     code, answer = r2_case.stop(module, capsys, 0)
     assert code == 3 and set(answer["unresolved_pids"]) == {middle.pid, worker.pid}
-    assert middle.poll() is None and worker.poll() is None and host.wait(timeout=5) == -signal.SIGKILL
+    assert middle.poll() is None and worker.poll() is None and host.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
     assert all(pid == host.pid for pid, _ in r2_case.projection.events)
 
 
@@ -4839,7 +4842,7 @@ def test_r18_ps_scope_stays_diagnostic_across_recovery(r2_case, capsys, state, c
     else:
         code, final = r2_case.stop(r2_case.module(False), capsys, 0)
         assert code == 0 and final["state"] == "stopped" and worker.pid in final["pids"]
-        assert (host.pid, signal.SIGKILL) in r2_case.projection.events and host.wait(timeout=5) == -signal.SIGKILL
+        assert (host.pid, signal.SIGKILL) in r2_case.projection.events and host.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
         assert worker.poll() == "CONFIRMED_EXIT" and (worker.pid, signal.SIGKILL) in r2_case.projection.events
 
 
@@ -4851,7 +4854,7 @@ def test_r18_incomplete_ps_cannot_discharge_coverage_after_a_retained_exit(r2_ca
     session = r2_case.launch.binding()["session"]
     current = r2_case.spawn(["claude", "--resume", session], ignore=True)
     r2_case.configs[0].with_suffix(".exit").touch()
-    assert old.wait(timeout=5) == 0
+    assert old.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
     module = r2_case.module(False)
     r2_case.ps(module, current, ["claude", "--resume", session])
     run, reads = module.subprocess.run, []
@@ -4961,7 +4964,7 @@ def test_r18_repeated_same_session_still_stops_the_actual_fake(r2_case, capsys):
     held = r18_fake_claude_hang(r2_case, session, ["--resume", session, "--resume", session])
     code, answer = r2_case.stop(module, capsys, 0)
     assert code == 0 and answer["state"] == "stopped" and answer["pids"] == [held.pid]
-    assert held.wait(timeout=5) == -signal.SIGTERM
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
 
 
 def test_r18_one_actor_interruption_fixture_declares_its_census_cohort(r2_case, capsys):
@@ -5055,7 +5058,7 @@ def test_r17_recovery_proves_live_ancestry_before_any_delivery(r2_case, capsys, 
             # Independent physical custody ends only H, exposing whether W was discovered first.
             slot = next(slot for slot, entry in r2_case.custody.entries.items() if entry["pid"] == host.pid)
             r2_case.custody.kill_owned(slot)
-            assert host.wait(timeout=5) == -signal.SIGKILL
+            assert host.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
     r2_case.projection.after_signal.append(reaped)
     code, answer = r2_case.stop(r2_case.module(False), capsys, 0)
     assert code == 0 and answer["state"] == "stopped"
@@ -5080,7 +5083,7 @@ def test_r17_every_coverage_obligation_roundtrips_to_next_stop(r2_case, capsys, 
 def test_r17_no_proc_retained_exit_is_verified_without_boot_id(r2_case, capsys):
     held, path, _ = r7_pending_attempt(r2_case, capsys)
     r2_case.configs[0].with_suffix(".exit").touch()
-    assert held.wait(timeout=5) == 0
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
     before = path.read_bytes()
     module = r2_case.module(False)
     r2_case.ps(module, held, ["claude", "--resume", r2_case.launch.binding()["session"]])
@@ -5120,7 +5123,7 @@ def test_r17_ps_cannot_clear_coverage_for_a_whitespace_session(r2_case, capsys, 
     old = r2_case.spawn(argv)
     row = module.read_process(old.pid).snapshot
     r2_case.configs[-1].with_suffix(".exit").touch()
-    assert old.wait(timeout=5) == 0 and module.read_process(old.pid).kind == "CONFIRMED_ABSENT"
+    assert old.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0 and module.read_process(old.pid).kind == "CONFIRMED_ABSENT"
     binding = {key: r2_case.launch.binding()[key] for key in ("host", "session", "generation")}
     # Legitimate previously discharged C, not borrowed authority: its original instance is physically gone.
     observed = dict(candidates={old.pid: row}, initial_unavailable={}, blocked=set(), identity_lost=set(),
@@ -5155,7 +5158,7 @@ def test_r17_discovery_and_custody_cover_registry_session_spellings(r2_case, cap
         assert code == 3 and answer["state"] == "stop_failed" and answer["unresolved_pids"] == [held.pid]
         assert held.poll() is None and r2_case.projection.events == []
     else:
-        assert code == 0 and answer["state"] == "stopped" and held.wait(timeout=5) == -signal.SIGTERM
+        assert code == 0 and answer["state"] == "stopped" and held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
         assert not module.unresolved_stop_custody(str(r2_case.launch.base), REVIEW)
 
 
@@ -5182,7 +5185,7 @@ def test_r17_resolved_partial_evidence_uses_only_coherent_birth(r2_case, capsys,
     module.read_process = unavailable
     if evidence == "no-birth":
         r2_case.configs[0].with_suffix(".exit").touch()
-        assert held.wait(timeout=5) == 0
+        assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
     if expected == "refuse":
         with pytest.raises(ValueError, match="resolved stop custody lacks physical exit proof"):
             module.require_resolved_custody(str(r2_case.launch.base), REVIEW)
@@ -5213,7 +5216,7 @@ def test_r15_delivery_rediscovers_a_late_visible_owned_group_child(r2_case, caps
 
     def delivered(pid, number):
         if pid == host.pid and number == signal.SIGTERM:
-            assert host.wait(timeout=5) == -signal.SIGTERM
+            assert host.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
 
     module.process_census = enumerated
     r2_case.projection.after_signal.append(delivered)
@@ -5242,7 +5245,7 @@ def test_r15_missing_intermediary_keeps_the_visible_worker_pending(r2_case, caps
             for name in ("H", "M"):
                 slot = next(slot for slot, row in r2_case.custody.entries.items() if row["pid"] == family[name].pid)
                 r2_case.custody.kill_owned(slot)
-            assert host.wait(timeout=5) == -signal.SIGKILL
+            assert host.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
             wait_until(lambda: middle.poll() == "CONFIRMED_EXIT")
             ended.append(True)
 
@@ -5276,7 +5279,7 @@ def test_r15_terminal_success_requires_a_fresh_group_census(r2_case, capsys):
 
     def delivered(pid, number):
         if pid == host.pid and number == signal.SIGTERM:
-            assert host.wait(timeout=5) == -signal.SIGTERM
+            assert host.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
 
     module.process_census = enumerated
     r2_case.projection.after_signal.append(delivered)
@@ -5321,7 +5324,7 @@ def test_r15_fresh_session_instance_after_exit_never_borrows_the_old_attempt(r2_
         assert answer["pids"] == [held.pid] and answer["unresolved_pids"] == [held.pid]
         assert r2_case.projection.events == [(held.pid, signal.SIGTERM)]
     finally:
-        assert held.wait(timeout=5) == -signal.SIGTERM
+        assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
 
 
 def test_r15_fresh_read_does_not_replace_initial_unknown_group_evidence(r2_case, capsys):
@@ -5349,7 +5352,7 @@ def test_r15_fresh_read_does_not_replace_initial_unknown_group_evidence(r2_case,
     assert code == 3 and answer["state"] == "stop_failed"
     assert answer["pids"] == [host.pid] and answer["unresolved_pids"] == [worker.pid]
     assert all(pid != worker.pid for pid, _ in r2_case.projection.events)
-    assert host.wait(timeout=5) == -signal.SIGTERM
+    assert host.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
 
 
 @pytest.mark.parametrize("surface", ["stop", "handoff"])
@@ -5394,7 +5397,7 @@ def test_r15_real_unreaped_zombie_is_valid_exit_evidence(r2_case, capsys, surfac
         assert current["birth"] == original["birth"] and current["state"].startswith("Z")
         assert r2_case.projection.events == [(held.pid, signal.SIGTERM)]
     finally:
-        assert held.wait(timeout=5) == -signal.SIGTERM
+        assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     assert r2_case.stop(r2_case.module(False), capsys, 0)[0] == 0
     if surface == "handoff":
         answer = run_main(control, r2_case.launch, spec_for(r2_case.launch), capsys, 0)
@@ -5422,7 +5425,7 @@ def test_r15_probe_cleanup_preserves_custody_but_removes_auth_and_finishes_roles
                     slot = next(slot for slot, row in r2_case.custody.entries.items()
                                 if row["pid"] == family[name].pid)
                     r2_case.custody.kill_owned(slot)
-                assert family["H"].wait(timeout=5) == -signal.SIGKILL
+                assert family["H"].wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
                 wait_until(lambda: family["M"].poll() == "CONFIRMED_EXIT")
                 raise KeyboardInterrupt("modelled probe loss retaining an actual orphan")
 
@@ -5494,7 +5497,7 @@ def test_r15_probe_cleanup_preserves_custody_but_removes_auth_and_finishes_roles
     # A real, test-owned exited PID supplies the stale run-lock prerequisite without inventing liveness.
     stale = r2_case.spawn(None)
     r2_case.configs[-1].with_suffix(".exit").touch()
-    assert stale.wait(timeout=5) == 0
+    assert stale.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
 
     folder = r2_case.launch.tmp / "r15-probe"
     folder.mkdir()
@@ -5550,10 +5553,10 @@ def test_r15_probe_cleanup_preserves_custody_but_removes_auth_and_finishes_roles
         assert (probe.root / "report.json").is_file() and (probe.root / "cleanup.json").is_file()
         assert not (probe.root / ".run.lock").exists()
         assert any(words[words.index("--endpoint") + 1] == endpoint for words in calls)
-        assert second.wait(timeout=5) == -signal.SIGTERM
+        assert second.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
         assert fault != "ambiguous-selector" or held.poll() is None
         if fault == "active-host":
-            assert held.wait(timeout=5) == -signal.SIGKILL
+            assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
             stopped = r2_case.launch.records()[-1]
             assert stopped["action"] == "stop" and stopped["state"] == "stopped" and stopped["pids"] == [held.pid]
             path = r2_case.launch.base / "launches" / discovery.quoted(REVIEW) / ".stop-custody" / "state.json"
@@ -5673,7 +5676,7 @@ def test_r16_cleanup_failure_still_removes_auth_and_releases_run_lock(r2_case, c
     discovery = r2_case.module(False)
     stale = r2_case.spawn()
     r2_case.configs[-1].with_suffix(".exit").touch()
-    assert stale.wait(timeout=5) == 0
+    assert stale.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
     folder = r2_case.launch.tmp / "failure-probe"
     folder.mkdir()
     probe = Probe(folder)
@@ -5819,7 +5822,7 @@ def test_second_stop_recovers_an_unreadable_orphan_from_the_first_stop(r2_case, 
             term.append(pid)
             if pid == leader.pid:
                 first.os.kill(pid, signal.SIGKILL)
-                assert leader.wait(timeout=5) == -signal.SIGKILL
+                assert leader.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
 
     def denied(path, raw):
         if worker.pid in term and str(path) == "/proc/%d/cmdline" % worker.pid:
@@ -5932,14 +5935,14 @@ def test_r14_latch_is_durable_before_next_observation(r2_case, capsys, site, dri
     code, answer = r2_case.stop(r2_case.module(False), capsys, 0)
     if drift == "cmdline":
         assert code == 0 and answer["state"] == "stopped" and answer["pids"] == [held.pid]
-        assert held.wait(timeout=5) == -signal.SIGKILL
+        assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
         assert (held.pid, signal.SIGKILL) in r2_case.projection.events
         assert json.loads(path.read_text())["active"] is False
         return
     assert code == 3 and answer["pids"] == [held.pid]
     assert answer["unresolved_pids"] == [held.pid] and r2_case.projection.events == before
     r2_case.configs[0].with_suffix(".exit").touch()
-    assert held.wait(timeout=5) == 0
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
     code, answer = r2_case.stop(r2_case.module(False), capsys, 0)
     if drift in ("birth", "uid"):
         assert code == 3 and answer["unresolved_pids"] == [held.pid]
@@ -5970,7 +5973,7 @@ def test_r14_empty_recheck_is_unavailable_until_a_qualified_exit(r2_case, capsys
     def exit_before_next_read(pid, count):
         if pid == held.pid and changed and not exited:
             r2_case.configs[0].with_suffix(".exit").touch()
-            assert held.wait(timeout=5) == 0
+            assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
             exited.append(True)  # Actual original exit; only now may qualified numeric absence resolve it.
 
     r2_case.projection.after_present.append(empty)
@@ -6016,7 +6019,7 @@ def test_r14_blocked_exit_proof_survives_outcome_crash(r2_case, capsys):
     with pytest.raises(R10Interrupted, match="modelled interruption after outcome/directory"):
         r2_case.stop(module, capsys)
     capsys.readouterr()
-    assert changed and exited and held.wait(timeout=5) == 0
+    assert changed and exited and held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
     assert json.loads(journal.read_text())["entries"][0]["resolved"]
     code, answer = r2_case.stop(r2_case.module(False), capsys, 0)
     assert code == 0 and answer["state"] == "stopped" and answer["pids"] == [held.pid]
@@ -6038,7 +6041,7 @@ def test_r14_resolved_claims_require_physical_identity(r2_case, capsys, boot, ph
     path.write_text(json.dumps(saved))
     if physical == "absent":
         r2_case.configs[0].with_suffix(".exit").touch()
-        assert held.wait(timeout=5) == 0
+        assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
 
     def modelled(pid, count, row):
         if pid == held.pid and physical == "reused":
@@ -6077,7 +6080,7 @@ def test_r14_grammar_hold_guidance_names_manual_process_and_followup(r2_case, ca
     assert "repair the process census" not in refused["error"]
     assert held.poll() is None and r2_case.projection.events == []
     r2_case.configs[0].with_suffix(".exit").touch()
-    assert held.wait(timeout=5) == 0
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
     control.hierarchy_launcher = r2_case.module(False)
     assert run_main(control, r2_case.launch, spec, capsys, 0)["entries"][0]["generation"] == 2
 
@@ -6087,7 +6090,7 @@ def test_r14_fresh_census_clears_obsolete_lossy_coverage(r2_case, capsys):
     saved["coverage"] = "argv_boundaries_unavailable"
     path.write_text(json.dumps(saved))
     r2_case.configs[0].with_suffix(".exit").touch()
-    assert held.wait(timeout=5) == 0
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
     code, answer = r2_case.stop(r2_case.module(False), capsys, 0)
     assert code == 0 and answer["state"] == "stopped"
     assert "reason" not in answer and not json.loads(path.read_text())["active"]
@@ -6103,7 +6106,7 @@ def test_r14_binding_mismatch_names_archive_and_followup_changes_outcome(r2_case
     assert "manual reconciliation" in answer["error"] and "mv -i --" in answer["error"]
     assert r2_case.projection.events == before and held.poll() is None
     r2_case.configs[0].with_suffix(".exit").touch()
-    assert held.wait(timeout=5) == 0
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
     path.rename(path.with_name("owner-reconciled.json"))
     code, answer = r2_case.stop(r2_case.module(False), capsys, 0)
     assert code == 0 and answer["state"] == "not_running"
@@ -6123,7 +6126,7 @@ def test_r14_escalation_recensuses_new_owned_root(r2_case, capsys):
     code, answer = r2_case.stop(module, capsys, 0)
     assert code == 0 and new
     assert answer["pids"] == sorted([held.pid, new[0].pid])
-    assert held.wait(timeout=5) == new[0].wait(timeout=5) == -signal.SIGKILL
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == new[0].wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
     assert (new[0].pid, signal.SIGKILL) in r2_case.projection.events
 
 
@@ -6173,7 +6176,7 @@ def test_r14_legacy_raw_journal_refuses_with_reconciliation(r2_case, capsys):
     assert code == 2 and "manual reconciliation" in refused["error"] and "mv -i --" in refused["error"]
     assert held.poll() is None and r2_case.projection.events == before
     r2_case.configs[0].with_suffix(".exit").touch()
-    assert held.wait(timeout=5) == 0
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
     path.rename(path.with_name("reconciled-v1.json"))
     code, answer = r2_case.stop(r2_case.module(False), capsys, 0)
     assert code == 0 and answer["state"] == "not_running"
@@ -6217,7 +6220,7 @@ def test_r14_large_physical_argv_can_be_stopped_without_a_size_dead_end(r2_case,
     assert len(r2_kernel_process(held.pid)["raw"]) > 90000
     module = r2_case.module(False)
     code, stopped = r2_case.stop(module, capsys)
-    assert code == 0 and stopped["pids"] == [held.pid] and held.wait(timeout=5) == -signal.SIGTERM
+    assert code == 0 and stopped["pids"] == [held.pid] and held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     path = module.Launches(str(r2_case.launch.base)).folder(REVIEW) / ".stop-custody" / "state.json"
     raw = path.read_bytes()
     assert len(raw) < 4096 and huge.encode() not in raw and huge.encode().hex().encode() not in raw
@@ -6228,7 +6231,7 @@ def test_r14_prior_inactive_noop_has_zero_custody_writes(r2_case, capsys):
     r2_case.bind("claude-code", session)
     held = r2_case.spawn(["claude", "--resume", session])
     module = r2_case.module(False)
-    assert r2_case.stop(module, capsys)[0] == 0 and held.wait(timeout=5) == -signal.SIGTERM
+    assert r2_case.stop(module, capsys)[0] == 0 and held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     path = module.Launches(str(r2_case.launch.base)).folder(REVIEW) / ".stop-custody" / "state.json"
     before, info, writes = path.read_bytes(), path.stat(), []
     fresh = r2_case.module(False)
@@ -6460,7 +6463,7 @@ def test_r13_writer_escaped_unicode_remains_readable(r2_case, capsys):
     held = r2_case.spawn(["claude", "--resume", session, "-p", "é"])
     module = r2_case.module(False)
     code, stopped = r2_case.stop(module, capsys)
-    assert code == 0 and held.wait(timeout=5) == -signal.SIGTERM
+    assert code == 0 and held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     path = module.Launches(str(r2_case.launch.base)).folder(REVIEW) / ".stop-custody" / "state.json"
     # v2 retains only the physical command digest, never logical prompt text (class I).
     assert path.read_bytes().isascii() and b"\\u00e9" not in path.read_bytes()
@@ -6603,7 +6606,7 @@ def test_r13_crash_before_initial_parent_fsync_never_signals(r2_case, capsys):
     recovered.os.fsync = synced
     r2_case.projection.after_signal.append(lambda pid, number: parents.append("signal"))
     code, stopped = r2_case.stop(recovered, capsys)
-    assert code == 0 and stopped["pids"] == [held.pid] and held.wait(timeout=5) == -signal.SIGTERM
+    assert code == 0 and stopped["pids"] == [held.pid] and held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     assert parents.index(folder.parent) < parents.index("signal")
 
 
@@ -6616,7 +6619,7 @@ def test_r13_previous_boot_has_an_actionable_outcome(r2_case, capsys, active):
     held = r2_case.spawn(["claude", "--resume", session])
     module = r2_case.module(False)
     code, stopped = r2_case.stop(module, capsys)
-    assert code == 0 and held.wait(timeout=5) == -signal.SIGTERM
+    assert code == 0 and held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     path = module.Launches(str(r2_case.launch.base)).folder(REVIEW) / ".stop-custody" / "state.json"
     saved = json.loads(path.read_text())
     saved.update(boot="modelled previous boot", active=active)
@@ -6661,7 +6664,7 @@ def test_r13_discovery_and_handoff_share_endpoint_lock(r2_case, capsys):
     module.session_processes = paused
     code, stopped = r2_case.stop(module, capsys)
     assert concurrent and code == 0 and stopped["pids"] == [held.pid]
-    assert held.wait(timeout=5) == -signal.SIGTERM
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
 
 
 def test_r13_census_unavailable_guidance_names_repair(r2_case, capsys):
@@ -6789,7 +6792,7 @@ def test_r13_recovery_syncs_legacy_directory_entries_before_effect(r2_case, caps
     module.os.fsync = fsync
     r2_case.projection.after_signal.append(lambda pid, number: events.append("signal"))
     code, stopped = r2_case.stop(module, capsys, 0)
-    assert code == 0 and stopped["pids"] == [held.pid] and held.wait(timeout=5) == -signal.SIGKILL
+    assert code == 0 and stopped["pids"] == [held.pid] and held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
     for parent in (path.parent.parent, path.parent.parent.parent, path.parent.parent.parent.parent):
         assert parent in events and events.index(parent) < events.index("signal")
 
@@ -6815,7 +6818,7 @@ def test_r13_parent_read_retry_is_bounded(r2_case, capsys, tears):
     code, answer = r2_case.stop(module, capsys, 0)
     assert code == (0 if tears == 1 else 3)
     if tears == 1:
-        assert held.wait(timeout=5) == -signal.SIGTERM
+        assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     else:
         assert held.poll() is None and r2_case.projection.events == []
         assert answer["unresolved_pids"] == [held.pid]
@@ -6837,7 +6840,7 @@ def test_r7_interrupted_stop_recovers_real_orphan_without_an_outcome(r2_case, ca
                 slot = next(slot for slot, entry in r2_case.custody.entries.items()
                             if entry["pid"] == family[label].pid)
                 r2_case.custody.kill_owned(slot)
-            assert family["H"].wait(timeout=5) == -signal.SIGKILL
+            assert family["H"].wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
             wait_until(lambda: family["M"].poll() == "CONFIRMED_EXIT")
             raise KeyboardInterrupt("modelled launcher loss with orphan")
 
@@ -6911,7 +6914,7 @@ def test_r7_failed_custody_write_after_term_retains_public_accounting(r2_case, c
     assert pending["active"] and pending["entries"][0]["attempted"]
     code, recovered = r2_case.stop(r2_case.module(), capsys, grace=0)
     assert code == 0 and recovered["state"] == "stopped" and recovered["pids"] == [held.pid]
-    assert held.wait(timeout=5) == -signal.SIGKILL
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
 
 
 def test_r7_failed_terminal_custody_write_records_failure_with_attempted_pids(r2_case, capsys):
@@ -6933,7 +6936,7 @@ def test_r7_failed_terminal_custody_write_records_failure_with_attempted_pids(r2
 
     module.os.replace = failed
     code, stopped = r2_case.stop(module, capsys, grace=1)
-    assert faults and held.wait(timeout=5) == -signal.SIGTERM
+    assert faults and held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     assert code == 3 and stopped["state"] == "stop_failed" and stopped["pids"] == [held.pid]
     assert "terminal custody update failure" in stopped["error"]
     assert r2_case.launch.records()[-1] == stopped
@@ -7007,7 +7010,7 @@ def test_r7_reused_pid_keeps_original_birth_across_recovery(r2_case, capsys, att
     r2_case.projection.after_present.remove(replacement)
     # Even actual later numeric absence cannot recover proof lost to an observed replacement.
     r2_case.configs[0].with_suffix(".exit").touch()
-    assert held.wait(timeout=5) == 0
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
     code, unresolved = r2_case.stop(r2_case.module(pidfds=False), capsys, grace=0)
     assert code == 3 and unresolved["unresolved_pids"] == [held.pid]
     assert r2_case.projection.events == before
@@ -7044,7 +7047,7 @@ def test_r7_public_handoff_cannot_ignore_interrupted_orphan_custody(r2_case, cap
                 slot = next(slot for slot, entry in r2_case.custody.entries.items()
                             if entry["pid"] == family[label].pid)
                 r2_case.custody.kill_owned(slot)
-            assert family["H"].wait(timeout=5) == -signal.SIGKILL
+            assert family["H"].wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
             wait_until(lambda: family["M"].poll() == "CONFIRMED_EXIT")
             raise KeyboardInterrupt("modelled interruption before stop outcome")
 
@@ -7234,7 +7237,7 @@ def test_stop_spares_a_diagnostic_naming_the_session(launch, children, with_host
     assert stopped["state"] == ("stopped" if with_host else "not_running")
     assert stopped["pids"] == ([owned.pid] if with_host else [])
     if owned is not None:
-        assert owned.wait(timeout=5) == -signal.SIGTERM
+        assert owned.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
 
 
 def test_stop_spares_a_program_for_a_different_host(launch, children):
@@ -7294,7 +7297,7 @@ def test_real_harness_wrapper_presents_the_hosts_program_name(tmp_path, program,
         wait_until(host_ready)
         assert held.poll() is None, "the harness wrapper must keep the fake host running"
         shown = subprocess.run(["ps", "-ww", "-o", "args=", "-p", str(held.pid)],
-                               capture_output=True, text=True, timeout=5, check=True)
+                               capture_output=True, text=True, timeout=R2_STOP_TIMEOUT_SECONDS, check=True)
         assert Path(shown.stdout.split()[0]).name == program
         assert session in shown.stdout.split()
         binary = Path(os.fsdecode(Path("/proc/%d/cmdline" % held.pid).read_bytes().split(b"\0")[0]))
@@ -7302,7 +7305,7 @@ def test_real_harness_wrapper_presents_the_hosts_program_name(tmp_path, program,
         assert tmp_path in binary.parents
         stopped = hosts.run("stop", "--endpoint", REVIEW, "--grace-seconds", "1", timeout=R2_STOP_TIMEOUT_SECONDS)
         assert stopped["state"] == "stopped" and stopped["pids"] == [held.pid]
-        assert held.wait(timeout=5) == -signal.SIGTERM
+        assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     finally:
         context.close()
 
@@ -7333,7 +7336,7 @@ def test_stop_accepts_validated_host_entrypoints(launch, children, host, program
     stopped = launch.run("stop", "--endpoint", REVIEW, "--grace-seconds", "1", timeout=R2_STOP_TIMEOUT_SECONDS)
 
     assert stopped["state"] == "stopped" and stopped["pids"] == [held.pid]
-    assert held.wait(timeout=5) == -signal.SIGTERM
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
 
 
 @pytest.mark.parametrize("host", ["claude-code", "codex-cli"])
@@ -7446,7 +7449,7 @@ def test_wrapper_symlink_creation_is_safe_when_callers_race(tmp_path, monkeypatc
     symlink_to = Path.symlink_to
 
     def simultaneous(path, target, *args, **kwargs):
-        barrier.wait(timeout=5)
+        barrier.wait(timeout=R2_STOP_TIMEOUT_SECONDS)
         return symlink_to(path, target, *args, **kwargs)
 
     monkeypatch.setattr(Path, "symlink_to", simultaneous)
@@ -7454,7 +7457,7 @@ def test_wrapper_symlink_creation_is_safe_when_callers_race(tmp_path, monkeypatc
     script.write_text("pass\n", encoding="utf-8")
     with ThreadPoolExecutor(max_workers=2) as pool:
         calls = [pool.submit(python_argv, "codex", script, tmp_path) for _ in range(2)]
-        commands = [call.result(timeout=5) for call in calls]
+        commands = [call.result(timeout=R2_STOP_TIMEOUT_SECONDS) for call in calls]
 
     binary = tmp_path / ".python" / "codex"
     assert all(command[0] == str(binary) for command in commands)
@@ -7476,7 +7479,7 @@ def test_wrapper_imports_only_its_folder_and_python_libraries(tmp_path, monkeypa
                       encoding="utf-8")
     monkeypatch.setattr(sys, "path", ["", str(work), *sys.path])
     command = python_argv("codex", script, tmp_path)
-    ran = subprocess.run(command, cwd=work, capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL)
+    ran = subprocess.run(command, cwd=work, capture_output=True, text=True, timeout=R2_STOP_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL)
 
     assert ran.returncode == 0, ran.stderr
     found = json.loads(ran.stdout)
@@ -7592,7 +7595,7 @@ def test_stop_rechecks_the_census_before_signalling(launch, children, monkeypatc
     assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "0"]) == (0 if changed == "cmdline" else 3)
     stopped = json.loads(capsys.readouterr().out)
     if changed == "cmdline":
-        assert held.wait(timeout=5) == -signal.SIGTERM
+        assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
         assert "unowned_pids" not in stopped and stopped["pids"] == [held.pid]
     else:
         assert held.poll() is None
@@ -7632,7 +7635,7 @@ def test_stop_opens_a_pidfd_then_verifies_then_signals(launch, children, monkeyp
     assert json.loads(capsys.readouterr().out)["state"] == "stopped"
     assert "open" in events and "signal" in events
     assert "read" in events[events.index("open") + 1:events.index("signal")]
-    assert held.wait(timeout=5) == -signal.SIGTERM
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
 
 
 def test_fallback_records_unproven_argument_boundaries(launch, monkeypatch, capsys):
@@ -7691,7 +7694,7 @@ def test_stop_spares_an_unowned_member_of_an_owned_group(launch, children, monke
     stopped = json.loads(capsys.readouterr().out)
     assert stopped["state"] == expected_state and stopped["pids"] == [leader.pid]
     assert stopped["unowned_pids"] == [other.pid]
-    assert leader.wait(timeout=5) == -signal.SIGTERM
+    assert leader.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     assert other.poll() is None
     if uid_offset == 0:
         assert stopped["unresolved_pids"] == [other.pid]
@@ -7774,7 +7777,7 @@ def test_stop_matches_codex_after_an_option_terminator(launch, children):
     held = children(str(launch.tmp / "codex"), "-c", CHILD, "exec", "resume", "--", session, "prompt", logical_argv=["codex", "exec", "resume", "--", session, "prompt"])
     stopped = launch.run("stop", "--endpoint", REVIEW, "--grace-seconds", "1", timeout=R2_STOP_TIMEOUT_SECONDS)
     assert stopped["state"] == "stopped" and stopped["pids"] == [held.pid]
-    assert held.wait(timeout=5) == -signal.SIGTERM
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
 
 
 @pytest.mark.parametrize("option", ["--loader", "--experimental-loader", "--import", "-r", "--require",
@@ -7787,7 +7790,7 @@ def test_stop_matches_node_options_with_separate_values(launch, children, monkey
     module = children.module()
     assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
     assert json.loads(capsys.readouterr().out)["pids"] == [held.pid]
-    assert held.wait(timeout=5) == -signal.SIGTERM
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
 
 
 def test_stop_spares_an_unknown_node_option_value(launch, children, monkeypatch, capsys):
@@ -7862,7 +7865,7 @@ def test_stop_falls_back_only_when_pidfd_is_unsupported(launch, children, monkey
     answer = json.loads(capsys.readouterr().out)
     if error == 38:  # ENOSYS establishes lack of kernel capability; other errors do not.
         assert code == 0 and answer["pids"] == [held.pid]
-        assert held.wait(timeout=5) == -signal.SIGTERM
+        assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     else:
         assert code == 3 and answer["state"] == "stop_failed" and answer["pids"] == []
         assert answer["error"] == ("stop could not obtain a safe process handle; preserve custody, restore "
@@ -7878,7 +7881,7 @@ def test_stop_falls_back_only_when_pidfd_is_unsupported(launch, children, monkey
         module.os = R2Facade(module.os, pidfd_open=unsupported)
         assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
         assert json.loads(capsys.readouterr().out)["pids"] == [held.pid]
-        assert held.wait(timeout=5) == -signal.SIGTERM
+        assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
 
 
 def test_stop_spares_a_forked_claude_session(launch, children):
@@ -7919,7 +7922,7 @@ def test_stop_uses_real_and_effective_status_uids(launch, children, monkeypatch,
     stopped = json.loads(capsys.readouterr().out)
     assert stopped["pids"] == ([held.pid] if changed == "directory" else [])
     if changed == "directory":
-        assert held.wait(timeout=5) == -signal.SIGTERM
+        assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     else:
         assert stopped["unowned_pids"] == [held.pid] and held.poll() is None
 
@@ -7954,7 +7957,7 @@ def test_stop_spares_a_group_member_selecting_another_session(launch, children, 
     assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
     stopped = json.loads(capsys.readouterr().out)
     assert stopped["pids"] == [leader.pid] and "unowned_pids" not in stopped
-    assert leader.wait(timeout=5) == -signal.SIGTERM
+    assert leader.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     assert other.poll() is None and shell.poll() is None
 
 
@@ -7978,9 +7981,9 @@ def test_stop_checks_the_descendants_entire_parent_chain(launch, children, monke
     stopped = json.loads(capsys.readouterr().out)
     expected = sorted([leader.pid, middle.pid, worker.pid]) if changed is None else [leader.pid]
     assert stopped["pids"] == expected and "unowned_pids" not in stopped
-    assert leader.wait(timeout=5) == -signal.SIGTERM
+    assert leader.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     if changed is None:
-        assert middle.wait(timeout=5) == worker.wait(timeout=5) == -signal.SIGTERM
+        assert middle.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == worker.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     else:
         assert middle.poll() is None and worker.poll() is None
 
@@ -8004,7 +8007,7 @@ def test_stop_does_not_report_non_session_group_members_as_unowned(launch, child
     stopped = json.loads(capsys.readouterr().out)
     assert stopped["pids"] == [leader.pid]
     assert "unowned_pids" not in stopped
-    assert leader.wait(timeout=5) == -signal.SIGTERM
+    assert leader.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     # R28: both a replacement UID and changed nonhost command authority prohibit a first signal.
     assert member.poll() is None
     assert all(pid != member.pid for pid, _ in children.projection.events)
@@ -8076,7 +8079,7 @@ def test_stop_spares_descendants_naming_another_uuid(launch, children, monkeypat
     stopped = json.loads(capsys.readouterr().out)
     assert stopped["pids"] == [leader.pid] and "unowned_pids" not in stopped
     assert worker.poll() is None
-    assert leader.wait(timeout=5) == -signal.SIGTERM
+    assert leader.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
 
 
 @pytest.mark.parametrize("use_pidfds", [True, False], ids=["pidfds", "start-time-evidence"])
@@ -8101,7 +8104,7 @@ def test_stop_retains_stubborn_descendants_after_the_middle_exits(launch, childr
     def observe(pid, number):
         events.append((pid, number))
         if pid == leader.pid and number == signal.SIGTERM:
-            assert middle.wait(timeout=5) == -signal.SIGTERM
+            assert middle.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
             term_done.append(True)
 
     def killed(pid, number):
@@ -8152,7 +8155,7 @@ def test_stop_retains_stubborn_descendants_after_the_middle_exits(launch, childr
     if change is None:
         assert code == 0 and stopped["state"] == "stopped"
         # A matching physical zombie can precede waitpid's nonblocking readiness; wait for its real status.
-        assert worker.wait(timeout=5) == -signal.SIGKILL
+        assert worker.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
         assert (worker.pid, signal.SIGKILL) in events
     else:
         # R28: same instance does not authorize a changed nonhost command, even if it mentions S.
@@ -8162,7 +8165,7 @@ def test_stop_retains_stubborn_descendants_after_the_middle_exits(launch, childr
             assert any(row.get("signal_refusal") == "signal_command_line_not_authorized" for row in stopped["unresolved"])
     assert stopped["pids"] == sorted([leader.pid, middle.pid, worker.pid])
     assert not set(stopped["pids"]) & set(stopped.get("unowned_pids", []))
-    assert leader.wait(timeout=5) == -signal.SIGKILL
+    assert leader.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
 
 
 def test_stubborn_descendant_stop_waits_for_actual_kill_delivery(launch, children, monkeypatch, capsys):
@@ -8207,7 +8210,7 @@ def test_stubborn_descendant_stop_waits_for_actual_kill_delivery(launch, childre
              "stop_records": [r for r in launch.records() if r.get("action") == "stop"]}, indent=2))
     assert held == delivered == [actors[2].pid] and len(live_reads) == 2
     assert all(not row["state"].startswith("Z") for row in live_reads)
-    assert actors[2].wait(timeout=5) == -signal.SIGKILL
+    assert actors[2].wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
 
 
 _HOOK_CHECK_TOKEN_LIMIT = 180
@@ -9376,7 +9379,7 @@ def test_stubborn_descendant_completion_waits_for_deferred_native_reap(launch, c
                             delivered.append(process.pid)
                             watcher = select.poll()
                             watcher.register(process.native_handle, select.POLLIN)
-                            if not watcher.poll(5000):
+                            if not watcher.poll(int(R2_STOP_TIMEOUT_SECONDS * 1000)):
                                 _record_hook_check(check_failures, "original_child_kill_completion",
                                                    "timeout", "pidfd-readable")
                     if physical["state"].startswith("Z"):
@@ -9453,7 +9456,7 @@ def test_stubborn_descendant_completion_waits_for_deferred_native_reap(launch, c
                 signal.pidfd_send_signal(worker.native_handle, signal.SIGKILL)
                 watcher = select.poll()
                 watcher.register(worker.native_handle, select.POLLIN)
-                assert watcher.poll(5000), (
+                assert watcher.poll(int(R2_STOP_TIMEOUT_SECONDS * 1000)), (
                     "the held child's independent exit did not complete; " + _format_hook_check_failures(check_failures))
                 if closure_fault == "errors":
                     def failed_cleanup(slot):
@@ -9484,7 +9487,7 @@ def test_stubborn_descendant_completion_waits_for_deferred_native_reap(launch, c
                 assert closure["state"] == "CLOSED" and not closure["errors"] and not closure["unresolved_slots"], (
                     "recorded hook check failures: " + _format_hook_check_failures(check_failures))
                 assert not children.case.custody.quarantine.exists()
-                assert worker.wait(timeout=5) == -signal.SIGKILL
+                assert worker.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
                 assert native_wait_fields(worker)["returncode"] == -signal.SIGKILL
                 assert worker.poll == delivery["poll"]
                 recorded = len(check_failures)
@@ -9531,7 +9534,7 @@ def test_selector_state_table_through_public_stop(launch, children, monkeypatch,
         if not owned:
             assert stopped["unowned_pids"] == [held.pid]
     if verdict == "OWNED":
-        assert held.wait(timeout=5) == -signal.SIGTERM
+        assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     else:
         assert held.poll() is None
 
@@ -9562,7 +9565,7 @@ def test_group_descendants_with_ambiguous_selection_are_spared(launch, children,
     stopped = json.loads(capsys.readouterr().out)
     assert stopped["pids"] == [leader.pid]
     assert worker.poll() is None
-    assert leader.wait(timeout=5) == -signal.SIGTERM
+    assert leader.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
 
 
 @pytest.mark.parametrize("command", [["resume"], ["exec", "resume"]])
@@ -9696,8 +9699,6 @@ class R2Case:
         Neither program names nor the production matcher discover this receipt. Physical custody precedes
         exec, and keeps its original handle through every pending/READY failure and natural exit.
         """
-        import time
-
         if (not isinstance(expected_argv, (list, tuple)) or not expected_argv or
                 not all(isinstance(word, str) and "\0" not in word for word in expected_argv)):
             raise RuntimeError("R2 fixture: an exact actual-exec array is required")
@@ -9732,32 +9733,121 @@ class R2Case:
             self.projection.pending(process)
             self.custody.release(tag)
             self.custody.await_event(tag, "running")
-            deadline = time.monotonic() + 3
-            while True:
-                self.service_exec_children()
-                if self.custody.observe(tag) is not None:
-                    self.retire_pending_exit(process, tag)
-                    return process
-                try:
-                    physical = r2_kernel_process(process.pid)
-                    if physical["raw"] == expected:
-                        self.projection.ready(process, logical_argv)
-                        return process
-                except (FileNotFoundError, RuntimeError):
-                    receipt = self.projection.receipts.get(str(process.pid))
-                    if (receipt is None or receipt["state"] != "PENDING" or
-                            self.custody.observe(tag) is None):
-                        raise
-                    self.retire_pending_exit(process, tag)
-                    return process
-                if time.monotonic() >= deadline:
-                    raise RuntimeError("R2 fixture: actual exec handshake failed\n" + self.custody.stderr_tail())
-                time.sleep(0.01)
+            return self.await_exec(process, tag, expected, logical_argv)
         except BaseException:
             self.close()
             raise
 
-    def service_exec_children(self):
+    def await_exec(self, process, slot, expected, logical_argv, *, ceiling=None, clock=None,
+                   sample=None, block=None):
+        """Wait on report/exit events, sampling argv across intermediate shell execs.
+
+        Linux exposes no pollable cmdline-change descriptor. The short sampling
+        slice is not a failure bound: only the generous handshake ceiling is.
+        A confirmed original exit retires PENDING; no argv observation invents READY.
+        """
+        import time
+        from tests.integration.test_hierarchy_launcher import R2_HANDSHAKE_CEILING_SECONDS
+
+        if ceiling is None:
+            ceiling = R2_HANDSHAKE_CEILING_SECONDS
+        if isinstance(ceiling, bool) or not isinstance(ceiling, (int, float)) or not 0 < ceiling <= 600:
+            raise RuntimeError("R2 fixture: invalid handshake ceiling")
+        if clock is None:
+            clock = time.monotonic
+        if sample is None:
+            sample = r2_kernel_process
+        if block is None:
+            block = self.custody._block_for_handshake
+        deadline = clock() + ceiling
+        while True:
+            self.service_exec_children()
+            state = self._stage_exec(process, slot, expected, logical_argv, sample=sample)
+            if state in ("READY", "EXITED"):
+                return process
+            terminal = self.custody._handshake_terminal(slot)
+            if terminal == "child exited":
+                self.retire_pending_exit(process, slot)
+                return process
+            if terminal is not None:
+                self.custody._refuse_handshake(slot, "exec", terminal)
+            remaining = deadline - clock()
+            if remaining <= 0:
+                # A readiness/exit observation wins a scheduling race with the ceiling.
+                self.service_exec_children()
+                if self._stage_exec(process, slot, expected, logical_argv, sample=sample) in ("READY", "EXITED"):
+                    return process
+                terminal = self.custody._handshake_terminal(slot)
+                if terminal == "child exited":
+                    self.retire_pending_exit(process, slot)
+                    return process
+                self.custody._refuse_handshake(slot, "exec", terminal or "ceiling")
+            block(slot, min(remaining, 0.05))
+
+    def _exec_exit_state(self, process, slot, allow_unstaged):
+        """Only retained original-instance evidence may retire a negative receipt."""
+        from tests.integration.test_hierarchy_launcher import R2IdentityConflict
+
+        proof = self.custody.observe(slot)
+        if self.custody.entries[slot].get("lost"):
+            self.custody.control_unknown = True
+            raise R2IdentityConflict("R2 fixture: exec identity lost")
+        if proof is None:
+            return "PENDING"
+        receipt = self.projection.receipts.get(str(process.pid))
+        if receipt is not None:
+            self.retire_pending_exit(process, slot)
+        elif not allow_unstaged:
+            raise RuntimeError("R2 fixture: pending exit needs a known receipt")
+        return "EXITED"
+
+    def _stage_exec(self, process, slot, expected, logical, *, sample=None, pending=False):
+        """One guarded staging step for both roots and captured children.
+
+        Exit-shaped reads stay negative until original-instance exit is proven.
+        Identity loss is terminal, including when that same child exits later.
+        """
+        from tests.integration.test_hierarchy_launcher import R2IdentityConflict, r2_identity_transition
+
+        entry = self.custody.entries[slot]
+        try:
+            if entry.get("lost"):
+                raise R2IdentityConflict("R2 fixture: exec identity lost")
+            state = self._exec_exit_state(process, slot, pending)
+            if state == "EXITED" or entry.get("exec_exiting"):
+                return state
+            if pending:
+                if str(process.pid) not in self.projection.receipts:
+                    self.projection.pending(process)
+                if self.projection.receipts[str(process.pid)]["birth"] != entry["birth"]:
+                    raise R2IdentityConflict("R2 fixture: exec identity lost")
+                if not self.custody.slots[slot]["released"]:
+                    self.custody.release(slot)
+            physical = (r2_kernel_process if sample is None else sample)(process.pid)
+            if (physical["birth"] != entry["birth"] or physical["uid"] != os.geteuid() or
+                    physical["euid"] != os.geteuid()):
+                raise R2IdentityConflict("R2 fixture: exec identity lost")
+            if physical["state"].startswith("Z"):
+                entry["exec_exiting"] = True
+                return self._exec_exit_state(process, slot, pending)
+            if physical["raw"] != expected:
+                return "PENDING"
+            self.projection.ready(process, logical)
+            return "READY"
+        except (R2IdentityConflict, PermissionError):
+            r2_identity_transition(entry, "lost")
+            self.custody.control_unknown = True
+            raise R2IdentityConflict("R2 fixture: exec identity lost") from None
+        except (FileNotFoundError, ProcessLookupError):
+            entry["exec_exiting"] = True
+            return self._exec_exit_state(process, slot, pending)
+        except RuntimeError as exc:
+            if str(exc) != "R2 fixture: child changed before READY":
+                raise
+            entry["exec_exiting"] = True
+            return self._exec_exit_state(process, slot, pending)
+
+    def service_exec_children(self, *, sample=None):
         from tests.integration.test_hierarchy_launcher import R2OwnedChild
 
         self.custody.pump()
@@ -9766,24 +9856,17 @@ class R2Case:
             if not self.custody.slots[slot]["hello"]:
                 continue
             child = R2OwnedChild(self.custody, slot)
-            if item["state"] == "RESERVED":
-                self.projection.pending(child)
-                item["state"] = "PENDING"
-                self.custody.release(slot)
-            if item["state"] != "PENDING":
+            if item["state"] not in ("RESERVED", "PENDING"):
                 ready = True
                 continue
-            if self.custody.observe(slot) is not None:
-                self.retire_pending_exit(child, slot)
-                item["state"] = "EXITED"
-                ready = True
-                continue
-            physical = r2_kernel_process(child.pid)
             expected = b"\0".join(os.fsencode(word) for word in item["spec"]["expected_argv"]) + b"\0"
-            if physical["raw"] == expected:
-                self.projection.ready(child, item["spec"]["logical_argv"])
-                item["state"] = "READY"
+            state = self._stage_exec(child, slot, expected, item["spec"]["logical_argv"],
+                                     sample=sample, pending=True)
+            if state in ("READY", "EXITED"):
+                item["state"] = state
                 ready = True
+            elif str(child.pid) in self.projection.receipts:
+                item["state"] = "PENDING"
         return ready
 
     def retire_pending_exit(self, process, slot):
@@ -9835,6 +9918,8 @@ class R2Case:
             root.capture_event("captured")
             root.start_capture()
             root.wait_observer = lambda: [child.poll() for child in self.children if child is not root]
+            root.wait_blocker = lambda remaining: self.custody._block_for_notifications(
+                list(self.custody.entries), remaining)
             # Observe live actors only after READY is saved and before R can execute public stop.
             # The caller C must run first to create R, but R keeps its own admission gate closed.
             self.admit(root_slot, root, ["codex", "exec", "resume", session] if session else None,
@@ -10009,7 +10094,7 @@ def test_r2_flatten_identical_arrays_do_not_share_ownership(r2_case, capsys, pro
         assert held.poll() is None and r2_case.projection.events == []
     else:
         assert code == 0 and stopped["state"] == "stopped" and stopped["pids"] == [held.pid]
-        assert held.wait(timeout=5) == -signal.SIGTERM
+        assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
 
 
 def test_r2_exact_round7_prompt_is_only_lossy_diagnostic_evidence(r2_case, capsys):
@@ -10034,7 +10119,7 @@ def test_r2_actual_codex_builder_keeps_single_word_resume_prompt(r2_case, capsys
     held = r2_case.spawn(argv)
     code, stopped = r2_case.stop(r2_case.module(), capsys)
     assert code == 0 and stopped["state"] == "stopped" and stopped["pids"] == [held.pid]
-    assert held.wait(timeout=5) == -signal.SIGTERM
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
 
 
 @pytest.mark.parametrize("which", ["start", "wake"])
@@ -10045,7 +10130,7 @@ def test_r2_actual_claude_builder_arrays_remain_stoppable(r2_case, capsys, which
     held = r2_case.spawn(argv)
     code, stopped = r2_case.stop(r2_case.module(), capsys)
     assert code == 0 and stopped["state"] == "stopped" and stopped["pids"] == [held.pid]
-    assert held.wait(timeout=5) == -signal.SIGTERM
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
 
 
 def test_r2_empty_lossy_provider_cannot_prove_no_targets(r2_case, capsys):
@@ -10109,7 +10194,7 @@ def test_r2_real_descendant_chain_retains_attempts_after_middle_exit(r2_case, ca
         assert (worker.pid, signal.SIGKILL) not in r2_case.projection.events
         if drift in ("cmdline", "named-session"):
             assert any(row.get("signal_refusal") == "signal_command_line_not_authorized" for row in stopped["unresolved"])
-    assert host.wait(timeout=5) == -signal.SIGKILL
+    assert host.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
 
 
 def test_r2_projection_contract_preserves_real_evidence(r2_case):
@@ -10165,7 +10250,7 @@ def test_r2_legacy_child_keeps_physical_argv_and_independent_custody(r2_case):
     assert (row.start_time, row.uid, row.euid) == (physical["birth"], physical["uid"], physical["euid"])
     report = r2_case.close()
     assert report["state"] == "CLOSED" and all(entry["exit"] for entry in report["entries"].values())
-    assert held.wait(timeout=5) == 0 and r2_case.projection.events == []
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0 and r2_case.projection.events == []
 
 
 @pytest.mark.parametrize("pidfds", [True, False], ids=["pidfd", "start-time"])
@@ -10326,7 +10411,7 @@ def test_r2_confirmed_exit_before_first_signal_resolves_candidate(r2_case, capsy
     def before(pid, count):
         if pid == held.pid and count == 2:
             r2_case.configs[0].with_suffix(".exit").touch()
-            assert held.wait(timeout=5) == 0  # Real child wait proves the original instance exited.
+            assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0  # Real child wait proves the original instance exited.
             confirmed.append(True)
 
     r2_case.projection.before_read.append(before)
@@ -10359,7 +10444,7 @@ def test_r2_metadata_drift_before_first_signal_spares_live_candidate(r2_case, ca
     code, stopped = r2_case.stop(module, capsys)
     if field == "cmdline":
         assert changed and code == 0 and stopped["state"] == "stopped" and stopped["pids"] == [held.pid]
-        assert held.wait(timeout=5) == -signal.SIGTERM
+        assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
         assert r2_case.projection.events == [(held.pid, signal.SIGTERM)]
         return
     assert changed and held.poll() is None and r2_case.projection.events == []
@@ -10390,7 +10475,7 @@ def test_r2_parent_chain_drift_blocks_first_descendant_signal(r2_case, capsys, p
     assert code == 3 and stopped["state"] == "stop_failed" and stopped["pids"] == [host.pid]
     assert set(stopped.get("unresolved_pids", [])) == {middle.pid, worker.pid}
     assert all(pid == host.pid for pid, _ in r2_case.projection.events)
-    assert host.wait(timeout=5) == -signal.SIGKILL
+    assert host.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
 
 
 @pytest.mark.parametrize("argument", ["<T>", "--unlisted=<T>", "-r<T>", "-r", "ambiguous"])
@@ -10408,7 +10493,7 @@ def test_r2_real_descendant_with_other_or_ambiguous_selection_is_spared(r2_case,
     assert worker.pid not in stopped["pids"] and worker.pid not in stopped.get("unowned_pids", [])
     assert worker.pid in stopped["unresolved_pids"]
     assert all(pid != worker.pid for pid, _ in r2_case.projection.events)
-    assert host.wait(timeout=5) == -signal.SIGKILL
+    assert host.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
 
 
 def test_r2_initial_unavailable_descendant_cannot_disappear_from_accounting(r2_case, capsys):
@@ -10433,7 +10518,7 @@ def test_r2_initial_unavailable_descendant_cannot_disappear_from_accounting(r2_c
     assert stopped.get("unresolved_pids") == [worker.pid]
     assert worker.pid not in stopped.get("unowned_pids", [])
     assert all(pid != worker.pid for pid, _ in r2_case.projection.events)
-    assert host.wait(timeout=5) == -signal.SIGKILL
+    assert host.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
 
 
 def test_r2_complete_descendant_prompt_resume_remains_opaque(r2_case, capsys):
@@ -10448,7 +10533,7 @@ def test_r2_complete_descendant_prompt_resume_remains_opaque(r2_case, capsys):
     assert stopped["pids"] == sorted([host.pid, middle.pid, worker.pid])
     assert "unresolved_pids" not in stopped and "unowned_pids" not in stopped
     assert (worker.pid, signal.SIGKILL) in r2_case.projection.events and worker.poll() is not None
-    assert host.wait(timeout=5) == -signal.SIGKILL
+    assert host.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
 
 
 def test_r2_initial_incomplete_candidate_resolves_on_its_actual_zombie(r2_case, capsys):
@@ -10473,8 +10558,8 @@ def test_r2_initial_incomplete_candidate_resolves_on_its_actual_zombie(r2_case, 
     r2_case.projection.path_view(module, missing_uid)
     r2_case.projection.before_read.append(exit_original)
     code, stopped = r2_case.stop(module, capsys)
-    assert exited and worker.wait(timeout=5) == 0
-    assert host.wait(timeout=5) == -signal.SIGTERM
+    assert exited and worker.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
+    assert host.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     assert code == 0 and stopped["state"] == "stopped" and stopped["pids"] == [host.pid]
     assert "unresolved_pids" not in stopped and "unowned_pids" not in stopped
     assert r2_case.projection.events == [(host.pid, signal.SIGTERM)]
@@ -10621,7 +10706,7 @@ def test_custody_uses_original_pidfd_when_metadata_read_races_actual_exit(r2_cas
     def exiting(pid):
         assert pid == held.pid
         r2_case.configs[0].with_suffix(".exit").touch()
-        assert held.wait(timeout=2) == 0
+        assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
         observations.append(pid)
         raise ProcessLookupError("modelled /proc read racing confirmed original exit")
 
@@ -10686,7 +10771,7 @@ def test_r2_projection_runner_uses_the_public_stop_entrypoint(r2_case):
     assert err == "" and runner.returncode == 0, out + err
     answer = json.loads(out)
     assert answer["state"] == "stopped" and answer["pids"] == [held.pid]
-    assert held.wait(timeout=5) == -signal.SIGTERM
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
 
 
 @pytest.mark.parametrize("caller", [False, True], ids=["direct", "through-caller"])
@@ -10696,19 +10781,14 @@ def test_r9_public_runner_capture_drains_before_communicate(r2_case, caller):
     held = r2_case.spawn(["codex", "exec", "resume", session])
     root, _ = r2_case.runner(session=session if caller else None, action="burst")
     slot = next(slot for slot, entry in r2_case.custody.entries.items() if entry["pid"] == root.pid)
-    completed_output = r2_case.custody.folder / (slot + ".capture-ready")
-    # This is a transport liveness guard, not a wall-clock performance assertion. The real writer must
-    # finish both streams while the fixture stages observations, before communicate begins draining.
-    def completed():
-        held.poll()  # The real parent must reap during staging, before communicate's observer begins.
-        return completed_output.exists()
-    wait_until(completed, seconds=R2_STOP_TIMEOUT_SECONDS)
+    # Real file/exit notifications wake this wait. Reaping the held child remains an owned observation.
+    r2_case.custody.await_slot_file(slot + ".capture-ready", slot, before=held.poll)
     out, err = root.communicate(timeout=R2_STOP_TIMEOUT_SECONDS)
     assert root.returncode == 0 and err == "E" * (2 * 1024 * 1024)
     assert out.startswith(" " * (2 * 1024 * 1024))
     answer = json.loads(out)
     assert answer["state"] == "stopped" and answer["pids"] == [held.pid]
-    assert held.wait(timeout=5) == -signal.SIGTERM
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
 
 
 def test_r9_identical_checkpoint_does_not_repeat_durable_io(r2_case, capsys):
@@ -10734,7 +10814,7 @@ def test_r9_identical_checkpoint_does_not_repeat_durable_io(r2_case, capsys):
     module.os.fsync = fsync
     r2_case.projection.after_signal.append(sent)
     code, stopped = r2_case.stop(module, capsys)
-    assert code == 0 and stopped["state"] == "stopped" and held.wait(timeout=5) == -signal.SIGTERM
+    assert code == 0 and stopped["state"] == "stopped" and held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     assert len(before_effect) == 1, "the A checkpoint carries C; no separate candidate checkpoint is needed"
     assert before_effect[0]["active"] and before_effect[0]["entries"][0]["attempted"]
 
@@ -10802,7 +10882,7 @@ def test_r9_visible_checkpoint_from_failed_fsync_is_not_a_durable_cache(r2_case,
     recovered.os.fsync = committed_fsync
     r2_case.projection.after_signal.append(lambda pid, number: committed.append("signal"))
     code, stopped = r2_case.stop(recovered, capsys)
-    assert code == 0 and stopped["pids"] == [held.pid] and held.wait(timeout=5) == -signal.SIGTERM
+    assert code == 0 and stopped["pids"] == [held.pid] and held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     assert committed[0]["active"] and committed[0]["entries"][0]["attempted"]
     assert committed.index("signal") >= 1
 
@@ -10857,7 +10937,7 @@ def test_r10_ordinary_stop_has_six_durable_barriers_plus_initialization(r2_case,
     (r2_case.launch.tmp / "r10-cost-evidence.json").write_text(json.dumps(
         dict(host=host, elapsed_ms=elapsed, fsync_count=len(events), fsyncs=events)) + "\n")
     assert code == 0 and stopped["state"] == "stopped" and stopped["pids"] == [held.pid]
-    assert held.wait(timeout=5) == -signal.SIGTERM
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     assert r2_case.launch.records() == [stopped]
     assert [(event["phase"], event["kind"]) for event in events] == [
         ("initialize", "directory"), ("initialize", "directory"), ("initialize", "directory"),
@@ -10895,7 +10975,7 @@ def test_r10_interrupted_barriers_keep_stop_and_handoff_safe(r2_case, capsys, ph
     else:
         # Sending TERM / observing a pidfd does not mean this parent's non-blocking wait has reaped yet.
         # Establish the actual native wait PID/status before asserting any post-effect "not live" row.
-        assert held.wait(timeout=5) == -signal.SIGTERM
+        assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
         assert held.native_wait_evidence["wait_pid"] == held.pid
     assert (held.poll() is None) is live
     if journal_state is None:
@@ -10917,7 +10997,7 @@ def test_r10_interrupted_barriers_keep_stop_and_handoff_safe(r2_case, capsys, ph
     code, recovered = r2_case.stop(r2_case.module(pidfds=False), capsys)
     assert code == 0 and recovered["state"] == ("not_running" if journal_state is False else "stopped")
     assert recovered["pids"] == ([] if journal_state is False else [held.pid])
-    assert held.wait(timeout=5) == -signal.SIGTERM
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     assert not json.loads(journal.read_text())["active"]
     granted = run_main(control, r2_case.launch, spec, capsys, 0)
     assert granted["entries"][0]["generation"] == 2
@@ -10955,7 +11035,7 @@ def test_r11_crash_cuts_observe_exit_before_asserting_dead(r2_case, capsys, monk
     [held] = held_children
     assert delayed == [held.pid], "fixture prerequisite: one actual exited-child poll was deferred"
     assert held.native_wait_evidence["wait_pid"] == held.pid
-    assert held.wait(timeout=5) == -signal.SIGTERM
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
 
 
 @pytest.mark.parametrize("caller", [False, True], ids=["direct", "through-caller"])
@@ -10994,7 +11074,7 @@ def test_r5_runner_observes_ready_actors_before_releasing_stop(r2_case, caller, 
         assert root.returncode == 0 and err == "", out + err
         answer = json.loads(out)
         assert answer["state"] == "stopped" and answer["pids"] == [held.pid]
-        assert held.wait(timeout=5) == -signal.SIGTERM
+        assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
         retry = r2_case.launch.run("stop", "--endpoint", REVIEW, "--grace-seconds", "0")
         assert retry["state"] == "not_running" and retry["pids"] == []
     assert len(observed) == 1
@@ -11013,7 +11093,7 @@ def test_r2_ancestor_exclusion_spares_a_ready_host_named_caller(r2_case):
     assert caller.returncode == 0 and err == "", out + err
     answer = json.loads(out)
     assert answer["state"] == "stopped" and answer["pids"] == [held.pid] and caller.pid not in answer["pids"]
-    assert held.wait(timeout=5) == -signal.SIGTERM
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
 
 
 # Exact finite 28-row matrix from the Root-admitted R2 evidence, not matcher-derived expectations.
@@ -11301,7 +11381,7 @@ def _r2_isolated_close_probe(folder, ending, pidfds, case=None):
                         reaped.append({"wait_pid": pid, "wait_status": status})
                     else:
                         assert time.monotonic() < deadline, "R2 fixture: adopted actor exit is unproven"
-                        time.sleep(0.01)
+                        handshake_tests._r2_wait_child_event(min(.05, deadline - time.monotonic()))
             finally:
                 if case.custody.report is None or case.custody.report["state"] == "UNKNOWN":
                     handshake_tests._release_r2_test_descriptors(case.custody)
@@ -11447,7 +11527,348 @@ def test_r2_exec_fixture_uses_actual_exec_bytes_and_owned_cleanup(r2_case):
     assert row.argv == ("codex", "exec", "resume", session)
     report = r2_case.close()
     assert report["state"] == "CLOSED" and report["errors"] == report["unresolved_slots"] == []
-    assert r2_case.projection.events == [] and held.wait(timeout=5) < 0
+    assert r2_case.projection.events == [] and held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) < 0
+
+
+@pytest.mark.parametrize("ending", ["ready", "exit", "hang"])
+def test_r2_exec_wait_follows_readiness_exit_or_ceiling(launch, ending):
+    from tests.integration.test_hierarchy_launcher import R2_HANDSHAKE_CEILING_SECONDS
+
+    state = {"now": 0.0, "blocked": 0, "sampled": 0}
+
+    def kernel(pid):
+        physical = r2_kernel_process(pid)
+        state["sampled"] += 1
+        if state["blocked"] == 0 or ending == "hang":
+            return {**physical, "raw": b"still-before-exec\0"}
+        return physical
+
+    def blocking(slot, remaining):
+        state["blocked"] += 1
+        state["now"] = R2_HANDSHAKE_CEILING_SECONDS + 1 if ending == "hang" else 4.0
+        if ending == "exit":
+            r2_case.custody.kill_owned(slot)
+        return r2_case.custody._block_for_handshake(slot, remaining)
+
+    class ControlledCase(R2Case):
+        def await_exec(self, process, slot, expected, logical):
+            return super().await_exec(process, slot, expected, logical, clock=lambda: state["now"],
+                                      sample=kernel, block=blocking)
+
+    r2_case = ControlledCase(launch)
+    command = [sys.executable, "-c", "import os; os.read(0, 1)"]
+    try:
+        if ending == "hang":
+            with pytest.raises(RuntimeError) as caught:
+                r2_case.spawn_exec(command, ["codex", "resume", str(uuid.uuid4())], command,
+                                   stdin=subprocess.PIPE)
+            message, raw = str(caught.value).split("\n", 1)
+            evidence = json.loads(raw)
+            assert message == "R2 fixture: exec handshake refused: ceiling"
+            assert evidence["reason"] == "ceiling" and evidence["returncode"] is None
+            assert evidence["field"] == "exec"
+        else:
+            held = r2_case.spawn_exec(command, ["codex", "resume", str(uuid.uuid4())], command,
+                                      stdin=subprocess.PIPE)
+            receipt = r2_case.projection.receipts.get(str(held.pid))
+            if ending == "ready":
+                assert receipt["state"] == "READY" and held.poll() is None
+            else:
+                assert receipt is None and held.wait(timeout=60) == -signal.SIGKILL
+        assert state["blocked"] >= 1 and state["sampled"] >= 1 and state["now"] > 3
+    finally:
+        _teardown_r2_case(r2_case)
+
+
+def test_r2_exec_final_terminal_exit_retires_pending(launch):
+    ticks = iter((0.0, R2_STOP_TIMEOUT_SECONDS + 1.0))
+    samples = []
+
+    def sample(pid):
+        physical = r2_kernel_process(pid)
+        samples.append(pid)
+        if len(samples) == 2:
+            slot = next(slot for slot, row in case.custody.entries.items() if row["pid"] == pid)
+            case.custody.kill_owned(slot)
+            assert case.custody.wait_native(slot) == -signal.SIGKILL
+        # The original instance exits after this intermediate-argv sample;
+        # only the following terminal observation can retire its receipt.
+        return {**physical, "raw": b"still-before-exec\0"}
+
+    class FinalExitCase(R2Case):
+        def await_exec(self, process, slot, expected, logical):
+            return super().await_exec(process, slot, expected, logical,
+                                      clock=lambda: next(ticks), sample=sample)
+
+    case = FinalExitCase(launch)
+    command = [sys.executable, "-c", "import os; os.read(0, 1)"]
+    try:
+        process = case.spawn_exec(command, None, command, stdin=subprocess.PIPE)
+        assert samples == [process.pid, process.pid]
+        assert str(process.pid) not in case.projection.receipts
+        slot = next(slot for slot, row in case.custody.entries.items() if row["pid"] == process.pid)
+        assert case.custody.entries[slot]["exit"]["returncode"] == -signal.SIGKILL
+    finally:
+        _teardown_r2_case(case)
+
+
+@pytest.mark.parametrize("surface", ["marker", "runner"])
+def test_r2_exited_actor_does_not_spin_pending_runner_wait(r2_case, monkeypatch, surface):
+    actor = r2_case.spawn(["python3", "completed-actor.py"])
+    actor_slot = next(slot for slot, row in r2_case.custody.entries.items() if row["pid"] == actor.pid)
+    retained = r2_case.custody._pidfd_for(actor_slot)
+    if retained is None:
+        pytest.skip("exited-actor notification regression requires pidfds")
+    r2_case.custody.kill_owned(actor_slot)
+    assert actor.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGKILL
+    runner, _ = r2_case.runner(action="hang")
+    runner_slot = next(slot for slot, row in r2_case.custody.entries.items() if row["pid"] == runner.pid)
+    marker = r2_case.custody.folder / "pending-runner.ready"
+    state = {"iterations": 0, "blocked": 0}
+    real_select = launcher_notifications.select
+
+    class ControlledPoll:
+        def __init__(self):
+            self.poller = real_select.poll()
+            self.watched = set()
+
+        def register(self, fd, event):
+            self.watched.add(fd)
+            self.poller.register(fd, event)
+
+        def poll(self, timeout):
+            if timeout > 0 and state["blocked"] < 2:
+                state["iterations"] += 1
+                assert state["iterations"] <= 12, "completed actor made the notification loop spin"
+                if retained not in self.watched:
+                    state["blocked"] += 1
+                    if state["blocked"] == 2:
+                        if surface == "marker":
+                            marker.touch()
+                        else:
+                            r2_case.custody.kill_owned(runner_slot)
+            return self.poller.poll(timeout)
+
+    # Replace this helper's OS boundary, never the shared select module.
+    monkeypatch.setattr(launcher_notifications, "select", R2Facade(real_select, poll=ControlledPoll))
+    try:
+        if surface == "marker":
+            r2_case.custody.await_slot_file(marker.name, runner_slot)
+            assert runner.poll() is None
+        else:
+            assert runner.communicate(timeout=R2_STOP_TIMEOUT_SECONDS) == ("", "")
+            assert runner.returncode == -signal.SIGKILL
+    finally:
+        monkeypatch.setattr(launcher_notifications, "select", real_select)
+    assert 2 <= state["iterations"] <= 12 and state["blocked"] >= 2
+    entry = r2_case.custody.entries[actor_slot]
+    assert entry["exit"]["returncode"] == -signal.SIGKILL
+    assert entry["fd"] == retained  # Evidence remains owned until ordinary closure.
+    os.fstat(retained)
+
+
+
+@pytest.mark.parametrize("surface,scenario", [
+    (surface, scenario)
+    for surface in ("root", "child")
+    for scenario in ("ready-exit", "zombie", "delayed-exit", "missing", "lookup", "conflict", "permission",
+                     "birth", "uid", "euid", "ready-birth", "ready-permission", "ready-lost", "pending-missing",
+                     "pending-birth", "pending-uid", "pending-euid", "pending-permission", "pending-conflict")
+    if surface == "child" or not scenario.startswith("pending-") and scenario != "ready-lost"
+])
+def test_r2_exec_staging_reconciles_exit_and_preserves_identity_loss(launch, tmp_path, request, surface, scenario):
+    from tests.integration.test_hierarchy_launcher import (
+        R2IdentityConflict, R2OwnedChild, R2Processes, WitnessedPopen,
+        _release_r2_test_descriptors, _r2_untrusted_text,
+    )
+
+    if surface == "child":
+        require_r2_indirect_exit(pidfd=True)
+    node = request.node.nodeid
+    if os.environ.get("R2_LTH2_SCOPE") != node:
+        completed = subprocess.run(
+            [sys.executable, "-m", "pytest", "-n", "0", "-q", "--tb=short",
+             "--basetemp=" + str(tmp_path / "scope"), node],
+            cwd=str(ROOT), env={**os.environ, "R2_LTH2_SCOPE": node},
+            capture_output=True, text=True, timeout=180,
+        )
+        assert completed.returncode == 0, _r2_untrusted_text(completed.stdout + completed.stderr, 12000)
+        return
+
+    state = {"injected": False, "ready_calls": 0}
+    identity = scenario in ("conflict", "permission", "birth", "uid", "euid",
+                            "ready-birth", "ready-permission", "ready-lost", "pending-birth", "pending-uid",
+                            "pending-euid", "pending-permission", "pending-conflict")
+
+    def is_target(process):
+        return isinstance(process, R2OwnedChild) if surface == "child" else isinstance(process, WitnessedPopen)
+
+    def end_original(process):
+        slot = next(name for name, row in case.custody.entries.items() if row["pid"] == process.pid)
+        state["slot"] = slot
+        case.custody.kill_owned(slot)
+        if isinstance(process, WitnessedPopen):
+            assert process.wait(timeout=60) == -signal.SIGKILL
+        else:
+            import select
+            watcher = select.poll()
+            watcher.register(case.custody.entries[slot]["fd"], select.POLLIN)
+            assert watcher.poll(60000), "original captured child did not exit"
+
+    def sample(pid):
+        physical = r2_kernel_process(pid)
+        slot = next(name for name, row in case.custody.entries.items() if row["pid"] == pid)
+        process = case.custody.entries[slot]["process"] or R2OwnedChild(case.custody, slot)
+        if not is_target(process) or state["injected"] or physical["raw"] != expected:
+            return physical
+        state["slot"] = slot
+        state["physical"] = physical
+        if scenario.startswith("ready-") or scenario == "pending-missing":
+            return physical
+        state["injected"] = True
+        if scenario == "delayed-exit":
+            return {**physical, "state": "Z", "raw": expected}
+        end_original(process)
+        if scenario == "conflict":
+            raise R2IdentityConflict("R2 fixture: unstable physical birth evidence")
+        if scenario == "permission":
+            raise PermissionError("token=supersecretvalue")
+        if scenario == "missing":
+            raise FileNotFoundError("modelled proc read during exit")
+        if scenario == "lookup":
+            raise ProcessLookupError("modelled proc read during exit")
+        if scenario in ("birth", "uid", "euid"):
+            changed = str(int(physical["birth"]) + 1) if scenario == "birth" else physical[scenario] + 1
+            return {**physical, scenario: changed, "raw": b"before-exec\0"}
+        return {**physical, "state": "Z", "raw": expected}
+
+    class RaceProjection(R2Processes):
+        def pending(self, process):
+            if is_target(process) and scenario.startswith("pending-") and not state["injected"]:
+                physical = r2_kernel_process(process.pid)
+                state["injected"] = True
+                end_original(process)
+                kind = scenario.removeprefix("pending-")
+                if kind == "missing":
+                    raise FileNotFoundError("modelled exit before PENDING")
+                if kind == "permission":
+                    raise PermissionError("token=supersecretvalue")
+                if kind == "conflict":
+                    raise R2IdentityConflict("R2 fixture: unstable physical birth evidence")
+                changed = str(int(physical["birth"]) + 1) if kind == "birth" else physical[kind] + 1
+                return super().pending(process, sample=lambda pid: {**physical, kind: changed})
+            return super().pending(process)
+
+        def ready(self, process, argv=None):
+            if is_target(process):
+                state["ready_calls"] += 1
+                if scenario.startswith("ready-") and not state["injected"]:
+                    state["injected"] = True
+                    end_original(process)
+                    if scenario == "ready-birth":
+                        def changed(pid):
+                            return {**state["physical"], "birth": str(int(state["physical"]["birth"]) + 1)}
+                        return super().ready(process, argv, sample=changed)
+                    if scenario == "ready-permission":
+                        raise PermissionError("token=supersecretvalue")
+                    if scenario == "ready-lost":
+                        def lost(pid):
+                            from tests.integration.test_hierarchy_launcher import r2_identity_transition
+                            r2_identity_transition(case.custody.entries[process.slot], "lost")
+                            case.custody.control_unknown = True
+                            return state["physical"]
+                        return super().ready(process, argv, sample=lost)
+            return super().ready(process, argv)
+
+    class RaceCase(R2Case):
+        def await_exec(self, process, slot, wanted, logical):
+            def blocking(name, remaining):
+                if scenario == "delayed-exit" and state["injected"]:
+                    assert self.projection.receipts[str(process.pid)]["state"] == "PENDING"
+                    assert state["ready_calls"] == 0
+                    end_original(process)
+                return self.custody._block_for_handshake(name, remaining)
+            return super().await_exec(process, slot, wanted, logical,
+                                      sample=sample if surface == "root" else None,
+                                      block=blocking if surface == "root" else None)
+
+        def service_exec_children(self):
+            if surface == "root":
+                return super().service_exec_children()
+            return super().service_exec_children(sample=sample)
+
+    case = RaceCase(launch)
+    case.projection = RaceProjection(launch.tmp / "race-projection")
+    command = [sys.executable, "-c", "import os; os.read(%d,1)" % case.custody.safety_read]
+    expected = b"\0".join(os.fsencode(word) for word in command) + b"\0"
+    # READY's second sample must be independently classifiable even if the child exits afterward.
+    state["physical"] = None
+
+    def exercise():
+        if surface == "root":
+            return case.spawn_exec(command, ["codex", "resume", str(uuid.uuid4())], command,
+                                   stdin=subprocess.PIPE)
+        from tests.integration.hierarchy_fake_wrapper import python_argv
+        target = launch.tmp / "race-parent.py"
+        target.write_text("import subprocess\nsubprocess.run(%r)\n" % command, encoding="utf-8")
+        prefix = python_argv("codex", ROOT / "tests/integration/test_hierarchy_launcher.py",
+                             launch.tmp, "r2_captured_entry")
+        parent = [*prefix, str(target), "script"]
+        root = case.spawn_exec(parent, None, parent,
+                               captured=[{"argv": command, "expected_argv": command, "logical_argv": None}],
+                               target=(target, "script"))
+        import time
+        deadline = time.monotonic() + 60
+        while not state["injected"] or case.exec_children[state["slot"]]["state"] != "EXITED":
+            case.service_exec_children()
+            if identity and state["injected"]:
+                return root
+            if scenario == "delayed-exit" and state["injected"] and case.custody.observe(state["slot"]) is None:
+                child = R2OwnedChild(case.custody, state["slot"])
+                assert case.projection.receipts[str(child.pid)]["state"] == "PENDING"
+                assert state["ready_calls"] == 0
+                end_original(child)
+            assert time.monotonic() < deadline, "captured staging was not reached"
+            case.custody._block_for_handshake("actor0-exec", 0.05)
+        return root
+
+    try:
+        if identity:
+            with pytest.raises(R2CleanupUnknown) as caught:
+                try:
+                    exercise()
+                finally:
+                    case.close()
+            slot = state["slot"]
+            assert case.custody.control_unknown
+            row = caught.value.report["entries"][slot]
+            assert row["lost"] and row["exit"] is None
+            receipt = case.projection.receipts.get(str(case.custody.entries[slot]["pid"]))
+            if scenario.startswith("pending-") and scenario != "pending-birth":
+                assert receipt is None
+            else:
+                assert receipt["state"] == "PENDING"
+            assert "supersecretvalue" not in str(caught.value)
+        else:
+            exercise()
+            slot = state["slot"]
+            assert state["injected"]
+            assert case.custody.observe(slot) is not None
+            assert str(case.custody.entries[slot]["pid"]) not in case.projection.receipts
+            if scenario in ("zombie", "delayed-exit"):
+                assert state["ready_calls"] == 0
+            if surface == "child":
+                assert case.exec_children[slot]["state"] == "EXITED"
+            assert case.close()["state"] == "CLOSED"
+    finally:
+        if case.custody.report is None:
+            try:
+                case.close()
+            except R2CleanupUnknown:
+                pass
+        for process in case.children:
+            process.wait(timeout=60)
+        _release_r2_test_descriptors(case.custody)
 
 
 def test_r2_exec_fixture_closes_an_actual_exec_on_ready_failure(r2_case, monkeypatch):
@@ -11455,7 +11876,7 @@ def test_r2_exec_fixture_closes_an_actual_exec_on_ready_failure(r2_case, monkeyp
         raise OSError("modelled actual-exec READY failure")
 
     monkeypatch.setattr(r2_case.projection, "ready", fail)
-    command = [sys.executable, "-c", "import time; time.sleep(5)"]
+    command = [sys.executable, "-c", "import os; os.read(%d,1)" % r2_case.custody.safety_read]
     with pytest.raises(OSError, match="^modelled actual-exec READY failure$"):
         r2_case.spawn_exec(command, ["codex", "resume", str(uuid.uuid4())], command)
     report = r2_case.custody.report
@@ -11470,7 +11891,7 @@ def test_r2_exec_fixture_keeps_a_fast_original_exit_as_negative_evidence(r2_case
     module = r2_case.module()
     command = [sys.executable, "-c", "pass"]
     held = r2_case.spawn_exec(command, ["codex", "resume", session], command)
-    assert held.wait(timeout=5) == 0
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == 0
     code, stopped = r2_case.stop(module, capsys)
     assert code == 0 and stopped["state"] == "not_running" and stopped["pids"] == []
     assert r2_case.projection.events == []
@@ -11482,10 +11903,11 @@ def test_r2_captured_exec_registers_a_real_child_before_releasing_it(r2_case, ca
 
     session = str(uuid.uuid4())
     r2_case.bind("codex-cli", session)
-    ready = r2_case.launch.tmp / "captured-child-ready"
+    ready = r2_case.custody.folder / "captured-child-ready"
     child = [sys.executable, "-c", CHILD]
     target = r2_case.launch.tmp / "captured-parent.py"
-    target.write_text("import subprocess, time\nsubprocess.run(%r)\ntime.sleep(5)\n" % child, encoding="utf-8")
+    target.write_text("import os, subprocess\nsubprocess.run(%r)\nos.read(%d, 1)\n" %
+                      (child, r2_case.custody.safety_read), encoding="utf-8")
     prefix = python_argv("codex", ROOT / "tests/integration/test_hierarchy_launcher.py", r2_case.launch.tmp,
                          "r2_captured_entry")
     command = [*prefix, str(target), "script"]
@@ -11493,10 +11915,8 @@ def test_r2_captured_exec_registers_a_real_child_before_releasing_it(r2_case, ca
                              environment={"STOP_OWNERSHIP_READY": str(ready)},
                              captured=[{"argv": child, "expected_argv": child, "logical_argv": None}],
                              target=(target, "script"))
-    try:
-        wait_until(lambda: r2_case.service_exec_children() or ready.exists())
-    except AssertionError as error:
-        raise AssertionError("captured child did not become ready\n" + r2_case.custody.stderr_tail()) from error
+    slot = next(slot for slot, row in r2_case.custody.entries.items() if row["pid"] == held.pid)
+    r2_case.custody.await_slot_file(ready.name, slot, before=r2_case.service_exec_children)
     r2_case.service_exec_children()
     descendants = [e for e in r2_case.custody.entries.values() if e["pid"] != held.pid]
     assert len(descendants) == 1
@@ -11504,14 +11924,14 @@ def test_r2_captured_exec_registers_a_real_child_before_releasing_it(r2_case, ca
     assert r2_kernel_process(worker)["ppid"] == held.pid
     code, stopped = r2_case.stop(r2_case.module(), capsys)
     assert code == 0 and stopped["state"] == "stopped" and stopped["pids"] == sorted([held.pid, worker])
-    assert held.wait(timeout=5) == -signal.SIGTERM
+    assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
 
 
 def test_r2_captured_exec_closes_a_child_still_behind_its_gate(r2_case, monkeypatch):
     from tests.integration.hierarchy_fake_wrapper import python_argv
     from tests.integration.test_hierarchy_mailbox import ROOT
 
-    child = [sys.executable, "-c", "import time; time.sleep(5)"]
+    child = [sys.executable, "-c", "import os; os.read(%d, 1)" % r2_case.custody.safety_read]
     target = r2_case.launch.tmp / "captured-pending-parent.py"
     target.write_text("import subprocess\nsubprocess.run(%r)\n" % child, encoding="utf-8")
     prefix = python_argv("codex", ROOT / "tests/integration/test_hierarchy_launcher.py", r2_case.launch.tmp,
@@ -11529,7 +11949,9 @@ def test_r2_captured_exec_closes_a_child_still_behind_its_gate(r2_case, monkeypa
         r2_case.spawn_exec(command, ["codex", "resume", str(uuid.uuid4())], command,
                            captured=[{"argv": child, "expected_argv": child, "logical_argv": None}],
                            target=(target, "script"))
-        wait_until(lambda: r2_case.service_exec_children())
+        wait_until(r2_case.service_exec_children,
+                   block=lambda remaining: r2_case.custody._block_for_notifications(
+                       list(r2_case.custody.entries), min(remaining, .05)))
     report = r2_case.close()
     assert report["state"] == "CLOSED" and report["errors"] == report["unresolved_slots"] == []
     assert len(report["entries"]) == 2 and all(row["exit"] for row in report["entries"].values())
@@ -11561,14 +11983,14 @@ def test_r2_fixture_closure_partial_tree_survives_receipt_stage_failure(tmp_path
 @pytest.mark.parametrize("ending", ["timeout", "caller-killed"])
 def test_r2_fixture_closure_visits_all_and_closes_orphan_runner(r2_case, ending):
     caller, runner = r2_case.runner(session=str(uuid.uuid4()), action="hang",
-                                   timeout=3 if ending == "caller-killed" else 0.3)
+                                   timeout=R2_STOP_TIMEOUT_SECONDS if ending == "caller-killed" else 0.3)
     caller_slot = next(slot for slot, row in r2_case.custody.entries.items() if row["pid"] == caller.pid)
     if ending == "caller-killed":
         r2_case.custody.kill_owned(caller_slot)
         # An actual native wait can precede Popen cleanup; never manufacture success from ECHILD.
         assert r2_case.custody.wait_native(caller_slot) == -signal.SIGKILL
     else:
-        caller.communicate(timeout=2)
+        caller.communicate(timeout=R2_STOP_TIMEOUT_SECONDS)
         assert caller.returncode == 124  # Cached real Popen status is independent of the runner's liveness.
     assert runner.poll() is None  # Caller exit alone did not close the still-owned runner.
     seen = []
@@ -11638,7 +12060,7 @@ def test_r2_finite_selector_disposition_through_public_stop(r2_case, capsys, cas
     assert code == case["expected_exit"] and stopped["state"] == case["expected_state"]
     assert stopped["pids"] == ([held.pid] if case["verdict"] == "OWNED" else [])
     if case["verdict"] == "OWNED":
-        assert held.wait(timeout=5) == -signal.SIGTERM
+        assert held.wait(timeout=R2_STOP_TIMEOUT_SECONDS) == -signal.SIGTERM
     else:
         assert held.poll() is None and r2_case.projection.events == []
     if case["provider"] == "LOSSY_PS":
