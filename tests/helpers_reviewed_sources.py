@@ -218,6 +218,37 @@ def git_environment(environ=None) -> dict:
     return env
 
 
+def _check_git_census_targets(cwd, args, callers):
+    """Keep census code from taking a second, live index through this runner."""
+    if callers is None:
+        return  # Initial inventory capture is attributed to the trusted helper.
+    active = tuple(_ACTIVE_CENSUSES)
+    roots = list(callers.items()) + [(None, state["root"]) for state in active]
+    if not roots:
+        return
+    redirects = any(arg.startswith("-C") or arg.partition("=")[0] in {"--git-dir", "--work-tree"}
+                    for arg in args)
+    targets = [cwd]
+    for arg in args:
+        candidates = (arg, arg.partition("=")[2]) if arg.startswith("--") else (arg,)
+        targets.extend(candidate for candidate in candidates if os.path.isabs(candidate))
+    failure = None
+    for module_file, root in roots:
+        for target in targets:
+            resolved = real_key(target)
+            if redirects or resolved is None or key_within(resolved, root):
+                label = resolved if resolved is not None else target
+                message = "live-tree census enumeration is forbidden: " + _display_path(label)
+                if module_file is not None:
+                    _AUTHORITY["history"].setdefault(module_file, []).append(message)
+                failure = AssertionError(message)
+                break
+    if failure is not None:
+        for state in active:
+            state["violations"].append(failure)
+        raise failure
+
+
 def git(cwd: Path, *args: str):
     """Run Git against this checkout; malformed gitfiles refuse with status 128."""
     git_dir = cwd / ".git"
@@ -240,6 +271,7 @@ def git(cwd: Path, *args: str):
                 raise ValueError("invalid Git directory")
     except (OSError, ValueError, RuntimeError):
         raise subprocess.CalledProcessError(128, command, output=b"", stderr=b"invalid Git marker\n") from None
+    _check_git_census_targets(cwd, args, _census_callers())
     command[1] = f"--git-dir={git_dir}"
     return subprocess.run(command, cwd=cwd, env=git_environment(), stdin=subprocess.DEVNULL,
                           check=True, capture_output=True, timeout=GIT_TIMEOUT)

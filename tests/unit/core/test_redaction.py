@@ -40,7 +40,11 @@ from aegis_core.verification.scanners import TIER_A_PATTERNS, scan_secrets_text
 REPO = Path(real_path(__file__)).parents[3]
 # Reviewed parse-cost ratchet: retain headroom for ordinary source additions.
 # Increasing this ceiling requires review; failures list all parsed paths.
-REDACTION_PARSE_CEILING = 72
+# Coordinator CEILING RULING 2026-11-16T21:22:03Z reviewed these six additions:
+# aegis_core/team_lease_custody.py, tests/helpers_reviewed_sources.py,
+# aegis_core/primitives.py, tests/unit/core/test_primitives.py,
+# aegis_core/pathlookup.py, tests/unit/core/test_gitsafe.py.
+REDACTION_PARSE_CEILING = 77
 
 
 def assignment_values(statement):
@@ -589,6 +593,123 @@ def test_live_census_runtime_rejects_reviewer_enumerations(tmp_path, caller, ope
     assert result.returncode != 0, "live census accepted checkout enumeration"
     assert b"live-tree census enumeration is forbidden" in result.stderr, result.stderr.decode()
     assert str(REPO).encode() in result.stderr
+
+
+@pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
+@pytest.mark.parametrize("runner", ["reviewed_helper.git", "_git"])
+@pytest.mark.parametrize("target", [
+    "checkout", "checkout-child", "caught-refusal", "-C", "-Cjoined",
+    "--git-dir", "--git-dir=", "--work-tree", "--work-tree=",
+    "outside-C", "outside-git-dir", "outside-work-tree",
+    "absolute-root", "absolute-child", "option-root", "option-child",
+])
+def test_live_census_git_refuses_live_index_listings(tmp_path, caller, runner, target):
+    fixture = tmp_path / "fixture"
+    reviewed_helper.freeze_fixture_sources(fixture, [("tests/reviewed.py", "# redaction\n")])
+    cwd = repr(str(fixture))
+    options = {
+        "-C": "'-C', str(REPO)", "-Cjoined": "'-C' + str(REPO)",
+        "--git-dir": "'--git-dir', str(REPO / '.git')",
+        "--git-dir=": "'--git-dir=' + str(REPO / '.git')",
+        "--work-tree": "'--work-tree', str(REPO)",
+        "--work-tree=": "'--work-tree=' + str(REPO)",
+        "outside-C": "'-C', " + cwd,
+        "outside-git-dir": "'--git-dir=' + str(Path(" + cwd + ") / '.git')",
+        "outside-work-tree": "'--work-tree=' + " + cwd,
+    }
+    args = "'ls-files', '--cached', '-z', '--', 'aegis_core'"
+    if target in {"checkout", "caught-refusal"}:
+        cwd = "REPO"
+    elif target == "checkout-child":
+        cwd = "REPO / 'aegis_core'"
+    elif target in options:
+        args = options[target] + ", 'ls-files', '--cached', '-z'"
+    else:
+        path = "REPO / 'aegis_core'" if target.endswith("child") else "REPO"
+        argument = "'--exclude=' + str(" + path + ")" if target.startswith("option") else "'--', str(" + path + ")"
+        args = "'ls-files', '--cached', '-z', " + argument
+    call = runner + "(Path(" + cwd + "), " + args + ")"
+    if target == "caught-refusal":
+        prelude = "    try:\n        " + call + "\n    except AssertionError:\n        pass\n"
+    else:
+        prelude = "    listed = " + call + ".stdout\n"
+        if target == "checkout":
+            prelude += (
+                "    live = {os.fsdecode(p) for p in listed.split(b'\\0') if p.endswith(b'.py')}\n"
+                "    assert live == {p for p in _REVIEWED_PYTHON_PATHS if p.startswith('aegis_core/')}\n"
+            )
+    extra = "\nimport tests.helpers_reviewed_sources as reviewed_helper\nfrom tests.helpers_reviewed_sources import git as _git\n"
+    source = census_source_variant(caller, "_python_sources() if sources is None else sources", extra, prelude)
+    result = run_census_variant(tmp_path, caller, source)
+    assert result.returncode != 0, "live census accepted a second Git index listing"
+    assert b"live-tree census enumeration is forbidden" in result.stderr, result.stderr.decode()
+
+
+@pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
+@pytest.mark.parametrize("runner", ["reviewed_helper.git", "_git"])
+def test_live_census_git_allows_fixture_index_listings(tmp_path, caller, runner):
+    fixture = tmp_path / "fixture"
+    reviewed_helper.freeze_fixture_sources(fixture, [("tests/reviewed.py", "# redaction\n")])
+    extra = "\nimport tests.helpers_reviewed_sources as reviewed_helper\nfrom tests.helpers_reviewed_sources import git as _git\n"
+    prelude = ("    listed = " + runner + "(Path(" + repr(str(fixture)) + "), 'ls-files', '-z').stdout\n"
+               "    assert listed.split(b'\\0') == [b'tests/reviewed.py', b'']\n")
+    source = census_source_variant(caller, "_python_sources() if sources is None else sources", extra, prelude)
+    result = run_census_variant(tmp_path, caller, source)
+    assert result.returncode == 0, result.stderr.decode()
+
+
+@pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
+@pytest.mark.parametrize("runner", ["reviewed_helper.git", "_git"])
+@pytest.mark.parametrize("target", ["checkout", "-C", "--git-dir", "--work-tree", "caught-refusal", "fixture"])
+def test_live_census_git_checks_worker_callbacks(tmp_path, caller, runner, target):
+    fixture = tmp_path / "fixture"
+    reviewed_helper.freeze_fixture_sources(fixture, [("tests/reviewed.py", "# redaction\n")])
+    cwd = "REPO" if target in {"checkout", "caught-refusal"} else "Path(" + repr(str(fixture)) + ")"
+    args = "'ls-files', '--cached', '-z', '--', 'aegis_core'"
+    if target == "-C":
+        args = "'-C', str(REPO), 'ls-files', '--cached', '-z'"
+    elif target == "--git-dir":
+        args = "'--git-dir=' + str(REPO / '.git'), 'ls-files', '--cached', '-z'"
+    elif target == "--work-tree":
+        args = "'--work-tree=' + str(REPO), 'ls-files', '--cached', '-z'"
+    elif target == "fixture":
+        args = "'ls-files', '-z'"
+    submission = "pool.submit(" + runner + ", " + cwd + ", " + args + ").result(timeout=5).stdout"
+    prelude = "    with ThreadPoolExecutor(max_workers=1) as pool:\n"
+    if target == "caught-refusal":
+        prelude += "        try:\n            " + submission + "\n        except AssertionError:\n            pass\n"
+    else:
+        prelude += "        listed = " + submission + "\n"
+        if target == "checkout":
+            prelude += (
+                "    live = {os.fsdecode(p) for p in listed.split(b'\\0') if p.endswith(b'.py')}\n"
+                "    assert live == {p for p in _REVIEWED_PYTHON_PATHS if p.startswith('aegis_core/')}\n"
+            )
+        elif target == "fixture":
+            prelude += "    assert listed.split(b'\\0') == [b'tests/reviewed.py', b'']\n"
+    extra = ("\nfrom concurrent.futures import ThreadPoolExecutor\n"
+             "import tests.helpers_reviewed_sources as reviewed_helper\n"
+             "from tests.helpers_reviewed_sources import git as _git\n")
+    source = census_source_variant(caller, "_python_sources() if sources is None else sources", extra, prelude)
+    result = run_census_variant(tmp_path, caller, source)
+    if target == "fixture":
+        assert result.returncode == 0, result.stderr.decode()
+    else:
+        assert result.returncode != 0, "worker callback bypassed the active census"
+        assert b"live-tree census enumeration is forbidden" in result.stderr, result.stderr.decode()
+        assert str(REPO).encode() in result.stderr
+
+
+def test_git_worker_without_a_census_can_read_the_index():
+    program = (
+        "from concurrent.futures import ThreadPoolExecutor\nfrom pathlib import Path\n"
+        "from tests.helpers_reviewed_sources import git\n"
+        "with ThreadPoolExecutor(max_workers=1) as pool:\n"
+        "    listed = pool.submit(git, Path(sys.argv[2]), 'ls-files', '--cached', '-z').result(timeout=5).stdout\n"
+        "assert b'tests/helpers_reviewed_sources.py' in listed.split(b'\\0')\n"
+    )
+    result = _run_isolated(program, REPO)
+    assert result.returncode == 0, result.stderr.decode()
 
 
 @pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
@@ -1258,7 +1379,7 @@ def test_private_import_census_refuses_an_unreadable_index(tmp_path: Path):
             runpy.run_path(str(module))
 
 
-@pytest.mark.parametrize("count", [1, 66, 72])
+@pytest.mark.parametrize("count", [1, 66, REDACTION_PARSE_CEILING])
 def test_private_import_census_accepts_additions_within_reviewed_ceiling(tmp_path, count):
     sources = [(f"tests/reviewed_{index}.py", "# redaction\n") for index in range(count)]
     result = run_census_fixture(tmp_path, "test_redaction.py", sources)
@@ -1266,11 +1387,12 @@ def test_private_import_census_accepts_additions_within_reviewed_ceiling(tmp_pat
 
 
 def test_private_import_census_ceiling_failure_lists_every_parsed_file(tmp_path):
-    sources = [(f"tests/reviewed_{index}.py", "# redaction\n") for index in range(73)]
+    count = REDACTION_PARSE_CEILING + 1
+    sources = [(f"tests/reviewed_{index}.py", "# redaction\n") for index in range(count)]
     result = run_census_fixture(tmp_path, "test_redaction.py", sources)
     assert result.returncode != 0
     message = result.stderr.decode()
-    assert "73" in message and "72" in message
+    assert f"redaction parse census: {count} files; reviewed ceiling {REDACTION_PARSE_CEILING}." in message
     assert all(label in message for label, _ in sources)
 
 
