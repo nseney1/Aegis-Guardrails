@@ -312,16 +312,51 @@ def test_mutation_root_symlink_into_checkout_is_refused(tmp_path, monkeypatch):
     assert result.lines == [-1]
 
 
+@pytest.fixture
+def explicit_layout_children(monkeypatch, suffix, real_child):
+    from types import SimpleNamespace
+    from aegis_core.verification import mutation_tester
+
+    spawned, stubbed = [], []
+    real_popen = mutation_tester.subprocess.Popen
+
+    def spawn(*args, **kwargs):
+        if not real_child:
+            stubbed.append(args)
+            if suffix == ".py":
+                staged = Path(kwargs["env"]["PYTHONPATH"].split(os.pathsep)[0])
+                (staged / "loaded.txt").write_text("target", encoding="utf-8")
+            returncode = int(suffix == ".py" and len(stubbed) == 2)
+            return SimpleNamespace(returncode=returncode, poll=lambda: returncode,
+                                   communicate=lambda timeout: ("", ""))
+        spawned.append(args)
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr("aegis_core.verification.mutation_tester.subprocess", SimpleNamespace(
+        **{**vars(mutation_tester.subprocess), "Popen": spawn},
+    ))
+    if not real_child:
+        # Cleanup belongs to the modeled child, never to a fabricated OS pid.
+        monkeypatch.setattr("aegis_core.verification.mutation_tester.testexec", SimpleNamespace(
+            **{**vars(mutation_tester.testexec), "kill_group": lambda proc: None},
+        ))
+    return spawned, stubbed
+
+
 @pytest.mark.parametrize("suffix", [".py", ".rs"])
 @pytest.mark.parametrize("invoked_from", ["other-checkout", "target-checkout"])
-@pytest.mark.parametrize("layout", ["relative", "absolute", "unresolved", "common-relative",
-                                  "parent-relative", "parent-absolute", "pointer-relative",
-                                  "pointer-absolute", "pointer-file-parent-relative",
-                                  "pointer-file-parent-absolute", "pointer-invalid-relative",
-                                  "pointer-invalid-absolute"])
-@pytest.mark.parametrize("external", [False, True], ids=["checkout-scratch", "external-scratch"])
+@pytest.mark.parametrize("layout,external,real_child", [
+    (layout, external, False)
+    for layout in ["relative", "absolute", "unresolved", "common-relative",
+                   "parent-relative", "parent-absolute", "pointer-relative",
+                   "pointer-absolute", "pointer-file-parent-relative",
+                   "pointer-file-parent-absolute", "pointer-invalid-relative",
+                   "pointer-invalid-absolute"]
+    for external in [False, True]
+] + [pytest.param("relative", True, True, id="real-child")])
 def test_explicit_layout_keeps_invocation_paths(
-    tmp_path, monkeypatch, suffix, invoked_from, layout, external, external_scratch_root,
+    tmp_path, monkeypatch, suffix, invoked_from, layout, external, real_child,
+    external_scratch_root, explicit_layout_children,
 ):
     from types import SimpleNamespace
     from aegis_core.ast.schema import MutationPoint
@@ -348,6 +383,7 @@ def test_explicit_layout_keeps_invocation_paths(
 
     real_tempfile = mutation_tester.tempfile
     allocated = []
+    spawned, stubbed = explicit_layout_children
 
     def allocate(**kwargs):
         if not external or unusable:
@@ -389,6 +425,8 @@ def test_explicit_layout_keeps_invocation_paths(
                 os.environ[name] += "/existing/.."
         before = {name: os.environ.get(name) for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")}
         result = mutation_tester.check(str(target), "add", str(test), max_mutations=1, ast_runner=runner)
+        assert len(spawned) == (2 if real_child else 0)
+        assert len(stubbed) == (2 if external and not unusable and not real_child else 0)
         if not external or unusable:
             assert result.verdict is False
             assert result.detail == (_unusable_layout_detail(layout) if unusable else _SCRATCH_INSIDE_DETAIL)
@@ -396,7 +434,7 @@ def test_explicit_layout_keeps_invocation_paths(
             assert result.lines == [-1]
             assert allocated == []
         else:
-            assert "survived" in result.detail, result.detail
+            assert result.detail == f"{0 if suffix == '.py' else 1}/1 survived (1 test file ran)"
             assert result.verdict is (suffix == ".py"), result.detail
             assert len(allocated) == 1
             assert allocated[0].parent == candidate.resolve()
