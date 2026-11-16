@@ -2480,21 +2480,19 @@ def test_cli_recovery_from_another_cwd_names_and_reaches_its_workspace(
         os.chdir(previous)
 
 
-@pytest.fixture(scope="session")
-def _operation_repository_seed(tmp_path_factory):
-    """Build the operation matrix's deterministic Git base once per worker."""
+def _build_operation_repository_seed(base, environ):
+    """Build the deterministic Git base using an explicit caller environment."""
     if not team_queue.descriptor_supported():
         pytest.skip("requires descriptor-relative nofollow operations")
     if shutil.which("git") is None:
         pytest.skip("requires git")
-    base = tmp_path_factory.mktemp("operation-repository-seed")
     root = base / "workspace"
     (root / ".aegis" / "rules").mkdir(parents=True)
     (root / ".aegis" / "team.json").write_text(
         json.dumps({"v": 1, "lanes": {"writer": ["src/**"]}}), encoding="utf-8")
     home = base / "home"
     home.mkdir()
-    environment = {**os.environ, "HOME": str(home), "USERPROFILE": str(home),
+    environment = {**environ, "HOME": str(home), "USERPROFILE": str(home),
                    "XDG_CONFIG_HOME": str(home / ".config"),
                    "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
                    "GIT_CONFIG_NOSYSTEM": "1",
@@ -2510,6 +2508,13 @@ def _operation_repository_seed(tmp_path_factory):
             capture_output=True, text=True, timeout=15)
         assert result.returncode == 0, result.stderr
     return root
+
+
+@pytest.fixture(scope="session")
+def _operation_repository_seed(tmp_path_factory):
+    """Build the operation matrix's deterministic Git base once per worker."""
+    return _build_operation_repository_seed(
+        tmp_path_factory.mktemp("operation-repository-seed"), os.environ)
 
 
 @pytest.fixture
@@ -2557,21 +2562,71 @@ def test_operation_seed_ignores_user_templates(tmp_path, configuration):
     else:
         environment["GIT_CONFIG_SYSTEM"] = str(config)
         environment.pop("GIT_CONFIG_NOSYSTEM")
-    source = Path(__file__).resolve().parents[3]
-    selection = "tests/unit/cli/test_cli_team_queue.py::test_public_operation_byte_goldens"
-    basetemp = tmp_path / "matrix"
-    result = subprocess.run(
-        [sys.executable, "-m", "pytest", selection + "[core-queue-add-valid-dict]",
-         selection + "[profile-config-presets-valid-text]", "-n", "0", "-q", "--basetemp", str(basetemp)],
-        cwd=source, env=environment, capture_output=True, text=True, timeout=60)
-    assert result.returncode == 0, result.stdout + result.stderr
-    seeds = [path for path in basetemp.glob("operation-repository-seed*/workspace")
-             if not path.parent.is_symlink()]
-    copies = [path for path in basetemp.glob("test_public_operation_byte_gol*/workspace")
-              if not path.parent.is_symlink()]
+    base = tmp_path / "seed"
+    base.mkdir()
+    seeds = [_build_operation_repository_seed(base, environment)]
+    copies = [shutil.copytree(seeds[0], tmp_path / ("copy-" + str(index)))
+              for index in range(2)]
     assert len(seeds) == 1 and len(copies) == 2
     for root in seeds + copies:
         for name in ("pre-commit", "commit-msg"):
             assert not (root / ".git" / "hooks" / name).exists()
         assert (root / ".git" / "refs" / "heads" / "main").read_text(encoding="ascii") == (
             root / ".git" / "refs" / "heads" / "lane" / "writer").read_text(encoding="ascii")
+        assert (root / ".git" / "refs" / "heads" / "main").read_bytes() == (
+            seeds[0] / ".git" / "refs" / "heads" / "main").read_bytes()
+
+
+@pytest.mark.parametrize("command", ("init", "symbolic-ref", "commit", "update-ref"))
+def test_operation_seed_git_failure_is_error_and_retry_succeeds(tmp_path, monkeypatch, command):
+    if not team_queue.descriptor_supported():
+        pytest.skip("requires descriptor-relative nofollow operations")
+    if shutil.which("git") is None:
+        pytest.skip("requires git")
+    processes = subprocess
+    failed = []
+
+    def run(arguments, **options):
+        if command in arguments and not failed:
+            failed.append(command)
+            if options.get("check"):
+                raise processes.CalledProcessError(86, arguments)
+            return processes.CompletedProcess(arguments, 86, stderr="injected seed git failure")
+        return processes.run(arguments, **options)
+
+    monkeypatch.setattr("tests.unit.cli.test_cli_team_queue.subprocess", SimpleNamespace(run=run))
+    base = tmp_path / "failed"
+    base.mkdir()
+    error = processes.CalledProcessError if command == "init" else AssertionError
+    with pytest.raises(error) as caught:
+        _build_operation_repository_seed(base, os.environ)
+    if command == "init":
+        assert caught.value.returncode == 86
+        assert caught.value.cmd[:2] == ["git", "init"]
+    else:
+        assert str(caught.value).splitlines()[0] == "injected seed git failure"
+    assert failed == [command]
+    retry = tmp_path / "retry"
+    retry.mkdir()
+    root = _build_operation_repository_seed(retry, os.environ)
+    assert (root / ".git" / "refs" / "heads" / "main").read_bytes() == (
+        root / ".git" / "refs" / "heads" / "lane" / "writer").read_bytes()
+
+
+@pytest.mark.parametrize("boundary", ("descriptor", "git"))
+def test_operation_seed_unsupported_boundary_skips(tmp_path, monkeypatch, boundary):
+    monkeypatch.setattr("tests.unit.cli.test_cli_team_queue.team_queue", SimpleNamespace(
+        descriptor_supported=lambda: boundary != "descriptor"))
+    monkeypatch.setattr("tests.unit.cli.test_cli_team_queue.shutil", SimpleNamespace(which=lambda name: None))
+    reason = ("requires descriptor-relative nofollow operations" if boundary == "descriptor"
+              else "requires git")
+    with pytest.raises(pytest.skip.Exception) as caught:
+        _build_operation_repository_seed(tmp_path, os.environ)
+    assert str(caught.value) == reason
+
+
+def test_operation_seed_template_check_skips_on_windows(tmp_path, monkeypatch):
+    monkeypatch.setattr("tests.unit.cli.test_cli_team_queue.os", SimpleNamespace(name="nt"))
+    with pytest.raises(pytest.skip.Exception) as caught:
+        test_operation_seed_ignores_user_templates(tmp_path, "home")
+    assert str(caught.value) == "requires executable POSIX Git hooks"
