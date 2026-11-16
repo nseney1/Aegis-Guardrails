@@ -4194,7 +4194,7 @@
                 "flags": [
                   "--branch"
                 ],
-                "help": "The lane's branch, recorded for display",
+                "help": "The lane's branch; when recorded, it must exist for CLI renewal",
                 "kind": "store",
                 "metavar": null,
                 "nargs": null,
@@ -4604,7 +4604,7 @@
                 "type": "str"
               }
             ],
-            "description": "Delete every expired lease by compare-and-swap; unreadable leases are kept.",
+            "description": "Delete every expired lease by compare-and-swap; unreadable leases are kept. CLI preflight: expired_with_worktree JSON lane_warnings rows report attached worktrees; expired leases are still collected. Unavailable Git evidence refuses with liveness_unknown.",
             "help": "Delete expired leases"
           },
           "hosts": {
@@ -6012,7 +6012,7 @@
                 "type": "int"
               }
             ],
-            "description": "Renew by compare-and-swap; an expired lease is re-claimed, overlap check included.",
+            "description": "Renew by compare-and-swap; an expired lease is re-claimed, overlap check included. CLI preflight: a missing recorded branch refuses with lease_branch_missing; an attached worktree is not required. Unavailable Git evidence refuses with liveness_unknown.",
             "help": "Extend a lease; prints the new lease oid"
           },
           "status": {

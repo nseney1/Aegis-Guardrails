@@ -11,7 +11,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 from aegis_cli import sanitize_display
-from aegis_core.approval_policy import GuidanceMessage, MESSAGE_TEMPLATES, MessageRow, PERMITTED_MODES, finding_message, guidance_value, receipt_value
+from aegis_core.approval_policy import PERMITTED_MODES
+from aegis_core.diagnostic_messages import (
+    GuidanceMessage, MESSAGE_TEMPLATES, MessageRow, clip_rendered_text, finding_message, guidance_value, receipt_value,
+)
 
 __all__ = [
     "coverage_explanation",
@@ -35,8 +38,6 @@ _MODEL_TEXT_MAX = 300
 
 def _model_text(value: Any) -> str:
     """Render one bounded model value, then clip without tearing its escapes."""
-    from aegis_core.approval_policy import clip_rendered_text
-
     return clip_rendered_text(guidance_value(str(value), _MODEL_TEXT_MAX * 4, prose=True), _MODEL_TEXT_MAX)
 
 

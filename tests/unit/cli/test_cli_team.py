@@ -609,6 +609,37 @@ def test_gc_collects_expired_leases(ws: Path, capsys):
     assert payload["kept"] == [{"lane": "junk", "reason": "unreadable"}]
 
 
+@pytest.mark.parametrize("as_json", [False, True])
+def test_gc_separates_event_and_lane_warnings_and_clears_them_on_retry(ws: Path, tmp_path: Path, capsys, as_json):
+    shared = Path(os.path.realpath(ws / ".git")) / "aegis"
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    try:
+        os.symlink(str(elsewhere), str(shared), target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are unavailable")
+    for lane in ("api", "docs"):
+        team.claim(ws, lane, [lane + "/**"], owner="o@h", ttl_s=60, now=NOW, branch="main")
+    if as_json:
+        rc, payload, err = _json(capsys, "gc")
+        assert (rc, err) == (0, "")
+        assert [row["lane"] for row in payload["collected"]] == ["api", "docs"]
+        assert len(payload["warnings"]) == 2
+        assert all(isinstance(warning, str) and warning.startswith("event not recorded: ")
+                   for warning in payload["warnings"])
+        assert payload["lane_warnings"] == [
+            {"lane": lane, "reason": "expired_with_worktree"} for lane in ("api", "docs")]
+    else:
+        rc, out, err = _run(capsys, "gc")
+        assert (rc, out) == (0, "collected api\ncollected docs\n")
+        assert err.count("Warning: event not recorded: ") == 2
+        assert err.endswith("Warning: api: expired_with_worktree\nWarning: docs: expired_with_worktree\n")
+    assert all(_ref(ws, lane) is None for lane in ("api", "docs"))
+    rc, payload, err = _json(capsys, "gc")
+    assert (rc, payload["status"], payload["collected"], err) == (0, "nothing to collect", [], "")
+    assert payload["warnings"] == payload["lane_warnings"] == []
+
+
 # ── list ─────────────────────────────────────────────────────────────────────
 
 def test_list_json_reports_every_plan_field_and_the_statement(ws: Path, capsys):

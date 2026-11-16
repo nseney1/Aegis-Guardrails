@@ -31,7 +31,7 @@ __all__ = [
 MAX_BYTES = 1048576
 MAX_ITEMS = 256
 MAX_FIELDS = 128
-MAX_TEXT = 4096
+MAX_TEXT = team_claims.RECOVERY_TEXT_LIMIT
 MAX_COMPLETED = 8192
 MAX_JSON_DEPTH = 16
 MAX_JSON_NODES = 65536
@@ -534,7 +534,8 @@ def _claimable(state, lanes, found, moment, queue_paths, policy, leases_checked,
     if not leases_checked or not policy["valid"]:
         return result
     index = _claim_index(state, found, moment)
-    lane_names = sorted(lanes or {})
+    eligible = {lane for lane in (lanes or {})
+                if lane not in index["busy"] and _capacity(index, lane, policy)}
     for identifier, row in sorted(state["items"].items()):
         if row["state"] == "done" or _live(row, moment):
             continue
@@ -542,12 +543,11 @@ def _claimable(state, lanes, found, moment, queue_paths, policy, leases_checked,
                                          item_blockers[identifier])
         if constraints["blockers"] or constraints["overlaps"] or found.unreadable:
             continue
-        for lane in lane_names:
-            if (lane in index["busy"] or _foreign_lease(constraints["covering"], lane, found)
-                    or not _capacity(index, lane, policy)):
-                continue
+        # No covering lease permits any eligible lane; one requires that lane.
+        # Multiple covering lanes always imply a foreign lease for every lane.
+        covering = constraints["covering"]
+        if eligible and (not covering or (len(covering) == 1 and covering <= eligible)):
             result.append([identifier, row["revision"]])
-            break
     return result
 
 
@@ -786,7 +786,7 @@ def _run(root, verb, now=None, caller=None, **arguments):
         with locked(root, timeout=5.0) if write else nullcontext():
             state = _state(root)
             if "unclaim" in state and verb != "unclaim":
-                raise team_claims.recovery_refusal(state["unclaim"])
+                raise team_claims.recovery_refusal(state["unclaim"], root=root)
             if verb == "unclaim":
                 payload.update(_unclaim(root, state, moment, caller, arguments))
                 return _project(payload)

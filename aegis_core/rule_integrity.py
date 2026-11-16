@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Opt
 
 from aegis_core import primitives
 from aegis_core import gitevidence, gitsafe, governance, rule_inventory
-from aegis_core.approval_policy import GuidanceMessage, MESSAGE_TEMPLATES, MessageRow, guidance_value
+from aegis_core.diagnostic_messages import GuidanceMessage, MESSAGE_TEMPLATES, MessageRow, guidance_value
 from aegis_core.config import read_user_config
 from aegis_core.errors import AegisError
 from aegis_core.lane_ast import pytest_config_view
