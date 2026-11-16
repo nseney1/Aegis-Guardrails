@@ -4,6 +4,7 @@ import hashlib
 import errno
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1206,8 +1207,8 @@ OPERATION_GOLDENS = {'cli-queue/add/valid/text': 'fe60c6c01c8f5adeaa653e6bf7a8fc
  'cli-queue/add/unsupported_platform/json': '9046b2c94b44085f9dd65236e0015aefaeeca254e4e5683d2277166ec8c8a76d',
  'cli-queue/add/queue_io_unavailable/text': '076be5182905950e062bf745ec3d9c9d24717b027c6ec8b2ed07b0e09b160767',
  'cli-queue/add/queue_io_unavailable/json': '076be5182905950e062bf745ec3d9c9d24717b027c6ec8b2ed07b0e09b160767',
- 'cli-queue/add/unclaim_recovery_required/text': 'fff92a8a34e7392cfeee9ef4303009f3d441f4b70f2608bef3a6916ff94e19ba',
- 'cli-queue/add/unclaim_recovery_required/json': 'fff92a8a34e7392cfeee9ef4303009f3d441f4b70f2608bef3a6916ff94e19ba',
+ 'cli-queue/add/unclaim_recovery_required/text': '09e202317d345b1376557c809a7bb59837e36cd879202aab4fc4635b17e087de',
+ 'cli-queue/add/unclaim_recovery_required/json': '09e202317d345b1376557c809a7bb59837e36cd879202aab4fc4635b17e087de',
  'cli-queue/add/queue_lock_timeout/text': '1176100526574bbe097182b0b3fdc31cc5748a8db5545c6bcb596eee786e7f84',
  'cli-queue/add/queue_lock_timeout/json': '1176100526574bbe097182b0b3fdc31cc5748a8db5545c6bcb596eee786e7f84',
  'cli-queue/add/invalid_item/text': '0986a7112917571703c5c62cfa10aceeb8b64e42ec2687c5211706f0f7d9091a',
@@ -1234,8 +1235,8 @@ OPERATION_GOLDENS = {'cli-queue/add/valid/text': 'fe60c6c01c8f5adeaa653e6bf7a8fc
  'cli-queue/list/unsupported_platform/json': '28c8057c096ff42602b497058bc754987f7accd6da49937c3908f057e3d62b74',
  'cli-queue/list/queue_io_unavailable/text': '4b305060eb0acb7ee5f98f87d2e7470f05191f720c2fe51ef1c1fa0e41deb31e',
  'cli-queue/list/queue_io_unavailable/json': '4b305060eb0acb7ee5f98f87d2e7470f05191f720c2fe51ef1c1fa0e41deb31e',
- 'cli-queue/list/unclaim_recovery_required/text': '3541c55f77069d667abd9d52cf09d1a7ec4470c8d581b65b5370c0a3f4e942c2',
- 'cli-queue/list/unclaim_recovery_required/json': '3541c55f77069d667abd9d52cf09d1a7ec4470c8d581b65b5370c0a3f4e942c2',
+ 'cli-queue/list/unclaim_recovery_required/text': '7cc4d719c948e552ffdcc021cf9f4ad3c642b1faaa892ccfa694452bee53a1a7',
+ 'cli-queue/list/unclaim_recovery_required/json': '7cc4d719c948e552ffdcc021cf9f4ad3c642b1faaa892ccfa694452bee53a1a7',
  'cli-queue/list/malformed_capability/text': '53f5598604c932505815550cd9c4affb30c6c0c2913dc7e6ccf05fb0de26d6cc',
  'cli-queue/list/malformed_capability/json': '53f5598604c932505815550cd9c4affb30c6c0c2913dc7e6ccf05fb0de26d6cc',
  'cli-queue/claim/valid/text': '61fb2b965c21d5253358ad827146f8fa098e96107383b79a6a57a93f701580f9',
@@ -1252,8 +1253,8 @@ OPERATION_GOLDENS = {'cli-queue/add/valid/text': 'fe60c6c01c8f5adeaa653e6bf7a8fc
  'cli-queue/claim/unsupported_platform/json': '66bf00fd466720cc01526a66deed38bd2bb8d7b1301aa3e7fe7ed14b501a548d',
  'cli-queue/claim/queue_io_unavailable/text': 'cd0f825a901ff47b4c6eefadf62c9f105fc7e0902a28a7a72d015474033cd2aa',
  'cli-queue/claim/queue_io_unavailable/json': 'cd0f825a901ff47b4c6eefadf62c9f105fc7e0902a28a7a72d015474033cd2aa',
- 'cli-queue/claim/unclaim_recovery_required/text': '0f638089952c3e69463a5dd10099d5b7924578e2c6b04a6013b807ba10db07b1',
- 'cli-queue/claim/unclaim_recovery_required/json': '0f638089952c3e69463a5dd10099d5b7924578e2c6b04a6013b807ba10db07b1',
+ 'cli-queue/claim/unclaim_recovery_required/text': '1906ba8d649b94969901510fc7686a427227fda358b6f0f32773210fd38de16e',
+ 'cli-queue/claim/unclaim_recovery_required/json': '1906ba8d649b94969901510fc7686a427227fda358b6f0f32773210fd38de16e',
  'cli-queue/claim/queue_lock_timeout/text': '7739bdc289ed6886be4312eb5203ecc618159b385db2564aadd1cb03c929d4eb',
  'cli-queue/claim/queue_lock_timeout/json': '7739bdc289ed6886be4312eb5203ecc618159b385db2564aadd1cb03c929d4eb',
  'cli-queue/claim/item_missing/text': '85cf7a4a7babacd5224dc12334cbb6302f60f6bc33d3a3667f4cc74b1f58656d',
@@ -1292,8 +1293,8 @@ OPERATION_GOLDENS = {'cli-queue/add/valid/text': 'fe60c6c01c8f5adeaa653e6bf7a8fc
  'cli-queue/release/unsupported_platform/json': '6538f2912f2a97e0c51f5cd9af5756995096937c6387c28d0ff7de441291f405',
  'cli-queue/release/queue_io_unavailable/text': '601d21284be47d94ddcb2f90b9e1338da2fa162bc9ac927f95b4e9741e256ea2',
  'cli-queue/release/queue_io_unavailable/json': '601d21284be47d94ddcb2f90b9e1338da2fa162bc9ac927f95b4e9741e256ea2',
- 'cli-queue/release/unclaim_recovery_required/text': '33df79ca76112cfb84a61bedc0ae8ea63f90c8442de09d6d9eca79823733804a',
- 'cli-queue/release/unclaim_recovery_required/json': '33df79ca76112cfb84a61bedc0ae8ea63f90c8442de09d6d9eca79823733804a',
+ 'cli-queue/release/unclaim_recovery_required/text': 'a4bfac261dee80960201c7ef3a128d965dd881895d206e04186371a5450482d5',
+ 'cli-queue/release/unclaim_recovery_required/json': 'a4bfac261dee80960201c7ef3a128d965dd881895d206e04186371a5450482d5',
  'cli-queue/release/queue_lock_timeout/text': 'cf698dfdd97abbfeedcf9a867995273ccac64e2eb59f655871cd05d1aba9b26e',
  'cli-queue/release/queue_lock_timeout/json': 'cf698dfdd97abbfeedcf9a867995273ccac64e2eb59f655871cd05d1aba9b26e',
  'cli-queue/release/item_missing/text': 'bfba77d4480e22d080aec23200025ea0bc53bec2665c77927400a70953c15cd9',
@@ -1326,8 +1327,8 @@ OPERATION_GOLDENS = {'cli-queue/add/valid/text': 'fe60c6c01c8f5adeaa653e6bf7a8fc
  'cli-queue/unclaim/unsupported_platform/json': '167ea7453eb1b2208e17da2655d0d47349f0dc89bed3f65a49462e055de4cdfb',
  'cli-queue/unclaim/queue_io_unavailable/text': 'f0475ed9e2ab8d95388a5adbe4f7937fd1ad383264c7fc984645e444186a4797',
  'cli-queue/unclaim/queue_io_unavailable/json': 'f0475ed9e2ab8d95388a5adbe4f7937fd1ad383264c7fc984645e444186a4797',
- 'cli-queue/unclaim/unclaim_recovery_required/text': 'c8fe64aa4c621591586a5e5550eb90f6803758af477ac345c8008e50ac13b7c5',
- 'cli-queue/unclaim/unclaim_recovery_required/json': 'c8fe64aa4c621591586a5e5550eb90f6803758af477ac345c8008e50ac13b7c5',
+ 'cli-queue/unclaim/unclaim_recovery_required/text': '699ce30d68b9eddb9bfb69a2d446231f486cab2ca8908bbff9d4392f129596c8',
+ 'cli-queue/unclaim/unclaim_recovery_required/json': '699ce30d68b9eddb9bfb69a2d446231f486cab2ca8908bbff9d4392f129596c8',
  'cli-queue/unclaim/queue_lock_timeout/text': 'd21cc1117bcbc9141d081ae2acc629889bc12deeddbf91802a99248dc1271d07',
  'cli-queue/unclaim/queue_lock_timeout/json': 'd21cc1117bcbc9141d081ae2acc629889bc12deeddbf91802a99248dc1271d07',
  'cli-queue/unclaim/item_missing/text': '2049cf09e3756e1ade4b6a7fd4a1dafa0d921ae9449627205d59a0e58f78b714',
@@ -1344,8 +1345,8 @@ OPERATION_GOLDENS = {'cli-queue/add/valid/text': 'fe60c6c01c8f5adeaa653e6bf7a8fc
  'cli-queue/unclaim/invalid_item/json': '7682b940c50da9ed952866522aa9beb1756dcfd06d4596bf48144f23e273453b',
  'cli-queue/unclaim/credential_like_text/text': 'fd5ce42284f23d2176dc5feb625d98dd5067e60bf73b19eb1d321097a13435d8',
  'cli-queue/unclaim/credential_like_text/json': 'fd5ce42284f23d2176dc5feb625d98dd5067e60bf73b19eb1d321097a13435d8',
- 'cli-queue/unclaim/unclaim_lease_refused/text': '2503f31b569b781908f63ae7b57fcb2e0976c8df75c5940c0444e5b25b96a528',
- 'cli-queue/unclaim/unclaim_lease_refused/json': '2503f31b569b781908f63ae7b57fcb2e0976c8df75c5940c0444e5b25b96a528',
+ 'cli-queue/unclaim/unclaim_lease_refused/text': '7f78fbde2ffe6f4ccb2359eb7178c62dd9d6242ba463d37927a869d875eac1ce',
+ 'cli-queue/unclaim/unclaim_lease_refused/json': '7f78fbde2ffe6f4ccb2359eb7178c62dd9d6242ba463d37927a869d875eac1ce',
  'cli-queue/unclaim/unclaim_event_unavailable/text': 'ba93eaf5448b869775d9a016eb98f060d8fc2df3e81e58f9d41f5006564c5809',
  'cli-queue/unclaim/unclaim_event_unavailable/json': 'ba93eaf5448b869775d9a016eb98f060d8fc2df3e81e58f9d41f5006564c5809',
  'cli-queue/unclaim/item_done/text': 'e7be3b9f08663fac2f74e2294178117ecc53712cffa51e1d690f80a7899f6260',
@@ -1368,8 +1369,8 @@ OPERATION_GOLDENS = {'cli-queue/add/valid/text': 'fe60c6c01c8f5adeaa653e6bf7a8fc
  'cli-queue/done/unsupported_platform/json': '793368da2e2be43759a652f2850f579a4385e64988b85551f7fd2f952c3f32c0',
  'cli-queue/done/queue_io_unavailable/text': '15cda7ef56b8fe55f7306a9855a8a9a2733ad13fae7f59005d70630949122f78',
  'cli-queue/done/queue_io_unavailable/json': '15cda7ef56b8fe55f7306a9855a8a9a2733ad13fae7f59005d70630949122f78',
- 'cli-queue/done/unclaim_recovery_required/text': '98d19d3f9e3c0d258c95dd431846030c219d2ebed032f4ba4a7c13dd2be45692',
- 'cli-queue/done/unclaim_recovery_required/json': '98d19d3f9e3c0d258c95dd431846030c219d2ebed032f4ba4a7c13dd2be45692',
+ 'cli-queue/done/unclaim_recovery_required/text': '24e6b7f6cb1d9983d0b48e684fbc86f3d8ea6076bf749d627c450e9ea9c1d687',
+ 'cli-queue/done/unclaim_recovery_required/json': '24e6b7f6cb1d9983d0b48e684fbc86f3d8ea6076bf749d627c450e9ea9c1d687',
  'cli-queue/done/queue_lock_timeout/text': '50bae5e5bff01926ed9872f688738744c84c9ba3b29a64fa7ca3fc9ad12db272',
  'cli-queue/done/queue_lock_timeout/json': '50bae5e5bff01926ed9872f688738744c84c9ba3b29a64fa7ca3fc9ad12db272',
  'cli-queue/done/item_missing/text': 'a6d1151bbf5952078f361eb73135d8011a180226c589482908f125bed1e61d5f',
@@ -1404,8 +1405,8 @@ OPERATION_GOLDENS = {'cli-queue/add/valid/text': 'fe60c6c01c8f5adeaa653e6bf7a8fc
  'cli-queue/audit/unsupported_platform/json': '7ddf6bae902ced5c30451c5bcd9c62beb80c74e0d7c2e71918268ccdef27fb3d',
  'cli-queue/audit/queue_io_unavailable/text': '1009cc95cc9349829123a6f1ed3de48ef77d139a2801a81b4911f8bd0b00b958',
  'cli-queue/audit/queue_io_unavailable/json': '1009cc95cc9349829123a6f1ed3de48ef77d139a2801a81b4911f8bd0b00b958',
- 'cli-queue/audit/unclaim_recovery_required/text': 'e17c99286a5a8d7ddb758d65a6f23e3c619c83d1cd98370c93f5726955cb2e18',
- 'cli-queue/audit/unclaim_recovery_required/json': 'e17c99286a5a8d7ddb758d65a6f23e3c619c83d1cd98370c93f5726955cb2e18',
+ 'cli-queue/audit/unclaim_recovery_required/text': '2150768ae5a1a6ca5faf5ca63ae2392c3b97bcaaf2e0bdd1a4d33d6b4e15ad23',
+ 'cli-queue/audit/unclaim_recovery_required/json': '2150768ae5a1a6ca5faf5ca63ae2392c3b97bcaaf2e0bdd1a4d33d6b4e15ad23',
  'cli-queue/compact/valid/text': 'd9d28429080e7e43bd5d4645d1bb79787392742f1a827e83529e3d77346277ef',
  'cli-queue/compact/valid/json': 'd9d28429080e7e43bd5d4645d1bb79787392742f1a827e83529e3d77346277ef',
  'cli-queue/compact/oversized/text': 'ba8f7e0d3282be2939562f05a367cd1be9b9fa507d02c11e6b5d507055e4e85f',
@@ -1420,8 +1421,8 @@ OPERATION_GOLDENS = {'cli-queue/add/valid/text': 'fe60c6c01c8f5adeaa653e6bf7a8fc
  'cli-queue/compact/unsupported_platform/json': 'fdc3d060fb3cd5e8e392b892aab62ee61f1bffb0ccbbff8f42ce1e387ea8b636',
  'cli-queue/compact/queue_io_unavailable/text': '6b4c6c6a7293af88d3d74576e5c839e7b77f129631379b34821484022fc99553',
  'cli-queue/compact/queue_io_unavailable/json': '6b4c6c6a7293af88d3d74576e5c839e7b77f129631379b34821484022fc99553',
- 'cli-queue/compact/unclaim_recovery_required/text': '4bd0f7c7e9e4f919a85839121624accab11d45435763860b02b581df934eeec5',
- 'cli-queue/compact/unclaim_recovery_required/json': '4bd0f7c7e9e4f919a85839121624accab11d45435763860b02b581df934eeec5',
+ 'cli-queue/compact/unclaim_recovery_required/text': '465c6adab5b2f8892720e937d7093aad9865f88b27fb75594b96ca66ebccfca2',
+ 'cli-queue/compact/unclaim_recovery_required/json': '465c6adab5b2f8892720e937d7093aad9865f88b27fb75594b96ca66ebccfca2',
  'cli-queue/compact/queue_lock_timeout/text': 'd6b8163cff25a2506ddf90a9b2cedb3807c15df49b88f1d69b051456c4f7f53b',
  'cli-queue/compact/queue_lock_timeout/json': 'd6b8163cff25a2506ddf90a9b2cedb3807c15df49b88f1d69b051456c4f7f53b',
  'cli-queue/compact/queue_history_limit/text': 'c35fc4569e1aefbceba7fe993b8135d73e19f67c19e6fa7421ff732ae5c38acf',
@@ -1433,7 +1434,7 @@ OPERATION_GOLDENS = {'cli-queue/add/valid/text': 'fe60c6c01c8f5adeaa653e6bf7a8fc
  'core-queue/add/queue_size_limit/dict': '422b1424cbf27a5da29c09f5480682bab8a32c8b489f8e005720469b327bd0b3',
  'core-queue/add/unsupported_platform/dict': '9046b2c94b44085f9dd65236e0015aefaeeca254e4e5683d2277166ec8c8a76d',
  'core-queue/add/queue_io_unavailable/dict': '076be5182905950e062bf745ec3d9c9d24717b027c6ec8b2ed07b0e09b160767',
- 'core-queue/add/unclaim_recovery_required/dict': 'fff92a8a34e7392cfeee9ef4303009f3d441f4b70f2608bef3a6916ff94e19ba',
+ 'core-queue/add/unclaim_recovery_required/dict': '09e202317d345b1376557c809a7bb59837e36cd879202aab4fc4635b17e087de',
  'core-queue/add/queue_lock_timeout/dict': '1176100526574bbe097182b0b3fdc31cc5748a8db5545c6bcb596eee786e7f84',
  'core-queue/add/invalid_item/dict': '4ded2a9c4ea3bc2827f832e505bd40a54d318d198d0db9d61d04a66725e598ed',
  'core-queue/add/credential_like_text/dict': 'c5f487af10bef9ce9231caf490322ae63ca4468b389a837b91517865df784148',
@@ -1447,7 +1448,7 @@ OPERATION_GOLDENS = {'cli-queue/add/valid/text': 'fe60c6c01c8f5adeaa653e6bf7a8fc
  'core-queue/list/queue_size_limit/dict': '1cb9ecbdbe5436122633800ec39e79fc59e72cdc1fefb190093ebe10e6dc279b',
  'core-queue/list/unsupported_platform/dict': '28c8057c096ff42602b497058bc754987f7accd6da49937c3908f057e3d62b74',
  'core-queue/list/queue_io_unavailable/dict': '4b305060eb0acb7ee5f98f87d2e7470f05191f720c2fe51ef1c1fa0e41deb31e',
- 'core-queue/list/unclaim_recovery_required/dict': '3541c55f77069d667abd9d52cf09d1a7ec4470c8d581b65b5370c0a3f4e942c2',
+ 'core-queue/list/unclaim_recovery_required/dict': '7cc4d719c948e552ffdcc021cf9f4ad3c642b1faaa892ccfa694452bee53a1a7',
  'core-queue/list/malformed_capability/dict': '53f5598604c932505815550cd9c4affb30c6c0c2913dc7e6ccf05fb0de26d6cc',
  'core-queue/claim/valid/dict': '61fb2b965c21d5253358ad827146f8fa098e96107383b79a6a57a93f701580f9',
  'core-queue/claim/oversized/dict': 'f0ce39215e2d0a7bea16ea2c3b435ed98752a3252eee696e5b176bca2876ccd7',
@@ -1456,7 +1457,7 @@ OPERATION_GOLDENS = {'cli-queue/add/valid/text': 'fe60c6c01c8f5adeaa653e6bf7a8fc
  'core-queue/claim/queue_size_limit/dict': 'a7feb4499d39dc0fae5b217db4d463f0adb1c489a175a846dd28ad623f1c6159',
  'core-queue/claim/unsupported_platform/dict': '66bf00fd466720cc01526a66deed38bd2bb8d7b1301aa3e7fe7ed14b501a548d',
  'core-queue/claim/queue_io_unavailable/dict': 'cd0f825a901ff47b4c6eefadf62c9f105fc7e0902a28a7a72d015474033cd2aa',
- 'core-queue/claim/unclaim_recovery_required/dict': '0f638089952c3e69463a5dd10099d5b7924578e2c6b04a6013b807ba10db07b1',
+ 'core-queue/claim/unclaim_recovery_required/dict': '1906ba8d649b94969901510fc7686a427227fda358b6f0f32773210fd38de16e',
  'core-queue/claim/queue_lock_timeout/dict': '7739bdc289ed6886be4312eb5203ecc618159b385db2564aadd1cb03c929d4eb',
  'core-queue/claim/item_missing/dict': '85cf7a4a7babacd5224dc12334cbb6302f60f6bc33d3a3667f4cc74b1f58656d',
  'core-queue/claim/stale_revision/dict': 'd14544c058b8556442703607c63beda479c1dbb4b959c0bec38ff1a1d52b78cc',
@@ -1476,7 +1477,7 @@ OPERATION_GOLDENS = {'cli-queue/add/valid/text': 'fe60c6c01c8f5adeaa653e6bf7a8fc
  'core-queue/release/queue_size_limit/dict': 'a5c0dad600c7cc498ae3e40b82e987454f67eefe687fddc2361ac93f979f132c',
  'core-queue/release/unsupported_platform/dict': '6538f2912f2a97e0c51f5cd9af5756995096937c6387c28d0ff7de441291f405',
  'core-queue/release/queue_io_unavailable/dict': '601d21284be47d94ddcb2f90b9e1338da2fa162bc9ac927f95b4e9741e256ea2',
- 'core-queue/release/unclaim_recovery_required/dict': '33df79ca76112cfb84a61bedc0ae8ea63f90c8442de09d6d9eca79823733804a',
+ 'core-queue/release/unclaim_recovery_required/dict': 'a4bfac261dee80960201c7ef3a128d965dd881895d206e04186371a5450482d5',
  'core-queue/release/queue_lock_timeout/dict': 'cf698dfdd97abbfeedcf9a867995273ccac64e2eb59f655871cd05d1aba9b26e',
  'core-queue/release/item_missing/dict': 'bfba77d4480e22d080aec23200025ea0bc53bec2665c77927400a70953c15cd9',
  'core-queue/release/stale_revision/dict': '3039ef59fd14380142132480af7d41b99e25022f6bcfba2feac53ac911ae5c7f',
@@ -1493,7 +1494,7 @@ OPERATION_GOLDENS = {'cli-queue/add/valid/text': 'fe60c6c01c8f5adeaa653e6bf7a8fc
  'core-queue/unclaim/queue_size_limit/dict': '0e84e1320da05f0ea3bc26c2427f4d2fb4bb5d8205d8e16057e7db95442eab98',
  'core-queue/unclaim/unsupported_platform/dict': '167ea7453eb1b2208e17da2655d0d47349f0dc89bed3f65a49462e055de4cdfb',
  'core-queue/unclaim/queue_io_unavailable/dict': 'f0475ed9e2ab8d95388a5adbe4f7937fd1ad383264c7fc984645e444186a4797',
- 'core-queue/unclaim/unclaim_recovery_required/dict': 'c8fe64aa4c621591586a5e5550eb90f6803758af477ac345c8008e50ac13b7c5',
+ 'core-queue/unclaim/unclaim_recovery_required/dict': '699ce30d68b9eddb9bfb69a2d446231f486cab2ca8908bbff9d4392f129596c8',
  'core-queue/unclaim/queue_lock_timeout/dict': 'd21cc1117bcbc9141d081ae2acc629889bc12deeddbf91802a99248dc1271d07',
  'core-queue/unclaim/item_missing/dict': '2049cf09e3756e1ade4b6a7fd4a1dafa0d921ae9449627205d59a0e58f78b714',
  'core-queue/unclaim/stale_revision/dict': '317b984d6ba9db6fad5a83ea7ab83116874fbaa8d1741bfb86e2a4e02d4fe0c7',
@@ -1502,7 +1503,7 @@ OPERATION_GOLDENS = {'cli-queue/add/valid/text': 'fe60c6c01c8f5adeaa653e6bf7a8fc
  'core-queue/unclaim/writer_not_stopped/dict': '8df21067e1acf192e8552d2394a91169d6bfd02ca51fc78202fa25b6e9ae1a40',
  'core-queue/unclaim/invalid_item/dict': '7682b940c50da9ed952866522aa9beb1756dcfd06d4596bf48144f23e273453b',
  'core-queue/unclaim/credential_like_text/dict': 'fd5ce42284f23d2176dc5feb625d98dd5067e60bf73b19eb1d321097a13435d8',
- 'core-queue/unclaim/unclaim_lease_refused/dict': '2503f31b569b781908f63ae7b57fcb2e0976c8df75c5940c0444e5b25b96a528',
+ 'core-queue/unclaim/unclaim_lease_refused/dict': '7f78fbde2ffe6f4ccb2359eb7178c62dd9d6242ba463d37927a869d875eac1ce',
  'core-queue/unclaim/unclaim_event_unavailable/dict': 'ba93eaf5448b869775d9a016eb98f060d8fc2df3e81e58f9d41f5006564c5809',
  'core-queue/unclaim/item_done/dict': 'e7be3b9f08663fac2f74e2294178117ecc53712cffa51e1d690f80a7899f6260',
  'core-queue/unclaim/malformed_identifier/dict': 'a1d1e6bbf34e1f0a11d037ce28ef359b528569dcda040d25941dcc7d2d2ee24a',
@@ -1514,7 +1515,7 @@ OPERATION_GOLDENS = {'cli-queue/add/valid/text': 'fe60c6c01c8f5adeaa653e6bf7a8fc
  'core-queue/done/queue_size_limit/dict': '5275a13308b631cfe193b731dbb7537c2bf6da450ba58fb5019803d32ee00d02',
  'core-queue/done/unsupported_platform/dict': '793368da2e2be43759a652f2850f579a4385e64988b85551f7fd2f952c3f32c0',
  'core-queue/done/queue_io_unavailable/dict': '15cda7ef56b8fe55f7306a9855a8a9a2733ad13fae7f59005d70630949122f78',
- 'core-queue/done/unclaim_recovery_required/dict': '98d19d3f9e3c0d258c95dd431846030c219d2ebed032f4ba4a7c13dd2be45692',
+ 'core-queue/done/unclaim_recovery_required/dict': '24e6b7f6cb1d9983d0b48e684fbc86f3d8ea6076bf749d627c450e9ea9c1d687',
  'core-queue/done/queue_lock_timeout/dict': '50bae5e5bff01926ed9872f688738744c84c9ba3b29a64fa7ca3fc9ad12db272',
  'core-queue/done/item_missing/dict': 'a6d1151bbf5952078f361eb73135d8011a180226c589482908f125bed1e61d5f',
  'core-queue/done/stale_revision/dict': '7b2c390a4a4aad036400ad6ed53703aea29da8fc0a64859fbe036f70960ada44',
@@ -1532,7 +1533,7 @@ OPERATION_GOLDENS = {'cli-queue/add/valid/text': 'fe60c6c01c8f5adeaa653e6bf7a8fc
  'core-queue/audit/queue_size_limit/dict': 'ba2f529bb06ad63ba2c893bf3c8f8331807b0c802f348578c651cf53959a1bf0',
  'core-queue/audit/unsupported_platform/dict': '7ddf6bae902ced5c30451c5bcd9c62beb80c74e0d7c2e71918268ccdef27fb3d',
  'core-queue/audit/queue_io_unavailable/dict': '1009cc95cc9349829123a6f1ed3de48ef77d139a2801a81b4911f8bd0b00b958',
- 'core-queue/audit/unclaim_recovery_required/dict': 'e17c99286a5a8d7ddb758d65a6f23e3c619c83d1cd98370c93f5726955cb2e18',
+ 'core-queue/audit/unclaim_recovery_required/dict': '2150768ae5a1a6ca5faf5ca63ae2392c3b97bcaaf2e0bdd1a4d33d6b4e15ad23',
  'core-queue/compact/valid/dict': 'd9d28429080e7e43bd5d4645d1bb79787392742f1a827e83529e3d77346277ef',
  'core-queue/compact/oversized/dict': '6336ba20cdd27c243554063b747a97b933104e39e293e5315cae3fbc78308921',
  'core-queue/compact/invalid_arguments/dict': '6336ba20cdd27c243554063b747a97b933104e39e293e5315cae3fbc78308921',
@@ -1540,7 +1541,7 @@ OPERATION_GOLDENS = {'cli-queue/add/valid/text': 'fe60c6c01c8f5adeaa653e6bf7a8fc
  'core-queue/compact/queue_size_limit/dict': '69c8245416c7f690ab6ac5fc8e60fa0eef3de0a73593be63fb198182094ceb18',
  'core-queue/compact/unsupported_platform/dict': 'fdc3d060fb3cd5e8e392b892aab62ee61f1bffb0ccbbff8f42ce1e387ea8b636',
  'core-queue/compact/queue_io_unavailable/dict': '6b4c6c6a7293af88d3d74576e5c839e7b77f129631379b34821484022fc99553',
- 'core-queue/compact/unclaim_recovery_required/dict': '4bd0f7c7e9e4f919a85839121624accab11d45435763860b02b581df934eeec5',
+ 'core-queue/compact/unclaim_recovery_required/dict': '465c6adab5b2f8892720e937d7093aad9865f88b27fb75594b96ca66ebccfca2',
  'core-queue/compact/queue_lock_timeout/dict': 'd6b8163cff25a2506ddf90a9b2cedb3807c15df49b88f1d69b051456c4f7f53b',
  'core-queue/compact/queue_history_limit/dict': 'c35fc4569e1aefbceba7fe993b8135d73e19f67c19e6fa7421ff732ae5c38acf',
  'lease/claim/valid/text': '29a7433b630730b10b2f93ad47d8fb7826715b8a16794e67967366afcc5300b0',
@@ -2395,3 +2396,88 @@ def test_public_operation_byte_goldens(workspace, capsys, monkeypatch, family, v
         assert code != 0, (family, verb, case, stdout, stderr)
     key = "/".join((family, verb, case, mode))
     _compat_observation(key, [code, stdout, stderr], workspace)
+
+
+def _shell_command(text):
+    quote = None
+    for index, char in enumerate(text):
+        if quote:
+            if char == quote:
+                quote = None
+            continue
+        if char in "'\"":
+            quote = char
+            continue
+        if char == ";":
+            return text[:index]
+    return text
+
+
+@pytest.mark.parametrize("workspace_name", ["plain", "work space qu'ote; literal"])
+def test_cli_recovery_from_another_cwd_names_and_reaches_its_workspace(
+        workspace, tmp_path, capsys, monkeypatch, workspace_name):
+    """An explicit --workspace copied from another directory still acts on the issuer."""
+    from aegis_core.workspace.binding import resolve_cli_root
+
+    workspace = workspace.rename(tmp_path / workspace_name)
+    os.environ.pop("AEGIS_WORKSPACE", None)
+    other = tmp_path / "elsewhere"
+    shutil.copytree(workspace, other)
+    owner = team.default_owner()
+    added = team_queue.add(workspace, {"id": "ONE", "title": "Work", "paths": ["src/**"], "capabilities": []},
+                           now=100, caller=owner)
+    claimed = team_queue.claim(workspace, "ONE", expect=added["item"]["revision"], lane="writer",
+                               now=101, caller=owner, branch="lane/writer")
+    assert not claimed["refused"], claimed
+    # Queue claim does not create the git lease. A live lease makes the first
+    # unclaim call _release_lease, which this test fails once.
+    team.claim(workspace, "writer", ["src/**"], owner=owner)
+    revision = claimed["item"]["revision"]
+    original = team_claims._release_lease
+    calls = {"n": 0}
+
+    def fail_once(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("injected")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(team_claims, "_release_lease", fail_once)
+    previous = os.getcwd()
+    os.chdir(other)
+    try:
+        code = main(["--workspace", str(workspace), "team", "queue", "unclaim", "ONE",
+                     "--expect", revision, "--lane", "writer", "--writer-stopped", "--json"])
+        refused = json.loads(capsys.readouterr().out)
+        assert code == 1 and refused["reason"] == "unclaim_recovery_required"
+        blocker = refused["blockers"][0]
+        assert (blocker["caller"], blocker["revision"], blocker["reason_text"]) == (owner, revision, "")
+        command = _shell_command(blocker["next_action"])
+        argv = shlex.split(command)
+        assert "--workspace" in argv, command
+        token = argv[argv.index("--workspace") + 1]
+        assert token == str(workspace)
+        assert resolve_cli_root(token, other) == workspace.resolve()
+        # The refusal sentence introduces the command. Replay from the program name.
+        replay = argv[argv.index("aegis") + 1:]
+        for verb, extra in (
+            ("list", []),
+            ("audit", []),
+            ("release", ["ONE", "--expect", revision, "--lane", "writer"]),
+        ):
+            code = main(["--workspace", str(workspace), "team", "queue", verb, *extra, "--json"])
+            payload = json.loads(capsys.readouterr().out)
+            assert code == 1 and payload["reason"] == "unclaim_recovery_required"
+            again = shlex.split(_shell_command(payload["blockers"][0]["next_action"]))
+            assert again[again.index("--workspace") + 1] == str(workspace)
+            assert (payload["blockers"][0]["caller"], payload["blockers"][0]["revision"],
+                    payload["blockers"][0]["reason_text"]) == (owner, revision, "")
+        code = main(replay + ["--json"])
+        recovered = json.loads(capsys.readouterr().out)
+        assert code == 0 and recovered["refused"] is False, recovered
+        assert recovered["item"]["state"] == "queued"
+        assert not (other / ".aegis" / "state" / "team-queue.json").exists()
+        listed = team_queue.list(workspace, now=102)
+        assert listed["refused"] is False and listed["items"][0]["state"] == "queued"
+    finally:
+        os.chdir(previous)

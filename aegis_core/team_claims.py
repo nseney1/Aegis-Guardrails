@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 import re
 import secrets
 import shlex
 
 from aegis_core import events, gitsafe, storage, team, team_paths
+from aegis_core.primitives import sanitize_display
+from aegis_core.redaction import redact_command_secrets
 
 __all__ = ["ClaimRefusal", "validate_pending", "transition", "fingerprint",
            "recovery_refusal", "observe_leases"]
@@ -66,13 +69,94 @@ def validate_pending(state, key_valid, text_valid):
             and row["revision"] == intent["revision"])
 
 
-def _cause_blocker(cause, lane, lease_oid):
+# Same bound as valid_workspace_spelling, applied before any display scan.
+_WORKSPACE_SPELLING_LIMIT = 32768
+_WORKSPACE_SEPARATORS = 256
+RECOVERY_TEXT_LIMIT = 4096
+_RETURN_TO_WORKSPACE = (
+    "return to the workspace that issued this command; its path cannot be shown safely")
+
+
+def _single_line(text):
+    """True when text has no control, C1, or Unicode line separator."""
+    return not any(ord(char) < 32 or 127 <= ord(char) <= 159 or char in "\u2028\u2029"
+                   for char in text)
+
+
+def _workspace_spelling(root):
+    """Absolute spelling that can be shown unchanged, or None. Does not touch the filesystem."""
+    text = str(root) if isinstance(root, Path) else root
+    if (type(text) is not str or not text or len(text) > _WORKSPACE_SPELLING_LIMIT or
+            text.count("/") + text.count("\\") > _WORKSPACE_SEPARATORS or not _single_line(text) or
+            not Path(text).is_absolute() or ".." in re.split(r"[\\/:]", text)):
+        return None
+    try:
+        encoded = text.encode("utf-8", "strict")
+        if encoded.decode("utf-8", "strict") != text:
+            return None
+    except UnicodeError:
+        return None
+    if sanitize_display(text, max_len=None) != text or redact_command_secrets(text) != text:
+        return None
+    return text
+
+
+def _display_stable(text, limit):
+    """Canonicalize, then redact, then truncate. Identity means nothing was altered."""
+    if type(text) is not str or len(text) > limit or not _single_line(text):
+        return False
+    canonical = sanitize_display(text, max_len=None)
+    if canonical != text:
+        return False
+    redacted = redact_command_secrets(canonical)
+    if redacted != text:
+        return False
+    return sanitize_display(redacted, max_len=limit) == text
+
+
+def _quote_workspace(text, room):
+    """Quote only after the unquoted spelling fits. A longer quote is not emitted."""
+    if room < 1 or len(text) > room:
+        return None
+    quoted = shlex.quote(text)
+    if len(quoted) > room:
+        return None
+    try:
+        parts = shlex.split(quoted)
+    except ValueError:
+        return None
+    if parts != [text]:
+        return None
+    return quoted
+
+
+def _anchored(root, command, *, prefix="", trailer=""):
+    """One faithful ``--workspace``, or an explicit return sentence. Never both."""
+    limit = RECOVERY_TEXT_LIMIT
+    phrase = _RETURN_TO_WORKSPACE
+    hidden = prefix + command + "; " + phrase + trailer
+    spelling = _workspace_spelling(root)
+    if spelling is not None:
+        room = limit - len(prefix) - len(command) - len(" --workspace ") - len(trailer)
+        quoted = _quote_workspace(spelling, room)
+        if quoted is not None:
+            field = prefix + command + " --workspace " + quoted + trailer
+            if _display_stable(field, limit):
+                return field
+    if _display_stable(hidden, limit):
+        return hidden
+    return phrase
+
+
+def _cause_blocker(cause, lane, lease_oid, root):
     """One fixed category plus lane, lease OID, and action when those are already safe."""
     if cause not in _CAUSE_REASONS:
         return None
     if cause == "queue_size_limit":
-        return {"refused": True, "reason": cause,
-            "next_action": "Complete the recorded unclaim recovery, then run aegis team queue compact before work needing more queue space."}
+        return {"refused": True, "reason": cause, "next_action": _anchored(
+            root, "aegis team queue compact",
+            prefix="Complete the recorded unclaim recovery, then run ",
+            trailer=" before work needing more queue space.")}
     if cause == "unclaim_event_unavailable":
         return {"refused": True, "reason": cause,
             "next_action": "Ask the coordinator to reconcile the unreadable or oversized events log from trusted evidence before retrying unclaim; its bounded reader accepts at most 16 MiB."}
@@ -87,10 +171,12 @@ def _cause_blocker(cause, lane, lease_oid):
     if safe_oid is not None:
         entry["lease_oid"] = safe_oid
     if safe_lane is not None and safe_oid is not None:
-        entry["next_action"] = ("Inspect the covering lease before retrying: aegis team release "
-            + safe_lane + " --expect " + safe_oid)
+        entry["next_action"] = _anchored(
+            root, "aegis team release " + safe_lane + " --expect " + safe_oid,
+            prefix="Inspect the covering lease before retrying: ")
     else:
-        entry["next_action"] = "aegis team list --json; ask the coordinator to repair the unreadable ref"
+        entry["next_action"] = _anchored(
+            root, "aegis team list --json", trailer="; ask the coordinator to repair the unreadable ref")
     return entry
 
 
@@ -113,7 +199,7 @@ def _recovery_cause(error):
     return None, None, None
 
 
-def recovery_refusal(intent, *, cause=None, lane=None, lease_oid=None):
+def recovery_refusal(intent, *, root=None, cause=None, lane=None, lease_oid=None):
     """Give every pending refusal a concrete, safely quoted retry command."""
     command = ("aegis team queue unclaim " + shlex.quote(intent["id"]) +
                " --lane " + shlex.quote(intent["lane"]) + " --expect " + intent["revision"] +
@@ -122,36 +208,41 @@ def recovery_refusal(intent, *, cause=None, lane=None, lease_oid=None):
         "refused": True, "reason": "unclaim_recovery_required",
         "item_id": intent["id"], "lane": intent["lane"], "revision": intent["revision"],
         "caller": intent["caller"], "reason_text": intent["reason"],
-        "next_action": "Retry as the recorded caller: " + command}]
-    extra = _cause_blocker(cause, lane, lease_oid)
+        "next_action": _anchored(root, command, prefix="Retry as the recorded caller: ")}]
+    extra = _cause_blocker(cause, lane, lease_oid, root)
     if extra is not None:
         blockers.append(extra)
     return ClaimRefusal("unclaim_recovery_required", blockers)
 
 
-def _lease_refusal(lane, oid):
-    command = (f"aegis team release {lane} --expect {oid}" if team.valid_lane(lane)
-               else "aegis team list --json; ask the coordinator to repair the unreadable ref")
+def _lease_refusal(root, lane, oid):
+    if team.valid_lane(lane):
+        command = f"aegis team release {lane} --expect {oid}"
+        trailer = ""
+    else:
+        command = "aegis team list --json"
+        trailer = "; ask the coordinator to repair the unreadable ref"
     return ClaimRefusal("unclaim_lease_refused", [{"lane": lane, "lease_oid": oid,
         "reason": "unclaim_lease_refused", "refused": True,
-        "next_action": "Inspect the covering lease before retrying: " + command}])
+        "next_action": _anchored(root, command, prefix="Inspect the covering lease before retrying: ",
+                                 trailer=trailer)}])
 
 
 def _preflight(root, row, lane, caller, now):
     found = team.read_leases(root)
     scope = team_paths.claim_paths(row["item"]["paths"])
     for bad in found.unreadable:
-        raise _lease_refusal(bad.lane, bad.oid)
+        raise _lease_refusal(root, bad.lane, bad.oid)
     selected = None
     for lease in found.leases:
         if not team_paths.overlap(lease.path_set, scope):
             continue
         if lease.lane != lane:
             if not lease.expired(now):
-                raise _lease_refusal(lease.lane, lease.oid)
+                raise _lease_refusal(root, lease.lane, lease.oid)
             continue
         if lease.owner != caller:
-            raise _lease_refusal(lease.lane, lease.oid)
+            raise _lease_refusal(root, lease.lane, lease.oid)
         selected = lease.oid
     return selected
 
@@ -243,7 +334,7 @@ def _record(root, intent, shown):
               "from_state": "claimed", "to_state": "queued",
               "released_lease_ids": intent.get("released_lease_ids", [])}
     if events.try_append(root, "lease_claimed", "queue_unclaim", shown(detail)) is not None:
-        raise recovery_refusal(intent, cause="queue_io_unavailable")
+        raise recovery_refusal(intent, root=root, cause="queue_io_unavailable")
 
 
 def _initial_intent(root, state, identifier, expect, lane, reason, caller, now, decode):
@@ -272,11 +363,11 @@ def _check_leases(root, state, intent, now, *, released=False):
     selected = _preflight(root, state["items"][intent["id"]], intent["lane"], intent["caller"], now)
     if oid is None:
         if selected is not None:
-            raise _lease_refusal(intent["lane"], selected)
+            raise _lease_refusal(root, intent["lane"], selected)
     else:
         current = gitsafe.read_ref(root, team.lane_ref(intent["lane"]))
         if (released and current is not None) or (not released and current not in (None, oid)):
-            raise _lease_refusal(intent["lane"], current or oid)
+            raise _lease_refusal(root, intent["lane"], current or oid)
 
 
 def _release_lease(root, lane, oid, *, caller, shown, recovering=False):
@@ -321,7 +412,7 @@ def _release(root, state, intent, now, recovering, receipt, publish, progress):
     if recovering and current is None:
         return
     if recovering and receipt is not None:
-        raise recovery_refusal(intent, cause="unclaim_lease_refused", lane=intent["lane"], lease_oid=current)
+        raise recovery_refusal(intent, root=root, cause="unclaim_lease_refused", lane=intent["lane"], lease_oid=current)
     progress["release_attempted"] = True
     try:
         confirmed = _release_lease(root, intent["lane"], oid, caller=intent["caller"],
@@ -333,7 +424,7 @@ def _release(root, state, intent, now, recovering, receipt, publish, progress):
         progress["release_attempted"] = False
         return
     if not confirmed:
-        raise recovery_refusal(intent, cause="unclaim_lease_refused", lane=intent["lane"], lease_oid=oid)
+        raise recovery_refusal(intent, root=root, cause="unclaim_lease_refused", lane=intent["lane"], lease_oid=oid)
     intent["released_lease_ids"] = [oid]
     publish(root, state)
 
@@ -348,12 +439,12 @@ def transition(root, state, *, identifier, expect, lane, reason, caller, writer_
         if recovering:
             if ((intent["id"], intent["revision"], intent["lane"], intent["caller"]) != (
                     identifier, expect, lane, caller) or (reason and reason != intent["reason"])):
-                raise recovery_refusal(intent)
+                raise recovery_refusal(intent, root=root)
             receipt = _event_state(root, intent["to_revision"], decode)
             if receipt is not None:
                 if (receipt.get("writer_stopped") is not True or
                         receipt.get("released_lease_ids") != intent.get("released_lease_ids", [])):
-                    raise recovery_refusal(intent, cause="unclaim_event_unavailable")
+                    raise recovery_refusal(intent, root=root, cause="unclaim_event_unavailable")
                 progress["receipt"] = True
             intent["writer_stopped"] = writer_stopped
         else:
@@ -364,7 +455,7 @@ def transition(root, state, *, identifier, expect, lane, reason, caller, writer_
             try:
                 publish(root, state)
             except (OSError, RuntimeError, gitsafe.GitError):
-                raise recovery_refusal(intent, cause="queue_io_unavailable") from None
+                raise recovery_refusal(intent, root=root, cause="queue_io_unavailable") from None
         _release(root, state, intent, now, recovering, receipt, publish, progress)
         _check_leases(root, state, intent, now, released=intent["lease_oid"] is not None)
         if receipt is None:
@@ -389,10 +480,10 @@ def transition(root, state, *, identifier, expect, lane, reason, caller, writer_
             # the lease reader did not supply one.
             if isinstance(error, team.LeaseRefused) and cause == "unclaim_lease_refused" and lease_oid is None:
                 lease_oid = intent.get("lease_oid")
-            raise recovery_refusal(intent, cause=cause, lane=cause_lane, lease_oid=lease_oid) from None
+            raise recovery_refusal(intent, root=root, cause=cause, lane=cause_lane, lease_oid=lease_oid) from None
         restore()
         if isinstance(error, team.LeaseRefused):
-            raise _lease_refusal(lane, error.current or intent["lease_oid"]) from None
+            raise _lease_refusal(root, lane, error.current or intent["lease_oid"]) from None
         raise
     except (OSError, ValueError, RuntimeError, gitsafe.GitError) as error:
         if intent is not None:
@@ -400,7 +491,7 @@ def transition(root, state, *, identifier, expect, lane, reason, caller, writer_
             if not recovering and not progress["release_attempted"] and not progress["receipt"]:
                 restore()
                 raise ClaimRefusal("queue_size_limit" if size_failure else "queue_io_unavailable") from None
-            raise recovery_refusal(intent, cause="queue_size_limit" if size_failure else "queue_io_unavailable") from None
+            raise recovery_refusal(intent, root=root, cause="queue_size_limit" if size_failure else "queue_io_unavailable") from None
         raise
 
 
