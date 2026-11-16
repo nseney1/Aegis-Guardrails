@@ -1,8 +1,7 @@
 """Read-only mining lint of exact accepted-rule bytes and final destinations.
 
-Checks 1--5 refuse drafts, 6 warns, and 7 is explicitly deferred to
-M2C-SCAN-SIM. No proposal, rule, ledger or decision is written. Filesystem
-candidates use bounded confined reads; rule sets use the runtime inventory.
+Checks 1--5 refuse drafts; 6--7 warn. No proposal, rule, ledger or decision is written.
+Filesystem candidates use bounded confined reads; rule sets use the runtime inventory.
 Unsupported platforms report a fixed refusal. In-memory lint works on every host.
 """
 from __future__ import annotations
@@ -25,6 +24,9 @@ from aegis_core.ast.detect import NATIVE_SOURCE_EXTENSIONS
 from aegis_core.ast.driver_errors import ASTDriverError
 from aegis_core.ast.policy import ASTExtractionError, evaluate_forbid_ast_structured, extract_normalized_ast
 from aegis_core.ast.source import decode_python_source
+from aegis_core import scan as scan_service
+from aegis_core.guidance_grammar import heading_has_slot, raw_do_instruction_span, raw_evidence_span
+from aegis_core.guidance_projection import contains_control_characters, detail_instruction_visible
 from aegis_core.packs import MAX_RULE_BYTES, PackPathError, parse_pack_path
 from aegis_core.primitives import sanitize_display
 from aegis_core.redaction import redact_insight_text
@@ -152,46 +154,31 @@ def _accepted(rule, path):
 
 
 def _guidance(body):
-    """Exclude reserved Evidence sections before selecting the actual Do line."""
-    lines, evidence, in_do, do_index = [], False, False, None
-    for raw, _, kind, _ in _markdown_lines(body):
-        line = raw.rstrip("\r\n")
-        if not lines and not line.strip():
-            continue
-        heading = _HEADING.match(line) if kind == "heading" else None
-        if heading and len(heading[1]) <= 2:
-            title = (heading[2] or "").strip().rstrip("#").rstrip().casefold()
-            evidence = len(heading[1]) == 2 and title == "evidence"
-            in_do = len(heading[1]) == 2 and title == "do"
-        if evidence:
-            continue
-        if in_do and do_index is None and _CONTAINER_PREFIX.sub("", line).strip() and kind == "inline":
-            do_index = len(lines)
-        lines.append(line)
-    return lines, do_index
+    """Derive retained text and the Do prefix only from scan's raw grammar."""
+    decision, _, end = raw_evidence_span([body], heading_has_slot, contains_control_characters)
+    retained = body[:end] if decision == 1 else body
+    span = raw_do_instruction_span([retained], heading_has_slot, contains_control_characters)
+    prefix = retained[:span[3]] if decision >= 0 and span[0] == 1 else None
+    return retained, prefix
 
 
-def _content(rule, lines, do_index, commands):
+def _content(rule, body, retained, prefix, commands):
     findings = []
     for field in ("hypothesis", "prediction"):
         value = rule.meta.get(field)
         if not isinstance(value, str) or not value.strip():
             findings.append(_finding(2, "required_content", "hypothesis and prediction must be non-empty text"))
-    fields = tuple(str(rule.meta.get(k, "")) for k in ("hypothesis", "prediction")) + ("\n".join(lines),)
+    fields = tuple(str(rule.meta.get(k, "")) for k in ("hypothesis", "prediction")) + (retained,)
     guidance = "\n\n".join(fields)
     known = set(DEFAULT_SLOTS)
     references = list(_REF.finditer(guidance))
     if any(ref[1] not in known for ref in references) or "${SLOT" in _REF.sub("", guidance):
         findings.append(_finding(3, "unknown_slot", "unknown slot or incomplete ${SLOT.*} placeholder"))
-    if do_index is None or do_index >= 8:
+    if prefix is None or not all(
+            detail_instruction_visible(body, prefix,
+                                       SlotRegistry({**DEFAULT_SLOTS, **profile, **commands}).sanitized())
+            for profile in PLATFORM_SLOT_PROFILES.values()):
         findings.append(_finding(2, "do_window", "first Do instruction must fit the rendered 300-character Detail window"))
-    else:
-        for profile in PLATFORM_SLOT_PROFILES.values():
-            registry = SlotRegistry({**DEFAULT_SLOTS, **profile, **commands}).sanitized()
-            rendered = [registry.resolve(line.strip(), strict=False) for line in lines[:do_index + 1]]
-            if len(" ".join(rendered)) > 300:
-                findings.append(_finding(2, "do_window", "first Do instruction must fit the rendered 300-character Detail window"))
-                break
     return findings, fields
 
 
@@ -718,21 +705,21 @@ def lint_rule(data, path, *, original=None, command_slots=None, sources=None):
     return _lint_loaded(rule, data, path, original, command_slots, sources)
 
 
-def _lint_loaded(rule, data, path, original, command_slots, sources, source_error=None):
+def _lint_loaded(rule, data, path, original, command_slots, sources, source_error=None, simulation="not evaluated: no scan workspace"):
     try:
         commands = _command_roles(command_slots)
     except _LintError as error:
         return _refusal(path, error.code)
     body = split_frontmatter(data.decode("utf-8-sig"))[2]
-    lines, do_index = _guidance(body)
-    findings, guidance = _content(rule, lines, do_index, commands)
+    retained, prefix = _guidance(body)
+    findings, guidance = _content(rule, body, retained, prefix, commands)
     findings.extend(_names(guidance, commands))
     findings.extend(_enforcement(rule, original))
     if not rule.target_paths and "forbid_ast" not in rule.meta:
         findings.append(_finding(6, "target_paths", "target_paths is empty without forbid_ast", "warning"))
     dry, hits, checked = ([source_error], None, 0) if source_error else _dry_run(rule, sources)
     findings.extend(dry)
-    findings.append(_finding(7, "scan_simulation", "not evaluated: pending M2C-SCAN-SIM", "warning"))
+    findings.append(_finding(7, "scan_simulation", simulation, "warning"))
     return LintResult(display_text(path), tuple(findings), hits, checked)
 
 
@@ -889,7 +876,7 @@ def _rules(root, paths):
     oversized.difference_update(prefix_paths - {rule.path for rule in loaded.rules})
     identities = Counter(rule_path_id(path) for path in oversized)
     identities.update(rule.id for rule in loaded.rules if rule.path not in oversized)
-    return selected, loaded.rules, oversized & selected.keys(), identities
+    return selected, loaded.rules, oversized & selected.keys(), identities, (inventory, loaded)
 
 
 def _sources(root, rules):
@@ -938,7 +925,8 @@ def lint_workspace(root, paths=(), *, command_slots=None):
         return (_refusal("", "invalid_input"),)
     try:
         root = _workspace_root(root)
-        snapshot, records, oversized, identities = _rules(root, paths)
+        snapshot, records, oversized, identities, captured = _rules(root, paths)
+        simulations = (getattr(scan_service, "simulate_rule_selection", None) or (lambda *_: {}))(root, *captured)
         duplicates = {name for name, count in identities.items() if count > 1}
         selected = sorted((rule for rule in records if rule.path in snapshot), key=lambda rule: rule.path)
         gates = [rule for rule in selected if rule.path not in oversized and _accepted(rule, rule.path)
@@ -971,7 +959,8 @@ def lint_workspace(root, paths=(), *, command_slots=None):
                 result = LintResult(display_text(rule.path), (_finding(1, "loader", "final accepted bytes or destination fail the rule loader"),))
             else:
                 result = _lint_loaded(rule, snapshot[rule.path], rule.path, None, command_slots, sources,
-                                      source_error if rule in gates else None)
+                                      source_error if rule in gates else None,
+                                      simulations.get(rule.id, "not evaluated: scan API unavailable"))
             results.append(result)
         return tuple(results)
     except _LintError as error:

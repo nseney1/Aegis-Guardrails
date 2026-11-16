@@ -88,15 +88,15 @@ parse_time = _display_refusals(parse_time, trusted_values=True)
 def fields(value, required, optional=()):
     """Keep the pinned field contract, displaying each unexpected raw key."""
     require(isinstance(value, dict), "expected a JSON object")
-    require(set(required) <= value.keys(), "missing fields: " + ", ".join(sorted(set(required) - value.keys())))
+    require(set(required) <= value.keys(), lambda: "missing fields: " + ", ".join(sorted(set(required) - value.keys())))
     require(value.keys() <= set(required) | set(optional),
-            "unexpected fields: " + ", ".join(_display(key) for key in sorted(
+            lambda: "unexpected fields: " + ", ".join(_display(key) for key in sorted(
                 value.keys() - set(required) - set(optional))))
 
 
 def absolute(value, label):
     path = Path(text(value, label))
-    require(path.is_absolute() and ".." not in path.parts, label + " must be absolute")
+    require(path.is_absolute() and ".." not in path.parts, lambda: label + " must be absolute")
     return value
 
 
@@ -161,11 +161,11 @@ class Ledger:
         self.granted_counts = dict.fromkeys(KINDS, 0)
 
     def initiative(self, identifier):
-        require(identifier in self.initiatives, "initiative is not registered: " + _display(identifier))
+        require(identifier in self.initiatives, lambda: "initiative is not registered: " + _display(identifier))
         return self.initiatives[identifier]
 
     def request(self, identifier):
-        require(identifier in self.requests, "unknown request: " + _display(identifier))
+        require(identifier in self.requests, lambda: "unknown request: " + _display(identifier))
         return self.requests[identifier]
 
     def held(self, kind):
@@ -176,7 +176,7 @@ class Ledger:
                 if b not in self.initiatives or self.initiatives[b]["state"] != "done"]
 
     def apply(self, event):
-        require(event["kind"] in APPLY, "unknown workspace event: " + _display(event["kind"]))
+        require(event["kind"] in APPLY, lambda: "unknown workspace event: " + _display(event["kind"]))
         require(event["kind"] == "init" or self.limits is not None, "workspace store is not initialized")
         APPLY[event["kind"]](self, event["data"], event)
         self.seq = event["seq"]
@@ -207,7 +207,7 @@ def apply_set_limits(ledger, data, _event):
         kind, ceiling = LIMIT_FIELDS[name]
         integer(data[name], name, maximum=ceiling)
         held = ledger.granted_counts[kind]
-        require(data[name] >= held, "%s %d is below the %d granted %s requests" % (name, data[name], held, kind))
+        require(data[name] >= held, lambda: "%s %d is below the %d granted %s requests" % (name, data[name], held, kind))
     for name in changes:
         ledger.limits[LIMIT_FIELDS[name][0]] = data[name]
 
@@ -216,13 +216,13 @@ def require_unclaimed_lanes(ledger, repository, lanes, identifier):
     for other in ledger.initiatives.values():
         if other["id"] != identifier and other["repository"] == repository:
             taken = sorted(set(lanes) & set(other["lanes"]))
-            require(not taken, "lane already belongs to initiative " + other["id"] + ": "
+            require(not taken, lambda: "lane already belongs to initiative " + other["id"] + ": "
                     + ", ".join(_display(lane) for lane in taken))
 
 
 def apply_register(ledger, data, event):
     validate_initiative(data)
-    require(data["id"] not in ledger.initiatives, "initiative already registered: " + data["id"])
+    require(data["id"] not in ledger.initiatives, lambda: "initiative already registered: " + data["id"])
     require_unclaimed_lanes(ledger, data["repository"], data.get("lanes", []), data["id"])
     ledger.initiatives[data["id"]] = {
         "touched_paths": [], "blocked_by": [], "checkouts": [], "lanes": [], **data, "state": "active",
@@ -242,14 +242,14 @@ def apply_update(ledger, data, _event):
         if data["state"] == "done":
             require(not any(r["initiative"] == initiative["id"] and r["state"] in ("queued", "granted")
                             for r in ledger.requests.values()),
-                    "initiative still holds capacity or queued requests: " + initiative["id"])
+                    lambda: "initiative still holds capacity or queued requests: " + initiative["id"])
     initiative.update({key: value for key, value in data.items() if key not in ("initiative", "source")})
 
 
 def apply_request(ledger, data, event):
     fields(data, {"request_id", "initiative", "kind", "holder"}, {"reference", "supersedes"})
     initiative = ledger.initiative(data["initiative"])
-    require(initiative["state"] == "active", "initiative is not active: " + initiative["id"])
+    require(initiative["state"] == "active", lambda: "initiative is not active: " + initiative["id"])
     require(isinstance(data["kind"], str) and data["kind"] in KINDS, "invalid kind")
     text(data["holder"], "holder", 256)
     if "reference" in data:
@@ -265,7 +265,7 @@ def apply_request(ledger, data, event):
         require(all(previous[key] == data[key] for key in ("initiative", "holder", "kind")),
                 "superseded request must have the same initiative, holder and kind")
         require(previous["state"] != "granted",
-                identifier + " is granted: accepted work is never preempted; wait for its release")
+                lambda: identifier + " is granted: accepted work is never preempted; wait for its release")
         require(previous["state"] == "queued", "superseded request is not queued")
     holder = (data["kind"], data["holder"])
     require(previous is not None or holder not in ledger.open_holders, "holder already has an open request")
@@ -282,7 +282,7 @@ def apply_withdraw(ledger, data, event):
     fields(data, {"request_id", "source"})
     text(data["source"], "source")
     request = ledger.request(data["request_id"])
-    require(request["state"] == "queued", "request is not queued: " + _display(data["request_id"]))
+    require(request["state"] == "queued", lambda: "request is not queued: " + _display(data["request_id"]))
     request.update(state="withdrawn", closed_at=event["at"])
     ledger.open_holders.remove((request["kind"], request["holder"]))
 
@@ -290,7 +290,7 @@ def apply_withdraw(ledger, data, event):
 def apply_grant(ledger, data, event):
     fields(data, {"request_id"})
     request = ledger.request(data["request_id"])
-    require(request["state"] == "queued", "request is not queued: " + _display(data["request_id"]))
+    require(request["state"] == "queued", lambda: "request is not queued: " + _display(data["request_id"]))
     require(ledger.granted_counts[request["kind"]] < ledger.limits[request["kind"]], "ledger grant exceeds capacity")
     request.update(state="granted", granted_at=event["at"])
     ledger.granted_counts[request["kind"]] += 1
@@ -300,7 +300,7 @@ def apply_release(ledger, data, event):
     fields(data, {"request_id", "evidence"})
     evidence_reference(data["evidence"])
     request = ledger.request(data["request_id"])
-    require(request["state"] == "granted", "request is not granted: " + _display(data["request_id"]))
+    require(request["state"] == "granted", lambda: "request is not granted: " + _display(data["request_id"]))
     request.update(state="released", closed_at=event["at"], evidence=data["evidence"])
     ledger.open_holders.remove((request["kind"], request["holder"]))
     ledger.granted_counts[request["kind"]] -= 1
@@ -325,7 +325,7 @@ def apply_clear(ledger, data, _event):
     text(data["source"], "source")
     evidence_reference(data["evidence"])
     initiative = ledger.initiative(data["initiative"])
-    require(initiative["base_moved"] is not None, "initiative has no moved base: " + initiative["id"])
+    require(initiative["base_moved"] is not None, lambda: "initiative has no moved base: " + initiative["id"])
     require(initiative["base_moved"]["commit"] == data["base_commit"],
             "revalidation does not match the latest moved base")
     initiative["base_moved"] = None
@@ -450,7 +450,7 @@ class Store:
             keys = []
             for path in paths:
                 info = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
-                require(not stat.S_ISLNK(info.st_mode), "symlink paths are not supported: " + _display(path))
+                require(not stat.S_ISLNK(info.st_mode), lambda: "symlink paths are not supported: " + _display(path))
                 keys.append((path.name, _event_key(info)))
             previous, self._memo = self._memo, None
             ledger = None
@@ -478,10 +478,10 @@ class Store:
                 safe_path(path)
                 continue
             name = EVENT_NAME.fullmatch(path.name)
-            require(name is not None, "unexpected workspace store entry: " + _display(path.name))
+            require(name is not None, lambda: "unexpected workspace store entry: " + _display(path.name))
             count += 1
             require(count <= MAX_RECORDS, "workspace event history exceeds record limit")
-            require(int(name.group(1)) == count, "nonconsecutive workspace event: " + _display(path.name))
+            require(int(name.group(1)) == count, lambda: "nonconsecutive workspace event: " + _display(path.name))
             if count <= replayed:
                 continue
             try:
