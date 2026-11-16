@@ -4348,6 +4348,287 @@ def test_public_refusal_golden_bytes(repo, entry, code, case):
     assert shared_bytes(repo) == before
 
 
+@pytest.mark.parametrize("shape", ["direct", "merge", "repeated"])
+def test_pick_reads_each_source_once_per_operation(repo, monkeypatch, shape):
+    git(repo, "checkout", "-qb", "pick-topic")
+    first = commit(repo, "first", b"first\n")
+    second = commit(repo, "second", b"second\n")
+    git(repo, "checkout", "-q", "main")
+    tip = commit(repo, "other", b"other\n")
+    sources = (first, second) if shape != "repeated" else (first, first)
+    if shape == "merge":
+        git(repo, "merge", "--no-ff", "-qm", "merge topic", second)
+        sources = (git(repo, "rev-parse", "HEAD").decode().strip(),)
+    wanted = set(sources) | ({first, second} if shape == "merge" else set())
+    with new_store(repo) as store:
+        calls, real = [], subprocess.Popen
+        def record(argv, **kwargs):
+            calls.append(tuple(argv))
+            return real(argv, **kwargs)
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+        results = []
+        for _ in range(2):
+            calls.clear()
+            results.append(tg.plan_pick(store, tip, sources, IDENTITY))
+            reads = {oid: sum(argv[-3:] == ("cat-file", "commit", oid) for argv in calls) for oid in wanted}
+            print("GM5D pick", shape, json.dumps({"launches": len(calls), "source_reads": sorted(reads.values())}))
+            assert results[-1].status == "clean" and len(results[-1].commits) == 2
+            assert all(count == 1 for count in reads.values())
+        assert results[0] == results[1]
+
+
+@pytest.mark.parametrize("message", [b"\xff", b"x\0y", b"Aegis-Approve: yes", b"x" * tg.MAX_MESSAGE_BYTES],
+                         ids=["utf8", "nul", "approval", "oversized"])
+@pytest.mark.parametrize("conflict", [False, True])
+def test_pick_cached_message_refusal_stays_after_conflict_and_retries(repo, message, conflict):
+    git(repo, "checkout", "-qb", "message-topic")
+    valid = commit(repo, "x", b"topic\n")
+    raw = git(repo, "cat-file", "commit", valid).split(b"\n\n", 1)[0] + b"\n\n" + message
+    source = git(repo, "hash-object", "-w", "--literally", "-t", "commit", "--stdin", data=raw).decode().strip()
+    git(repo, "checkout", "-q", "main")
+    tip = commit(repo, "x" if conflict else "other", b"main\n")
+    before = shared_bytes(repo)
+    with new_store(repo) as store:
+        for _ in range(2):
+            if conflict:
+                assert tg.plan_pick(store, tip, (source,), IDENTITY) == tg.Plan("conflict", conflicts=("x",))
+            else:
+                with pytest.raises(tg.GitRefusal) as caught:
+                    tg.plan_pick(store, tip, (source,), IDENTITY)
+                assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+                    "invalid_message", "Lane Git operation refused: invalid_message", None)
+        assert tg.plan_pick(store, tip, (valid,), IDENTITY).status == ("conflict" if conflict else "clean")
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("state", ["clean", "dirty", "uncertain"])
+def test_snapshot_stat_shortcut_payload_counts_and_retry(repo, monkeypatch, state):
+    context = make_store(repo)
+    git(repo, "config", "core.autocrlf", "false")
+    os.utime(repo / "x", ns=(1000000000000000000, 1000000000000000000))
+    git(repo, "update-index", "--refresh")
+    if state == "dirty":
+        (repo / "x").write_bytes(b"dirty payload\n")
+    elif state == "uncertain":
+        os.utime(repo / "x", ns=(1000000000000000000, 1000000000000000001))
+    identity = (repo / "x").stat()
+    with context as store:
+        reads, calls, real = [], [], subprocess.Popen
+        def read(fd, size):
+            observed = os.fstat(fd)
+            data = os.read(fd, size)
+            if (observed.st_dev, observed.st_ino) == (identity.st_dev, identity.st_ino):
+                reads.append(len(data))
+            return data
+        def record(argv, **kwargs):
+            calls.append(tuple(argv))
+            return real(argv, **kwargs)
+        monkeypatch.setattr(tg, "os", SimpleNamespace(**{**vars(os), "read": read}))
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+        trees = []
+        for _ in range(2):
+            reads.clear()
+            calls.clear()
+            trees.append(tg.snapshot_tree(store))
+            print("GM5D snapshot", state, json.dumps({"launches": len(calls), "payload_reads": len(reads), "payload_bytes": sum(reads)}))
+            assert (len(reads) == 0) == (state == "clean")
+        assert trees[0] == trees[1]
+        assert store.read_blob(trees[0], "x") == (b"dirty payload\n" if state == "dirty" else b"base\n")
+
+
+@pytest.mark.parametrize("over_wire", [False, True], ids=["under-wire-budget", "over-wire-budget"])
+def test_snapshot_stat_clean_auto_baseline_boundary(repo, tmp_path, filter_home, over_wire):
+    context = make_store(repo)
+    git(repo, "config", "core.autocrlf", "false")
+    git(repo, "rm", "-q", "x")
+    size = 16777200 if over_wire else 16777140
+    names = [f"file{number}" for number in range(8)]
+    for number, name in enumerate(names):
+        payload = (bytes((65 + number,)) * 2 + b"\r\n") * (size // 4)
+        assert len(payload) == size
+        (repo / name).write_bytes(payload)
+        del payload
+        os.utime(repo / name, ns=(1000000000000000000, 1000000000000000000))
+    git(repo, "add", "--", *names)
+    git(repo, "update-index", "--refresh")
+    (repo / ".gitattributes").write_bytes(b"* text=auto\n")
+    total = size * len(names)
+    wire = total + len(names) * (40 + 34)
+    assert total + len(b"* text=auto\n") < tg.MAX_SNAPSHOT_BYTES
+    assert (wire > tg.MAX_SNAPSHOT_BYTES) == over_wire
+    environment = {**filter_git_env(filter_home), "GIT_INDEX_FILE": str(tmp_path / "oracle-index")}
+    def oracle_tree():
+        shutil.copyfile(repo / ".git" / "index", tmp_path / "oracle-index")
+        git(repo, "add", "-A", env=environment)
+        return git(repo, "write-tree", env=environment).decode().strip()
+    expected = oracle_tree()
+    if over_wire:
+        git(repo, "rm", "--cached", "-q", "--", names[-1], env=environment)
+        recovered = git(repo, "write-tree", env=environment).decode().strip()
+    before = shared_bytes(repo)
+    with context as store:
+        for _ in range(2):
+            if over_wire:
+                with pytest.raises(tg.GitRefusal) as caught:
+                    tg.snapshot_tree(store)
+                assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+                    "git_object_limit", "Lane Git operation refused: git_object_limit", None)
+            else:
+                assert tg.snapshot_tree(store) == expected
+        if over_wire:
+            (repo / names[-1]).unlink()
+            assert tg.snapshot_tree(store) == recovered
+    assert shared_bytes(repo) == before
+    print("GM5D R2 baseline boundary", json.dumps({"over_wire": over_wire, "file_bytes": size,
+        "snapshot_bytes": total + len(b"* text=auto\n"), "wire_bytes": wire}))
+
+
+@pytest.mark.parametrize("fault,code", [
+    ("missing", "invalid_object"), ("malformed", "invalid_object"),
+    ("wrong-kind", "invalid_object"), ("bad-hash", "invalid_object"), ("bad-framing", "invalid_object"),
+    ("object-limit", "git_object_limit"), ("aggregate-limit", "git_object_limit"),
+    ("git_failed", "git_failed"), ("git_timeout", "git_timeout"),
+    ("git_output_limit", "git_output_limit"), ("git_cleanup_failed", "git_cleanup_failed"),
+])
+def test_snapshot_stat_clean_auto_baseline_refusals_and_retry(repo, monkeypatch, filter_home, fault, code):
+    context = make_store(repo)
+    git(repo, "config", "core.autocrlf", "false")
+    names = [f"file{number}" for number in range(9)]
+    for number, name in enumerate(names):
+        (repo / name).write_bytes(("value %d\r\n" % number).encode())
+    git(repo, "add", "--", *names)
+    for name in ["x", *names]:
+        os.utime(repo / name, ns=(1000000000000000000, 1000000000000000000))
+    git(repo, "update-index", "--refresh")
+    (repo / ".gitattributes").write_bytes(b"* text=auto\n")
+    source_oids = {row.split()[1] for row in git(repo, "ls-files", "--stage", "--", *names).splitlines()}
+    calls = []
+    def damaged(real, args, *rest, **kwargs):
+        calls.append(tuple(args))
+        if args == ["cat-file", "--batch"] and fault.startswith("git_"):
+            raise gitsafe.GitError("never echo token=private", code=fault)
+        result = real(args, *rest, **kwargs)
+        data = result.stdout
+        if (args == ["cat-file", "--batch-check"]
+                and set(kwargs.get("stdin", b"").splitlines()) == source_oids):
+            if fault == "malformed":
+                data = b"invalid header\n"
+            elif fault in ("missing", "wrong-kind", "object-limit", "aggregate-limit"):
+                rows = data.splitlines()
+                if fault == "aggregate-limit":
+                    rows = [row.split()[0] + b" blob " + str(tg.MAX_OBJECT_BYTES).encode() for row in rows]
+                else:
+                    oid, _, size = rows[0].split()
+                    rows[0] = (oid + b" missing" if fault == "missing" else
+                               oid + b" tree " + size if fault == "wrong-kind" else
+                               oid + b" blob " + str(tg.MAX_OBJECT_BYTES + 1).encode())
+                data = b"\n".join(rows) + b"\n"
+        elif args == ["cat-file", "--batch"]:
+            if fault == "bad-framing":
+                data = data[:-1]
+            elif fault == "bad-hash":
+                start = data.index(b"\n") + 1
+                data = data[:start] + bytes((data[start] ^ 1,)) + data[start + 1:]
+        return subprocess.CompletedProcess(result.args, result.returncode, data, result.stderr)
+    before = shared_bytes(repo)
+    with context as store:
+        restore = patch_lane_run(monkeypatch, damaged)
+        for _ in range(2):
+            calls.clear()
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+                code, "Lane Git operation refused: " + code, None)
+            assert ("read-tree", "--empty") not in calls
+            if fault in ("missing", "malformed", "object-limit", "aggregate-limit"):
+                assert ("cat-file", "--batch") not in calls
+        restore()
+        tree = tg.snapshot_tree(store)
+        assert store.read_blob(tree, "file0") == b"value 0\r\n"
+        assert tg.snapshot_tree(store) == tree
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("automatic", [False, True], ids=["stat-shortcut", "auto-read-fallback"])
+def test_snapshot_stat_skip_revalidates_descriptor_and_releases_busy_store(repo, monkeypatch, automatic):
+    context = make_store(repo)
+    if automatic:
+        (repo / ".gitattributes").write_bytes(b"x text=auto\n")
+    os.utime(repo / "x", ns=(1000000000000000000, 1000000000000000000))
+    git(repo, "update-index", "--refresh")
+    identity = (repo / "x").stat()
+    reached, resume, probes = Event(), Event(), []
+    def fstat(fd):
+        observed = os.fstat(fd)
+        if (observed.st_dev, observed.st_ino) == (identity.st_dev, identity.st_ino):
+            probes.append(fd)
+            if len(probes) == 2:
+                reached.set()
+                assert resume.wait(5)
+                return os.fstat(fd)
+        return observed
+    with context as store:
+        monkeypatch.setattr(tg, "os", SimpleNamespace(**{**vars(os), "fstat": fstat}))
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(tg.snapshot_tree, store)
+            try:
+                assert reached.wait(5)
+                with pytest.raises(tg.GitRefusal) as busy:
+                    tg.snapshot_tree(store)
+                assert busy.value.code == "store_busy"
+                (repo / "x").write_bytes(b"concurrent replacement bytes\n")
+            finally:
+                resume.set()
+            with pytest.raises(tg.GitRefusal) as changed:
+                future.result(timeout=5)
+            assert changed.value.code == "worktree_changed"
+        for fd in set(probes):
+            with pytest.raises(OSError) as closed:
+                os.fstat(fd)
+            assert closed.value.errno == errno.EBADF
+        assert store.read_blob(tg.snapshot_tree(store), "x") == b"concurrent replacement bytes\n"
+
+
+def test_snapshot_stat_clean_attribute_bytes_are_always_read(repo, monkeypatch):
+    context = make_store(repo)
+    commit(repo, ".gitattributes", b"# harmless\n")
+    git(repo, "config", "filter.unused.clean", "must-never-run")
+    for name in ("x", ".gitattributes"):
+        os.utime(repo / name, ns=(1000000000000000000, 1000000000000000000))
+    git(repo, "update-index", "--refresh")
+    attribute = (repo / ".gitattributes").stat()
+    reads = []
+    def read(fd, size):
+        observed = os.fstat(fd)
+        data = os.read(fd, size)
+        if (observed.st_dev, observed.st_ino) == (attribute.st_dev, attribute.st_ino):
+            reads.append(data)
+        return data
+    with context as store:
+        monkeypatch.setattr(tg, "os", SimpleNamespace(**{**vars(os), "read": read}))
+        tree = tg.snapshot_tree(store)
+        assert b"".join(reads) == b"# harmless\n"
+        assert tree == git(repo, "rev-parse", "HEAD^{tree}").decode().strip()
+
+
+def test_snapshot_control_byte_boundaries_match_git_add(repo, tmp_path):
+    context = make_store(repo)
+    (repo / ".gitattributes").write_bytes(b"*.txt text=auto\n")
+    for value in range(256):
+        for index, payload in enumerate((bytes((value,)), b"a" * 127 + bytes((value,)),
+                b"a" * 128 + bytes((value,)), b"a" * 255 + bytes((value,)) * 2,
+                b"a\r\n" + bytes((value,)) + b"\r\n", b"a\r" + bytes((value,)),
+                b"a\0" + bytes((value,)), bytes((value,)) + b"\x1a")):
+            (repo / f"sample-{value}-{index}.txt").write_bytes(payload)
+    environment = {**filter_git_env(tmp_path), "GIT_INDEX_FILE": str(tmp_path / "oracle-index")}
+    git(repo, "read-tree", "HEAD", env=environment)
+    git(repo, "add", "-A", env=environment)
+    expected = git(repo, "write-tree", env=environment).decode().strip()
+    with context as store:
+        assert tg.snapshot_tree(store) == expected
+        assert tg.snapshot_tree(store) == expected
+
+
 @pytest.mark.parametrize("code,action", [
     ("conversion_unavailable", None), ("size_limit", None),
     ("index_flags_unsupported", "Clear assume-unchanged and skip-worktree flags, then retry."),
