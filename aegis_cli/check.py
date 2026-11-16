@@ -41,7 +41,10 @@ import re
 import sys
 
 from aegis_core import primitives
-from aegis_core.diagnostic_messages import GuidanceMessage, MESSAGE_TEMPLATES, clip_rendered_text
+from aegis_core.diagnostic_messages import (
+    GuidanceMessage, MESSAGE_TEMPLATES, MessageRow, clip_rendered_text, finding_message,
+    guidance_value as show, receipt_value,
+)
 from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_cli.verify import run_verify
 
@@ -115,7 +118,6 @@ def _record_components(row: dict, *, failing: bool):
 
 def _receipt_text(value: str, limit: int = 120, *, identifier: bool = False) -> str:
     from aegis_cli import sanitize_display
-    from aegis_core.diagnostic_messages import receipt_value
 
     return receipt_value(value, limit, identifier=identifier, canonicalize=sanitize_display)
 
@@ -312,8 +314,6 @@ def _ci_blocking(report, reg_report=None, perf_report=None, trailer_checks=None,
 
 def _build_ci_document(report, root: str, reg_report=None, cov_report=None, perf_report=None, trailer_checks=None,
                        skipped=(), scanner_results=None) -> dict:
-    from aegis_core.diagnostic_messages import MessageRow
-
     document = report.as_dict(root)
     if report.owner_review_required:
         document["owner_review_findings"] = [MessageRow({key: _receipt_text(value, 400, identifier=True)
@@ -372,13 +372,12 @@ def _print_policy(document, fmt, blocking, span):
 
 def _approval_command(document, ref=None):
     from aegis_core.redaction import command_token
-    from aegis_core.diagnostic_messages import guidance_value
 
     command = "aegis approve"
     if document.get("approval_mode") == "signature":
-        base = guidance_value(document["scope"]["base"])
+        base = show(document["scope"]["base"])
         if ref is not None:
-            displayed = guidance_value(ref)
+            displayed = show(ref)
             if command_token(ref) and displayed == ref:
                 base = displayed
         command += f" --base {base}"
@@ -386,19 +385,15 @@ def _approval_command(document, ref=None):
 
 
 def _print_approval_hint(report, document, what):
-    from aegis_core.diagnostic_messages import guidance_value
-
     command = _approval_command(document, report.comparison_ref)
     print(f"  A {what} passes only with a signed approval: {command} (a key listed in allowed_signers on the base "
           "branch), or at tier A with an approving review of the head commit by someone other than its author.")
     if report.comparison_ref is not None and document.get("approval_mode") == "signature" \
             and command != f"aegis approve --base {report.comparison_ref}":
-        print(f"  Comparison ref: {guidance_value(report.comparison_ref, prose=True)}.")
+        print(f"  Comparison ref: {show(report.comparison_ref, prose=True)}.")
 
 
 def _print_findings(document, gated=True):
-    from aegis_core.diagnostic_messages import finding_message, guidance_value as show
-
     for item in document["weakenings"]:
         print(f"  [{show(item['code'], prose=True)}] {show(item['rule'], prose=True)} ({show(item['path'], prose=True)}): {finding_message(item, producer='weakenings')}")
     for entry in document["governance"]["paths"] if gated else ():
@@ -410,8 +405,6 @@ def _print_ci_findings(report, document, gated):
 
 
 def _print_owner_review(report, document, fmt):
-    from aegis_core.diagnostic_messages import finding_message, guidance_value as show
-
     if fmt != "github" and report.owner_review_required:
         for item in document["owner_review_findings"]:
             print(f"  [{show(item['code'], prose=True)}] {show(item['rule'], prose=True)} ({show(item['path'], prose=True)}): {finding_message(item, producer='owner_review_required')}")
@@ -425,7 +418,6 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
                                              render_ci_json)
     from aegis_cli.verify import _append_step_summary
     from aegis_core import regression
-    from aegis_core.diagnostic_messages import guidance_value as show
 
     document = _build_ci_document(report, root, reg_report, cov_report, perf_report, trailer_checks=trailer_checks,
                                   skipped=skipped, scanner_results=scanner_results)
@@ -605,9 +597,7 @@ def _run_ci(args: argparse.Namespace) -> int:
         checkout, named = gitsafe.head_commit(root), getattr(args, "head", None)
         asked = gitsafe.resolve_commit(root, named) if named else checkout
         if asked != checkout:  # perf measures the work tree, as coverage does
-            from aegis_core.diagnostic_messages import guidance_value
-
-            selector = guidance_value(str(asked or named), 12, prose=True)
+            selector = show(str(asked or named), 12, prose=True)
             perf_report = {"status": "unverified", "regressed": False, "noisy": False, "passed": True,
                            "reason": f"the checkout is not {selector}; check out the pull request head"}
         else:
