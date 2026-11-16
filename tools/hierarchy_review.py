@@ -33,6 +33,7 @@ sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hierarchy_git import object_read_argv, object_read_env  # noqa: E402
+import hierarchy_hosts  # noqa: E402
 from hierarchy_mailbox import (GIT_ID, encoded, matching, publish_file, require, safe_path, strict_json,  # noqa: E402
                                timestamp)
 
@@ -46,24 +47,29 @@ MEANING = ("Exact committed bytes. A symlink is a plain file holding its target,
            "Run verify before relying on this folder; read-only modes alone prove nothing.")
 
 
-def git(repository, *arguments, **options):
-    return subprocess.run(object_read_argv(*arguments), cwd=repository, env=object_read_env(), capture_output=True,
-                          timeout=GIT_TIMEOUT_SECONDS, **options)
+def read_environment(*, planned=None):
+    environment = object_read_env()
+    return hierarchy_hosts.child_environment(environment, "no-host") if planned is not False else environment
 
 
-def exact_commit(repository, commit, label, expected_tree):
+def git(repository, *arguments, planned=None, **options):
+    return subprocess.run(object_read_argv(*arguments), cwd=repository, env=read_environment(planned=planned),
+                          capture_output=True, timeout=GIT_TIMEOUT_SECONDS, **options)
+
+
+def exact_commit(repository, commit, label, expected_tree, *, planned=None):
     matching(commit, GIT_ID, label)
-    found = git(repository, "rev-parse", "--verify", "-q", commit + "^{commit}")
+    found = git(repository, "rev-parse", "--verify", "-q", commit + "^{commit}", planned=planned)
     require(found.returncode == 0 and found.stdout.decode().strip() == commit, label + " commit is not in the repository: " + commit)
-    found = git(repository, "rev-parse", commit + "^{tree}")
+    found = git(repository, "rev-parse", commit + "^{tree}", planned=planned)
     require(found.returncode == 0, "could not read the tree of " + commit)
     tree = found.stdout.decode().strip()
     require(expected_tree is None or tree == expected_tree, label + " tree is %s, not the expected %s" % (tree, expected_tree))
     return {"commit": commit, "tree": tree}
 
 
-def tree_entries(repository, commit):
-    listed = git(repository, "ls-tree", "-r", "-z", "--full-tree", commit)
+def tree_entries(repository, commit, *, planned=None):
+    listed = git(repository, "ls-tree", "-r", "-z", "--full-tree", commit, planned=planned)
     require(listed.returncode == 0, "could not list the tree of " + commit)
     entries = []
     for row in listed.stdout.split(b"\0"):
@@ -79,12 +85,12 @@ def tree_entries(repository, commit):
     return entries
 
 
-def export(repository, entries, folder):
+def export(repository, entries, folder, *, planned=None):
     """Writes raw blobs, because even `git archive` applies attributes such as export-ignore."""
     rows = []
     folder.mkdir()
     with tempfile.TemporaryFile() as errors, subprocess.Popen(
-            object_read_argv("cat-file", "--batch"), cwd=repository, env=object_read_env(),
+            object_read_argv("cat-file", "--batch"), cwd=repository, env=read_environment(planned=planned),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors) as process:
         for mode, kind, oid, path in entries:
             if kind == "commit":
@@ -139,10 +145,10 @@ def scaffold_digest(folder):
     return digest.hexdigest()
 
 
-def write_output(repository, path, *arguments):
+def write_output(repository, path, *arguments, planned=None):
     with open(path, "xb") as stream:
-        done = subprocess.run(object_read_argv(*arguments), cwd=repository, env=object_read_env(), stdout=stream,
-                              stderr=subprocess.PIPE, timeout=GIT_TIMEOUT_SECONDS)
+        done = subprocess.run(object_read_argv(*arguments), cwd=repository, env=read_environment(planned=planned),
+                              stdout=stream, stderr=subprocess.PIPE, timeout=GIT_TIMEOUT_SECONDS)
     require(done.returncode == 0, "git failed writing " + path.name + ": " + done.stderr.decode(errors="replace")[:512])
     return file_digest(path)
 
