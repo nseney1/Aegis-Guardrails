@@ -3159,7 +3159,7 @@ def test_digest_reference_overflow_with_no_inbox_recovers_by_fewer_refs(bound):
         jobs = [pool.submit(call, connection(root), "mailbox_digest", arguments) for _ in range(2)]
         concurrent = [job.result(timeout=15) for job in jobs]
     assert [data(item) for item in concurrent] == [data(refused), data(refused)]
-    _follow_measured_retry(writer, data(refused), arguments, reference=first)
+    _follow_measured_retry(writer, data(refused), arguments)
     fewer = data(call(writer, "mailbox_digest",
                       {"limit": 1, "refs": [first], "fields": ["body"], "max_chars": fit}))
     assert fewer["messages"] == []
@@ -3194,7 +3194,7 @@ def test_digest_mixed_inbox_and_refs_overflow_recovers_by_fewer_refs(bound, monk
                 for _ in range(2)]
         concurrent = [job.result(timeout=15) for job in jobs]
     assert [data(item) for item in concurrent] == [data(refused), data(refused)]
-    _follow_measured_retry(reader, data(refused), arguments, reference=rid)
+    _follow_measured_retry(reader, data(refused), arguments)
     fewer = data(call(reader, "mailbox_digest", {"limit": 1, "fields": ["body"], "max_chars": budget}))
     assert [row["message_id"] for row in fewer["messages"]] == ["m-plain"]
     assert fewer["messages"][0]["body"] == "plain-inbox"
@@ -4105,7 +4105,7 @@ def test_digest_later_record_view_overflow_recovers_by_reducing_limit(bound, mon
     assert repaired["messages"][0]["body"] == "alpha"
 
 
-def _follow_measured_retry(conn, refusal, arguments, *, message_id=None, reference=None):
+def _follow_measured_retry(conn, refusal, arguments):
     error = refusal["error"]
     retry = error["retry"]
     tool, options = retry["tool"], retry["options"]
@@ -4119,8 +4119,8 @@ def _follow_measured_retry(conn, refusal, arguments, *, message_id=None, referen
         if target["collection"] == "records":
             request_args = dict(options, ref=arguments["refs"][target["index"]])
         else:
-            assert message_id is not None
-            request_args = dict(options, message_id=message_id)
+            assert "message_id" in options
+            request_args = options
     result = call(conn, tool, request_args)
     assert not result.get("isError"), result
     return tool, data(result)
@@ -4135,7 +4135,7 @@ def test_digest_first_record_advice_is_a_measured_successful_retry(bound, budget
     refused = data(call(reader, "mailbox_digest", arguments))
     assert refused["error"]["code"] == "E_LIMIT"
     _assert_closed("mailbox_digest", refused)
-    tool, retried = _follow_measured_retry(reader, refused, arguments, message_id="minimum")
+    tool, retried = _follow_measured_retry(reader, refused, arguments)
     view = retried if tool == "mailbox_read_record" else retried["messages"][0]["record"]
     assert view["attribution"] == "match" and view["mailbox_from"] == "a/orchestrator"
     if budget <= 120:
@@ -4147,7 +4147,7 @@ def test_digest_first_record_advice_is_a_measured_successful_retry(bound, budget
                        ("mailbox_read_record", "fields", "outline", "fewer refs"))
         options = refused["error"]["retry"]["options"]
         too_small = call(reader, tool, dict(dict(arguments, **options) if tool == "mailbox_digest" else
-                                           dict(options, message_id="minimum"), max_chars=minimum - 1))
+                                           dict(options), max_chars=minimum - 1))
         assert data(too_small)["error"]["code"] == "E_LIMIT"
 
 
@@ -4561,6 +4561,87 @@ def test_digest_record_retry_identifies_the_failing_reference(bound):
     assert view["attribution"] == "grant-index"
 
 
+@pytest.mark.parametrize("scenario,budget", [("first", 220), ("earlier", 220),
+                                             ("bad-stub", 120), ("append", 220)])
+def test_digest_received_record_retry_is_self_contained(bound, monkeypatch, scenario, budget):
+    _root, writer, reader = bound
+    monkeypatch.setattr(mailbox_module, "timestamp", lambda: "2026-11-15T16:30:00Z")
+    if scenario == "earlier":
+        # The first row fits, but a one-row retry's long next_after does not.
+        _ordinary(writer, "a" * 80, "small")
+    published = data(call(writer, "mailbox_publish_record", request("b-target", content=json.dumps({
+        "fields": {}, "body": "x" * 65000, "refs": {}}))))
+    assert "id" in published
+    if scenario == "bad-stub":
+        _ordinary(writer, "z-broken", "aegis-record/1 broken")
+    arguments = {"limit": 3, "fields": ["body"], "max_chars": budget}
+    refused = data(call(reader, "mailbox_digest", arguments))
+    _assert_measured_budget(refused)
+    retry = refused["error"]["retry"]
+    assert retry["tool"] == "mailbox_read_record"
+    assert retry["target"] == {"collection": "messages", "index": int(scenario == "earlier")}
+    assert retry["options"]["message_id"] == "b-target"
+    assert retry["options"]["max_chars"] == refused["error"].get("minimum_max_chars", budget)
+    assert reader.returned == []
+    if "minimum_max_chars" in refused["error"]:
+        too_small = data(call(reader, retry["tool"], dict(retry["options"],
+            max_chars=refused["error"]["minimum_max_chars"] - 1)))
+        assert too_small == codec.CodecError("E_LIMIT").as_dict()
+    if scenario == "append":
+        # Concurrent publication inserts ahead of the refused row; an index alone
+        # would now identify this new message instead of the measured target.
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(_ordinary, writer, "a-concurrent", "small").result(timeout=15)
+    expected = data(call(reader, "mailbox_read_record", dict(retry["options"], max_chars=records.MAX_CHARS)))
+    for _ in range(2):
+        tool, view = _follow_measured_retry(reader, refused, arguments)
+        assert tool == "mailbox_read_record" and view == expected
+        assert view["ref"] == published["id"][:16] and view["attribution"] == "match"
+        assert reader.returned == ["b-target"]
+    with pytest.raises(TypeError, match="unexpected keyword argument 'message_id'"):
+        _follow_measured_retry(reader, refused, arguments, message_id="b-target")
+
+
+def test_digest_received_record_privacy_refusal_discloses_no_retry_identity(bound):
+    _root, writer, reader = bound
+    published = data(call(writer, "mailbox_publish_record", request("private-source", to="a/front-door")))
+    assert "id" in published
+    assert not call(writer, "mailbox_publish", {"message_id": "private-probe", "to": reader.sender["from"],
+        "type": "info", "body": "aegis-record/1 sha256=" + published["id"] + " kind=text"}).get("isError")
+    for _ in range(2):
+        refused = data(call(reader, "mailbox_digest", {"max_chars": 120}))
+        assert refused == auth_error("reference")
+        assert "private-probe" not in json.dumps(refused) and published["id"] not in json.dumps(refused)
+        assert "retry" not in refused["error"] and reader.returned == []
+    assert data(call(reader, "mailbox_read_record", {"message_id": "private-probe"})) == refused
+
+
+def test_digest_received_record_retry_missing_payload_refuses_and_recovers(bound):
+    root, writer, reader = bound
+    published = data(call(writer, "mailbox_publish_record", request("loss-target", content=json.dumps({
+        "fields": {}, "body": "x" * 65000, "refs": {}}))))
+    assert "id" in published
+    arguments = {"fields": ["body"], "max_chars": 220}
+    refused = data(call(reader, "mailbox_digest", arguments))
+    _assert_measured_budget(refused)
+    retry = refused["error"]["retry"]
+    assert retry["tool"] == "mailbox_read_record"
+    payload = root.parent / "mailbox-records" / (published["id"] + ".json")
+    original = payload.read_bytes()
+    payload.unlink()
+    try:
+        for _ in range(2):
+            failed = data(call(reader, retry["tool"], retry["options"]))
+            assert failed == auth_error("reference")
+            assert "loss-target" not in json.dumps(failed) and published["id"] not in json.dumps(failed)
+            assert reader.returned == []
+    finally:
+        payload.write_bytes(original)
+    tool, view = _follow_measured_retry(reader, refused, arguments)
+    assert tool == "mailbox_read_record" and view["ref"] == published["id"][:16]
+    assert view["attribution"] == "match" and reader.returned == ["loss-target"]
+
+
 def test_refusal_inventory_includes_reachable_codec_boundaries():
     required, _history = _reachable_refusal_pairs()
     for tool in required:
@@ -4582,7 +4663,7 @@ def test_digest_minimum_retry_can_read_first_record_before_a_later_bad_stub(boun
     refused = data(call(reader, "mailbox_digest", arguments))
     assert refused["error"]["code"] == "E_LIMIT"
     assert refused["error"]["minimum_max_chars"] > 120
-    tool, view = _follow_measured_retry(reader, refused, arguments, message_id="a-large")
+    tool, view = _follow_measured_retry(reader, refused, arguments)
     assert tool == "mailbox_read_record" and view["attribution"] == "match"
 
 
@@ -4803,7 +4884,7 @@ def test_every_emitted_refusal_names_an_accepted_action(bound, monkeypatch):
     assert data(call(reader, "mailbox_digest", {"limit": 1, "max_chars": records.MAX_CHARS}))["messages"]
     floor = data(call(reader, "mailbox_digest", {"max_chars": 10, "limit": 1}))
     cover("mailbox_digest", "E_LIMIT", "digest_floor", floor)
-    _follow_measured_retry(reader, floor, {"max_chars": 10, "limit": 1}, message_id="base")
+    _follow_measured_retry(reader, floor, {"max_chars": 10, "limit": 1})
     assert data(call(reader, "mailbox_digest", {"limit": 1, "max_chars": records.MAX_CHARS}))["messages"][0]["message_id"] == "base"
 
     for identifier, body in (("page-1", "alpha"), ("page-2", "bravo"), ("page-3", "charlie")):
@@ -4842,9 +4923,7 @@ def test_every_emitted_refusal_names_an_accepted_action(bound, monkeypatch):
                                                "max_chars": view_fit}))
     cover("mailbox_digest", "E_LIMIT", "digest_view", view)
     _follow_measured_retry(writer, view,
-                           {"limit": 1, "refs": [first, second], "fields": ["body"], "max_chars": view_fit},
-                           message_id=data(alone)["messages"][0]["message_id"] if data(alone)["messages"] else None,
-                           reference=first)
+                           {"limit": 1, "refs": [first, second], "fields": ["body"], "max_chars": view_fit})
     assert "after_message_id" not in view["error"]["next_action"]
     fewer = data(call(writer, "mailbox_digest", {"limit": 1, "refs": [first], "fields": ["body"],
                                                 "max_chars": view_fit}))
@@ -5052,8 +5131,7 @@ def test_every_emitted_refusal_names_an_accepted_action(bound, monkeypatch):
                                                   "after_message_id": "m1"}))
     cover("mailbox_digest", "E_LIMIT", "digest_view_minimum", minimum)
     _follow_measured_retry(reader, minimum,
-                           {"limit": 1, "fields": ["body"], "max_chars": 80, "after_message_id": "m1"},
-                           message_id="m2")
+                           {"limit": 1, "fields": ["body"], "max_chars": 80, "after_message_id": "m1"})
     outlined = data(call(reader, "mailbox_digest", {"limit": 1, "outline": True, "max_chars": 80,
                                                    "after_message_id": "m1"}))
     assert outlined["error"]["code"] == "E_LIMIT"

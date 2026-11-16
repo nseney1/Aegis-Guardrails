@@ -226,7 +226,7 @@ def measured_refusal(codec, original, maximum, probe, *, failure):
         text = _attempt(codec, probe, tool, options, maximum)
         if text is not None:
             detail = "digest_page" if "limit" in options else "digest_view"
-            return _target_retry(_retry_error(codec, detail, tool, options, action), failure)
+            return _target_retry(_retry_error(codec, detail, tool, options, action), failure, maximum)
     if ordinary:
         if inbox is not None:
             error = codec.CodecError("E_LIMIT", detail="digest_inbox")
@@ -252,7 +252,7 @@ def measured_refusal(codec, original, maximum, probe, *, failure):
             return _target_retry(_retry_error(codec, "digest_view_minimum" if record else "digest_floor", tool,
                                  dict(options, max_chars=minimum),
                                  "increase max_chars to at least " + str(minimum)
-                                 + ("; use mailbox_read_record" if tool == "mailbox_read_record" else ""), minimum), failure)
+                                 + ("; use mailbox_read_record" if tool == "mailbox_read_record" else ""), minimum), failure, maximum)
     # Ordinary messages keep the inbox recovery. An unmeasurable record (for
     # example a concurrent storage failure) receives no guessed selector advice.
     if record:
@@ -260,11 +260,17 @@ def measured_refusal(codec, original, maximum, probe, *, failure):
     return original
 
 
-def _target_retry(error, failure):
+def _target_retry(error, failure, maximum):
     retry = error.budget_advice["retry"]
     if retry["tool"] == "mailbox_read_record":
-        key, _item, messages, references = failure
+        key, item, messages, references = failure
         retry["target"] = {"collection": key, "index": messages if key == "messages" else references}
+        retry["options"].setdefault("max_chars", maximum)
+        if key == "messages":
+            # History validation bounds this identity to the mailbox slug grammar.
+            # Only a successful, authorized view probe reaches this advice; the
+            # stable ID remains usable when later publication shifts the index.
+            retry["options"]["message_id"] = item["message_id"]
     return error
 
 
@@ -319,7 +325,7 @@ def tool_specs(properties, max_bytes):
          "A record view or explicit refs: " + DIGEST_VIEW_NEXT + ". "
          "A max_chars below the minimum record view: " + DIGEST_VIEW_MINIMUM_NEXT + ". "
          "Record-view budget refusals include a measured retry with tool and options; minimum_max_chars includes the complete returned view. "
-         "Record-read retry.target identifies the failing collection and index. Ordinary-message failures preserve inbox recovery regardless of other records. "
+         "Record-read retry.target identifies the failing collection and index; received-message retry.options includes its authorized message_id and measured max_chars, while explicit refs resolve from the original request. Ordinary-message failures preserve inbox recovery regardless of other records. "
          "With a planned inbox and a digest cursor, restart mailbox_inbox from the start without after_message_id and follow fresh oldest-first pages. "
          "max_chars below the page envelope: pass max_chars large enough for the digest page, as an integer from 0 to "
          + str(MAX_CHARS) + ". "

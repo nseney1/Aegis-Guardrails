@@ -1642,7 +1642,7 @@ OPERATION_GOLDENS = {'cli-queue/add/valid/text': 'fe60c6c01c8f5adeaa653e6bf7a8fc
  'lease/release/stale/text': '357670f992b6f9ade3ac139cbf8c3441012cee2e2e6927f152c587aba98de929',
  'lease/release/stale/json': '9b57ef253f3440f49f4991ab7895d7977637a3d4ec644f27d5a76263676d8222',
  'lease/gc/valid/text': '5146ce591942cf1d48e7d6d4e3556ced4a5436a4a08f629b074ac6b288e39353',
- 'lease/gc/valid/json': '278e258febfd85dcf975404d79bea289211ad7c6ee5853306af0f28cbf2111fa',
+ 'lease/gc/valid/json': 'f191ef007b4434baab5616354ebc81012775f1c63f1db3bf9bf6df4cb3d07298',
  'lease/gc/oversized/text': '8902de7d0dc899f5f8fe1ba099b3ad8bd16e42105c8533e9af2650dc9ad37e3d',
  'lease/gc/oversized/json': '8902de7d0dc899f5f8fe1ba099b3ad8bd16e42105c8533e9af2650dc9ad37e3d',
  'lease/gc/invalid_arguments/text': 'ab3ce0306fdf22b1defb7ef22f3b6102177138d008ea9ec1499a4058db91d65a',

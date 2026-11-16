@@ -379,12 +379,13 @@ def _gc(args: argparse.Namespace, root: Path, now: int) -> lease_output.PendingR
             "status": "collected" if result.collected else "nothing to collect",
             "collected": [{"lane": c.lane, "previous": c.previous, "caller": c.caller} for c in result.collected],
             "kept": [{"lane": lane, "reason": reason} for lane, reason in result.kept],
-            "warnings": warnings + rows,
+            "warnings": warnings,
+            "lane_warnings": rows,
         })
         response.json(payload)
         return response
     response.warn(warnings)
-    response.warn([row["reason"] for row in rows])
+    response.warn([f"{row['lane']}: {row['reason']}" for row in rows])
     for change in result.collected:
         response.line(f"collected {change.lane}")
     if not result.collected:
