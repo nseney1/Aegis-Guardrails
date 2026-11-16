@@ -37,7 +37,7 @@ from aegis_core.primitives import sanitize_display
 from aegis_core.redaction import redact_insight_text
 
 __all__ = ["CommitIdentity", "GitRefusal", "GitStore", "Plan", "cas_fast_forward", "commit_tested",
-           "descriptor_support", "plan_merge", "plan_pick", "plan_revert", "snapshot_tree",
+           "descriptor_support", "ref_oid", "plan_merge", "plan_pick", "plan_revert", "snapshot_tree",
            # Export the internal runner-transfer surface for the lane guard's accounting.
            "_current", "_publish", "_require_runner", "_snapshot_baselines", "_write_snapshot"]
 
@@ -712,6 +712,20 @@ def _current(store: GitStore, ref: str, runner) -> Optional[str]:
         return runner.read_ref(store.repo, ref)
     except AegisError as exc:
         raise GitRefusal(_error_code(exc, "ref_unreadable"), next_action=getattr(exc, "next_action", None)) from None
+
+
+@_lane_operation
+def ref_oid(store: GitStore, ref: str, *, _runner=None) -> Optional[str]:
+    """Read one exact fully-qualified ref, or None when it is absent.
+
+    The active store binds executable, repository and capture limits. Git read
+    failures retain GitRefusal codes; interpreting the object belongs to callers.
+    """
+    _require_runner(_runner)
+    try:
+        return _current(store, ref, _runner)
+    except OSError:
+        raise GitRefusal("ref_unreadable") from None
 
 
 def _publish(store: GitStore, new: str, runner) -> None:
