@@ -1,7 +1,9 @@
 """Public MC-1 contracts: hostile inputs first, then lossless views and storage."""
+from concurrent.futures import TimeoutError as FutureTimeoutError
 import copy
 import hashlib
 import json
+import multiprocessing
 import os
 import stat
 from pathlib import Path
@@ -11,6 +13,7 @@ import tracemalloc
 from itertools import combinations
 from contextlib import contextmanager
 from types import SimpleNamespace
+from unittest.mock import patch as codec_patch
 
 import pytest
 from conftest import symlink_or_skip
@@ -18,6 +21,8 @@ from conftest import symlink_or_skip
 from aegis_core import message_codec as codec
 from aegis_core import message_codec_format as codec_format
 from aegis_core import message_codec_store as codec_store
+from aegis_core import primitives
+from aegis_core.redaction import redact_command_secrets
 
 
 MARKER = "HOSTILE_MARKER"
@@ -31,6 +36,322 @@ MESSAGES = {
     "E_SPAN": "invalid span selection",
     "E_AUTH": "store access refused: unsafe directory or platform lacks anchored file operations; use a supported real directory",
 }
+
+
+def _concurrent_reads(context, references, *, budget=None, timeout=10, release=None,
+                      join_timeout=10, entered=None):
+    """Release controlled waits before joining the daemon readers."""
+    from concurrent.futures import FIRST_EXCEPTION, Future, wait
+    from threading import Event, Thread
+    from time import monotonic
+    release = release if release is not None else Event()
+    references = list(references)
+    futures = [Future() for _ in references]
+    workers = []
+
+    def read(offset):
+        for index in range(offset, len(references), 2):
+            if release.is_set():
+                return
+            try:
+                value = context.read(references[index], _budget=budget)
+            except BaseException as error:
+                futures[index].set_exception(error)
+            else:
+                futures[index].set_result(value)
+
+    try:
+        deadline = monotonic() + timeout
+        for offset in range(min(2, len(references))):
+            worker = Thread(target=read, args=(offset,), daemon=True)
+            worker.start()
+            workers.append(worker)
+        if entered is not None:
+            assert entered.wait(5), "controlled reader did not enter"
+            deadline = monotonic() + timeout
+        completed, incomplete = wait(futures, timeout=max(0, deadline - monotonic()),
+                                     return_when=FIRST_EXCEPTION)
+        for future in completed:
+            if future.exception() is not None:
+                future.result()
+        if incomplete:
+            raise FutureTimeoutError()
+        return [future.result() for future in futures]
+    finally:
+        release.set()
+        deadline = monotonic() + join_timeout
+        for worker in workers:
+            worker.join(max(0, deadline - monotonic()))
+        for worker in workers:
+            assert not worker.is_alive(), "read worker did not stop after release"
+
+
+def _codec_process(scenario, root, writer):
+    from queue import Empty, Queue
+    from threading import Event, Thread
+    messages = Queue(maxsize=8)  # Thread-local only; never shared across processes.
+
+    def report():
+        # This thread alone owns the writer, including its close.
+        try:
+            for _ in range(8):
+                message, terminal = messages.get(timeout=30)
+                writer.send_bytes(message)
+                if terminal:
+                    return
+        except (Empty, OSError):
+            return
+        finally:
+            writer.close()
+
+    def notify(message):
+        assert message in {"blocked", "teardown", "unblocked"}, "invalid codec progress"
+        messages.put_nowait((message.encode("ascii"), False))
+
+    reporter = Thread(target=report, daemon=True)
+    try:
+        reporter.start()
+    except BaseException:
+        writer.close()
+        raise
+    try:
+        scenario(root, Event(), notify)
+    except pytest.skip.Exception:
+        message, code = b"skip", 0
+    except BaseException as error:
+        try:
+            detail = redact_command_secrets(primitives.sanitize_display(
+                type(error).__name__ + ": " + str(error), max_len=None))[:512]
+            message = b"error:" + detail.encode("utf-8", errors="backslashreplace")
+        except BaseException:
+            message = b"error:codec scenario failed while formatting its diagnostic"
+        code = 1
+    else:
+        message, code = b"ok", 0
+    messages.put_nowait((message, True))
+    reporter.join(1)
+    if reporter.is_alive():
+        raise SystemExit(1)
+    raise SystemExit(code)
+
+
+def _run_codec_scenario(scenario, root, *, timeout=10, observed=None, requires_store=False):
+    """Supervise assertions and Store teardown in one killable spawned child."""
+    from concurrent.futures import Future
+    from threading import Thread
+    from time import monotonic
+    if requires_store and not _store_supported():
+        pytest.skip("anchored store operations unavailable on this platform (end-of-build platform pass)")
+    context = multiprocessing.get_context("spawn")
+    reader, writer, process = None, None, None
+    future, threads = Future(), []
+
+    def receive():
+        try:
+            for _ in range(8):
+                message = reader.recv_bytes(4096)
+                if message in {b"blocked", b"teardown", b"unblocked"}:
+                    if observed is not None:
+                        observed.append(message.decode("ascii"))
+                    continue
+                assert message in {b"ok", b"skip"} or message.startswith(b"error:"), "invalid codec outcome"
+                future.set_result(message)
+                return
+            raise AssertionError("too many codec progress messages")
+        except EOFError:
+            future.set_exception(AssertionError("codec child exited without an outcome"))
+        except BaseException:
+            future.set_exception(AssertionError("invalid codec child outcome"))
+
+    try:
+        deadline = monotonic() + timeout
+        reader, writer = context.Pipe(duplex=False)
+        process = context.Process(target=_codec_process, args=(scenario, root, writer))
+        process.start()
+        writer.close()
+        thread = Thread(target=receive, daemon=True)
+        threads.append(thread)
+        thread.start()
+        message = future.result(timeout=max(0, deadline - monotonic()))
+        process.join(max(0, deadline - monotonic()))
+        if process.is_alive():
+            raise FutureTimeoutError()
+        if message == b"skip" and process.exitcode == 0:
+            pytest.skip("anchored store operations unavailable in spawned scenario")
+        if message.startswith(b"error:"):
+            detail = redact_command_secrets(primitives.sanitize_display(
+                message[6:].decode("utf-8"), max_len=None))[:512]
+            raise AssertionError("codec child failed: " + detail)
+        assert message == b"ok" and process.exitcode == 0, "codec child exit disagrees with outcome"
+    finally:
+        try:
+            if process is not None and process.pid is not None:
+                if process.is_alive():
+                    process.terminate()
+                process.join(0.5)
+                if process.is_alive():
+                    process.kill()
+                process.join(2)
+            for thread in threads:
+                if thread.ident is not None:
+                    thread.join(2)
+            assert process is None or not process.is_alive(), "codec child survived kill"
+            assert not any(thread.is_alive() for thread in threads), "codec outcome reader did not stop"
+        finally:
+            if reader is not None:
+                reader.close()
+            if writer is not None:
+                writer.close()
+            if process is not None and not process.is_alive():
+                process.close()
+
+
+def _unreleased_store_reader(root, release, notify):
+    from threading import Event
+    entered = Event()
+    store = make_store(root)
+    try:
+        value = record(body="blocked real reader")
+        rid = store.write(value)
+        context = codec.ReadContext(store, lambda reference: {"author": value["meta"], "kind": "text"})
+        original = codec_store.Store._read_bytes
+
+        def blocked(self, *args, **kwargs):
+            entered.set()
+            notify("blocked")
+            Event().wait(30)  # Deliberately ignores the scenario's release event.
+            notify("unblocked")
+            return original(self, *args, **kwargs)
+
+        with codec_patch.object(codec_store.Store, "_read_bytes", blocked):
+            try:
+                _concurrent_reads(context, [rid], timeout=0.05, release=release,
+                                  join_timeout=0.05, entered=entered)
+            finally:
+                notify("teardown")
+                store.close()
+    finally:
+        store.close()
+
+
+def _unreleased_portable_reader(root, release, notify):
+    from threading import Event, Lock
+    lock, entered = Lock(), Event()
+
+    def blocked(reference, **kwargs):
+        with lock:
+            entered.set()
+            notify("blocked")
+            Event().wait(30)  # Deliberately ignores release, like the Store control.
+            notify("unblocked")
+            return reference
+
+    try:
+        _concurrent_reads(SimpleNamespace(read=blocked), ["blocked"], timeout=0.05,
+                          release=release, join_timeout=0.05, entered=entered)
+    finally:
+        notify("teardown")
+        with lock:  # Models close waiting for a stuck reader on every platform.
+            pass
+
+
+def _sigterm_resistant_codec_scenario(scenario, root, release, notify):
+    import signal
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    scenario(root, release, notify)
+
+
+@pytest.mark.parametrize("portable", [False, True])
+@pytest.mark.parametrize("ignore_sigterm", [False, True])
+def test_codec_scenario_reaps_reader_ignoring_release(tmp_path, monkeypatch, ignore_sigterm, portable):
+    from functools import partial
+    if ignore_sigterm and os.name != "posix":
+        pytest.skip("requires POSIX SIGTERM handlers")
+    if portable:
+        monkeypatch.setattr("tests.unit.core.test_message_codec._store_supported", lambda: False)
+    observed = []
+    scenario = _unreleased_store_reader if _store_supported() else _unreleased_portable_reader
+    if ignore_sigterm:
+        scenario = partial(_sigterm_resistant_codec_scenario, scenario)
+    with pytest.raises(FutureTimeoutError):
+        _run_codec_scenario(scenario, tmp_path, observed=observed)
+    assert "blocked" in observed
+    assert "teardown" in observed
+    assert "unblocked" not in observed
+    assert multiprocessing.active_children() == []
+
+
+def _failing_codec_scenario(root, release, notify):
+    raise AssertionError("\x1b[31mtoken=SCENARIO_SECRET\x1b[0m\n " + "x" * 4096)
+
+
+def _successful_codec_scenario(root, release, notify):
+    release.set()
+    assert release.is_set()
+
+
+def test_store_scenario_skips_before_spawn_when_probe_is_unavailable(tmp_path, monkeypatch):
+    monkeypatch.setattr("tests.unit.core.test_message_codec._store_supported", lambda: False)
+    monkeypatch.setattr("tests.unit.core.test_message_codec.multiprocessing", SimpleNamespace(
+        get_context=lambda method: pytest.fail("unsupported Store scenario attempted spawn")))
+    with pytest.raises(pytest.skip.Exception, match="^anchored store operations unavailable"):
+        _run_codec_scenario(_successful_codec_scenario, tmp_path, requires_store=True)
+
+
+def test_codec_scenario_reports_bounded_redacted_assertions_and_allows_retry(tmp_path):
+    with pytest.raises(AssertionError, match="^codec child failed: AssertionError:") as caught:
+        _run_codec_scenario(_failing_codec_scenario, tmp_path)
+    message = str(caught.value)
+    assert "SCENARIO_SECRET" not in message and "\x1b" not in message and "\n" not in message
+    assert len(message) <= len("codec child failed: ") + 512
+    assert multiprocessing.active_children() == []
+    _run_codec_scenario(_successful_codec_scenario, tmp_path)
+    assert multiprocessing.active_children() == []
+
+
+@pytest.mark.parametrize("failure", ["timeout", "raise", "raise-later"])
+def test_concurrent_reads_release_blocked_workers_and_allow_retry(failure):
+    from threading import Event, Thread, current_thread
+    entered, release, finished, done, rescued = (Event() for _ in range(5))
+    readers = []
+    timeout = 10 if failure == "timeout" else 1
+
+    def read(reference, **kwargs):
+        readers.append(current_thread())
+        if reference == "blocked":
+            entered.set()
+            try:
+                assert release.wait(30), "control was not released"
+                return reference
+            finally:
+                finished.set()
+        assert entered.wait(2), "blocked peer did not enter"
+        raise ValueError("read control failed")
+
+    def rescue():
+        if not done.wait(timeout + 2):
+            rescued.set()
+            release.set()
+
+    watchdog = Thread(target=rescue, daemon=True)
+    watchdog.start()
+    try:
+        references = (["blocked"] if failure == "timeout" else
+                      ["blocked", "raise"] if failure == "raise-later" else ["raise", "blocked"])
+        expected = FutureTimeoutError if failure == "timeout" else ValueError
+        message = None if failure == "timeout" else "^read control failed$"
+        with pytest.raises(expected, match=message):
+            _concurrent_reads(SimpleNamespace(read=read), references,
+                              timeout=timeout, release=release)
+        assert not rescued.is_set(), "reader shutdown waited for the blocked worker"
+        assert finished.is_set()
+        assert all(reader.daemon and not reader.is_alive() for reader in readers)
+        assert _concurrent_reads(SimpleNamespace(read=lambda ref, **kw: ref), [1, 2, 3, 4]) == [1, 2, 3, 4]
+    finally:
+        done.set()
+        release.set()
+        watchdog.join(2)
+        assert not watchdog.is_alive()
 
 
 def test_read_context_denial_precedes_payload_and_retry_is_request_scoped(tmp_path, monkeypatch):
@@ -116,8 +437,7 @@ def test_read_context_failure_accounting_and_repair(tmp_path, failure):
         store.close()
 
 
-def test_read_context_concurrent_cache_and_closed_reader_boundary(tmp_path, monkeypatch):
-    from concurrent.futures import ThreadPoolExecutor
+def _scenario_concurrent_cache_and_closed_reader_boundary(tmp_path, release, notify):
     store = make_store(tmp_path)
     try:
         value = record(body="child")
@@ -129,22 +449,25 @@ def test_read_context_concurrent_cache_and_closed_reader_boundary(tmp_path, monk
             reads.append(args[0])
             return original(self, *args, **kwargs)
 
-        monkeypatch.setattr(codec_store.Store, "_read_bytes", counted)
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            assert list(pool.map(context.read, [rid] * 4)) == [value] * 4
-        assert reads == [rid] and context.io.used == len(raw(value))
-        parent = dict(record(), refs={"child": rid})
-        assert codec.read_view(parent, store=context) == codec.read_view(parent, store=store)
-        class Reader:
-            read = context.read
-            describe = context.describe
-        class Derived(codec.ReadContext):
-            pass
-        for reader in (Reader(), Derived(store, lambda reference: {})):
-            assert_error("E_REF", lambda: codec.read_view(parent, store=reader))
-            assert_error("E_REF", lambda: codec.ReadContext(reader, lambda reference: {}))
+        with codec_patch.object(codec_store.Store, "_read_bytes", counted):
+            assert _concurrent_reads(context, [rid] * 4) == [value] * 4
+            assert reads == [rid] and context.io.used == len(raw(value))
+            parent = dict(record(), refs={"child": rid})
+            assert codec.read_view(parent, store=context) == codec.read_view(parent, store=store)
+            class Reader:
+                read = context.read
+                describe = context.describe
+            class Derived(codec.ReadContext):
+                pass
+            for reader in (Reader(), Derived(store, lambda reference: {})):
+                assert_error("E_REF", lambda: codec.read_view(parent, store=reader))
+                assert_error("E_REF", lambda: codec.ReadContext(reader, lambda reference: {}))
     finally:
         store.close()
+
+
+def test_read_context_concurrent_cache_and_closed_reader_boundary(tmp_path):
+    _run_codec_scenario(_scenario_concurrent_cache_and_closed_reader_boundary, tmp_path, requires_store=True)
 
 
 @pytest.mark.parametrize("options,code", [({"selectors": ["body.bad"]}, "E_SELECTOR"),
@@ -209,8 +532,7 @@ def test_read_context_budget_aliases_preserve_verification_and_exact_charges(tmp
         store.close()
 
 
-def test_read_context_concurrent_distinct_records_share_an_ancestor_once(tmp_path):
-    from concurrent.futures import ThreadPoolExecutor
+def _scenario_concurrent_distinct_records_share_an_ancestor_once(tmp_path, release, notify):
     store = make_store(tmp_path)
     try:
         values = [record(body=body) for body in ("one", "two")]
@@ -220,12 +542,14 @@ def test_read_context_concurrent_distinct_records_share_an_ancestor_once(tmp_pat
         context = codec.ReadContext(store, lambda reference: {"author": values[0]["meta"], "kind": "text"})
         context.io.limit, context.io.parent = total, ancestor
         view = codec.Budget(total, parent=ancestor)
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [pool.submit(context.read, rid, _budget=view) for rid in ids]
-            assert [future.result(timeout=10) for future in futures] == values
+        assert _concurrent_reads(context, ids, budget=view) == values
         assert context.io.used == view.used == ancestor.used == total
     finally:
         store.close()
+
+
+def test_read_context_concurrent_distinct_records_share_an_ancestor_once(tmp_path):
+    _run_codec_scenario(_scenario_concurrent_distinct_records_share_an_ancestor_once, tmp_path, requires_store=True)
 
 
 @pytest.mark.parametrize("alias", ["direct", "descendant", "ancestor"])
@@ -341,10 +665,14 @@ def test_r9_replay_refusal_does_not_partially_charge_a_view_chain(tmp_path):
         store.close()
 
 
-def make_store(root, *, fixture_owned=False):
+def _store_supported():
     capabilities = {function.__name__ for function in os.supports_dir_fd}
-    if not ({"open", "stat", "link", "unlink"} <= capabilities and
-            hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")):
+    return ({"open", "stat", "link", "unlink"} <= capabilities and
+            hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY"))
+
+
+def make_store(root, *, fixture_owned=False):
+    if not _store_supported():
         pytest.skip("anchored store operations unavailable on this platform (end-of-build platform pass)")
     store = codec.Store(root)
     complete = False
