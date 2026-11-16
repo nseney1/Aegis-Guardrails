@@ -1,7 +1,10 @@
 """Recoverable unclaim transitions through the public queue service."""
 from concurrent.futures import ProcessPoolExecutor
+import hashlib
 import json
 import os
+from pathlib import PureWindowsPath
+import shlex
 import shutil
 import subprocess
 import time
@@ -11,6 +14,7 @@ import pytest
 
 from conftest import symlink_or_skip
 from aegis_core import events, gitsafe, storage, team, team_claims, team_queue as queue
+from aegis_core.workspace.binding import resolve_cli_root
 
 
 @pytest.fixture
@@ -656,7 +660,11 @@ def test_maximum_reason_keeps_a_complete_retry_command(make_store, monkeypatch):
     monkeypatch.setattr(team_claims, "_release_lease", failed)
     result = unclaim(make_store, revision, reason=reason)
     blocker = result["blockers"][0]
-    assert blocker["next_action"].endswith("--writer-stopped")
+    action = blocker["next_action"]
+    assert action.startswith("Retry as the recorded caller: ")
+    assert action.index("--writer-stopped") < action.index("--workspace")
+    assert str(make_store) in action and len(action) <= queue.MAX_TEXT
+    assert action == queue._shown(action) and "\n" not in action
     assert blocker["reason_text"] == reason
     monkeypatch.setattr(team_claims, "_release_lease", original)
     assert not unclaim(make_store, revision)["refused"]
@@ -777,8 +785,10 @@ def test_large_fingerprint_observation_has_linear_evaluation_budget(make_store, 
     assert len(raw) <= queue.MAX_BYTES
     path.write_bytes(raw)
     lease = team.claim(make_store, "l3999", ["src/**"], owner="owner", now=100)
-    counts = {"items": 0, "holds": 0, "overlaps": 0, "live_checks": 0}
+    counts = {"items": 0, "holds": 0, "overlaps": 0, "live_checks": 0,
+              "foreign_lease": 0, "capacity": 0}
     original_blockers, original_live, paths = queue._blockers, queue._live, queue.team_paths
+    original_foreign, original_capacity = queue._foreign_lease, queue._capacity
 
     def blockers(item, *args, **kwargs):
         counts["items"] += 1
@@ -796,8 +806,18 @@ def test_large_fingerprint_observation_has_linear_evaluation_budget(make_store, 
         assert counts["live_checks"] <= 4 * (count * holds + count * lane_count), counts
         return original_live(*args)
 
+    def foreign(*args):
+        counts["foreign_lease"] += 1
+        return original_foreign(*args)
+
+    def capacity(*args):
+        counts["capacity"] += 1
+        return original_capacity(*args)
+
     monkeypatch.setattr(queue, "_blockers", blockers)
     monkeypatch.setattr(queue, "_live", live)
+    monkeypatch.setattr(queue, "_foreign_lease", foreign)
+    monkeypatch.setattr(queue, "_capacity", capacity)
     monkeypatch.setattr(queue, "team_paths", SimpleNamespace(**{**vars(paths), "overlap": overlap}))
     started = time.monotonic()
     result = queue.list(make_store, now=102)
@@ -807,9 +827,13 @@ def test_large_fingerprint_observation_has_linear_evaluation_budget(make_store, 
     assert elapsed < 30, (elapsed, counts)
     record_property("observation_budget", json.dumps({**counts, "seconds": elapsed,
         "config_bytes": len(config_raw), "queue_bytes": len(raw), "lanes": lane_count, "items": count}))
+    assert counts["foreign_lease"] == 0, counts
+    assert counts["capacity"] <= lane_count, counts
     monkeypatch.setattr(queue, "_blockers", original_blockers)
     monkeypatch.setattr(queue, "_live", original_live)
     monkeypatch.setattr(queue, "team_paths", paths)
+    monkeypatch.setattr(queue, "_foreign_lease", original_foreign)
+    monkeypatch.setattr(queue, "_capacity", original_capacity)
     revision = result["items"][0]["revision"]
     claimed = queue.claim(make_store, "I000", expect=revision, lane="l3999", now=102)
     assert claimed["refused"] is (case == "holds")
@@ -872,6 +896,127 @@ def test_round_two_fingerprint_golden(make_store, monkeypatch, record_property, 
     assert not result["refused"], result
     record_property("round_two_golden", json.dumps({case: result["claimable_fingerprint"]}))
     assert result["claimable_fingerprint"] == ROUND_TWO_FINGERPRINTS[case]
+
+
+# Public full-list response hashes captured at d896c4db before product edits.
+LANE_ELIGIBILITY_GOLDENS = {
+    "empty": "e1395b2bd419e1e2aeb537041a844ef9266fa7de16bf874b8641f2734ec26787",
+    "cover-alpha": "2f43411ae899098a532d6949ecc3d62e50589cece06a7f7a08477bc0bdefb380",
+    "cover-beta": "ece667d317c79e2fd0bd18df6f0f185bf04501f96977c05e31a4c41dd495f344",
+    "cover-two": "cca91a8d827952b90274355a4592a700b64e0963a11d92f395cf25e85dab14e8",
+    "cover-unconfigured": "03a3a521a094a759def2001e0350d256f7689e8f7b7d80b627f1076b9d28b155",
+    "busy-cover": "186c01a4b25b2d4cdd4932eda7d06d4738bfb73b58514219458d20cceab90659",
+    "busy-other": "9063f30b3d7f83dc50fe90212f0f4fe37b4ae469d971557fa4ce632eb7fd7f24",
+    "busy-all": "27783ed7d5fbe427bfd0b1cdd3026a534ea382b5a913f4c045bef2e54c4b724a",
+    "capacity-cover": "11b4dae0dfeba1f5ced56bf649156215ad9fa690381a4ed23a0c1508a02baab9",
+    "capacity-empty": "f4e907d8122600c044fdc039a762e70d637f6b178ddc1246c7124dcb3393a7dd",
+    "over-capacity": "e840265df73173094d71b60c38dd2950a15d50b90567eefc7a79bc02ef967915",
+    "invalid-profile": "b3797bbdb6aa1642bc30bef6685feb0f71545f4ebf742eeb6cec8c30b4af41a9",
+    "unchecked": "ca32255d9472dee8c9956f9601ee77925a6897d943dfa64c7b2d92fd4fcb710a",
+    "unreadable": "812da6d72e931a910078d9aa72da9be24b7156afc78fbdd0bada968f226df834",
+    "done": "8107aa3525fd39fe96e9c01037ebaabe64f33c065397d9c813f56bc02294c197",
+    "live": "099dd4b9c8acb5e4f2b5deea46d752f631ba4bc56c65c5875622dd518a20372e",
+    "expired": "c5d8679843f9c195682bd1b3de8de843efa19b362fa41b32367157fac0fa9420",
+    "no-lanes": "5c0899720345c4107f16946d81b9ef32d6895058a9b80b307e57c02d618e5790",
+}
+
+
+@pytest.mark.parametrize("case,claimable", [
+    ("empty", True), ("cover-alpha", True), ("cover-beta", True),
+    ("cover-two", False), ("cover-unconfigured", False),
+    ("busy-cover", False), ("busy-other", True), ("busy-all", False),
+    ("capacity-cover", True), ("capacity-empty", False), ("over-capacity", False),
+    ("invalid-profile", False), ("unchecked", False), ("unreadable", False),
+    ("done", False), ("live", False), ("expired", True), ("no-lanes", False),
+])
+def test_list_lane_eligibility_matrix(make_store, monkeypatch, record_property, case, claimable):
+    row = {"item": {"id": "ONE", "title": "Work", "paths": ["src/**"], "capabilities": []},
+        "state": "queued", "revision": "1" * 64, "lane": None, "expires_at": None}
+    state = {"version": 1, "items": {"ONE": row}, "milestones": [], "completed": {}}
+    lanes = {"alpha": ["src/**"], "beta": ["docs/**"]}
+    lease_specs = {
+        "cover-alpha": [("alpha", "src/**")], "cover-beta": [("beta", "src/**")],
+        "cover-two": [("alpha", "src/**"), ("beta", "src/**")],
+        "cover-unconfigured": [("foreign", "src/**")],
+        "busy-cover": [("alpha", "src/**")], "busy-other": [("alpha", "src/**")],
+        "capacity-cover": [("alpha", "src/**")], "capacity-empty": [("foreign", "docs/**")],
+        "over-capacity": [("alpha", "src/**"), ("beta", "docs/**")],
+    }
+    leases = tuple(team.Lease(lane, "implementer", "owner", "0" * 16, 1, None,
+                             (scope,), 100, 3600, str(index + 1) * 40)
+                   for index, (lane, scope) in enumerate(lease_specs.get(case, [])))
+    unreadable = ((team.Unreadable("foreign", team.lane_ref("foreign"), "b" * 40, "invalid"),)
+                  if case == "unreadable" else ())
+    found, checked = team.LeaseSet(leases, unreadable), case != "unchecked"
+    if case in ("busy-cover", "busy-other", "busy-all"):
+        busy_lanes = ("alpha", "beta") if case == "busy-all" else (
+            "beta" if case == "busy-other" else "alpha",)
+        for lane in busy_lanes:
+            state["items"][lane] = {"item": {"id": lane, "title": "Busy", "paths": ["busy/**"],
+                "capabilities": []}, "state": "claimed", "revision": "2" * 64,
+                "lane": lane, "expires_at": 200}
+    if case == "done":
+        row["state"] = "done"
+    elif case in ("live", "expired"):
+        row.update(state="claimed", lane="alpha", expires_at=103 if case == "live" else 102)
+    elif case == "no-lanes":
+        lanes = {}
+        (make_store / ".aegis" / "team.json").write_text('{"v":1,"lanes":{}}', encoding="utf-8")
+    limit = 1 if case.startswith("capacity-") or case == "over-capacity" else 2
+    policy = {"valid": True, "writers_max": limit} if case != "invalid-profile" else {"valid": False}
+    profile = make_store / ".aegis" / "team" / "profile.json"
+    profile.parent.mkdir()
+    profile.write_text(json.dumps({"version": 1, "run_config": {"limits": {"writers_max": limit}}})
+                       if policy["valid"] else "{}", encoding="utf-8")
+    path = make_store / ".aegis" / "state" / "team-queue.json"
+    path.parent.mkdir()
+    path.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
+    before = path.read_bytes()
+    monkeypatch.setattr(team_claims, "observe_leases", lambda root: (found, checked))
+    expected = team_claims.fingerprint(state, found, 102,
+        [["ONE", row["revision"]]] if claimable else [], lanes or None, policy, checked)
+    for _ in range(2):
+        result = queue.list(make_store, now=102, include_done=True)
+        assert not result["refused"], result
+        assert result["claimable_fingerprint"] == expected
+        assert queue.list(make_store, now=102, view="fingerprint")["claimable_fingerprint"] == expected
+        assert path.read_bytes() == before
+    # Exclude the release version so a version bump does not invalidate the fixture.
+    payload = {key: value for key, value in result.items() if key != "aegis_version"}
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("ascii")).hexdigest()
+    record_property("lane_eligibility_golden", json.dumps({case: digest}))
+    assert digest == LANE_ELIGIBILITY_GOLDENS[case]
+
+
+@pytest.mark.parametrize("view", ["full", "fingerprint"])
+def test_list_lane_eligibility_unsupported_platform(tmp_path, monkeypatch, view):
+    monkeypatch.setattr(queue, "descriptor_supported", lambda: False)
+    result = queue.list(tmp_path, now=102, view=view)
+    assert result["refused"] and result["reason"] == "unsupported_platform"
+    assert result["exit_code"] == 1
+
+
+def test_list_lane_eligibility_uses_one_lease_snapshot_and_refreshes(make_store, monkeypatch):
+    added = queue.add(make_store, {"id": "ONE", "title": "Work", "paths": ["src/**"],
+                                 "capabilities": []}, now=100)
+    assert not added["refused"], added
+    before = queue.list(make_store, now=102)
+    original, published = queue._capacity, []
+
+    def publish_during_observation(*args):
+        if not published:
+            published.append(team.claim(make_store, "foreign", ["src/**"], owner="owner", now=100))
+        return original(*args)
+
+    monkeypatch.setattr(queue, "_capacity", publish_during_observation)
+    assert queue.list(make_store, now=102) == before
+    assert len(published) == 1
+    after = queue.list(make_store, now=102)
+    assert not after["refused"], after
+    assert after["claimable_fingerprint"] != before["claimable_fingerprint"]
+    assert queue.list(make_store, now=102) == after
+    team.release(make_store, "foreign", published[0].oid, caller="owner")
+    assert queue.list(make_store, now=102) == before
 
 
 def plant_pending(root, monkeypatch):
@@ -959,7 +1104,9 @@ def test_recovery_cause_names_the_blocker_and_retries(make_store, monkeypatch, b
         if blocker in ("foreign", "unreadable"):
             assert cause["reason"] == "unclaim_lease_refused"
             assert cause["lane"] == "beta" and cause["lease_oid"]
-            assert "aegis team release beta --expect " + cause["lease_oid"] == cause["next_action"].split(": ", 1)[1]
+            release = cause["next_action"].split(": ", 1)[1]
+            assert release.startswith("aegis team release beta --expect " + cause["lease_oid"] + " --workspace ")
+            assert str(make_store) in release
         else:
             assert cause["reason"] == "unclaim_event_unavailable"
             assert set(cause) == {"refused", "reason", "next_action"}
@@ -993,7 +1140,10 @@ def test_recovery_cause_omits_unsanitized_lease_facts(make_store, monkeypatch):
     cause = cause_of(result)
     assert cause["reason"] == "unclaim_lease_refused"
     assert "lane" not in cause and "lease_oid" not in cause
-    assert cause["next_action"] == "aegis team list --json; ask the coordinator to repair the unreadable ref"
+    listed = cause["next_action"]
+    assert listed.startswith("aegis team list --json --workspace ")
+    assert listed.endswith("; ask the coordinator to repair the unreadable ref")
+    assert str(make_store) in listed and "private-value" not in listed
     assert "private-value" not in json.dumps(result)
     assert "beta private-value" not in json.dumps(result)
     assert path.read_bytes() == before
@@ -1249,13 +1399,16 @@ def _assert_recovery_cause(result, category, *, lane=None, lease_oid=None):
         "unclaim_recovery_required", category], result
     cause = result["blockers"][1]
     rendered = json.dumps(result)
-    assert "private-value" not in rendered and "/tmp/" not in rendered
+    assert "private-value" not in rendered and "/tmp/secret" not in rendered
     assert "\n" not in json.dumps(cause)
+    retry = result["blockers"][0]["next_action"]
+    assert retry.startswith("Retry as the recorded caller: ")
+    assert "--writer-stopped" in retry and "--workspace" in retry
     if category == "unclaim_lease_refused":
         assert cause["lane"] == lane and cause["lease_oid"] == lease_oid
         assert set(cause) == {"refused", "reason", "lane", "lease_oid", "next_action"}
         command = "aegis team release " + lane + " --expect " + lease_oid
-        assert cause["next_action"].split(": ", 1)[1] == command
+        assert cause["next_action"].split(": ", 1)[1].startswith(command + " --workspace ")
         assert "unreadable" not in cause["next_action"]
     else:
         assert set(cause) == {"refused", "reason", "next_action"}
@@ -1440,3 +1593,230 @@ def test_absent_lease_refusal_keeps_intent_oid(make_store, monkeypatch):
     recovered = unclaim(make_store, revision)
     assert not recovered["refused"], recovered
     assert recovered["released_lease_ids"] == [oid]
+
+
+_RETURN_TO_WORKSPACE = (
+    "return to the workspace that issued this command; its path cannot be shown safely")
+
+
+def _intent():
+    return {"id": "ONE", "revision": "ab" * 32, "lane": "alpha", "caller": "owner",
+            "reason": "Waiting", "lease_oid": None, "to_revision": "cd" * 32}
+
+
+def _shell_command(text):
+    """The shell command before an unquoted semicolon. Quoted semicolons stay put."""
+    quote = None
+    for index, char in enumerate(text):
+        if quote:
+            if char == quote:
+                quote = None
+            continue
+        if char in "'\"":
+            quote = char
+            continue
+        if char == ";":
+            return text[:index]
+    return text
+
+
+def _workspace_token(text):
+    argv = shlex.split(_shell_command(text))
+    assert "--workspace" in argv, text
+    return argv[argv.index("--workspace") + 1]
+
+
+def _assert_identical_blocker_fields(blocker, intent):
+    assert (blocker["caller"], blocker["revision"], blocker["reason_text"]) == (
+        intent["caller"], intent["revision"], intent["reason"])
+    assert blocker["item_id"] == intent["id"] and blocker["lane"] == intent["lane"]
+    assert blocker["reason"] == "unclaim_recovery_required" and blocker["refused"] is True
+
+
+def _assert_quoted_workspace(text, spelling):
+    """The command carries one faithfully quoted ``--workspace`` and no joined line."""
+    assert _RETURN_TO_WORKSPACE not in text, text
+    token = _workspace_token(text)
+    assert token == spelling
+    assert shlex.split(shlex.quote(token)) == [token]
+    shown = queue._shown(text)
+    assert shown == text and len(shown) <= queue.MAX_TEXT and "\n" not in text
+
+
+def _assert_shown_command(text, root):
+    """A real root is quoted faithfully and resolves back to the workspace that issued it."""
+    _assert_quoted_workspace(text, os.fspath(root))
+    other = root.parent if root.parent != root else root
+    assert resolve_cli_root(_workspace_token(text), other) == root.resolve()
+
+
+def _assert_hidden_command(text, marker):
+    """An unshowable path is omitted whole. Screening must not echo or join it."""
+    assert "--workspace" not in text, text
+    assert _RETURN_TO_WORKSPACE in text, text
+    assert marker not in text
+    assert "\n" not in text and "REDACTED" not in text
+    shown = queue._shown(text)
+    assert shown == text and marker not in shown
+
+
+def test_windows_drive_less_recovery_path_requires_return(monkeypatch):
+    monkeypatch.setattr(team_claims, "Path", PureWindowsPath)
+    marker = "MARKERVALUE"
+    refusal = team_claims.recovery_refusal(_intent(), root="/workspace/" + marker)
+    _assert_hidden_command(refusal.blockers[0]["next_action"], marker)
+
+    absolute = team_claims.recovery_refusal(_intent(), root="C:/workspace/plain")
+    _assert_quoted_workspace(absolute.blockers[0]["next_action"], "C:/workspace/plain")
+
+
+@pytest.mark.parametrize("shape", ["plain", "spaces", "quotes", "long", "credential", "overlong",
+                                    "newline", "surrogate", "relative", "empty", "quoted-overflow",
+                                    "display-overflow", "line-separator", "ansi", "components"])
+def test_recovery_command_shape_matrix(shape):
+    """Every recovery command names its workspace, or refuses to show the path."""
+    intent = _intent()
+    marker = "MARKERVALUE"
+    anchor = "C:/" if os.name == "nt" else "/"
+    if shape == "plain":
+        root = anchor + "workspace/plain"
+    elif shape == "spaces":
+        root = anchor + "workspace/my work"
+    elif shape == "quotes":
+        root = anchor + "workspace/qu'ote"
+    elif shape == "long":
+        root = anchor + ("p" * 3000)
+    elif shape == "credential":
+        root = anchor + "tmp/token=" + marker
+    elif shape == "overlong":
+        root = anchor + (marker * 800)
+    elif shape == "newline":
+        root = anchor + "tmp/ab\n" + marker
+    elif shape == "surrogate":
+        root = anchor + "tmp/\udcff" + marker
+    elif shape == "relative":
+        root = "workspace/" + marker
+    elif shape == "quoted-overflow":
+        root = anchor + "workspace/" + ("'" * 1000) + marker
+    elif shape == "display-overflow":
+        root = anchor + "workspace/" + ("p" * queue.MAX_TEXT) + marker
+    elif shape == "line-separator":
+        root = anchor + "workspace/\u2028" + marker
+    elif shape == "ansi":
+        root = anchor + "workspace/\x1b[31m" + marker
+    elif shape == "components":
+        root = anchor + "workspace/" + ("part/" * 257) + marker
+    else:
+        root = ""
+    show = shape in ("plain", "spaces", "quotes", "long")
+    refusal = team_claims.recovery_refusal(intent, root=root)
+    assert refusal.reason == "unclaim_recovery_required" and str(refusal) == refusal.reason
+    blocker = refusal.blockers[0]
+    _assert_identical_blocker_fields(blocker, intent)
+    lease = team_claims._lease_refusal(root, "alpha", "ab" * 20)
+    assert lease.reason == "unclaim_lease_refused"
+    compact = team_claims.recovery_refusal(intent, root=root, cause="queue_size_limit")
+    listed = team_claims.recovery_refusal(
+        intent, root=root, cause="unclaim_lease_refused", lane="not a lane", lease_oid="nope")
+    commands = (
+        blocker["next_action"],
+        lease.blockers[0]["next_action"],
+        compact.blockers[1]["next_action"],
+        listed.blockers[1]["next_action"],
+    )
+    for text in commands:
+        if show:
+            _assert_quoted_workspace(text, root)
+        else:
+            _assert_hidden_command(text, marker)
+    if show:
+        assert "aegis team queue unclaim" in blocker["next_action"]
+        assert "aegis team release alpha --expect " + ("ab" * 20) in lease.blockers[0]["next_action"]
+        assert "aegis team queue compact" in compact.blockers[1]["next_action"]
+        assert "aegis team list --json" in listed.blockers[1]["next_action"]
+        assert "not a lane" not in listed.blockers[1]["next_action"]
+        assert "nope" not in json.dumps(listed.blockers[1])
+    else:
+        rendered = json.dumps(refusal.blockers)
+        assert marker not in rendered and "REDACTED" not in rendered
+
+
+def test_recovery_commands_from_a_real_workspace_resolve_back(make_store, tmp_path):
+    """Public refusals carry the issuing root, including spaces and quotes."""
+    quoted = tmp_path / "my work" / "qu'ote"
+    quoted.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(quoted)], check=True)
+    (quoted / ".aegis").mkdir()
+    (quoted / ".aegis" / "team.json").write_text(json.dumps({
+        "v": 1, "lanes": {"alpha": ["src/**"]}}), encoding="utf-8")
+    for root in (make_store, quoted):
+        added = queue.add(root, {"id": "ONE", "title": "Work", "paths": ["src/**"], "capabilities": []}, now=100)
+        claimed = queue.claim(root, "ONE", expect=added["item"]["revision"], lane="alpha", now=101, caller="owner")
+        assert not claimed["refused"], claimed
+        team.claim(root, "alpha", ["src/**"], owner="owner", now=100)
+        original = team_claims._release_lease
+
+        def failed(*args, **kwargs):
+            raise OSError("injected")
+
+        # The module attribute is the one transition calls. Patch that, not os.open.
+        team_claims._release_lease = failed
+        try:
+            first = unclaim(root, claimed["item"]["revision"], reason="Waiting")
+            again = queue.list(root, now=102)
+        finally:
+            team_claims._release_lease = original
+        assert first["reason"] == "unclaim_recovery_required"
+        for result in (first, again):
+            blocker = result["blockers"][0]
+            assert (blocker["caller"], blocker["revision"], blocker["reason_text"]) == (
+                "owner", claimed["item"]["revision"], "Waiting")
+            _assert_shown_command(blocker["next_action"], root)
+        assert queue.list(root, now=103)["reason"] == "unclaim_recovery_required"
+        recovered = unclaim(root, claimed["item"]["revision"])
+        assert not recovered["refused"], recovered
+
+
+def test_pending_verbs_from_another_directory_name_the_issuing_workspace(make_store, tmp_path):
+    """list, audit and another verb refuse with a command that resolves to this root."""
+    added = queue.add(make_store, {"id": "ONE", "title": "Work", "paths": ["src/**"], "capabilities": []}, now=100)
+    claimed = queue.claim(make_store, "ONE", expect=added["item"]["revision"], lane="alpha",
+                          now=101, caller="owner", branch="lane/alpha")
+    path = make_store / ".aegis" / "state" / "team-queue.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["unclaim"] = {"id": "ONE", "revision": claimed["item"]["revision"], "lane": "alpha",
+                        "caller": "owner", "reason": "Waiting", "lease_oid": None, "to_revision": "ab" * 32}
+    path.write_text(json.dumps(state), encoding="utf-8")
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    previous = os.getcwd()
+    os.chdir(other)
+    try:
+        listed = queue.list(make_store, now=102)
+        audited = queue.audit(make_store, now=102)
+        released = queue.release(make_store, "ONE", expect=claimed["item"]["revision"], lane="alpha", now=102)
+    finally:
+        os.chdir(previous)
+    for result in (listed, audited, released):
+        assert result["reason"] == "unclaim_recovery_required" and result["exit_code"] == 1
+        blocker = result["blockers"][0]
+        assert blocker["reason_text"] == "Waiting" and blocker["caller"] == "owner"
+        _assert_shown_command(blocker["next_action"], make_store)
+        assert os.fspath(other) not in blocker["next_action"]
+    assert "unclaim" in json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_read_only_list_without_pending_unclaim_emits_no_recovery_command(make_store):
+    added = queue.add(make_store, {"id": "ONE", "title": "Work", "paths": ["src/**"], "capabilities": []}, now=100)
+    assert not added["refused"], added
+    listed = queue.list(make_store, now=101)
+    rendered = json.dumps(listed)
+    assert listed["refused"] is False
+    assert "aegis team queue unclaim" not in rendered
+    assert "--workspace" not in rendered
+    from aegis_mcp.tools import execute_tool
+    mcp = execute_tool("aegis_team_queue", {"workspace": make_store})
+    mcp_text = json.dumps(mcp)
+    assert mcp["refused"] is False
+    assert "aegis team queue unclaim" not in mcp_text
+    assert "--workspace" not in mcp_text

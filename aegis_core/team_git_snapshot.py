@@ -16,9 +16,13 @@ from aegis_core.workspace.git_objects import object_id
 
 __all__ = ["GitRefusal", "OID_PATTERN", "baseline_requests", "binary_text", "blob_pack", "check_filter_bytes", "check_filter_sources", "clean_bytes",
            "clean_eol", "conversion_settings", "decode_worktree", "eol_rule", "filter_drivers", "index_clean", "index_matches",
-           "index_records", "is_attribute_path", "preserved_paths", "snapshot_attributes", "snapshot_entries", "snapshot_rules"]
+           "index_records", "is_attribute_path", "preserved_paths", "snapshot_attributes", "snapshot_entries", "snapshot_rules",
+           "attribute_version", "attribute_entries", "attribute_fallbacks", "deleted_attribute_rules"]
 
 OID_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+MAX_ATTRIBUTE_LINE_BYTES = 2048
+MAX_ATTRIBUTE_FILE_BYTES = 100 * 1024 * 1024
+_CONTROL_BYTES = bytes((*range(8), 11, *range(14, 27), *range(28, 32), 127))
 
 _INDEX_STAT = re.compile(rb"  ctime: ([0-9]{1,20}):([0-9]{1,10})\n  mtime: ([0-9]{1,20}):([0-9]{1,10})\n"
     rb"  dev: ([0-9]{1,20})\tino: ([0-9]{1,20})\n  uid: ([0-9]{1,20})\tgid: ([0-9]{1,20})\n"
@@ -131,10 +135,78 @@ def eol_rule(values, settings, *, native_crlf):
 
 
 def snapshot_attributes(out, paths):
-    """Check captured check-attr framing before observing conversion config."""
+    """Check the source-query framing before parsing conversion attributes."""
     if out.count(b"\0") != 3 * len(paths) * 6 or (out and not out.endswith(b"\0")):
         raise GitRefusal("conversion_unavailable")
     return out.split(b"\0")
+
+
+def attribute_version(raw):
+    """Bound the version observation before parsing the --source capability."""
+    if type(raw) is not bytes or len(raw) > 256:
+        raise GitRefusal("conversion_unavailable")
+    found = re.fullmatch(rb"git version ([0-9]{1,5})\.([0-9]{1,5})(?:\.[0-9]{1,5})?[^\r\n]*\n?", raw)
+    if found is None or tuple(int(value) for value in found.groups()) < (2, 40):
+        raise GitRefusal("conversion_unavailable")
+
+
+def attribute_entries(sources, oid_length):
+    """Raw captured bytes, without applying their own text/encoding rules."""
+    # Git v2.43.0 attr.c:335-338,674-760: file input strips a leading BOM
+    # and CRLF; blob input stops at NUL, retains CR, and lacks the file cap.
+    # Refuse all ambiguous forms; never normalize the captured source bytes.
+    for data in sources.values():
+        if (len(data) >= MAX_ATTRIBUTE_FILE_BYTES or data.startswith(b"\xef\xbb\xbf") or b"\0" in data):
+            raise GitRefusal("conversion_unavailable")
+        start = 0
+        while start < len(data):
+            end = data.find(b"\n", start, start + MAX_ATTRIBUTE_LINE_BYTES + 1)
+            if end < 0:
+                end = len(data)
+            if end - start >= MAX_ATTRIBUTE_LINE_BYTES:
+                raise GitRefusal("conversion_unavailable")
+            start = end + 1
+    return [(path, "100644", object_id(data, oid_length), data) for path, data in sorted(sources.items())]
+
+
+def attribute_fallbacks(captured, baseline):
+    """Select bindable stage-0 sources; keep paths distinct for budget charges."""
+    wanted = {}
+    for path, (mode, oid, cache) in baseline.items():
+        if path.rpartition(b"/")[2] != b".gitattributes" or path in captured or not oid:
+            continue
+        if mode not in ("100644", "100755") or cache is None or cache[9] & 0x3000:
+            raise GitRefusal("conversion_unavailable")
+        wanted[path] = oid
+    return wanted
+
+
+def deleted_attribute_rules(paths, baseline, fallbacks, indexed, captured):
+    """Refuse ambiguous index-deletion order rather than restore stale rules."""
+    result = dict(captured)
+    for path in paths:
+        if path in fallbacks:
+            continue
+        applicable = []
+        directory = path.rpartition(b"/")[0]
+        while True:
+            source = (directory + b"/" if directory else b"") + b".gitattributes"
+            if source in fallbacks:
+                applicable.append(source)
+            if not directory:
+                break
+            directory = directory.rpartition(b"/")[0]
+        if not applicable:
+            continue
+        # Git processes tracked entries in index order before untracked adds.
+        # A tracked path preceding every applicable deletion sees the old rules.
+        if path in baseline and all(path < source for source in applicable):
+            result[path] = indexed[path]
+        elif len(applicable) != 1 or indexed[path] != captured[path]:
+            # Equal endpoints with multiple deletions cannot prove intermediate
+            # contexts equal. Keep the fallback conservative in that case too.
+            raise GitRefusal("conversion_unavailable")
+    return result
 
 
 def filter_drivers(raw, status):
@@ -251,7 +323,7 @@ def binary_text(data):
     crlf = data.count(b"\r\n")
     if b"\0" in data or data.count(b"\r") != crlf:
         return True
-    nonprintable = sum(data.count(bytes((c,))) for c in (*range(8), 11, *range(14, 27), *range(28, 32), 127))
+    nonprintable = len(data) - len(data.translate(None, _CONTROL_BYTES))
     printable = len(data) - nonprintable - data.count(b"\r") - data.count(b"\n")
     nonprintable -= data.endswith(b"\x1a")
     return (printable >> 7) < nonprintable
@@ -326,7 +398,7 @@ def index_clean(mode, data, observed, prior, settings, oid_length, index_time):
 def baseline_requests(contents, baseline, rules, *, configured_filters):
     """One batch for CRLF baselines and all attribute blobs when any driver exists."""
     wanted = [baseline[path][1] for path, mode, data, _ in contents if mode != "120000"
-            and b"\r\n" in data and rules[path][0] == "auto" and path in baseline and baseline[path][1]]
+            and data is not None and b"\r\n" in data and rules[path][0] == "auto" and path in baseline and baseline[path][1]]
     if configured_filters:
         wanted.extend(oid for path, (_, oid, _) in baseline.items() if is_attribute_path(path) and oid)
     return wanted
@@ -343,7 +415,7 @@ def snapshot_entries(contents, settings, baseline, rules, preserved, oid_length,
         prior = baseline.get(path, ("100644", None, None))
         prior_mode = prior[0]
         unchanged = index_clean(mode, data, observed, prior, settings, oid_length, index_time)
-        if unchanged:
+        if unchanged is True:
             entries.append((path, prior_mode, prior[1], None))
             continue
         if mode != "120000" and not unchanged:

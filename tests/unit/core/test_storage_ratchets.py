@@ -310,6 +310,7 @@ AUDIT_FORWARDER_OPERATIONS = {
 # or delegation to an independently registered writer/storage boundary.
 AUDIT_READ_ONLY_OPERATIONS = {
     ("aegis_core/team_git.py", "_read_path", "os.open"): "GM-5 O_RDONLY no-follow parent and regular-leaf opens from the held trusted root; read-only snapshot inspection, every descriptor closed",
+    ("aegis_core/team_git.py", "_snapshot_attribute_candidates", "os.open"): "GM-5-ATTR-CONTEXT r2 (coordinator-applied): read-only no-follow directory open for attribute candidate capture from the held trusted root; no create or mutation; descriptors closed in finally",
     ("aegis_core/team_git.py", "snapshot_tree", "os.open"): "GM-5 O_RDONLY no-follow trusted root descriptor for private snapshots; read-only, closed in finally",
     ("aegis_cli/hooks/registrar.py", "install_insight_hook", "aegis_core.insights.keys.create_link_key"): "initialize the user link key through storage and verify an existing key; any mutation belongs to the deeper registered writer/storage frame",
     ("aegis_cli/init.py", "_config_hosts", "aegis_core.workspace.confinement.read_confined_bytes"): "read-only bounded existing config or migration source bytes; this approved call requests read-only inspection",
@@ -492,6 +493,7 @@ CALLBACK_EXCEPTIONS = {
 # another call in an already reviewed function still requires explicit review.
 REVIEWED_DESCRIPTOR_OPERATIONS = {
     ("aegis_core/team_git.py", "_read_path", "os.open"): (2, "GM-5 O_RDONLY no-follow parent and regular-leaf opens from the held trusted root; every descriptor closed"),
+    ("aegis_core/team_git.py", "_snapshot_attribute_candidates", "os.open"): (1, "GM-5-ATTR-CONTEXT r2 (coordinator-applied): one O_RDONLY|O_DIRECTORY|O_NOFOLLOW directory open relative to the held trusted root or the active chain parent while capturing attribute candidates; read-only, at most the active chain held, every descriptor closed in finally"),
     ("aegis_core/team_git.py", "snapshot_tree", "os.open"): (1, "GM-5 O_RDONLY no-follow trusted root descriptor for private snapshots; closed in finally"),
     ("aegis_cli/hooks/registrar.py", "install_insight_hook", "aegis_core.insights.keys.create_link_key"): (1, "initialize the user link key through storage and verify an existing key"),
     ("aegis_cli/init.py", "_config_hosts", "aegis_core.workspace.confinement.read_confined_bytes"): (2, "read-only bounded existing config or migration source bytes"),
