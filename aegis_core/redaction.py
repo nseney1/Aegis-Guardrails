@@ -33,7 +33,6 @@ __all__ = [
     "guidance_field",
     "guidance_value",
     "receipt_value",
-    "unresolved_base_hint",
 ]
 
 # The longest text handled whole: redact_insight_text keeps a whole-word head of a longer one
@@ -552,15 +551,6 @@ def receipt_value(value: str, limit: int = 120, *, identifier: bool = False, can
                     f"\\u{codepoint:04x}" if codepoint <= 0xffff else f"\\U{codepoint:08x}")
         shown.append(char)
     return "".join(shown).rstrip() if not identifier else "".join(shown)
-
-
-def unresolved_base_hint(selector: str, *, canonicalize) -> str:
-    """Describe a failed comparison without introducing shell-active data."""
-    label = guidance_value(selector, prose=True, canonicalize=canonicalize)
-    origin = "fetch origin. " if selector.startswith(("origin/", "refs/remotes/origin/")) else ""
-    if not command_token(selector, MAX_GUIDANCE_CHARS) or selector != label:
-        return f"cannot resolve the base. {origin}fetch it or pass the full commit id. Base selector: {label}."
-    return f"cannot resolve the base {label}; {origin}fetch it or pass the full commit id"
 
 
 def guidance_field(value, separators=(), *, canonicalize):

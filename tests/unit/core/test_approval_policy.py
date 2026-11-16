@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from aegis_core import approval_policy, gitsafe, human_gate, rule_integrity
+from aegis_core import approval_policy, diagnostic_messages, gitsafe, human_gate, rule_integrity
 from aegis_core import redaction as display_redaction
 from aegis_cli import cli
 from tests import helpers_humangate as hg
@@ -41,10 +41,12 @@ def test_finished_text_clipping_preserves_atomic_units_and_template_literals(lim
 
 def test_finished_text_refuses_oversized_input_before_sanitization(monkeypatch):
     def forbidden(*args, **kwargs):
-        pytest.fail("oversized finished text reached sanitization")
+        raise AssertionError("finished text reached sanitization")
 
-    monkeypatch.setattr(approval_policy, "primitives", SimpleNamespace(sanitize_display=forbidden))
+    monkeypatch.setattr(diagnostic_messages, "primitives", SimpleNamespace(sanitize_display=forbidden))
     assert approval_policy.clip_rendered_text("a" * 81921) == "diagnostic_omitted_too_large"
+    with pytest.raises(AssertionError, match="finished text reached sanitization"):
+        approval_policy.clip_rendered_text("ordinary")
 
 
 @pytest.mark.parametrize("ellipsis", [False, True])
@@ -74,7 +76,7 @@ def _within_redaction_budget(action, size=400, *, call_steps=False):
     """Bound actual work; generated cases count Python/regex calls, direct cases lines."""
     from aegis_core import redaction
 
-    tracked = {approval_policy.__file__, redaction.__file__, __file__}
+    tracked = {diagnostic_messages.__file__, approval_policy.__file__, redaction.__file__, __file__}
     steps = [0]
     previous = sys.getprofile() if call_steps else sys.gettrace()
 
@@ -354,7 +356,7 @@ def test_repeated_redactions_have_a_linear_line_step_budget(repetitions, prose):
     from aegis_core import redaction
 
     value = "token=aaaa " * repetitions
-    tracked = {approval_policy.__file__, redaction.__file__, difflib.__file__}
+    tracked = {diagnostic_messages.__file__, approval_policy.__file__, redaction.__file__, difflib.__file__}
     steps, budget = [0], 256 * len(value) + 5000
     previous = sys.gettrace()
 
@@ -519,11 +521,23 @@ def test_guidance_prose_preserves_readable_text_and_escapes_shell_characters(val
     assert approval_policy.guidance_value(value, prose=True) == expected
 
 
-def test_guidance_value_omits_oversized_data_before_canonicalization(monkeypatch):
+@pytest.mark.parametrize("helper", ["guidance_value", "receipt_value"])
+def test_guidance_value_omits_oversized_data_before_canonicalization(monkeypatch, helper):
     def premature(*args, **kwargs):
-        pytest.fail("oversized guidance reached canonicalization")
-    monkeypatch.setattr(approval_policy, "primitives", SimpleNamespace(sanitize_display=premature))
-    assert approval_policy.guidance_value("x" * (8 * 1024 + 1)) == "diagnostic_omitted_too_large"
+        raise AssertionError("display value reached canonicalization")
+    monkeypatch.setattr(diagnostic_messages, "primitives", SimpleNamespace(sanitize_display=premature))
+    render = getattr(approval_policy, helper)
+    omitted = "[diagnostic omitted: too_large]" if helper == "receipt_value" else "diagnostic_omitted_too_large"
+    assert render("x" * (8 * 1024 + 1)) == omitted
+    with pytest.raises(AssertionError, match="display value reached canonicalization"):
+        render("ordinary")
+
+
+@pytest.mark.parametrize("helper", ["clip_rendered_text", "guidance_value", "receipt_value"])
+@pytest.mark.parametrize("call_steps", [False, True], ids=["lines", "calls"])
+def test_short_display_work_has_a_bounded_budget(helper, call_steps):
+    render = getattr(approval_policy, helper)
+    assert _within_redaction_budget(lambda: render("ordinary"), 8, call_steps=call_steps) == "ordinary"
 
 
 def _repr_sites(source):
@@ -561,15 +575,41 @@ def test_guidance_repr_guard_detects_each_formatting_surface(expression):
     assert len(_repr_sites("def hint(value, values):\n    return " + expression)) == 1
 
 
-def test_guidance_in_swept_files_never_uses_repr():
-    root = Path(__file__).resolve().parents[3]
+def _assert_guidance_without_repr(root, *, excluded=()):
+    from tests.unit.cli.test_check_ci_push import SWEPT_OUTPUT_MODULES
+
     exceptions = set()
-    paths = ("aegis_cli/check.py", "aegis_cli/approve.py", "aegis_core/approval_policy.py",
-             "aegis_core/rule_integrity.py", "aegis_cli/formatters/report.py")
-    sites = {(path, owner, expression) for path in paths
+    sites = {(path, owner, expression) for path in SWEPT_OUTPUT_MODULES if path not in excluded
              for owner, expression in _repr_sites((root / path).read_text(encoding="utf-8"))}
     assert sites - exceptions == set(), "guidance must use the inert display helper: " + str(sorted(sites - exceptions))
     assert exceptions - sites == set(), "remove stale non-guidance repr exceptions"
+
+
+def test_guidance_in_swept_files_never_uses_repr():
+    _assert_guidance_without_repr(Path(__file__).resolve().parents[3])
+
+
+@pytest.mark.parametrize("expression,expected", [("f'{value!r}'", "value"), ("repr(value)", "repr(value)")],
+                         ids=["fstring", "repr"])
+def test_guidance_repr_census_detects_owner_mutations(tmp_path, expression, expected):
+    from tests.unit.cli.test_check_ci_push import SWEPT_OUTPUT_MODULES
+
+    root = Path(__file__).resolve().parents[3]
+    owner = "aegis_core/diagnostic_messages.py"
+    for filename in SWEPT_OUTPUT_MODULES:
+        target = tmp_path / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text((root / filename).read_text(encoding="utf-8"), encoding="utf-8")
+    source = (root / owner).read_text(encoding="utf-8")
+    (tmp_path / owner).write_text(source, encoding="utf-8")
+    _assert_guidance_without_repr(tmp_path)
+    (tmp_path / owner).write_text(source + "\n\ndef census_mutation(value):\n    return " + expression + "\n",
+                                 encoding="utf-8")
+    _assert_guidance_without_repr(tmp_path, excluded=(owner,))
+    with pytest.raises(AssertionError) as error:
+        _assert_guidance_without_repr(tmp_path)
+    assert str(error.value).splitlines()[0] == \
+        "guidance must use the inert display helper: " + str([(owner, "census_mutation", expected)])
 
 
 @pytest.fixture
