@@ -18,9 +18,15 @@ import unicodedata
 import pytest
 
 from tests.conftest import symlink_or_skip
+from tests.helpers_reviewed_sources import (
+    census_guard, check_census_rows, run_census_fixture,
+    GITFILE_MAX_BYTES, git as _git, git_environment as _git_environment, reviewed_python_paths,
+    run_isolated_test as _run_isolated,
+)
 
 from aegis_core import insights as core_insights
 from aegis_core.errors import PathTraversalError
+from aegis_core.primitives import real_path
 from aegis_core.gitsafe_policy import LOCAL_ENV
 from aegis_core.insights import (
     KEY_SIZE,
@@ -41,49 +47,10 @@ from aegis_core.insights import (
     write_proposal,
 )
 
-REPO = Path(__file__).resolve().parents[3]
-PACKAGES = ("aegis_cli", "aegis_core", "aegis_mcp", "aegis_sdk")
+REPO = Path(real_path(__file__)).parents[3]
 # Reviewed parse-cost ratchet with headroom for ordinary tracked source additions.
 # Raising this ceiling requires review; failures list every parsed path.
 INSIGHTS_PARSE_CEILING = 80
-GITFILE_MAX_BYTES = 1024 * 1024
-
-
-def _git_environment(environ=None) -> dict:
-    """No inherited Git selectors or host configuration may affect these fixtures."""
-    env = {key: value for key, value in (os.environ if environ is None else environ).items()
-           if not key.upper().startswith("GIT_")}
-    env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
-                "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"})
-    return env
-
-
-def _git(cwd: Path, *args: str):
-    git_dir = cwd / ".git"
-    command = ["git", f"--git-dir={git_dir}", f"--work-tree={cwd}",
-               "-c", "user.email=t@example.com", "-c", "user.name=T", "-c", "core.fsmonitor=false",
-               "-c", "core.safecrlf=false", "-c", "core.autocrlf=false", "-c", "core.excludesFile=", *args]
-    try:
-        if git_dir.is_file():
-            # Linked worktrees and submodules use one bounded gitdir pointer line.
-            with git_dir.open("rb") as marker:
-                data = marker.read(GITFILE_MAX_BYTES + 1)
-            if len(data) > GITFILE_MAX_BYTES:
-                raise ValueError("oversized Git marker")
-            line = data.removesuffix(b"\n").removesuffix(b"\r")
-            if (not line.startswith(b"gitdir: ") or not line[8:]
-                    or any(char in line for char in (b"\n", b"\r", b"\0"))):
-                raise ValueError("invalid Git marker")
-            git_dir = (cwd / os.fsdecode(line[8:])).resolve(strict=True)
-            if not git_dir.is_dir():
-                raise ValueError("invalid Git directory")
-    except (OSError, ValueError, RuntimeError):
-        raise subprocess.CalledProcessError(128, command, output=b"", stderr=b"invalid Git marker\n") from None
-    command[1] = f"--git-dir={git_dir}"
-    return subprocess.run(
-        command,
-        cwd=cwd, env=_git_environment(), stdin=subprocess.DEVNULL, check=True, capture_output=True, timeout=60,
-    )
 
 
 def _make_repo(path: Path) -> Path:
@@ -861,32 +828,21 @@ def test_the_hook_takes_its_session_and_workspace_from_the_canonical_keys_only(t
     assert [r["event"] for r in rows] == ["insight"] and "hs" not in rows[0]
 
 
-def _reviewed_python_paths() -> tuple:
-    roots = (*PACKAGES, "tests")
-    if os.path.lexists(REPO / ".git"):
-        # No Git history is needed; untracked files from parallel workers are excluded.
-        listed = _git(REPO, "ls-files", "--cached", "-z", "--", *roots)
-        paths = [os.fsdecode(name) for name in listed.stdout.split(b"\0") if name]
-    else:
-        # History-less snapshots freeze their initial inventory during collection.
-        paths = [path.relative_to(REPO).as_posix()
-                 for name in roots for path in (REPO / name).rglob("*.py")]
-    return tuple(sorted({name for name in paths
-                         if name.endswith(".py") and "__pycache__" not in Path(name).parts}))
+_REVIEWED_PYTHON_PATHS = reviewed_python_paths(REPO)
 
 
-_REVIEWED_PYTHON_PATHS = _reviewed_python_paths()
-
-
-def _python_sources(root: Path = REPO, paths=None) -> list:
+def _python_sources(root: Path = REPO, paths=None) -> tuple:
     # Freeze membership, not contents: edited or missing reviewed files still fail.
-    return [(root / name, (root / name).read_text(encoding="utf-8"))
-            for name in (_REVIEWED_PYTHON_PATHS if paths is None else paths)]
+    root = type(root)(real_path(root))
+    return tuple((root / name, (root / name).read_text(encoding="utf-8"))
+                 for name in (_REVIEWED_PYTHON_PATHS if paths is None else paths))
 
 
 def _defined_names_referenced_outside(module_file: Path, sources, skip) -> set:
     """Identifiers in sources mentioning insights before or after NFKC,
     except ``module_file`` (a package's ``__init__.py``: the whole package) and nodes in ``skip``."""
+    sources = tuple(sources)
+    check_census_rows(sources)
     inside = module_file.resolve().parent if module_file.name == "__init__.py" else module_file.resolve()
     seen = set()
     for path, text in sources:
@@ -951,6 +907,7 @@ def test_insights_name_scan_still_rejects_malformed_candidates(tmp_path: Path, s
         _defined_names_referenced_outside(tmp_path / "insights.py", _python_sources(tmp_path, ("caller.py",)), set())
 
 
+@census_guard(REPO, module_file=__file__, absolute_labels=True)
 def test_every_name_in_insights_all_is_used_outside_the_module(monkeypatch: pytest.MonkeyPatch, sources=None):
     real_parse = ast.parse
     parse_count = 0
@@ -977,7 +934,7 @@ def test_every_name_in_insights_all_is_used_outside_the_module(monkeypatch: pyte
     )
 
 
-@pytest.mark.parametrize("indexed", [True, False], ids=["git-index", "committed-checkout"])
+@pytest.mark.parametrize("indexed", [True, False], ids=["git-index", "gitfile-index"])
 def test_insights_census_ignores_files_created_after_collection(tmp_path: Path, indexed: bool):
     """Freeze membership, but reread changed or missing reviewed sources on every attempt."""
     module = tmp_path / "tests" / "unit" / "core" / "test_insights.py"
@@ -992,13 +949,15 @@ def test_insights_census_ignores_files_created_after_collection(tmp_path: Path, 
     cache = reviewed.parent / "__pycache__"
     cache.mkdir()
     (cache / "cached.py").write_text("insights syntax (\n", encoding="utf-8")
-    if indexed:
-        _git(tmp_path, "init", "-q")
-        _git(tmp_path, "add", "-f", ".")
-        assert b"aegis_core/__pycache__/cached.py" in _git(tmp_path, "ls-files", "-z").stdout.split(b"\0")
-        for index in range(81):
-            (tmp_path / "tests" / f"untracked_{index}.py").write_text(
-                "insights.unreviewed_name\n", encoding="utf-8")
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "add", "-f", ".")
+    assert b"aegis_core/__pycache__/cached.py" in _git(tmp_path, "ls-files", "-z").stdout.split(b"\0")
+    if not indexed:
+        (tmp_path / ".git").rename(tmp_path / "metadata")
+        (tmp_path / ".git").write_text("gitdir: metadata\n", encoding="utf-8")
+    for index in range(81):
+        (tmp_path / "tests" / f"untracked_{index}.py").write_text(
+            "insights.unreviewed_name\n", encoding="utf-8")
     scope = runpy.run_path(str(module))
     scan = scope["_python_sources"]
     references = scope["_defined_names_referenced_outside"]
@@ -1049,24 +1008,6 @@ def insights_import_path(request, tmp_path_factory):
         (package / "__init__.py").write_text("# Installed tests package without repository modules.\n", encoding="utf-8")
         paths.insert(0, str(root))
     return paths
-
-
-def _run_isolated(program: str, *args, env=None, cwd=REPO, import_path=None):
-    # Match conftest's package-path bootstrap without loading its pytest/audit state.
-    program = (
-        "import json, sys\n"
-        "sys.path[:] = json.loads(sys.argv[1])\n"
-        "import tests\n"
-        f"tests_dir = {str(REPO / 'tests')!r}\n"
-        "if tests_dir not in tests.__path__:\n"
-        "    tests.__path__ = [tests_dir, *tests.__path__]\n"
-    ) + program
-    return subprocess.run(
-        [sys.executable, "-I", "-S", "-B", "-c", program,
-         json.dumps(sys.path if import_path is None else import_path), *map(str, args)],
-        cwd=cwd, env=_git_environment() if env is None else env, stdin=subprocess.DEVNULL,
-        capture_output=True, timeout=120, check=False,
-    )
 
 
 def test_insights_isolated_import_bootstrap_does_not_load_conftest(insights_import_path):
@@ -1265,33 +1206,32 @@ def test_insights_git_fixtures_ignore_ambient_configuration(tmp_path: Path, insi
 
 
 @pytest.mark.parametrize("count", [1, 42, 80])
-def test_insights_census_accepts_additions_within_reviewed_ceiling(monkeypatch, count):
+def test_insights_census_accepts_additions_within_reviewed_ceiling(tmp_path, count):
     text = "from aegis_core.insights import " + ", ".join(core_insights.__all__) + "\n"
-    sources = [(REPO / f"tests/reviewed_{index}.py", text) for index in range(count)]
-    test_every_name_in_insights_all_is_used_outside_the_module(monkeypatch, sources)
+    sources = [(f"tests/reviewed_{index}.py", text) for index in range(count)]
+    result = run_census_fixture(tmp_path, "test_insights.py", sources)
+    assert result.returncode == 0, result.stderr.decode()
 
 
-def test_insights_census_ceiling_failure_lists_every_parsed_file(monkeypatch):
+def test_insights_census_ceiling_failure_lists_every_parsed_file(tmp_path):
     text = "from aegis_core.insights import " + ", ".join(core_insights.__all__) + "\n"
-    sources = [(REPO / f"tests/reviewed_{index}.py", text) for index in range(81)]
-    with pytest.raises(AssertionError) as failure:
-        test_every_name_in_insights_all_is_used_outside_the_module(monkeypatch, sources)
-    message = str(failure.value)
+    sources = [(f"tests/reviewed_{index}.py", text) for index in range(81)]
+    result = run_census_fixture(tmp_path, "test_insights.py", sources)
+    assert result.returncode != 0
+    message = result.stderr.decode()
     assert "insights parse census: 81 files; reviewed ceiling 80." in message
-    assert all(str(path) in message for path, _ in sources)
+    assert all(str(tmp_path / path) in message for path, _ in sources)
 
 
-def test_insights_census_ceiling_is_independent_of_working_directory(insights_import_path):
+def test_insights_census_ceiling_is_independent_of_working_directory(insights_import_path, tmp_path):
     program = (
-        "import pytest\n"
+        "from pathlib import Path\n"
         "from tests.unit.core import test_insights as module\n"
         "for count in (1, 42, 80):\n"
-        "    with pytest.MonkeyPatch.context() as patch:\n"
-        "        module.test_insights_census_accepts_additions_within_reviewed_ceiling(patch, count)\n"
-        "with pytest.MonkeyPatch.context() as patch:\n"
-        "    module.test_insights_census_ceiling_failure_lists_every_parsed_file(patch)\n"
+        "    module.test_insights_census_accepts_additions_within_reviewed_ceiling(Path(sys.argv[2]) / str(count), count)\n"
+        "module.test_insights_census_ceiling_failure_lists_every_parsed_file(Path(sys.argv[2]) / 'over')\n"
     )
-    result = _run_isolated(program, cwd=REPO / "aegis_core" / "insights", import_path=insights_import_path)
+    result = _run_isolated(program, tmp_path, cwd=REPO / "aegis_core" / "insights", import_path=insights_import_path)
     assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
 
 
@@ -1611,9 +1551,10 @@ def test_an_export_the_module_does_not_bind_is_named(tmp_path: Path):
 
 
 def test_insights_is_a_package_of_four_modules():
-    pkg = REPO / "aegis_core" / "insights"
     assert not (REPO / "aegis_core" / "insights.py").exists()
-    assert sorted(p.name for p in pkg.glob("*.py")) == sorted(["__init__.py", *(f"{m}.py" for m in INSIGHT_MODULES)])
+    names = [Path(name).name for name in reviewed_python_paths(REPO)
+             if Path(name).parent.as_posix() == "aegis_core/insights"]
+    assert sorted(names) == sorted(["__init__.py", *(f"{m}.py" for m in INSIGHT_MODULES)])
     assert hasattr(core_insights, "__path__")
 
 
