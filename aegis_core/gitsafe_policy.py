@@ -108,6 +108,9 @@ def _literal_path(value):
             and all(p not in ("", ".", "..", ".git") for p in value.split("/")))
 def read_shape(args):
     if args in READ_SHAPES: return True
+    if args[:4] == ("check-attr", "-z", "--stdin", "--source"):
+        return (len(args) == 11 and full_oid(args[4])
+                and args[5:] == ("filter", "text", "eol", "ident", "working-tree-encoding", "crlf"))
     if len(args) == 2 and args[0] == "read-tree": return full_oid(args[1])
     if len(args) == 2 and args[0] == "check-ref-format": return ref_name(args[1])
     if len(args) == 3 and args[0] == "cat-file" and args[1] in ("blob", "tree", "commit", "-t"): return full_oid(args[2])
