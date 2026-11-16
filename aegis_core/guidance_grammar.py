@@ -8,7 +8,7 @@ from aegis_core.redaction import (
 )
 
 __all__ = ["bounded_rule_text", "clip_redacted", "copy_retained_items",
-           "guidance_token_estimate", "heading_has_slot", "raw_evidence_span", "redact_labeled"]
+           "guidance_token_estimate", "heading_has_slot", "raw_evidence_span", "raw_do_instruction_span", "redact_labeled"]
 
 
 def clip_redacted(text, limit):
@@ -103,13 +103,25 @@ def _content_start(text, start, end):
     return index
 
 
-def _evidence_like(text, start, end):
+def _heading_span(text, start, end):
+    """One contained ATX recognizer with ASCII-only closing-title trimming."""
     heading = _ATX.match(text, _content_start(text, start, end), end)
     if not heading:
-        return False
+        return None
     left, right = heading.span(1)
     while right > left and text[right - 1] in " #\t":
         right -= 1
+    level = 0
+    while heading.start() + level < left and text[heading.start() + level] == "#":
+        level += 1
+    return level, left, right
+
+
+def _evidence_like(text, start, end):
+    heading = _heading_span(text, start, end)
+    if heading is None:
+        return False
+    _, left, right = heading
     return right - left == 8 and text[left:right].casefold() == "evidence"
 
 
@@ -194,6 +206,65 @@ def raw_evidence_span(items, slot_open=None, controls=None):
 
 def heading_has_slot(text, start, end):
     return bool(_ATX.match(text, start, end) and text.find(chr(36) + "{", start, end) >= 0)
+
+
+def raw_do_instruction_span(items, slot_open=None, controls=None, *, max_chars=1024 * 1024):
+    """Return (decision, item, start, end) under a column-zero ## Do heading.
+
+    Call with retained guidance: at most 256 items and max_chars characters,
+    including item separators. Codes: 1 found, 0 absent, -1 ambiguous, -2 invalid
+    field/callback, -3 controls, -4 limit. Offsets exclude line endings. Evidence
+    ends discovery; the shared block scanner still validates later retained
+    lines, so a later structural/control refusal invalidates an earlier span.
+    """
+    if type(items) not in (list, tuple):
+        return -2, 0, 0, 0
+    if (type(max_chars) is not int or not 0 <= max_chars <= 1024 * 1024 or len(items) > 256):
+        return -4, 0, 0, 0
+    if any(callback is not None and not callable(callback) for callback in (slot_open, controls)):
+        return -2, 0, 0, 0
+    size = 0
+    for index, text in enumerate(items):
+        if type(text) is not str:
+            return -2, index, 0, 0
+        size += len(text) + bool(index)
+        if size > max_chars:
+            return -4, index, 0, 0
+    blocks, found, in_do, index, end = _RawBlocks(), None, False, 0, 0
+    for index, text in enumerate(items):
+        for line in _RAW_LINES.finditer(text):
+            start, end = line.span()
+            if start == end == len(text) and text and text[-1] not in "\r\n":
+                continue
+            while end > start and text[end - 1] in "\r\n":
+                end -= 1
+            blocked = bool(blocks.marker or blocks.html is not None or blocks.ambiguous)
+            decision = blocks.line(text, start, end, slot_open)
+            if decision != 1 and controls is not None and controls(text, start, end):
+                return -3, index, start, start
+            if decision == 1:
+                return found if found is not None else (0, index, start, start)
+            if decision:
+                return decision, index, start, start
+            if blocked or blocks.marker or blocks.html is not None or blocks.ambiguous:
+                continue
+            heading = _heading_span(text, start, end)
+            if heading is not None:
+                level, left, right = heading
+                if level <= 2:
+                    in_do = text[start] == "#" and level == 2 and right - left == 2 and text[left:right].casefold() == "do"
+                continue
+            if not in_do or found is not None:
+                continue
+            indent = 0
+            for position in range(start, _SPACES.match(text, start, end).end()):
+                indent += 4 - indent % 4 if text[position] == "\t" else 1
+                if indent >= 4:
+                    break
+            if indent < 4 and _content_start(text, start, end) < end:
+                found = 1, index, start, end
+        end = len(text)
+    return found if found is not None else (0, index, end, end)
 
 
 def _decode_source_line(raw, start, end, byte_limit, char_limit):
