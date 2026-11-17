@@ -9,7 +9,12 @@ from __future__ import annotations
 
 from itertools import chain
 import re
-import sre_parse
+import sys
+
+if sys.version_info >= (3, 11):
+    from re import _parser as sre_parse
+else:
+    import sre_parse
 
 __all__ = ["compile_possible", "max_match_width", "may_match_visible", "overlapping_matches", "project_window"]
 

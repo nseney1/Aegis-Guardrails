@@ -35,6 +35,38 @@ def results(rig):
             if row["op"] == "commit" and row["kind"] == "result"]
 
 
+class _ObservationClock:
+    """Monotonic seam: sleep advances this clock and does not call time.sleep."""
+
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, delay):
+        if delay < 0:
+            raise AssertionError("observation sleep must be non-negative")
+        self.sleeps.append(delay)
+        self.now += delay
+
+
+def _expected_observation_sleeps():
+    """Steps the named window must sleep: double from the initial poll, clip to the cap and deadline."""
+    now, delay = 0.0, custody.OBSERVATION_POLL_SECONDS
+    deadline = custody.OBSERVATION_SECONDS
+    steps = []
+    while now < deadline:
+        step = min(delay, custody.OBSERVATION_POLL_MAX_SECONDS, deadline - now)
+        if step <= 0:
+            break
+        steps.append(step)
+        now += step
+        delay = min(delay * 2.0, custody.OBSERVATION_POLL_MAX_SECONDS)
+    return steps
+
+
 def test_commit_exact_tested_bytes_and_retry_once(rig):
     index = (rig.repo / ".git/index").read_bytes()
     work = (rig.repo / "src/a.py").read_bytes()
@@ -340,6 +372,11 @@ def test_returned_cas_with_live_holder_stays_unknown_until_holder_closes(rig, mo
         held.append(os.dup(kwargs["effect_fds"][0]))
         return result
     monkeypatch.setattr(custody, "team_git", SimpleNamespace(**{**vars(team_git), "cas_fast_forward": retained}))
+    ticks = iter((0.0, custody.OBSERVATION_SECONDS + 1.0))
+    def expired(delay):
+        pytest.fail("a live holder made the observation window sleep")
+    monkeypatch.setattr(custody, "time", SimpleNamespace(
+        monotonic=lambda: next(ticks), sleep=expired))
     try:
         for _ in range(2):
             with pytest.raises(custody.CommitRefused) as caught:
@@ -349,6 +386,7 @@ def test_returned_cas_with_live_holder_stays_unknown_until_holder_closes(rig, mo
     finally:
         for descriptor in held:
             os.close(descriptor)
+    monkeypatch.setattr(custody, "time", time)
     assert run(rig).status == "committed_recovered"
     assert calls == [1] and len(results(rig)) == 1
 
@@ -731,6 +769,53 @@ def test_admission_exit_failure_releases_receipt_without_running_effect(rig, mon
     assert len(results(rig)) == 1 and results(rig)[0]["status"] == "not_applied"
 
 
+def test_observation_window_backs_off_on_the_clock_seam(monkeypatch):
+    """Waiting observation is immediate, then doubles until the named window, without process sleep."""
+    clock = _ObservationClock()
+    monkeypatch.setattr(custody, "time", clock)
+
+    class Journal:
+        def __init__(self, ready_at=None):
+            self.ready_at = ready_at
+            self.reads = 0
+
+        def reconcile(self, lane, observe, request_id=None):
+            self.reads += 1
+            if self.ready_at is not None and clock.now >= self.ready_at:
+                return [{"kind": "result", "request_id": request_id, "status": "done"}]
+            return []
+
+        def read(self):
+            return SimpleNamespace(rows=[])
+
+    expired = Journal()
+    assert custody._terminal(None, expired, "work", "commit-1", "refs/heads/lane/work", wait=True) is None
+    expected = _expected_observation_sleeps()
+    assert clock.sleeps == expected
+    assert expected[0] == custody.OBSERVATION_POLL_SECONDS
+    assert expected[1] == custody.OBSERVATION_POLL_SECONDS * 2
+    assert expected[2] == custody.OBSERVATION_POLL_SECONDS * 4
+    assert expected[3] == custody.OBSERVATION_POLL_SECONDS * 8
+    assert expected[4] == custody.OBSERVATION_POLL_MAX_SECONDS
+    assert expected[-1] < custody.OBSERVATION_POLL_MAX_SECONDS
+    assert clock.now == custody.OBSERVATION_SECONDS
+    assert expired.reads == len(expected) + 1
+    assert len(expected) < custody.OBSERVATION_SECONDS / custody.OBSERVATION_POLL_SECONDS
+    slept = len(clock.sleeps)
+    found = custody._terminal(None, Journal(ready_at=0.0), "work", "commit-1",
+                              "refs/heads/lane/work", wait=True)
+    assert found["status"] == "done" and len(clock.sleeps) == slept
+    assert custody._terminal(None, Journal(), "work", "commit-1",
+                             "refs/heads/lane/work", wait=False) is None
+    assert len(clock.sleeps) == slept
+    clock.now, clock.sleeps = 0.0, []
+    raced = Journal(ready_at=custody.OBSERVATION_POLL_SECONDS)
+    found = custody._terminal(None, raced, "work", "commit-2", "refs/heads/lane/work", wait=True)
+    assert found == {"kind": "result", "request_id": "commit-2", "status": "done"}
+    assert clock.sleeps == [custody.OBSERVATION_POLL_SECONDS]
+    assert raced.reads == 2
+
+
 def test_distinct_attachment_timeout_preserves_unknown_until_holder_exits(rig, monkeypatch):
     real = team_git.cas_fast_forward
     held, calls = [], []
@@ -746,7 +831,7 @@ def test_distinct_attachment_timeout_preserves_unknown_until_holder_exits(rig, m
         with pytest.raises(custody.CommitRefused) as caught:
             run(rig)
         assert caught.value.code == "ref_update_unknown"
-        ticks = iter((0.0, 6.0))
+        ticks = iter((0.0, custody.OBSERVATION_SECONDS + 1.0))
         monkeypatch.setattr(custody, "time", SimpleNamespace(
             monotonic=lambda: next(ticks), sleep=forbidden_sleep))
         with pytest.raises(custody.CommitRefused) as caught:
