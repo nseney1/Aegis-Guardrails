@@ -607,11 +607,20 @@ The contract is implemented in:
   `test_no_lease_state_proves_writer_dead` and
   `test_real_lease_records_never_prove_liveness`.
 
-Leave `aegis_core/team.py`, `aegis_core/team_supervisor_start.py`,
-`aegis_cli/team.py`, `tools/hierarchy_team.py`, and the pinned hierarchy
-tools untouched. Share the starter's identity rules by the same `/proc`
-contract in the new module. Do not import private starter helpers and do
-not grow `team.py`.
+Leave `aegis_core/team.py`, `aegis_cli/team.py`, `tools/hierarchy_team.py`,
+and the pinned hierarchy tools untouched. The public readers in
+`aegis_core/kernel_identity.py` own the `/proc` start-ticks, boot-ID and
+PID-namespace parsers. Writer binding, supervisor start and MCP queue-role
+adapters retain their own refusal codes and patched attributes; queue session
+names remain `boot_id-pid-start_ticks.json`. Do not import private starter
+helpers or grow `team.py`.
+
+Binding reads one scope before the lease and refuses `identity_unavailable`
+if a second scope differs afterwards, preserving existing binding bytes.
+Binding and starter share a nonblocking owner-directory flock: EACCES,
+EAGAIN and EWOULDBLOCK map to `state_locked`, other acquisition errors to
+`state_unavailable`. Unlock errors do not mask the result; each caller closes
+its held directory descriptor on exit.
 
 Tests patch `team_writer_binding` and `team_supervisor_observe` attributes.
 They do not patch `os.open` or `builtins`. Descriptor, symlink, and mode

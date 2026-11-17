@@ -1808,7 +1808,7 @@ def test_lint_plain_oversized_documentation_uses_loader_classification_without_y
         entries = kwargs["inventory"].entries
         assert all(len(entry.content) <= lint.MAX_RULE_BYTES for entry in entries)
         prefixes = [entry for entry in entries if entry.relative_path == path]
-        assert len(prefixes) == (0 if ending else 1)
+        assert len(prefixes) == 1  # Invalid bytes beyond capture cannot change classification.
         for entry in prefixes:
             assert split_frontmatter(entry.content.decode("utf-8-sig"))[0] == "none"
         calls.append(entries)
@@ -1818,12 +1818,7 @@ def test_lint_plain_oversized_documentation_uses_loader_classification_without_y
     results = lint.lint_workspace(root)
     by_path = {r.path: r for r in results}
     assert {r.path for r in records} == set(by_path)
-    if ending:
-        assert "too_large" in lint_codes(by_path[path])
-        if target.stem == "sample":
-            assert all("duplicate" in lint_codes(r) for r in results)
-    else:
-        assert len(results) == 1 and results[0].ok
+    assert len(results) == 1 and results[0].ok
     assert len(calls) == 1
 
 
@@ -2061,11 +2056,8 @@ def test_lint_bounded_frontmatter_preserves_unicode_boundaries_and_encoding_erro
     records = load_rules(root).rules
     results = lint.lint_workspace(root)
     assert {r.path for r in results} == {r.path for r in records}
-    if invalid_tail:
-        assert len(results) == 2 and all("duplicate" in lint_codes(r) for r in results)
-        assert "too_large" in lint_codes(next(r for r in results if r.path == path))
-    else:
-        assert len(results) == 1 and results[0].ok
+    # The coordinator's bounded-prefix ruling makes the uncaptured tail irrelevant.
+    assert len(results) == 1 and results[0].ok
 
 
 def test_lint_oversized_gate_does_not_capture_sources_from_its_frontmatter_prefix(tmp_path, monkeypatch):
@@ -2271,9 +2263,9 @@ def scan_simulation_row(result):
 
 @pytest.mark.parametrize("scenario,expected", [
     ("selected", "scan simulation: selected in all profiles"),
-    ("tokens", "scan simulation: not selected in one or more profiles"),
-    ("mandatory", "scan simulation: not selected in one or more profiles"),
-    ("fitness", "scan simulation: not selected in one or more profiles"),
+    ("tokens", "scan simulation: not selected in profiles: antigravity, claude-code, codex-cli, gemini-cli, generic"),
+    ("mandatory", "scan simulation: not selected in profiles: antigravity, claude-code, codex-cli, gemini-cli, generic"),
+    ("fitness", "scan simulation: not selected in profiles: antigravity, claude-code, codex-cli, gemini-cli, generic"),
 ])
 def test_lint_scan_simulation_matches_real_scan_and_cli(tmp_path, monkeypatch, capsys, scenario, expected):
     import argparse
@@ -2614,7 +2606,7 @@ def test_argon_0935_reviewed_bytes_checked_before_matching(tmp_path, reviewed_ta
     assert ("sample" in actual.exposure_rule_ids()) is (reviewed_target == "src/**")
     expected = ("not evaluated: candidate differs from scan snapshot" if amended else
                 "scan simulation: selected in all profiles" if reviewed_target == "src/**" else
-                "scan simulation: not selected in one or more profiles")
+                "scan simulation: not selected in profiles: antigravity, claude-code, codex-cli, gemini-cli, generic")
     for _ in range(2):
         assert scan_simulation_row(lint.lint_workspace(root, [path])[0]) == expected
     with ThreadPoolExecutor(max_workers=3) as pool:
@@ -2623,7 +2615,7 @@ def test_argon_0935_reviewed_bytes_checked_before_matching(tmp_path, reviewed_ta
     (root / path).write_bytes(reviewed)
     recovered = lint.lint_workspace(root, [path])[0]
     assert scan_simulation_row(recovered) == ("scan simulation: selected in all profiles" if reviewed_target == "src/**"
-                                             else "scan simulation: not selected in one or more profiles")
+                                             else "scan simulation: not selected in profiles: antigravity, claude-code, codex-cli, gemini-cli, generic")
 
 
 @pytest.mark.parametrize("code", ["git_timeout", "git_failed", "privacy_refused"])
@@ -2913,3 +2905,101 @@ def test_formal_1446_same_raw_instruction_survives_layout_and_expansion(newline,
         registry = SlotRegistry({**DEFAULT_SLOTS, **profile}).sanitized()
         assert detail_instruction_visible(body, body, registry) is True
     assert_heading_lint_scan_agreement(body, "safely.", True)
+
+
+def _cold_rule(rule_id, kind="trap", targets=("src/**",), do="Read safely."):
+    folder = {"trap": "traps", "invariant": "invariants", "gate": "gates"}[kind]
+    enforcement = "advisory" if kind == "trap" else "gate"
+    patterns = "".join(f"  - '{target}'\n" for target in targets)
+    path = f".aegis/rules/{folder}/{rule_id}.md"
+    text = (
+        f"---\nid: {rule_id}\ntype: {kind}\nenforcement: {enforcement}\n"
+        f"hypothesis: Hypothesis of {rule_id}.\n"
+        f"target_paths:\n{patterns}---\n## Do\n{do}\n"
+    )
+    return path, text
+
+
+@pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+@pytest.mark.skipif(not lint.descriptor_supported(), reason="descriptor-relative no-follow reads unavailable")
+def test_lint_check7_reports_a_cold_draft_and_retries(tmp_path, monkeypatch, capsys):
+    """Check 7 names whether scan would select a binding draft that is not installed."""
+    import argparse
+    import json
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_cli.rule import RuleCommand, run_rule
+
+    root = tmp_path / "repo"
+    repo = hg.Repo(root, hg.Home(tmp_path / "home"))
+    kept, kept_text = _cold_rule("kept")
+    edited, reviewed = _cold_rule("edited", "invariant", do="Read reviewed.")
+    repo.write(kept, kept_text)
+    repo.write(edited, reviewed)
+    repo.write("src/a.py", "value = 1\n")
+    repo.commit("base")
+    repo.branch("work")
+    repo.write(edited, reviewed.replace("Read reviewed.", "Read candidate."))
+    cold, cold_text = _cold_rule("cold", "invariant")
+    repo.write(cold, cold_text)
+    repo.write("src/a.py", "value = 2\n")
+    monkeypatch.setattr(git_service, "changed_files", lambda *_a, **_k: ["src/a.py"])
+
+    def rows():
+        results = {result.path: result for result in lint.lint_workspace(root, [kept, edited, cold])}
+        return {path: scan_simulation_row(results[path]) for path in (kept, edited, cold)}
+
+    expected = {
+        kept: "scan simulation: selected in all profiles",
+        edited: "not evaluated: candidate differs from scan snapshot",
+        cold: "scan simulation: selected in all profiles",
+    }
+    assert rows() == expected
+    assert rows() == expected
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        concurrent = list(pool.map(lambda _: rows(), range(3), timeout=30))
+    assert concurrent == [expected, expected, expected]
+    parser = argparse.ArgumentParser()
+    RuleCommand().configure_parser(parser)
+    args = parser.parse_args(["lint", cold, "--json", "--workspace", str(root)])
+    assert run_rule(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    check7 = [item["message"] for item in payload["results"][0]["findings"] if item["check"] == 7]
+    assert check7 == ["scan simulation: selected in all profiles"]
+
+    def unavailable(*_args, **_kwargs):
+        raise OSError("UNTRUSTED\nsecret")
+
+    real_list = scan_service.gitsafe.list_files
+    monkeypatch.setattr(scan_service.gitsafe, "list_files", unavailable)
+    refused = lint.lint_workspace(root, [cold])[0]
+    assert scan_simulation_row(refused) == "not evaluated: scan inputs unavailable"
+    assert "UNTRUSTED" not in repr(refused)
+    monkeypatch.setattr(scan_service.gitsafe, "list_files", real_list)
+    assert scan_simulation_row(lint.lint_workspace(root, [cold])[0]) == expected[cold]
+
+
+@pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+def test_lint_check7_cold_verdict_does_not_depend_on_sibling_drafts(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    root = lint_root(tmp_path / "repo")
+    repo = hg.Repo(root, hg.Home(tmp_path / "home"))
+    repo.write("src/a.py", "value = 1\n")
+    repo.commit("base")
+    repo.branch("work")
+    draft, text = _cold_rule("z", "gate")
+    repo.write(draft, text)
+
+    def row():
+        return scan_simulation_row(lint.lint_workspace(root, [draft])[0])
+
+    expected = row()
+    assert expected == "scan simulation: selected in all profiles"
+    for rule_id in ("a", "b"):
+        path, text = _cold_rule(rule_id, "gate")
+        repo.write(path, text)
+    assert row() == expected
+    assert row() == expected
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(lambda _: row(), range(3), timeout=30))
+    assert results == [expected] * 3

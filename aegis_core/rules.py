@@ -37,14 +37,16 @@ One policy, applied everywhere:
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import os
 import threading
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from aegis_core.match import first_match, is_test_path, matching_files
-from aegis_core.rule_inventory import RuleInventory, RuleInventoryEntry, inventory_rules
+from aegis_core.rule_inventory import (
+    MAX_RULE_BYTES, RuleInventory, RuleInventoryEntry, classification_prefix, inventory_rules,
+)
 from aegis_core.taxonomy import DIR_RULE_TYPES, RULE_TYPES, legacy_rule_type
 from aegis_core.workspace import as_workspace
 from aegis_core.workspace.layout import RULES_RELDIR
@@ -174,6 +176,7 @@ class Rule:
     error: Optional[str] = None
     legacy_keys: Tuple[str, ...] = ()  # derived counters and retired keys the file still has
     raw: bytes = field(default=b"", repr=False, compare=False)
+    size: Optional[int] = field(default=None, repr=False, compare=False)  # Original size for refused oversized records.
 
     @property
     def ok(self) -> bool:
@@ -475,10 +478,22 @@ def load_rules(workspace: Any, inventory: Optional[RuleInventory] = None) -> Rul
         parts = relative[len(prefix):].split("/")
         if any(p.startswith(".") for p in parts[:-1]):
             continue  # a hidden directory (.archive) keeps rules out of service on purpose
+        original = entry
+        oversized = entry.size > MAX_RULE_BYTES
+        if oversized:
+            data = entry.prefix or entry.content[:MAX_RULE_BYTES + 1]
+            bounded = classification_prefix(data)
+            data = data if bounded is None else bounded
+            entry = replace(entry, content=data, size=len(data))
         rule, skipped, rule_type = _classify(entry, parts)
         if rule_type is not None:
             rule = _parse(entry, rule_type, parts[0])
         if rule is not None:
+            if oversized:
+                message = f"{original.size} bytes exceeds the {MAX_RULE_BYTES} byte limit (too_large)"
+                if rule.error and _UNTERMINATED in rule.error:
+                    message += "; " + _UNTERMINATED
+                rule = replace(rule, error=message, digest=original.digest, body="", raw=b"", size=original.size)
             loaded.append(rule)
         if skipped is not None:
             ignored.append(skipped)
@@ -496,8 +511,7 @@ def load_rules(workspace: Any, inventory: Optional[RuleInventory] = None) -> Rul
             message = f"duplicate rule id {rule_id!r} (also {others})"
             if rule.error:
                 message = f"{message}; {rule.error}"
-            loaded[i] = Rule(rule.id, rule.path, rule.type, rule.meta, rule.body, rule.digest, message,
-                             rule.legacy_keys, rule.raw)
+            loaded[i] = replace(rule, error=message)
     return RuleSet(tuple(loaded), tuple(ignored), snapshot.fingerprint)
 
 

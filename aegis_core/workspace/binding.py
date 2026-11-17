@@ -51,6 +51,7 @@ __all__ = [
     "Attested",
     "CONFIDENCE",
     "REGISTRY_VERSION",
+    "REASONS",
     "Registry",
     "WorkspaceBinding",
     "WorkspaceHold",
@@ -83,6 +84,19 @@ CONFIDENCE: Mapping[str, str] = {
 
 BOUND, UNBOUND, HOLD, ERROR = "bound", "unbound", "hold", "error"
 
+# Every refusal producer is checked against the wording contract's declared set.
+REASONS = frozenset({
+    "pin_missing", "pin_denied", "pin_not_a_workspace", "pin_conflicts_with_host_root",
+    "pin_conflicts_with_registry", "host_root_conflicts_with_registry", "host_roots_not_governed",
+    "ambiguous_host_roots", "cwd_conflicts_with_registry", "ambiguous_registry_selection",
+    "no_workspace", "pin_conflicts_with_target", "pin_conflicts_with_cwd",
+})
+
+
+def _require_reason(reason: str) -> None:
+    if reason not in REASONS:
+        raise ValueError("undeclared workspace binding reason")
+
 
 class Attested(NamedTuple):
     """A root the host (not the model) reports for the session: ``source`` is a CONFIDENCE key."""
@@ -107,6 +121,8 @@ class WorkspaceBinding:
     reason: Optional[str] = None
     message: str = ""
     details: Tuple[Tuple[str, Any], ...] = field(default_factory=tuple)
+    # Presentation variant, deliberately absent from the public as_dict schema.
+    kind: Optional[str] = None
 
     @property
     def bound(self) -> bool:
@@ -136,8 +152,11 @@ def _bound(root: Path, source: str) -> WorkspaceBinding:
     return WorkspaceBinding(BOUND, root, source, CONFIDENCE[source])
 
 
-def _not_bound(status: str, reason: str, message: str, source: Optional[str] = None, **details: Any) -> WorkspaceBinding:
-    return WorkspaceBinding(status, source=source, reason=reason, message=message, details=tuple(details.items()))
+def _not_bound(status: str, reason: str, message: str, source: Optional[str] = None,
+               *, kind: Optional[str] = None, **details: Any) -> WorkspaceBinding:
+    _require_reason(reason)
+    return WorkspaceBinding(status, source=source, reason=reason, message=message,
+                            details=tuple(details.items()), kind=kind)
 
 
 # ── denylist and the bounded walk-up ─────────────────────────────────────────
@@ -450,14 +469,24 @@ def home_message(home: Path) -> str:
     )
 
 
-def _pin_problem(pin: Path) -> Optional[Tuple[str, str]]:
+@dataclass(frozen=True)
+class _PinProblem:
+    reason: str
+    message: str
+    kind: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        _require_reason(self.reason)
+
+
+def _pin_problem(pin: Path) -> Optional[_PinProblem]:
     denied = denial(pin)
     if denied:
-        return "pin_denied", f"AEGIS_WORKSPACE is set to {pin}, which is the {denied.replace('_', ' ')}"
+        return _PinProblem("pin_denied", f"AEGIS_WORKSPACE is set to {pin}, which is the {denied.replace('_', ' ')}", denied)
     if not pin.is_dir():
-        return "pin_missing", f"AEGIS_WORKSPACE is set to {pin}, which is not a directory"
+        return _PinProblem("pin_missing", f"AEGIS_WORKSPACE is set to {pin}, which is not a directory", "not_a_directory")
     if not is_aegis_workspace(pin):
-        return "pin_not_a_workspace", f"AEGIS_WORKSPACE is set to {pin}, which has no .aegis/ (run aegis init there)"
+        return _PinProblem("pin_not_a_workspace", f"AEGIS_WORKSPACE is set to {pin}, which has no .aegis/ (run aegis init there)")
     return None
 
 
@@ -482,7 +511,7 @@ def resolve_binding(
             return _not_bound(ERROR, "pin_missing", f"AEGIS_WORKSPACE is set to {raw_pin}, which cannot be resolved", "pin")
         problem = _pin_problem(pin_root)
         if problem:
-            return _not_bound(ERROR, problem[0], problem[1].replace(str(pin_root), raw_pin), "pin")
+            return _not_bound(ERROR, problem.reason, problem.message.replace(str(pin_root), raw_pin), "pin", kind=problem.kind)
         if attested:
             host_roots = sorted({_shown(a.path) for a in attested})
             # A host root agrees when it lies in the pinned workspace (its walk-up finds
@@ -589,7 +618,12 @@ def _cli_path(path: PathLike, base: Optional[Path] = None, what: str = "") -> Pa
     try:
         return _resolved(path, base)
     except OSError as exc:
-        raise WorkspaceNotFoundError(f"{what}{os.fspath(path)} cannot be resolved: {exc.__cause__ or exc}") from exc
+        kind = {"AEGIS_WORKSPACE ": "pin_resolution", "--workspace ": "target_resolution"}.get(what)
+        field = "pin" if kind == "pin_resolution" else "target"
+        binding = _not_bound(ERROR, "pin_missing" if field == "pin" else "no_workspace", "",
+                             kind=kind, **{field: os.fspath(path)})
+        raise WorkspaceNotFoundError(f"{what}{os.fspath(path)} cannot be resolved: {exc.__cause__ or exc}",
+                                     binding=binding) from exc
 
 
 def _pin_hold(explicit: PathLike, start: Path, pin_root: Path, accept: Optional[Callable[[Path], bool]]) -> None:
@@ -667,10 +701,12 @@ def resolve_cli_root(
         raw_pin = os.fspath(pin)
         pin_root = _cli_path(raw_pin, base, "AEGIS_WORKSPACE ")
         problem = _pin_problem(pin_root)
-        if problem and problem[0] == "pin_not_a_workspace" and accept is not None and accept(pin_root):
+        if problem and problem.reason == "pin_not_a_workspace" and accept is not None and accept(pin_root):
             problem = None  # an explicit accept policy may also raise its own refusal
         if problem:
-            raise WorkspaceNotFoundError(problem[1].replace(str(pin_root), raw_pin))
+            message = problem.message.replace(str(pin_root), raw_pin)
+            binding = _not_bound(ERROR, problem.reason, message, "pin", kind=problem.kind, pin=raw_pin)
+            raise WorkspaceNotFoundError(message, binding=binding)
         if explicit:
             _pin_hold(explicit, start, pin_root, accept)
         else:
@@ -681,5 +717,6 @@ def resolve_cli_root(
         return found
     message = denial_message(start)
     if message:
-        raise WorkspaceNotFoundError(message)
+        binding = _not_bound(ERROR, "no_workspace", message, kind=denial(start), target=str(start))
+        raise WorkspaceNotFoundError(message, binding=binding)
     return start

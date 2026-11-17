@@ -2623,7 +2623,7 @@ def test_cache_primed_before_workspace_symlink_retarget_is_skipped(tmp_path, fre
             found = gitsafe.git_executable(cwd=ws)
             assert found != str(alias)
             assert os.path.samefile(found, real_git)
-            assert pathlookup._inside(str(alias), pathlookup.git_fence(ws))
+            assert pathlookup._provenance_inside(str(alias), pathlookup.git_fence(ws))
             result = gitsafe.run(["--version"], ws)
     assert result.returncode == 0 and result.stdout.startswith(b"git version")
     assert not marker.exists()
@@ -6462,6 +6462,7 @@ def test_ordinary_git_shims_preserve_script_identity(repo, tmp_path, monkeypatch
 # Exact AST proofs are reserved for refusals before lookup or mixed variants.
 # A changed body invalidates its proof; new construction sites need a guard.
 _STRICT_SITE_PROOFS = {
+    ('test_gitsafe', 'test_bound_root_does_not_change_supplied_or_unsupported_strict_lookup'): ('489c9f1bb9b60e968c51f0bd9a741dadf130f2404e7f4fe9643fc01923e15cfb', 'The program probe is forced false; custody_program must refuse unsupported_effect_platform before spawn on every platform.'),
     ('test_gitsafe', 'test_effect_descriptor_refused_before_any_spawn'): ('f440d542ccf05a986720fb51cdadb1b5a38a54c0c776d783a4c8c4f2fa72e07b', 'Invalid receipt descriptors refuse in pass_through before executable lookup.'),
     ('test_gitsafe', 'test_effect_unsupported_platform_is_a_pre_spawn_refusal'): ('4480e3b2ef2f7c06b1c60a74288dd00df9da0584dae64c5a8a765ec7437174ba', 'The effect-platform probe is forced false; pass_through refuses before lookup.'),
     ('test_gitsafe', 'test_effect_write_roots_refuse_before_expansion'): ('f8042b05a19e1caa57c0370d7e57ff2c964a11d522499873180c6f8ad4bada44', 'Invalid or oversized root containers refuse before executable lookup.'),
@@ -6871,3 +6872,112 @@ def test_effect_cleanup_keeps_timeout_class_and_closes_every_stream(fault):
     finally:
         for stream in streams:
             stream.close()
+
+
+def _bound_fence(path):
+    from aegis_core.primitives import real_key
+    return real_key(os.fspath(path))
+
+
+@contextlib.contextmanager
+def _bound_ordinary_root(path):
+    from aegis_core import pathlookup
+    token = pathlookup.ordinary_root.set(_bound_fence(path))
+    try:
+        yield
+    finally:
+        pathlookup.ordinary_root.reset(token)
+
+
+def test_bound_root_runs_enclosing_git_skips_workspace_git_and_retries(tmp_path, fresh_git_lookup):
+    """Git in the enclosing checkout is outside the owner root; git inside it is still refused."""
+    from aegis_core import pathlookup
+    from aegis_core.primitives import sanitize_display
+    from aegis_core.redaction import redact_insight_text
+    enclosing = _worktree(tmp_path / "home-dotfiles")
+    secret = "AKIAIOSFODNN7EXAMPLE"
+    app = _worktree(enclosing / secret)
+    (app / "sub").mkdir()
+    inside = tmp_path / "INSIDE"
+    outside = tmp_path / "OUTSIDE"
+    _plant_git(app / "bin", inside)
+    _plant_git(enclosing / "bin", outside)
+    planted = os.pathsep.join((str(app / "bin"), str(enclosing / "bin")))
+    with _temporary_env({"PATH": planted}):
+        with pytest.raises(gitsafe.GitError) as unbound:
+            gitsafe.run(["--version"], app / "sub")
+    assert unbound.value.code == "ERR_AEGIS"
+    assert not inside.exists() and not outside.exists()
+    with _bound_ordinary_root(app):
+        with _temporary_env({"PATH": planted}):
+            allowed = gitsafe.run(["--version"], app / "sub")
+        assert allowed.returncode == 0
+        assert outside.exists() and not inside.exists()
+        outside.unlink()
+        with _temporary_env({"PATH": str(app / "bin")}):
+            with pytest.raises(gitsafe.GitError) as refused:
+                gitsafe.run(["--version"], app)
+        fence = pathlookup.GitCache().for_cwd(app).fence
+        canonical = sanitize_display(fence, max_len=None)
+        expected = sanitize_display(redact_insight_text(canonical, max_len=max(1, len(canonical))), max_len=256)
+        assert refused.value.code == "ERR_AEGIS"
+        assert str(refused.value).endswith(expected)
+        assert secret not in str(refused.value)
+        assert "[REDACTED_AWS]" in str(refused.value)
+        assert "\n" not in str(refused.value) and "\r" not in str(refused.value)
+        assert not inside.exists()
+        with _temporary_env({"PATH": _REAL_GIT_DIR}):
+            retried = gitsafe.run(["--version"], app)
+        assert retried.returncode == 0 and retried.stdout.startswith(b"git version")
+        assert not inside.exists()
+    assert pathlookup.ordinary_root.get() is None
+    with _temporary_env({"PATH": planted}):
+        with pytest.raises(gitsafe.GitError):
+            gitsafe.run(["--version"], app)
+    assert not outside.exists() and not inside.exists()
+
+
+def test_bound_root_holds_for_ordinary_lookup_when_descriptors_are_unavailable(tmp_path, fresh_git_lookup):
+    from aegis_core import pathlookup
+    enclosing = _worktree(tmp_path / "home-dotfiles")
+    app = _worktree(enclosing / "app")
+    marker = tmp_path / "PWNED"
+    _plant_git(enclosing / "bin", marker)
+    probe = pathlookup.descriptor_fence_supported
+    pathlookup.descriptor_fence_supported = lambda: False
+    try:
+        with _bound_ordinary_root(app):
+            with _temporary_env({"PATH": str(enclosing / "bin")}):
+                result = gitsafe.run(["--version"], app)
+            assert pathlookup.GitCache().for_cwd(app).fence == _bound_fence(app)
+    finally:
+        pathlookup.descriptor_fence_supported = probe
+    assert result.returncode == 0 and marker.exists()
+    assert pathlookup.ordinary_root.get() is None
+
+
+def test_bound_root_does_not_change_supplied_or_unsupported_strict_lookup(tmp_path, monkeypatch, fresh_git_lookup):
+    from types import SimpleNamespace
+    from aegis_core import pathlookup
+    enclosing = _worktree(tmp_path / "home-dotfiles")
+    app = _worktree(enclosing / "app")
+    seen = []
+    real = pathlookup.which
+
+    def which(name, *args, **kwargs):
+        seen.append(kwargs.get("outside"))
+        return real(name, *args, **kwargs)
+
+    monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(**{**vars(pathlookup), "which": which}))
+    with _bound_ordinary_root(app):
+        assert gitsafe.git_executable(cwd=enclosing) == real("git", path=os.environ.get("PATH", os.defpath),
+                                                              outside=_bound_fence(app), fence_program=True, descriptors=False)
+        seen.clear()
+        assert gitsafe.git_executable(environ={"PATH": _REAL_GIT_DIR}, cwd=enclosing)
+        assert seen and all(os.path.normcase(os.path.realpath(item)) != _bound_fence(app) for item in seen)
+        monkeypatch.setattr(gitsafe_run, "_program_supported", lambda: False)
+        with pytest.raises(gitsafe.GitError) as caught:
+            gitsafe.custody_program(enclosing, environ={"PATH": _REAL_GIT_DIR})
+    assert caught.value.code == "unsupported_effect_platform"
+    assert caught.value.process_started is False
+    assert pathlookup.ordinary_root.get() is None

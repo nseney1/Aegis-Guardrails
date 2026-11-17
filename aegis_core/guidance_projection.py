@@ -17,7 +17,7 @@ from aegis_core.taxonomy import JIT_DEFAULT_MAX_TOKENS, RULE_TYPES, WORDS_TO_TOK
 
 __all__ = ["CONTROL_GUIDANCE", "GuidanceProjectionError", "GuidanceResult", "MAX_GUIDANCE_CHARS",
            "SLOT_REF_PATTERN", "WITHHELD_GUIDANCE", "checked_result_copy", "projection_refusal_copy",
-           "assembled_text", "project_assembled", "contains_control_characters", "estimate_tokens", "field_text", "finish_payload",
+           "assembled_text", "contains_control_characters", "estimate_tokens", "field_text", "finish_payload",
            "instruction_body", "normalize_layout", "redact_clean_text", "project_detail", "detail_instruction_visible", "project_display_data",
            "project_envelope_fields", "project_field", "project_identifier", "project_rule_entries",
            "project_text", "project_diagnostic", "project_display_text", "project_error_name", "raw_rule_text"]
@@ -29,6 +29,7 @@ SLOT_REF_PATTERN = re.compile(r"\$\{(?:SLOT|RULE)\.([A-Za-z0-9_\-]+)\}|\$\{([A-Z
 WITHHELD_GUIDANCE = "guidance withheld: ambiguous structure"
 CONTROL_GUIDANCE = "guidance withheld: control characters"
 MAX_IDENTIFIER_ITEMS = 4096
+_MAX_ERROR_NAME_PASSES = 32
 _IDENTIFIER_FIELDS = frozenset({"id", "name", "path", "_path", "matched_files", "files"})
 _CONTROL_CANDIDATES = re.compile(r"[^\t\n\r\x20-\x7e]")
 _DIAGNOSTIC_ESCAPES = re.compile(
@@ -263,7 +264,7 @@ def detail_instruction_visible(body: str, prefix: Optional[str], registry: Optio
         return False
 
 
-def project_field(value: Any, registry: Optional[_Slots] = None, *, body: bool = False) -> str | list[str]:
+def project_field(value: Any, registry: Optional[_Slots] = None) -> str | list[str]:
     if value is None:
         return ""
     if isinstance(value, str):
@@ -403,9 +404,11 @@ def project_identifier(value: Any, registry: Optional[_Slots] = None) -> str:
 
 
 def project_error_name(value: Any) -> str:
-    """Redact a diagnostic name to a fixed point within the input character cap."""
+    """Return a fixed point within 32 passes, or the fixed invalid-field refusal."""
     try:
-        for _ in range(MAX_GUIDANCE_CHARS):
+        # Bounded token rows can expose another match on each whole-name pass.
+        # Count the equality check too; never publish an unconfirmed fixed point.
+        for _ in range(_MAX_ERROR_NAME_PASSES):
             projected = project_identifier(value)
             if projected == value:
                 return projected
@@ -475,11 +478,6 @@ def _retained_value(value, *, auxiliary=False):
     except _ControlCharacters:
         return [CONTROL_GUIDANCE] if is_list else CONTROL_GUIDANCE
     return retained if is_list else retained[0] if retained else ""
-
-
-def project_assembled(value, registry=None, *, warnings=False):
-    """An incoming assembly is untrusted text, without presentation protection."""
-    return project_field(_retained_value(value, auxiliary=warnings), None if warnings else registry)
 
 
 def _project_auxiliary(value):

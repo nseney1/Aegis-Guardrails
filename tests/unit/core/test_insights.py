@@ -998,8 +998,14 @@ def test_insights_census_ignores_files_created_after_collection(tmp_path: Path, 
     assert references(module, scan(), set()) == {"insights", "restored_name"}
 
 
+@pytest.fixture(scope="module")
+def insights_import_path():
+    """Use the parent import layout for the census scenarios."""
+    return list(sys.path)
+
+
 @pytest.fixture(scope="module", params=["parent", "competing-tests"])
-def insights_import_path(request, tmp_path_factory):
+def insights_bootstrap_import_path(request, tmp_path_factory):
     paths = list(sys.path)
     if request.param == "competing-tests":
         root = tmp_path_factory.mktemp("competing-tests")
@@ -1010,7 +1016,7 @@ def insights_import_path(request, tmp_path_factory):
     return paths
 
 
-def test_insights_isolated_import_bootstrap_does_not_load_conftest(insights_import_path):
+def test_insights_isolated_import_bootstrap_does_not_load_conftest(insights_bootstrap_import_path):
     program = (
         "from pathlib import Path\n"
         "import tests\n"
@@ -1020,7 +1026,7 @@ def test_insights_isolated_import_bootstrap_does_not_load_conftest(insights_impo
         "from tests.unit.core import test_insights\n"
         "assert Path(test_insights.__file__).resolve() == Path(sys.argv[3])\n"
     )
-    result = _run_isolated(program, REPO / "tests", Path(__file__).resolve(), import_path=insights_import_path)
+    result = _run_isolated(program, REPO / "tests", Path(__file__).resolve(), import_path=insights_bootstrap_import_path)
     assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
 
 
@@ -1654,7 +1660,9 @@ S0 = {
                          "aegis_core.verification.test_runner"},
 }
 # The storage split accompanies storage at all three hook stages.
-NEW_MODULES = frozenset({"aegis_core.redaction", "aegis_core.storage_shared",
+NEW_MODULES = frozenset({
+    "aegis_core.pathlookup_gitcache",
+    "aegis_core.redaction", "aegis_core.storage_shared",
                          "aegis_core.gitsafe_run",
                          "aegis_core.gitsafe_policy",
                          *(f"aegis_core.insights.{m}" for m in INSIGHT_MODULES),
