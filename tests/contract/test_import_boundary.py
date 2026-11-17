@@ -108,6 +108,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team": 1,
     "aegis_core.team_host_adapter": 0,
     "aegis_core.team_host_agy": 1,
+    "aegis_core.team_isolation_capability": 0,
     "aegis_core.team_isolation_mounts": 0,
     "aegis_core.team_isolation_verify": 0,
     "aegis_core.team_lease_custody": 0,
@@ -137,6 +138,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.guidance_projection": 0,
     # Host hook payload normalization (stdlib only).
     "aegis_core.hook_events": 1,
+    "aegis_core.kernel_identity": 0,
     # Pure AST inspection of lane declarations and pytest configuration.
     "aegis_core.lane_ast": 0,
     # The post-lane gate (aegis check --lane): team, matcher, gitsafe and events.

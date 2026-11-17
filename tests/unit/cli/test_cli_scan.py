@@ -63,6 +63,7 @@ def test_long_refusal_path_never_clips_the_field_or_reason(ws, monkeypatch, caps
                                       "control_path", marks=pytest.mark.skipif(
                                           os.name == "nt", reason="Windows filename controls"))])
 def test_projection_refusal_prints_locations_and_fixed_repair(ws, monkeypatch, capsys, json_mode, case):
+    from aegis_core.packs import MAX_RULE_BYTES
     from aegis_core.scan import scan
     from aegis_core.skills.slots import SlotRegistry
     if case == "minimal":
@@ -70,14 +71,18 @@ def test_projection_refusal_prints_locations_and_fixed_repair(ws, monkeypatch, c
     home = ws.parent / "home"
     config = home / ".aegis" / "config.json"
     config.parent.mkdir(parents=True)
-    config.write_text(json.dumps({"v": 1, "slots": {"MODEL_FAST": "m" * 80}}), encoding="utf-8")
+    slots = {"MODEL_FAST": "m" * 80}
+    if case == "expanded":
+        slots["X"] = "m" * 80
+    config.write_text(json.dumps({"v": 1, "slots": slots}), encoding="utf-8")
     monkeypatch.setattr(UserLayout, "current", classmethod(lambda cls: UserLayout(home)))
     path = ws / ".aegis" / "rules" / "traps" / "trap-src-python.md"
     secret = "ghp_" + "S" * 36
     field, reason = "hypothesis", "invalid_field"
     if case in {"source", "expanded"}:
-        body = "x" * (1024 * 1024 + 1) if case == "source" else "${SLOT.MODEL_FAST}" * 14000
+        body = "x" * (1024 * 1024 + 1) if case == "source" else "${X}" * 13108
         path.write_text(path.read_text(encoding="utf-8") + body, encoding="utf-8")
+        assert (path.stat().st_size > MAX_RULE_BYTES) == (case == "source")
         field, reason = "detail", "limit"
     else:
         if case == "prediction":
@@ -97,8 +102,13 @@ def test_projection_refusal_prints_locations_and_fixed_repair(ws, monkeypatch, c
         path.write_text(path.read_text(encoding="utf-8").replace("id: trap-src-python", "id: " + json.dumps(new_id)),
                         encoding="utf-8")
         path = path.rename(path.with_name(new_id + ".md"))
-    expected = scan(ws, ["src/app.py"], registry=SlotRegistry({"MODEL_FAST": "m" * 80}))
+    expected = scan(ws, ["src/app.py"], registry=SlotRegistry(slots))
     assert expected["rule_errors"]
+    if case == "source":
+        assert expected["rule_errors"] == [{
+            "path": path.relative_to(ws).as_posix(),
+            "error": f"{path.stat().st_size} bytes exceeds the {MAX_RULE_BYTES} byte limit (too_large)",
+        }]
     assert main(["scan", "src/app.py"] + (["--json"] if json_mode else [])) == 1
     captured = capsys.readouterr()
     assert secret not in captured.out + captured.err
@@ -106,6 +116,9 @@ def test_projection_refusal_prints_locations_and_fixed_repair(ws, monkeypatch, c
     if json_mode:
         assert captured.err == ""
         assert json.loads(captured.out) == expected
+    elif case == "source":
+        assert captured.out == ""
+        assert captured.err == "Error: " + expected["error"] + "\n"
     else:
         assert captured.out == ""
         rows = "".join("Error: " + row["path"] + ": " + row["error"] + "\n" for row in expected["rule_errors"])

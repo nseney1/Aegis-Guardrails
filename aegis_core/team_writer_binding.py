@@ -6,15 +6,13 @@ the current lease itself. ``observe`` reads without the lock and never writes.
 from __future__ import annotations
 
 from contextlib import contextmanager
-import errno
 import json
 import os
 from pathlib import Path
 import re
 import stat
-import sys
 
-from aegis_core import gitsafe, storage_confined, team
+from aegis_core import gitsafe, kernel_identity, storage_confined, team
 from aegis_core.primitives import json_preflight, sanitize_display
 from aegis_core.redaction import redact_command_secrets
 from aegis_core.team_supervisor import read_owned_leaf
@@ -52,7 +50,7 @@ class _Refusal(ValueError):
 
 def descriptor_supported():
     """Linux start ticks and no-follow directory descriptors; no PID-file fallback."""
-    return sys.platform == "linux" and storage_confined.descriptor_supported()
+    return kernel_identity.descriptor_supported()
 
 
 def _refused(code):
@@ -201,79 +199,29 @@ def _directory(home):
 
 @contextmanager
 def _locked(directory):
-    import fcntl
     try:
-        fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        raise _Refusal("state_locked") from None
-    except OSError as error:
-        if error.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
-            raise _Refusal("state_locked") from None
-        raise _Refusal("state_unavailable") from None
-    try:
-        yield
-    finally:
-        try:
-            fcntl.flock(directory, fcntl.LOCK_UN)
-        except OSError:
-            pass
+        with kernel_identity.owner_directory_lock(directory):
+            yield
+    except kernel_identity.IdentityError as error:
+        code = "state_locked" if error.reason == "locked" else "state_unavailable"
+        raise _Refusal(code) from None
 
 
 def process_identity(pid):
-    """Kernel identity for one pid. Absent and zombie are None; unreadability refuses."""
+    """Kernel identity for one pid, retaining the binding refusal contract."""
     if not descriptor_supported():
         raise _Refusal("unsupported_platform")
-    if type(pid) is not int or not 1 <= pid <= 2147483647:
-        raise _Refusal("identity_unavailable")
     try:
-        with _confined_file(Path("/proc"), (str(pid), "stat")) as handle:
-            data = handle.read_bytes(4096)
-        prefix, separator, tail = data.rpartition(b") ")
-        if not separator or not prefix.startswith(str(pid).encode("ascii") + b" ("):
-            raise _Refusal("identity_unavailable")
-        fields = tail.split()
-        if len(fields) < 20 or not fields[19].isdigit() or len(fields[19]) > 20:
-            raise _Refusal("identity_unavailable")
-        if fields[0] in (b"Z", b"X", b"x"):
-            return None
-        return {"pid": pid, "start_ticks": int(fields[19])}
-    except _Refusal:
-        raise
-    except storage_confined.ConfinedFileError as error:
-        if error.reason == "missing" and pid != os.getpid():
-            if process_identity(os.getpid()) is None:
-                raise _Refusal("identity_unavailable")
-            return None
-        raise _Refusal("identity_unavailable") from None
-    except Exception:
-        raise _Refusal("identity_unavailable") from None
-
-
-def _namespace():
-    with _confined_file(Path("/proc"), ("self",)) as handle:
-        own_pid = os.readlink("self", dir_fd=handle._parent)
-        if own_pid != str(os.getpid()):
-            raise _Refusal("identity_unavailable")
-    with _confined_file(Path("/proc"), (own_pid, "ns", "pid")) as handle:
-        namespace = os.readlink("pid", dir_fd=handle._parent)
-    if type(namespace) is not str or len(namespace) > 26 or _NAMESPACE.fullmatch(namespace) is None:
-        raise _Refusal("identity_unavailable")
-    return namespace
+        return kernel_identity.process_identity(pid, confined_file=_confined_file)
+    except kernel_identity.IdentityError as error:
+        code = "unsupported_platform" if error.reason == "unsupported" else "identity_unavailable"
+        raise _Refusal(code) from None
 
 
 def _scope():
     try:
-        with _confined_file(Path("/proc"), ("sys", "kernel", "random", "boot_id")) as handle:
-            data = handle.read_bytes(37)
-        if len(data) not in (36, 37) or len(data) == 37 and data[-1:] != b"\n":
-            raise _Refusal("identity_unavailable")
-        boot = data[:36].decode("ascii")
-        if _BOOT.fullmatch(boot) is None:
-            raise _Refusal("identity_unavailable")
-        return {"boot_id": boot, "pid_namespace": _namespace()}
-    except _Refusal:
-        raise
-    except Exception:
+        return kernel_identity.scope(confined_file=_confined_file, readlink=os.readlink)
+    except kernel_identity.IdentityError:
         raise _Refusal("identity_unavailable") from None
 
 
@@ -317,17 +265,13 @@ def _bind_locked(directory, workspace, lane, pid):
     identity = process_identity(pid)
     if identity is None:
         raise _Refusal("identity_unavailable")
-    record = {
-        "boot_id": _scope()["boot_id"], "claim_id": None, "gen": None, "pid": identity["pid"],
-        "pid_namespace": _scope()["pid_namespace"], "start_ticks": identity["start_ticks"],
-    }
-    chosen = _lease_for(workspace, lane)
-    record["claim_id"] = chosen.claim_id
-    record["gen"] = chosen.gen
-    # Scope is read twice so a proc change between the two reads is not stored half-updated.
     scope = _scope()
-    record["boot_id"] = scope["boot_id"]
-    record["pid_namespace"] = scope["pid_namespace"]
+    chosen = _lease_for(workspace, lane)
+    if _scope() != scope:
+        raise _Refusal("identity_unavailable")
+    record = {
+        **scope, **identity, "claim_id": chosen.claim_id, "gen": chosen.gen,
+    }
     if _decision(current.get(lane), record) == "keep":
         return {"status": "ok"}
     updated = dict(current)
