@@ -153,7 +153,7 @@ class MergeTreeUnavailable(GitError):
     driver from the repository's own config it would run)."""
 
 
-_GIT_FOUND: Dict[Tuple[Optional[str], ...], str] = {}
+_GIT_FOUND = pathlookup.GitCache()
 
 
 def _reset_for_tests() -> None:
@@ -161,11 +161,11 @@ def _reset_for_tests() -> None:
 
 
 def git_executable(*, environ=None, cwd=None) -> str:
-    """Resolve Git centrally; effects use their environment/fence and a fresh cache."""
-    return gitsafe_run.find_executable(_GIT_FOUND if environ is None else {}, environ,
+    """Resolve Git centrally; ordinary reads fence the outermost enclosing checkout."""
+    return gitsafe_run.find_executable((cache := _GIT_FOUND.for_cwd(cwd)) if environ is None else {}, environ,
         lambda effective: pathlookup.which("git",
-            **({"path": effective.get("PATH", os.defpath), "outside": getattr(effective, "root", cwd)} if environ is not None else {})),
-        error=GitError, cwd=cwd)
+            **({"path": effective.get("PATH", os.defpath), "outside": getattr(effective, "root", cwd)} if environ is not None else {"outside": cache.fence, "fence_program": True, "descriptors": False})),
+        error=GitError if environ is not None else cache.error(GitError), cwd=cwd)
 
 
 def custody_program(cwd, *, environ=None) -> Optional[str]:
@@ -203,7 +203,7 @@ def run(
     Nonzero exits are returned; spawn/timeout raises GitError. tty permits caller stdin.
     Effects require effect_fds and an owner-bound worktree_root; the caller owns the receipt.
     """
-    return gitsafe_run.execute(args, cwd, executable=git_executable, legacy_runner=subprocess.run,
+    return gitsafe_run.execute(args, cwd, executable=git_executable if effect_fds is not None or gitsafe_run.strict_active() else (lambda: git_executable(cwd=cwd)), legacy_runner=subprocess.run,
                                error=GitError, environ=_environ, timeout=timeout, stdin=stdin,
                                hardening=_hardening, env=_env, tty=tty, legacy_namespace=subprocess, effect_fds=effect_fds, write_roots=write_roots, worktree_root=worktree_root)
 

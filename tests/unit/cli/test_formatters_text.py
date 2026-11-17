@@ -153,9 +153,11 @@ def test_card_could_not_run_details_are_bounded_canonicalized_and_redacted():
     doc['layer1']['checks_that_could_not_run'] = [detail] * 22
     lines = text.render_card(doc)
     start = lines.index('  checks that could not run:')
-    assert lines[start + 1:start + 21] == ['    ' + 'x' * 270 + ' ghp_REDACTED end' + 'y' * 10 + '...'] * 20
+    assert lines[start + 1:start + 21] == ['    ' + 'x' * 270 + ' [REDACTED_VCS_TOKEN] end' + 'y' * 2 + '...'] * 20
     assert lines[start + 21] == '    ... and 2 more'
     assert token not in '\n'.join(lines)
+    assert all(token[index:index + 4] not in '\n'.join(lines) for index in range(len(token) - 3))
+    assert all(len(line[4:]) <= 300 for line in lines[start + 1:start + 21])
     assert '\x1b' not in '\n'.join(lines)
 
 
