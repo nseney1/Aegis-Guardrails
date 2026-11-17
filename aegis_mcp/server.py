@@ -39,6 +39,7 @@ from aegis_core.taxonomy import MCP_DEFAULT_RATE_LIMITS
 from aegis_core.workspace.base import Workspace
 from aegis_core.workspace.binding import Attested, Registry, WorkspaceBinding, read_registry, resolve_binding
 from aegis_core.workspace.layout import UserLayout
+from aegis_core.workspace.diagnostics import project_binding
 
 from .projection import is_error_result
 from aegis_mcp.handlers.common import DEFAULT_CLIENT_PLATFORM, NOT_GOVERNED_MESSAGE
@@ -305,113 +306,11 @@ def _workspace_for(binding: WorkspaceBinding) -> Workspace:
     return _workspaces[key]
 
 
-_BINDING_MESSAGES = {
-    "pin_conflicts_with_host_root": (
-        "AEGIS_WORKSPACE pins {pin}, but the host reports the session in {host_roots}; "
-        "fix the pin or open the pinned project", ("pin", "host_roots")),
-    "pin_conflicts_with_registry": (
-        "AEGIS_WORKSPACE pins {pin}, but the files belong to the registered workspace {registered_root}",
-        ("pin", "registered_root")),
-    "host_root_conflicts_with_registry": (
-        "the host reports the session in {host_root}, but the files belong to the registered workspace "
-        "{registered_root}", ("host_root", "registered_root")),
-    "host_root_conflicts_with_registry_outside": (
-        "the host reports the session outside any Aegis workspace, but the files belong to "
-        "the registered workspace {registered_root}", ("registered_root",)),
-    "ambiguous_host_roots": (
-        "the host reports several Aegis workspaces and the call's files do not pick one; "
-        "pass the files you plan to edit", ()),
-    "cwd_conflicts_with_registry": (
-        "the server runs in the workspace {cwd_root}, but the files exist only in the registered "
-        "workspace(s) {candidates}; pass absolute paths", ("cwd_root", "candidates")),
-    "ambiguous_registry_selection": ("the files exist in several registered workspaces; pass absolute paths", ()),
-    "host_roots_not_governed": ("the host's workspace has no .aegis/", ()),
-    "no_workspace": ("no Aegis workspace resolves for this call", ()),
-    "pin_missing": ("AEGIS_WORKSPACE is set to {workspace}, which cannot be resolved", ()),
-    "pin_missing_directory": ("AEGIS_WORKSPACE is set to {workspace}, which is not a directory", ()),
-    "pin_not_a_workspace": ("AEGIS_WORKSPACE is set to {workspace}, which has no .aegis/ (run aegis init there)", ()),
-    "pin_denied": ("AEGIS_WORKSPACE is set to {workspace}, which is the home directory", ()),
-    "pin_denied_root": ("AEGIS_WORKSPACE is set to {workspace}, which is the filesystem root", ()),
-}
-
-
 def _unbound_result(binding: WorkspaceBinding) -> Dict[str, Any]:
     launch_pin = _workspace_pin or getattr(_canonical_workspace, "root", _canonical_workspace)
     if isinstance(launch_pin, os.PathLike):
         launch_pin = os.fspath(launch_pin)
-    raw = {"status": binding.status, "root": str(binding.root) if binding.root is not None else None,
-           "source": binding.source, "confidence": binding.confidence, "reason": binding.reason,
-           "_pin": launch_pin}
-    # Bound wrappers, path count and each raw component before copying details.
-    # With at most 256 projected items of 1024 characters, later joins are bounded too.
-    refusal = None
-    items = len(binding.details)
-    for value in raw.values():
-        if value is not None:
-            if not isinstance(value, str):
-                refusal = "guidance_projection_invalid_field"
-                break
-            if len(value) > MAX_GUIDANCE_CHARS:
-                refusal = GuidanceProjectionError.code
-                break
-    if items > 256:
-        refusal = GuidanceProjectionError.code
-    allowed = {"pin", "target", "cwd", "cwd_root", "host_root", "registered_root", "host_roots", "candidates"}
-    if refusal is None:
-        for key, value in binding.details:
-            if key not in allowed or not isinstance(value, list if key in {"host_roots", "candidates"} else str):
-                refusal = "guidance_projection_invalid_field"
-                break
-            items += len(value) if isinstance(value, list) else 1
-            if items > 256:
-                refusal = GuidanceProjectionError.code
-                break
-            for path in value if isinstance(value, list) else (value,):
-                if not isinstance(path, str):
-                    refusal = "guidance_projection_invalid_field"
-                    break
-                if len(path) > MAX_GUIDANCE_CHARS:
-                    refusal = GuidanceProjectionError.code
-                    break
-            if refusal is not None:
-                break
-    display = {}
-    for key, value in raw.items():
-        if value is None:
-            display[key] = None
-        else:
-            try:
-                name = project_error_name(value)
-            except GuidanceProjectionError as error:
-                name = error.code
-            display[key] = project_diagnostic(name, escaped=False)
-    projected_pin = display.pop("_pin")
-    details = {}
-    if refusal is None:
-        for key, value in binding.details:
-            shown = []
-            for path in value if isinstance(value, list) else (value,):
-                try:
-                    name = project_error_name(path)
-                except GuidanceProjectionError as error:
-                    name = error.code
-                shown.append(project_diagnostic(name, escaped=False))
-            details[key] = shown if isinstance(value, list) else shown[0]
-    kind = binding.reason
-    if kind == "host_root_conflicts_with_registry" and "host_root" not in details:
-        kind = "host_root_conflicts_with_registry_outside"
-    elif kind == "pin_missing" and binding.message.endswith("which is not a directory"):
-        kind = "pin_missing_directory"
-    elif kind == "pin_denied" and binding.message.endswith("which is the filesystem root"):
-        kind = "pin_denied_root"
-    template, required = _BINDING_MESSAGES.get(kind, ("workspace binding refused", ()))
-    if refusal is None and not all(key in details for key in required):
-        refusal = "guidance_projection_invalid_field"
-    display["details"] = details if refusal is None else {}
-    values = {key: ", ".join(value) if isinstance(value, list) else value for key, value in display["details"].items()}
-    values["workspace"] = projected_pin or values.get("pin") or display["root"] or "workspace"
-    message = refusal or template.format(**values)
-    display["message"] = project_diagnostic(message, escaped=False)
+    display = project_binding(binding, workspace=launch_pin)
     if binding.status == "hold":
         return {"status": "hold", "reason": display["reason"], "error": display["message"], "binding": display}
     if binding.status == "error":
