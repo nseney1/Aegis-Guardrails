@@ -2623,7 +2623,7 @@ def test_cache_primed_before_workspace_symlink_retarget_is_skipped(tmp_path, fre
             found = gitsafe.git_executable(cwd=ws)
             assert found != str(alias)
             assert os.path.samefile(found, real_git)
-            assert pathlookup._inside(str(alias), pathlookup.git_fence(ws))
+            assert pathlookup._provenance_inside(str(alias), pathlookup.git_fence(ws))
             result = gitsafe.run(["--version"], ws)
     assert result.returncode == 0 and result.stdout.startswith(b"git version")
     assert not marker.exists()

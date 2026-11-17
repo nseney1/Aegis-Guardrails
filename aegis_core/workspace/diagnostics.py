@@ -1,10 +1,11 @@
 """Pure workspace-binding display projection shared by CLI and MCP.
 
 Canonical bindings stay private. Validate the whole collection before projecting
-literal components, then compose fixed wording and bound the final sentence.
+literal components, then reserve fixed wording before budgeting display identities.
 """
 from __future__ import annotations
 
+from string import Formatter
 from typing import Any, Dict, Optional
 
 from aegis_core.guidance_projection import (
@@ -12,6 +13,7 @@ from aegis_core.guidance_projection import (
     project_diagnostic, project_error_name,
 )
 from aegis_core.workspace.binding import WorkspaceBinding
+from aegis_core.redaction import clip_atomic_text
 
 __all__ = ["project_binding"]
 
@@ -124,6 +126,32 @@ def _message_key(binding, details):
     return reason
 
 
+def _frame_message(template, values):
+    """Fit projected identities around an immutable cause and recovery frame.
+
+    Count repeated placeholders before allocating space. Short identities donate
+    their unused allowance; clipping keeps redaction atoms whole. These values
+    are display-only and never replace canonical binding fields.
+    """
+    fields = [name for _, name, _, _ in Formatter().parse(template) if name is not None]
+    remaining = 1024 - len(template.format(**dict.fromkeys(fields, "")))
+    slots = len(fields)
+    shown = {}
+    suffix = "... [display-only]"
+    for name in sorted(set(fields), key=lambda name: (len(values[name]), name)):
+        count = fields.count(name)
+        value = values[name]
+        allowance = remaining // slots
+        if len(value) > allowance:
+            value = clip_atomic_text(value, allowance - len(suffix), policy="guidance") + suffix
+        shown[name] = value
+        remaining -= count * len(value)
+        slots -= count
+    # The components are already projected. Redacting the assembled sentence
+    # again could let an identity's trailing "token=" consume fixed wording.
+    return template.format(**shown)
+
+
 def project_binding(binding: WorkspaceBinding, *, workspace: Optional[str] = None,
                     cli: bool = False) -> Dict[str, Any]:
     """Project once without reading message text or mutating the canonical record.
@@ -154,7 +182,7 @@ def project_binding(binding: WorkspaceBinding, *, workspace: Optional[str] = Non
             values["workspace"] = values.get("pin") or supplied or "workspace"
     else:
         values["workspace"] = supplied or values.get("pin") or display["root"] or "workspace"
-    message = project_diagnostic(refusal or template.format(**values), escaped=False)
+    message = refusal or _frame_message(template, values)
     if cli:
         display.update(message=message, details=details)
     else:

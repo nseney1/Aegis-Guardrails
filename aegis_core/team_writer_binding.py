@@ -5,25 +5,28 @@ the current lease itself. ``observe`` reads without the lock and never writes.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import json
 import os
 from pathlib import Path
 import re
 import stat
 
-from aegis_core import gitsafe, kernel_identity, storage_confined, team
+from aegis_core import gitsafe, kernel_identity, storage, storage_confined, team
 from aegis_core.primitives import json_preflight, sanitize_display
 from aegis_core.redaction import redact_command_secrets
 from aegis_core.team_supervisor import read_owned_leaf
+from aegis_core.workspace.layout import WorkspaceLayout
 
 __all__ = [
     "NAME", "MAX_BYTES", "descriptor_supported", "process_identity", "bind", "load", "judge",
+    "BindingLockRefused", "claim_exclusion",
 ]
 
 NAME = "writer-bindings.json"
 MAX_BYTES = 68379
 _ANCHOR = ("writer-binding-workspace",)
+_CLAIM_LOCK = "aegis-writer.lock"
 _RECORD_KEYS = {"boot_id", "claim_id", "gen", "pid", "pid_namespace", "start_ticks"}
 _BOOT = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 _CLAIM = re.compile(r"[0-9a-f]{16}")
@@ -46,6 +49,67 @@ class _Refusal(ValueError):
     def __init__(self, code):
         super().__init__(_REASONS[code])
         self.code = code
+
+
+class BindingLockRefused(ValueError):
+    """Fixed state_locked or lease_unavailable failure acquiring claim exclusion."""
+
+    def __init__(self, code):
+        super().__init__(_REASONS[code])
+        self.code = code
+
+
+def _git_marker_above(workspace):
+    """Prove absence up the bounded root spelling; unsafe probes are uncertain."""
+    def present(root, name):
+        try:
+            with storage_confined.confined_file(root, (name,)) as handle:
+                handle.read_bytes(0)
+        except storage_confined.ConfinedFileError as error:
+            if error.reason == "missing":
+                return False
+        return True
+    for root in (workspace, *workspace.parents):
+        if present(root, ".git") or (present(root, "HEAD") and present(root, "objects")):
+            return True
+    return False
+
+
+@contextmanager
+def claim_exclusion(workspace, *, validated_workspace=False):
+    """Serialize bind/unclaim for Git refs shared by every linked worktree.
+
+    Acquire after the workspace lock and retain through the whole mutation.
+    The queue passes its validated root; binding callers retain their stricter
+    path contract. A Git common directory is independent of workspace depth.
+    Outside Git there is no real lease for bind to select or publish against.
+    Only acquisition failures are translated; consumer refusals pass unchanged.
+    """
+    with ExitStack() as stack:
+        try:
+            if not validated_workspace:
+                workspace = _root(workspace)
+            common = gitsafe.common_dir(workspace)
+            if common is None and _git_marker_above(workspace):
+                # Layout discovery also returns None on some Git failures. A
+                # marked repository must never bypass its shared exclusion.
+                raise _Refusal("lease_unavailable")
+            if common is not None:
+                spelling = str(common)
+                if (len(spelling) > (32768 if validated_workspace else 32740) or
+                        (not validated_workspace and spelling.count("/") + spelling.count("\\") > 128)):
+                    raise _Refusal("lease_unavailable")
+                # common_dir can include a lexical '..' from a Git subdirectory;
+                # normalize it without following any filesystem link.
+                normalized = os.path.abspath(spelling)
+                common = Path(normalized) if validated_workspace else _root(normalized)
+                handle = stack.enter_context(storage_confined.confined_file(common, (_CLAIM_LOCK,)))
+                stack.enter_context(storage.file_lock(common / _CLAIM_LOCK, timeout=0, dir_fd=handle._parent))
+        except storage.LockTimeoutError:
+            raise BindingLockRefused("state_locked") from None
+        except Exception:
+            raise BindingLockRefused("lease_unavailable") from None
+        yield
 
 
 def descriptor_supported():
@@ -282,6 +346,22 @@ def _bind_locked(directory, workspace, lane, pid):
     return {"status": "ok"}
 
 
+@contextmanager
+def _workspace_locked(workspace):
+    """Share unclaim's lock inode, opened through a held directory descriptor."""
+    with ExitStack() as stack:
+        try:
+            target = WorkspaceLayout(workspace).lock_file
+            handle = stack.enter_context(storage_confined.confined_file(
+                workspace, target.relative_to(workspace).parts, create_parents=True))
+            stack.enter_context(storage.file_lock(target, timeout=0, dir_fd=handle._parent))
+        except storage.LockTimeoutError:
+            raise _Refusal("state_locked") from None
+        except Exception:
+            raise _Refusal("lease_unavailable") from None
+        yield
+
+
 def bind(user_root, workspace_root, lane, pid):
     """Store this pid for the lane's current lease. The caller does not pass the triple."""
     try:
@@ -292,10 +372,12 @@ def bind(user_root, workspace_root, lane, pid):
         if type(pid) is not int or not 1 <= pid <= 2147483647:
             return _refused("identity_unavailable")
         home, workspace = _root(user_root), _root(workspace_root)
-        with _directory(home) as directory:
+        # Workspace first, then owner directory: selection and publication must
+        # not straddle unclaim's judgement, release, or final queue publication.
+        with _workspace_locked(workspace), claim_exclusion(workspace), _directory(home) as directory:
             with _locked(directory):
                 return _bind_locked(directory, workspace, lane, pid)
-    except _Refusal as error:
+    except (_Refusal, BindingLockRefused) as error:
         return _refused(error.code)
     except Exception:
         return _refused("state_unavailable")
