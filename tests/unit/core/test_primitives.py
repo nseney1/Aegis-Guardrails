@@ -696,8 +696,7 @@ def test_display_source_view_masks_only_surviving_characters_and_preserves_conte
 @pytest.mark.parametrize("prefix", [pytest.param("\x1b[", id="csi"), pytest.param("\x1b[1", id="csi-parameter")])
 @pytest.mark.parametrize("inner", [pytest.param("\r", id="cr"), pytest.param("\x00", id="nul"),
                                   pytest.param("\x7f", id="del"), pytest.param("\x85", id="c1"),
-                                  pytest.param("\x1b[31m", id="supported-csi", marks=pytest.mark.xfail(
-                                      strict=True, reason="SANITIZE-CRAFTED-INTERLEAVING"))])
+                                  pytest.param("\x1b[31m", id="supported-csi")])
 @pytest.mark.parametrize("family", ["aws", "github"])
 @pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
 def test_display_deleted_view_masks_consumed_prefix_with_internal_control(prefix, inner, family, surface):
@@ -993,3 +992,365 @@ def test_display_source_guard_cannot_complete_a_new_credential_or_tear_a_mask(su
     assert "abcd" not in shown and "omitted" not in shown
     expected = "AK" + "IA" + "123456789PWD"
     assert shown == expected + (r"\x5bREDACTED\x5d" if surface == "guidance" else "[REDACTED]")
+
+
+@pytest.mark.parametrize("count", [128, 1024, 8192])
+def test_display_attribution_budget_masks_stress_before_interpretation_allocation(count, monkeypatch):
+    observations = []
+    original = primitives._display_attribution
+
+    def observed(*args):
+        spans, stats = original(*args)
+        observations.append(dict(stats))
+        return spans, stats
+
+    def forbidden(*args):
+        pytest.fail("an over-budget interpretation was allocated")
+
+    monkeypatch.setattr("aegis_core.primitives._display_attribution", observed)
+    monkeypatch.setattr("aegis_core.primitives._display_attribution_view", forbidden)
+    value = "gh" + "p_" + "\x1b[a" * count + "!"
+    assert primitives.sanitize_display(value, max_len=None) == "[REDACTED]"
+    assert len(observations) == 1
+    stats = observations[0]
+    assert len(stats["windows"]) == 1
+    assert stats["windows"][0]["coverage"] in {"possible", "exhausted"}
+    assert stats["exhausted"] == (stats["windows"][0]["coverage"] == "exhausted")
+    assert 0 < stats["steps"] <= stats["limit"] <= primitives._DISPLAY_ATTRIBUTION_CEILING
+    assert stats["limit"] <= primitives._DISPLAY_ATTRIBUTION_RATE * len(value)
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("plain", "plain"), ("\r\x00safe", "safe"),
+    ("before\x1b]title", "before]title"), ("\x9b31mplain", "31mplain"),
+    ("before\x1b]title\x07after", "beforeafter"), ("\t\n", "  "),
+])
+def test_display_attribution_gate_keeps_inputs_without_suppressed_finals_identical(value, expected, monkeypatch):
+    def forbidden(*args):
+        pytest.fail("attribution search ran without a suppressed printable final")
+
+    monkeypatch.setattr("aegis_core.primitives._display_attribution", forbidden)
+    assert primitives.sanitize_display(value, max_len=None) == expected
+
+
+@pytest.mark.parametrize("suffix", ["", "\x1b[31m"])
+def test_display_attribution_preserves_ordinary_left_boundary(suffix):
+    key = "AK" + "IA" + "A" * 16
+    assert primitives.sanitize_display("x" + key + suffix, max_len=None) == "x" + key
+
+
+@pytest.mark.parametrize("value, payload", [
+    ("AS" + "IA" + "A" * 16, "A" * 16),
+    ("AR" + "OA" + "A" * 16, "A" * 16),
+    ("gh" + "o_" + "a" * 36, "a" * 36),
+    ("git" + "hub_pat_" + "a" * 24, "a" * 24),
+    ("gl" + "pat-" + "a" * 24, "a" * 24),
+    ("sk" + "_live_" + "a" * 24, "a" * 24),
+    ("sk" + "-proj-" + "a" * 24, "a" * 24),
+    ("AI" + "za" + "a" * 30, "a" * 30),
+    ("xo" + "xb-" + "a" * 24, "a" * 24),
+    ("npm" + "_" + "a" * 24, "a" * 24),
+    ("py" + "pi-" + "a" * 24, "a" * 24),
+    ("ey" + "J" + "a" * 12 + "." + "b" * 8 + "." + "c" * 8, "c" * 8),
+    ("Bearer " + "a" * 24, "a" * 24),
+    ("password=" + "test-value-123456", "test-value-123456"),
+    ("password is " + "test-value-123456", "test-value-123456"),
+    ("https://user:" + "test-value-123456" + "@example.test", "test-value-123456"),
+])
+@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
+def test_display_attribution_covers_shared_rule_families(value, payload, surface):
+    from aegis_core import diagnostic_messages
+    from aegis_core.redaction import redact_command_secrets
+
+    render = {"sanitize": lambda text: redact_command_secrets(primitives.sanitize_display(text, max_len=None)),
+              "receipt": diagnostic_messages.receipt_value,
+              "guidance": diagnostic_messages.guidance_value}[surface]
+    shown = render("\x1b[" + value[:4] + "\x1b[31m" + value[4:])
+    assert payload not in shown
+    assert "REDACTED" in shown
+
+
+def test_display_attribution_budget_is_local_to_retries_and_parallel_calls():
+    from concurrent.futures import ThreadPoolExecutor
+
+    key = "AK" + "IA" + "A" * 16
+    values = ["gh" + "p_" + "\x1b[a" * 128 + "!",
+              "\x1b[" + key[:4] + "\x1b[31m" + key[4:], "safe"] * 8
+    expected = ["[REDACTED]", "[REDACTED_AWS]", "safe"] * 8
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(lambda text: primitives.sanitize_display(text, max_len=None), values)) == expected
+    assert [primitives.sanitize_display(text, max_len=None) for text in values] == expected
+
+
+@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
+def test_display_attribution_exhaustion_masks_only_candidate_between_sealed_strings(surface, monkeypatch):
+    from aegis_core import diagnostic_messages
+    from aegis_core.redaction import redact_command_secrets
+
+    monkeypatch.setattr("aegis_core.primitives._DISPLAY_ATTRIBUTION_CEILING", 0)
+    key = "AK" + "IA" + "A" * 16
+    candidate = "\x1b[" + key[:4] + "\x1b[31m" + key[4:]
+    render = {"sanitize": lambda text: redact_command_secrets(primitives.sanitize_display(text, max_len=None)),
+              "receipt": diagnostic_messages.receipt_value,
+              "guidance": diagnostic_messages.guidance_value}[surface]
+    value = "before\x1b]title\x07" + candidate + "\x1b]title\x07after"
+    assert render(value) == render("before[REDACTED]after")
+
+
+@pytest.mark.parametrize("count", [1, 3, 6])
+def test_display_attribution_long_benign_colour_runs_keep_parity(count):
+    part = "x" * 5001
+    value = (part + "\x1b[31m") * count + part
+    assert primitives.sanitize_display(value, max_len=None) == part * (count + 1)
+
+
+def test_display_attribution_adjacent_colours_keep_long_context():
+    prefix, suffix = "left" * 1500, "right" * 1500
+    value = prefix + "\x1b[31mone\x1b[0m \x1b[32mtwo\x1b[0m" + suffix
+    assert primitives.sanitize_display(value, max_len=None) == prefix + "one two" + suffix
+
+
+def test_display_attribution_exhaustion_masks_only_two_separate_windows(monkeypatch):
+    observations = []
+    original = primitives._display_attribution
+
+    def observed(*args):
+        spans, stats = original(*args)
+        observations.extend(stats["windows"])
+        return spans, stats
+
+    monkeypatch.setattr("aegis_core.primitives._display_attribution", observed)
+    monkeypatch.setattr("aegis_core.primitives._DISPLAY_ATTRIBUTION_CEILING", 0)
+    part = "z" * (2 * primitives._display_attribution_tables()[0] + 77)
+    value = part + "\x1b[31m" + part + "\x1b[31m" + part
+    shown = primitives.sanitize_display(value, max_len=None)
+    assert len(observations) == 2
+    pieces, cursor = [], 0
+    for stats in observations:
+        assert stats["exhausted"] and stats["steps"] == stats["limit"] == 0
+        pieces.extend((value[cursor:stats["start"]], "[REDACTED]"))
+        cursor = stats["end"]
+    pieces.append(value[cursor:])
+    assert shown == "".join(pieces)
+    assert shown.startswith("z" * 77) and shown.endswith("z" * 77)
+
+
+def test_display_attribution_clipped_window_does_not_create_a_left_boundary():
+    key = "AK" + "IA" + "A" * 16
+    gap = "x" * (primitives._display_attribution_tables()[0] - len(key))
+    plain = "x" * 5000 + key + gap
+    assert primitives.sanitize_display(plain + "\x1b[31m", max_len=None) == plain
+
+
+def test_display_attribution_exhausted_window_does_not_poison_later_window():
+    key = "AK" + "IA" + "A" * 16
+    first = "gh" + "p_" + "\x1b[a" * 128 + "!"
+    second = "\x1b[" + key[:4] + "\x1b[31m" + key[4:]
+    assert primitives.sanitize_display(first + "\x1b]title\x07" + second, max_len=None) == (
+        "[REDACTED][REDACTED_AWS]")
+
+
+def test_display_attribution_hidden_only_credential_does_not_mask_visible_context():
+    key = "AK" + "IA" + "A" * 16
+    value = "left" + "".join("\x1b[" + char for char in key)
+    assert primitives.sanitize_display(value, max_len=None) == "left"
+
+
+def test_display_attribution_widths_and_unknown_grammars_fail_conservatively():
+    import re
+    from aegis_core.display_attribution import compile_possible, max_match_width, may_match_visible
+
+    assert max_match_width([re.compile(r"a{7}(?:bc|d)")], unbounded_cap=64) == 9
+    assert max_match_width([re.compile(r"a*")], unbounded_cap=64) == 64
+    assert max_match_width([re.compile(r"a{4096}")], unbounded_cap=64) == 4096
+    assert compile_possible([re.compile(r"a{1000000}")]) is None
+    assert compile_possible([re.compile(r"(ab)\1")]) is None
+    runs = [(0, 4, 0, True, None, 0)]
+    assert may_match_visible(None, "safe", runs, lambda amount: True)
+    assert may_match_visible(compile_possible([re.compile("abc")]), "safe", runs, lambda amount: False)
+
+
+@pytest.mark.parametrize("count", [5000, 50000])
+@pytest.mark.parametrize("control", [pytest.param("\x00", id="nul"), pytest.param("\r", id="cr"),
+                                     pytest.param("\x7f", id="del"), pytest.param("\x85", id="c1")])
+@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
+def test_display_attribution_detection_windows_span_removed_control_gaps(count, control, surface):
+    from aegis_core import diagnostic_messages
+    from aegis_core.redaction import redact_command_secrets
+
+    key = "AK" + "IA" + "A" * 16
+    value = "\x1b[" + key[:4] + "\x1b[31m" + control * count + key[4:]
+    render = {"sanitize": lambda text: redact_command_secrets(primitives.sanitize_display(text, max_len=None)),
+              "receipt": diagnostic_messages.receipt_value,
+              "guidance": diagnostic_messages.guidance_value}[surface]
+    shown = render(value)
+    if count == 5000:
+        assert shown == render("[REDACTED_AWS]")
+    elif surface == "sanitize":
+        assert shown == "[REDACTED]"
+    else:
+        # These bounded surfaces refuse before invoking canonicalization.
+        assert shown == {"receipt": "[diagnostic omitted: too_large]",
+                         "guidance": "diagnostic_omitted_too_large"}[surface]
+    assert "A" * 16 not in shown
+
+
+def test_display_attribution_detection_windows_keep_visible_whitespace():
+    key = "AK" + "IA" + "A" * 16
+    value = "\x1b[" + key[:4] + "\x1b[31m" + "\t" * 5000 + key[4:]
+    assert primitives.sanitize_display(value, max_len=None) == key[1:4] + " " * 5000 + key[4:]
+
+
+def test_display_attribution_detection_windows_retry_after_large_gap_in_parallel():
+    from concurrent.futures import ThreadPoolExecutor
+
+    key = "AK" + "IA" + "A" * 16
+    values = ["\x1b[" + key[:4] + "\x1b[31m" + "\x00" * count + key[4:]
+              for count in (50000, 5000, 0)] * 4
+    expected = ["[REDACTED]", "[REDACTED_AWS]", "[REDACTED_AWS]"] * 4
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(lambda value: primitives.sanitize_display(value, max_len=None), values)) == expected
+    assert [primitives.sanitize_display(value, max_len=None) for value in values] == expected
+
+
+@pytest.mark.parametrize("count", [5000, 50000])
+@pytest.mark.parametrize("placement", ["prefix", "between", "payload"])
+def test_display_attribution_detection_window_geometry_keeps_source_budget(count, placement, monkeypatch):
+    observations = []
+    original = primitives._display_attribution
+
+    def observed(*args):
+        spans, stats = original(*args)
+        observations.extend(stats["windows"])
+        return spans, stats
+
+    monkeypatch.setattr("aegis_core.primitives._display_attribution", observed)
+    key = "AK" + "IA" + "A" * 16
+    gap = "\x00" * count
+    value = {"prefix": "\x1b[" + key[:1] + gap + key[1:4] + "\x1b[31m" + key[4:],
+             "between": "\x1b[" + key[:4] + gap + "\x1b[31m" + key[4:],
+             "payload": "\x1b[" + key[:4] + "\x1b[31m" + gap + key[4:]}[placement]
+    shown = primitives.sanitize_display(value, max_len=None)
+    assert shown == ("[REDACTED_AWS]" if count == 5000 else "[REDACTED]")
+    assert len(observations) == 1
+    stats = observations[0]
+    assert stats["detection_end"] - stats["detection_start"] == len(key) - 1
+    assert stats["end"] == len(value)
+    assert stats["source_length"] == stats["end"] - stats["start"]
+    assert stats["source_length"] > count
+    assert 0 < stats["steps"] <= stats["limit"] <= primitives._DISPLAY_ATTRIBUTION_CEILING
+    assert stats["limit"] == min(primitives._DISPLAY_ATTRIBUTION_CEILING,
+                                 primitives._DISPLAY_ATTRIBUTION_RATE * stats["source_length"])
+    assert not stats["exhausted"]
+    assert stats["coverage"] == ("possible" if count == 50000 else "complete")
+
+
+@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
+@pytest.mark.parametrize("family", ["jwt", "vcs"])
+def test_display_attribution_masks_overlapping_ordinary_credentials(surface, family):
+    from aegis_core import diagnostic_messages
+    from aegis_core.redaction import redact_command_secrets
+
+    if family == "jwt":
+        value = "eyJ" + "a" * 8 + ".aaaa_eyJ" + "b" * 8 + ".ccc\x1b[c." + "d" * 43
+        signature, marker = "d" * 43, "[REDACTED_JWT]"
+    else:
+        prefix = "git" + "hub_pat_"
+        value = prefix + "a" * 200 + "_" + prefix + "\x1b[b" + "b" * 99
+        signature, marker = "b" * 43, "[REDACTED_VCS_TOKEN]"
+    render = {"sanitize": lambda text: redact_command_secrets(primitives.sanitize_display(text, max_len=None)),
+              "receipt": diagnostic_messages.receipt_value,
+              "guidance": diagnostic_messages.guidance_value}[surface]
+    shown = render(value)
+    assert signature not in shown
+    assert shown == render(marker)
+
+
+@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
+@pytest.mark.parametrize("plain", [pytest.param("xAK" + "IA" + "A" * 16, id="ascii-aws"),
+                                  pytest.param("\u212aBearer " + "a" * 24, id="unicode-bearer")])
+def test_display_attribution_fallback_preserves_ordinary_boundary_and_flags(surface, plain):
+    from aegis_core import diagnostic_messages
+    from aegis_core.redaction import redact_command_secrets
+
+    render = {"sanitize": lambda text: redact_command_secrets(primitives.sanitize_display(text, max_len=None)),
+              "receipt": diagnostic_messages.receipt_value,
+              "guidance": diagnostic_messages.guidance_value}[surface]
+    assert render(plain + "\x1b[31m" * 128) == render(plain)
+
+
+@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
+def test_display_attribution_fallback_keeps_carried_starts(surface):
+    from aegis_core import diagnostic_messages
+    from aegis_core.redaction import redact_command_secrets
+
+    key = "AK" + "IA" + "A" * 16
+    value = "x\x1b[" + key[:4] + "\x1b[31m" * 128 + key[4:]
+    render = {"sanitize": lambda text: redact_command_secrets(primitives.sanitize_display(text, max_len=None)),
+              "receipt": diagnostic_messages.receipt_value,
+              "guidance": diagnostic_messages.guidance_value}[surface]
+    shown = render(value)
+    assert "A" * 16 not in shown and "REDACTED" in shown
+
+
+def test_display_attribution_possible_match_is_not_budget_exhaustion(monkeypatch):
+    observations = []
+    original = primitives._display_attribution
+
+    def observed(*args):
+        spans, stats = original(*args)
+        observations.extend(stats["windows"])
+        return spans, stats
+
+    monkeypatch.setattr("aegis_core.primitives._display_attribution", observed)
+    value = "gh" + "p_" + "\x1b[a" * 128 + "!"
+    assert primitives.sanitize_display(value, max_len=None) == "[REDACTED]"
+    assert len(observations) == 1
+    stats = observations[0]
+    assert not stats["exhausted"]
+    assert stats["coverage"] == "possible"
+    assert stats["steps"] < stats["limit"]
+
+
+def test_display_attribution_overlapping_scan_budget_refuses_and_retries(monkeypatch):
+    observations, rejected = [], []
+    original, original_charge = primitives._display_attribution, primitives._display_attribution_charge
+
+    def observed(*args):
+        spans, stats = original(*args)
+        observations.extend(stats["windows"])
+        return spans, stats
+
+    def charged(stats, amount):
+        allowed = original_charge(stats, amount)
+        if not allowed:
+            rejected.append(amount)
+        return allowed
+
+    monkeypatch.setattr("aegis_core.primitives._display_attribution", observed)
+    monkeypatch.setattr("aegis_core.primitives._display_attribution_charge", charged)
+    prefix = "git" + "hub_pat_"
+    value = prefix + "a" * 200 + "_" + prefix + "\x1b[b" + "b" * 99
+    original_ceiling = primitives._DISPLAY_ATTRIBUTION_CEILING
+    monkeypatch.setattr("aegis_core.primitives._DISPLAY_ATTRIBUTION_CEILING", 70000)
+    assert primitives.sanitize_display(value, max_len=None) == "[REDACTED]"
+    stats = observations[0]
+    assert stats["exhausted"] and stats["coverage"] == "exhausted"
+    assert 0 < stats["steps"] <= stats["limit"] == 70000
+    # The denied charge is a scan over detection text, after variant admission.
+    assert rejected and max(rejected) <= len(value) + 1
+    monkeypatch.setattr("aegis_core.primitives._DISPLAY_ATTRIBUTION_CEILING", original_ceiling)
+    assert primitives.sanitize_display(value, max_len=None) == "[REDACTED_VCS_TOKEN]"
+    assert observations[-1]["coverage"] == "complete" and not observations[-1]["exhausted"]
+
+
+def test_display_attribution_overlaps_and_fallback_are_isolated_in_parallel():
+    from concurrent.futures import ThreadPoolExecutor
+
+    plain = "xAK" + "IA" + "A" * 16
+    overlapping = "eyJ" + "a" * 8 + ".aaaa_eyJ" + "b" * 8 + ".ccc\x1b[c." + "d" * 43
+    values = [overlapping, plain + "\x1b[31m" * 128, "gh" + "p_" + "\x1b[a" * 128 + "!"] * 4
+    expected = ["[REDACTED_JWT]", plain, "[REDACTED]"] * 4
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(lambda value: primitives.sanitize_display(value, max_len=None), values)) == expected
+    assert [primitives.sanitize_display(value, max_len=None) for value in values] == expected
