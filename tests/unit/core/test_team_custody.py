@@ -72,6 +72,10 @@ def test_governance_requires_explicit_true_and_failure_is_retryable(rig, decisio
         run(rig, governance_check=governance)
     assert caught.value.code == "governance_refused"
     assert str(caught.value) == custody.REFUSALS["governance_refused"]
+    assert caught.value.next_action == {
+        "actor": "custodian",
+        "command": "obtain governance approval for the tested bytes before retrying commit custody",
+    }
     assert state(rig) == before
     assert run(rig).status == "committed"
 
@@ -104,6 +108,10 @@ def test_unsupported_platform_refuses_without_git_or_journal(monkeypatch):
                        governance_check=None)
     assert caught.value.code == "unsupported_platform"
     assert str(caught.value) == custody.REFUSALS["unsupported_platform"]
+    assert caught.value.next_action == {
+        "actor": "custodian",
+        "command": "use a host with descriptor-relative commit custody support",
+    }
 
 
 def test_governance_race_cannot_overwrite_concurrent_ref(rig):
@@ -115,11 +123,19 @@ def test_governance_race_cannot_overwrite_concurrent_ref(rig):
     with pytest.raises(custody.CommitRefused) as caught:
         run(rig, governance_check=governance)
     assert caught.value.code == "cas_mismatch"
+    assert caught.value.next_action == {
+        "actor": "custodian",
+        "command": "inspect the lane ref and terminal commit result; never repeat this request's effect",
+    }
     assert git(rig.repo, "rev-parse", "HEAD").decode().strip() == winner
     assert len(results(rig)) == 1 and results(rig)[0]["status"] == "unknown"
     with pytest.raises(custody.CommitRefused) as caught:
         run(rig)
     assert caught.value.code == "request_closed"
+    assert caught.value.next_action == {
+        "actor": "custodian",
+        "command": "inspect the terminal commit result; never retry this request's effect",
+    }
     assert len(results(rig)) == 1
 
 
@@ -154,6 +170,10 @@ def test_unknown_transport_is_observed_never_repeated(rig, monkeypatch, applied)
     with pytest.raises(custody.CommitRefused) as caught:
         run(rig)
     assert caught.value.code == "ref_update_unknown"
+    assert caught.value.next_action == {
+        "actor": "custodian",
+        "command": "inspect the commit intent and reconcile by observation; never repeat its effect",
+    }
     if applied:
         assert run(rig).status == "committed_recovered"
     else:
@@ -180,6 +200,10 @@ def test_two_callers_same_request_get_one_effect_and_one_result(rig, monkeypatch
             with pytest.raises(custody.CommitRefused) as caught:
                 pool.submit(run, rig).result(timeout=10)
             assert caught.value.code == "ref_update_unknown"
+            assert caught.value.next_action == {
+                "actor": "custodian",
+                "command": "inspect the commit intent and reconcile by observation; never repeat its effect",
+            }
             assert not results(rig)
         finally:
             release.set()
@@ -194,6 +218,10 @@ def test_retry_changed_binding_refuses_without_effect(rig):
     with pytest.raises(custody.CommitRefused) as caught:
         run(rig, message="different")
     assert caught.value.code == "request_conflict"
+    assert caught.value.next_action == {
+        "actor": "custodian",
+        "command": "inspect the recorded request binding and restore its original inputs; never repeat its effect",
+    }
     assert state(rig) == before and len(results(rig)) == 1
 
 
@@ -214,17 +242,46 @@ def test_other_commit_intent_shape_refuses_without_raw_exception(rig, new):
 
 @pytest.mark.parametrize("field,value", [("request_id", None), ("request_id", "x" * 129),
                                        ("request_id", "bad\nvalue"), ("actor", "bad\nvalue")])
-def test_invalid_request_fields_refuse_before_store_access(field, value):
+def test_invalid_request_fields_refuse_before_store_access(monkeypatch, field, value):
     options = dict(lane=None, owner=None, expected_head=None, tested_tree=None, required_legs=(),
                    message=None, identity=None, journal=None, request_id="commit-1", actor="custodian",
                    read_branch=None, read_head=None, read_paths=None, read_policy=None, governance_check=None)
     options[field] = value
-    # This input-only gate is portable; the capability seam is provided below.
-    if not team_qualify.descriptor_supported():
-        pytest.skip("commit request gate follows platform support")
-    with pytest.raises(custody.CommitRefused) as caught:
-        custody.commit(None, **options)
-    assert caught.value.code == "invalid_request"
+    monkeypatch.setattr(custody, "team_git", SimpleNamespace(descriptor_support=lambda: True))
+    monkeypatch.setattr(custody, "team_qualify", SimpleNamespace(descriptor_supported=lambda: True))
+    for _ in range(2):
+        with pytest.raises(custody.CommitRefused) as caught:
+            custody.commit(None, **options)
+        assert caught.value.code == "invalid_request"
+        assert str(caught.value) == custody.REFUSALS["invalid_request"]
+        assert caught.value.next_action == {
+            "actor": "custodian",
+            "command": "provide valid commit request and actor identifiers",
+        }
+
+
+@pytest.mark.parametrize("kind", ["wrong-type", "unreadable"])
+def test_journal_gate_advice_precedes_store_access_and_is_repeatable(monkeypatch, kind):
+    class UnreadableJournal:
+        def read(self):
+            raise team_gitops.GitOpsError("journal_io")
+    monkeypatch.setattr(custody, "team_git", SimpleNamespace(descriptor_support=lambda: True))
+    monkeypatch.setattr(custody, "team_qualify", SimpleNamespace(descriptor_supported=lambda: True))
+    monkeypatch.setattr(custody, "team_gitops", SimpleNamespace(
+        GitOpsJournal=UnreadableJournal, GitOpsError=team_gitops.GitOpsError))
+    journal = object() if kind == "wrong-type" else UnreadableJournal()
+    for _ in range(2):
+        with pytest.raises(custody.CommitRefused) as caught:
+            custody.commit(None, lane=None, owner=None, expected_head=None, tested_tree=None,
+                           required_legs=(), message=None, identity=None, journal=journal,
+                           request_id="commit-1", actor="custodian", read_branch=None, read_head=None,
+                           read_paths=None, read_policy=None, governance_check=None)
+        assert caught.value.code == "journal_failed"
+        assert str(caught.value) == custody.REFUSALS["journal_failed"]
+        assert caught.value.next_action == {
+            "actor": "custodian",
+            "command": "restore journal access and reconcile by observation; never repeat an existing intent's effect",
+        }
 
 
 def test_failed_result_append_is_recovered_without_repeating_cas(rig, monkeypatch):
@@ -244,6 +301,10 @@ def test_failed_result_append_is_recovered_without_repeating_cas(rig, monkeypatc
     with pytest.raises(custody.CommitRefused) as caught:
         run(rig, journal=facade)
     assert caught.value.code == "journal_failed"
+    assert caught.value.next_action == {
+        "actor": "custodian",
+        "command": "restore journal access and reconcile by observation; never repeat an existing intent's effect",
+    }
     assert not results(rig)
     monkeypatch.setattr(custody, "team_gitops", team_gitops)
     assert run(rig).status == "committed_recovered"
@@ -793,8 +854,27 @@ def test_matching_bound_inputs_preserve_genuine_store_failure(rig):
         run(other)
     assert caught.value.code == "store_closed"
     assert str(caught.value) == custody.REFUSALS["store_closed"]
+    assert caught.value.next_action == {
+        "actor": "custodian",
+        "command": "open an active private Git store and reconcile any existing intent by observation; never repeat its effect",
+    }
     assert state(rig) == before and len(results(rig)) == 1
     assert run(rig).status == "committed_recovered"
+
+
+def test_invalid_commit_identity_advice_allows_corrected_retry(rig):
+    before = state(rig)
+    for _ in range(2):
+        with pytest.raises(custody.CommitRefused) as caught:
+            run(rig, identity=team_git.CommitIdentity("bad\nvalue", IDENTITY.email, IDENTITY.date))
+        assert caught.value.code == "invalid_identity"
+        assert str(caught.value) == custody.REFUSALS["invalid_identity"]
+        assert caught.value.next_action == {
+            "actor": "custodian",
+            "command": "provide a valid commit identity and reconcile any existing intent by observation; never repeat its effect",
+        }
+        assert state(rig) == before and not results(rig)
+    assert run(rig).status == "committed"
 
 
 @pytest.mark.parametrize("branch_state", ["unchanged", "switched", "detached", "reader-failed"])

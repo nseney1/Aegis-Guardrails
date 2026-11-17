@@ -349,7 +349,10 @@ def lint_workspace(root, paths=(), *, command_slots=None):
             root, paths, _LintError, confined_file=confined_file, inventory_rules=inventory_rules,
             load_rules=load_rules, max_entries=MAX_ENTRIES, max_rules=MAX_RULES,
             max_rule_bytes=MAX_RULE_BYTES, max_rule_total=MAX_RULE_TOTAL)
-        simulations = (getattr(scan_service, "simulate_rule_selection", None) or (lambda *_: {}))(root, *captured)
+        if any(entry.size > MAX_RULE_BYTES for entry in captured[0].entries):
+            simulations = {rule.id: "not evaluated: scan inputs over limit" for rule in records}
+        else:
+            simulations = (getattr(scan_service, "simulate_rule_selection", None) or (lambda *_: {}))(root, *captured)
         duplicates = {name for name, count in identities.items() if count > 1}
         selected = sorted((rule for rule in records if rule.path in snapshot), key=lambda rule: rule.path)
         gates = [rule for rule in selected if rule.path not in oversized and _accepted(rule, rule.path)

@@ -1,25 +1,87 @@
 """Canonical, race-detecting byte snapshot of the rule files (aegis_core.rules projects it)."""
 from __future__ import annotations
 
+import codecs
+from dataclasses import dataclass, field
 import hashlib
 import os
 from pathlib import Path
 import stat
-from aegis_core.workspace.layout import WorkspaceLayout
+from typing import Collection, Dict, Iterable, List, Optional, Tuple
+
 from aegis_core.storage import file_generation
-from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple
+from aegis_core.workspace.layout import WorkspaceLayout
+
+# A 64 KiB lifecycle body plus room for frontmatter.
+MAX_RULE_BYTES = 128 * 1024
+
+
+def descriptor_supported() -> bool:
+    """Load the descriptor backend only when inventory actually opens a rule."""
+    from aegis_core.storage_confined import descriptor_supported as supported
+
+    return supported()
 
 
 @dataclass(frozen=True)
 class RuleInventoryEntry:
-    """One immutable rule snapshot captured during inventory."""
+    """A bounded snapshot. Oversized entries have empty content and a prefix.
+
+    Their digest hashes a separate domain, actual size and bounded prefix, never
+    the whole file. Stat identity is race evidence, not fingerprint input.
+    """
 
     relative_path: str
     absolute_path: str
     content: bytes
     digest: str
     size: int
+    prefix: bytes = field(default=b"", repr=False)
+    stat_identity: Optional[Tuple[int, ...]] = field(default=None, compare=False)
+
+
+def captured_entry(relative_path: str, absolute_path: str, data: bytes, *,
+                   size: Optional[int] = None, stat_identity: Optional[Tuple[int, ...]] = None) -> RuleInventoryEntry:
+    """Normalize bounded working bytes and historical blobs identically.
+
+    Historical blob materialization belongs to the Git reader; this function
+    retains only the prefix when the supplied bytes exceed the rule limit.
+    """
+    size = len(data) if size is None else size
+    if size > MAX_RULE_BYTES:
+        prefix = data[:MAX_RULE_BYTES + 1]
+        digest = hashlib.sha256(b"aegis-rule-oversized-v1\0" + str(size).encode("ascii") + b"\0" + prefix).hexdigest()
+        return RuleInventoryEntry(relative_path, absolute_path, b"", digest, size, prefix, stat_identity)
+    return RuleInventoryEntry(relative_path, absolute_path, data, hashlib.sha256(data).hexdigest(), size,
+                              stat_identity=stat_identity)
+
+
+def classification_prefix(data: bytes, max_rule_bytes: int = MAX_RULE_BYTES) -> Optional[bytes]:
+    """Complete bounded metadata, or empty headerless text, from captured UTF-8.
+
+    An incomplete final codepoint is expected at the capture boundary. Invalid
+    captured bytes still fail classification; bytes beyond capture are irrelevant.
+    """
+    from aegis_core.yaml_engine.frontmatter import split_frontmatter
+
+    data = data[:max_rule_bytes + 1]
+    decoder = codecs.getincrementaldecoder("utf-8-sig")()
+    try:
+        text = decoder.decode(data[:max_rule_bytes], final=False)
+        end = min(len(data), max_rule_bytes) - len(decoder.getstate()[0])
+        status, _, body = split_frontmatter(text)
+        if status == "unterminated":
+            return None
+        if status == "ok":
+            if not body.startswith("\n") and end < len(data):
+                return None
+            end -= len(body.encode("utf-8")) - int(body.startswith("\n"))
+        else:
+            end = 0
+        decoder.decode(data[max_rule_bytes:], final=False)
+    except UnicodeError:
+        return None
+    return data[:end]
 
 
 @dataclass(frozen=True)
@@ -83,7 +145,8 @@ def _require_directory(path: str, info: os.stat_result) -> None:
         raise RuleInventoryError("validate", path, "expected a directory")
 
 
-def _read_stable_file(path: str, before: os.stat_result) -> bytes:
+def _read_stable_file(path: str, before: os.stat_result,
+                      identities: Dict[str, Tuple[int, int, int]], root: str, listed: Collection[str]) -> bytes:
     if stat.S_ISLNK(before.st_mode):
         raise RuleInventoryError("validate", path, "symlinked .md rule is not allowed")
     if not stat.S_ISREG(before.st_mode):
@@ -95,12 +158,40 @@ def _read_stable_file(path: str, before: os.stat_result) -> bytes:
     flags |= getattr(os, "O_BINARY", 0)
     flags |= getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    # The owner-selected root is trusted. Only descendants belong to the hostile
+    # rule tree; opening ancestors separately would reject trusted aliases and
+    # require read permission on otherwise traversable, execute-only parents.
+    parts = (root, *Path(os.path.relpath(path, root)).parts) if descriptor_supported() else (path,)
+    # Traversal-only parents need search permission. Without O_PATH (including
+    # macOS), these parents still require read permission; listed directories
+    # always need it, so retain O_RDONLY there.
+    directory_flags = (getattr(os, "O_DIRECTORY", 0)
+                       | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+    fd, parent, spelling = None, None, ""
     try:
-        fd = os.open(path, flags)
-    except OSError as exc:
-        raise RuleInventoryError("open", path, str(exc), exc) from exc
-
-    try:
+        try:
+            for index, part in enumerate(parts):
+                leaf = index == len(parts) - 1
+                spelling = os.path.join(spelling, part)
+                mode = os.O_RDONLY if spelling in listed else getattr(os, "O_PATH", os.O_RDONLY)
+                open_flags = flags if leaf else directory_flags | mode
+                opened_fd = os.open(part, open_flags, dir_fd=parent)
+                if leaf:
+                    fd = opened_fd
+                    break
+                previous, parent = parent, opened_fd
+                if previous is not None:
+                    os.close(previous)
+                if spelling in identities:
+                    try:
+                        info = os.fstat(parent)
+                    except OSError as exc:
+                        raise RuleInventoryError("stat", path, "directory stat failed", exc) from exc
+                    if _identity_signature(info) != identities[spelling]:
+                        raise RuleInventoryError("read", path, "ancestor changed before file open")
+        except OSError as exc:
+            raise RuleInventoryError("open", path, str(exc), exc) from exc
         try:
             opened = os.fstat(fd)
         except OSError as exc:
@@ -109,14 +200,16 @@ def _read_stable_file(path: str, before: os.stat_result) -> bytes:
             raise RuleInventoryError("read", path, "file changed before it was opened")
 
         chunks = []  # type: List[bytes]
-        while True:
+        remaining = MAX_RULE_BYTES + 1
+        while remaining:
             try:
-                chunk = os.read(fd, 65536)
+                chunk = os.read(fd, min(65536, remaining))
             except OSError as exc:
                 raise RuleInventoryError("read", path, str(exc), exc) from exc
             if not chunk:
                 break
             chunks.append(chunk)
+            remaining -= len(chunk)
 
         try:
             after_read = os.fstat(fd)
@@ -126,14 +219,24 @@ def _read_stable_file(path: str, before: os.stat_result) -> bytes:
             raise RuleInventoryError("read", path, "file changed while it was read")
     finally:
         try:
-            os.close(fd)
+            if fd is not None:
+                os.close(fd)
         except OSError:
             pass
+        finally:
+            if parent is not None:
+                try:
+                    os.close(parent)
+                except OSError as exc:
+                    raise RuleInventoryError("read", path, "directory close failed", exc) from exc
 
     after_path = _stat_path(path)
     if _stat_signature(after_path) != _stat_signature(before):
         raise RuleInventoryError("read", path, "file changed during inventory")
-    return b"".join(chunks)
+    data = b"".join(chunks)
+    if len(data) != min(before.st_size, MAX_RULE_BYTES + 1):
+        raise RuleInventoryError("read", path, "file size disagrees with captured bytes")
+    return data
 
 
 def fingerprint(entries: Iterable[RuleInventoryEntry]) -> str:
@@ -152,11 +255,14 @@ def _empty_inventory() -> RuleInventory:
 def inventory_rules(workspace: str) -> RuleInventory:
     """Capture every ``.md`` below ``.aegis/rules`` without following links.
 
-    The returned content bytes are the same bytes used to calculate each entry
-    digest and the aggregate fingerprint. Directory and file metadata are
-    checked before and after capture so concurrent changes fail closed.
+    Ordinary content and fingerprints retain their byte-for-byte definition.
+    Oversized files retain only a bounded prefix and actual size; their digest
+    is domain-separated from full-file digests. Each read is capped before
+    allocation. Metadata before/after capture detects concurrent changes.
     """
-    workspace_abs = os.path.abspath(os.fspath(workspace))
+    from aegis_core.primitives import real_path
+
+    workspace_abs = real_path(os.path.abspath(os.fspath(workspace)))
     layout = WorkspaceLayout(Path(workspace_abs))
     parent_dir = str(layout.aegis_dir)
     rules_root = str(layout.rules_dir)
@@ -213,17 +319,17 @@ def inventory_rules(workspace: str) -> RuleInventory:
                 rule_paths.append(os.path.join(dirpath, filename))
 
     entries = []  # type: List[RuleInventoryEntry]
+    directory_identities = {**ancestor_identities, **{path: info[:3] for path, info in directory_signatures.items()}}
     for path in sorted(rule_paths):
         before = _stat_path(path)
-        content = _read_stable_file(path, before)
-        digest = hashlib.sha256(content).hexdigest()
+        content = _read_stable_file(path, before, directory_identities, workspace_abs, directory_signatures)
         relative = os.path.relpath(path, workspace_abs).replace(os.sep, "/")
-        entries.append(RuleInventoryEntry(
+        entries.append(captured_entry(
             relative_path=relative,
             absolute_path=os.path.abspath(path),
-            content=content,
-            digest=digest,
-            size=len(content),
+            data=content,
+            size=before.st_size,
+            stat_identity=_stat_signature(before),
         ))
 
     for path, expected in ancestor_identities.items():
@@ -239,9 +345,12 @@ def inventory_rules(workspace: str) -> RuleInventory:
 
 
 __all__ = [
+    "MAX_RULE_BYTES",
     "RuleInventory",
     "RuleInventoryEntry",
     "RuleInventoryError",
+    "captured_entry",
+    "classification_prefix",
     "fingerprint",
     "inventory_rules",
 ]

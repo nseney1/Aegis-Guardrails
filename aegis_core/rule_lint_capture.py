@@ -8,17 +8,15 @@ confined_file, including when that reader fails closed.
 from __future__ import annotations
 
 from collections import Counter
-import codecs
 from dataclasses import replace
 import hashlib
 from pathlib import Path
 
 from aegis_core.ast.detect import NATIVE_SOURCE_EXTENSIONS
-from aegis_core.rule_inventory import RuleInventory
+from aegis_core.rule_inventory import RuleInventory, classification_prefix
 from aegis_core.rules import rule_path_id
 from aegis_core.storage import ConfinedFileError
 from aegis_core.workspace.layout import RULES_RELDIR, WorkspaceLayout
-from aegis_core.yaml_engine.frontmatter import split_frontmatter
 
 __all__ = [
     "RULE_PREFIX",
@@ -88,29 +86,6 @@ def _rule_excluded(path):
     return not path.startswith(RULE_PREFIX) or any(part.startswith(".") for part in parts[:-1])
 
 
-def _classification_prefix(data, max_rule_bytes):
-    """Complete bounded metadata or empty headerless text, with whole-file UTF-8."""
-    decoder = codecs.getincrementaldecoder("utf-8-sig")()
-    try:
-        text = decoder.decode(data[:max_rule_bytes], final=False)
-        end = min(len(data), max_rule_bytes) - len(decoder.getstate()[0])
-        status, _, body = split_frontmatter(text)
-        if status == "unterminated":
-            return None
-        if status == "ok":
-            if not body.startswith("\n") and end < len(data):
-                return None
-            end -= len(body.encode("utf-8")) - int(body.startswith("\n"))
-        else:
-            end = 0
-        for offset in range(max_rule_bytes, len(data), max_rule_bytes):
-            decoder.decode(data[offset:offset + max_rule_bytes], final=False)
-        decoder.decode(b"", final=True)
-    except UnicodeError:
-        return None
-    return data[:end]
-
-
 def capture_rules(root, paths, refuse, *, confined_file, inventory_rules, load_rules,
                    max_entries, max_rules, max_rule_bytes, max_rule_total):
     layout = WorkspaceLayout(root)
@@ -154,15 +129,15 @@ def capture_rules(root, paths, refuse, *, confined_file, inventory_rules, load_r
     found, total, bounded_entries, prefix_paths = {}, 0, [], set()
     prefixes = ["/".join(parts) for parts in selections]
     for entry in entries:
-        data, path = entry.content, entry.relative_path
+        data, path = entry.prefix or entry.content, entry.relative_path
         if path in candidates and data != candidates[path]:
             raise refuse("changed")
-        if path in oversized and len(data) <= max_rule_bytes:
+        if path in oversized and entry.size <= max_rule_bytes:
             raise refuse("changed")
         bounded = entry
-        if len(data) > max_rule_bytes:
+        if entry.size > max_rule_bytes:
             oversized.add(path)
-            prefix = _classification_prefix(data, max_rule_bytes)
+            prefix = classification_prefix(data, max_rule_bytes)
             bounded = None if prefix is None else replace(entry, content=prefix, size=len(prefix),
                                                          digest=hashlib.sha256(prefix).hexdigest())
             if bounded is not None:
