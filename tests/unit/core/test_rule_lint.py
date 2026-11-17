@@ -2263,9 +2263,9 @@ def scan_simulation_row(result):
 
 @pytest.mark.parametrize("scenario,expected", [
     ("selected", "scan simulation: selected in all profiles"),
-    ("tokens", "scan simulation: not selected in one or more profiles"),
-    ("mandatory", "scan simulation: not selected in one or more profiles"),
-    ("fitness", "scan simulation: not selected in one or more profiles"),
+    ("tokens", "scan simulation: not selected in profiles: antigravity, claude-code, codex-cli, gemini-cli, generic"),
+    ("mandatory", "scan simulation: not selected in profiles: antigravity, claude-code, codex-cli, gemini-cli, generic"),
+    ("fitness", "scan simulation: not selected in profiles: antigravity, claude-code, codex-cli, gemini-cli, generic"),
 ])
 def test_lint_scan_simulation_matches_real_scan_and_cli(tmp_path, monkeypatch, capsys, scenario, expected):
     import argparse
@@ -2606,7 +2606,7 @@ def test_argon_0935_reviewed_bytes_checked_before_matching(tmp_path, reviewed_ta
     assert ("sample" in actual.exposure_rule_ids()) is (reviewed_target == "src/**")
     expected = ("not evaluated: candidate differs from scan snapshot" if amended else
                 "scan simulation: selected in all profiles" if reviewed_target == "src/**" else
-                "scan simulation: not selected in one or more profiles")
+                "scan simulation: not selected in profiles: antigravity, claude-code, codex-cli, gemini-cli, generic")
     for _ in range(2):
         assert scan_simulation_row(lint.lint_workspace(root, [path])[0]) == expected
     with ThreadPoolExecutor(max_workers=3) as pool:
@@ -2615,7 +2615,7 @@ def test_argon_0935_reviewed_bytes_checked_before_matching(tmp_path, reviewed_ta
     (root / path).write_bytes(reviewed)
     recovered = lint.lint_workspace(root, [path])[0]
     assert scan_simulation_row(recovered) == ("scan simulation: selected in all profiles" if reviewed_target == "src/**"
-                                             else "scan simulation: not selected in one or more profiles")
+                                             else "scan simulation: not selected in profiles: antigravity, claude-code, codex-cli, gemini-cli, generic")
 
 
 @pytest.mark.parametrize("code", ["git_timeout", "git_failed", "privacy_refused"])
