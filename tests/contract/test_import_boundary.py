@@ -65,6 +65,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.gitsafe": 0,
     "aegis_core.gitsafe_policy": 0,
     "aegis_core.gitsafe_run": 0,
+    "aegis_core.team_board": 1,
     "aegis_core.team_claims": 2,
     "aegis_core.team_custody": 1,
     "aegis_core.team_custody_checks": 1,
