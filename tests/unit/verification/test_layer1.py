@@ -6,8 +6,11 @@ synthetic pre-fix scenarios.
 """
 import sys
 import textwrap
+import json
 
 import pytest
+from tests import helpers_humangate as hg
+from tests.conftest import run as run_process
 
 # tests/test_verification/ → tests/ → REPO_ROOT
 REPO_ROOT = str(next(p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").exists()))
@@ -543,6 +546,75 @@ class TestLayer1FailsClosed:
         results = runner.run_layer1(changed_files=["mod.py"], repo_root=str(tmp_path), fast_mode=True)
         assert [r for r in results if r.tool.startswith("forbid_ast")] == []
         assert runner.gate_verdict(results) is True
+
+
+def _layer1_with_home(root, home, reviewed=True):
+    program = (
+        "import json, sys\nfrom dataclasses import asdict\n"
+        "from aegis_core.verification.runner import run_layer1\n"
+        "rows = run_layer1(['app.py'], sys.argv[1], fast_mode=True, reviewed=sys.argv[2] == '1')\n"
+        "print(json.dumps([asdict(row) for row in rows]))\n"
+    )
+    completed = run_process([sys.executable, "-c", program, str(root), "1" if reviewed else "0"],
+                            cwd=REPO_ROOT, env=home.env, timeout=30)
+    assert completed.returncode == 0, completed.stderr
+    return [ToolEvidence(**row) for row in json.loads(completed.stdout)]
+
+
+@pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+@pytest.mark.parametrize("change", ["unchanged", "replaced", "deleted", "working", "working_malformed"])
+def test_oversized_reviewed_gate_remains_a_broken_layer1_rule(tmp_path, change):
+    from aegis_core.rule_inventory import MAX_RULE_BYTES
+
+    home = hg.Home(tmp_path / "home")
+    repo = hg.Repo(tmp_path / "project", home)
+    path = ".aegis/rules/gates/no-eval.md"
+    header = ("---\nid: no-eval\ntype: gate\nenforcement: gate\ntarget_paths: [app.py]\n"
+              "forbid_ast:\n  calls: [eval]\n---\n# No eval\n")
+    oversized = header + "x" * MAX_RULE_BYTES
+    base = header.replace("calls: [eval]", "calls: eval") if change == "working_malformed" else header
+    repo.write(path, base if change.startswith("working") else oversized)
+    repo.write("app.py", "def main(source):\n    return eval(source)\n")
+    repo.commit("review the gate")
+    repo.git("update-ref", "refs/remotes/origin/main", "HEAD")
+    repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    repo.branch("work")
+    if change == "replaced":
+        repo.write(path, header.replace("[eval]", "[exec]"))
+    elif change == "deleted":
+        (repo.root / path).unlink()
+    elif change.startswith("working"):
+        repo.write(path, oversized)
+
+    for _ in range(2):
+        results = _layer1_with_home(repo.root, home)
+        broken = [row for row in results if row.tool == "forbid_ast"]
+        assert [(row.target, row.verdict) for row in broken] == [(path, False)]
+        assert "too_large" in broken[0].detail
+        assert runner.gate_verdict(results) is False
+    repo.write(path, header)
+    repo.write("app.py", "def main():\n    return 1\n")
+    repaired = _layer1_with_home(repo.root, home, reviewed=False)
+    assert not [row for row in repaired if row.tool == "forbid_ast"]
+    assert runner.gate_verdict(repaired) is True
+
+
+@pytest.mark.parametrize("reviewed", [False, True], ids=["snapshot", "working"])
+def test_oversized_working_rule_is_not_dropped_when_raw_has_no_gate_key(tmp_path, reviewed):
+    from aegis_core.rule_inventory import MAX_RULE_BYTES
+
+    path = ".aegis/rules/invariants/large.md"
+    target = tmp_path / path
+    target.parent.mkdir(parents=True)
+    target.write_text("---\nid: large\ntype: invariant\nenforcement: gate\n---\n" + "x" * MAX_RULE_BYTES,
+                      encoding="utf-8")
+    (tmp_path / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
+    for _ in range(2):
+        results = runner.run_layer1(["app.py"], str(tmp_path), fast_mode=True, reviewed=reviewed)
+        broken = [row for row in results if row.tool == "forbid_ast"]
+        assert [(row.target, row.verdict) for row in broken] == [(path, False)]
+        assert "too_large" in broken[0].detail
+        assert runner.gate_verdict(results) is False
 
 
 _NO_EVAL = "---\nid: no-eval\ntype: invariant\nenforcement: gate\nforbid_ast:\n  calls: [eval]\n---\n"

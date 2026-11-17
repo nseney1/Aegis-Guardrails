@@ -19,11 +19,30 @@ RAW |= {"os." + n for n in (
     "spawnl", "spawnle", "spawnlp", "spawnlpe", "spawnv", "spawnve", "spawnvp", "spawnvpe",
     "execl", "execle", "execlp", "execlpe", "execv", "execve", "execvp", "execvpe",
     "posix_spawn", "posix_spawnp")}
+SPAWN_MODULES = frozenset(api.partition(".")[0] for api in RAW)
 POPEN_POSITIONAL_APIS = {"subprocess." + name for name in ("Popen", "run", "call", "check_call", "check_output")}
 
 # Coordinator ruling 2026-11-15T04:52:12Z: this reviewed source inventory is
 # the completeness gate. Resolver precision does not grant admission to a site.
 SELECTOR_SITE_TABLE = (
+    ("aegis_core/ast/runner.py", "_run_driver", "reviewed-dynamic",
+     "Review AST driver argv from the validated driver plan; no shell, no stdin, bounded timeout."),
+    ("aegis_cli/doctor.py", "_run_host_cli", "reviewed-dynamic",
+     "Review doctor's single host-CLI probe argv and _child_env; no shell, no stdin, bounded timeout."),
+    ("aegis_cli/hooks/registrar.py", "_probe", "reviewed-dynamic",
+     "Review host hook probe argv in an empty temporary directory; no shell, no stdin, bounded timeout."),
+    ("aegis_cli/install_hosts.py", "_run_cli", "reviewed-dynamic",
+     "Review host CLI registration argv in a neutral temporary cwd; no shell, no stdin, bounded timeout."),
+    ("aegis_cli/hooks/__init__.py", "__getattr__", "escape",
+     "Review the lazy hook facade's allowlisted projections from management, secret-masking, runtime and safety modules."),
+    ("aegis_cli/team_queue.py", "run_queue", "escape",
+     "Review dynamic dispatch of the declared release/done verbs through the repository team_queue module."),
+    ("aegis_core/storage.py", "__getattr__", "escape",
+     "Review the lazy storage facade's three allowlisted projections through the storage_confined module."),
+    ("aegis_cli/msg.py", "_write_output", "escape",
+     "Review clearing the imported sys.stdout after a failed write so interpreter shutdown cannot retry the failed stream."),
+    ("aegis_core/ast/batch.py", "BatchDriver.__init__", "escape",
+     "The optional stored-process Popen annotation is type metadata, not a callable forwarding path."),
     ("aegis_cli/doctor.py", "_launcher_problem", "lexer-or-message",
      "Compare the registered isolated Python launcher shape; no launch is performed here."),
     ("aegis_cli/hooks/commitmsg.py", "generate_script", "shell-script",
@@ -34,8 +53,8 @@ SELECTOR_SITE_TABLE = (
      "Construct isolated Python insight-hook launchers from the constant INSIGHT_RUNNER."),
     ("aegis_cli/install_hosts.py", "mcp_command", "resolved-python-program",
      "Construct the isolated MCP launcher from the constant MCP_RUNNER."),
-    ("aegis_core/benchmark.py", "measure_hook", "resolved-python-program",
-     "Benchmark the constant isolated HOOK_RUNNER through the injected reviewed runner."),
+    ("aegis_core/benchmark.py", "measure_hook", "escape",
+     "Review the subprocess.run default forwarded to the constant isolated HOOK_RUNNER launcher."),
     ("aegis_core/command_safety/analyzer.py", "evaluate_git", "lexer-or-message",
      "Recognize and refuse Git configuration override flags in analyzed commands."),
     ("aegis_core/command_safety/guard.py", "_git_aliases", "lexer-or-message",
@@ -60,8 +79,10 @@ SELECTOR_SITE_TABLE = (
      "Construct Git configuration pairs that neutralize repository filter drivers."),
     ("aegis_core/gitsafe.py", "merge_tree_conflicted", "git-config",
      "Disable merge renormalization alongside the existing Git filter hardening."),
-    ("aegis_core/gitsafe.py", "run", "reviewed-dynamic",
-     "Delegate the Git transport with its executable resolver and existing subprocess runner reference."),
+    ("aegis_core/gitsafe.py", "run", "escape",
+     "Review subprocess.run and its legacy subprocess namespace passed to Git transport with executable resolution and hardening."),
+    ("aegis_core/gitsafe_run.py", "execute", "escape",
+     "Review the legacy subprocess namespace used for DEVNULL and TimeoutExpired; launches use the separately supplied runner."),
     ("aegis_core/gitsafe_run.py", "<module>", "git-config",
      "Declare the fixed native Git hardening and lane configuration option tuples."),
     ("aegis_core/gitsafe_run.py", "LaneRunner.validate", "git-config",
@@ -98,6 +119,8 @@ SELECTOR_SITE_TABLE = (
      "Construct native Git filter neutralization pairs from observed driver names."),
     ("aegis_core/treeid.py", "_stable_flags", "git-config",
      "Expand the fixed stable native Git configuration settings into option pairs."),
+    ("aegis_core/treeid.py", "_spawn", "reviewed-dynamic",
+     "Review native Git argv from gitsafe.git_executable and caller flags/arguments when imported command provenance is unresolved."),
     ("aegis_core/verification/coverage_check.py", "_native_coverage", "reviewed-dynamic",
      "The Go coverage option starts with -c but is native tool data, not Python source."),
     ("aegis_core/verification/language_tests.py", "<module>", "reviewed-dynamic",
@@ -184,10 +207,10 @@ SELECTOR_SITE_TABLE = (
      "Module documentation describes the owner-launched Python -m queue MCP command."),
     ("aegis_core/rule_lint.py", "_canonical_head", "lexer-or-message",
      "Report-only rule lint command-example lexer; recognize Python -m, never execute it."),
-    ("aegis_core/ast/batch.py", "BatchDriver._terminate_group", "reviewed-dynamic",
-     "The Popen type annotation shares a scope with positional process-group cleanup calls."),
-    ("aegis_core/benchmark.py", "run_benchmark", "reviewed-dynamic",
-     "Forward the default subprocess runner to benchmark helpers using positional arguments."),
+    ("aegis_core/ast/batch.py", "BatchDriver._terminate_group", "escape",
+     "The Popen parameter annotation is type metadata; review also covers process-group cleanup calls."),
+    ("aegis_core/benchmark.py", "run_benchmark", "escape",
+     "Review the subprocess.run default forwarded positionally only to the reviewed hook benchmark."),
     ("aegis_core/team_supervisor_start.py", "_spawn", "reviewed-dynamic",
      "Launch the configured supervisor process and perform startup identity and timeout checks."),
     ("aegis_core/testexec.py", "kill_group", "reviewed-dynamic",
@@ -228,7 +251,7 @@ SELECTOR_SITE_TABLE = (
      "Forward command options through the Git output callback before decoding text."),
 )
 SELECTOR_KINDS = frozenset({"git-config", "resolved-python-program", "shell-script",
-                            "lexer-or-message", "native-option", "reviewed-dynamic"})
+                            "lexer-or-message", "native-option", "reviewed-dynamic", "escape"})
 BROAD_SELECTOR_PATTERN = re.compile(r"""(?:^|[\s'"=])-[A-Za-z]*[cm][^\s'"]*""")
 SELECTOR_WORD_PATTERN = re.compile(r"\S+")
 
@@ -248,6 +271,17 @@ OPTION_PREFIX_PINS = {
 }
 OPTION_PREFIX_CALLER = ("aegis_core/verification/regression_commands.py", "run_configured_snapshot")
 
+# Coordinator ruling 2026-11-15T20:13:07Z: waive only imported-module
+# stores in these exact UTF-8 program bytes, at these reviewed source owners.
+LITERAL_PROGRAM_EXCEPTIONS = {
+    ("aegis_core/testexec.py", "run_pytest_snapshot",
+     "803eddf9509c06ab8e5e37a94653738489f699425b8a1e3d2cd130f99d452902"):
+        "snapshot bootstrap isolates sys.path from the live checkout",
+    ("aegis_core/verification/regression_commands.py", "run_configured_snapshot",
+     "820cac9a505d774844ddad9f86f0ee041ba49eeb42fd186ca35914b683dca456"):
+        "snapshot bootstrap isolates sys.path from the live checkout",
+}
+
 
 def checked_prefix_function(modules, key, pins):
     rel, function = key
@@ -262,6 +296,7 @@ def checked_prefix_function(modules, key, pins):
 
 
 def test_process_census_matches_reviewed_sites():
+    assert selector_gate_errors(dict(module_trees(REPO)), SELECTOR_SITE_TABLE) == []
     record = json.loads(RECORD.read_text())
     assert census_errors(process_sites(REPO), record) == []
     assert sum(v["count"] for k, v in record.items() if k.startswith("typeerror:")) <= 18
@@ -328,20 +363,37 @@ def import_bindings(node, rel):
 
 
 class _AliasScope:
-    def __init__(self, parent=None, kind="module", *, comprehension=False):
+    def __init__(self, parent=None, kind="module", *, comprehension=False, namespace=""):
         self.parent = parent
         self.kind = kind
         self.comprehension = comprehension
         self.imports = {}
+        self.star_imports = set()
+        self.classes = {}
+        self.namespace = namespace
         self.bound = set()
         self.globals = set()
         self.nonlocals = set()
+        self.writes = set()
+        self.definite = set()
+        self.conditional = set()
+        self.opaque = set()
+        self.opaque_views = {}
+
+    def bind(self, name):
+        self.bound.add(name)
+        self.writes.add(name)
 
     def resolve(self, name):
         # A scope may import different things along different branches. Keep every
         # possible import there; never let another scope's last import overwrite it.
-        if name in self.imports:
-            return self.imports[name]
+        values = self.imports.get(name, set())
+        if name not in self.bound or name in self.imports:
+            values = values | {base + "." + name for base in self.star_imports}
+        if values:
+            if self.kind == "class" and self.parent is not None:
+                values = values | self.parent.resolve(name)
+            return values
         if name in self.globals and self.parent is not None:
             root = self.parent
             while root.parent is not None:
@@ -349,8 +401,15 @@ class _AliasScope:
             return root.resolve(name)
         if name in self.nonlocals and self.parent is not None:
             return self.parent.resolve(name)
+        if name in self.classes:
+            values = {self.classes[name]}
+            if self.kind == "class" and self.parent is not None:
+                values |= self.parent.resolve(name)
+            return values
         if name in self.bound:
-            return set()
+            # Class LOAD_NAME may reach an enclosing import before a class
+            # assignment/definition binds the name. Function locals still hide it.
+            return self.parent.resolve(name) if self.kind == "class" and self.parent is not None else set()
         return self.parent.resolve(name) if self.parent is not None else set()
 
 
@@ -369,19 +428,45 @@ class ScopedNames:
     defaults/decorators are evaluated in the enclosing scope. Assignment aliases
     and dynamic imports are outside this static resolver.
     """
-    def __init__(self, tree, rel, *, runtime_only=False):
+    def __init__(self, tree, rel, *, runtime_only=False, import_graph=None):
         self.rel = rel
         self.at = {}
         self.allowed = None
+        self.import_graph = import_graph
+        self.class_reads = []
+        namespace = rel.removesuffix(".py").replace("/", ".").removesuffix(".__init__")
+        root = _AliasScope(namespace=namespace)
+        self.namespaces = {namespace: [root]}
         if runtime_only:
             from tests.contract.test_import_boundary import import_nodes
             self.allowed = {id(n) for n in import_nodes(tree)}
-        self._index(tree, _AliasScope())
+        self._index(tree, root)
+        for node, scope, definite in self.class_reads:
+            owner = binding_scope(scope, node.id)
+            if owner is not scope:
+                self.at[id(node)] = owner
+            elif node.id in scope.bound and (not definite or node.id in scope.conditional):
+                if node.id not in scope.opaque_views:
+                    if len(scope.opaque_views) >= _MAX_WORDS:
+                        raise ValueError("selector import resolution limit")
+                    view = _AliasScope(scope.parent, "class", namespace=scope.namespace)
+                    view.bound.add(node.id)
+                    view.opaque.add(node.id)
+                    scope.opaque_views[node.id] = view
+                self.at[id(node)] = scope.opaque_views[node.id]
+        # Imports declared global/nonlocal belong to their Python binding scope.
+        # Move them after indexing, when all enclosing bindings are known.
+        for scope in set(self.at.values()):
+            for local, targets in tuple(scope.imports.items()):
+                owner = binding_scope(scope, local)
+                if owner is not scope:
+                    owner.imports.setdefault(local, set()).update(targets)
+                    del scope.imports[local]
 
     def _arguments(self, args, outer, inner):
         for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg):
             if arg is not None:
-                inner.bound.add(arg.arg)
+                inner.bind(arg.arg)
                 self.at[id(arg)] = inner
                 if arg.annotation is not None:
                     self._index(arg.annotation, outer)
@@ -393,21 +478,42 @@ class ScopedNames:
         if self.allowed is not None and id(node) not in self.allowed:
             return
         self.at[id(node)] = scope
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and scope.kind == "class":
+            if len(self.class_reads) >= _MAX_WORDS:
+                raise ValueError("selector import resolution limit")
+            self.class_reads.append((node, scope, node.id in scope.definite))
         if isinstance(node, ast.NamedExpr):
             owner = scope
             while owner.comprehension:
                 owner = owner.parent
-            self._index(node.target, owner)
             self._index(node.value, scope)
+            self._index(node.target, owner)
+            return
+        if scope.kind == "class" and isinstance(node, (ast.Assign, ast.AnnAssign)):
+            if node.value is not None:
+                self._index(node.value, scope)
+            targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
+            for target in targets:
+                bound = isinstance(target, ast.Name) and target.id in scope.bound
+                self._index(target, scope)
+                if isinstance(node, ast.AnnAssign) and node.value is None and isinstance(target, ast.Name) and not bound:
+                    scope.bound.discard(target.id)  # An annotation alone does not bind a class value.
+            if isinstance(node, ast.AnnAssign):
+                self._index(node.annotation, scope)
             return
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
             if not isinstance(node, ast.Lambda):
-                scope.bound.add(node.name)
                 for value in node.decorator_list:
                     self._index(value, scope)
             kind = "class" if isinstance(node, ast.ClassDef) else "function"
-            inner = _AliasScope(_lexical_parent(scope), kind)
+            label = node.name if not isinstance(node, ast.Lambda) else "<lambda>"
+            suffix = ".<locals>" if kind == "function" else ""
+            if len(scope.namespace) + len(label) + len(suffix) + 1 > 1048576:
+                raise ValueError("selector import resolution limit")
+            namespace = scope.namespace + "." + label + suffix
+            inner = _AliasScope(_lexical_parent(scope), kind, namespace=namespace)
             if isinstance(node, ast.ClassDef):
+                self.namespaces.setdefault(namespace, []).append(inner)
                 for value in (*node.bases, *node.keywords):
                     self._index(value, scope)
             else:
@@ -415,10 +521,25 @@ class ScopedNames:
                 if getattr(node, "returns", None) is not None:
                     self._index(node.returns, scope)
             for value in [node.body] if isinstance(node, ast.Lambda) else node.body:
+                if kind == "class":
+                    inner.writes = set()
                 self._index(value, inner)
+                if kind == "class":
+                    if isinstance(value, ast.AnnAssign) and value.value is None:
+                        continue
+                    if isinstance(value, (ast.Assign, ast.AnnAssign, ast.Import, ast.ImportFrom,
+                                          ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        inner.definite.update(inner.writes)
+                    else:
+                        inner.conditional.update(inner.writes)
+                        inner.definite.difference_update(inner.writes)
+            if not isinstance(node, ast.Lambda):
+                scope.bind(node.name)
+                if isinstance(node, ast.ClassDef):
+                    scope.classes[node.name] = namespace
             return
         if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
-            inner = _AliasScope(_lexical_parent(scope), "function", comprehension=True)
+            inner = _AliasScope(_lexical_parent(scope), "function", comprehension=True, namespace=scope.namespace)
             for index, generator in enumerate(node.generators):
                 self._index(generator.iter, scope if index == 0 else inner)
                 self._index(generator.target, inner)
@@ -428,12 +549,22 @@ class ScopedNames:
                 self._index(value, inner)
             return
         for local, target in import_bindings(node, self.rel).items():
-            scope.bound.add(local)
+            scope.bind(local)
             scope.imports.setdefault(local, set()).add(target)
+        if isinstance(node, ast.ImportFrom) and any(alias.name == "*" for alias in node.names):
+            probe = ast.ImportFrom(module=node.module, level=node.level,
+                                   names=[ast.alias(name="__all__", asname=None)])
+            base = import_bindings(probe, self.rel)["__all__"].removesuffix(".__all__")
+            if base.partition(".")[0] in PACKAGES:
+                scope.star_imports.add(base)
         if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
-            scope.bound.add(node.id)
+            scope.bind(node.id)
         elif isinstance(node, ast.ExceptHandler) and node.name:
-            scope.bound.add(node.name)
+            scope.bind(node.name)
+        elif type(node).__name__ in {"MatchAs", "MatchStar", "MatchMapping"}:
+            local = getattr(node, "name", None) or getattr(node, "rest", None)
+            if local:
+                scope.bind(local)
         elif isinstance(node, ast.Global):
             scope.globals.update(node.names)
         elif isinstance(node, ast.Nonlocal):
@@ -444,10 +575,176 @@ class ScopedNames:
     def resolve(self, node):
         if isinstance(node, ast.Name):
             scope = self.at.get(id(node))
-            return scope.resolve(node.id) if scope is not None else set()
-        if isinstance(node, ast.Attribute):
-            return {base + "." + node.attr for base in self.resolve(node.value)}
-        return set()
+            if scope is not None and node.id in scope.opaque and self.import_graph is None:
+                return set()  # Value proofs cannot choose either side of an ambiguous class read.
+            if scope is not None and scope.kind == "class" and not isinstance(node.ctx, ast.Load):
+                # STORE_NAME/DELETE_NAME do not read an enclosing class-body
+                # fallback; retain only imports already indexed in this scope.
+                names = scope.imports.get(node.id, set())
+            else:
+                names = scope.resolve(node.id) if scope is not None else set()
+        elif isinstance(node, ast.Attribute):
+            names = {base + "." + node.attr for base in self.resolve(node.value)}
+        else:
+            names = set()
+        if self.import_graph is None:
+            return names
+        return set().union(*(self.import_graph.resolve(name) for name in names))
+
+
+class ImportGraph:
+    """Follow only import declarations and class namespaces in the parsed tree.
+
+    Import alternatives accumulate. Assignments, callable results and object
+    attributes do not add edges; escape review covers those uses separately.
+    """
+    def __init__(self, modules, *, parent=None):
+        added = {rel: ScopedNames(tree, rel) for rel, tree in modules.items()}
+        self.names = {} if parent is None else dict(parent.names)
+        self.names.update(added)
+        self.namespaces = {} if parent is None else dict(parent.namespaces)
+        self.cache = {}
+        for names in added.values():
+            for namespace, scopes in names.namespaces.items():
+                self.namespaces[namespace] = [*self.namespaces.get(namespace, ()), *scopes]
+            names.import_graph = self
+        for rel, names in added.items():
+            namespace = names.at[id(modules[rel])].namespace
+            if len(namespace) > 1048576 or namespace.count(".") >= 4096:
+                raise ValueError("selector import resolution limit")
+            while "." in namespace:
+                namespace = namespace.rpartition(".")[0]
+                self.namespaces.setdefault(namespace, [])
+        self.module_names = {namespace for namespace, scopes in self.namespaces.items()
+                             if not scopes or any(scope.kind == "module" for scope in scopes)}
+        self.repo_module_names = set(self.module_names)
+        if parent is None:
+            children = {}
+            for namespace in self.repo_module_names:
+                package, _, child = namespace.rpartition(".")
+                children.setdefault(package, set()).add(child)
+            shadowed = set()
+            for rel, names in added.items():
+                if not rel.endswith("/__init__.py"):
+                    continue
+                owner = names.at[id(modules[rel])]
+                candidates = owner.bound & children.get(owner.namespace, set())
+                if not candidates:
+                    continue
+                conflicts = set()
+                for node in ast.walk(modules[rel]):
+                    if names.at.get(id(node)) is not owner:
+                        continue
+                    if isinstance(node, (ast.Import, ast.ImportFrom)):
+                        for alias in node.names:
+                            if alias.name == "*":
+                                continue
+                            local = alias.asname or (alias.name.partition(".")[0] if isinstance(node, ast.Import)
+                                                     else alias.name)
+                            canonical = (isinstance(node, ast.ImportFrom) and node.level == 1
+                                         and node.module is None and alias.asname is None)
+                            if not canonical:
+                                conflicts.add(local)
+                    if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                        conflicts.add(node.id)
+                    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        conflicts.add(node.name)
+                    elif isinstance(node, ast.ExceptHandler) and node.name:
+                        conflicts.add(node.name)
+                shadowed.update(owner.namespace + "." + child for child in candidates & conflicts)
+            self.shadowed_children = frozenset(shadowed)
+        else:
+            self.shadowed_children = parent.shadowed_children
+        if parent is not None:
+            self.module_names.update(parent.module_names)
+        self.module_names.update(target for rel, tree in modules.items() for node in ast.walk(tree)
+                                 if isinstance(node, ast.Import) for target in import_bindings(node, rel).values())
+        # A literal adds namespaces without re-indexing or mutating its package
+        # graph. Its parent scopes keep their original resolution context.
+        self.size = len(self.namespaces) + (1 if parent is None else parent.size) + sum(
+            len(names.namespaces) + sum(sum(map(len, scope.imports.values()))
+                                       + len(scope.classes) + len(scope.star_imports)
+                                       for scopes in names.namespaces.values() for scope in scopes)
+            for names in added.values())
+
+    def is_shadowed(self, qualified):
+        if len(qualified) > 1048576 or qualified.count(".") >= 4096:
+            raise ValueError("selector import resolution limit")
+        return any(qualified == child or qualified.startswith(child + ".") for child in self.shadowed_children)
+
+    def imported(self, node, rel):
+        references = set()
+        for target in import_bindings(node, rel).values():
+            references.update(self.resolve(target))
+        if isinstance(node, ast.ImportFrom) and any(alias.name == "*" for alias in node.names):
+            probe = ast.ImportFrom(module=node.module, level=node.level,
+                                   names=[ast.alias(name="__all__", asname=None)])
+            base = import_bindings(probe, rel)["__all__"].removesuffix(".__all__")
+            remaining, seen = list(self.resolve(base)), set()
+            while remaining:
+                namespace = remaining.pop()
+                if namespace in seen or namespace not in self.namespaces:
+                    continue
+                seen.add(namespace)
+                for scope in self.namespaces[namespace]:
+                    for targets in scope.imports.values():
+                        for target in targets:
+                            references.update(self.resolve(target))
+                    for target in scope.star_imports:
+                        remaining.extend(self.resolve(target) - seen)
+        return references
+
+    def resolve(self, qualified):
+        # Bound text and component counts before splitting or concatenating.
+        if len(qualified) > 1048576 or qualified.count(".") >= 4096:
+            raise ValueError("selector import resolution limit")
+        if qualified in self.cache:
+            return self.cache[qualified]
+        remaining, seen, found = [qualified], {qualified}, set()
+        budget = self.size * (qualified.count(".") + 2)
+        while remaining:
+            name = remaining.pop()
+            if len(name) > 1048576 or name.count(".") >= 4096:
+                raise ValueError("selector import resolution limit")
+            if self.is_shadowed(name):
+                found.add(name)  # Preserve the unresolved path; never follow the physical child or alias.
+                continue
+            if name in RAW:
+                found.add(name)
+                continue
+            if name in self.namespaces:
+                found.add(name)
+            parts = name.split(".")
+            prefix = next((i for i in range(len(parts) - 1, 0, -1)
+                           if ".".join(parts[:i]) in self.namespaces), None)
+            if prefix is None:
+                found.add(name)
+                continue
+            namespace = ".".join(parts[:prefix])
+            targets = set()
+            attribute = parts[prefix]
+            for scope in self.namespaces[namespace]:
+                # Attribute lookup sees exported declarations, not the enclosing
+                # fallback used while evaluating expressions in a class body.
+                targets.update(scope.imports.get(attribute, ()))
+                if attribute in scope.classes:
+                    targets.add(scope.classes[attribute])
+                targets.update(base + "." + attribute for base in scope.star_imports)
+            if not targets:
+                found.add(name)
+                continue
+            suffix = ".".join(parts[prefix + 1:])
+            for target in targets:
+                if len(target) + len(suffix) + bool(suffix) > 1048576:
+                    raise ValueError("selector import resolution limit")
+                following = target + "." + suffix if suffix else target
+                if following not in seen:
+                    if len(seen) >= budget:
+                        raise ValueError("selector import resolution limit")
+                    seen.add(following)
+                    remaining.append(following)
+        self.cache[qualified] = found
+        return found
 
 
 def binding_scope(scope, name):
@@ -461,16 +758,57 @@ def binding_scope(scope, name):
     return scope
 
 
-def mutable_call_inputs(node, names, bindings, namespaces):
+# Canonical builtin type names are identity proofs only after lexical shadowing
+# and export-mutation checks. Keep this closed vocabulary separate from callable
+# transforms; reading the live builtins namespace is itself a ratchet escape.
+_BUILTIN_BASES = frozenset({
+    "bool", "memoryview", "bytearray", "bytes", "classmethod", "complex", "dict", "enumerate", "filter",
+    "float", "frozenset", "property", "int", "list", "map", "object", "range", "reversed", "set", "slice",
+    "staticmethod", "str", "super", "tuple", "type", "zip", "BaseException", "Exception", "GeneratorExit",
+    "KeyboardInterrupt", "SystemExit", "ArithmeticError", "AssertionError", "AttributeError", "BufferError",
+    "EOFError", "ImportError", "LookupError", "MemoryError", "NameError", "OSError", "ReferenceError",
+    "RuntimeError", "StopAsyncIteration", "StopIteration", "SyntaxError", "SystemError", "TypeError",
+    "ValueError", "Warning", "FloatingPointError", "OverflowError", "ZeroDivisionError", "BytesWarning",
+    "DeprecationWarning", "FutureWarning", "ImportWarning", "PendingDeprecationWarning", "ResourceWarning",
+    "RuntimeWarning", "SyntaxWarning", "UnicodeWarning", "UserWarning", "BlockingIOError", "ChildProcessError",
+    "ConnectionError", "FileExistsError", "FileNotFoundError", "InterruptedError", "IsADirectoryError",
+    "NotADirectoryError", "PermissionError", "ProcessLookupError", "TimeoutError", "IndentationError",
+    "IndexError", "KeyError", "ModuleNotFoundError", "NotImplementedError", "RecursionError", "UnboundLocalError",
+    "UnicodeError", "BrokenPipeError", "ConnectionAbortedError", "ConnectionRefusedError", "ConnectionResetError",
+    "TabError", "UnicodeDecodeError", "UnicodeEncodeError", "UnicodeTranslateError", "EnvironmentError", "IOError",
+})
+if sys.version_info >= (3, 10):
+    _BUILTIN_BASES |= {"EncodingWarning"}
+if sys.version_info >= (3, 11):
+    _BUILTIN_BASES |= {"BaseExceptionGroup", "ExceptionGroup"}
+if os.name == "nt":
+    _BUILTIN_BASES |= {"WindowsError"}
+
+
+PURE_BUILTINS = frozenset({
+    "str", "int", "float", "bytes", "repr", "ascii", "len", "hash", "bool",
+    "list", "tuple", "dict", "set", "frozenset", "print", "isinstance", "issubclass",
+    "range", "enumerate", "zip", "reversed", "sorted", "any", "all", "sum", "min", "max",
+    "getattr", "hasattr",
+})
+
+
+def mutable_call_inputs(node, names, bindings, namespaces, *, callees=None, helper_identity=None,
+                        module_identity=None):
     """Unproven helpers may mutate receivers/arguments; OS launch APIs do not."""
+    if callees is not None:
+        resolved = callees.resolve(node.func)
+        if resolved and resolved <= RAW:
+            return ()
+    if helper_identity is not None and helper_identity(node.func, names.rel) is not None:
+        return ()  # The same proven stdlib helpers have no mutable receiver or argument.
+    if isinstance(node.func, ast.Attribute) and node.func.attr in _CONTENT_METHODS | _STRING_METHODS:
+        return ()  # Content readers and string transforms do not replace their input bindings.
     resolved = names.resolve(node.func)
-    if resolved and resolved <= RAW | {"shlex.quote", "pathlib.Path.cwd", "pathlib.Path.home"}:
+    readonly = {"shlex.quote", "pathlib.Path.cwd", "pathlib.Path.home"} if helper_identity is None else set()
+    if resolved and resolved <= RAW | readonly:
         return ()
-    if isinstance(node.func, ast.Name) and node.func.id in {
-            "str", "int", "float", "bytes", "repr", "ascii", "len", "hash", "bool",
-            "list", "tuple", "dict", "set", "frozenset", "print", "isinstance", "issubclass",
-            "range", "enumerate", "zip", "reversed", "sorted", "any", "all", "sum", "min", "max",
-            "getattr", "hasattr"}:
+    if isinstance(node.func, ast.Name) and node.func.id in PURE_BUILTINS:
         scope = names.at[id(node.func)]
         while scope is not None and node.func.id not in scope.bound:
             scope = scope.parent
@@ -478,7 +816,10 @@ def mutable_call_inputs(node, names, bindings, namespaces):
             return ()
     receiver = (node.func.value,) if isinstance(node.func, ast.Attribute) else ()
     if receiver:
-        symbols = names.resolve(receiver[0])
+        if module_identity is None:
+            symbols = names.resolve(receiver[0])
+        else:
+            symbols = module_identity(receiver[0], names.rel) or set()
         if symbols and symbols <= namespaces:
             receiver = ()  # A module function call has no bound mutable receiver.
     if receiver and node.func.attr in {"copy", "count", "index", "get", "keys", "values", "items"}:
@@ -514,10 +855,17 @@ def alias_inputs(node):
         yield from alias_inputs(node.right)
 
 
-def literal_bindings(tree, rel, namespaces=frozenset(), modules=None):
+def literal_bindings(tree, rel, namespaces=frozenset(), modules=None, *, callees=None, helper_identity=None,
+                     module_identity=None, call_inputs=True):
     """Keep alternatives, but never trust an initializer after an unsupported write."""
+    # Value traversal must visit intermediate bindings and invalidations rather
+    # than following an import-only graph straight to the terminal declaration.
     names, bindings = ScopedNames(tree, rel), {}
+    for scope in set(names.at.values()):
+        for name in scope.opaque:
+            bindings[scope, name] = [_UNRESOLVED_IMPORT]
     changed, aliases, exports, export_aliases = set(), [], set(), []
+    declarations, invalidated, parameters, untraced = set(), set(), set(), set()
     parents = {id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
 
     def key(target):
@@ -529,14 +877,19 @@ def literal_bindings(tree, rel, namespaces=frozenset(), modules=None):
 
     def immutable_value(value):
         return (isinstance(value, (ast.Constant, ast.JoinedStr)) or isinstance(value, ast.Call)
-                and captured_module(value, names, rel, modules or {}) is not None)
+                and captured_module(value, names, rel, modules or {}, helper_identity=helper_identity) is not None)
 
     def invalidate(target, *, mutation=False):
         if isinstance(target, ast.Name):
             values = bindings.get(key(target), ())
             if mutation and values and all(immutable_value(value) for value in values):
                 return  # Passing an immutable literal cannot mutate its binding.
+            if mutation and key(target) in parameters and values == [None]:
+                return  # An opaque parameter retains its existing provenance treatment.
             changed.add(key(target))
+            invalidated.add(key(target))
+            if not mutation:
+                untraced.add(key(target))
         elif isinstance(target, ast.Subscript):
             invalidate(target.value, mutation=mutation)
         elif isinstance(target, ast.Attribute):
@@ -552,6 +905,7 @@ def literal_bindings(tree, rel, namespaces=frozenset(), modules=None):
         elif isinstance(target, ast.Starred):
             invalidate(target.value, mutation=mutation)
 
+    parameters.update((names.at[id(node)], node.arg) for node in ast.walk(tree) if isinstance(node, ast.arg))
     for node in ast.walk(tree):
         if isinstance(node, ast.arg):
             bindings.setdefault((names.at[id(node)], node.arg), []).append(None)
@@ -560,18 +914,32 @@ def literal_bindings(tree, rel, namespaces=frozenset(), modules=None):
                 bindings.setdefault(key(node.target), []).append(node)
             else:
                 invalidate(node.target)
+        elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+            if isinstance(node.optional_vars, ast.Name):
+                bindings.setdefault(key(node.optional_vars), []).append(node.context_expr)
+            else:
+                invalidate(node.optional_vars)
         elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-            if not isinstance(parents[id(node)], (ast.Assign, ast.AnnAssign, ast.For, ast.comprehension)):
+            if not isinstance(parents[id(node)], (ast.Assign, ast.AnnAssign, ast.For, ast.AsyncFor,
+                                                  ast.comprehension, ast.withitem)):
                 invalidate(node)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler)):
             if node.name:
-                changed.add((binding_scope(names.at[id(node)], node.name), node.name))
+                declaration = binding_scope(names.at[id(node)], node.name), node.name
+                changed.add(declaration)
+                if isinstance(node, ast.ExceptHandler):
+                    invalidated.add(declaration)
+                    untraced.add(declaration)
+                else:
+                    declarations.add(declaration)
         elif type(node).__name__ in {"MatchAs", "MatchStar", "MatchMapping"}:
             name = getattr(node, "name", None) or getattr(node, "rest", None)
             if name:
                 scope = names.at[id(node)]
                 scope.bound.add(name)
                 changed.add((binding_scope(scope, name), name))
+                invalidated.add((binding_scope(scope, name), name))
+                untraced.add((binding_scope(scope, name), name))
         targets = node.targets if isinstance(node, ast.Assign) else (
             [node.target] if isinstance(node, ast.AnnAssign) else [])
         shared = [key(target) for target in targets if isinstance(target, ast.Name)]
@@ -591,31 +959,53 @@ def literal_bindings(tree, rel, namespaces=frozenset(), modules=None):
                     aliases.append((key(target), (binding_scope(source, dependency.id), dependency.id)))
             else:
                 invalidate(target)
+                if isinstance(target, ast.Name) and node.value is None:
+                    invalidated.add(key(target))
+                if isinstance(target, (ast.Tuple, ast.List)):
+                    for item in ast.walk(target):
+                        if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Store):
+                            # Keep the source for provenance without resolving unpacked values.
+                            bindings.setdefault(key(item), []).append(node)
         if isinstance(node, (ast.AugAssign, ast.NamedExpr)):
-            changed.add(key(node.target)) if isinstance(node.target, ast.Name) else invalidate(node.target)
+            invalidate(node.target)
         elif isinstance(node, ast.Delete):
             for target in node.targets:
                 invalidate(target)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            for target in mutable_call_inputs(node, names, bindings, namespaces):
-                invalidate(target, mutation=True)
+    if call_inputs:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                for target in mutable_call_inputs(node, names, bindings, namespaces, callees=callees,
+                                                   helper_identity=helper_identity, module_identity=module_identity):
+                    invalidate(target, mutation=True)
     immutable = {key for key, values in bindings.items() if values and all(immutable_value(value) for value in values)}
     aliases = [(left, right) for left, right in aliases if left not in immutable and right not in immutable]
     while True:
         expanded = changed | {other for a, b in aliases if a in changed or b in changed for other in (a, b)}
-        if expanded == changed:
+        unknown = untraced | {other for a, b in aliases if a in untraced or b in untraced for other in (a, b)}
+        if expanded == changed and unknown == untraced:
             break
-        changed = expanded
+        changed, untraced = expanded, unknown
     for scope, name in changed:
-        bindings.setdefault((scope, name), []).append(None)
+        values = bindings.get((scope, name), ())
+        # Opaque call-side mutations keep the earlier source traversal (D-aw).
+        # Unsupported writes or absent initializers need an explicit unknown source.
+        traced = (scope, name) not in untraced and (
+            (scope, name) in declarations and (scope, name) not in invalidated
+            or any(isinstance(value, ast.AST) for value in values))
+        marker = None if traced else _UNRESOLVED_IMPORT
+        bindings.setdefault((scope, name), []).append(marker)
         exports.update(scope.imports.get(name, ()))
+        if (scope.kind == "module" and ((scope, name) not in declarations or (scope, name) in invalidated
+                                       or any(value is not None for value in bindings[(scope, name)]))):
+            exports.add(scope.namespace + "." + name)
     exports.update(name for key, name in export_aliases if key in changed)
     return names, bindings, exports
 
 
-def captured_module(node, names, rel, modules):
+def captured_module(node, names, rel, modules, *, helper_identity=None):
     """Prove an import-time UTF-8 read of a co-located, censused module."""
+    if not isinstance(node, ast.Call):
+        return None
     scope = names.at[id(node)]
     if scope.kind != "module" or "__file__" in scope.bound:
         return None
@@ -633,9 +1023,12 @@ def captured_module(node, names, rel, modules):
     if (not isinstance(filename, ast.Constant) or not isinstance(filename.value, str)
             or not filename.value.endswith(".py") or not filename.value[:-3].isidentifier()):
         return None
-    if (not isinstance(path, ast.Call) or names.resolve(path.func) != {"pathlib.Path"}
-            or len(path.args) != 1 or path.keywords or not isinstance(path.args[0], ast.Name)
+    if (not isinstance(path, ast.Call) or len(path.args) != 1 or path.keywords or not isinstance(path.args[0], ast.Name)
             or path.args[0].id != "__file__"):
+        return None
+    identity = helper_identity(path.func, rel) if helper_identity is not None else (
+        "pathlib.Path" if names.resolve(path.func) == {"pathlib.Path"} else None)
+    if identity != "pathlib.Path":
         return None
     target = str(Path(rel).with_name(filename.value)).replace("\\", "/")
     return ("captured-module", target) if target in modules else None
@@ -645,9 +1038,33 @@ _Argv = namedtuple("_Argv", "kind items")
 _Shell = namedtuple("_Shell", "text holes hidden")
 _Quoted = namedtuple("_Quoted", "value")
 _Launch = namedtuple("_Launch", "executable argv shell")
+_LaunchResolution = namedtuple("_LaunchResolution", "programs reason module")
+_SpawnVerdict = namedtuple("_SpawnVerdict", "rel node scope verdict reason programs module")
+_ARGV_ORIGINS = object()
+
+
+class _CommandEvidence(namedtuple("_CommandEvidence", "unresolved interpreter selector content module",
+                                  defaults=(False,))):
+    __slots__ = ()
+
+    @property
+    def requires_review(self):
+        return self.unresolved and (self.interpreter or self.selector or self.content)
+
+
 _SPLICE, _PYTHON, _OPTION_PREFIX, _USE_HEAD = object(), object(), object(), object()
+_UNRESOLVED_IMPORT = object()
+_UNRESOLVED_MODULE = object()
+_CONTENT_METHODS = frozenset({"read_text", "read_bytes", "open", "read", "readline", "readlines"})
+_STRING_METHODS = frozenset({"capitalize", "casefold", "center", "count", "encode", "endswith", "expandtabs",
+    "find", "format", "format_map", "index", "isalnum", "isalpha", "isascii", "isdecimal", "isdigit",
+    "isidentifier", "islower", "isnumeric", "isprintable", "isspace", "istitle", "isupper", "join",
+    "ljust", "lower", "lstrip", "maketrans", "partition", "removeprefix", "removesuffix", "replace",
+    "rfind", "rindex", "rjust", "rpartition", "rsplit", "rstrip", "split", "splitlines", "startswith",
+    "strip", "swapcase", "title", "translate", "upper", "zfill"})
 _MAX_CHOICES, _MAX_WORDS, _MAX_TEXT = 64, 4096, 1048576
 _MAX_DEPTH = 64
+_FORMAT_FIELD = re.compile(r"\{([A-Za-z_][A-Za-z_0-9]*|[0-9]*)(?:!([sra]))?(?::s?)?\}")
 
 
 def append_shell_piece(parts, piece, budget):
@@ -752,6 +1169,99 @@ def selector_module_argv(node):
     return False
 
 
+def selector_import_escape(node, rel, names, imports):
+    """Review noncanonical bindings at their import, before any forwarding."""
+    if not isinstance(node, (ast.Import, ast.ImportFrom)):
+        return False
+    if names.at[id(node)].kind == "class":
+        return True
+    if isinstance(node, ast.ImportFrom) and set(import_bindings(node, rel).values()) & RAW:
+        return True
+    if isinstance(node, ast.Import) and any(alias.name in SPAWN_MODULES and alias.asname is not None
+                                          for alias in node.names):
+        return True
+    if isinstance(node, ast.ImportFrom) and any(alias.name == "*" for alias in node.names):
+        probe = ast.ImportFrom(module=node.module, level=node.level,
+                               names=[ast.alias(name="__all__", asname=None)])
+        base = import_bindings(probe, rel)["__all__"].removesuffix(".__all__")
+        return (base in imports.namespaces and base in imports.module_names
+                or bool(imports.imported(node, rel) & (RAW | SPAWN_MODULES)))
+    return False
+
+
+def selector_module_escape(node, parents, names, imports=None):
+    """Module objects forwarded as values require review at their origin."""
+    if not isinstance(node, (ast.Name, ast.Attribute)) or not isinstance(node.ctx, ast.Load):
+        return False
+    if isinstance(node, ast.Attribute) and imports is not None:
+        for namespace in names.resolve(node.value) & imports.namespaces.keys():
+            if imports.is_shadowed(namespace):
+                continue
+            for scope in imports.namespaces[namespace]:
+                if any(imports.resolve(target) & (RAW | SPAWN_MODULES)
+                       for target in scope.imports.get(node.attr, ())):
+                    return True
+    modules = names.resolve(node) & (SPAWN_MODULES | (imports.repo_module_names if imports is not None else set()))
+    if not modules:
+        return False
+    parent = parents.get(id(node))
+    if isinstance(parent, ast.Attribute) and parent.value is node:
+        return False
+    if (isinstance(parent, ast.Call) and parent.args and parent.args[0] is node
+            and not parent.keywords and isinstance(parent.func, ast.Name)):
+        name = parent.func.id
+        scope = names.at[id(parent.func)]
+        while scope is not None and name not in scope.bound:
+            scope = scope.parent
+        if scope is None:
+            if name == "hasattr" and len(parent.args) == 2:
+                return False
+            if (name == "getattr" and len(parent.args) in (2, 3)
+                    and isinstance(parent.args[1], ast.Constant) and isinstance(parent.args[1].value, str)
+                    and all(module + "." + parent.args[1].value not in RAW for module in modules)):
+                return False
+    return True
+
+
+def selector_module_mutation(node, names, imports):
+    """Stores rooted at imported module objects require review."""
+    target = None
+    if isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del)):
+        target = node
+    elif isinstance(node, ast.Call) and node.args:
+        resolved = names.resolve(node.func)
+        if resolved and resolved <= {"builtins.setattr", "builtins.delattr"}:
+            target = node.args[0]
+        elif isinstance(node.func, ast.Name) and node.func.id in {"setattr", "delattr"}:
+            scope = names.at[id(node.func)]
+            while scope is not None and node.func.id not in scope.bound:
+                scope = scope.parent
+            if scope is None:
+                target = node.args[0]
+    while isinstance(target, (ast.Attribute, ast.Subscript)):
+        target = target.value
+    return target is not None and bool(names.resolve(target) & imports.module_names)
+
+
+def selector_escape_sites(modules):
+    """Noncanonical imports and API values outside a direct callee need review."""
+    found = {}
+    imports = ImportGraph(modules)
+    for rel, tree in modules.items():
+        if not rel.startswith(tuple(package + "/" for package in PACKAGES)):
+            continue
+        names = imports.names[rel]
+        parents = {id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+        callees = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+        for node, scope in qualified_nodes(tree, include_signature=True):
+            if (selector_import_escape(node, rel, names, imports)
+                    or selector_module_escape(node, parents, names, imports)
+                    or selector_module_mutation(node, names, imports)
+                    or id(node) not in callees and names.resolve(node) & RAW):
+                found.setdefault((rel, scope), []).append(node.lineno)
+    return dict(sorted(found.items()))
+
+
 def selector_expanded_spawn(node, names):
     if (isinstance(node, ast.ImportFrom) and node.level == 0 and node.module in {"os", "subprocess"}
             and any(alias.name == "*" for alias in node.names)):
@@ -766,19 +1276,40 @@ def selector_expanded_spawn(node, names):
             or apis & POPEN_POSITIONAL_APIS and len(node.args) > 1)
 
 
-def selector_sites(modules):
+def selector_sites(modules, *, include_escapes=True, table=()):
     found = {}
+    resolver = CommandResolver(modules, option_pins={})
+    imports = resolver.imports
+    verdicts = spawn_totality(modules, table, resolver=resolver)
+    for item in verdicts:
+        unknown_command = False
+        if item.verdict == "reviewed" and not item.programs:
+            for api in imports.names[item.rel].resolve(item.node.func) & RAW:
+                command = resolver.construction_command(item.node, api)
+                expression = ast.Tuple(elts=list(command)) if isinstance(command, tuple) else command
+                unknown_command |= any(value is None or value is _UNRESOLVED_IMPORT
+                                       for value in resolver.values(expression, item.rel))
+        if item.reason is not None or unknown_command:
+            found.setdefault((item.rel, item.scope), []).append(item.node.lineno)
     for rel, tree in modules.items():
-        if not rel.startswith(("aegis_core/", "aegis_cli/", "aegis_mcp/")):
+        if not rel.startswith(tuple(package + "/" for package in PACKAGES)):
             continue
-        names = ScopedNames(tree, rel)
+        names = imports.names[rel]
+        scopes = {id(node): scope for node, scope in qualified_nodes(tree, include_signature=True)}
+        scopes.update((id(item.node), item.scope) for item in verdicts if item.rel == rel)
+        for node, source, origins, launch in resolver.programs(rel, with_locations=True):
+            module_operand = source == ("external-module", None)
+            if launch and module_operand:
+                found.setdefault((rel, scopes[id(node)]), []).append(node.lineno)
         references, expanded, positional = set(), {}, {}
         module_reference = False
         # Clause B is module-wide for expanded calls; callable alias analysis
         # is deliberately unnecessary. Keep the prior same-scope positional
         # rule as well. Defaults/decorators participate in their function.
         for node, scope in qualified_nodes(tree, include_signature=True):
-            imported = set(import_bindings(node, rel).values()) & RAW
+            if any(imports.is_shadowed(target) for target in names.resolve(node)):
+                found.setdefault((rel, scope), []).append(node.lineno)
+            imported = imports.imported(node, rel) & RAW
             if names.resolve(node) & RAW or imported:
                 references.add(scope)
                 module_reference = True
@@ -803,6 +1334,9 @@ def selector_sites(modules):
                 raise ValueError("selector site limit " + rel + ":" + scope) from None
             if selected:
                 found.setdefault((rel, scope), []).append(node.lineno)
+    if include_escapes:
+        for key, lines in selector_escape_sites(modules).items():
+            found.setdefault(key, []).extend(lines)
     return dict(sorted(found.items()))
 
 
@@ -817,6 +1351,23 @@ def selector_site_errors(current, table):
         reviewed.add(key)
     errors.extend("unreviewed selector site " + rel + ":" + scope for rel, scope in sorted(current.keys() - reviewed))
     errors.extend("stale selector site " + rel + ":" + scope for rel, scope in sorted(reviewed - current.keys()))
+    return errors
+
+
+def selector_gate_errors(modules, table):
+    """Review every selector and API escape, including the escape row kind."""
+    escapes = selector_escape_sites(modules)
+    current = selector_sites(modules, include_escapes=False, table=table)
+    for key, lines in escapes.items():
+        current.setdefault(key, []).extend(lines)
+    errors = selector_site_errors(current, table)
+    kinds = {(rel, scope): kind for rel, scope, kind, _ in table}
+    errors.extend("selector escape requires escape kind " + rel + ":" + scope
+                  for rel, scope in sorted(escapes.keys() & kinds.keys())
+                  if kinds[rel, scope] != "escape")
+    errors.extend("stale selector escape " + rel + ":" + scope
+                  for (rel, scope), kind in sorted(kinds.items())
+                  if kind == "escape" and (rel, scope) not in escapes)
     return errors
 
 
@@ -853,14 +1404,88 @@ def value_selector_hint(value):
     return python_selector(text)[0] in {"code", "module"}
 
 
+def api_keywords(node, *, key_resolver=None, opaque_values=None):
+    """Expand explicit dictionary keys while keeping unknown mappings separate from evidence."""
+    if len(node.keywords) > _MAX_WORDS:
+        return None, True
+    found, unknown, budget = {}, False, [_MAX_WORDS]
+
+    def mapping(value, depth):
+        if not isinstance(value, ast.Dict):
+            return {}, True
+        if depth >= _MAX_DEPTH or len(value.keys) > budget[0]:
+            return None, True
+        budget[0] -= len(value.keys)
+        fields, opaque = {}, False
+        for key, item in zip(value.keys, value.values):
+            if key is None:
+                extra, uncertain = mapping(item, depth + 1)
+                if extra is None:
+                    return None, True
+                fields.update(extra)  # Within one dict, Python uses the last value for a key.
+                opaque |= uncertain
+            elif isinstance(key, ast.Constant) and isinstance(key.value, str):
+                fields[key.value] = item
+            else:
+                keys = key_resolver(key) if key_resolver is not None else None
+                if keys is not None and len(keys) == 1 and all(isinstance(word, str) for word in keys):
+                    name = next(iter(keys))
+                    fields[name] = item
+                    keep = name in {"args", "argv", "cmd", "command", "executable", "path", "file"}
+                else:
+                    opaque = True
+                    keep = True
+                if keep and opaque_values is not None:
+                    if len(opaque_values) >= _MAX_WORDS:
+                        return None, True
+                    opaque_values.append(item)
+        return fields, opaque
+
+    for keyword in node.keywords:
+        if keyword.arg is not None:
+            if budget[0] <= 0:
+                return None, True
+            budget[0] -= 1
+            fields = {keyword.arg: keyword.value}
+        else:
+            fields, opaque = mapping(keyword.value, 0)
+            if fields is None:
+                return None, True
+            unknown |= opaque
+        for key, value in fields.items():
+            if key in found:
+                return None, True
+            found[key] = value
+    return found, unknown
+
+
+def api_executable_fields(node, api):
+    """Retain executable evidence even when the complete argument layout is rejected."""
+    if len(node.args) + len(node.keywords) > _MAX_WORDS:
+        return None
+    keywords, _ = api_keywords(node)
+    if keywords is None:
+        return None
+    if api in {"os.system", "os.popen", "subprocess.getoutput", "subprocess.getstatusoutput"}:
+        return ()
+    index = 2 if api.startswith("subprocess.") else (1 if api.startswith("os.spawn") else 0)
+    keys = {"executable"} if api.startswith("subprocess.") else {"path", "file", "executable"}
+    fields = [node.args[index]] if len(node.args) > index else []
+    for key, value in keywords.items():
+        if key in keys:
+            if len(fields) >= _MAX_CHOICES:
+                return None
+            fields.append(value)
+    return tuple(fields)
+
+
 def api_arguments(node, api):
     """Return executable AST, argv AST/variadic tuple, and shell mode by API."""
     if (len(node.args) + len(node.keywords) > _MAX_WORDS
-            or any(isinstance(arg, ast.Starred) for arg in node.args)
-            or any(keyword.arg is None for keyword in node.keywords)):
+            or any(isinstance(arg, ast.Starred) for arg in node.args)):
         return None
-    keywords = {keyword.arg: keyword.value for keyword in node.keywords}
-    if len(keywords) != len(node.keywords):
+    keywords, unknown = api_keywords(node)
+    if keywords is None or unknown:
         return None
     shell_apis = {"os.system": "command", "os.popen": "cmd",
                   "subprocess.getoutput": "cmd", "subprocess.getstatusoutput": "cmd"}
@@ -880,10 +1505,18 @@ def api_arguments(node, api):
             return None
         return (executable, command, shell.value if shell is not None else False) if command is not None else None
     offset = 1 if api.startswith("os.spawn") else 0
+    executable_keys = [key for key in ("file", "path", "executable") if key in keywords]
+    if len(executable_keys) > 1 or len(node.args) > offset and executable_keys:
+        return None
+    executable = node.args[offset] if len(node.args) > offset else keywords.get(executable_keys[0]) if executable_keys else None
+    suffix = api.rsplit(".", 1)[1]
+    vector_keys = [key for key in ("args", "argv") if key in keywords]
+    if len(vector_keys) > 1 or len(node.args) > offset + 1 and vector_keys:
+        return None
+    if vector_keys:
+        return executable, keywords[vector_keys[0]], False
     if len(node.args) <= offset + 1:
         return None
-    executable = node.args[offset]
-    suffix = api.rsplit(".", 1)[1]
     if suffix.startswith(("execl", "spawnl")):
         end = -1 if suffix.endswith("e") else len(node.args)
         vector = tuple(node.args[offset + 1:end])
@@ -898,6 +1531,86 @@ def shell_word(word):
         "sh", "bash", "dash", "ash", "ksh", "zsh", "cmd", "powershell", "pwsh"}
 
 
+# Exact option spellings and operand arities; anything else is UNKNOWN.
+_WRAPPER_GRAMMAR = {
+    "env": ({"-i", "--ignore-environment"}, {"-u", "--unset", "-C", "--chdir"}),
+    "nice": (set(), {"-n", "--adjustment"}),
+    "timeout": ({"--foreground", "--preserve-status", "--verbose", "-v"}, {"-s", "--signal", "-k", "--kill-after"}),
+    "stdbuf": (set(), {"-i", "-o", "-e", "--input", "--output", "--error"}),
+    "xargs": ({"-0", "--null", "-r", "--no-run-if-empty", "-t", "--verbose", "-p", "--interactive", "-x", "--exit"},
+              {"-n", "--max-args", "-L", "--max-lines", "-s", "--max-chars", "-P", "--max-procs", "-d", "--delimiter", "-E", "--eof"}),
+    **{name: (set(), set()) for name in ("sudo", "doas", "time", "command", "builtin", "exec", "nohup",
+                                       "setsid", "busybox", "ionice")},
+}
+_UNKNOWN_WRAPPERS = frozenset({"su", "runuser", "sg"})
+
+
+def command_basename(word):
+    if not isinstance(word, str) or len(word) > _MAX_TEXT:
+        return None
+    return word.replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe")
+
+
+def closed_wrapper_argv(items):
+    """Return the untouched suffix only after a completely proven wrapper prefix."""
+    if len(items) > _MAX_WORDS or sum(len(word) for word in items if isinstance(word, str)) > _MAX_TEXT:
+        return None
+    index = 0
+    for _ in range(_MAX_DEPTH):
+        if index >= len(items):
+            return ()
+        wrapper = command_basename(items[index])
+        if wrapper in _UNKNOWN_WRAPPERS:
+            return None  # A username and shell command do not form an executable suffix.
+        if wrapper not in _WRAPPER_GRAMMAR:
+            return items[index:]
+        switches, operands = _WRAPPER_GRAMMAR[wrapper]
+        index += 1
+        while index < len(items):
+            word = items[index]
+            if not isinstance(word, str):
+                return None
+            if word == "--":
+                index += 1
+                break
+            if word in switches:
+                index += 1
+            elif word in operands:
+                if index + 1 >= len(items) or not isinstance(items[index + 1], str):
+                    return None
+                operand = items[index + 1]
+                if wrapper == "nice" and not re.fullmatch(r"[+-]?[0-9]+", operand):
+                    return None
+                if (wrapper == "xargs" and word in {"-n", "--max-args", "-L", "--max-lines", "-s", "--max-chars", "-P", "--max-procs"}
+                        and not re.fullmatch(r"[0-9]+", operand)):
+                    return None
+                if wrapper == "stdbuf" and not re.fullmatch(r"L|0|[0-9]+[KMG]?", operand):
+                    return None
+                if (wrapper == "timeout" and word in {"-k", "--kill-after"}
+                        and not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?[smhd]?", operand)):
+                    return None
+                index += 2
+            elif wrapper == "stdbuf" and re.fullmatch(r"-[ioe](?:L|0|[0-9]+[KMG]?)", word):
+                index += 1
+            elif wrapper == "xargs" and re.fullmatch(r"-[nLsP][0-9]+", word):
+                index += 1
+            elif word.startswith("-"):
+                return None
+            elif wrapper == "env" and "=" in word:
+                name = word.partition("=")[0]
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name):
+                    return None
+                index += 1
+            else:
+                break
+        if wrapper == "timeout":
+            if (index >= len(items) or not isinstance(items[index], str)
+                    or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?[smhd]?", items[index])):
+                return None
+            index += 1
+    return None
+
+
 class CommandResolver:
     """Resolve whole command constructions; uncertainty never becomes an initializer.
 
@@ -907,7 +1620,13 @@ class CommandResolver:
     Namespace obfuscation remains outside ScopedNames' honest-author threat model.
     """
     def __init__(self, modules, *, option_pins=None, package_context=None):
+        self._constant_checks = set()
+        self._launch_cache = {}
+        self._return_definitions = {}
+        self._method_graph = None
+        self._definite_cache = {}
         self.modules = modules if package_context is None else {**package_context.modules, **modules}
+        self.imports = ImportGraph(modules, parent=None if package_context is None else package_context.imports)
         namespaces = {rel.removesuffix("/__init__.py").removesuffix(".py").replace("/", ".") for rel in modules}
         namespaces.update(target for rel, tree in modules.items() for node in ast.walk(tree)
                           if isinstance(node, ast.Import) for target in import_bindings(node, rel).values())
@@ -918,14 +1637,25 @@ class CommandResolver:
         # Package ASTs and their bindings are unchanged. Analyze only the new
         # literal tree, keeping original modules available for its imports.
         self.contexts = {} if package_context is None else dict(package_context.contexts)
-        self.contexts.update({rel: literal_bindings(tree, rel, namespaces, self.modules) for rel, tree in modules.items()})
+        self.contexts.update({rel: literal_bindings(tree, rel, namespaces, self.modules,
+                                                   callees=self.imports.names[rel], call_inputs=False)
+                              for rel, tree in modules.items()})
+        self.changed_exports = {name for _, _, changes in self.contexts.values() for name in changes}
+        # Establish explicit bindings/writes before classifying call effects, so
+        # a re-exported stdlib module is not mistaken for a mutable receiver.
+        # The full pass retains all other call effects and capture immutability.
+        self.contexts.update({rel: literal_bindings(tree, rel, namespaces, self.modules,
+                                                   callees=self.imports.names[rel], helper_identity=self.helper_identity,
+                                                   module_identity=self.module_identity)
+                              for rel, tree in modules.items()})
         self.changed_exports = {name for _, _, changes in self.contexts.values() for name in changes}
         pins = OPTION_PREFIX_PINS if option_pins is None else option_pins
         self.option_functions = ({key: checked_prefix_function(modules, key, pins) for key in pins}
                                  if OPTION_PREFIX_CALLER[0] in modules else {})
 
-    def export_changed(self, qualified):
-        return any(qualified == name or qualified.startswith(name + ".") or name.startswith(qualified + ".")
+    def export_changed(self, qualified, *, descendants=True):
+        return any(qualified == name or qualified.startswith(name + ".")
+                   or descendants and name.startswith(qualified + ".")
                    for name in self.changed_exports)
 
     def option_prefix(self, node, origin):
@@ -956,20 +1686,173 @@ class CommandResolver:
             return shlex.quote(value.value)
         return None
 
-    def imported(self, qualified, seen):
-        if qualified in seen or self.export_changed(qualified) or len(seen) >= _MAX_DEPTH:
-            return {None}
-        seen = seen | {qualified}
+    def imported_binding(self, qualified):
+        """Locate one module hop without skipping its local writes."""
+        if self.imports.is_shadowed(qualified):
+            return None
         base, _, attribute = qualified.rpartition(".")
         origin = base.replace(".", "/") + ".py"
         if origin not in self.modules:
             origin = base.replace(".", "/") + "/__init__.py"
         if origin not in self.modules:
-            return {None}
+            return None
         names, bindings, _ = self.contexts[origin]
         scope = names.at[id(self.modules[origin])]
-        result = {v for node in bindings.get((scope, attribute), ()) for v in self.values(node, origin, seen)}
-        return (result | {v for name in scope.imports.get(attribute, ()) for v in self.imported(name, seen)}) or {None}
+        sources = set(scope.imports.get(attribute, ()))
+        sources.update(base + "." + attribute for base in scope.star_imports)
+        return origin, bindings.get((scope, attribute), ()), sources
+
+    def helper_identity(self, node, origin):
+        """Prove only the modeled stdlib identities, preserving binding guards."""
+        if isinstance(node, ast.Name) and not self.definite_name(node, origin):
+            return None
+        return self.reference_identity(node, origin, {
+            "shlex.quote", "shlex.join", "os.fspath", "pathlib.Path", "pathlib.PurePath",
+            "pathlib.Path.cwd", "pathlib.Path.home"})
+
+    def module_identity(self, node, origin):
+        """Prove namespace receivers without treating classes as modules."""
+        return self.reference_identity(node, origin, self.namespaces, module_receiver=True)
+
+    def reference_identity(self, node, origin, terminals, *, module_receiver=False):
+        """Share the bounded alias/import proof and its invalidation guards."""
+        cache, expressions, remaining = {}, {}, [_MAX_WORDS]
+
+        def qualified_names(expression, source, seen):
+            key = "node", source, id(expression)
+            if key in seen or len(seen) >= _MAX_DEPTH or remaining[0] <= 0:
+                return set()
+            remaining[0] -= 1
+            if key in expressions:
+                return expressions[key]
+            names, bindings, _ = self.contexts[source]
+            result = set()
+            if isinstance(expression, ast.Name):
+                if len(expression.id) > _MAX_TEXT:
+                    return set()
+                builtin = self.builtin_name(expression, source)
+                if builtin is not None and len(builtin) + 9 <= _MAX_TEXT:
+                    qualified = "builtins." + builtin
+                    if qualified in terminals:
+                        expressions[key] = {qualified}
+                        return expressions[key]
+                scope = names.at[id(expression)]
+                while scope is not None:
+                    scope = binding_scope(scope, expression.id)
+                    values = bindings.get((scope, expression.id), ())
+                    if scope.kind == "module":
+                        if len(scope.namespace) + len(expression.id) + 1 > _MAX_TEXT:
+                            return set()
+                        if self.export_changed(scope.namespace + "." + expression.id, descendants=not module_receiver):
+                            return set()
+                    if values:
+                        if ((not module_receiver and len(values) != 1) or expression.id in scope.imports
+                                or len(values) > _MAX_CHOICES):
+                            return set()
+                        for value in values:
+                            extra = qualified_names(value, source, seen | {key})
+                            if not extra or len(result) + len(extra) > _MAX_CHOICES:
+                                return set()
+                            result.update(extra)
+                        break
+                    if expression.id in scope.bound:
+                        result = names.resolve(expression)
+                        break
+                    scope = scope.parent
+                else:
+                    result = names.resolve(expression)
+            elif isinstance(expression, ast.Attribute):
+                bases = qualified_names(expression.value, source, seen | {key})
+                if any(len(base) + len(expression.attr) + 1 > _MAX_TEXT or base.count(".") + 1 >= 4096
+                       for base in bases):
+                    return set()
+                result = {base + "." + expression.attr for base in bases}
+            elif module_receiver and isinstance(expression, ast.IfExp):
+                for choice in (expression.body, expression.orelse):
+                    extra = qualified_names(choice, source, seen | {key})
+                    if not extra or len(result) + len(extra) > _MAX_CHOICES:
+                        return set()
+                    result.update(extra)
+            if len(result) > _MAX_CHOICES:
+                return set()
+            expressions[key] = result
+            return result
+
+        def follow(qualified, seen):
+            key = "qualified", qualified
+            if key in seen or len(seen) >= _MAX_DEPTH or remaining[0] <= 0:
+                return None
+            remaining[0] -= 1
+            if qualified in cache:
+                return cache[qualified]
+            result = None
+            if (not self.imports.is_shadowed(qualified)
+                    and not self.export_changed(qualified, descendants=not module_receiver)):
+                if qualified in terminals:
+                    result = frozenset({qualified})
+                else:
+                    binding = self.imported_binding(qualified)
+                    prefix, suffix = qualified, ""
+                    while binding is None and "." in prefix and remaining[0] > 0:
+                        remaining[0] -= 1
+                        prefix, _, attribute = prefix.rpartition(".")
+                        suffix = attribute + ("." + suffix if suffix else "")
+                        binding = self.imported_binding(prefix)
+                    if binding is not None:
+                        target, choices, sources = binding
+                        if choices:
+                            if sources or len(choices) > _MAX_CHOICES or not module_receiver and len(choices) != 1:
+                                sources = set()
+                            else:
+                                sources = set()
+                                for choice in choices:
+                                    extra = qualified_names(choice, target, seen | {key})
+                                    if not extra or len(sources) + len(extra) > _MAX_CHOICES:
+                                        sources = set()
+                                        break
+                                    sources.update(extra)
+                        if sources and len(sources) <= _MAX_CHOICES:
+                            for source in sources:
+                                if len(source) + len(suffix) + bool(suffix) > _MAX_TEXT:
+                                    result = None
+                                    break
+                                following = source + "." + suffix if suffix else source
+                                identity = follow(following, seen | {key})
+                                if identity is None or result is not None and len(result) + len(identity) > _MAX_CHOICES:
+                                    result = None
+                                    break
+                                result = identity if result is None else result | identity
+            cache[qualified] = result
+            return result
+
+        names = qualified_names(node, origin, frozenset())
+        identities = frozenset()
+        for name in names:
+            extra = follow(name, frozenset())
+            if extra is None or len(identities) + len(extra) > _MAX_CHOICES:
+                return None
+            identities |= extra
+        if module_receiver:
+            return identities or None
+        return next(iter(identities)) if len(identities) == 1 else None
+
+    def imported(self, qualified, seen):
+        if qualified in seen or self.export_changed(qualified) or len(seen) >= _MAX_DEPTH:
+            return {None}
+        seen = seen | {qualified}
+        binding = self.imported_binding(qualified)
+        if binding is None:
+            return {None}
+        origin, choices, sources = binding
+        if any(isinstance(node, (ast.List, ast.Dict, ast.Set, ast.Call)) for node in choices):
+            return {None}
+        result = {v for node in choices for v in self.values(node, origin, seen)}
+        result |= {v for name in sources for v in self.imported(name, seen)}
+        if not result or any(not (isinstance(value, str) or value is _PYTHON
+                or isinstance(value, _Argv) and value.kind == "tuple"
+                and all(isinstance(word, str) or word is _PYTHON for word in value.items)) for value in result):
+            return {None}  # Mutable containers and call results do not cross modules as known values.
+        return result
 
     def named(self, node, origin, seen):
         names, bindings, _ = self.contexts[origin]
@@ -990,19 +1873,189 @@ class CommandResolver:
 
     def sequence(self, node, origin, seen):
         if len(node.elts) > _MAX_WORDS:
-            return {None}
+            return {self.unknown_value(node, origin)}
         states = {()}
         for item in node.elts:
             starred = isinstance(item, ast.Starred)
             choices = self.values(item.value if starred else item, origin, seen)
+            if not starred and any(value is None or value is _UNRESOLVED_IMPORT for value in choices):
+                constants = self.constant_strings(item, origin, seen)
+                if constants is not None:
+                    choices = constants
             pieces = {v.items if starred and isinstance(v, _Argv) else (
-                (_OPTION_PREFIX,) if starred and v is _OPTION_PREFIX else ((_SPLICE,) if starred else (v,))) for v in choices}
+                (_OPTION_PREFIX,) if starred and v is _OPTION_PREFIX else (
+                    (_UNRESOLVED_IMPORT,) if v is _UNRESOLVED_IMPORT else ((_SPLICE,) if starred else (v,)))) for v in choices}
             if len(states) * len(pieces) > _MAX_CHOICES:
-                return {None}
+                return {self.unknown_value(node, origin)}
             if any(len(a) + len(b) > _MAX_WORDS for a in states for b in pieces):
-                return {None}
+                return {self.unknown_value(node, origin)}
             states = {a + b for a in states for b in pieces}
         return {_Argv("list" if isinstance(node, ast.List) else "tuple", state) for state in states}
+
+    def constant_strings(self, node, origin, seen=frozenset(), budget=None):
+        """Resolve only bounded, string-only constant formatting; never execute user helpers."""
+        budget = [_MAX_WORDS] if budget is None else budget
+        if not isinstance(node, ast.AST) or id(node) in seen or len(seen) >= _MAX_DEPTH or budget[0] <= 0:
+            return None
+        budget[0] -= 1
+        seen = seen | {id(node)}
+        if isinstance(node, ast.Constant):
+            return {node.value} if isinstance(node.value, str) and len(node.value) <= _MAX_TEXT else None
+        names, bindings, _ = self.contexts[origin]
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            choices = []
+            for qualified in names.resolve(node):
+                if self.export_changed(qualified):
+                    return None
+                binding = self.imported_binding(qualified)
+                if binding is None or binding[2] or not binding[1]:
+                    return None
+                if len(choices) + len(binding[1]) > _MAX_CHOICES:
+                    return None
+                choices.extend((value, binding[0]) for value in binding[1])
+            if isinstance(node, ast.Name):
+                scope = names.at[id(node)]
+                while scope is not None:
+                    scope = binding_scope(scope, node.id)
+                    if scope.kind == "module" and self.export_changed(scope.namespace + "." + node.id):
+                        return None
+                    values = bindings.get((scope, node.id), ())
+                    if values or node.id in scope.bound:
+                        if len(choices) + len(values) > _MAX_CHOICES:
+                            return None
+                        choices.extend((value, origin) for value in values)
+                        break
+                    scope = scope.parent
+            if not choices or len(choices) > _MAX_CHOICES:
+                return None
+            result = set()
+            for value, source in choices:
+                extra = self.constant_strings(value, source, seen, budget)
+                if extra is None or len(result) + len(extra) > _MAX_CHOICES:
+                    return None
+                result.update(extra)
+            return result
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left = self.constant_strings(node.left, origin, seen, budget)
+            right = self.constant_strings(node.right, origin, seen, budget)
+            if left is None or right is None or len(left) * len(right) > _MAX_CHOICES:
+                return None
+            if any(len(a) + len(b) > _MAX_TEXT for a in left for b in right):
+                return None
+            return {a + b for a in left for b in right}
+        if isinstance(node, ast.JoinedStr):
+            for part in node.values:
+                if isinstance(part, ast.FormattedValue) and (
+                        part.format_spec is not None or self.constant_strings(part.value, origin, seen, budget) is None):
+                    return None
+            normal = self.values(node, origin, seen - {id(node)})
+            return normal if normal and all(isinstance(value, str) for value in normal) else None
+        if isinstance(node, (ast.BoolOp, ast.IfExp)):
+            operands = node.values if isinstance(node, ast.BoolOp) else (node.body, node.orelse)
+            result = set()
+            for operand in operands:
+                extra = self.constant_strings(operand, origin, seen, budget)
+                if extra is None or len(result) + len(extra) > _MAX_CHOICES:
+                    return None
+                result.update(extra)
+            return result
+        percent = isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod)
+        formatted = (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                     and node.func.attr == "format")
+        if not percent and not formatted:
+            return None
+        templates = self.constant_strings(node.left if percent else node.func.value, origin, seen, budget)
+        if templates is None:
+            return None
+        arguments = (node.right.elts if isinstance(node.right, ast.Tuple) else (node.right,)) if percent else node.args
+        keywords = () if percent else node.keywords
+        if len(arguments) + len(keywords) > _MAX_WORDS or any(keyword.arg is None for keyword in keywords):
+            return None
+        states = {()}
+        for argument in (*arguments, *(keyword.value for keyword in keywords)):
+            choices = self.constant_strings(argument, origin, seen, budget)
+            if choices is None or len(states) * len(choices) > _MAX_CHOICES:
+                return None
+            states = {state + (choice,) for state in states for choice in choices}
+        if len(states) * len(templates) > _MAX_CHOICES:
+            return None
+        result = set()
+        fields = _FORMAT_FIELD
+        for template in templates:
+            for values in states:
+                output, size, position, automatic, explicit = [], 0, 0, 0, False
+                used = 0
+                while position < len(template):
+                    if len(output) >= _MAX_WORDS:
+                        return None
+                    char = template[position]
+                    if percent and char == "%":
+                        if position + 1 >= len(template):
+                            return None
+                        conversion = template[position + 1]
+                        position += 2
+                        if conversion == "%":
+                            piece = "%"
+                        elif conversion in "sra" and used < len(values):
+                            piece = values[used]
+                            used += 1
+                            if conversion != "s":
+                                if len(piece) > (_MAX_TEXT - 2) // 10:
+                                    return None
+                                piece = repr(piece) if conversion == "r" else ascii(piece)
+                        else:
+                            return None  # Unsupported widths/conversions are never evaluated.
+                    elif not percent and char in "{}":
+                        if template.startswith(char * 2, position):
+                            piece, position = char, position + 2
+                        elif char == "{":
+                            field = fields.match(template, position)
+                            if field is None:
+                                return None
+                            name, conversion = field.groups()
+                            if name and not name.isdigit():
+                                keys = [keyword.arg for keyword in keywords]
+                                if name not in keys:
+                                    return None
+                                index = len(arguments) + keys.index(name)
+                            elif name:
+                                if automatic or len(name) > len(str(_MAX_WORDS)):
+                                    return None
+                                explicit = True
+                                index = int(name)
+                                if index >= len(arguments):
+                                    return None
+                            else:
+                                if explicit:
+                                    return None
+                                index, automatic = automatic, automatic + 1
+                                if index >= len(arguments):
+                                    return None
+                            if index >= len(values):
+                                return None
+                            piece = values[index]
+                            if conversion in ("r", "a"):
+                                if len(piece) > (_MAX_TEXT - 2) // 10:
+                                    return None
+                                piece = repr(piece) if conversion == "r" else ascii(piece)
+                            position = field.end()
+                        else:
+                            return None
+                    else:
+                        # Copy a bounded literal run, not one allocation per character.
+                        end = position + 1
+                        special = "%" if percent else "{}"
+                        while end < len(template) and template[end] not in special:
+                            end += 1
+                        piece, position = template[position:end], end
+                    if size + len(piece) > _MAX_TEXT:
+                        return None
+                    size += len(piece)
+                    output.append(piece)
+                if percent and used != len(values):
+                    return None
+                result.add("".join(output))
+        return result
 
     def concatenate(self, node, origin, seen):
         left, right = self.values(node.left, origin, seen), self.values(node.right, origin, seen)
@@ -1064,7 +2117,38 @@ class CommandResolver:
         return {_Shell(text, holes, hidden) if holes or hidden else text for text, holes, hidden in states}
 
     def values(self, node, origin, seen=frozenset()):
-        if node is None or id(node) in seen or len(seen) >= _MAX_DEPTH:
+        if node is _UNRESOLVED_IMPORT:
+            return {_UNRESOLVED_IMPORT}
+        result = self._values(node, origin, seen)
+        if any(value is None or value is _UNRESOLVED_IMPORT or isinstance(value, _Shell)
+               and (value.holes or value.hidden) for value in result):
+            key = origin, id(node)
+            if key not in self._constant_checks and len(self._constant_checks) < _MAX_DEPTH:
+                self._constant_checks.add(key)
+                try:
+                    constants = self.constant_strings(node, origin, seen)
+                finally:
+                    self._constant_checks.remove(key)
+                if constants is not None:
+                    result = constants
+        if None in result:
+            marker = self.unknown_value(node, origin)
+            if marker is _UNRESOLVED_IMPORT:
+                result = (result - {None}) | {marker}
+        return result
+
+    def unknown_value(self, node, origin):
+        """Type unknown sources without recursively re-entering their provenance check."""
+        if not isinstance(node, ast.AST) or getattr(self, "_checking_value_source", False):
+            return None
+        self._checking_value_source = True
+        try:
+            return _UNRESOLVED_IMPORT if self.bearing(node, origin, unresolved_only=True) else None
+        finally:
+            self._checking_value_source = False
+
+    def _values(self, node, origin, seen=frozenset()):
+        if node is None or node is _UNRESOLVED_IMPORT or id(node) in seen or len(seen) >= _MAX_DEPTH:
             return {None}
         seen = seen | {id(node)}
         if isinstance(node, (ast.For, ast.comprehension)):
@@ -1082,7 +2166,7 @@ class CommandResolver:
             return {_PYTHON}
         if names.resolve(node) == {"os.devnull"} and not self.export_changed("os.devnull"):
             return {os.devnull}
-        capture = captured_module(node, names, origin, self.modules)
+        capture = captured_module(node, names, origin, self.modules, helper_identity=self.helper_identity)
         if capture is not None and not self.export_changed("pathlib.Path"):
             return {capture}
         if isinstance(node, (ast.List, ast.Tuple)):
@@ -1094,8 +2178,15 @@ class CommandResolver:
         if isinstance(node, ast.IfExp):
             if self.option_prefix(node, origin):
                 return {_OPTION_PREFIX}
-            return self.values(node.body, origin, seen) | self.values(node.orelse, origin, seen)
-        if (isinstance(node, ast.Call) and names.resolve(node.func) == {"shlex.quote"}
+            constants = self.constant_strings(node, origin, seen - {id(node)})
+            if constants is not None:
+                return constants
+            left = self.values(node.body, origin, seen)
+            right = self.values(node.orelse, origin, seen)
+            if len(left) + len(right) >= _MAX_CHOICES:
+                return {_UNRESOLVED_IMPORT}
+            return left | right | {_UNRESOLVED_IMPORT}
+        if (isinstance(node, ast.Call) and self.helper_identity(node.func, origin) == "shlex.quote"
                 and len(node.args) == 1 and not node.keywords):
             return {_Quoted(v) for v in self.values(node.args[0], origin, seen)}
         return self.named(node, origin, seen)
@@ -1109,7 +2200,12 @@ class CommandResolver:
         """An omitted or explicit None override selects the argv executable."""
         if executable is None or isinstance(executable, ast.Constant) and executable.value is None:
             return {_USE_HEAD}
-        return self.values(executable, origin)
+        values = self.values(executable, origin)
+        if None in values or _UNRESOLVED_IMPORT in values:
+            constants = self.constant_strings(executable, origin)
+            if constants is not None:
+                return constants
+        return values
 
     def normalized_launches(self, node, api, origin):
         extracted = api_arguments(node, api)
@@ -1142,13 +2238,1081 @@ class CommandResolver:
                     yield None
                     continue
                 program = vector.items[0] if program is _USE_HEAD else program
-                valid_words = all(isinstance(word, str) or word is _PYTHON or word is _OPTION_PREFIX
+                positions = {}
+                for _ in self.argv_programs(vector, fragment=False, executable=program, source_positions=positions):
+                    pass
+                module_operand = positions.get("index") if positions.get("mode") == "module" else None
+                valid_words = all(index == module_operand or isinstance(word, str)
+                                  or word is _PYTHON or word is _OPTION_PREFIX
                                   or isinstance(word, tuple) and len(word) == 2 and word[0] == "captured-module"
-                                  for word in vector.items)
+                                  for index, word in enumerate(vector.items))
                 if not valid_words or not isinstance(program, str) and program is not _PYTHON:
                     yield None
                 else:
                     yield _Launch(program, vector, False)
+
+    def opaque_command(self, node, origin, seen=frozenset(), budget=None):
+        """Unknown command expressions stay opaque unless an existing model classifies them."""
+        if not isinstance(node, ast.AST):
+            return node is None or node is _UNRESOLVED_IMPORT
+        budget = [0] if budget is None else budget
+        if id(node) in seen or len(seen) >= _MAX_DEPTH or budget[0] >= _MAX_WORDS:
+            return True
+        budget[0] += 1
+        seen = seen | {id(node)}
+        if isinstance(node, (ast.List, ast.Tuple)):
+            return bool(node.elts) and self.opaque_command(node.elts[0], origin, seen, budget)
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in {"list", "tuple"} and len(node.args) == 1 and not node.keywords):
+            return self.opaque_command(node.args[0], origin, seen, budget)
+        if isinstance(node, ast.Constant):
+            return False
+        if isinstance(node, ast.Call):
+            pure = self.helper_identity(node.func, origin) is not None
+            if isinstance(node.func, ast.Name) and node.func.id in {"str", "repr", "ascii", "bytes"}:
+                scope = self.contexts[origin][0].at[id(node.func)]
+                while scope is not None and (node.func.id not in scope.bound or scope.kind == "class"):
+                    scope = scope.parent
+                pure |= scope is None
+            if isinstance(node.func, ast.Attribute) and node.func.attr in _STRING_METHODS:
+                pure |= node.func.attr != "format" or self.format_conversion(node, origin)
+            return not pure or self.bearing(node, origin, unresolved_only=True)
+        if not isinstance(node, ast.Name):
+            return True
+        names, bindings, _ = self.contexts[origin]
+        scope = names.at[id(node)]
+        while scope is not None:
+            scope = binding_scope(scope, node.id)
+            choices = bindings.get((scope, node.id), ())
+            if choices or node.id in scope.bound:
+                if not choices or len(choices) > _MAX_CHOICES:
+                    return True
+                return any(self.opaque_command(value, origin, seen, budget) for value in choices)
+            scope = scope.parent
+        return True
+
+    def launch_resolution(self, node, api, origin):
+        """Fill unresolved source/selector outcomes without replacing no-program proofs."""
+        key = origin, id(node), api
+        if key in self._launch_cache:
+            return self._launch_cache[key]
+        if len(self._launch_cache) >= _MAX_WORDS:
+            return _LaunchResolution((), "spawn verdict limit", False)
+        extracted = api_arguments(node, api)
+        command = self.construction_command(node, api)
+        fields = api_executable_fields(node, api)
+        executable = (extracted[0] if extracted is not None else
+                      fields[0] if fields else None)
+        evidence = self.command_evidence(command, origin, executable=executable)
+        opaque_values = []
+        resolved_keywords, _ = api_keywords(node, key_resolver=lambda key: self.constant_strings(key, origin),
+                                           opaque_values=opaque_values)
+        for value in opaque_values:
+            extra = self.command_evidence(value, origin)
+            evidence = _CommandEvidence(*(left or right for left, right in zip(evidence, extra)))
+        for field in fields or ():
+            if field is not executable:
+                extra = self.command_evidence(command, origin, executable=field)
+                evidence = _CommandEvidence(*(left or right for left, right in zip(evidence, extra)))
+        reason = "unresolved selector or program source" if evidence.requires_review else None
+        if resolved_keywords is None:
+            reason = reason or "keyword evidence limit"
+        if fields is None:
+            reason = "executable evidence limit"
+        executables = self.effective_executables(executable, origin)
+        native_override = bool(executables) and all(isinstance(item, str)
+            and not python_word(item) and not shell_word(item) for item in executables)
+        native_program = native_override and all(command_basename(item) not in _WRAPPER_GRAMMAR.keys() | _UNKNOWN_WRAPPERS
+                                                 for item in executables)
+        last_input = 8 if api.startswith("subprocess.") else 2 if api.startswith("os.spawn") else 1
+        if api.rsplit(".", 1)[1].startswith(("execl", "spawnl")):
+            last_input = len(node.args) - 1  # Every variadic argv slot can supply a selector or its source.
+        if extracted is None and (evidence.interpreter or evidence.selector or evidence.content
+                or not native_program and any(isinstance(argument, ast.Starred) and index <= last_input
+                       for index, argument in enumerate(node.args))):
+            reason = "unresolved launch arguments"
+        names = self.contexts[origin][0]
+        if any(isinstance(item, ast.Name) and item.id in names.at[id(item)].opaque
+               for item in ast.walk(node.func)):
+            reason = "unresolved class callee"
+        programs = []
+        for program in self.launch_programs(node, api, origin):
+            if len(programs) >= _MAX_WORDS:
+                raise ValueError(origin + ": literal occurrence limit")
+            programs.append(program)
+            if program is None or program is _UNRESOLVED_MODULE:
+                reason = reason or "unresolved program source"
+            elif isinstance(program, str):
+                if len(program) > _MAX_TEXT:
+                    raise ValueError(origin + ": literal program text limit")
+        # A whole unknown command has no established head or operand positions.
+        # Partial native argv and transparent helper constructions retain the
+        # existing parser's no-program classification.
+        expression = ast.Tuple(elts=list(command)) if isinstance(command, tuple) else command
+        values = self.values(expression, origin)
+        if (executable is not None and evidence.requires_review
+                and any(item is None or item is _UNRESOLVED_IMPORT for item in executables)):
+            reason = reason or "unresolved executable"
+        if (evidence.requires_review and any(item is None or item is _UNRESOLVED_IMPORT for item in values)
+                and not native_override and self.opaque_command(expression, origin)):
+            reason = reason or "unresolved command value"
+        result = _LaunchResolution(tuple(programs), reason,
+                                   evidence.module or any(item is _UNRESOLVED_MODULE for item in programs))
+        self._launch_cache[key] = result
+        return result
+
+    def selector_owner(self, node, origin, fallback):
+        """Retain a local helper's existing ownership of a Python selector prefix."""
+        owners, work = set(), 0
+        names = self.contexts[origin][0]
+        root = names.at[id(self.modules[origin])].namespace
+        for api in self.imports.names[origin].resolve(node.func) & RAW:
+            if self.launch_resolution(node, api, origin).reason is None:
+                continue
+            command = self.construction_command(node, api)
+            expression = ast.Tuple(elts=list(command)) if isinstance(command, tuple) else command
+            if not isinstance(expression, ast.AST):
+                continue
+            for child in ast.walk(expression):
+                if work >= _MAX_WORDS:
+                    return fallback
+                work += 1
+                if not isinstance(child, ast.Call):
+                    continue
+                returns = self.called_returns(child.func, origin, call=child)
+                if returns is None:
+                    return fallback
+                for item in returns:
+                    value, value_origin = item if isinstance(item, tuple) else (item, origin)
+                    if value_origin != origin:
+                        return fallback  # Only a local helper can take this source owner's selector row.
+                    if work >= _MAX_WORDS:
+                        return fallback
+                    work += 1
+                    for choice in self.values(value, value_origin):
+                        if (isinstance(choice, _Argv) and choice.items
+                                and (choice.items[0] is _PYTHON or python_word(choice.items[0]))
+                                and any(value_selector_hint(word) for word in choice.items[1:])):
+                            if len(owners) >= _MAX_CHOICES:
+                                return fallback
+                            namespace = self.contexts[value_origin][0].at[id(value)].namespace
+                            owners.add(namespace.removeprefix(root + ".").replace(".<locals>", ""))
+        return next(iter(owners)) if len(owners) == 1 else fallback
+
+    def string_receiver_proven(self, node, origin, seen=frozenset(), budget=None):
+        """Prove a modeled string value, rather than trusting a local method spelling."""
+        budget = [_MAX_WORDS] if budget is None else budget
+        if not isinstance(node, ast.AST) or id(node) in seen or len(seen) >= _MAX_DEPTH or budget[0] <= 0:
+            return False
+        budget[0] -= 1
+        seen = seen | {id(node)}
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return (self.string_receiver_proven(node.left, origin, seen, budget)
+                    and self.string_receiver_proven(node.right, origin, seen, budget))
+        if isinstance(node, ast.IfExp):
+            return (self.string_receiver_proven(node.body, origin, seen, budget)
+                    and self.string_receiver_proven(node.orelse, origin, seen, budget))
+        values = self.values(node, origin)
+        if values and len(values) <= _MAX_CHOICES and all(
+                isinstance(value, (str, _Quoted)) or value is _PYTHON for value in values):
+            return True
+        names, bindings, _ = self.contexts[origin]
+        if isinstance(node, ast.Call):
+            if self.helper_identity(node.func, origin) in {"shlex.quote", "shlex.join", "os.fspath"}:
+                return True
+            if isinstance(node.func, ast.Name) and node.func.id in {"str", "repr", "ascii", "bytes"}:
+                scope = names.at[id(node.func)]
+                while scope is not None and node.func.id not in scope.bound:
+                    scope = scope.parent
+                if scope is None:
+                    return True  # These are the unshadowed builtins, not local name patterns.
+            if isinstance(node.func, ast.Attribute) and node.func.attr in _STRING_METHODS:
+                return self.string_receiver_proven(node.func.value, origin, seen, budget)
+        if isinstance(node, ast.JoinedStr):
+            return True
+        if isinstance(node, ast.Name):
+            scope = names.at[id(node)]
+            while scope is not None:
+                scope = binding_scope(scope, node.id)
+                choices = bindings.get((scope, node.id), ())
+                if choices or node.id in scope.bound:
+                    if (len(choices) > _MAX_CHOICES or _UNRESOLVED_IMPORT in choices
+                            or node.id in scope.imports or scope.star_imports):
+                        return False
+                    expressions = [value for value in choices if isinstance(value, ast.AST)]
+                    return (bool(expressions) and len(expressions) == len(choices)
+                            and all(self.string_receiver_proven(value, origin, seen, budget)
+                                    for value in expressions))
+                scope = scope.parent
+        return False
+
+    def definite_bindings(self, origin):
+        """Index direct declarations without promoting writes from a conditional body."""
+        names = self.contexts[origin][0]
+        cached = self._definite_cache.get(origin)
+        if cached is None or cached[0] is not names:
+            definite, count = set(), 0
+            for work, parent in enumerate(ast.walk(self.modules[origin])):
+                if work >= _MAX_WORDS * _MAX_DEPTH:
+                    self._definite_cache[origin] = names, None
+                    return None
+                if not isinstance(parent, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if len(parent.body) > _MAX_WORDS:
+                    self._definite_cache[origin] = names, None
+                    return None
+                if not parent.body:
+                    continue
+                scope = names.at[id(parent)] if isinstance(parent, ast.Module) else names.at[id(parent.body[0])]
+                for statement in parent.body:
+                    locals_ = ()
+                    if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        locals_ = (statement.name,)
+                    elif isinstance(statement, (ast.Import, ast.ImportFrom)):
+                        locals_ = (("*",) if isinstance(statement, ast.ImportFrom)
+                                   and any(alias.name == "*" for alias in statement.names)
+                                   else import_bindings(statement, origin))
+                    elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                        if statement.value is None:
+                            continue
+                        targets = statement.targets if isinstance(statement, ast.Assign) else (statement.target,)
+                        if len(targets) > _MAX_WORDS:
+                            self._definite_cache[origin] = names, None
+                            return None
+                        locals_ = (target.id for target in targets if isinstance(target, ast.Name))
+                    for local in locals_:
+                        if count >= _MAX_WORDS:
+                            self._definite_cache[origin] = names, None
+                            return None
+                        count += 1
+                        if binding_scope(scope, local) is scope:
+                            definite.add((scope, local))
+            self._definite_cache[origin] = names, definite
+            cached = names, definite
+        return cached[1]
+
+    def definite_name(self, node, origin):
+        """Prove a binding exists without relying on a conditional statement."""
+        if not isinstance(node, ast.Name):
+            return False
+        definite = self.definite_bindings(origin)
+        if definite is None:
+            return False
+        names = self.contexts[origin][0]
+        scope = names.at[id(node)]
+        while scope is not None:
+            scope = binding_scope(scope, node.id)
+            if node.id in scope.bound:
+                return (scope, node.id) in definite
+            if scope.star_imports:
+                return (scope, "*") in definite
+            scope = scope.parent
+        return False
+
+    def builtin_name(self, node, origin):
+        if not isinstance(node, ast.Name):
+            return None
+        scope = self.contexts[origin][0].at[id(node)]
+        while scope is not None:
+            scope = binding_scope(scope, node.id)
+            if node.id in scope.bound or scope.star_imports:
+                return None
+            scope = scope.parent
+        return node.id
+
+    def builtin_base(self, node, origin):
+        """Builtin type identities cannot inherit an in-repository class."""
+        name = self.builtin_name(node, origin)
+        if name in _BUILTIN_BASES:
+            return not self.export_changed("builtins." + name)
+        terminals = {"builtins." + name for name in _BUILTIN_BASES}
+        return self.reference_identity(node, origin, terminals) is not None
+
+    def receiver_binding(self, node, origin):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return None
+        names = self.contexts[origin][0]
+        scope = binding_scope(names.at[id(node)], node.name)
+        arguments = node.args.posonlyargs or node.args.args
+        if scope.kind != "class" or not arguments:
+            return None
+        classmethod = (len(node.decorator_list) == 1 and (
+            self.builtin_name(node.decorator_list[0], origin) == "classmethod"
+            or self.reference_identity(node.decorator_list[0], origin, {"builtins.classmethod"}) is not None))
+        if node.decorator_list and not classmethod:
+            return None
+        return names.at[id(arguments[0])], arguments[0].arg, scope
+
+    def method_candidates(self, owner, attribute):
+        """Union class lookup and subclass overrides; writes or unresolved bases fail closed."""
+        if self._method_graph is None:
+            records, written, unresolved = {}, {}, False
+            receivers, writes = {}, []
+            class_bindings, class_rebindings = set(), set()
+            count = 0
+            for origin, tree in self.modules.items():
+                names = self.contexts[origin][0]
+                for work, node in enumerate(ast.walk(tree)):
+                    if work >= _MAX_WORDS * _MAX_DEPTH:
+                        self._method_graph = False
+                        return None
+                    if isinstance(node, ast.ClassDef):
+                        if count >= _MAX_WORDS or len(node.bases) > _MAX_CHOICES:
+                            self._method_graph = False
+                            return None
+                        count += 1
+                        outer = names.at[id(node)].namespace
+                        if len(outer) + len(node.name) + 1 > _MAX_TEXT:
+                            self._method_graph = False
+                            return None
+                        namespace = outer + "." + node.name
+                        if not node.body:
+                            self._method_graph = False
+                            return None
+                        scope = names.at[id(node.body[0])]
+                        if scope.kind != "class" or scope.namespace != namespace:
+                            self._method_graph = False
+                            return None
+                        # Alternative ClassDefs share a namespace, never a body scope.
+                        records.setdefault(namespace, []).append((origin, node, (scope,), set()))
+                        declaration = binding_scope(names.at[id(node)], node.name), node.name
+                        class_bindings.add(declaration)
+                        if node.decorator_list:
+                            class_rebindings.add(declaration)
+                    receiver = self.receiver_binding(node, origin)
+                    if receiver is not None:
+                        if len(receivers) >= _MAX_WORDS:
+                            self._method_graph = False
+                            return None
+                        scope, label, owner_scope = receiver
+                        receivers[scope, label] = owner_scope.namespace
+                    name, target, mutation = None, None, False
+                    if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                        name, target, mutation = node.attr, node.value, True
+                    if isinstance(node, ast.Call):
+                        setter = self.builtin_name(node.func, origin) in {"setattr", "delattr"}
+                        setter |= bool(names.resolve(node.func) & {"builtins.setattr", "builtins.delattr"})
+                        if setter:
+                            target = node.args[0] if node.args else None
+                            if (len(node.args) >= 2 and isinstance(node.args[1], ast.Constant)
+                                    and isinstance(node.args[1].value, str)):
+                                name = node.args[1].value
+                            mutation = True
+                    if mutation:
+                        if name is not None and len(name) > _MAX_TEXT or len(writes) >= _MAX_WORDS:
+                            self._method_graph = False
+                            return None
+                        writes.append((origin, target, name))
+            # A setter can mutate a class without rebinding its lexical name.
+            # Distinguish that declaration metadata from an actual competing binding.
+            for origin, tree in self.modules.items():
+                names = self.contexts[origin][0]
+                for work, node in enumerate(ast.walk(tree)):
+                    if work >= _MAX_WORDS * _MAX_DEPTH:
+                        self._method_graph = False
+                        return None
+                    labels = ()
+                    if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                        labels = (node.id,)
+                    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        labels = (node.name,)
+                    elif isinstance(node, ast.arg):
+                        labels = (node.arg,)
+                    elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                        if len(node.names) > _MAX_WORDS:
+                            self._method_graph = False
+                            return None
+                        labels = import_bindings(node, origin)
+                    elif isinstance(node, ast.ExceptHandler) and node.name:
+                        labels = (node.name,)
+                    elif type(node).__name__ in {"MatchAs", "MatchStar", "MatchMapping"}:
+                        label = getattr(node, "name", None) or getattr(node, "rest", None)
+                        labels = (label,) if label else ()
+                    for label in labels:
+                        key = binding_scope(names.at[id(node)], label), label
+                        if key in class_bindings:
+                            class_rebindings.add(key)
+            constructor_unsafe_bases, constructor_unsafe_symbols = set(), set()
+            for namespace, alternatives in records.items():
+                for origin, node, _, bases in alternatives:
+                    names = self.contexts[origin][0]
+                    if (binding_scope(names.at[id(node)], node.name), node.name) in class_rebindings:
+                        constructor_unsafe_symbols.add(namespace)
+                    for base in node.bases:
+                        if self.builtin_base(base, origin):
+                            continue
+                        targets = set()
+                        for name in names.resolve(base):
+                            extra = self.imports.resolve(name)
+                            if len(targets) + len(extra) > _MAX_CHOICES:
+                                unresolved = True
+                                constructor_unsafe_bases.add(id(node))
+                                break
+                            targets.update(extra)
+                        if not targets or not targets <= records.keys() or len(bases) + len(targets) > _MAX_CHOICES:
+                            unresolved = True
+                            constructor_unsafe_bases.add(id(node))
+                        else:
+                            bases.update(targets)
+            remaining = [_MAX_WORDS]
+            constructor_changes, constructor_cache = set(), {}
+            constructor_work = [_MAX_WORDS]
+
+            def conventional_constructor(namespace, ancestors=frozenset()):
+                if namespace in ancestors or len(ancestors) >= _MAX_DEPTH:
+                    return False
+                if namespace in constructor_cache:
+                    return constructor_cache[namespace]
+                if (namespace not in records or namespace in constructor_unsafe_symbols
+                        or constructor_work[0] <= 0
+                        or None in constructor_changes or namespace in constructor_changes):
+                    return False
+                constructor_work[0] -= 1
+                alternatives = records[namespace]
+                if len(alternatives) > _MAX_CHOICES:
+                    return False
+                following = ancestors | {namespace}
+                proven = True
+                for origin, declaration, scopes, bases in alternatives:
+                    if constructor_work[0] <= 0:
+                        proven = False
+                        break
+                    constructor_work[0] -= 1
+                    if (id(declaration) in constructor_unsafe_bases or declaration.decorator_list
+                            or len(declaration.keywords) > _MAX_CHOICES
+                            or any("__new__" in scope.bound for scope in scopes)):
+                        proven = False
+                        break
+                    for keyword in declaration.keywords:
+                        if constructor_work[0] <= 0:
+                            proven = False
+                            break
+                        constructor_work[0] -= 1
+                        if (keyword.arg != "metaclass" or self.reference_identity(
+                                keyword.value, origin, {"builtins.type"}) != "builtins.type"):
+                            proven = False
+                            break
+                    if not proven or not all(conventional_constructor(base, following) for base in bases):
+                        proven = False
+                        break
+                constructor_cache[namespace] = proven
+                return proven
+
+            def owners(node, origin, seen=frozenset(), *, class_only=False, constructors=True):
+                if node is None or id(node) in seen or len(seen) >= _MAX_DEPTH or remaining[0] <= 0:
+                    return {None}
+                remaining[0] -= 1
+                names, bindings, _ = self.contexts[origin]
+                following = seen | {id(node)}
+                if isinstance(node, ast.Call):
+                    if class_only:
+                        return {None}  # A factory result is not a proven class constructor.
+                    type_call = (self.builtin_name(node.func, origin) == "type"
+                                 or self.reference_identity(node.func, origin, {"builtins.type"}) is not None)
+                    if type_call:
+                        if len(node.args) != 1 or node.keywords:
+                            return {None}
+                        return owners(node.args[0], origin, following, constructors=constructors)
+                    if not constructors:
+                        return {None}  # Constructor-hook writes cannot assume their receiver's result type.
+                    result = owners(node.func, origin, following, class_only=True)
+                    if None in result or not all(conventional_constructor(owner) for owner in result):
+                        return {None}
+                    return result
+                if class_only and self.builtin_base(node, origin):
+                    return set()  # A builtin instance cannot be an in-repository class's receiver.
+                result, unrelated = set(), False
+                for qualified in names.resolve(node):
+                    targets = self.imports.resolve(qualified)
+                    if len(result) + len(targets) > _MAX_CHOICES:
+                        return {None}
+                    for target in targets:
+                        if target in records:
+                            result.add(target)
+                        elif target in self.imports.module_names:
+                            unrelated = True
+                if isinstance(node, ast.Name):
+                    scope = names.at[id(node)]
+                    while scope is not None:
+                        scope = binding_scope(scope, node.id)
+                        if node.id in scope.bound:
+                            declaration = scope, node.id
+                            if declaration in class_rebindings:
+                                return {None}
+                            receiver = receivers.get((scope, node.id))
+                            if receiver is not None and not class_only:
+                                result.add(receiver)
+                            choices = bindings.get((scope, node.id), ())
+                            if len(choices) > _MAX_CHOICES:
+                                return {None}
+                            for value in choices:
+                                if value is None and (result or unrelated):
+                                    continue  # A known class/receiver's declaration metadata is not another owner.
+                                if value is _UNRESOLVED_IMPORT and result and declaration in class_bindings:
+                                    continue  # Call-side mutation cannot rebind this proven class declaration.
+                                extra = owners(value, origin, following, class_only=class_only,
+                                               constructors=constructors)
+                                if len(result) + len(extra) > _MAX_CHOICES:
+                                    return {None}
+                                result.update(extra)
+                            break
+                        scope = scope.parent
+                elif isinstance(node, (ast.Constant, ast.List, ast.Tuple, ast.Dict, ast.Set)):
+                    unrelated = True
+                return result if result else set() if unrelated else {None}
+
+            # A class hook assigned after its body is just as uncertain as a
+            # declared __new__. Resolve these writes without assuming constructors.
+            for origin, target, name in writes:
+                if name is None or name == "__new__":
+                    changed = owners(target, origin, constructors=False)
+                    if changed & constructor_unsafe_symbols:
+                        changed = {None}  # An unproven class alias can name any constructor's hook.
+                    if len(constructor_changes) + len(changed) > _MAX_WORDS:
+                        constructor_changes = {None}
+                        break
+                    constructor_changes.update(changed)
+            total = 0
+            for origin, target, name in writes:
+                for namespace in owners(target, origin):
+                    if total >= _MAX_WORDS:
+                        self._method_graph = False
+                        return None
+                    total += 1
+                    written.setdefault(namespace, set()).add(name)
+            self._method_graph = records, written, unresolved
+        if self._method_graph is False:
+            return None
+        records, written, unresolved = self._method_graph
+        if unresolved or owner.namespace not in records:
+            return None
+        selected = {owner.namespace}
+        for _ in range(len(records)):
+            extra = {namespace for namespace, alternatives in records.items()
+                     if any(bases & selected for _, _, _, bases in alternatives)}
+            if extra <= selected:
+                break
+            selected.update(extra)
+        related, pending = set(selected), list(selected)
+        while pending:
+            namespace = pending.pop()
+            for _, _, _, bases in records[namespace]:
+                for base in bases:
+                    if base not in related:
+                        if len(related) >= _MAX_WORDS:
+                            return None
+                        related.add(base)
+                        pending.append(base)
+        if any(attribute in written.get(namespace, ()) or None in written.get(namespace, ())
+               for namespace in (*related, None)):
+            return None
+        pending, visited, found, work = list(selected), set(), [], 0
+        while pending:
+            namespace = pending.pop()
+            if namespace in visited:
+                continue
+            if work >= _MAX_WORDS:
+                return None
+            work += 1
+            visited.add(namespace)
+            if len(namespace) + len(attribute) + 1 > _MAX_TEXT:
+                return None
+            if self.export_changed(namespace + "." + attribute):
+                return None
+            for origin, tree, scopes, bases in records[namespace]:
+                names, bindings, _ = self.contexts[origin]
+                local = False
+                for scope in scopes:
+                    declared = []
+                    for node in ast.walk(tree):
+                        if work >= _MAX_WORDS:
+                            return None
+                        work += 1
+                        if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == attribute
+                                and binding_scope(names.at[id(node)], node.name) is scope):
+                            if len(declared) >= _MAX_CHOICES:
+                                return None
+                            declared.append(node)
+                    assigned = bindings.get((scope, attribute), ())
+                    if len(found) + len(declared) + len(assigned) > _MAX_CHOICES:
+                        return None
+                    if declared or assigned:
+                        definite = self.definite_bindings(origin)
+                        if definite is None:
+                            return None
+                        local |= (scope, attribute) in definite
+                        found.extend((value, origin) for value in declared)
+                        found.extend((value, origin) for value in assigned if value is not None or not declared)
+                if not local:
+                    if len(pending) + len(bases) + work > _MAX_WORDS:
+                        return None
+                    pending.extend(bases)
+        return tuple(found) if found else None
+
+    def identity_decorator(self, node, origin):
+        """Preserve only proven builtin descriptor identities."""
+        if self.reference_identity(node, origin, {"builtins.staticmethod", "builtins.classmethod"}) is not None:
+            return True
+        if not isinstance(node, ast.Name) or node.id not in {"staticmethod", "classmethod"}:
+            return False
+        scope = self.contexts[origin][0].at[id(node)]
+        while scope is not None:
+            scope = binding_scope(scope, node.id)
+            if node.id in scope.bound or scope.star_imports:
+                return False
+            scope = scope.parent
+        return True
+
+    def called_returns(self, function, origin, *, call=None, _factory=0, _depth=0,
+                       _ancestors=frozenset(), _budget=None, _decorating=False):
+        """Union bounded callable candidates' evidence; unsupported selections are unknown."""
+        if _depth >= _MAX_DEPTH or id(function) in _ancestors or (_budget is not None and _budget[0] <= 0):
+            return None
+        names, bindings, _ = self.contexts[origin]
+        if origin not in self._return_definitions:
+            definitions, receivers, parameters = {}, {}, set()
+            count = 0
+            for work, node in enumerate(ast.walk(self.modules[origin])):
+                if work >= _MAX_WORDS * _MAX_DEPTH:
+                    return None
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                    if count >= _MAX_WORDS:
+                        return None
+                    count += 1
+                    if not isinstance(node, ast.Lambda):
+                        scope = binding_scope(names.at[id(node)], node.name)
+                        definitions.setdefault((scope, node.name), []).append(node)
+                        receiver = self.receiver_binding(node, origin)
+                        if receiver is not None:
+                            parameter_scope, label, owner_scope = receiver
+                            receivers[parameter_scope, label] = owner_scope
+                    if isinstance(node, ast.ClassDef):
+                        continue  # Keep class identity; its body is not function return evidence.
+                    args = node.args
+                    count_parameters = (len(args.posonlyargs) + len(args.args) + len(args.kwonlyargs)
+                                        + int(args.vararg is not None) + int(args.kwarg is not None))
+                    if count_parameters > _MAX_WORDS or len(parameters) + count_parameters > _MAX_WORDS:
+                        return None
+                    arguments = (*args.posonlyargs, *args.args, *args.kwonlyargs,
+                                 *((args.vararg,) if args.vararg is not None else ()),
+                                 *((args.kwarg,) if args.kwarg is not None else ()))
+                    parameters.update((names.at[id(argument)], argument.arg) for argument in arguments)
+            self._return_definitions[origin] = definitions, receivers, parameters
+        definitions, receivers, parameters = self._return_definitions[origin]
+        budget = [_MAX_WORDS] if _budget is None else _budget
+
+        def receiver_owner(node):
+            if not isinstance(node, ast.Name):
+                return None, None
+            scope = names.at[id(node)]
+            while scope is not None:
+                scope = binding_scope(scope, node.id)
+                if node.id in scope.bound:
+                    break
+                scope = scope.parent
+            return scope, receivers.get((scope, node.id))
+
+        def callable_reference(node, seen=frozenset(), *, container=False):
+            if id(node) in seen or len(seen) >= _MAX_DEPTH or budget[0] <= 0:
+                return True
+            budget[0] -= 1
+            following = seen | {id(node)}
+            if isinstance(node, ast.Lambda):
+                return True
+            if isinstance(node, ast.IfExp):
+                return (callable_reference(node.body, following, container=container)
+                        or callable_reference(node.orelse, following, container=container))
+            if isinstance(node, ast.BoolOp):
+                return any(callable_reference(value, following, container=container) for value in node.values)
+            if isinstance(node, ast.Subscript):
+                return callable_reference(node.value, following, container=True)
+            if isinstance(node, (ast.List, ast.Tuple, ast.Dict, ast.Set)):
+                values = node.values if isinstance(node, ast.Dict) else node.elts
+                if len(values) > _MAX_CHOICES:
+                    return True
+                return any(callable_reference(value, following) for value in values)
+            if isinstance(node, ast.Call):
+                returns = self.called_returns(node.func, origin, call=node, _depth=_depth + len(following),
+                                              _ancestors=_ancestors | following, _budget=budget)
+                return (returns is None or any(isinstance(value, tuple)
+                        or callable_reference(value, following, container=container) for value in returns))
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+                _, owner = receiver_owner(node.value)
+                if owner is not None and definitions.get((owner, node.attr)):
+                    return True
+                return False
+            if not isinstance(node, ast.Name):
+                return False
+            scope = names.at[id(node)]
+            while scope is not None:
+                scope = binding_scope(scope, node.id)
+                if (scope, node.id) in definitions or node.id in scope.imports or scope.star_imports:
+                    return True
+                if node.id in scope.bound:
+                    choices = bindings.get((scope, node.id), ())
+                    if len(choices) > _MAX_CHOICES:
+                        return True
+                    return any(callable_reference(value, following, container=container) for value in choices if value is not None)
+                scope = scope.parent
+            return False
+
+        def decorated_target(node):
+            if isinstance(node, ast.Name) and self.definite_name(node, origin):
+                scope = names.at[id(node)]
+                while scope is not None:
+                    scope = binding_scope(scope, node.id)
+                    if node.id in scope.bound:
+                        declared = definitions.get((scope, node.id), ())
+                        return bool(declared) and all(value.decorator_list for value in declared)
+                    scope = scope.parent
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+                _, owner = receiver_owner(node.value)
+                methods = self.method_candidates(owner, node.attr) if owner is not None else None
+                return methods is not None and all(isinstance(value, (ast.FunctionDef, ast.AsyncFunctionDef))
+                                                   and value.decorator_list for value, _ in methods)
+            return False
+
+        def decorator_argument(node):
+            if isinstance(node, ast.Lambda):
+                return True
+            if isinstance(node, ast.Name) and self.definite_name(node, origin):
+                scope = names.at[id(node)]
+                while scope is not None:
+                    scope = binding_scope(scope, node.id)
+                    if node.id in scope.bound:
+                        return bool(definitions.get((scope, node.id))) or self.helper_identity(node, origin) is not None
+                    scope = scope.parent
+            return False
+
+        def selection_form(node, decorating, factory):
+            if isinstance(node, ast.Name):
+                if self.builtin_name(node, origin) in PURE_BUILTINS:
+                    return "pure-builtin" if factory == 0 and call is not None else "UNKNOWN"
+                return "definite-name" if self.definite_name(node, origin) else "UNKNOWN"
+            if isinstance(node, ast.Attribute):
+                return "resolved-attribute"
+            if isinstance(node, ast.Lambda):
+                return "lambda"
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return "resolved-definition"
+            if isinstance(node, ast.Call):
+                if self.identity_decorator(node.func, origin) and len(node.args) == 1 and not node.keywords:
+                    return "descriptor"
+                if decorating or decorated_target(node.func):
+                    return "decorator-model"
+                if len(node.args) == 1 and not node.keywords and decorator_argument(node.args[0]):
+                    return "decorator-application"
+            return "UNKNOWN"
+
+        def callback_arguments():
+            callbacks = []
+            if len(call.args) + len(call.keywords) > _MAX_WORDS:
+                return None
+            for value in call.args:
+                if callable_reference(value):
+                    if len(callbacks) >= _MAX_WORDS:
+                        return None
+                    callbacks.append(value)
+            fields, unknown = api_keywords(call, key_resolver=lambda value: self.constant_strings(value, origin))
+            # Unknown ** mappings can contain key= or a callable under another key.
+            if fields is None or unknown:
+                return None
+            else:
+                for name, value in fields.items():
+                    key_callback = name == "key" and not (isinstance(value, ast.Constant) and value.value is None)
+                    if key_callback or callable_reference(value):
+                        if len(callbacks) >= _MAX_WORDS:
+                            return None
+                        callbacks.append(value)
+            return callbacks
+
+        callbacks, inspected_callbacks = (), False
+        pending, found, seen, work = [(function, False, _depth, _ancestors, _factory, _decorating)], [], set(), 0
+        while pending:
+            node, selected, depth, ancestors, factory, decorating = pending.pop()
+            if id(node) in ancestors or depth >= _MAX_DEPTH:
+                return None
+            key = id(node), selected, factory, decorating
+            if key in seen:
+                continue
+            if work >= _MAX_WORDS or budget[0] <= 0:
+                return None
+            budget[0] -= 1
+            seen.add(key)
+            work += 1
+            if node is None and not selected:
+                continue  # Ordinary local declaration metadata adds no callable alternative.
+            form = selection_form(node, decorating, factory)
+            if form == "UNKNOWN":
+                return None
+            if form == "pure-builtin" and (not selected or decorating):
+                if not inspected_callbacks:
+                    callbacks, inspected_callbacks = callback_arguments(), True
+                if callbacks is None:
+                    return None
+                if len(pending) + len(callbacks) + work > _MAX_WORDS:
+                    return None
+                for value in callbacks:
+                    pending.append((value, True, depth + 1, ancestors | {id(node)}, 0, False))
+            candidates = ()
+            next_factory, next_decorating = factory, decorating
+            if isinstance(node, ast.Name):
+                scope = names.at[id(node)]
+                while scope is not None:
+                    scope = binding_scope(scope, node.id)
+                    imported = node.id in scope.imports or node.id not in scope.bound and scope.star_imports
+                    if imported and self.helper_identity(node, origin) is None:
+                        # Helper identity follows imported_binding; declaration placeholders supply no return body.
+                        return None
+                    if node.id in scope.bound:
+                        if (scope, node.id) in parameters:
+                            return None  # A caller may replace a callable parameter, whatever its default.
+                        declared = definitions.get((scope, node.id), ())
+                        assigned = bindings.get((scope, node.id), ())
+                        if len(declared) + len(assigned) > _MAX_CHOICES:
+                            return None
+                        if declared:
+                            # None marks an ordinary declaration, not another callable alternative.
+                            assigned = tuple(value for value in assigned if value is not None)
+                        candidates = (*declared, *assigned)
+                        break
+                    scope = scope.parent
+                if (not candidates and self.helper_identity(node, origin) is None
+                        and self.builtin_name(node, origin) not in PURE_BUILTINS):
+                    return None  # An opaque callable candidate is not an inspected native helper.
+            elif isinstance(node, ast.Call):
+                next_decorating = True
+                if self.identity_decorator(node.func, origin) and len(node.args) == 1 and not node.keywords:
+                    candidates, selected = (node.args[0],), True
+                else:
+                    candidates, selected, next_factory = (node.func,), True, factory + 1
+            elif isinstance(node, ast.Attribute):
+                scope, owner = receiver_owner(node.value)
+                if owner is not None:
+                    initializers = bindings.get((scope, node.value.id), ())
+                    if (owner is None or len(initializers) > _MAX_CHOICES
+                            or any(value is not None for value in initializers)):
+                        return None
+                    methods = self.method_candidates(owner, node.attr)
+                    if methods is None:
+                        return None
+                    local = []
+                    for candidate, target in methods:
+                        if target == origin:
+                            local.append(candidate)
+                        else:
+                            returns = self.called_returns(candidate, target, _factory=factory, _depth=depth + 1,
+                                                          _ancestors=ancestors | {id(node)}, _budget=budget)
+                            if returns is None or len(found) + len(returns) > _MAX_WORDS:
+                                return None
+                            found.extend(item if isinstance(item, tuple) else (item, target) for item in returns)
+                    candidates = tuple(local)
+                elif (self.helper_identity(node, origin) is None
+                      and not (node.attr in _STRING_METHODS and self.string_receiver_proven(node.value, origin))):
+                    return None  # An unmodeled method may return an interpreter command.
+            elif isinstance(node, ast.Lambda):
+                if len(found) + len(node.args.defaults) + len(node.args.kw_defaults) + 1 > _MAX_WORDS:
+                    return None
+                found.extend(value for value in (*node.args.defaults, *node.args.kw_defaults) if value is not None)
+                if factory:
+                    candidates, next_factory = (node.body,), factory - 1
+                else:
+                    found.append(node.body)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if len(node.decorator_list) > _MAX_CHOICES or len(node.decorator_list) + work > _MAX_WORDS:
+                    return None
+                replacement = None
+                for decorator in node.decorator_list:
+                    work += 1
+                    if not self.identity_decorator(decorator, origin):
+                        replacement = decorator
+                        break
+                if replacement is not None:
+                    if len(pending) + work + 1 > _MAX_WORDS:
+                        return None
+                    # The outermost non-descriptor decorator determines the returned callable.
+                    pending.append((replacement, True, depth + 1, ancestors | {id(node)}, factory + 1, True))
+                    continue
+                if (len(node.body) + work > _MAX_WORDS
+                        or len(found) + len(node.args.defaults) + len(node.args.kw_defaults) > _MAX_WORDS):
+                    return None
+                found.extend(value for value in (*node.args.defaults, *node.args.kw_defaults) if value is not None)
+                body = list(node.body)
+                returned = []
+                while body:
+                    statement = body.pop()
+                    if work >= _MAX_WORDS:
+                        return None
+                    work += 1
+                    if isinstance(statement, (ast.Return, ast.Yield, ast.YieldFrom)):
+                        if statement.value is not None:
+                            if len(found) + len(returned) >= _MAX_WORDS:
+                                return None
+                            (returned if factory else found).append(statement.value)
+                    elif not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                        for child in ast.iter_child_nodes(statement):
+                            if len(body) + work >= _MAX_WORDS:
+                                return None
+                            body.append(child)
+                if factory:
+                    candidates, next_factory = returned, factory - 1
+            elif selected or node is not None:
+                return None  # An unresolved callable alternative is unknown even before selection.
+            if len(candidates) > _MAX_CHOICES or len(pending) + len(candidates) + work > _MAX_WORDS:
+                return None
+            ancestors = ancestors | {id(node)}
+            pending.extend((candidate, selected, depth + 1, ancestors, next_factory, next_decorating)
+                           for candidate in candidates)
+        return tuple(found)
+
+    def command_evidence(self, command, origin, *, executable=None):
+        """Keep uncertainty and interpreter evidence when command resolution loses words."""
+        expression = ast.Tuple(elts=list(command)) if isinstance(command, tuple) else command
+        content = expression is not None and self.bearing(expression, origin, unresolved_only=True)
+        pending, visited = [(expression, origin, 0)], set()
+        executables = self.effective_executables(executable, origin) or {None}
+        if len(executables) > _MAX_CHOICES:
+            return _CommandEvidence(True, True, True, True)
+        if executable is not None and executables != {_USE_HEAD}:
+            pending.append((executable, origin, 0))
+        unresolved, interpreter, selector = False, False, False
+        module, code = False, False
+        work = 0
+
+        def extend(target, items):
+            for item in items:
+                if len(target) + work >= _MAX_WORDS:
+                    return False
+                target.append(item)
+            return True
+
+        while pending:
+            node, source, depth = pending.pop()
+            key = source, node if isinstance(node, str) else id(node)
+            if key in visited:
+                continue
+            visited.add(key)
+            if depth >= _MAX_DEPTH or work >= _MAX_WORDS:
+                return _CommandEvidence(True, True, True, True)
+            work += 1
+            if isinstance(node, str):
+                binding = self.imported_binding(node)
+                if binding is None:
+                    unresolved = content = True
+                    continue
+                target, choices, imports = binding
+                if any(item is None for item in choices):
+                    return _CommandEvidence(True, True, True, True)  # Imported declarations provide no return body.
+                extra = []
+                if (not extend(extra, ((item, target, depth + 1) for item in choices))
+                        or not extend(extra, ((item, None, depth + 1) for item in imports))):
+                    return _CommandEvidence(True, True, True, True)
+            elif isinstance(node, ast.AST):
+                values = self.values(node, source)
+                if None in values or _UNRESOLVED_IMPORT in values:
+                    constants = self.constant_strings(node, source)
+                    if constants is not None:
+                        values = constants
+                if _UNRESOLVED_IMPORT in values:
+                    content |= self.bearing(node, source, unresolved_only=True)
+                unknown = False
+                words = []
+                if not extend(words, values):
+                    return _CommandEvidence(True, True, True, True)
+                while words:
+                    value = words.pop()
+                    if value is _PYTHON:
+                        interpreter = True
+                    elif value is _OPTION_PREFIX:
+                        continue  # The exact source-pinned option proof is known.
+                    elif isinstance(value, _Argv):
+                        if len(value.items) > _MAX_WORDS:
+                            return _CommandEvidence(True, True, True, True)
+                        allowed, module_operands, tails = None, None, None
+                        for actual in executables:
+                            positions, captures_for_actual, resolved_code = {}, Counter(), False
+                            for program in self.argv_programs(value, fragment=False, executable=actual,
+                                                              source_positions=positions):
+                                if (positions.get("mode") == "code" and isinstance(program, tuple)
+                                        and program[0] == "captured-module"):
+                                    captures_for_actual[program] += 1
+                                resolved_code |= positions.get("mode") == "code" and isinstance(program, str)
+                            suffix = set(range(positions["tail"], len(value.items))) if resolved_code else set()
+                            tails = suffix if tails is None else tails & suffix
+                            index = positions.get("index") if positions.get("mode") == "module" else None
+                            indices = set() if index is None else {index}
+                            module_operands = indices if module_operands is None else module_operands & indices
+                            allowed = captures_for_actual if allowed is None else allowed & captures_for_actual
+                        allowed = allowed or Counter()
+                        captures = Counter(word for word in value.items if isinstance(word, tuple)
+                                           and len(word) == 2 and word[0] == "captured-module")
+                        for index, word in enumerate(value.items):
+                            if index in (tails or ()):
+                                continue  # Arguments after a resolved -c source cannot change its program.
+                            if index in (module_operands or ()):
+                                continue  # ROUND-17c: this argument names a module, never inline source.
+                            if word in captures and captures[word] <= allowed[word]:
+                                continue  # Exactly a modeled, unchanged program operand.
+                            if not extend(words, (word,)):
+                                return _CommandEvidence(True, True, True, True)
+                    elif isinstance(value, _Quoted):
+                        text = self.text(value)
+                        if not extend(words, (text if text is not None else None,)):
+                            return _CommandEvidence(True, True, True, True)
+                    elif isinstance(value, (str, _Shell)):
+                        text = value.text if isinstance(value, _Shell) else value
+                        if len(text) > _MAX_TEXT:
+                            return _CommandEvidence(True, True, True, True)
+                        tokens = text.split(None, _MAX_WORDS)
+                        if len(tokens) > _MAX_WORDS:
+                            return _CommandEvidence(True, True, True, True)
+                        interpreter |= any(python_word(word.strip("'\";,()")) for word in tokens)
+                        selector |= any(value_selector_hint(word) or selector_hint(word) for word in tokens)
+                        modes = {python_selector(word.strip("'\";,()"))[0] for word in tokens}
+                        module |= "module" in modes
+                        code |= "code" in modes
+                        unknown |= isinstance(value, _Shell) and bool(value.holes or value.hidden)
+                    else:
+                        unknown = True
+                        if isinstance(value, tuple) and len(value) == 2 and value[0] == "captured-module":
+                            content = True  # Captures elsewhere cannot waive launch uncertainty.
+                unresolved |= unknown
+                if not unknown:
+                    continue
+                names, bindings, _ = self.contexts[source]
+                extra = []
+                trusted = isinstance(node, ast.Call) and self.helper_identity(node.func, source) is not None
+                children = (child for child in ast.iter_child_nodes(node)
+                            if not (trusted and child is node.func))
+                if not extend(extra, ((child, source, depth + 1) for child in children)):
+                    return _CommandEvidence(True, True, True, True)
+                if isinstance(node, ast.Name):
+                    scope = names.at[id(node)]
+                    while scope is not None:
+                        scope = binding_scope(scope, node.id)
+                        choices = bindings.get((scope, node.id), ())
+                        if choices or node.id in scope.bound:
+                            if not extend(extra, ((item, source, depth + 1) for item in choices)):
+                                return _CommandEvidence(True, True, True, True)
+                            break
+                        scope = scope.parent
+                if isinstance(node, ast.Call) and not trusted:
+                    returns = self.called_returns(node.func, source, call=node)
+                    if returns is None:
+                        return _CommandEvidence(True, True, True, True)
+                    for item in returns:
+                        value, target = item if isinstance(item, tuple) else (item, source)
+                        if not extend(extra, ((value, target, depth + 1),)):
+                            return _CommandEvidence(True, True, True, True)
+                if not extend(extra, ((name, None, depth + 1) for name in names.resolve(node))):
+                    return _CommandEvidence(True, True, True, True)
+            else:
+                unresolved = True
+                continue
+            if len(pending) + len(extra) + work > _MAX_WORDS:
+                return _CommandEvidence(True, True, True, True)
+            pending.extend(extra)
+        return _CommandEvidence(unresolved, interpreter, selector, content, module and not code)
 
     def launch_programs(self, node, api, origin):
         # Unknown runtime arguments still enroll at the API reference. Inspect
@@ -1160,30 +3324,29 @@ class CommandResolver:
         vectors = (self.sequence(ast.Tuple(elts=list(command)), origin, frozenset())
                    if isinstance(command, tuple) else self.values(command, origin))
         executables = self.effective_executables(executable, origin)
-        if None in vectors and any(isinstance(vector, _Argv) and vector.items
-                                   and any(python_selector(word)[0] == "code" for word in vector.items)
-                                   and (vector.items[0] is _PYTHON or python_word(vector.items[0])
-                                        or vector.items[0] is None) for vector in vectors):
-            yield None  # An untracked write can change a known program vector.
         for vector in vectors:
             for program in executables:
                 if shell:
                     text = vector.items[0] if isinstance(vector, _Argv) and vector.items else vector
                     if program is _PYTHON or python_word(program):
                         yield self.code(text)
+                    elif program is None or program is _UNRESOLVED_IMPORT:
+                        yield None  # An explicit unknown executable may select Python rather than a shell.
                     elif isinstance(text, (str, _Shell)):
                         yield from self.shell_programs(text)
                 elif isinstance(vector, _Argv):
                     yield from self.argv_programs(vector, executable=program, fragment=False)
 
     def module_program(self, value):
-        if not isinstance(value, str) or not value.startswith(("aegis_core.", "aegis_cli.", "aegis_mcp.", "tools.")):
+        if not isinstance(value, str):
+            return "external-module", None  # Unknown module operands use the import path (ROUND-17c).
+        if not value.startswith(("aegis_core.", "aegis_cli.", "aegis_mcp.", "tools.")):
             return "external-module", value
         base = value.replace(".", "/")
         for target in (base + ".py", base + "/__main__.py"):
             if target in self.modules:
                 return "captured-module", target
-        return None
+        return _UNRESOLVED_MODULE
 
     def shell_argv_programs(self, items, executable, depth):
         if executable.replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe") in {"cmd", "powershell", "pwsh"}:
@@ -1216,11 +3379,12 @@ class CommandResolver:
         key = text.partition("=")[0]
         return bool(key and key[0].isalpha() and all(char.isalnum() or char in "._-" for char in key))
 
-    def argv_programs(self, value, *, fragment=True, executable=_USE_HEAD, depth=0):
+    def argv_programs(self, value, *, fragment=True, executable=_USE_HEAD, depth=0,
+                      source_positions=None):
         items = value.items
         if not items:
             return
-        if depth >= _MAX_DEPTH:
+        if depth >= _MAX_DEPTH or len(items) > _MAX_WORDS:
             yield None
             return
         for nested in items:
@@ -1234,13 +3398,61 @@ class CommandResolver:
             yield None
             return
         head = items[0] if executable is _USE_HEAD else executable
+        if isinstance(head, tuple) and len(head) == 2 and head[0] == "captured-module":
+            yield None  # Captured module bytes are never a proven interpreter name.
+            return
         if shell_word(head):
             yield from self.shell_argv_programs(items, head, depth)
             return
+        wrapper = command_basename(head)
+        original_wrapper = command_basename(items[0])
+        wrappers = _WRAPPER_GRAMMAR.keys() | _UNKNOWN_WRAPPERS
+        if wrapper in wrappers or original_wrapper in wrappers:
+            if executable is not _USE_HEAD:
+                yield None
+                return  # Explicit executable overrides are outside the closed wrapper model.
+            suffix = closed_wrapper_argv(items)
+            if suffix is None:
+                yield None
+                return
+            if not suffix:
+                return
+            start = len(items) - len(suffix)
+            positions = {}
+            for program in self.argv_programs(_Argv(value.kind, suffix), fragment=False,
+                                              depth=depth + 1, source_positions=positions):
+                yield _UNRESOLVED_MODULE if program == ("external-module", None) else program
+            if source_positions is not None and positions:
+                source_positions.update(positions)
+                for key in ("index", "tail"):
+                    if source_positions.get(key) is not None:
+                        source_positions[key] += start
+            return
         hint = any(value_selector_hint(word) for word in items)
         interpreter = head is _PYTHON or python_word(head)
-        uncertain = head is None or head is _SPLICE or isinstance(head, (_Shell, _Quoted))
-        if not hint and not (interpreter and any(word is _SPLICE for word in items)):
+        uncertain = head is None or head is _UNRESOLVED_IMPORT or head is _SPLICE or isinstance(head, (_Shell, _Quoted))
+        if not interpreter and hint:
+            for position, word in enumerate(items[1:], 1):
+                mode, attached = python_selector(word)
+                if mode != "code":
+                    continue
+                source = attached if attached is not None else self.code(items[position + 1]) if position + 1 < len(items) else None
+                if not isinstance(source, str):
+                    continue
+                if len(source) > _MAX_TEXT:
+                    yield None
+                    return
+                try:
+                    ast.parse(source)
+                except (SyntaxError, ValueError, UnicodeError, RecursionError):
+                    continue  # Only a parsable literal is inspected independently of its head.
+                yield source
+        if uncertain and not fragment:
+            if hint or len(items) > 1:
+                yield None  # Its selector may be Python; its source language is unproven.
+            return
+        if not hint and not (interpreter and any(not isinstance(word, str) and word is not _OPTION_PREFIX
+                                                for word in items[1:])):
             return
         if interpreter:
             index = 1
@@ -1254,23 +3466,22 @@ class CommandResolver:
             uncertain = True  # An option fragment has no executable yet.
             index = 0
         else:
+            shell = next((index for index, word in enumerate(items[1:], 1) if shell_word(word)), None)
+            if shell is not None:
+                yield from self.shell_argv_programs(items[shell:], items[shell], depth)
+                return
             if any(word is _PYTHON or python_word(word) for word in items[1:]):
                 yield None  # Interpreter/selector present but not consumed at the command position.
                 return
-            # Native option grammars differ from Python's. Inspect constant
-            # programs wherever their selector occurs, without interpreting data.
-            for position, word in enumerate(items[1:], 1):
-                mode, attached = python_selector(word)
-                if mode == "code":
-                    source = attached if attached is not None else self.code(items[position + 1]) if position + 1 < len(items) else None
-                    if source is not None:
-                        yield source
             return
         while index < len(items):
             word = items[index]
             if word is _OPTION_PREFIX:
                 index += 1
                 continue  # The exact pinned proof permits only options here.
+            if not isinstance(word, str):
+                yield None  # Only resolved strings may occupy an option/selector position.
+                return
             mode, attached = python_selector(word)
             if mode in {"code", "module"}:
                 source = None
@@ -1280,8 +3491,13 @@ class CommandResolver:
                     source = self.code(items[index + 1])
                 elif fragment:
                     return
+                if interpreter and source_positions is not None:
+                    source_positions.update(mode=mode, index=index + 1 if attached is None
+                                            and index + 1 < len(items) else None,
+                                            tail=index + (2 if attached is None else 1))
                 if mode == "module":
-                    yield self.module_program(source)
+                    yield (_UNRESOLVED_MODULE if attached is None and index + 1 >= len(items)
+                           else self.module_program(source))
                 elif source is not None or interpreter or uncertain:
                     yield source
                 return
@@ -1405,102 +3621,261 @@ class CommandResolver:
             converted.append(_SPLICE if any(matches) else (None if matches else word))
         yield from self.argv_programs(_Argv("list", tuple(converted)), fragment=False, depth=depth + 1)
 
-    def bearing(self, node, origin, seen=frozenset()):
-        if id(node) in seen or len(seen) >= _MAX_DEPTH:
+    def format_conversion(self, node, origin):
+        """Prove plain string fields; attribute and subscript fields perform operations."""
+        templates = self.constant_strings(node.func.value, origin)
+        if templates is None:
             return False
-        seen = seen | {id(node)}
-        names, bindings, _ = self.contexts[origin]
-        for child in ast.walk(node):
-            if names.resolve(child) == {"sys.executable"}:
+        work = 0
+        for template in templates:
+            position = 0
+            for brace in re.finditer(r"[{}]", template):
+                if work >= _MAX_WORDS:
+                    return False
+                work += 1
+                if brace.start() < position:
+                    continue
+                char, position = brace.group(), brace.start()
+                if template.startswith(char * 2, position):
+                    position += 2
+                else:
+                    field = _FORMAT_FIELD.match(template, position) if char == "{" else None
+                    if field is None:
+                        return False
+                    position = field.end()
+        return True
+
+    def bearing(self, node, origin, seen=frozenset(), *, unresolved_only=False):
+        """Walk sources, preserving unknown content through every value wrapper."""
+        pending, visited = [(node, origin, False, False)], set()
+
+        def enqueue(value, source, operated, path_operated=False):
+            if len(pending) + len(visited) >= _MAX_WORDS:
+                return False
+            pending.append((value, source, operated, path_operated))
+            return True
+
+        while pending:
+            value, source, operated, path_operated = pending.pop()
+            if value is _UNRESOLVED_IMPORT:
                 return True
-            if isinstance(child, ast.Constant) and isinstance(child.value, str) and value_selector_hint(child.value):
-                return True
-            if isinstance(child, ast.Name):
-                scope = names.at[id(child)]
-                while scope is not None:
-                    scope = binding_scope(scope, child.id)
-                    values = bindings.get((scope, child.id), ())
-                    if values or child.id in scope.bound:
-                        if any(isinstance(value, (ast.Name, ast.List, ast.Tuple, ast.BinOp, ast.JoinedStr, ast.Constant, ast.IfExp))
-                               and self.bearing(value, origin, seen) for value in values):
+            if value is None:
+                continue  # Parameters and ordinary declarations are opaque, not content sources.
+            key = (value, operated, path_operated) if isinstance(value, str) else (source, id(value), operated, path_operated)
+            if key in visited or not isinstance(value, str) and id(value) in seen:
+                continue
+            visited.add(key)
+            if isinstance(value, str):
+                if self.export_changed(value) or self.imported(value, frozenset()) == {None}:
+                    return True
+                binding = self.imported_binding(value)
+                if binding is None:
+                    return True
+                target, choices, imports = binding
+                for item in choices:
+                    if not enqueue(item, target, operated, path_operated):
+                        return True
+                for qualified in imports:
+                    if not enqueue(qualified, None, operated, path_operated):
+                        return True
+                continue
+            if not isinstance(value, ast.AST):
+                continue
+            names, bindings, _ = self.contexts[source]
+            capture = captured_module(value, names, source, self.modules, helper_identity=self.helper_identity)
+            if capture is not None and not self.export_changed("pathlib.Path"):
+                if operated:
+                    return True
+                continue  # Only the exact, unchanged captured bytes are known.
+            if isinstance(value, ast.Constant) and isinstance(value.value, (str, bytes)):
+                text = value.value
+                if len(text) > _MAX_TEXT:
+                    return True
+                if isinstance(text, bytes):
+                    text = text.decode("latin-1")
+                words = text.split(None, _MAX_WORDS)
+                if len(words) > _MAX_WORDS or any(
+                        value_selector_hint(word) or selector_hint(word) for word in words):
+                    return True
+                continue
+            if isinstance(value, (ast.For, ast.AsyncFor, ast.comprehension)):
+                if not enqueue(value.iter, source, True, True):
+                    return True
+                if isinstance(value, ast.comprehension):
+                    for condition in value.ifs:
+                        if not enqueue(condition, source, True, True):
                             return True
-                        break
-                    scope = scope.parent
+                continue
+            if isinstance(value, ast.Call):
+                # These helpers transform inputs without introducing a new source.
+                # Their entire proven callee reference is known; every argument remains live.
+                identity = self.helper_identity(value.func, source)
+                if path_operated and identity in {"pathlib.Path", "pathlib.PurePath", "pathlib.Path.cwd", "pathlib.Path.home"}:
+                    return True
+                trusted = identity is not None
+                conversion = identity == "os.fspath" or identity in {
+                    "pathlib.Path", "pathlib.PurePath", "pathlib.Path.cwd", "pathlib.Path.home"}
+                if isinstance(value.func, ast.Name) and value.func.id in {"str", "repr", "ascii", "bytes"}:
+                    scope = names.at[id(value.func)]
+                    while scope is not None and (value.func.id not in scope.bound or scope.kind == "class"):
+                        scope = scope.parent
+                    conversion = scope is None
+                if isinstance(value.func, ast.Attribute):
+                    if value.func.attr in _CONTENT_METHODS:
+                        return True
+                    if not trusted and value.func.attr in _STRING_METHODS:
+                        if not enqueue(value.func.value, source, True, True):
+                            return True
+                        trusted = True
+                        conversion = value.func.attr == "format" and self.format_conversion(value, source)
+                if not trusted and not enqueue(value.func, source, True, True):
+                    return True
+                for argument in value.args:
+                    if not enqueue(argument, source, True, not conversion):
+                        return True
+                for keyword in value.keywords:
+                    if not enqueue(keyword.value, source, True, not conversion):
+                        return True
+                continue
+            if isinstance(value, (ast.Name, ast.Attribute)):
+                if isinstance(value, ast.Name) and value.id == "open":
+                    scope = names.at[id(value)]
+                    while scope is not None and ("open" not in scope.bound or scope.kind == "class"):
+                        scope = scope.parent
+                    if scope is None:
+                        return True  # Preserve the builtin reader through stored callable aliases too.
+                if isinstance(value, ast.Attribute) and value.attr in _CONTENT_METHODS:
+                    return True  # A stored reader keeps its source when called via an alias.
+                resolved = names.resolve(value)
+                if resolved in ({"sys.executable"}, {"os.devnull"}):
+                    if resolved == {"sys.executable"} and not unresolved_only:
+                        return True
+                    continue
+                for qualified in resolved:
+                    if not enqueue(qualified, None, operated, path_operated):
+                        return True
+                if isinstance(value, ast.Name):
+                    scope = names.at[id(value)]
+                    while scope is not None:
+                        scope = binding_scope(scope, value.id)
+                        choices = bindings.get((scope, value.id), ())
+                        if choices or value.id in scope.bound:
+                            for item in choices:
+                                if not enqueue(item, source, operated, path_operated):
+                                    return True
+                            break
+                        scope = scope.parent
+                    continue
+            if isinstance(value, ast.FormattedValue):
+                if not enqueue(value.value, source, True, False):
+                    return True
+                if value.format_spec is not None and not enqueue(value.format_spec, source, True, True):
+                    return True
+                continue
+            if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Mod):
+                templates = self.values(value.left, source)
+                if templates and all(isinstance(text, str) for text in templates):
+                    if not enqueue(value.left, source, True, False) or not enqueue(value.right, source, True, False):
+                        return True
+                    continue
+            # Transport preserves Path values. String conversion ends Path operations;
+            # every transformation of captured program bytes still removes its waiver.
+            unchanged = isinstance(value, (ast.List, ast.Tuple, ast.Set, ast.Dict, ast.IfExp, ast.BoolOp))
+            for child in ast.iter_child_nodes(value):
+                if not enqueue(child, source, operated or not unchanged or isinstance(value, ast.BoolOp),
+                               path_operated or not unchanged):
+                    return True
         return False
 
     def imported_argv_source_words(self, qualified, seen):
         """Follow the same re-export chain as values(), retaining AST operands."""
-        if qualified in seen or len(seen) >= _MAX_DEPTH:
-            return set()
+        if qualified in seen or self.export_changed(qualified) or len(seen) >= _MAX_DEPTH:
+            return {((None, _UNRESOLVED_IMPORT),)}
+        if self.imported(qualified, seen) == {None}:
+            return {((None, _UNRESOLVED_IMPORT),)}
         seen = seen | {qualified}
-        base, _, attribute = qualified.rpartition(".")
-        target = base.replace(".", "/") + ".py"
-        if target not in self.modules:
-            target = base.replace(".", "/") + "/__init__.py"
-        if target not in self.modules:
-            return set()
-        names, bindings, _ = self.contexts[target]
-        scope = names.at[id(self.modules[target])]
+        binding = self.imported_binding(qualified)
+        if binding is None:
+            return {((None, _UNRESOLVED_IMPORT),)}
+        target, values, sources = binding
         result = set()
-        choices = (self.argv_source_words(value, target, seen) for value in bindings.get((scope, attribute), ()))
-        imports = (self.imported_argv_source_words(name, seen) for name in scope.imports.get(attribute, ()))
+        choices = (self.argv_source_words(value, target, seen) for value in values)
+        imports = (self.imported_argv_source_words(name, seen) for name in sources)
         for groups in (choices, imports):
             for extra in groups:
                 if len(result) + len(extra) > _MAX_CHOICES:
-                    return set()
+                    return {((None, _UNRESOLVED_IMPORT),)}
                 result.update(extra)
-        return result
+        return result or {((None, _UNRESOLVED_IMPORT),)}
 
     def argv_source_words(self, node, origin, seen=frozenset()):
         """Retain AST operands through flattening; this never resolves a program."""
+        def fallback():
+            if isinstance(node, tuple):
+                if len(node) > _MAX_WORDS:
+                    return {((origin, _UNRESOLVED_IMPORT),)}
+                bearing = any(self.bearing(item, origin, unresolved_only=True) for item in node)
+            else:
+                bearing = isinstance(node, ast.AST) and self.bearing(node, origin, unresolved_only=True)
+            return {((origin, _UNRESOLVED_IMPORT),)} if bearing else set()
+
+        if node is _UNRESOLVED_IMPORT:
+            return {((origin, node),)}
         if node is None or id(node) in seen or len(seen) >= _MAX_DEPTH:
-            return set()
+            return fallback()
         seen = seen | {id(node)}
+        if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+            return {((origin, node),)}  # A known word is source data, never an unknown marker.
         if isinstance(node, (ast.For, ast.comprehension)):
             result = set()
             for words in self.argv_source_words(node.iter, origin, seen):
                 for item_origin, item in words:
                     extra = self.argv_source_words(item, item_origin, seen)
                     if len(result) + len(extra) > _MAX_CHOICES:
-                        return set()
+                        return fallback()
                     result.update(extra)
-            return result
+            return result or fallback()
         if isinstance(node, tuple):
-            return {tuple((origin, item) for item in node)} if len(node) <= _MAX_WORDS else set()
+            return {tuple((origin, item) for item in node)} if len(node) <= _MAX_WORDS else fallback()
         if isinstance(node, (ast.List, ast.Tuple)):
             if len(node.elts) > _MAX_WORDS:
-                return set()
+                return fallback()
             states = {()}
             for item in node.elts:
                 pieces = self.argv_source_words(item.value, origin, seen) if isinstance(item, ast.Starred) else {((origin, item),)}
+                if not pieces and isinstance(item, ast.Starred):
+                    pieces = ({((origin, _UNRESOLVED_IMPORT),)} if self.bearing(item, origin, unresolved_only=True)
+                              else {((origin, item.value),)})
                 if len(states) * len(pieces) > _MAX_CHOICES:
-                    return set()
+                    return fallback()
                 if any(len(left) + len(right) > _MAX_WORDS for left in states for right in pieces):
-                    return set()
+                    return fallback()
                 states = {left + right for left in states for right in pieces}
             return states
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-            left = self.argv_source_words(node.left, origin, seen)
-            right = self.argv_source_words(node.right, origin, seen)
+            left = self.argv_source_words(node.left, origin, seen) or {((origin, node.left),)}
+            right = self.argv_source_words(node.right, origin, seen) or {((origin, node.right),)}
             if len(left) * len(right) > _MAX_CHOICES:
-                return set()
+                return fallback()
             if any(len(a) + len(b) > _MAX_WORDS for a in left for b in right):
-                return set()
+                return fallback()
             return {a + b for a in left for b in right}
         if isinstance(node, ast.IfExp):
             left = self.argv_source_words(node.body, origin, seen)
             right = self.argv_source_words(node.orelse, origin, seen)
-            return left | right if len(left) + len(right) <= _MAX_CHOICES else set()
+            return left | right if len(left) + len(right) <= _MAX_CHOICES else fallback()
         if isinstance(node, (ast.Name, ast.Attribute)):
             names, bindings, _ = self.contexts[origin]
+            if names.resolve(node) in ({"sys.executable"}, {"os.devnull"}):
+                return {((origin, node),)}
             result = set()
             for qualified in names.resolve(node):
                 extra = self.imported_argv_source_words(qualified, seen)
                 if len(result) + len(extra) > _MAX_CHOICES:
-                    return set()
+                    return fallback()
                 result.update(extra)
             if not isinstance(node, ast.Name):
-                return result
+                return result or fallback()
             scope = names.at[id(node)]
             while scope is not None:
                 scope = binding_scope(scope, node.id)
@@ -1509,12 +3884,14 @@ class CommandResolver:
                     for value in values:
                         extra = self.argv_source_words(value, origin, seen)
                         if len(result) + len(extra) > _MAX_CHOICES:
-                            return set()
+                            return fallback()
                         result.update(extra)
-                    return result
+                    return result or fallback()
                 scope = scope.parent
-            return result
-        return set()
+            return result or fallback()
+        if isinstance(node, ast.AST) and self.bearing(node, origin, seen - {id(node)}, unresolved_only=True):
+            return {((origin, _UNRESOLVED_IMPORT),)}
+        return fallback()
 
     def program_sources(self, command, program, origin, *, executable=None, fragment=True):
         """Use the selector's source operand as the occurrence, not its wrappers."""
@@ -1557,11 +3934,17 @@ class CommandResolver:
     def construction_command(self, node, api):
         """Locate argv source for counting, even when other launch options are unknown."""
         if len(node.args) + len(node.keywords) > _MAX_WORDS:
-            return None
+            return _UNRESOLVED_IMPORT
         extracted = api_arguments(node, api)
         if extracted is not None:
             return extracted[1]
-        keywords = {keyword.arg: keyword.value for keyword in node.keywords if keyword.arg is not None}
+        keywords, _ = api_keywords(node)
+        if keywords is None:
+            return _UNRESOLVED_IMPORT
+        shell_keys = {"os.system": "command", "os.popen": "cmd", "subprocess.getoutput": "cmd",
+                      "subprocess.getstatusoutput": "cmd"}
+        if api in shell_keys:
+            return node.args[0] if node.args else keywords.get(shell_keys[api])
         if api.startswith("subprocess."):
             return node.args[0] if node.args else keywords.get("args")
         suffix = api.rsplit(".", 1)[1]
@@ -1569,39 +3952,44 @@ class CommandResolver:
             return None
         offset = 1 if suffix.startswith("spawn") else 0
         if suffix.startswith(("execl", "spawnl")):
+            if len(node.args) <= offset + 1:
+                return keywords.get("argv", keywords.get("args"))
             end = -1 if suffix.endswith("e") else len(node.args)
             return tuple(node.args[offset + 1:end])
-        return node.args[offset + 1] if len(node.args) > offset + 1 else keywords.get("argv")
+        return node.args[offset + 1] if len(node.args) > offset + 1 else keywords.get("argv", keywords.get("args"))
 
     def construction_programs(self, value, node, api, origin):
         """A normalized call's execution context also governs its constructions."""
         extracted = api_arguments(node, api)
         if extracted is None:
-            yield from self.argv_programs(value)
+            yield from self.argv_programs(value, fragment=False)
             return  # Retain existing reviewed uncertainty; do not normalize kwargs.
         executable, _, shell = extracted
         if shell:
             return  # launch_programs already inspects the actual shell command.
         for program in self.effective_executables(executable, origin):
-            yield from self.argv_programs(value, executable=program, fragment=program is _USE_HEAD)
+            yield from self.argv_programs(value, executable=program, fragment=False)
 
-    def programs(self, rel, *, with_locations=False):
+    def programs(self, rel, *, with_locations=False, with_nodes=False, construction_refusals=False):
         # Located events distinguish launch occurrences from argv source data.
         # Consumers remove construction subtrees used by a normalized launch;
         # separate calls remain separate even when they share one argv value.
+        # Node-bearing refusal events retain the legacy eligibility rules,
+        # without the located inventory's additional consumption-only events.
         tree = self.modules[rel]
-        names = self.contexts[rel][0]
+        names = self.imports.names[rel]  # The graph resolves spawn callees only.
         parents = {id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
         emitted = set()
         events = {}
-        event_counts = [0, 0]
+        event_counts = [0, 0, 0]
 
         def record(node, program, sources, launch):
             key = node.lineno, node.col_offset, program, launch
             if key in events:
                 events[key][2].update(sources)
             else:
-                category = int(program is None)
+                category = (2 if program is _ARGV_ORIGINS else
+                            int(program is None or program is _UNRESOLVED_MODULE))
                 if event_counts[category] >= _MAX_WORDS:
                     raise ValueError(rel + ": literal occurrence limit")
                 event_counts[category] += 1
@@ -1611,19 +3999,36 @@ class CommandResolver:
             parent = parents.get(id(node))
             if isinstance(node, ast.Call) and names.resolve(node.func) & RAW:
                 for api in sorted(names.resolve(node.func) & RAW):
-                    extracted = api_arguments(node, api) if with_locations else None
-                    for program in self.launch_programs(node, api, rel):
+                    command = self.construction_command(node, api)
+                    expression = ast.Tuple(elts=list(command)) if isinstance(command, tuple) else command
+                    vectors = (self.sequence(expression, rel, frozenset()) if isinstance(command, tuple)
+                               else self.values(command, rel))
+                    extracted = api_arguments(node, api)
+                    resolution = self.launch_resolution(node, api, rel)
+                    unresolved = resolution.reason is not None
+                    uncertainty = _UNRESOLVED_MODULE if resolution.module else None
+                    if unresolved:
+                        if with_locations:
+                            record(node, uncertainty, {(rel, _UNRESOLVED_IMPORT)}, True)
+                        else:
+                            key = (id(node) if with_nodes else node.lineno), uncertainty
+                            if key not in emitted:
+                                emitted.add(key)
+                                yield (node if with_nodes else node.lineno), uncertainty
+                    for program in resolution.programs:
                         sources = set()
+                        if (program is None or program is _UNRESOLVED_MODULE) and unresolved:
+                            sources.add((rel, _UNRESOLVED_IMPORT))
                         if with_locations and extracted is not None and isinstance(program, str):
                             executable, command, shell = extracted
                             if not shell:
                                 sources = self.program_sources(command, program, rel, executable=executable, fragment=False)
-                        key = node.lineno, program
+                        key = (id(node) if with_nodes else node.lineno), program
                         if with_locations:
                             record(node, program, sources, True)
                         elif key not in emitted:
                             emitted.add(key)
-                            yield key
+                            yield (node if with_nodes else node.lineno), program
                     if with_locations:
                         command = self.construction_command(node, api)
                         vectors = (self.sequence(ast.Tuple(elts=list(command)), rel, frozenset())
@@ -1639,7 +4044,7 @@ class CommandResolver:
                                                 for value in executables):
                                 origins = {word for words in self.argv_source_words(command, rel) for word in words}
                                 if origins:
-                                    record(node, None, origins, True)
+                                    record(node, _ARGV_ORIGINS, origins, True)
                         for vector in vectors:
                             if not isinstance(vector, _Argv):
                                 continue
@@ -1669,11 +4074,15 @@ class CommandResolver:
                         continue  # Nested argv values have distinct source occurrences below this wrapper.
                     programs = (program for api in sorted(names.resolve(launch.func) & RAW)
                                 for program in self.construction_programs(value, launch, api, rel)) if launch is not None else self.argv_programs(value)
-                elif value is None and self.bearing(node, rel):
+                elif (value is None or value is _UNRESOLVED_IMPORT) and self.bearing(node, rel):
                     programs = (None,)
                 else:
                     continue
                 for program in programs:
+                    if (program is None or program is _UNRESOLVED_MODULE) and (
+                            with_locations or not construction_refusals
+                            and not self.bearing(node, rel, unresolved_only=True)):
+                        continue  # Unknown construction data is judged at its actual spawn call.
                     sources = self.program_sources(node, program, rel) if with_locations and isinstance(program, str) else set()
                     if with_locations:
                         if launch is not None:
@@ -1682,44 +4091,138 @@ class CommandResolver:
                     for source_rel, occurrence in sources or {(rel, node)}:
                         if source_rel != rel:
                             continue  # The defining package module inventories its own construction.
-                        key = node.lineno, program
+                        key = (id(node) if with_nodes else node.lineno), program
                         if with_locations:
                             record(occurrence, program, {(source_rel, occurrence)}, False)
                         elif key not in emitted:
                             emitted.add(key)
-                            yield key
+                            yield (node if with_nodes else node.lineno), program
         if with_locations:
             yield from events.values()
+
+
+def spawn_totality(modules, table, *, resolver=None):
+    """Enumerate each spawn call once; no resolver return may leave it unclassified."""
+    resolver = resolver or CommandResolver(modules)
+    reviewed = {row[:2] for row in table}
+    expected, found, verdicts = set(), set(), []
+    for rel, tree in modules.items():
+        names = resolver.imports.names[rel]
+        scopes = {id(node): scope for node, scope in qualified_nodes(tree, include_signature=True)}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            apis = names.resolve(node.func) & RAW
+            if not apis:
+                continue
+            key = rel, id(node)
+            expected.add(key)
+            scope = scopes[id(node)]
+            reason, programs, module = None, [], False
+            for api in sorted(apis):
+                resolution = resolver.launch_resolution(node, api, rel)
+                reason = reason or resolution.reason
+                module |= resolution.module
+                if len(programs) + len(resolution.programs) > _MAX_WORDS:
+                    raise ValueError("process census: spawn verdict limit")
+                programs.extend(resolution.programs)
+            if reason is not None:
+                scope = resolver.selector_owner(node, rel, scope)
+            verdict = ("reviewed" if (rel, scope) in reviewed else
+                       "inventoried" if reason is None else "refused")
+            if key in found:
+                raise ValueError("process census: duplicate spawn verdict")
+            if len(verdicts) >= _MAX_WORDS:
+                raise ValueError(rel + ": literal occurrence limit")
+            found.add(key)
+            verdicts.append(_SpawnVerdict(rel, node, scope, verdict, reason, tuple(programs), module))
+    if found != expected:
+        raise ValueError("process census: incomplete spawn verdicts")
+    return verdicts
 
 
 def literal_programs(tree, rel, modules=None, resolver=None):
     modules = {rel: tree} if modules is None else modules
     yield from (resolver or CommandResolver(modules)).programs(rel)
 
-def refuse_literal_spawns(tree, rel, modules=None, resolver=None):
-    if not rel.startswith(("aegis_core/", "aegis_cli/")):
+
+def literal_context(program, context_rel, resolver, suffix):
+    # A virtual sibling preserves relative imports and leaves the original
+    # module available to absolute imports from this literal program.
+    parent = context_rel.rpartition("/")[0]
+    stem = context_rel.rsplit("/", 1)[-1].removesuffix(".py")
+    nested_rel = parent + f"/<{stem}__literal_{suffix}>.py"
+    nested = CommandResolver({nested_rel: program}, option_pins={}, package_context=resolver)
+    return nested_rel, nested
+
+
+def checked_literal_exceptions(exceptions):
+    for reason in exceptions.values():
+        if (not isinstance(reason, str) or not reason or reason.isspace()
+                or any(char in reason for char in "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")):
+            raise ValueError("process census: invalid literal program exception")
+    return exceptions
+
+
+def literal_program_review(source, rel, scope, exceptions):
+    key = rel, scope, hashlib.sha256(source.encode("utf-8")).hexdigest()
+    return key if key in exceptions else None
+
+
+def refuse_literal_escapes(program, rel, context_rel, resolver, *, store_review=None, used_reviews=None):
+    """Literals cannot carry review rows for import or module-value escapes."""
+    names = resolver.imports.names[context_rel]
+    parents = {id(child): node for node in ast.walk(program) for child in ast.iter_child_nodes(node)}
+    callees = {id(node.func) for node in ast.walk(program) if isinstance(node, ast.Call)}
+    for node in ast.walk(program):
+        if any(resolver.imports.is_shadowed(target) for target in names.resolve(node)):
+            raise ValueError(f"{rel}: unresolved Python -c program")
+        module_store = selector_module_mutation(node, names, resolver.imports)
+        if module_store and store_review is not None and used_reviews is not None:
+            used_reviews.add(store_review)
+        if (selector_import_escape(node, context_rel, names, resolver.imports)
+                or selector_module_escape(node, parents, names, resolver.imports)
+                or module_store and store_review is None
+                or id(node) not in callees and names.resolve(node) & RAW):
+            if (isinstance(node, ast.ImportFrom) and node.level == 0 and node.module in SPAWN_MODULES
+                    and any(alias.name == "*" for alias in node.names)):
+                raise ValueError(f"{rel}: unresolved Python -c program")
+            raise ValueError(f"{rel}: process spawn inside a literal -c program")
+
+
+def refuse_literal_spawns(tree, rel, modules=None, resolver=None, *, literal_exceptions=None,
+                          construction_refusals=False):
+    if not rel.startswith(tuple(package + "/" for package in PACKAGES)):
         return
-    for _, source in literal_programs(tree, rel, modules, resolver):
+    exceptions = checked_literal_exceptions(LITERAL_PROGRAM_EXCEPTIONS if literal_exceptions is None else literal_exceptions)
+    resolver = resolver or CommandResolver({rel: tree} if modules is None else modules)
+    scopes = {id(node): scope for node, scope in qualified_nodes(tree, include_signature=True)}
+    for node, source in resolver.programs(rel, with_nodes=True, construction_refusals=construction_refusals):
+        if source is _UNRESOLVED_MODULE:
+            raise ValueError(f"{rel}: unresolved Python module")
         if source is None:
             raise ValueError(f"{rel}: unresolved Python -c program")
         if isinstance(source, tuple) and len(source) == 2 and source[0] in {"captured-module", "external-module"}:
             continue  # Exact co-located module capture, already parsed by this census.
+        if len(source) > _MAX_TEXT:
+            raise ValueError(rel + ": literal program text limit")
         try:
             program = ast.parse(source)
-        except (SyntaxError, ValueError, UnicodeError):
-            continue  # Invalid constant Python cannot execute a hidden spawn.
-        if any(isinstance(node, ast.ImportFrom) and node.module in {"os", "subprocess"}
-               and any(alias.name == "*" for alias in node.names) for node in ast.walk(program)):
-            raise ValueError(f"{rel}: unresolved Python -c program")
-        names = ScopedNames(program, rel)
+        except (SyntaxError, ValueError, UnicodeError, RecursionError):
+            continue  # A resolved Python program with invalid syntax has no executable spawns.
+        nested_rel, nested = literal_context(program, rel, resolver, f"refusal_L{node.lineno}C{node.col_offset}")
+        review = literal_program_review(source, rel, scopes[id(node)], exceptions)
+        refuse_literal_escapes(program, rel, nested_rel, nested, store_review=review)
+        names = nested.imports.names[nested_rel]
         if any(names.resolve(node) & RAW for node in ast.walk(program)):
             raise ValueError(f"{rel}: process spawn inside a literal -c program")
 
 
-def module_process_sites(modules):
+def module_process_sites(modules, *, imports=None):
     found = {}
+    imports = imports or ImportGraph(modules)
     for rel, tree in modules.items():
-        names = ScopedNames(tree, rel)
+        names = imports.names[rel]
 
         def visit(node, scope="<module>"):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -1751,21 +4254,39 @@ def literal_fixture_sites(root, *, option_pins=None):
     modules = dict(module_trees(root))
     resolver = CommandResolver(modules, option_pins=option_pins)
     for rel, tree in modules.items():
-        refuse_literal_spawns(tree, rel, modules, resolver)
-    return module_process_sites(modules)
+        refuse_literal_spawns(tree, rel, modules, resolver, construction_refusals=True)
+    return module_process_sites(modules, imports=resolver.imports)
 
 
 def literal_process_sites(rel, tree, resolver, *, owner=None, origin_line=None, depth=0, context_rel=None,
-                          consumed=None, constructors=None, dependencies=frozenset()):
+                          consumed=None, constructors=None, dependencies=frozenset(),
+                          literal_exceptions=None, used_reviews=None, selector_table=()):
     """Count resolvable program occurrences, retaining their reviewed source owner."""
     found, parsed = [], set()
     consumed = set() if consumed is None else consumed
     constructors = set() if constructors is None else constructors
+    exceptions = checked_literal_exceptions({} if literal_exceptions is None else literal_exceptions)
+    used_reviews = set() if used_reviews is None else used_reviews
     scopes = {id(node): scope for node, scope in qualified_nodes(tree, include_signature=True)}
     context_rel = rel if context_rel is None else context_rel
+    rows = selector_table if not depth else ()
+    reviewed = {row[:2] for row in rows}
+    for verdict in spawn_totality({context_rel: tree}, rows, resolver=resolver):
+        scopes[id(verdict.node)] = verdict.scope
+        if verdict.verdict == "refused":
+            raise ValueError(rel + (": unresolved Python module" if verdict.module
+                                    else ": unresolved Python -c program"))
     for node, source, origins, launch in resolver.programs(context_rel, with_locations=True):
-        if launch and source is None and origins:
+        if source is _ARGV_ORIGINS:
             consumed.update((source_rel, id(source_node)) for source_rel, source_node in origins)
+            continue  # This is argv consumption metadata, not a resolver outcome.
+        if source is None or source is _UNRESOLVED_MODULE:
+            if (context_rel, scopes[id(node)]) not in reviewed:
+                raise ValueError(rel + (": unresolved Python module" if source is _UNRESOLVED_MODULE
+                                        else ": unresolved Python -c program"))
+            if launch:
+                consumed.update((source_rel, id(source_node)) for source_rel, source_node in origins)
+            continue  # Explicitly reviewed uncertainty; never an implicit source=None omission.
         if not isinstance(source, str):
             continue  # Reviewed uncertainty or an already-censused captured module.
         required = dependencies
@@ -1789,40 +4310,50 @@ def literal_process_sites(rel, tree, resolver, *, owner=None, origin_line=None, 
         parsed.add(key)
         try:
             program = ast.parse(source)
-        except (SyntaxError, ValueError, UnicodeError):
-            continue
+        except (SyntaxError, ValueError, UnicodeError, RecursionError):
+            continue  # Unparsable constants contribute no child spawns.
         prefix = scope + f".<literal-c-L{node.lineno}C{node.col_offset}>"
         line = node.lineno if origin_line is None else origin_line
-        for child_key, lines in module_process_sites({rel: program}).items():
+        nested_rel, nested = literal_context(program, context_rel, resolver,
+                                             f"D{depth}_L{node.lineno}_C{node.col_offset}")
+        review = literal_program_review(source, rel, scope, exceptions)
+        refuse_literal_escapes(program, rel, nested_rel, nested, store_review=review, used_reviews=used_reviews)
+        for child_key, lines in module_process_sites({nested_rel: program}, imports=nested.imports).items():
             category, _, child_scope, api = child_key.split(":", 3)
             if category == "process":
                 found.extend((f"process:{rel}:{prefix}.{child_scope}:{api}", line, required) for _ in lines)
-        # A virtual sibling preserves relative imports and leaves the original
-        # module available to absolute imports from this literal program.
-        parent = context_rel.rpartition("/")[0]
-        stem = context_rel.rsplit("/", 1)[-1].removesuffix(".py")
-        nested_rel = parent + f"/<{stem}__literal_D{depth}_L{node.lineno}_C{node.col_offset}>.py"
-        nested = CommandResolver({nested_rel: program}, option_pins={}, package_context=resolver)
         found.extend(literal_process_sites(
             rel, program, nested, owner=prefix, origin_line=line, depth=depth + 1, context_rel=nested_rel,
-            consumed=consumed, constructors=constructors, dependencies=required))
+            consumed=consumed, constructors=constructors, dependencies=required,
+            literal_exceptions=exceptions, used_reviews=used_reviews))
     return found
 
 
-def process_sites(root, *, option_pins=None, selector_table=None):
+def process_sites(root, *, option_pins=None, selector_table=None, literal_exceptions=None):
     modules = dict(module_trees(root))
     # Temporary repositories have no inherited source reviews. The production
     # repository always uses the one static table, including rows for removed files.
     if selector_table is None:
         selector_table = SELECTOR_SITE_TABLE if root.resolve() == REPO else ()
-    errors = selector_site_errors(selector_sites(modules), selector_table)
+    if literal_exceptions is None:
+        literal_exceptions = LITERAL_PROGRAM_EXCEPTIONS if root.resolve() == REPO else {}
+    literal_exceptions = checked_literal_exceptions(literal_exceptions)
+    current = selector_sites(modules, include_escapes=False, table=selector_table)
+    # Escape review belongs to the selector gate; keep the process/reference
+    # inventory independent, including the pinned default-expression fixture.
+    applicable = tuple(row for row in selector_table if row[2] != "escape" or row[:2] in current)
+    errors = selector_site_errors(current, applicable)
     if errors:
         raise ValueError(errors[0])
     resolver = CommandResolver(modules, option_pins=option_pins)
-    found = module_process_sites(modules)
-    literals, consumed, constructors = [], set(), set()
+    found = module_process_sites(modules, imports=resolver.imports)
+    literals, consumed, constructors, used_reviews = [], set(), set(), set()
     for rel, tree in modules.items():
-        literals.extend(literal_process_sites(rel, tree, resolver, consumed=consumed, constructors=constructors))
+        literals.extend(literal_process_sites(rel, tree, resolver, consumed=consumed, constructors=constructors,
+                                             literal_exceptions=literal_exceptions, used_reviews=used_reviews,
+                                             selector_table=selector_table))
+    if literal_exceptions.keys() - used_reviews:
+        raise ValueError("process census: stale literal program exception")
     for key, line, dependencies in literals:
         if all(dependency not in consumed and dependency[:2] not in consumed for dependency in dependencies):
             found.setdefault(key, []).append(line)
@@ -1881,6 +4412,9 @@ if __name__ == "__main__":
     if sys.argv[1:] != ["--write"]:
         sys.exit("usage: python3 tests/contract/test_process_ratchets.py --write")
     try:
+        errors = selector_gate_errors(dict(module_trees(REPO)), SELECTOR_SITE_TABLE)
+        if errors:
+            raise ValueError(errors[0])
         updated = lowered_census(json.loads(RECORD.read_text()), process_sites(REPO))
     except ValueError as exc:
         sys.exit(str(exc))
@@ -1936,6 +4470,8 @@ def test_rule_m_scope_correction(tmp_path, body, expected):
     if expected in {"spawn", "unresolved"}:
         message = ("process spawn inside a literal -c program" if expected == "spawn"
                    else "unresolved Python -c program")
+        if body == "argv = [sys.executable, '-m', 'aegis_core.not_censused']":
+            message = "unresolved Python module"  # ROUND-17c authorizes this relabel only.
         with pytest.raises(ValueError) as error:
             literal_fixture_sites(tmp_path)
         assert str(error.value) == "aegis_core/probe.py: " + message
@@ -2913,8 +5449,8 @@ _FORMAL_0440_CASES = {
     "accessor_alias": ("", "A=[sys.executable,'-c','pass']\nBOX={'argv':A}\nALIAS=BOX.get('argv')\nALIAS[2]=P\nsubprocess.run(A)", "subprocess.run"),
     "override_mutation": ("", "A=['worker','-c','pass']\nA[2]=P\nsubprocess.run(A, executable=sys.executable)", "subprocess.run"),
     "shell_mutation": ("", "A=['sh','-c','true']\nA[2]='python3 -c '+shlex.quote(P)\nsubprocess.run(A)", "subprocess.run"),
-    "imported_prefix": ("from aegis_core.shared import PREFIX\n", "subprocess.run(PREFIX + tail)", "subprocess.run"),
-    "imported_builder": ("from aegis_core.shared import PREFIX\n", "def build():\n    return [P]\nsubprocess.run(PREFIX + build())", "subprocess.run"),
+    "imported_prefix": ("from aegis_core.shared import PREFIX\n", "subprocess.run([*PREFIX, *tail])", "subprocess.run"),
+    "imported_builder": ("from aegis_core.shared import PREFIX\n", "def build():\n    return [P]\nsubprocess.run([*PREFIX, *build()])", "subprocess.run"),
     "argon_env_shell": ("", "subprocess.run(['env', 'sh', '-c', f'python3 -c {P!r}'])", "subprocess.run"),
     "argon_append_selector": ("", "ARGV=[sys.executable, '-I']\nARGV.append('-c')\nARGV.append(P)\nsubprocess.run(ARGV)", "subprocess.run"),
     "argon_returned_prefix": ("", "def get_prefix():\n    return [sys.executable, '-I', '-c']\nsubprocess.run(get_prefix() + [P])", "subprocess.run"),
@@ -2949,7 +5485,7 @@ def test_selector_site_formal_0440_requires_review(tmp_path, case):
     package.mkdir()
     prefix, body, api = _FORMAL_0440_CASES[case]
     if prefix:
-        (package / "shared.py").write_text("import sys\nPREFIX=[sys.executable,'-I','-c']\n", encoding="utf-8")
+        (package / "shared.py").write_text("import sys\nPREFIX=(sys.executable,'-I','-c')\n", encoding="utf-8")
     program = "import subprocess; subprocess.Popen(['/bin/true'])" if case.startswith("argon_") else "import os; os.system('id')"
     source = ("import os, sys, subprocess, shlex\nP=" + repr(program) + "\n" + prefix
               + "def launch(tail=None, code=None, mode=None, opts=None):\n"
@@ -2957,13 +5493,17 @@ def test_selector_site_formal_0440_requires_review(tmp_path, case):
     (package / "probe.py").write_text(source, encoding="utf-8")
     scope = {"argon_returned_prefix": "launch.get_prefix", "argon_nonlocal_alias": "launch.outer",
              "argon_git_setting": "launch.make_flags"}.get(case, "launch")
-    site = ("aegis_core/shared.py", "<module>") if prefix else ("aegis_core/probe.py", scope)
+    original = ("aegis_core/shared.py", "<module>") if prefix else ("aegis_core/probe.py", scope)
+    # ROUND-17b: the consuming launch now needs its own review as well.
+    site = (("aegis_core/probe.py", "launch") if case in {
+        "imported_prefix", "imported_builder", "argon_git_setting"} else original)
     message = "unreviewed selector site " + ":".join(site)
     for _ in range(2):
         with pytest.raises(ValueError) as error:
             process_sites(tmp_path)
         assert str(error.value) == message
-    table = ((*site, "reviewed-dynamic", "Test-owned review of this selector construction."),)
+    table = tuple((*key, "reviewed-dynamic", "Test-owned review of this selector construction.")
+                  for key in sorted({original, site}))
     sites = process_sites(tmp_path, selector_table=table)
     assert "process:aegis_core/probe.py:launch:" + api in sites
 
@@ -3184,17 +5724,19 @@ def test_selector_site_formal_0554_requires_review(tmp_path, case):
     package.mkdir()
     prefix, body, scope, api = _FORMAL_0554_CASES[case]
     if prefix:
-        (package / "shared.py").write_text("import sys\nPREFIX=[sys.executable, '-m']\n", encoding="utf-8")
+        (package / "shared.py").write_text("import sys\nPREFIX=(sys.executable, '-m')\n", encoding="utf-8")
     (package / "probe.py").write_text(
         "import os, sys, subprocess, shlex\nP=\"import os; os.system('id')\"\n" + prefix
         + "def launch(mode=True, options=None, target=None, arguments=None, name=None, path=None):\n"
         + "".join("    " + line + "\n" for line in body.splitlines()), encoding="utf-8")
     rel = "aegis_core/shared.py" if prefix else "aegis_core/probe.py"
+    site = ("aegis_core/probe.py", "launch") if case == "imported_module_prefix" else (rel, scope)
     for _ in range(2):
         with pytest.raises(ValueError) as error:
             process_sites(tmp_path)
-        assert str(error.value) == "unreviewed selector site " + rel + ":" + scope
-    table = ((rel, scope, "reviewed-dynamic", "Test-owned broad-site review."),)
+        assert str(error.value) == "unreviewed selector site " + ":".join(site)
+    table = tuple((*key, "reviewed-dynamic", "Test-owned broad-site review.")
+                  for key in sorted({(rel, scope), site}))
     sites = process_sites(tmp_path, selector_table=table)
     caller = "launch" if scope == "<module>" else scope
     assert "process:aegis_core/probe.py:" + caller + ":" + api in sites
@@ -3296,15 +5838,16 @@ def test_selector_site_wildcard_import_requires_review_and_counts(tmp_path, api)
     ("from subprocess import *; Popen(['/bin/true'])", "subprocess.Popen"),
     ("from os import *; system('id')", "os.system"),
 ])
-def test_literal_spawn_wildcard_import_is_counted(tmp_path, program, api):
+def test_literal_spawn_wildcard_import_refuses_without_review(tmp_path, program, api):
     package = tmp_path / "aegis_core"
     package.mkdir()
     (package / "probe.py").write_text(
         "import sys,subprocess\ndef launch():\n    subprocess.run([sys.executable,'-c'," + repr(program) + "])\n",
         encoding="utf-8")
     table = (("aegis_core/probe.py", "launch", "resolved-python-program", "Test-owned wildcard literal program."),)
-    sites = process_sites(tmp_path, selector_table=table)
-    assert sum(len(lines) for key, lines in sites.items() if key.endswith(":" + api)) == 1
+    with pytest.raises(ValueError) as error:
+        process_sites(tmp_path, selector_table=table)
+    assert str(error.value) == "aegis_core/probe.py: unresolved Python -c program"
 
 
 @pytest.mark.parametrize("source,scope", [
@@ -3457,7 +6000,7 @@ def test_literal_spawn_flattened_fragments_count_once(tmp_path, body):
 def test_literal_spawn_shared_argv_keeps_each_launch(tmp_path, imported, same_owner):
     package = tmp_path / "aegis_core"
     package.mkdir()
-    definition = "import sys\nARGV=[sys.executable,'-c',\"import os; os.system('id')\"]\n"
+    definition = "import sys\nARGV=(sys.executable,'-c',\"import os; os.system('id')\")\n"
     if imported:
         (package / "shared.py").write_text(definition, encoding="utf-8")
     prefix = "from aegis_core.shared import ARGV\n" if imported else definition
@@ -3516,6 +6059,12 @@ def test_selector_site_argon_nested_dynamic_program_requires_owner(tmp_path, inn
         process_sites(tmp_path)
     assert str(error.value) == "unreviewed selector site aegis_core/probe.py:launch"
     table = (("aegis_core/probe.py", "launch", "reviewed-dynamic", "Test-owned review of the nested dynamic construction."),)
+    if inner.startswith("FLAGS="):
+        # ROUND-17b: an outer review cannot waive unresolved mutated argv inside it.
+        with pytest.raises(ValueError) as error:
+            process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == "aegis_core/probe.py: unresolved Python -c program"
+        return
     sites = process_sites(tmp_path, selector_table=table)
     assert sum(len(lines) for key, lines in sites.items() if key.endswith(":subprocess.run")) == 2
 
@@ -3628,7 +6177,7 @@ def test_literal_spawn_formal_0728_launch_site_dedup(tmp_path, call, shape, nest
     imports = "import os,sys,subprocess,shlex\n"
     owners = []
     if shape == "reexport":
-        (package / "base.py").write_text(definition.replace("EXEC=sys.executable\n", "") + "FRAGMENT=['-c',P]\n", encoding="utf-8")
+        (package / "base.py").write_text(definition.replace("EXEC=sys.executable\n", "") + "FRAGMENT=('-c',P)\n", encoding="utf-8")
         (package / "relay.py").write_text("from .base import FRAGMENT\n", encoding="utf-8")
         imports += "from aegis_core.relay import FRAGMENT\n"
         body = "CMD=[sys.executable,*FRAGMENT]\n" + call
@@ -3709,7 +6258,7 @@ def test_literal_spawn_invalid_byte_program_returns_only_outer_site(tmp_path):
 def test_literal_spawn_argon_0728_imported_tail_is_counted(tmp_path, staged, copies):
     package = tmp_path / "aegis_core"
     package.mkdir()
-    (package / "shared.py").write_text("P=\"import os; os.system('id')\"\nTAIL=[P]\n", encoding="utf-8")
+    (package / "shared.py").write_text("P=\"import os; os.system('id')\"\nTAIL=(P,)\n", encoding="utf-8")
     body = "ARGV=[sys.executable,'-c',*TAIL]\n" if staged else ""
     command = "ARGV" if staged else "[sys.executable,'-c',*TAIL]"
     body += ("subprocess.run(" + command + ", **opts)\n") * copies
@@ -3761,7 +6310,7 @@ def test_selector_site_argon_0728_signature_needs_function_row(tmp_path, source)
 def test_literal_spawn_argon_0728_nested_dynamic_argv_is_site(tmp_path, argument):
     package = tmp_path / "aegis_core"
     package.mkdir()
-    code = "import sys,subprocess\nsubprocess.run(sys.argv[1:])\n"
+    code = "import subprocess\ndef child(args):\n    subprocess.run(args)\nchild([])\n"
     argument = argument.replace("CODE",repr(code))
     (package / "probe.py").write_text("import sys,subprocess\ndef launch(args,opts):\n    subprocess.run(" + argument + ")\n",
                                      encoding="utf-8")
@@ -3902,3 +6451,4890 @@ def test_literal_spawn_correctness_0821_signature_owner(tmp_path, kind):
     after = process_sites(tmp_path,selector_table=reviewed("two"))
     assert sum(len(lines) for key,lines in after.items() if ":two.<literal-c-" in key and key.endswith(":os.system")) == 1
     assert not any(":one.<literal-c-" in key for key in after)
+
+
+@pytest.mark.parametrize("position,source,scope", [
+    ("assignment", "runner = subprocess.Popen\n", "<module>"),
+    ("default", "def launch(runner=subprocess.Popen):\n    pass\n", "launch"),
+    ("argument", "consume(subprocess.Popen)\n", "<module>"),
+    ("map", "map(subprocess.Popen, commands)\n", "<module>"),
+    ("partial", "from functools import partial\npartial(subprocess.Popen)\n", "<module>"),
+    ("container", "callbacks = [subprocess.Popen]\n", "<module>"),
+    ("attribute_store", "holder.callback = subprocess.Popen\n", "<module>"),
+    ("return", "def factory():\n    return subprocess.Popen\n", "factory"),
+    ("yield", "def callbacks():\n    yield subprocess.Popen\n", "callbacks"),
+    ("decorator", "@subprocess.Popen\ndef factory():\n    pass\n", "factory"),
+    ("comparison", "same = callback is subprocess.Popen\n", "<module>"),
+    ("annotation", "def cleanup(proc: subprocess.Popen):\n    pass\n", "cleanup"),
+    ("from_import", "from subprocess import Popen as spawn\nrunner = spawn\n", "<module>"),
+])
+@pytest.mark.parametrize("package_name", PACKAGES)
+def test_spawn_escape_positions_require_review(tmp_path, position, source, scope, package_name):
+    package = tmp_path / package_name
+    package.mkdir()
+    path = package / "probe.py"
+    path.write_text("import subprocess\n" + source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    key = package_name + "/probe.py", scope
+    for _ in range(2):
+        assert set(selector_sites(modules)) == {key}
+        assert selector_site_errors(selector_sites(modules), ()) == ["unreviewed selector site " + key[0] + ":" + scope]
+    table = ((*key, "escape", "Test-owned spawn API escape review."),)
+    assert selector_site_errors(selector_sites(modules), table) == []
+    assert selector_gate_errors(modules, table) == []
+
+
+@pytest.mark.parametrize("api", sorted(RAW))
+def test_spawn_escape_uses_the_complete_api_inventory(tmp_path, api):
+    package = tmp_path / "aegis_core"
+    package.mkdir()
+    module, name = api.split(".")
+    (package / "probe.py").write_text("import " + module + "\nrunner = " + module + "." + name + "\n", encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    assert selector_escape_sites(modules) == {("aegis_core/probe.py", "<module>"): [2]}
+    assert selector_gate_errors(modules, ()) == ["unreviewed selector site aegis_core/probe.py:<module>"]
+
+
+@pytest.mark.parametrize("source", [
+    "import subprocess\nsubprocess.Popen(['tool'])\n",
+    "from subprocess import Popen as spawn\nspawn(['tool'])\n",
+    "import subprocess\nvalue = subprocess.PIPE\n",
+    "import subprocess as backend\ndef shadowed(backend):\n    return backend.Popen\n",
+    "from subprocess import Popen as spawn\ndef shadowed(spawn):\n    return spawn\n",
+    "def left():\n    from subprocess import Popen as spawn\n    spawn(['tool'])\ndef right(spawn):\n    return spawn\n",
+    "import subprocess\nsubprocess.Popen(['tool']).wait()\n",
+])
+def test_spawn_direct_calls_and_shadows_add_no_value_escapes(tmp_path, source):
+    package = tmp_path / "aegis_core"
+    package.mkdir()
+    (package / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    expected = {}
+    if " as " in source:
+        scope, line = ("left", 2) if source.startswith("def left") else ("<module>", 1)
+        expected[("aegis_core/probe.py", scope)] = [line]
+    assert selector_escape_sites(modules) == expected
+    table = tuple((*key, "escape", "Review the import; direct calls and shadows add no value escapes.") for key in expected)
+    assert selector_gate_errors(modules, table) == []
+
+
+@pytest.mark.parametrize("case,provider,consumer,scope", [
+    ("inheritance", "class Base:\n    callback = staticmethod(subprocess.Popen)\n",
+     "from .provider import Base\nclass Child(Base):\n    pass\nChild().callback(code, **options)\n", "Base"),
+    ("bound_method", "runner = subprocess.Popen\n",
+     "from .provider import runner\nclass Holder:\n    def set(this, callback):\n        this.callback = callback\nholder = Holder()\nsetter = holder.set\nsetter(runner)\nholder.callback(code, **options)\n", "<module>"),
+    ("starred_offset", "runner = subprocess.Popen\n",
+     "from .provider import runner\ndef third(a, b, c):\n    return c\ncallback = third(*(None, None), runner)\ncallback(code, **options)\n", "<module>"),
+    ("container_copy", "runner = subprocess.Popen\n",
+     "from .provider import runner\ncallbacks = [runner]\ncopied = callbacks[:].copy()\ncopied[0](code, **options)\n", "<module>"),
+    ("dictionary_default", "def factory():\n    return {}.get('runner', subprocess.Popen)\n",
+     "from .provider import factory\ncallback = factory()\ncallback(code, **options)\n", "factory"),
+    ("generator", "def callbacks():\n    yield subprocess.Popen\n",
+     "from .provider import callbacks\nfor callback in callbacks():\n    callback(code, **options)\n", "callbacks"),
+    ("decorator", "def inject(target):\n    return lambda: target(subprocess.Popen)\n",
+     "from .provider import inject\n@inject\ndef factory(backend):\n    return backend\ncallback = factory()\ncallback(code, **options)\n", "inject"),
+])
+def test_spawn_escape_reviews_the_origin_of_formal_forwarding_routes(tmp_path, case, provider, consumer, scope):
+    package = tmp_path / "aegis_core"
+    package.mkdir()
+    (package / "provider.py").write_text("import subprocess\n" + provider, encoding="utf-8")
+    (package / "consumer.py").write_text(consumer, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    key = "aegis_core/provider.py", scope
+    assert set(selector_escape_sites(modules)) == {key}
+    for _ in range(2):
+        assert selector_gate_errors(modules, ()) == ["unreviewed selector site " + key[0] + ":" + scope]
+    table = ((*key, "escape", "Test-owned review of the forwarding origin."),)
+    assert selector_gate_errors(modules, table) == []
+    assert selector_gate_errors(dict(reversed(list(modules.items()))), table) == []
+
+
+def test_spawn_escape_requires_its_review_kind_and_rejects_stale_reviews(tmp_path):
+    package = tmp_path / "aegis_core"
+    package.mkdir()
+    path = package / "probe.py"
+    path.write_text("import subprocess\nrunner = subprocess.Popen\nmessage = '-c example'\n", encoding="utf-8")
+    key = "aegis_core/probe.py", "<module>"
+    wrong = ((*key, "reviewed-dynamic", "This ordinary row cannot review an escape."),)
+    table = ((*key, "escape", "Test-owned spawn escape review."),)
+    modules = dict(module_trees(tmp_path))
+    assert selector_gate_errors(modules, wrong) == ["selector escape requires escape kind aegis_core/probe.py:<module>"]
+    assert selector_gate_errors(modules, table) == []
+    path.write_text("message = '-c example'\n", encoding="utf-8")
+    assert selector_gate_errors(dict(module_trees(tmp_path)), table) == ["stale selector escape aegis_core/probe.py:<module>"]
+    for reason in ("", "first\nsecond", "first\rsecond"):
+        row = ((*key, "escape", reason),)
+        assert selector_gate_errors(modules, row) == ["invalid selector row aegis_core/probe.py:<module>"]
+
+
+def test_spawn_escape_review_is_separate_from_process_reference_counts(tmp_path):
+    package = tmp_path / "aegis_core"
+    package.mkdir()
+    (package / "probe.py").write_text("import subprocess\nrunner = subprocess.Popen\n", encoding="utf-8")
+    table = (("aegis_core/probe.py", "<module>", "escape", "Test-owned API assignment review."),)
+    expected = {"process:aegis_core/probe.py:<module>:subprocess.Popen": [2]}
+    assert process_sites(tmp_path) == expected
+    assert process_sites(tmp_path, selector_table=table) == expected
+    assert selector_gate_errors(dict(module_trees(tmp_path)), ()) == ["unreviewed selector site aegis_core/probe.py:<module>"]
+    assert selector_gate_errors(dict(module_trees(tmp_path)), table) == []
+
+
+def test_spawn_escape_concurrent_gate_checks_keep_their_own_state(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    package = tmp_path / "aegis_core"
+    package.mkdir()
+    path = package / "probe.py"
+    path.write_text("from subprocess import Popen as spawn\nrunner = spawn\n", encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    table = (("aegis_core/probe.py", "<module>", "escape", "Test-owned concurrent escape review."),)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: selector_gate_errors(modules, table), range(4), timeout=30))
+    assert results == [[], [], [], []]
+    path.write_text("value = None\n", encoding="utf-8")
+    assert selector_gate_errors(dict(module_trees(tmp_path)), ()) == []
+    assert selector_gate_errors(dict(module_trees(tmp_path)), table) == ["stale selector site aegis_core/probe.py:<module>",
+                                                                     "stale selector escape aegis_core/probe.py:<module>"]
+
+
+@pytest.mark.parametrize("route", ["plain", "alias", "namespace", "import_as", "package", "chain", "class_import", "nested_class", "star", "star_chain"])
+@pytest.mark.parametrize("shape", ["expanded", "positional", "escape"])
+@pytest.mark.parametrize("consumer_package", ["aegis_core", "aegis_sdk"])
+def test_import_chain_references_receive_normal_review(tmp_path, route, shape, consumer_package):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    provider, prefix, callee = "from subprocess import Popen\n", "from aegis_core.provider import Popen\n", "Popen"
+    if route == "alias":
+        provider, prefix, callee = "from subprocess import Popen as runner\n", "from aegis_core.provider import runner as invoke\n", "invoke"
+    elif route == "namespace":
+        provider, prefix, callee = "import subprocess as backend\n", "from aegis_core.provider import backend as driver\n", "driver.Popen"
+    elif route == "import_as":
+        provider, prefix, callee = "import subprocess\n", "import aegis_core.provider as driver\n", "driver.subprocess.Popen"
+    elif route == "package":
+        (core / "__init__.py").write_text("from .provider import Popen as spawn\n", encoding="utf-8")
+        prefix, callee = "from aegis_core import spawn\n", "spawn"
+    elif route == "chain":
+        (core / "middle.py").write_text("from .provider import Popen as first\n", encoding="utf-8")
+        prefix, callee = "from aegis_core.middle import first as invoke\n", "invoke"
+    elif route == "class_import":
+        provider = "class Backend:\n    from subprocess import Popen as runner\n"
+        prefix, callee = "from aegis_core.provider import Backend\n", "Backend.runner"
+    elif route == "nested_class":
+        provider = "class Outer:\n    class Inner:\n        from subprocess import Popen\n"
+        prefix, callee = "from aegis_core.provider import Outer\n", "Outer.Inner.Popen"
+    elif route == "star":
+        prefix = "from aegis_core.provider import *\n"
+    elif route == "star_chain":
+        (core / "middle.py").write_text("from .provider import *\n", encoding="utf-8")
+        prefix = "from aegis_core.middle import Popen\n"
+    (core / "provider.py").write_text(provider, encoding="utf-8")
+    consumer = tmp_path / consumer_package
+    consumer.mkdir(exist_ok=True)
+    operation = {"expanded": callee + "(command, **options)", "positional": callee + "(command, -1, executable)",
+                 "escape": callee}[shape]
+    (consumer / "consumer.py").write_text(
+        prefix + "def launch(command, options, executable):\n    return " + operation + "\n", encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    key = consumer_package + "/consumer.py", "launch"
+    origin = set() if route == "import_as" else {("aegis_core/provider.py", {
+        "class_import": "Backend", "nested_class": "Outer.Inner"}.get(route, "<module>"))}
+    if route == "star":
+        origin.add((consumer_package + "/consumer.py", "<module>"))
+    elif route == "star_chain":
+        origin.add(("aegis_core/middle.py", "<module>"))
+    escaped = shape == "escape" or route in {"import_as", "class_import", "nested_class"}
+    assert set(selector_sites(modules)) == origin | {key}
+    assert set(selector_escape_sites(modules)) == origin | ({key} if escaped else set())
+    for _ in range(2):
+        assert selector_gate_errors(modules, ()) == ["unreviewed selector site " + rel + ":" + scope
+                                                    for rel, scope in sorted(origin | {key})]
+    table = ((*key, "escape" if escaped else "reviewed-dynamic", "Test-owned transitive import review."),)
+    table += tuple((*site, "escape", "Test-owned import-origin review.") for site in sorted(origin))
+    assert selector_gate_errors(modules, table) == []
+    assert selector_gate_errors(dict(reversed(list(modules.items()))), table) == []
+
+
+@pytest.mark.parametrize("shape,body,scope", [
+    ("rhs", "    Popen = Popen\n", "Backend"),
+    ("default", "    def Popen(self, spawn=Popen):\n        pass\n", "Backend.Popen"),
+    ("decorator", "    @decorate(Popen)\n    def Popen(self):\n        pass\n", "Backend.Popen"),
+    ("class_base", "    class Popen(Popen):\n        pass\n", "Backend.Popen"),
+    ("class_decorator", "    @decorate(Popen)\n    class Popen:\n        pass\n", "Backend.Popen"),
+    ("staticmethod", "    Popen = staticmethod(Popen)\n", "Holder"),
+])
+def test_class_body_references_reach_enclosing_imports(tmp_path, shape, body, scope):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    class_name = "Holder" if shape == "staticmethod" else "Backend"
+    (core / "provider.py").write_text("from subprocess import Popen\nclass " + class_name + ":\n" + body, encoding="utf-8")
+    (core / "consumer.py").write_text(
+        "from .provider import " + class_name + "\ndef launch(command, options):\n    return " + class_name + ".Popen(command, **options)\n", encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    key = "aegis_core/provider.py", scope
+    origin = "aegis_core/provider.py", "<module>"
+    assert selector_escape_sites(modules).keys() == {key, origin}
+    assert len(selector_escape_sites(modules)[key]) == 1
+    assert selector_gate_errors(modules, ()) == ["unreviewed selector site " + rel + ":" + owner
+                                                for rel, owner in sorted({key, origin})]
+    table = tuple((*site, "escape", "Test-owned enclosing import escape review.") for site in (key, origin))
+    assert selector_gate_errors(modules, table) == []
+
+
+@pytest.mark.parametrize("shape", ["parameter", "class_parameter", "nonspawn"])
+def test_import_chain_and_class_resolution_keep_nonspawn_shadows(tmp_path, shape):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "provider.py").write_text("from subprocess import Popen as runner\nfrom subprocess import PIPE\n", encoding="utf-8")
+    body = {"parameter": "from .provider import runner\ndef launch(runner):\n    return runner\n",
+            "class_parameter": "from .provider import runner\nclass Backend:\n    def launch(runner):\n        return runner\n",
+            "nonspawn": "from .provider import PIPE as runner\nvalue = runner\n"}[shape]
+    (core / "consumer.py").write_text(body, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    assert selector_escape_sites(modules) == {("aegis_core/provider.py", "<module>"): [1]}
+    table = (("aegis_core/provider.py", "<module>", "escape", "Review only the provider import, not a shadow."),)
+    assert selector_gate_errors(modules, table) == []
+
+
+def test_import_resolution_distinguishes_class_lookup_from_class_body_loads(tmp_path):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "provider.py").write_text(
+        "from subprocess import Popen\nclass Backend:\n    def Popen(self, command, **options):\n        pass\n", encoding="utf-8")
+    (core / "consumer.py").write_text(
+        "from .provider import Backend\ndef launch(command, options):\n    return Backend.Popen(command, **options)\n", encoding="utf-8")
+    table = (("aegis_core/provider.py", "<module>", "escape", "Test-owned provider import review."),)
+    assert selector_gate_errors(dict(module_trees(tmp_path)), table) == []
+
+
+def test_import_resolution_preserves_import_and_class_alternatives(tmp_path):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "provider.py").write_text(
+        "from subprocess import Popen as Backend\nif mode:\n    class Backend:\n        pass\n", encoding="utf-8")
+    (core / "consumer.py").write_text("from .provider import Backend\ncallback = Backend\n", encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    assert selector_escape_sites(modules) == {("aegis_core/consumer.py", "<module>"): [2],
+                                              ("aegis_core/provider.py", "<module>"): [1]}
+
+
+@pytest.mark.parametrize("size_kind", ["text", "parts", "namespace"])
+def test_import_resolution_limits_refuse_without_echoing_input(size_kind):
+    name = ".".join(["private_marker"] * 4097) if size_kind == "parts" else "private_marker" + "x" * 1048576
+    tree = ast.fix_missing_locations(ast.Module(body=[
+        ast.Import(names=[ast.alias(name=name, asname="backend")]),
+        ast.Assign(targets=[ast.Name(id="callback", ctx=ast.Store())],
+                   value=ast.Attribute(value=ast.Name(id="backend", ctx=ast.Load()), attr="Popen", ctx=ast.Load())),
+    ], type_ignores=[]))
+    if size_kind == "namespace":
+        tree = ast.fix_missing_locations(ast.Module(body=[ast.ClassDef(
+            name=name, bases=[], keywords=[], body=[ast.Pass()], decorator_list=[]
+        )], type_ignores=[]))
+    for _ in range(2):
+        with pytest.raises(ValueError) as error:
+            selector_gate_errors({"aegis_core/probe.py": tree}, ())
+        assert str(error.value) == "selector import resolution limit"
+
+
+def test_import_cycles_and_concurrent_gates_keep_resolution_local(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    provider = core / "provider.py"
+    provider.write_text("if mode:\n    from .middle import runner\nelse:\n    from subprocess import Popen as runner\n", encoding="utf-8")
+    (core / "middle.py").write_text("from .provider import runner\n", encoding="utf-8")
+    (core / "consumer.py").write_text("from .middle import runner\ncallback = runner\n", encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    table = tuple((rel, "<module>", "escape", "Test-owned cyclic import escape review.")
+                  for rel in ("aegis_core/consumer.py", "aegis_core/provider.py"))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: selector_gate_errors(modules, table), range(4), timeout=30))
+    assert results == [[], [], [], []]
+    provider.write_text("from .middle import runner\n", encoding="utf-8")
+    assert selector_gate_errors(dict(module_trees(tmp_path)), ()) == []
+
+
+@pytest.mark.parametrize("shape", ["api", "module"])
+def test_argon_exact_import_chain_inputs_require_review(tmp_path, shape):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    provider, prefix, callee = ("from subprocess import Popen as runner\n", "from .provider import runner\n", "runner") if shape == "api" else (
+        "import subprocess\n", "from .provider import subprocess\n", "subprocess.Popen")
+    (core / "provider.py").write_text(provider, encoding="utf-8")
+    (core / "consumer.py").write_text(prefix + "def launch(code, options):\n    return " + callee + "(code, **options)\n", encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    expected = ["unreviewed selector site aegis_core/consumer.py:launch"]
+    table = (("aegis_core/consumer.py", "launch", "reviewed-dynamic", "Test-owned exact Argon import-chain review."),)
+    if shape == "api":
+        expected.append("unreviewed selector site aegis_core/provider.py:<module>")
+        table += (("aegis_core/provider.py", "<module>", "escape", "Test-owned exact import-origin review."),)
+    assert selector_gate_errors(modules, ()) == expected
+    assert selector_gate_errors(modules, table) == []
+    sites = process_sites(tmp_path, selector_table=table)
+    assert sites == {"process:aegis_core/consumer.py:launch:subprocess.Popen": [3]}
+
+
+@pytest.mark.parametrize("package_name", PACKAGES)
+@pytest.mark.parametrize("shape", ["expanded", "positional", "escape", "wildcard", "literal", "module_wide"])
+def test_argon_selector_rules_are_uniform_across_packages(tmp_path, package_name, shape):
+    package = tmp_path / package_name
+    package.mkdir()
+    source, scope, kind = {
+        "expanded": ("import subprocess, sys\nP=\"import os; os.system('id')\"\ndef launch():\n    return subprocess.Popen(P, **{'shell': True, 'executable': sys.executable})\n", "launch", "reviewed-dynamic"),
+        "positional": ("import subprocess\ndef launch(command, executable):\n    return subprocess.Popen(command, -1, executable)\n", "launch", "reviewed-dynamic"),
+        "escape": ("import subprocess\ndef launch():\n    return subprocess.Popen\n", "launch", "escape"),
+        "wildcard": ("from subprocess import *\n", "<module>", "escape"),
+        "literal": ("message = '-c example'\n", "<module>", "reviewed-dynamic"),
+        "module_wide": ("from subprocess import Popen\ndef launch(options):\n    return ordinary(**options)\n", "launch", "reviewed-dynamic"),
+    }[shape]
+    (package / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    key = package_name + "/probe.py", scope
+    keys = {key}
+    table = ((*key, kind, "Test-owned uniform package selector review."),)
+    if shape == "module_wide":
+        keys.add((key[0], "<module>"))
+        table += ((key[0], "<module>", "escape", "Test-owned uniform import-origin review."),)
+    for _ in range(2):
+        assert selector_gate_errors(modules, ()) == ["unreviewed selector site " + rel + ":" + owner
+                                                    for rel, owner in sorted(keys)]
+    assert selector_gate_errors(modules, table) == []
+
+
+@pytest.mark.parametrize("star", [False, True])
+def test_transitive_import_declarations_keep_module_wide_expansion_review(tmp_path, star):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "provider.py").write_text("from subprocess import Popen as runner\n", encoding="utf-8")
+    (core / "consumer.py").write_text(
+        "from .provider import " + ("*" if star else "runner") + "\ndef launch(options):\n    return ordinary(**options)\n", encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    escapes = {("aegis_core/provider.py", "<module>"): [1]}
+    if star:
+        escapes[("aegis_core/consumer.py", "<module>")] = [1]
+    assert selector_escape_sites(modules) == escapes
+    keys = escapes.keys() | {("aegis_core/consumer.py", "launch")}
+    assert selector_gate_errors(modules, ()) == ["unreviewed selector site " + rel + ":" + scope
+                                                for rel, scope in sorted(keys)]
+
+
+@pytest.mark.parametrize("api", sorted(RAW))
+@pytest.mark.parametrize("scope", ["<module>", "launch", "Backend"])
+@pytest.mark.parametrize("aliased", [False, True])
+def test_spawn_api_import_origin_requires_escape_review(tmp_path, api, scope, aliased):
+    module, name = api.split(".")
+    statement = "from " + module + " import " + name + (" as runner" if aliased else "") + "\n"
+    source = statement if scope == "<module>" else (
+        ("def launch():\n" if scope == "launch" else "class Backend:\n") + "    " + statement)
+    modules = {"aegis_core/probe.py": ast.parse(source)}
+    key = "aegis_core/probe.py", scope
+    expected = ["unreviewed selector site " + key[0] + ":" + scope]
+    for _ in range(2):
+        assert selector_gate_errors(modules, ()) == expected
+    assert selector_escape_sites(modules) == {key: [1 if scope == "<module>" else 2]}
+    row = (*key, "escape", "Test-owned import-origin review.")
+    assert selector_gate_errors(modules, (row,)) == []
+    assert selector_gate_errors(modules, ((*key, "reviewed-dynamic", row[3]),)) == [
+        "selector escape requires escape kind " + key[0] + ":" + scope]
+
+
+@pytest.mark.parametrize("module", ["os", "subprocess"])
+@pytest.mark.parametrize("scope", ["<module>", "launch", "Backend"])
+@pytest.mark.parametrize("aliased", [False, True])
+def test_spawn_module_import_origin_respects_canonical_scopes(module, scope, aliased):
+    statement = "import " + module + (" as backend" if aliased else "") + "\n"
+    source = statement if scope == "<module>" else (
+        ("def launch():\n" if scope == "launch" else "class Backend:\n") + "    " + statement)
+    modules = {"aegis_sdk/probe.py": ast.parse(source)}
+    key = "aegis_sdk/probe.py", scope
+    if aliased or scope == "Backend":
+        assert selector_gate_errors(modules, ()) == ["unreviewed selector site " + key[0] + ":" + scope]
+        assert selector_gate_errors(modules, ((*key, "escape", "Test-owned module import review."),)) == []
+    else:
+        assert selector_escape_sites(modules) == {}
+        assert selector_gate_errors(modules, ()) == []
+
+
+@pytest.mark.parametrize("shape", ["alternative", "global", "nonlocal"])
+def test_formal_1657_class_import_origins_require_review(shape):
+    source, scope = {
+        "alternative": ("if use_native:\n    from .native import Backend\nelse:\n    class Backend:\n        from subprocess import Popen\ncallback = Backend.Popen\n", "Backend"),
+        "global": ("def initialize():\n    global Backend\n    class Backend:\n        from subprocess import Popen\ninitialize()\n", "initialize.Backend"),
+        "nonlocal": ("def outer():\n    Backend = None\n    def initialize():\n        nonlocal Backend\n        class Backend:\n            from subprocess import Popen\n    initialize()\n    return Backend\n", "outer.initialize.Backend"),
+    }[shape]
+    modules = {"aegis_core/provider.py": ast.parse(source),
+               "aegis_core/native.py": ast.parse("class Backend:\n    Popen = None\n"),
+               "aegis_core/consumer.py": ast.parse("from .provider import Backend\ndef launch(c, o):\n    return Backend.Popen(c, **o)\n")}
+    if shape == "alternative":
+        del modules["aegis_core/consumer.py"]
+    key = "aegis_core/provider.py", scope
+    assert selector_gate_errors(modules, ()) == ["unreviewed selector site " + key[0] + ":" + scope]
+    row = (*key, "escape", "Review the class import before any forwarded use.")
+    assert selector_gate_errors(modules, (row,)) == []
+
+
+@pytest.mark.parametrize("shape", ["module", "class", "positional"])
+def test_formal_1657_star_shadow_routes_require_provider_review(shape):
+    source = {
+        "module": "from .provider import *\ncallback = runner\ndef runner():\n    pass\n",
+        "class": "class Backend:\n    from .provider import *\n    callback = runner\n    def runner():\n        pass\n",
+        "positional": "from .provider import *\nif use_native:\n    def runner():\n        pass\ndef launch(command, executable):\n    return runner(command, -1, executable)\n",
+    }[shape]
+    modules = {"aegis_core/provider.py": ast.parse("from subprocess import Popen as runner\n"),
+               "aegis_core/consumer.py": ast.parse(source)}
+    key = "aegis_core/provider.py", "<module>"
+    keys = {key}
+    keys.add(("aegis_core/consumer.py", "Backend" if shape == "class" else "<module>"))
+    for _ in range(2):
+        assert selector_gate_errors(modules, ()) == ["unreviewed selector site " + rel + ":" + scope
+                                                    for rel, scope in sorted(keys)]
+    table = tuple((*site, "escape", "Review the star route at its import origin.") for site in sorted(keys))
+    assert selector_gate_errors(modules, table) == []
+
+
+def test_argon_1657_conditional_class_reexport_import_requires_review():
+    modules = {
+        "aegis_core/provider.py": ast.parse("from subprocess import Popen as runner\n"),
+        "aegis_core/consumer.py": ast.parse("import types as Backend\nif mode:\n    class Backend:\n        from .provider import runner\ndef launch(c, exe):\n    return Backend.runner(c, -1, exe)\n"),
+    }
+    keys = {("aegis_core/provider.py", "<module>"), ("aegis_core/consumer.py", "Backend")}
+    assert selector_gate_errors(modules, ()) == ["unreviewed selector site " + rel + ":" + scope
+                                                for rel, scope in sorted(keys)]
+    table = tuple((*key, "escape", "Test-owned review of the conditional class import origin.") for key in keys)
+    assert selector_gate_errors(modules, table) == []
+
+
+@pytest.mark.parametrize("route", ["plain", "alias", "module", "class", "package"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_argon_1657_literal_import_graph_counts_and_refuses(tmp_path, route, nested):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    provider, prefix, callee = {
+        "plain": ("from subprocess import Popen as runner\n", "from aegis_core.provider import runner", "runner"),
+        "alias": ("from subprocess import Popen as runner\n", "from aegis_core.middle import invoke", "invoke"),
+        "module": ("import subprocess\n", "from aegis_core.provider import subprocess as backend", "backend.Popen"),
+        "class": ("class Backend:\n    from subprocess import Popen\n", "from aegis_core.provider import Backend", "Backend.Popen"),
+        "package": ("from subprocess import Popen as runner\n", "from aegis_core import invoke", "invoke"),
+    }[route]
+    (core / "provider.py").write_text(provider, encoding="utf-8")
+    (core / "middle.py").write_text("from .provider import runner as invoke\n", encoding="utf-8")
+    (core / "__init__.py").write_text("from .provider import runner as invoke\n", encoding="utf-8")
+    program = prefix + "; " + callee + "(['/bin/true'])"
+    if nested:
+        program = "import sys,subprocess; subprocess.run([sys.executable,'-c'," + repr(program) + "])"
+    (core / "consumer.py").write_text(
+        "import sys,subprocess\ndef launch():\n    subprocess.run([sys.executable,'-c'," + repr(program) + "])\n", encoding="utf-8")
+    table = (("aegis_core/consumer.py", "launch", "resolved-python-program", "Test-owned imported literal spawn."),)
+    if route == "class":
+        with pytest.raises(ValueError) as error:
+            process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == "aegis_core/consumer.py: process spawn inside a literal -c program"
+        return
+    for _ in range(2):
+        sites = process_sites(tmp_path, selector_table=table)
+        assert sum(len(lines) for key, lines in sites.items() if key.endswith(":subprocess.Popen")) == 1
+        assert sum(len(lines) for key, lines in sites.items() if key.endswith(":subprocess.run")) == (2 if nested else 1)
+        assert all(lines == [3] for key, lines in sites.items() if ":launch." in key)
+        with pytest.raises(ValueError) as error:
+            literal_fixture_sites(tmp_path)
+        assert str(error.value) == "aegis_core/consumer.py: process spawn inside a literal -c program"
+
+
+def test_argon_1657_literal_import_graph_retries_and_concurrency(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    provider = core / "provider.py"
+    provider.write_text("from subprocess import Popen as runner\n", encoding="utf-8")
+    (core / "consumer.py").write_text(
+        "import sys,subprocess\ndef launch():\n    subprocess.run([sys.executable,'-c',\"from .provider import runner; runner([])\"])\n", encoding="utf-8")
+    table = (("aegis_core/consumer.py", "launch", "resolved-python-program", "Test-owned relative literal import."),)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: process_sites(tmp_path, selector_table=table), range(4), timeout=30))
+    assert all(any(key.endswith(":subprocess.Popen") for key in sites) for sites in results)
+    provider.write_text("def runner(command):\n    pass\n", encoding="utf-8")
+    assert process_sites(tmp_path, selector_table=table) == {"process:aegis_core/consumer.py:launch:subprocess.run": [3]}
+    assert literal_fixture_sites(tmp_path) == {"process:aegis_core/consumer.py:launch:subprocess.run": [3]}
+
+
+@pytest.mark.parametrize("form", ["code", "argv", "package_code", "package_argv", "star_code", "star_argv"])
+def test_imported_command_values_visit_intermediate_rebindings(tmp_path, form):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    vector = form.endswith("argv")
+    name = "ARGV" if vector else "CODE"
+    initial = "('python3', '-c', 'pass')" if vector else repr("pass")
+    changed = "('python3', '-c', \"import os; os.system('id')\")" if vector else repr("import os; os.system('id')")
+    (core / "defaults.py").write_text("import sys\n" + name + " = " + initial + "\n", encoding="utf-8")
+    if form.startswith("package_"):
+        provider = core / "provider" / "__init__.py"
+        provider.parent.mkdir()
+        prefix = "from ..defaults import "
+    else:
+        provider = core / "provider.py"
+        prefix = "from .defaults import "
+    declaration = prefix + ("*" if form.startswith("star_") else name) + "\n"
+    provider.write_text("import sys\n" + declaration + name + " = " + changed + "\n", encoding="utf-8")
+    argument = name if vector else "[sys.executable, '-c', CODE]"
+    (core / "consumer.py").write_text("import sys,subprocess\nfrom .provider import " + name
+                                     + "\ndef launch():\n    subprocess.run(" + argument + ")\n", encoding="utf-8")
+    table = (("aegis_core/consumer.py", "launch", "resolved-python-program", "Test-owned intermediate value replacement."),)
+    if vector:
+        table = tuple((path, "<module>", "resolved-python-program", "Test-owned imported argv construction.")
+                      for path in ("aegis_core/defaults.py", provider.relative_to(tmp_path).as_posix()))
+    for _ in range(2):
+        sites = process_sites(tmp_path, selector_table=table)
+        children = {key: lines for key, lines in sites.items() if key.endswith(":os.system")}
+        assert len(children) == 1
+        assert next(iter(children)).startswith("process:aegis_core/consumer.py:launch.")
+        assert next(iter(children.values())) == [4]
+        with pytest.raises(ValueError) as error:
+            literal_fixture_sites(tmp_path)
+        assert str(error.value) == "aegis_core/consumer.py: process spawn inside a literal -c program"
+    provider.write_text(declaration, encoding="utf-8")
+    remaining_table = tuple(row for row in table if row[0] != provider.relative_to(tmp_path).as_posix())
+    expected = {"process:aegis_core/consumer.py:launch:subprocess.run": [4]}
+    assert process_sites(tmp_path, selector_table=remaining_table) == expected
+    assert literal_fixture_sites(tmp_path) == expected
+
+
+@pytest.mark.parametrize("form", ["code", "argv", "package_code", "package_argv", "star_code", "star_argv"])
+@pytest.mark.parametrize("write", ["augment", "delete", "unknown"])
+def test_imported_command_values_keep_intermediate_invalidations(tmp_path, form, write):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    vector = form.endswith("argv")
+    name = "ARGV" if vector else "CODE"
+    initial = "[sys.executable, '-c', 'pass']" if vector else repr("pass")
+    (core / "defaults.py").write_text("import sys\n" + name + " = " + initial + "\n", encoding="utf-8")
+    if form.startswith("package_"):
+        provider = core / "provider" / "__init__.py"
+        provider.parent.mkdir()
+        prefix = "from ..defaults import "
+    else:
+        provider = core / "provider.py"
+        prefix = "from .defaults import "
+    replacement = {"augment": name + " += extra\n", "delete": "del " + name + "\n",
+                   "unknown": name + " = make_value()\n"}[write]
+    provider.write_text(prefix + ("*" if form.startswith("star_") else name) + "\n" + replacement, encoding="utf-8")
+    argument = name if vector else "[sys.executable, '-c', CODE]"
+    (core / "consumer.py").write_text("import sys,subprocess\nfrom .provider import " + name
+                                     + "\ndef launch():\n    subprocess.run(" + argument + ")\n", encoding="utf-8")
+    for _ in range(2):
+        with pytest.raises(ValueError) as error:
+            literal_fixture_sites(tmp_path)
+        assert str(error.value) == "aegis_core/consumer.py: unresolved Python -c program"
+
+
+@pytest.mark.parametrize("source", [
+    "from subprocess import Popen\n",
+    "import subprocess as backend\n",
+    "class Backend:\n    import subprocess\n",
+    "class Backend:\n    import math\n",
+    "def initialize():\n    global Backend\n    class Backend:\n        from subprocess import Popen\ninitialize()\nBackend.Popen(['/bin/true'])\n",
+    "if use_native:\n    from types import SimpleNamespace as Backend\nelse:\n    class Backend:\n        from subprocess import Popen\nBackend.Popen(['/bin/true'])\n",
+    "def outer():\n    Backend = None\n    def initialize():\n        nonlocal Backend\n        class Backend:\n            from subprocess import Popen\n    initialize()\n    return Backend\nouter().Popen(['/bin/true'])\n",
+])
+@pytest.mark.parametrize("entry", ["refusal", "inventory"])
+@pytest.mark.parametrize("package_name", PACKAGES)
+def test_literal_import_origins_refuse_without_review(tmp_path, source, entry, package_name):
+    core = tmp_path / package_name
+    core.mkdir()
+    (core / "consumer.py").write_text(
+        "import sys,subprocess\ndef launch():\n    subprocess.run([sys.executable,'-c'," + repr(source) + "])\n", encoding="utf-8")
+    table = ((package_name + "/consumer.py", "launch", "resolved-python-program", "A parent review cannot admit a literal import escape."),)
+    for _ in range(2):
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                literal_fixture_sites(tmp_path)
+            else:
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == package_name + "/consumer.py: process spawn inside a literal -c program"
+
+
+@pytest.mark.parametrize("case", ["rebound_value", "literal_import"])
+def test_command_resolution_retries_and_concurrent_runs_keep_state_local(tmp_path, case):
+    from concurrent.futures import ThreadPoolExecutor
+
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "defaults.py").write_text("CODE = 'pass'\n", encoding="utf-8")
+    provider = core / "provider.py"
+    program = "import os; os.system('id')" if case == "rebound_value" else "from subprocess import Popen"
+    provider.write_text("from .defaults import CODE\nCODE = " + repr(program) + "\n", encoding="utf-8")
+    (core / "consumer.py").write_text(
+        "import sys,subprocess\nfrom .provider import CODE\ndef launch():\n    subprocess.run([sys.executable,'-c',CODE])\n", encoding="utf-8")
+    table = (("aegis_core/consumer.py", "launch", "resolved-python-program", "Test-owned concurrent command resolution."),)
+    expected = "aegis_core/consumer.py: process spawn inside a literal -c program"
+
+    def inspect(_):
+        if case == "literal_import":
+            with pytest.raises(ValueError) as error:
+                process_sites(tmp_path, selector_table=table)
+            assert str(error.value) == expected
+        else:
+            sites = process_sites(tmp_path, selector_table=table)
+            assert sum(len(lines) for key, lines in sites.items() if key.endswith(":os.system")) == 1
+        with pytest.raises(ValueError) as error:
+            literal_fixture_sites(tmp_path)
+        assert str(error.value) == expected
+        return True
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(inspect, range(4), timeout=30)) == [True] * 4
+    provider.write_text("from .defaults import CODE\n", encoding="utf-8")
+    expected_sites = {"process:aegis_core/consumer.py:launch:subprocess.run": [4]}
+    assert process_sites(tmp_path, selector_table=table) == expected_sites
+    assert literal_fixture_sites(tmp_path) == expected_sites
+
+
+def test_imported_spawn_callee_preserves_its_local_command_value(tmp_path):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "backend.py").write_text("from subprocess import Popen as spawn\n", encoding="utf-8")
+    (core / "consumer.py").write_text(
+        "import sys\nfrom .backend import spawn\ndef launch():\n    ARGV = [sys.executable, '-c', 'pass']\n    spawn(ARGV)\n", encoding="utf-8")
+    expected = {"process:aegis_core/consumer.py:launch:subprocess.Popen": [5]}
+    table = (("aegis_core/consumer.py", "launch", "resolved-python-program", "Test-owned imported spawn callee."),)
+    assert literal_fixture_sites(tmp_path) == expected
+    assert process_sites(tmp_path, selector_table=table) == expected
+
+
+@pytest.mark.parametrize("expression", [
+    "backend = subprocess\n",
+    "def launch(backend=subprocess):\n    pass\n",
+    "def launch():\n    return subprocess\n",
+    "consume(subprocess)\n",
+    "backends = [subprocess]\n",
+    "spawn = getattr(subprocess, 'Popen')\n",
+    "def launch(hasattr):\n    return hasattr(subprocess, 'Popen')\n",
+    "def launch(getattr):\n    return getattr(subprocess, 'PIPE')\n",
+])
+@pytest.mark.parametrize("entry", ["module", "literal"])
+def test_spawn_module_values_require_review_or_literal_refusal(tmp_path, expression, entry):
+    source = "import subprocess\n" + expression
+    scope = "launch" if expression.startswith("def ") else "<module>"
+    if entry == "module":
+        modules = {"aegis_core/probe.py": ast.parse(source)}
+        key = "aegis_core/probe.py", scope
+        assert set(selector_escape_sites(modules)) == {key}
+        assert selector_gate_errors(modules, ()) == ["unreviewed selector site " + key[0] + ":" + scope]
+        assert selector_gate_errors(modules, ((*key, "escape", "Test-owned module value review."),)) == []
+    else:
+        core = tmp_path / "aegis_core"
+        core.mkdir()
+        (core / "probe.py").write_text("import sys,subprocess\ndef launch():\n    subprocess.run([sys.executable,'-c',"
+                                       + repr(source) + "])\n", encoding="utf-8")
+        table = (("aegis_core/probe.py", "launch", "resolved-python-program", "A literal module escape cannot be reviewed."),)
+        for operation in (lambda: process_sites(tmp_path, selector_table=table), lambda: literal_fixture_sites(tmp_path)):
+            with pytest.raises(ValueError) as error:
+                operation()
+            assert str(error.value) == "aegis_core/probe.py: process spawn inside a literal -c program"
+
+
+@pytest.mark.parametrize("source", [
+    "import subprocess\nsubprocess.Popen(['tool'])\n",
+    "import os\nhasattr(os, 'posix_spawn')\n",
+    "import subprocess\nvalue = getattr(subprocess, 'PIPE', None)\n",
+    "import os\nvalue = getattr(os, 'O_NOFOLLOW', 0)\n",
+    "import subprocess\ndef launch(subprocess):\n    return subprocess\n",
+])
+def test_spawn_module_value_capability_guards_and_parameter_shadows_are_not_escapes(source):
+    modules = {"aegis_sdk/probe.py": ast.parse(source)}
+    assert selector_escape_sites(modules) == {}
+    assert selector_gate_errors(modules, ()) == []
+
+
+@pytest.mark.parametrize("shape", ["expanded", "positional", "capture"])
+@pytest.mark.parametrize("route", ["direct", "star_chain", "alias_chain"])
+def test_star_imports_of_spawn_modules_require_origin_review(shape, route):
+    modules = {"aegis_core/provider.py": ast.parse("import subprocess\n")}
+    provider, symbol = "provider", "subprocess"
+    keys = {("aegis_core/consumer.py", "<module>")}
+    if route != "direct":
+        provider = "middle"
+        modules["aegis_core/middle.py"] = ast.parse("from .provider import " + (
+            "subprocess as runner\n" if route == "alias_chain" else "*\n"))
+        if route == "alias_chain":
+            symbol = "runner"
+        else:
+            keys.add(("aegis_core/middle.py", "<module>"))
+    operation = {"expanded": symbol + ".Popen(command, **options)",
+                 "positional": symbol + ".Popen(command, -1, executable)",
+                 "capture": symbol + ".Popen"}[shape]
+    modules["aegis_core/consumer.py"] = ast.parse("from ." + provider
+        + " import *\nif use_native:\n    " + symbol + " = native\ndef launch(command, options, executable):\n    return " + operation + "\n")
+    assert set(selector_escape_sites(modules)) == keys
+    assert selector_gate_errors(modules, ()) == ["unreviewed selector site " + rel + ":" + scope
+                                                for rel, scope in sorted(keys)]
+    table = tuple((*key, "escape", "Review the star import before any forwarding.") for key in keys)
+    assert selector_gate_errors(modules, table) == []
+
+
+@pytest.mark.parametrize("shape", ["conditional", "global", "nonspawn"])
+def test_every_class_body_import_requires_origin_review(shape):
+    source, scope = {
+        "conditional": ("import types as Backend\nif mode:\n    class Backend:\n        from . import provider\ndef launch(c, o):\n    return Backend.provider.subprocess.Popen(c, **o)\n", "Backend"),
+        "global": ("def initialize():\n    global Backend\n    class Backend:\n        import aegis_core.provider as p\ninitialize()\nBackend.p.subprocess.Popen(c, **o)\n", "initialize.Backend"),
+        "nonspawn": ("class Backend:\n    import math\n", "Backend"),
+    }[shape]
+    modules = {"aegis_core/provider.py": ast.parse("import subprocess\n"),
+               "aegis_core/consumer.py": ast.parse(source)}
+    key = "aegis_core/consumer.py", scope
+    assert set(selector_escape_sites(modules)) == {key}
+    assert selector_gate_errors(modules, ()) == ["unreviewed selector site " + key[0] + ":" + scope]
+    assert selector_gate_errors(modules, ((*key, "escape", "Test-owned class import review."),)) == []
+
+
+@pytest.mark.parametrize("literal", [False, True])
+def test_implicit_package_prefixes_preserve_spawn_callees(tmp_path, literal):
+    core = tmp_path / "aegis_core"
+    (core / "subpkg").mkdir(parents=True)
+    (core / "__init__.py").write_text("from .helpers import *\n", encoding="utf-8")
+    (core / "helpers.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (core / "subpkg" / "provider.py").write_text("import subprocess\n", encoding="utf-8")
+    source = "import aegis_core.subpkg.provider\ndef launch(c, o):\n    return aegis_core.subpkg.provider.subprocess.Popen(c, **o)\n"
+    if literal:
+        program = "import aegis_core.subpkg.provider; aegis_core.subpkg.provider.subprocess.Popen([])"
+        source = "import sys,subprocess\ndef launch(c, o):\n    subprocess.run([sys.executable,'-c'," + repr(program) + "])\n"
+    (core / "consumer.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    table = (("aegis_core/consumer.py", "launch", "resolved-python-program", "Test-owned implicit package spawn route."),)
+    table += (("aegis_core/__init__.py", "<module>", "escape", "Review the package star re-export."),)
+    assert selector_gate_errors(modules, ()) == ["unreviewed selector site aegis_core/__init__.py:<module>",
+                                                "unreviewed selector site aegis_core/consumer.py:launch"]
+    if literal:
+        with pytest.raises(ValueError) as error:
+            process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == "aegis_core/consumer.py: process spawn inside a literal -c program"
+    else:
+        table = tuple((*row[:2], "escape", row[3]) for row in table)
+        assert selector_gate_errors(modules, table) == []
+        sites = process_sites(tmp_path, selector_table=table)
+        assert sum(len(lines) for key, lines in sites.items() if key.endswith(":subprocess.Popen")) == 1
+
+
+def test_literal_star_import_origin_cannot_be_reviewed(tmp_path):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "provider.py").write_text("import subprocess\n", encoding="utf-8")
+    program = "from .provider import *\nif use_native:\n    subprocess = native\nsubprocess.Popen([])\n"
+    (core / "consumer.py").write_text("import sys,subprocess\ndef launch():\n    subprocess.run([sys.executable,'-c',"
+                                     + repr(program) + "])\n", encoding="utf-8")
+    table = (("aegis_core/consumer.py", "launch", "resolved-python-program", "A literal star escape cannot be reviewed."),)
+    for operation in (lambda: process_sites(tmp_path, selector_table=table), lambda: literal_fixture_sites(tmp_path)):
+        with pytest.raises(ValueError) as error:
+            operation()
+        assert str(error.value) == "aegis_core/consumer.py: process spawn inside a literal -c program"
+
+
+@pytest.mark.parametrize("route", ["direct", "package", "chain"])
+def test_unresolved_module_reexports_require_consuming_site_review(tmp_path, route):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "defaults.py").write_text("import sys\nARGV = [sys.executable, '-c', 'pass']\n", encoding="utf-8")
+    if route == "package":
+        provider = core / "provider" / "__init__.py"
+        provider.parent.mkdir()
+        declaration = "from .. import defaults as config\n"
+    elif route == "chain":
+        provider = core / "provider.py"
+        (core / "relay.py").write_text("from . import defaults as config\n", encoding="utf-8")
+        declaration = "from .relay import config\n"
+    else:
+        provider = core / "provider.py"
+        declaration = "from . import defaults as config\n"
+    provider.write_text(declaration + "config.ARGV[2] = \"import os; os.system('id')\"\n", encoding="utf-8")
+    (core / "consumer.py").write_text("import subprocess\nfrom .provider import config\nsubprocess.run(config.ARGV)\n", encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    defaults = (("aegis_core/defaults.py", "<module>", "resolved-python-program", "Test-owned original argv."),)
+    consumer = "aegis_core/consumer.py", "<module>"
+    mutation = provider.relative_to(tmp_path).as_posix(), "<module>"
+    for _ in range(2):
+        errors = selector_gate_errors(modules, defaults)
+        assert "unreviewed selector site " + consumer[0] + ":<module>" in errors
+        assert "unreviewed selector site " + mutation[0] + ":<module>" in errors
+        with pytest.raises(ValueError) as error:
+            process_sites(tmp_path, selector_table=defaults)
+        assert str(error.value) == "unreviewed selector site aegis_core/consumer.py:<module>"
+        with pytest.raises(ValueError) as error:
+            literal_fixture_sites(tmp_path)
+        assert str(error.value) == "aegis_core/consumer.py: unresolved Python -c program"
+    table = defaults + ((*consumer, "reviewed-dynamic", "Review the unknown imported command."),
+                        (*mutation, "escape", "Review the cross-module mutation."))
+    assert selector_gate_errors(modules, table) == []
+    assert process_sites(tmp_path, selector_table=table) == {
+        "process:aegis_core/consumer.py:<module>:subprocess.run": [3]}
+
+
+@pytest.mark.parametrize("statement", [
+    "config.ARGV = []\n",
+    "config.ARGV[2] = 'new'\n",
+    "config.ARGV += extra\n",
+    "del config.ARGV\n",
+    "setattr(config, 'ARGV', [])\n",
+    "delattr(config, 'ARGV')\n",
+])
+@pytest.mark.parametrize("entry", ["module", "literal"])
+def test_imported_module_mutations_require_review_or_literal_refusal(tmp_path, statement, entry):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "defaults.py").write_text("ARGV = []\n", encoding="utf-8")
+    source = "from . import defaults as config\n" + statement
+    if entry == "module":
+        (core / "probe.py").write_text(source, encoding="utf-8")
+        modules = dict(module_trees(tmp_path))
+        key = "aegis_core/probe.py", "<module>"
+        assert set(selector_escape_sites(modules)) == {key}
+        assert selector_gate_errors(modules, ()) == ["unreviewed selector site " + key[0] + ":<module>"]
+        assert selector_gate_errors(modules, ((*key, "escape", "Test-owned imported-module store review."),)) == []
+    else:
+        (core / "probe.py").write_text("import sys,subprocess\ndef launch():\n    subprocess.run([sys.executable,'-c',"
+                                       + repr(source) + "])\n", encoding="utf-8")
+        table = (("aegis_core/probe.py", "launch", "resolved-python-program", "A parent row cannot review a literal store."),)
+        for operation in (lambda: process_sites(tmp_path, selector_table=table), lambda: literal_fixture_sites(tmp_path)):
+            with pytest.raises(ValueError) as error:
+                operation()
+            assert str(error.value) == "aegis_core/probe.py: process spawn inside a literal -c program"
+
+
+@pytest.mark.parametrize("provider", ["from . import backend\n", "from . import backend as runner\n"])
+def test_every_repository_star_import_requires_review(provider):
+    symbol = "runner" if " as " in provider else "backend"
+    modules = {"aegis_core/backend.py": ast.parse("import subprocess\n"),
+               "aegis_core/provider.py": ast.parse(provider),
+               "aegis_core/consumer.py": ast.parse("from .provider import *\nif use_native:\n    " + symbol
+                   + " = native\ndef launch(c, o):\n    return " + symbol + ".subprocess.Popen(c, **o)\n")}
+    key = "aegis_core/consumer.py", "<module>"
+    assert set(selector_escape_sites(modules)) == {key}
+    assert selector_gate_errors(modules, ()) == ["unreviewed selector site " + key[0] + ":<module>"]
+    assert selector_gate_errors(modules, ((*key, "escape", "Review the repository star import at its origin."),)) == []
+
+
+def test_repository_star_import_without_spawn_exports_is_still_a_literal_escape(tmp_path):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "provider.py").write_text("VALUE = 1\n", encoding="utf-8")
+    program = "from .provider import *\n"
+    (core / "consumer.py").write_text("import sys,subprocess\ndef launch():\n    subprocess.run([sys.executable,'-c',"
+                                     + repr(program) + "])\n", encoding="utf-8")
+    table = (("aegis_core/consumer.py", "launch", "resolved-python-program", "A literal cannot review any repository star import."),)
+    for operation in (lambda: process_sites(tmp_path, selector_table=table), lambda: literal_fixture_sites(tmp_path)):
+        with pytest.raises(ValueError) as error:
+            operation()
+        assert str(error.value) == "aegis_core/consumer.py: process spawn inside a literal -c program"
+
+
+def test_imported_loop_argv_invalidation_remains_bearing(tmp_path):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "defaults.py").write_text(
+        "import sys\nfor ARGV in [[sys.executable,'-c','pass']]:\n    ARGV[2] = \"import os; os.system('id')\"\n", encoding="utf-8")
+    (core / "consumer.py").write_text("import subprocess\nfrom .defaults import ARGV\nsubprocess.run(ARGV)\n", encoding="utf-8")
+    table = (("aegis_core/defaults.py", "<module>", "resolved-python-program", "Test-owned loop argv construction."),)
+    with pytest.raises(ValueError) as error:
+        literal_fixture_sites(tmp_path)
+    assert str(error.value) == "aegis_core/consumer.py: unresolved Python -c program"
+    with pytest.raises(ValueError) as error:
+        process_sites(tmp_path, selector_table=table)
+    assert str(error.value) == "unreviewed selector site aegis_core/consumer.py:<module>"
+
+
+def test_unresolved_import_retries_and_concurrent_reviews_keep_state_local(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "defaults.py").write_text("import sys\nARGV = [sys.executable, '-c', 'pass']\n", encoding="utf-8")
+    provider = core / "provider.py"
+    provider.write_text("from . import defaults as config\nconfig.ARGV[2] = 'changed'\n", encoding="utf-8")
+    consumer = core / "consumer.py"
+    consumer.write_text("import subprocess\nfrom .provider import config\nsubprocess.run(config.ARGV)\n", encoding="utf-8")
+    defaults = (("aegis_core/defaults.py", "<module>", "resolved-python-program", "Test-owned original argv."),)
+    table = defaults + (("aegis_core/provider.py", "<module>", "escape", "Review the imported-module mutation."),
+                        ("aegis_core/consumer.py", "<module>", "reviewed-dynamic", "Review the unresolved imported command."))
+    modules = dict(module_trees(tmp_path))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(lambda _: selector_gate_errors(modules, table), range(4), timeout=30)) == [[], [], [], []]
+    (core / "defaults.py").write_text("import sys\nARGV = (sys.executable, '-c', 'pass')\n", encoding="utf-8")
+    provider.write_text("from .defaults import ARGV\n", encoding="utf-8")
+    consumer.write_text("import subprocess\nfrom .provider import ARGV\nsubprocess.run(ARGV)\n", encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    assert selector_gate_errors(modules, defaults) == []
+    assert process_sites(tmp_path, selector_table=defaults) == {
+        "process:aegis_core/consumer.py:<module>:subprocess.run": [3]}
+    assert literal_fixture_sites(tmp_path) == {
+        "process:aegis_core/consumer.py:<module>:subprocess.run": [3]}
+    errors = selector_gate_errors(modules, table)
+    assert "stale selector site aegis_core/consumer.py:<module>" in errors
+    assert "stale selector escape aegis_core/provider.py:<module>" in errors
+
+
+def test_imported_class_and_shadowed_module_stores_are_not_module_mutations():
+    modules = {"aegis_core/provider.py": ast.parse("class Holder:\n    pass\n"),
+               "aegis_core/consumer.py": ast.parse("from .provider import Holder\nHolder.report_path = 'out'\n"
+                   "import sys\ndef launch(sys):\n    sys.stdout = None\n")}
+    assert selector_escape_sites(modules) == {}
+    assert selector_gate_errors(modules, ()) == []
+
+
+@pytest.mark.parametrize("api", ["os.system", "os.popen", "subprocess.getoutput", "subprocess.getstatusoutput"])
+def test_unresolved_imported_shell_text_requires_consuming_review(tmp_path, api):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "defaults.py").write_text("CODE = 'pass'\n", encoding="utf-8")
+    (core / "provider.py").write_text("from . import defaults as config\n", encoding="utf-8")
+    (core / "consumer.py").write_text("import os,subprocess\nfrom .provider import config\n"
+                                     + api + "(config.CODE)\n", encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    expected = "unreviewed selector site aegis_core/consumer.py:<module>"
+    assert selector_gate_errors(modules, ()) == [expected]
+    with pytest.raises(ValueError) as error:
+        process_sites(tmp_path)
+    assert str(error.value) == expected
+    with pytest.raises(ValueError) as error:
+        literal_fixture_sites(tmp_path)
+    assert str(error.value) == "aegis_core/consumer.py: unresolved Python -c program"
+
+
+@pytest.mark.parametrize("body", ["backend = provider\n", "provider.subprocess.Popen(c, **options)\n"])
+def test_repository_module_values_and_spawn_exposing_attributes_require_review(body):
+    modules = {"aegis_core/provider.py": ast.parse("import subprocess\n"),
+               "aegis_core/consumer.py": ast.parse("from . import provider\n" + body)}
+    key = "aegis_core/consumer.py", "<module>"
+    assert set(selector_escape_sites(modules)) == {key}
+    assert selector_gate_errors(modules, ()) == ["unreviewed selector site " + key[0] + ":<module>"]
+    assert selector_gate_errors(modules, ((*key, "escape", "Review the repository namespace origin."),)) == []
+
+
+def test_ambiguous_package_binding_and_module_file_are_unknown(tmp_path):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "provider.py").write_text("CODE = 'pass'\n", encoding="utf-8")
+    (core / "evil.py").write_text("CODE = \"import os; os.system('id')\"\n", encoding="utf-8")
+    (core / "__init__.py").write_text("from . import evil as provider\n", encoding="utf-8")
+    (core / "consumer.py").write_text("import sys,subprocess\nfrom . import provider\n"
+                                     "subprocess.run([sys.executable,'-c',provider.CODE])\n", encoding="utf-8")
+    for _ in range(2):
+        with pytest.raises(ValueError) as error:
+            literal_fixture_sites(tmp_path)
+        assert str(error.value) == "aegis_core/consumer.py: unresolved Python -c program"
+
+
+@pytest.mark.parametrize("definition", ["ARGV = ['python3', '-c', 'pass']\n", "ARGV = list(('python3', '-c', 'pass'))\n"])
+def test_mutable_or_call_result_command_values_cannot_cross_modules_as_known(tmp_path, definition):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "provider.py").write_text(definition, encoding="utf-8")
+    (core / "consumer.py").write_text("import subprocess\nfrom .provider import ARGV\nsubprocess.run(ARGV)\n", encoding="utf-8")
+    table = (("aegis_core/provider.py", "<module>", "resolved-python-program", "Test-owned original argv."),)
+    with pytest.raises(ValueError) as error:
+        process_sites(tmp_path, selector_table=table)
+    assert str(error.value) == "unreviewed selector site aegis_core/consumer.py:<module>"
+    with pytest.raises(ValueError) as error:
+        literal_fixture_sites(tmp_path)
+    assert str(error.value) == "aegis_core/consumer.py: unresolved Python -c program"
+
+
+def test_noncall_spawn_reference_in_literal_has_no_review_path(tmp_path):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    program = "import subprocess\nrunner = subprocess.Popen\nrunner('tool', **options)\n"
+    (core / "consumer.py").write_text("import sys,subprocess\ndef launch():\n    subprocess.run([sys.executable,'-c',"
+                                     + repr(program) + "])\n", encoding="utf-8")
+    table = (("aegis_core/consumer.py", "launch", "resolved-python-program", "A literal RAW value cannot carry review."),)
+    with pytest.raises(ValueError) as error:
+        process_sites(tmp_path, selector_table=table)
+    assert str(error.value) == "aegis_core/consumer.py: process spawn inside a literal -c program"
+
+
+SNAPSHOT_LITERAL_CASES = (
+    ("aegis_core/testexec.py", "run_pytest_snapshot", "_SNAPSHOT_RUNNER",
+     "803eddf9509c06ab8e5e37a94653738489f699425b8a1e3d2cd130f99d452902"),
+    ("aegis_core/verification/regression_commands.py", "run_configured_snapshot", "_BOOTSTRAP",
+     "820cac9a505d774844ddad9f86f0ee041ba49eeb42fd186ca35914b683dca456"),
+)
+
+
+def test_literal_program_exceptions_are_the_two_reviewed_bootstraps():
+    assert LITERAL_PROGRAM_EXCEPTIONS == {
+        (rel, function, digest): "snapshot bootstrap isolates sys.path from the live checkout"
+        for rel, function, _, digest in SNAPSHOT_LITERAL_CASES}
+
+
+def snapshot_literal_source(rel, binding):
+    tree = ast.parse((REPO / rel).read_text(encoding="utf-8"))
+    return ast.literal_eval(next(node.value for node in tree.body if isinstance(node, ast.Assign)
+                                 and any(isinstance(target, ast.Name) and target.id == binding
+                                         for target in node.targets)))
+
+
+def literal_review_tree(tmp_path, program, rel="aegis_core/probe.py", function="launch"):
+    path = tmp_path / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("import subprocess, sys\ndef " + function + "():\n"
+                    "    subprocess.run([sys.executable, '-c', " + repr(program) + "])\n", encoding="utf-8")
+    return ((rel, function, "resolved-python-program", "Test-owned literal program."),)
+
+
+@pytest.mark.parametrize("rel,function,binding,digest", SNAPSHOT_LITERAL_CASES)
+def test_snapshot_literal_exact_source_is_accepted(tmp_path, rel, function, binding, digest):
+    program = snapshot_literal_source(rel, binding)
+    assert hashlib.sha256(program.encode("utf-8")).hexdigest() == digest
+    table = literal_review_tree(tmp_path, program, rel, function)
+    modules = dict(module_trees(tmp_path))
+    # The existing refusal entry point must accept each real bootstrap too.
+    refuse_literal_spawns(modules[rel], rel, modules, CommandResolver(modules, option_pins={}))
+    exceptions = {(rel, function, digest): "snapshot bootstrap isolates sys.path from the live checkout"}
+    assert process_sites(tmp_path, option_pins={}, selector_table=table, literal_exceptions=exceptions) == {
+        "process:" + rel + ":" + function + ":subprocess.run": [3]}
+
+
+@pytest.mark.parametrize("rel,function,binding,digest", SNAPSHOT_LITERAL_CASES)
+def test_snapshot_literal_one_byte_change_refuses(tmp_path, rel, function, binding, digest):
+    program = snapshot_literal_source(rel, binding) + " "
+    table = literal_review_tree(tmp_path, program, rel, function)
+    exceptions = {(rel, function, digest): "snapshot bootstrap isolates sys.path from the live checkout"}
+    with pytest.raises(ValueError) as error:
+        process_sites(tmp_path, option_pins={}, selector_table=table, literal_exceptions=exceptions)
+    assert str(error.value) == rel + ": process spawn inside a literal -c program"
+
+
+@pytest.mark.parametrize("changed", ["file", "function"])
+def test_snapshot_literal_exception_is_bound_to_its_owner(tmp_path, changed):
+    rel, function, binding, digest = SNAPSHOT_LITERAL_CASES[0]
+    program = snapshot_literal_source(rel, binding)
+    exceptions = {(rel, function, digest): "snapshot bootstrap isolates sys.path from the live checkout"}
+    if changed == "file":
+        rel = "aegis_core/other.py"
+    else:
+        function = "other"
+    table = literal_review_tree(tmp_path, program, rel, function)
+    with pytest.raises(ValueError) as error:
+        process_sites(tmp_path, option_pins={}, selector_table=table, literal_exceptions=exceptions)
+    assert str(error.value) == rel + ": process spawn inside a literal -c program"
+
+
+def test_unlisted_literal_module_store_has_no_exception(tmp_path):
+    table = literal_review_tree(tmp_path, "import sys\nsys.path[:] = []\n")
+    with pytest.raises(ValueError) as error:
+        process_sites(tmp_path, selector_table=table)
+    assert str(error.value) == "aegis_core/probe.py: process spawn inside a literal -c program"
+
+
+@pytest.mark.parametrize("program", [None, "pass\n"])
+def test_literal_program_exception_stale_row_refuses(tmp_path, program):
+    rel, function, _, digest = SNAPSHOT_LITERAL_CASES[0]
+    table = () if program is None else literal_review_tree(tmp_path, program, rel, function)
+    with pytest.raises(ValueError) as error:
+        process_sites(tmp_path, option_pins={}, selector_table=table,
+                      literal_exceptions={(rel, function, digest): "Test-owned stale review."})
+    assert str(error.value) == "process census: stale literal program exception"
+
+
+@pytest.mark.parametrize("tail", [
+    "import subprocess as backend\n",
+    "import subprocess\nrunner = subprocess.Popen\n",
+    "import subprocess\nforwarded = subprocess\n",
+    "class Backend:\n    import pathlib\n",
+])
+def test_literal_program_exception_waives_only_module_stores(tmp_path, tail):
+    program = "import sys\nsys.path[:] = []\n" + tail
+    table = literal_review_tree(tmp_path, program)
+    key = "aegis_core/probe.py", "launch", hashlib.sha256(program.encode("utf-8")).hexdigest()
+    with pytest.raises(ValueError) as error:
+        process_sites(tmp_path, selector_table=table,
+                      literal_exceptions={key: "Test-owned module-store exception only."})
+    assert str(error.value) == "aegis_core/probe.py: process spawn inside a literal -c program"
+
+
+def test_literal_program_exception_keeps_nested_spawn_inventory(tmp_path):
+    program = "import sys, subprocess\nsys.path[:] = []\nsubprocess.run(['native-tool'])\n"
+    table = literal_review_tree(tmp_path, program)
+    key = "aegis_core/probe.py", "launch", hashlib.sha256(program.encode("utf-8")).hexdigest()
+    exceptions = {key: "Test-owned module-store exception only."}
+    sites = process_sites(tmp_path, selector_table=table, literal_exceptions=exceptions)
+    assert sites == {
+        "process:aegis_core/probe.py:launch:subprocess.run": [3],
+        "process:aegis_core/probe.py:launch.<literal-c-L3C4>.<module>:subprocess.run": [3],
+    }
+    modules = dict(module_trees(tmp_path))
+    with pytest.raises(ValueError) as error:
+        refuse_literal_spawns(modules["aegis_core/probe.py"], "aegis_core/probe.py", modules,
+                              literal_exceptions=exceptions)
+    assert str(error.value) == "aegis_core/probe.py: process spawn inside a literal -c program"
+
+
+def test_literal_program_exception_keeps_unresolved_import_refusal(tmp_path):
+    program = ("import sys, subprocess\nsys.path[:] = []\n"
+               "from .provider import config\nsubprocess.run(config.ARGV)\n")
+    table = literal_review_tree(tmp_path, program)
+    (tmp_path / "aegis_core/defaults.py").write_text("ARGV = ('python', '-c', 'pass')\n", encoding="utf-8")
+    (tmp_path / "aegis_core/provider.py").write_text("from . import defaults as config\n", encoding="utf-8")
+    table += (("aegis_core/defaults.py", "<module>", "resolved-python-program", "Test-owned original argv."),)
+    key = "aegis_core/probe.py", "launch", hashlib.sha256(program.encode("utf-8")).hexdigest()
+    with pytest.raises(ValueError) as error:
+        process_sites(tmp_path, selector_table=table,
+                      literal_exceptions={key: "Test-owned module-store exception only."})
+    assert str(error.value) == "aegis_core/probe.py: unresolved Python -c program"
+
+
+def package_shadow_tree(tmp_path, declaration, *, form="code", nested=False, package_child=True):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    owner = core / "outer" if nested else core
+    owner.mkdir(exist_ok=True)
+    (owner / "__init__.py").write_text(declaration, encoding="utf-8")
+    (owner / "alternate.py").write_text("from . import payload as config\n", encoding="utf-8")
+    (owner / "payload.py").write_text("CODE = \"import os; os.system('id')\"\n", encoding="utf-8")
+    if package_child:
+        child = owner / "provider"
+        child.mkdir()
+        (child / "__init__.py").write_text("", encoding="utf-8")
+        config = child / "config.py"
+        expression = "provider.config."
+    else:
+        config = owner / "provider.py"
+        expression = "provider."
+    config.write_text("CODE = 'pass'\nARGV = ('python', '-c', 'pass')\n", encoding="utf-8")
+    command = "[sys.executable, '-c', " + expression + "CODE]" if form == "code" else expression + "ARGV"
+    consumer = owner / "consumer.py"
+    consumer.write_text("import sys, subprocess\nfrom . import provider\nsubprocess.run(" + command + ")\n",
+                        encoding="utf-8")
+    return consumer.relative_to(tmp_path).as_posix(), config.relative_to(tmp_path).as_posix()
+
+
+@pytest.mark.parametrize("declaration", [
+    "from . import alternate as provider\n",
+    "from .alternate import config as provider\n",
+    "provider = None\n",
+    "def provider():\n    pass\n",
+    "class provider:\n    pass\n",
+    "from . import provider\nprovider = None\n",
+])
+@pytest.mark.parametrize("form", ["code", "argv"])
+def test_shadowed_package_prefix_literal_refusal(tmp_path, declaration, form):
+    rel, _ = package_shadow_tree(tmp_path, declaration, form=form)
+    with pytest.raises(ValueError) as error:
+        literal_fixture_sites(tmp_path)
+    assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("nested,package_child", [(False, True), (True, True), (False, False), (True, False)])
+def test_shadowed_package_prefix_inventory_requires_consumer_review(tmp_path, nested, package_child):
+    rel, config = package_shadow_tree(tmp_path, "from . import alternate as provider\n", form="argv",
+                                     nested=nested, package_child=package_child)
+    table = ((config, "<module>", "resolved-python-program", "Test-owned physical argv."),)
+    modules = dict(module_trees(tmp_path))
+    expected = "unreviewed selector site " + rel + ":<module>"
+    assert selector_gate_errors(modules, table) == [expected]
+    with pytest.raises(ValueError) as error:
+        process_sites(tmp_path, selector_table=table)
+    assert str(error.value) == expected
+    table += ((rel, "<module>", "reviewed-dynamic", "Review an unresolved package command."),)
+    assert selector_gate_errors(modules, table) == []
+    assert process_sites(tmp_path, selector_table=table) == {"process:" + rel + ":<module>:subprocess.run": [3]}
+
+
+@pytest.mark.parametrize("declaration", [
+    "", "from . import provider\n", "other = None\n",
+    "def other():\n    provider = None\n", "class Other:\n    provider = None\n",
+])
+@pytest.mark.parametrize("form", ["code", "argv"])
+def test_unshadowed_nested_package_values_still_resolve(tmp_path, declaration, form):
+    rel, config = package_shadow_tree(tmp_path, declaration, form=form, nested=True)
+    modules = dict(module_trees(tmp_path))
+    resolver = CommandResolver(modules)
+    assert list(literal_programs(modules[rel], rel, modules, resolver)) == [(3, "pass")]
+    assert literal_fixture_sites(tmp_path) == {"process:" + rel + ":<module>:subprocess.run": [3]}
+    table = ((config, "<module>", "resolved-python-program", "Test-owned physical argv."),)
+    if form == "code":
+        table += ((rel, "<module>", "resolved-python-program", "Test-owned scalar program."),)
+    assert selector_gate_errors(modules, table) == []
+    assert process_sites(tmp_path, selector_table=table) == {"process:" + rel + ":<module>:subprocess.run": [3]}
+
+
+def test_shadowed_package_prefix_callee_is_unknown(tmp_path):
+    rel, config = package_shadow_tree(tmp_path, "from . import alternate as provider\n")
+    (tmp_path / config).write_text("from subprocess import Popen\n", encoding="utf-8")
+    (tmp_path / rel).write_text("from . import provider\nprovider.config.Popen(command)\n", encoding="utf-8")
+    table = ((config, "<module>", "escape", "Review the physical spawn import."),)
+    modules = dict(module_trees(tmp_path))
+    assert selector_gate_errors(modules, table) == ["unreviewed selector site " + rel + ":<module>"]
+    table += ((rel, "<module>", "reviewed-dynamic", "Review an unresolved package callee."),)
+    assert selector_gate_errors(modules, table) == []
+    assert process_sites(tmp_path, selector_table=table) == {}
+
+
+def test_shadowed_package_prefix_in_literal_callee_refuses(tmp_path):
+    rel, config = package_shadow_tree(tmp_path, "from . import alternate as provider\n")
+    (tmp_path / config).write_text("from subprocess import Popen\n", encoding="utf-8")
+    program = "from . import provider\nprovider.config.Popen(command)\n"
+    table = literal_review_tree(tmp_path, program, rel, "launch")
+    table += ((config, "<module>", "escape", "Review the physical spawn import."),)
+    with pytest.raises(ValueError) as error:
+        process_sites(tmp_path, selector_table=table)
+    assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("declaration,expression", [
+    ("from .provider.config import CODE\n", "CODE"),
+    ("import aegis_core.provider.config as config\n", "config.CODE"),
+    ("import aegis_core.provider.config\n", "aegis_core.provider.config.CODE"),
+    ("from .relay import CODE\n", "CODE"),
+])
+def test_shadowed_package_prefix_survives_import_routes(tmp_path, declaration, expression):
+    rel, _ = package_shadow_tree(tmp_path, "from . import alternate as provider\n")
+    (tmp_path / "aegis_core/relay.py").write_text("from .provider.config import CODE\n", encoding="utf-8")
+    (tmp_path / rel).write_text("import sys, subprocess\n" + declaration
+                               + "subprocess.run([sys.executable, '-c', " + expression + "])\n", encoding="utf-8")
+    with pytest.raises(ValueError) as error:
+        literal_fixture_sites(tmp_path)
+    assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+def test_shadowed_package_prefix_does_not_match_a_sibling_name(tmp_path):
+    rel, _ = package_shadow_tree(tmp_path, "from . import alternate as provider\n")
+    (tmp_path / "aegis_core/provider_extra.py").write_text("CODE = 'pass'\n", encoding="utf-8")
+    (tmp_path / rel).write_text("import sys, subprocess\nfrom . import provider_extra\n"
+                               "subprocess.run([sys.executable, '-c', provider_extra.CODE])\n", encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    assert list(literal_programs(modules[rel], rel, modules, CommandResolver(modules))) == [(3, "pass")]
+    assert literal_fixture_sites(tmp_path) == {"process:" + rel + ":<module>:subprocess.run": [3]}
+
+
+@pytest.mark.parametrize("declaration", [
+    "from . import provider, alternate as provider\n",
+    "from . import alternate as provider, provider\n",
+])
+@pytest.mark.parametrize("form", ["code", "argv"])
+def test_shadowed_package_prefix_repeated_import_alias_refuses(tmp_path, declaration, form):
+    rel, _ = package_shadow_tree(tmp_path, declaration, form=form)
+    with pytest.raises(ValueError) as error:
+        literal_fixture_sites(tmp_path)
+    assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("wrapper", ["tuple(config.ARGV)", "list(config.ARGV)", "config.ARGV[:]",
+                                      "[x for x in config.ARGV]"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_unresolved_import_provenance_survives_local_wrappers(tmp_path, wrapper, entry):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "defaults.py").write_text("ARGV = ('python', '-c', 'pass')\n", encoding="utf-8")
+    (core / "provider.py").write_text("import sys\nfrom . import defaults as config\n"
+                                     "config.ARGV = (sys.executable, '-c', \"import os; os.system('id')\")\n",
+                                     encoding="utf-8")
+    (core / "consumer.py").write_text("import subprocess\nfrom .provider import config\nargv = " + wrapper
+                                     + "\nsubprocess.run(argv)\n", encoding="utf-8")
+    rel = "aegis_core/consumer.py"
+    modules = dict(module_trees(tmp_path))
+    table = (("aegis_core/defaults.py", "<module>", "resolved-python-program", "Test-owned original argv."),
+             ("aegis_core/provider.py", "<module>", "escape", "Review the imported-module store."))
+    expected = "unreviewed selector site " + rel + ":<module>"
+    if entry == "selector":
+        assert selector_gate_errors(modules, table) == [expected]
+    elif entry == "refusal":
+        with pytest.raises(ValueError) as error:
+            refuse_literal_spawns(modules[rel], rel, modules, CommandResolver(modules))
+        assert str(error.value) == rel + ": unresolved Python -c program"
+    else:
+        with pytest.raises(ValueError) as error:
+            process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == expected
+
+
+@pytest.mark.parametrize("wrapper", ["tuple(('native-tool',))", "[str(x) for x in ('native-tool',)]"])
+def test_local_wrappers_without_bearing_sources_add_no_review(tmp_path, wrapper):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "consumer.py").write_text("import subprocess\nargv = " + wrapper + "\nsubprocess.run(argv)\n",
+                                     encoding="utf-8")
+    assert selector_gate_errors(dict(module_trees(tmp_path)), ()) == []
+    assert literal_fixture_sites(tmp_path) == {"process:aegis_core/consumer.py:<module>:subprocess.run": [3]}
+
+
+@pytest.mark.parametrize("route", ["module", "from_import"])
+@pytest.mark.parametrize("reviewed", [False, True])
+def test_modeled_stdlib_quote_callee_is_not_unresolved(tmp_path, route, reviewed):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    declaration, helper = ("import shlex\n", "shlex.quote") if route == "module" else (
+        "from shlex import quote as shell_quote\n", "shell_quote")
+    metadata = "    message = '-c is printed as shell data'\n" if reviewed else ""
+    (core / "consumer.py").write_text("import os\n" + declaration + "def launch(arg):\n" + metadata
+                                     + "    os.system('echo ' + " + helper + "(arg))\n", encoding="utf-8")
+    table = (("aegis_core/consumer.py", "launch", "lexer-or-message", "Review the literal option-message metadata."),) if reviewed else ()
+    modules = dict(module_trees(tmp_path))
+    assert selector_gate_errors(modules, table) == []
+    expected = {"process:aegis_core/consumer.py:launch:os.system": [5 if reviewed else 4]}
+    assert process_sites(tmp_path, selector_table=table) == expected
+    assert literal_fixture_sites(tmp_path) == expected
+
+
+@pytest.mark.parametrize("route", ["module", "from_import"])
+def test_modeled_stdlib_quote_still_walks_unresolved_arguments(tmp_path, route):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "defaults.py").write_text("CODE = 'plain text'\n", encoding="utf-8")
+    (core / "provider.py").write_text("from . import defaults as config\n", encoding="utf-8")
+    declaration, helper = ("import shlex\n", "shlex.quote") if route == "module" else (
+        "from shlex import quote as shell_quote\n", "shell_quote")
+    (core / "consumer.py").write_text("import os\n" + declaration + "from .provider import config\n"
+                                     + "os.system('echo ' + " + helper + "(config.CODE))\n", encoding="utf-8")
+    with pytest.raises(ValueError) as error:
+        literal_fixture_sites(tmp_path)
+    assert str(error.value) == "aegis_core/consumer.py: unresolved Python -c program"
+
+
+def test_captured_stdlib_path_callee_is_not_unresolved(tmp_path):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "worker.py").write_text("pass\n", encoding="utf-8")
+    (core / "consumer.py").write_text("from pathlib import Path\n"
+                                     "CODE = Path(__file__).with_name('worker.py').read_text(encoding='utf-8')\n",
+                                     encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    resolver = CommandResolver(modules)
+    expression = modules["aegis_core/consumer.py"].body[1].value
+    assert resolver.bearing(expression, "aegis_core/consumer.py", unresolved_only=True) is False
+    assert literal_fixture_sites(tmp_path) == {}
+
+
+@pytest.mark.parametrize("reason", ["", "   ", "one\ntwo", "one\rtwo", "one\r\ntwo", "one\u2028two", None, 7, b"reason"])
+@pytest.mark.parametrize("entry", ["refusal", "inventory"])
+def test_literal_exception_reason_must_be_one_nonempty_text_line(tmp_path, reason, entry):
+    rel, function, program = "aegis_core/probe.py", "launch", "import sys\nsys.path[:] = []\n"
+    table = literal_review_tree(tmp_path, program, rel, function)
+    exceptions = {(rel, function, hashlib.sha256(program.encode()).hexdigest()): reason}
+    with pytest.raises(ValueError) as error:
+        if entry == "refusal":
+            modules = dict(module_trees(tmp_path))
+            refuse_literal_spawns(modules[rel], rel, modules, literal_exceptions=exceptions)
+        else:
+            process_sites(tmp_path, selector_table=table, literal_exceptions=exceptions)
+    assert str(error.value) == "process census: invalid literal program exception"
+
+
+@pytest.mark.parametrize("reviewed", [False, True])
+def test_literal_exception_ownership_uses_statement_nodes_on_shared_lines(reviewed):
+    rel, program = "aegis_core/probe.py", "import sys\nsys.path[:] = []\n"
+    command = "subprocess.run([sys.executable, '-c', " + repr(program) + "])"
+    # AST location metadata can co-locate separate statements. Preserve each
+    # statement's actual lexical owner instead of taking the line's last scope.
+    if reviewed:
+        tree = ast.parse("import sys, subprocess\ndef launch(): " + command + "\npass\n")
+        ast.increment_lineno(tree.body[-1], -1)
+    else:
+        tree = ast.parse("import sys, subprocess\n" + command + "\ndef launch(): pass\n")
+        ast.increment_lineno(tree.body[-1], -1)
+    exceptions = {(rel, "launch", hashlib.sha256(program.encode()).hexdigest()): "Review only the function's store."}
+    if reviewed:
+        refuse_literal_spawns(tree, rel, {rel: tree}, literal_exceptions=exceptions)
+    else:
+        with pytest.raises(ValueError) as error:
+            refuse_literal_spawns(tree, rel, {rel: tree}, literal_exceptions=exceptions)
+        assert str(error.value) == rel + ": process spawn inside a literal -c program"
+
+
+STDLIB_REEXPORT_ROUTES = ("direct", "plain", "aliased", "package", "transitive", "namespace", "package_transitive",
+                         "stdlib_module", "stdlib_module_alias")
+
+
+def stdlib_reexport_tree(tmp_path, helper, route):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    module, name = ("shlex", "quote") if helper == "quote" else ("pathlib", "Path")
+    export = "exported" if route == "aliased" else name
+    declaration = "from " + module + " import " + name + (" as exported" if route == "aliased" else "") + "\n"
+    files = {}
+    provider = None
+    if route == "direct":
+        consumer_import = "from " + module + " import " + name + " as helper\n"
+        expression = "helper"
+    else:
+        provider = "helpers/__init__.py" if route == "package" else "provider.py"
+        files[provider] = declaration
+        source = "helpers" if route == "package" else "provider"
+        if route == "transitive":
+            files["relay.py"] = "from .provider import " + name + "\n"
+            source, provider = "relay", "relay.py"
+        elif route == "package_transitive":
+            files = {"helpers/leaf.py": declaration, "helpers/__init__.py": "from .leaf import " + name + "\n"}
+            source, provider = "helpers", "helpers/__init__.py"
+        consumer_import = "from ." + source + " import " + export + " as helper\n"
+        expression = "helper"
+        if route == "namespace":
+            consumer_import, expression = "from . import provider\n", "provider." + name
+        elif route in {"stdlib_module", "stdlib_module_alias"}:
+            export = "tools" if route == "stdlib_module_alias" else module
+            files[provider] = "import " + module + (" as tools" if route == "stdlib_module_alias" else "") + "\n"
+            consumer_import, expression = "from .provider import " + export + " as helper\n", "helper." + name
+    for rel, text in files.items():
+        path = core / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    return consumer_import, expression, core / provider if provider is not None else None, export
+
+
+@pytest.mark.parametrize("route", STDLIB_REEXPORT_ROUTES)
+@pytest.mark.parametrize("command", ["echo", "python"])
+def test_trusted_stdlib_reexports_preserve_quote_modeling(tmp_path, route, command):
+    declaration, helper, _, _ = stdlib_reexport_tree(tmp_path, "quote", route)
+    call = "os.system('echo ' + " + helper + "(arg))" if command == "echo" else (
+        "os.system('python -c ' + " + helper + "('pass'))")
+    (tmp_path / "aegis_core/consumer.py").write_text("import os\n" + declaration + "def launch(arg):\n"
+        "    message = '-c is option-message metadata'\n    " + call + "\n", encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    table = (("aegis_core/consumer.py", "launch", "resolved-python-program", "Review this test-owned shell site."),)
+    assert selector_gate_errors(modules, table) == []
+    expected = {"process:aegis_core/consumer.py:launch:os.system": [5]}
+    assert literal_fixture_sites(tmp_path) == expected
+    assert process_sites(tmp_path, selector_table=table) == expected
+    if command == "python":
+        assert list(literal_programs(modules["aegis_core/consumer.py"], "aegis_core/consumer.py", modules)) == [(5, "pass")]
+
+
+@pytest.mark.parametrize("route", STDLIB_REEXPORT_ROUTES)
+@pytest.mark.parametrize("opaque_user", [False, True])
+def test_trusted_stdlib_reexports_preserve_path_capture(tmp_path, route, opaque_user):
+    declaration, helper, _, _ = stdlib_reexport_tree(tmp_path, "Path", route)
+    (tmp_path / "aegis_core/worker.py").write_text("pass\n", encoding="utf-8")
+    source = declaration + "import sys, subprocess\nCODE = " + helper + "(__file__).with_name('worker.py').read_text(encoding='utf-8')\n"
+    if opaque_user:
+        source += "def inspect(code):\n    pass\ninspect(CODE)\n"
+    source += "subprocess.run([sys.executable, '-c', CODE])\n"
+    (tmp_path / "aegis_core/consumer.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    resolver = CommandResolver(modules)
+    capture = next(node.value for node in modules["aegis_core/consumer.py"].body if isinstance(node, ast.Assign))
+    assert resolver.bearing(capture, "aegis_core/consumer.py", unresolved_only=True) is False
+    expected = {"process:aegis_core/consumer.py:<module>:subprocess.run": [len(source.splitlines())]}
+    table = (("aegis_core/consumer.py", "<module>", "resolved-python-program", "Review the test-owned captured module."),)
+    assert selector_gate_errors(modules, table) == []
+    assert literal_fixture_sites(tmp_path) == expected
+    assert process_sites(tmp_path, selector_table=table) == expected
+
+
+@pytest.mark.parametrize("route", STDLIB_REEXPORT_ROUTES)
+def test_trusted_stdlib_reexports_still_walk_quote_arguments(tmp_path, route):
+    declaration, helper, _, _ = stdlib_reexport_tree(tmp_path, "quote", route)
+    core = tmp_path / "aegis_core"
+    (core / "defaults.py").write_text("CODE = 'plain text'\n", encoding="utf-8")
+    (core / "config_source.py").write_text("from . import defaults as config\n", encoding="utf-8")
+    (core / "consumer.py").write_text("import os\n" + declaration + "from .config_source import config\n"
+        "os.system('echo ' + " + helper + "(config.CODE))\n", encoding="utf-8")
+    with pytest.raises(ValueError) as error:
+        literal_fixture_sites(tmp_path)
+    assert str(error.value) == "aegis_core/consumer.py: unresolved Python -c program"
+
+
+@pytest.mark.parametrize("route", ["plain", "aliased", "package", "transitive", "stdlib_module", "stdlib_module_alias"])
+@pytest.mark.parametrize("helper", ["quote", "Path"])
+def test_trusted_stdlib_reexports_refuse_intermediate_rebinding(tmp_path, route, helper):
+    declaration, expression, provider, export = stdlib_reexport_tree(tmp_path, helper, route)
+    provider.write_text(provider.read_text(encoding="utf-8") + export + " = str\n", encoding="utf-8")
+    core = tmp_path / "aegis_core"
+    (core / "worker.py").write_text("pass\n", encoding="utf-8")
+    call = ("os.system('echo ' + " + expression + "(arg))" if helper == "quote" else
+            "subprocess.run([sys.executable, '-c', " + expression + "(__file__).with_name('worker.py').read_text(encoding='utf-8')])")
+    (core / "consumer.py").write_text("import os, sys, subprocess\n" + declaration
+        + "def launch(arg):\n    " + call + "\n", encoding="utf-8")
+    with pytest.raises(ValueError) as error:
+        literal_fixture_sites(tmp_path)
+    assert str(error.value) == "aegis_core/consumer.py: unresolved Python -c program"
+
+
+@pytest.mark.parametrize("shape", ["cycle", "depth"])
+def test_trusted_stdlib_reexports_bound_import_walks(tmp_path, shape):
+    declaration, helper, provider, _ = stdlib_reexport_tree(tmp_path, "quote", "plain")
+    core = tmp_path / "aegis_core"
+    if shape == "cycle":
+        provider.write_text("from .relay import quote\n", encoding="utf-8")
+        (core / "relay.py").write_text("from .provider import quote\n", encoding="utf-8")
+    else:
+        provider.write_text("from .hop0 import quote\n", encoding="utf-8")
+        for index in range(_MAX_DEPTH + 1):
+            text = "from .hop" + str(index + 1) + " import quote\n" if index < _MAX_DEPTH else "from shlex import quote\n"
+            (core / ("hop" + str(index) + ".py")).write_text(text, encoding="utf-8")
+    (core / "consumer.py").write_text("import os\n" + declaration + "def launch(arg):\n"
+        "    os.system('echo ' + " + helper + "(arg))\n", encoding="utf-8")
+    with pytest.raises(ValueError) as error:
+        literal_fixture_sites(tmp_path)
+    assert str(error.value) == "aegis_core/consumer.py: unresolved Python -c program"
+
+
+@pytest.mark.parametrize("route", ["direct", "plain", "stdlib_module_alias"])
+@pytest.mark.parametrize("method", ["cwd", "home"])
+def test_trusted_stdlib_readonly_path_calls_pass(tmp_path, route, method):
+    declaration, helper, _, _ = stdlib_reexport_tree(tmp_path, "Path", route)
+    (tmp_path / "aegis_core/consumer.py").write_text("import os\n" + declaration + "def launch():\n"
+        "    message = '-c is option-message metadata'\n"
+        "    os.system('echo ' + str(" + helper + "." + method + "()))\n", encoding="utf-8")
+    table = (("aegis_core/consumer.py", "launch", "lexer-or-message", "Review test-owned option-message metadata."),)
+    assert selector_gate_errors(dict(module_trees(tmp_path)), table) == []
+    expected = {"process:aegis_core/consumer.py:launch:os.system": [5]}
+    assert literal_fixture_sites(tmp_path) == expected
+    assert process_sites(tmp_path, selector_table=table) == expected
+
+
+@pytest.mark.parametrize("route", ["direct", "plain", "package_transitive"])
+@pytest.mark.parametrize("scope", ["module", "function"])
+def test_trusted_stdlib_local_alias_preserves_quote(tmp_path, route, scope):
+    declaration, helper, _, _ = stdlib_reexport_tree(tmp_path, "quote", route)
+    source = "import os\n" + declaration
+    if scope == "module":
+        source += "quote_alias = " + helper + "\n"
+    source += "def launch(arg):\n    message = '-c is option-message metadata'\n"
+    if scope == "function":
+        source += "    quote_alias = " + helper + "\n"
+    source += "    os.system('echo ' + quote_alias(arg))\n"
+    (tmp_path / "aegis_core/consumer.py").write_text(source, encoding="utf-8")
+    table = (("aegis_core/consumer.py", "launch", "lexer-or-message", "Review test-owned option-message metadata."),)
+    assert selector_gate_errors(dict(module_trees(tmp_path)), table) == []
+    expected = {"process:aegis_core/consumer.py:launch:os.system": [len(source.splitlines())]}
+    assert literal_fixture_sites(tmp_path) == expected
+    assert process_sites(tmp_path, selector_table=table) == expected
+
+
+@pytest.mark.parametrize("route", ["direct", "plain"])
+@pytest.mark.parametrize("scope", ["module", "function"])
+def test_trusted_stdlib_local_alias_rebinding_refuses(tmp_path, route, scope):
+    declaration, helper, _, _ = stdlib_reexport_tree(tmp_path, "quote", route)
+    core = tmp_path / "aegis_core"
+    (core / "foreign.py").write_text("def foreign(value):\n    return value\n", encoding="utf-8")
+    source = "import os\n" + declaration + "from .foreign import foreign\n"
+    assignment = "quote_alias = " + helper + "\nquote_alias = foreign\n"
+    if scope == "module":
+        source += assignment
+    source += "def launch(arg):\n"
+    if scope == "function":
+        source += "".join("    " + line + "\n" for line in assignment.splitlines())
+    source += "    os.system('echo ' + quote_alias(arg))\n"
+    (core / "consumer.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    call = next(n for n in ast.walk(modules["aegis_core/consumer.py"]) if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Name) and n.func.id == "quote_alias")
+    assert CommandResolver(modules).helper_identity(call.func, "aegis_core/consumer.py") is None
+    with pytest.raises(ValueError) as error:
+        literal_fixture_sites(tmp_path)
+    assert str(error.value) == "aegis_core/consumer.py: unresolved Python -c program"
+
+
+@pytest.mark.parametrize("shape", ["cycle", "depth"])
+def test_trusted_stdlib_local_alias_walk_is_bounded(tmp_path, shape):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    if shape == "cycle":
+        source = "first = second\nsecond = first\n"
+    else:
+        source = "from shlex import quote\nfirst = alias0\n"
+        source += "".join("alias" + str(i) + " = " + ("alias" + str(i + 1) if i < _MAX_DEPTH else "quote")
+                          + "\n" for i in range(_MAX_DEPTH + 1))
+    source += "def launch(arg):\n    return first(arg)\n"
+    (core / "consumer.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    call = next(n for n in ast.walk(modules["aegis_core/consumer.py"]) if isinstance(n, ast.Call))
+    assert CommandResolver(modules).helper_identity(call.func, "aegis_core/consumer.py") is None
+
+
+TRUSTED_RECEIVER_FORMS = ("direct", "module", "function", "chain_module", "chain_function", "closure",
+                          "nested_closure", "reexport", "reexport_assignment", "reexport_chain")
+TRUSTED_RECEIVER_REBINDS = (("direct", "first"), ("module", "first"), ("function", "first"),
+    ("chain_module", "first"), ("chain_module", "last"), ("chain_function", "first"), ("chain_function", "last"),
+    ("closure", "first"), ("nested_closure", "first"), ("nested_closure", "last"),
+    ("reexport", "first"), ("reexport_assignment", "first"), ("reexport_chain", "first"), ("reexport_chain", "last"))
+
+
+def trusted_receiver_tree(tmp_path, form, api, *, rebind=None, argument=None):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    module = "shlex" if api == "quote" else "pathlib"
+    lines = ["import os, sys, shlex, pathlib, types"]
+    if form.startswith("reexport"):
+        (core / "provider.py").write_text("import " + module + " as q\n", encoding="utf-8")
+        if form == "reexport_chain":
+            (core / "relay.py").write_text("from .provider import q as tools\n", encoding="utf-8")
+            lines.append("from .relay import tools as imported")
+        else:
+            lines.append("from .provider import q as imported")
+    if argument == "foreign":
+        (core / "defaults.py").write_text("CODE = 'plain text'\n", encoding="utf-8")
+        (core / "config_source.py").write_text("from . import defaults as config\n", encoding="utf-8")
+        lines.append("from .config_source import config")
+    pairs = {
+        "direct": [], "module": [("tools", module)], "function": [("tools", module)],
+        "chain_module": [("a", module), ("b", "a")], "chain_function": [("a", module), ("b", "a")],
+        "closure": [("tools", module)], "nested_closure": [("tools", module), ("selected", "tools")],
+        "reexport": [], "reexport_assignment": [("tools", "imported")],
+        "reexport_chain": [("a", "imported"), ("b", "a")],
+    }[form]
+    receiver = pairs[-1][0] if pairs else ("imported" if form == "reexport" else module)
+    target = pairs[0 if rebind == "first" else -1][0] if pairs else receiver
+
+    def emit(text, indent=0):
+        lines.append("    " * indent + text)
+
+    def assignments(items, indent):
+        for name, value in items:
+            emit(name + " = " + value, indent)
+            if rebind is not None and name == target:
+                emit(name + " = types", indent)
+
+    if not pairs and rebind is not None:
+        emit(target + " = types")
+    if form in {"module", "chain_module", "reexport_assignment"}:
+        assignments(pairs, 0)
+    indent, scope = 0, "launch"
+    if form in {"closure", "nested_closure"}:
+        emit("def outer():")
+        assignments(pairs[:1], 1)
+        indent, scope = 1, "outer.launch"
+        if form == "nested_closure":
+            emit("def middle():", 1)
+            assignments(pairs[1:], 2)
+            indent, scope = 2, "outer.middle.launch"
+    emit("def launch(arg):", indent)
+    emit("message = '-c is option-message metadata'", indent + 1)
+    if form in {"function", "chain_function", "reexport_chain"}:
+        assignments(pairs, indent + 1)
+    helper = receiver + (".quote" if api == "quote" else ".Path" + ("." + api if api in {"cwd", "home"} else ""))
+    operand = "config.CODE" if argument == "foreign" else receiver if argument == "receiver" else "arg"
+    call = helper + "(" + operand + ")" if api in {"quote", "path"} else helper + "()"
+    emit("os.system('echo ' + " + (call if api == "quote" else "str(" + call + ")") + ")", indent + 1)
+    path = core / "consumer.py"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    tree = modules["aegis_core/consumer.py"]
+    spawn = next(n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                 and isinstance(n.func.value, ast.Name) and n.func.value.id == "os" and n.func.attr == "system")
+    command = spawn.args[0]
+    reference = command.right.func if api == "quote" else command.right.args[0].func
+    table = (("aegis_core/consumer.py", scope, "lexer-or-message", "Review the test-owned option-message metadata."),)
+    expected = {"process:aegis_core/consumer.py:" + scope + ":os.system": [len(lines)]}
+    return modules, CommandResolver(modules), command, reference, table, expected
+
+
+@pytest.mark.parametrize("form", TRUSTED_RECEIVER_FORMS)
+@pytest.mark.parametrize("api", ["quote", "path", "cwd", "home"])
+@pytest.mark.parametrize("entry", ["selector", "refusal"])
+def test_trusted_receiver_forms_agree_with_helper_identity(tmp_path, form, api, entry):
+    modules, resolver, command, reference, table, expected = trusted_receiver_tree(tmp_path, form, api)
+    identity = "shlex.quote" if api == "quote" else "pathlib.Path" + ("." + api if api in {"cwd", "home"} else "")
+    assert resolver.helper_identity(reference, "aegis_core/consumer.py") == identity
+    assert resolver.bearing(command, "aegis_core/consumer.py", unresolved_only=True) is False
+    if entry == "selector":
+        assert selector_gate_errors(modules, table) == []
+        assert process_sites(tmp_path, selector_table=table) == expected
+    else:
+        refuse_literal_spawns(modules["aegis_core/consumer.py"], "aegis_core/consumer.py", modules, resolver)
+        assert literal_fixture_sites(tmp_path) == expected
+
+
+@pytest.mark.parametrize("form,link", TRUSTED_RECEIVER_REBINDS)
+@pytest.mark.parametrize("api", ["quote", "path", "cwd", "home"])
+def test_trusted_receiver_rebinding_keeps_refusal(tmp_path, form, link, api):
+    modules, resolver, command, reference, _, _ = trusted_receiver_tree(tmp_path, form, api, rebind=link)
+    assert resolver.helper_identity(reference, "aegis_core/consumer.py") is None
+    assert resolver.bearing(command, "aegis_core/consumer.py", unresolved_only=True) is True
+    with pytest.raises(ValueError) as error:
+        refuse_literal_spawns(modules["aegis_core/consumer.py"], "aegis_core/consumer.py", modules, resolver)
+    assert str(error.value) == "aegis_core/consumer.py: unresolved Python -c program"
+
+
+@pytest.mark.parametrize("form", ["module", "chain_function", "closure", "reexport_assignment"])
+@pytest.mark.parametrize("argument", ["foreign", "receiver"])
+@pytest.mark.parametrize("entry", ["selector", "refusal"])
+def test_trusted_receiver_exemption_still_walks_arguments(tmp_path, form, argument, entry):
+    modules, resolver, command, reference, table, _ = trusted_receiver_tree(tmp_path, form, "quote", argument=argument)
+    assert resolver.helper_identity(reference, "aegis_core/consumer.py") == "shlex.quote"
+    assert resolver.bearing(command, "aegis_core/consumer.py", unresolved_only=True) is True
+    if entry == "selector":
+        assert selector_gate_errors(modules, ()) == ["unreviewed selector site " + table[0][0] + ":" + table[0][1]]
+        assert any(source is None for _, source in literal_programs(modules["aegis_core/consumer.py"],
+                                                                    "aegis_core/consumer.py", modules, resolver))
+    else:
+        with pytest.raises(ValueError) as error:
+            refuse_literal_spawns(modules["aegis_core/consumer.py"], "aegis_core/consumer.py", modules, resolver)
+        assert str(error.value) == "aegis_core/consumer.py: unresolved Python -c program"
+
+
+TRUSTED_CONSTRUCTION_RECEIVERS = {
+    "direct": ("direct", "quote"), "assignment": ("function", "quote"),
+    "chain": ("chain_function", "quote"), "closure": ("closure", "quote"),
+    "reexport": ("reexport", "quote"), "path_cwd": ("function", "cwd"),
+    "path_home": ("function", "home"),
+}
+TRUSTED_COMMAND_CONSTRUCTIONS = ("concatenation", "f_string", "percent", "format", "join", "list_argv",
+                                 "list_concat", "tuple_argv", "comprehension_argv", "return_concat")
+
+
+def trusted_construction_tree(tmp_path, receiver, construction, *, rebound=False, argument=None):
+    form, api = TRUSTED_CONSTRUCTION_RECEIVERS[receiver]
+    modules, _, command, reference, table, _ = trusted_receiver_tree(
+        tmp_path, form, api, rebind="first" if rebound else None, argument=argument)
+    spelling = ast.unparse(reference)
+    word = ast.unparse(command.right)
+    expressions = {
+        "concatenation": "'echo ' + " + word,
+        "f_string": 'f"echo {' + word + '}"',
+        "percent": "'echo %s' % " + word,
+        "format": "'echo {}'.format(" + word + ")",
+        "join": "' '.join(['echo', " + word + "])",
+        "list_argv": "['echo', " + word + "]",
+        "list_concat": "['echo', " + word + "] + extra",
+        "tuple_argv": "tuple(['echo', " + word + "])",
+        "comprehension_argv": "[" + word.replace("(arg)", "(item)") + " for item in arg]",
+        "return_concat": "['echo', " + word + "] + extra",
+    }
+    tree = modules["aegis_core/consumer.py"]
+    spawn = next(node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                 and ast.unparse(node.func) == "os.system")
+    path = tmp_path / "aegis_core/consumer.py"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    lines[0] = lines[0].replace("import os, sys,", "import os, sys, subprocess,", 1)
+    if construction in {"list_concat", "return_concat"}:
+        lines = [line.replace("def launch(arg):", "def launch(arg, extra=()):") for line in lines]
+    process_api = "subprocess.run" if construction in {
+        "list_argv", "list_concat", "tuple_argv", "comprehension_argv"} else "os.system"
+    statement = ("return " + expressions[construction] if construction == "return_concat" else
+                 process_api + "(" + expressions[construction] + ")")
+    lines[spawn.lineno - 1] = " " * spawn.col_offset + statement
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    tree = modules["aegis_core/consumer.py"]
+    if construction == "return_concat":
+        statement = next(node for node in ast.walk(tree) if isinstance(node, ast.Return))
+        command, expected = statement.value, {}
+    else:
+        spawn = next(node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                     and ast.unparse(node.func) == process_api)
+        command = spawn.args[0]
+        expected = {"process:aegis_core/consumer.py:" + table[0][1] + ":" + process_api: [spawn.lineno]}
+    reference = next(node.func for node in ast.walk(tree) if isinstance(node, ast.Call)
+                     and ast.unparse(node.func) == spelling)
+    return modules, CommandResolver(modules), command, reference, table, expected
+
+
+@pytest.mark.parametrize("receiver", TRUSTED_CONSTRUCTION_RECEIVERS)
+@pytest.mark.parametrize("construction", TRUSTED_COMMAND_CONSTRUCTIONS)
+@pytest.mark.parametrize("entry", ["selector", "refusal"])
+@pytest.mark.parametrize("rebound", [False, True])
+def test_trusted_receiver_construction_matrix(tmp_path, receiver, construction, entry, rebound):
+    modules, resolver, command, reference, table, expected = trusted_construction_tree(
+        tmp_path, receiver, construction, rebound=rebound)
+    rel = "aegis_core/consumer.py"
+    api = TRUSTED_CONSTRUCTION_RECEIVERS[receiver][1]
+    identity = "shlex.quote" if api == "quote" else "pathlib.Path." + api
+    assert resolver.helper_identity(reference, rel) == (None if rebound else identity)
+    if rebound:
+        if entry == "selector":
+            message = "unreviewed selector site " + rel + ":" + table[0][1]
+            assert selector_gate_errors(modules, ()) == [message]
+            with pytest.raises(ValueError) as error:
+                process_sites(tmp_path, selector_table=())
+            assert str(error.value) == message
+            assert any(source is None for _, source in literal_programs(modules[rel], rel, modules, resolver))
+        else:
+            with pytest.raises(ValueError) as error:
+                refuse_literal_spawns(modules[rel], rel, modules, resolver)
+            assert str(error.value) == rel + ": unresolved Python -c program"
+    else:
+        if entry == "selector":
+            assert selector_gate_errors(modules, table) == []
+            assert process_sites(tmp_path, selector_table=table) == expected
+        else:
+            refuse_literal_spawns(modules[rel], rel, modules, resolver)
+            assert literal_fixture_sites(tmp_path) == expected
+        assert list(literal_programs(modules[rel], rel, modules, resolver)) == []
+    for unresolved_only in (False, True):
+        assert resolver.bearing(command, rel, unresolved_only=unresolved_only) is rebound
+
+
+@pytest.mark.parametrize("construction", TRUSTED_COMMAND_CONSTRUCTIONS)
+@pytest.mark.parametrize("entry", ["selector", "refusal"])
+def test_trusted_receiver_constructions_keep_argument_provenance(tmp_path, construction, entry):
+    modules, resolver, command, reference, table, _ = trusted_construction_tree(
+        tmp_path, "assignment", construction, argument="foreign")
+    rel = "aegis_core/consumer.py"
+    assert resolver.helper_identity(reference, rel) == "shlex.quote"
+    if entry == "selector":
+        message = "unreviewed selector site " + rel + ":" + table[0][1]
+        assert selector_gate_errors(modules, ()) == [message]
+        with pytest.raises(ValueError) as error:
+            process_sites(tmp_path, selector_table=())
+        assert str(error.value) == message
+        assert any(source is None for _, source in literal_programs(modules[rel], rel, modules, resolver))
+    else:
+        with pytest.raises(ValueError) as error:
+            refuse_literal_spawns(modules[rel], rel, modules, resolver)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+    for unresolved_only in (False, True):
+        assert resolver.bearing(command, rel, unresolved_only=unresolved_only) is True
+
+
+@pytest.mark.parametrize("route", ["direct", "module_alias", "class_alias", "stored_method"])
+@pytest.mark.parametrize("method", ["read_text", "open"])
+@pytest.mark.parametrize("command", ["argv", "shell"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_untrusted_path_methods_keep_receiver_provenance(tmp_path, route, method, command, entry):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    declarations = {
+        "direct": ("", "pathlib.Path." + method),
+        "module_alias": ("    paths = pathlib\n", "paths.Path." + method),
+        "class_alias": ("    cls = pathlib.Path\n", "cls." + method),
+        "stored_method": ("    cls = pathlib.Path\n    reader = cls." + method + "\n", "reader"),
+    }
+    assignment, reference = declarations[route]
+    read = reference + "(p)"
+    call = ("subprocess.run([sys.executable, " + read + ", \"import os; os.system('id')\"])") if command == "argv" else (
+        "os.system('echo ' + " + read + ")")
+    source = "import os, subprocess, sys, pathlib\ndef launch(p):\n" + assignment + "    " + call + "\n"
+    path = core / "probe.py"
+    if entry == "inventory":
+        path.write_text("import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n",
+                        encoding="utf-8")
+        table = ((rel, "<module>", "resolved-python-program", "Review the test-owned outer literal."),)
+        with pytest.raises(ValueError) as error:
+            process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+    else:
+        path.write_text(source, encoding="utf-8")
+        modules = dict(module_trees(tmp_path))
+        if entry == "selector":
+            message = "unreviewed selector site " + rel + ":launch"
+            assert selector_gate_errors(modules, ()) == [message]
+            with pytest.raises(ValueError) as error:
+                process_sites(tmp_path, selector_table=())
+            assert str(error.value) == message
+        else:
+            with pytest.raises(ValueError) as error:
+                refuse_literal_spawns(modules[rel], rel, modules)
+            assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("receiver", ["assignment", "chain", "closure", "reexport"])
+@pytest.mark.parametrize("construction", TRUSTED_COMMAND_CONSTRUCTIONS)
+@pytest.mark.parametrize("entry", ["selector", "refusal"])
+@pytest.mark.parametrize("mutated", [False, True])
+def test_module_alias_calls_preserve_helpers_and_real_mutations(tmp_path, receiver, construction, entry, mutated):
+    modules, _, command, reference, table, expected = trusted_construction_tree(tmp_path, receiver, construction)
+    rel = "aegis_core/consumer.py"
+    alias = ast.unparse(reference.value)
+    path = tmp_path / rel
+    lines = path.read_text(encoding="utf-8").splitlines()
+    position = command.lineno - 1
+    indent = " " * (len(lines[position]) - len(lines[position].lstrip()))
+    before = ([indent + "setattr(" + alias + ", 'quote', str)"] if mutated else [])
+    before.extend([indent + alias + ".split(arg)", indent + "os.system('echo ' + shlex.quote(arg))"])
+    lines[position:position] = before
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    other = "aegis_core/other.py"
+    (tmp_path / other).write_text("import os, shlex\ndef launch(arg):\n"
+        "    message = '-c is option-message metadata'\n    os.system('echo ' + shlex.quote(arg))\n",
+        encoding="utf-8")
+    table += ((other, "launch", "lexer-or-message", "Review test-owned option-message metadata."),)
+    expected = {key: [line + len(before) for line in values] for key, values in expected.items()}
+    direct = "process:" + rel + ":" + table[0][1] + ":os.system"
+    expected.setdefault(direct, []).insert(0, position + len(before))
+    expected["process:" + other + ":launch:os.system"] = [4]
+    modules = dict(module_trees(tmp_path))
+    resolver = CommandResolver(modules)
+    if mutated:
+        if entry == "selector":
+            message = "unreviewed selector site " + rel + ":" + table[0][1]
+            assert selector_gate_errors(modules, table[1:]) == [message]
+            with pytest.raises(ValueError) as error:
+                process_sites(tmp_path, selector_table=table[1:])
+            assert str(error.value) == message
+        else:
+            with pytest.raises(ValueError) as error:
+                refuse_literal_spawns(modules[rel], rel, modules, resolver)
+            assert str(error.value) == rel + ": unresolved Python -c program"
+        assert any(source is None for _, source in literal_programs(modules[rel], rel, modules, resolver))
+    else:
+        if entry == "selector":
+            assert selector_gate_errors(modules, table) == []
+            assert process_sites(tmp_path, selector_table=table) == expected
+        else:
+            for source_rel, tree in modules.items():
+                refuse_literal_spawns(tree, source_rel, modules, resolver)
+            assert literal_fixture_sites(tmp_path) == expected
+        for source_rel in (rel, other):
+            assert list(literal_programs(modules[source_rel], source_rel, modules, resolver)) == []
+            references = [node.func for node in ast.walk(modules[source_rel]) if isinstance(node, ast.Call)
+                          and isinstance(node.func, ast.Attribute) and node.func.attr == "quote"]
+            assert all(resolver.helper_identity(node, source_rel) == "shlex.quote" for node in references)
+
+
+SHELL_SELECTOR_TEMPLATES = (
+    "os.system('python3 -c %s' % shlex.quote(P))",
+    "os.system('python3 -c {}'.format(shlex.quote(P)))",
+    "os.system(' '.join(['python3 -c', shlex.quote(P)]))",
+    "os.system(('python3 -c ' + shlex.quote(P)).strip())",
+    "subprocess.run('python3 -c %s' % tools.quote(P), shell=True)",
+    "subprocess.run(tuple(['python3', b'-c', P]))",
+)
+
+
+@pytest.mark.parametrize("command", SHELL_SELECTOR_TEMPLATES)
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_shell_template_constants_retain_python_selectors(tmp_path, command, entry):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    source = ("import os, subprocess, shlex\nP = \"import os; os.system('id')\"\n"
+              "def launch():\n    tools = shlex\n    " + command + "\n")
+    path = core / "probe.py"
+    if entry == "inventory":
+        path.write_text("import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n",
+                        encoding="utf-8")
+        table = ((rel, "<module>", "resolved-python-program", "Review the test-owned outer literal."),)
+        with pytest.raises(ValueError) as error:
+            process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+    else:
+        path.write_text(source, encoding="utf-8")
+        modules = dict(module_trees(tmp_path))
+        if entry == "selector":
+            message = "unreviewed selector site " + rel + ":launch"
+            assert selector_gate_errors(modules, ()) == [message]
+            with pytest.raises(ValueError) as error:
+                process_sites(tmp_path, selector_table=())
+            assert str(error.value) == message
+        else:
+            with pytest.raises(ValueError) as error:
+                refuse_literal_spawns(modules[rel], rel, modules)
+            assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+TRUSTED_RESULT_OPERATIONS = {
+    "direct": ("", "", "pathlib.Path(p).read_text()"),
+    "stored": ("", "    q = pathlib.Path(p)\n", "q.read_text()"),
+    "stored_alias": ("", "    q = pathlib.Path(p)\n    target = q\n", "target.read_text()"),
+    "module_alias": ("", "    paths = pathlib\n", "paths.Path(p).read_text()"),
+    "class_alias": ("", "    P = pathlib.Path\n", "P(p).read_text()"),
+    "open_read": ("", "", "pathlib.Path(p).open().read()"),
+    "cwd": ("", "", "(pathlib.Path.cwd() / p).read_text()"),
+    "home": ("", "", "(pathlib.Path.home() / p).read_text()"),
+    "joinpath": ("", "", "pathlib.Path.cwd().joinpath(p).read_text()"),
+    "stored_method": ("", "    reader = pathlib.Path(p).read_text\n", "reader()"),
+    "missing_capture": ("CODE = pathlib.Path(__file__).with_name('absent.py').read_text(encoding='utf-8')\n", "", "CODE"),
+    "attribute": ("", "", "pathlib.Path(p).name"),
+    "subscript": ("", "    q = shlex.quote(p)\n", "q[:2]"),
+    "iteration": ("", "", "next(iter(pathlib.Path(p)))"),
+    "iteration_binding": ("", "    for opt in shlex.quote(p):\n        pass\n", "opt"),
+    "comprehension": ("", "    parts = [c for c in shlex.quote(p)]\n", "''.join(parts)"),
+    "unpack": ("", "    opt, *rest = shlex.quote(p)\n", "opt"),
+    "unpack_instance": ("", "    q, = [pathlib.Path(p)]\n", "q.read_text()"),
+    "f_string_attribute": ("", "", "f'{pathlib.Path(p).name}'"),
+    "format_attribute": ("", "    q = pathlib.Path(p)\n", "'{}'.format(q.name)"),
+}
+
+
+@pytest.mark.parametrize("shape", TRUSTED_RESULT_OPERATIONS)
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_operations_on_trusted_results_keep_provenance(tmp_path, shape, entry):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    module, local, operand = TRUSTED_RESULT_OPERATIONS[shape]
+    source = ("import pathlib, os, subprocess, sys, shlex\n" + module + "def launch(p):\n" + local
+              + "    subprocess.run([sys.executable, " + operand + ", \"import os; os.system('id')\"])\n")
+    path = core / "probe.py"
+    if entry == "inventory":
+        path.write_text("import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n",
+                        encoding="utf-8")
+        table = ((rel, "<module>", "resolved-python-program", "Review the test-owned outer literal."),)
+        with pytest.raises(ValueError) as error:
+            process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+    else:
+        path.write_text(source, encoding="utf-8")
+        modules = dict(module_trees(tmp_path))
+        if entry == "selector":
+            message = "unreviewed selector site " + rel + ":launch"
+            assert selector_gate_errors(modules, ()) == [message]
+            with pytest.raises(ValueError) as error:
+                process_sites(tmp_path, selector_table=())
+            assert str(error.value) == message
+        else:
+            with pytest.raises(ValueError) as error:
+                refuse_literal_spawns(modules[rel], rel, modules)
+            assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("declaration,operand", [
+    ("", "str(pathlib.Path(p))"),
+    ("    q = pathlib.Path(p)\n", "str(q)"),
+    ("    q = pathlib.Path(p)\n    alias = q\n", "str(alias)"),
+    ("    q = shlex.quote(p)\n", "q"),
+    ("    q = pathlib.Path.cwd()\n", "str(q)"),
+    ("    q = pathlib.Path.home()\n", "str(q)"),
+])
+def test_trusted_results_used_directly_remain_exempt(tmp_path, declaration, operand):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    source = "import pathlib, os, shlex\ndef launch(p):\n" + declaration + "    os.system('echo ' + " + operand + ")\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    assert selector_gate_errors(modules, ()) == []
+    refuse_literal_spawns(modules[rel], rel, modules)
+    assert literal_fixture_sites(tmp_path) == {"process:" + rel + ":launch:os.system": [len(source.splitlines())]}
+
+
+NAMESPACE_RECEIVER_CASES = ("unpack", "annotation", "handler", "handler_table", "package_unrelated",
+    "conditional_import", "conditional_alias", "conditional_reexport", "conditional_assignment", "conditional_expression")
+
+
+def namespace_receiver_tree(tmp_path, case, rebound):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    if case in NAMESPACE_RECEIVER_CASES[:5]:
+        changes = {"unpack": "A, B = (1, 2)\n", "annotation": "A: int\n",
+            "handler": "try:\n    pass\nexcept Exception as error:\n    pass\n",
+            "handler_table": "HANDLERS = (helper,)\n", "package_unrelated": ""}
+        provider = (core / "provider/__init__.py") if case == "package_unrelated" else (core / "provider.py")
+        provider.parent.mkdir(exist_ok=True)
+        provider.write_text("import shlex as q\nCMD = ('git', 'status')\ndef helper(x):\n    return x\n"
+                            + changes[case], encoding="utf-8")
+        if case == "package_unrelated":
+            provider.with_name("unrelated.py").write_text("A, B = (1, 2)\n", encoding="utf-8")
+        source = "import os, subprocess\nfrom . import provider\nfrom .provider import q, CMD\n"
+        source += ("provider = object()\n" if rebound else "") + "def launch(arg):\n"
+        quote = "provider.q.quote" if rebound else "q.quote"
+        source += "    provider.helper(arg)\n    os.system('echo ' + " + quote + "(arg))\n    subprocess.run(CMD)\n"
+    else:
+        imports = ("import os, sys, shlex, ntpath\nif sys.platform == 'win32':\n"
+                   "    import ntpath as helper_mod\nelse:\n    import shlex as helper_mod\n")
+        receiver = "helper_mod"
+        if case == "conditional_reexport":
+            (core / "provider.py").write_text(imports, encoding="utf-8")
+            source = "import os, shlex\nfrom .provider import helper_mod\n"
+        elif case == "conditional_assignment":
+            source = ("import os, sys, shlex, ntpath\nif sys.platform == 'win32':\n"
+                      "    helper_mod = ntpath\nelse:\n    helper_mod = shlex\n")
+        elif case == "conditional_expression":
+            source = "import os, sys, shlex, ntpath\nhelper_mod = ntpath if sys.platform == 'win32' else shlex\n"
+        else:
+            source = imports
+        if case == "conditional_alias":
+            source += "alias = helper_mod\n"
+            receiver = "alias"
+        source += (receiver + " = object()\n" if rebound else "") + "def launch(arg):\n"
+        quote = receiver + ".quote" if rebound else "shlex.quote"
+        source += "    " + receiver + ".split(arg)\n    os.system('echo ' + " + quote + "(arg))\n"
+    (core / "consumer.py").write_text(source, encoding="utf-8")
+    return source
+
+
+@pytest.mark.parametrize("case", NAMESPACE_RECEIVER_CASES)
+@pytest.mark.parametrize("rebound", [False, True])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_namespace_receiver_changes_do_not_poison_exports(tmp_path, case, rebound, entry):
+    source = namespace_receiver_tree(tmp_path, case, rebound)
+    rel = "aegis_core/consumer.py"
+    if entry == "inventory":
+        (tmp_path / rel).write_text("import subprocess, sys\nsubprocess.run([sys.executable, '-c', "
+                                   + repr(source) + "])\n", encoding="utf-8")
+        table = ((rel, "<module>", "resolved-python-program", "Review the test-owned outer literal."),)
+        if rebound:
+            with pytest.raises(ValueError) as error:
+                process_sites(tmp_path, selector_table=table)
+            assert str(error.value) == rel + ": unresolved Python -c program"
+        else:
+            sites = process_sites(tmp_path, selector_table=table)
+            assert sum(len(lines) for key, lines in sites.items() if key.endswith(":os.system")) == 1
+            assert sum(len(lines) for key, lines in sites.items() if key.endswith(":subprocess.run")) == (
+                2 if case in NAMESPACE_RECEIVER_CASES[:5] else 1)
+        return
+    modules = dict(module_trees(tmp_path))
+    if rebound:
+        if entry == "selector":
+            message = "unreviewed selector site " + rel + ":launch"
+            assert selector_gate_errors(modules, ()) == [message]
+            with pytest.raises(ValueError) as error:
+                process_sites(tmp_path, selector_table=())
+            assert str(error.value) == message
+        else:
+            with pytest.raises(ValueError) as error:
+                refuse_literal_spawns(modules[rel], rel, modules)
+            assert str(error.value) == rel + ": unresolved Python -c program"
+    else:
+        if entry == "selector":
+            assert selector_gate_errors(modules, ()) == []
+        else:
+            refuse_literal_spawns(modules[rel], rel, modules)
+        sites = process_sites(tmp_path, selector_table=())
+        expected = {"process:" + rel + ":launch:" + api: [index] for index, text in enumerate(source.splitlines(), 1)
+                    for api in ("os.system", "subprocess.run") if text.strip().startswith(api + "(")}
+        assert sites == expected
+
+
+CONTENT_SOURCE_CASES = {
+    "conditional": ("", "", "(pathlib.Path(p) if p else pathlib.Path(q)).read_text()"),
+    "boolean": ("", "", "(pathlib.Path(p) or pathlib.Path(q)).read_bytes()"),
+    "list_selection": ("", "", "[pathlib.Path(p), pathlib.Path(q)][0].read_text()"),
+    "dict_selection": ("", "", "{'p': pathlib.Path(p)}['p'].read_text()"),
+    "comprehension": ("", "    paths = [pathlib.Path(x) for x in (p, q)]\n", "paths[0].read_text()"),
+    "comprehension_filter": ("", "", "''.join(x for x in p if pathlib.Path(q).read_text())"),
+    "builtin_open": ("", "", "open(pathlib.Path(p)).read()"),
+    "with_open": ("", "    with pathlib.Path(p).open() as stream:\n        flag = stream.read()\n", "flag"),
+    "async_with": ("", "    async with pathlib.Path(p).open() as stream:\n        flag = stream.readline()\n", "flag"),
+    "stream_iteration": ("", "    with open(p) as stream:\n        for flag in stream:\n            pass\n", "flag"),
+    "stream_alias_iteration": ("", "    opener = open\n    for flag in opener(p):\n        pass\n", "flag"),
+    "stream_lines": ("", "", "''.join(open(p).readlines())"),
+    "wrapped_read": ("", "", "f'{pathlib.Path(p).read_text()}'.strip()"),
+    "formatted_read": ("", "", "'{}'.format(pathlib.Path(p).read_text()).strip()"),
+    "joined_read": ("", "", "''.join([pathlib.Path(p).read_text()]).strip()"),
+    "capture_replace": ("CODE = pathlib.Path(__file__).with_name('worker.py').read_text(encoding='utf-8').replace('# setup', 'pass')\n", "", "CODE"),
+    "capture_strip": ("CODE = pathlib.Path(__file__).with_name('worker.py').read_text(encoding='utf-8')\nFLAG = CODE.strip()\n", "", "FLAG"),
+    "capture_slice": ("CODE = pathlib.Path(__file__).with_name('worker.py').read_text(encoding='utf-8')\n", "", "CODE[:2]"),
+    "capture_concat": ("CODE = pathlib.Path(__file__).with_name('worker.py').read_text(encoding='utf-8')\n", "", "CODE + p"),
+    "capture_alias": ("CODE = pathlib.Path(__file__).with_name('worker.py').read_text(encoding='utf-8')\n", "    alias = CODE\n", "alias.replace('# setup', p)"),
+    "capture_iteration": ("CODE = pathlib.Path(__file__).with_name('worker.py').read_text(encoding='utf-8')\n", "    for flag in CODE:\n        pass\n", "flag"),
+    "invalidated": ("", "    flag: str\n", "flag"),
+}
+
+
+@pytest.mark.parametrize("case", CONTENT_SOURCE_CASES)
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_content_sources_survive_wrappers_and_binding_targets(tmp_path, case, entry):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "worker.py").write_text("# setup\npass\n", encoding="utf-8")
+    rel = "aegis_core/probe.py"
+    module, local, operand = CONTENT_SOURCE_CASES[case]
+    definition = "async def" if case == "async_with" else "def"
+    command = ("os.system('echo ' + " + operand + ")" if case in {"stream_alias_iteration", "comprehension_filter"} else
+               "subprocess.run([sys.executable, " + operand + ", \"import os; os.system('id')\"])")
+    source = ("import pathlib, subprocess, sys, os\n" + module + definition + " launch(p, q):\n" + local
+              + "    " + command + "\n")
+    path = core / "probe.py"
+    if entry == "inventory":
+        path.write_text("import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n",
+                        encoding="utf-8")
+        table = ((rel, "<module>", "resolved-python-program", "Review the test-owned outer literal."),)
+        with pytest.raises(ValueError) as error:
+            process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+    else:
+        path.write_text(source, encoding="utf-8")
+        modules = dict(module_trees(tmp_path))
+        if entry == "selector":
+            assert "unreviewed selector site " + rel + ":launch" in selector_gate_errors(modules, ())
+        else:
+            with pytest.raises(ValueError) as error:
+                refuse_literal_spawns(modules[rel], rel, modules)
+            assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("branch", ["assignments", "conditional"])
+@pytest.mark.parametrize("template", ["'python3 -c %s'", "b'python3 -c %s'"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_mixed_template_alternatives_retain_selectors(tmp_path, branch, template, entry):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    program = template + " % shlex.quote(P)"
+    assignments = ("    command = " + program + "\n    command = 'echo ok'\n" if branch == "assignments"
+                   else "    command = " + program + " if cond else 'echo ok'\n")
+    source = ("import os, shlex\nP = \"import os; os.system('id')\"\ndef launch(cond):\n"
+              + assignments + "    os.system(command)\n")
+    path = core / "probe.py"
+    if entry == "inventory":
+        path.write_text("import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n",
+                        encoding="utf-8")
+        table = ((rel, "<module>", "resolved-python-program", "Review the test-owned outer literal."),)
+        with pytest.raises(ValueError) as error:
+            process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+    else:
+        path.write_text(source, encoding="utf-8")
+        modules = dict(module_trees(tmp_path))
+        if entry == "selector":
+            assert selector_gate_errors(modules, ()) == ["unreviewed selector site " + rel + ":launch"]
+        else:
+            with pytest.raises(ValueError) as error:
+                refuse_literal_spawns(modules[rel], rel, modules)
+            assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("expression", [
+    "f'{shlex.quote(p)}'.strip()", "'{}'.format(shlex.quote(p)).strip()",
+    "''.join([shlex.quote(p)]).strip()", "shlex.join([shlex.quote(p)])",
+    "str(pathlib.PurePath(p))", "os.fspath(pathlib.Path(p))",
+])
+@pytest.mark.parametrize("content", [False, True])
+def test_pure_transforms_keep_only_input_provenance(tmp_path, expression, content):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    argument = "pathlib.Path(p).read_text()" if content else "p"
+    source = ("import os, shlex, pathlib\ndef launch(p):\n    os.system('echo ' + "
+              + expression.replace("(p)", "(" + argument + ")") + ")\n")
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if content:
+        assert selector_gate_errors(modules, ()) == ["unreviewed selector site " + rel + ":launch"]
+        with pytest.raises(ValueError) as error:
+            refuse_literal_spawns(modules[rel], rel, modules)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+    else:
+        assert selector_gate_errors(modules, ()) == []
+        refuse_literal_spawns(modules[rel], rel, modules)
+        assert literal_fixture_sites(tmp_path) == {"process:" + rel + ":launch:os.system": [3]}
+
+
+@pytest.mark.parametrize("method", ["format", "join", "replace", "strip"])
+def test_string_transform_names_do_not_exempt_module_functions(tmp_path, method):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    (core / "probe.py").write_text("import os, foreign\ndef launch(p):\n    tools = foreign\n"
+        "    os.system('echo ' + tools." + method + "(p))\n", encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    assert selector_gate_errors(modules, ()) == ["unreviewed selector site " + rel + ":launch"]
+    with pytest.raises(ValueError) as error:
+        refuse_literal_spawns(modules[rel], rel, modules)
+    assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+POSITIONAL_SOURCE_CASES = {
+    "capture_selector": ("FLAG = pathlib.Path(__file__).with_name('opts.py').read_text(encoding='utf-8')\n", "", "subprocess.run(['python3', FLAG, P])"),
+    "capture_head": ("FLAG = pathlib.Path(__file__).with_name('interpreter.py').read_text(encoding='utf-8')\n", "", "subprocess.run([FLAG, '-c', P])"),
+    "capture_boolean": ("CODE = pathlib.Path(__file__).with_name('worker.py').read_text(encoding='utf-8')\n", "", "subprocess.run(['python3', '-c', CODE or p])"),
+    "capture_format": ("CODE = pathlib.Path(__file__).with_name('worker.py').read_text(encoding='utf-8')\n", "", "subprocess.run(['python3', '-c', '%s' % CODE])"),
+    "path_selector": ("", "", "subprocess.run(['python3', pathlib.Path(p).name, P])"),
+    "parameter_selector": ("", "", "subprocess.run(['python3', p, P])"),
+    "parameter_head": ("", "", "subprocess.run([p, '-c', P])"),
+    "override_selector": ("", "", "subprocess.run(['worker', p, P], executable=sys.executable)"),
+    "parameter_program": ("", "", "subprocess.run(['python3', '-c', p])"),
+    "percent_width": ("", "", "subprocess.run(['python3', '-c', '%1048577s' % P])"),
+    "format_width": ("", "", "subprocess.run(['python3', '-c', '{:1048577}'.format(P)])"),
+    "nonstring_format": ("", "", "subprocess.run(['python3', '-c', '%s' % b\"import os; os.system('id')\"] )"),
+    "missing_positional": ("", "", "subprocess.run(['python3', '-c', '{}'.format(code=P)])"),
+    "keyword_as_index": ("", "", "subprocess.run(['python3', '-c', '{1}'.format('pass', code=P)])"),
+    "attribute_splice": ("", "    plan = SimpleNamespace(argv=pathlib.Path(p).read_text().split())\n", "subprocess.run(['env', *(plan.argv if cond else [])])"),
+    "add_splice": ("", "    parts = [pathlib.Path(p).read_text()] + tail\n", "subprocess.run(['env', *(parts if cond else ())])"),
+    "comprehension_splice": ("", "    parts = [x for x in pathlib.Path(p).read_text().split()]\n", "subprocess.run(['env', *(parts if cond else [])])"),
+    "alias_store": ("", "    argv = ['env', 'true']\n    alias = argv\n    alias[1] = pathlib.Path(p).read_text()\n", "subprocess.run(argv)"),
+    "except_target": ("", "    cmd = 'echo ok'\n    try:\n        pass\n    except Exception as cmd:\n        pass\n", "os.system(cmd)"),
+    "match_as": ("", "    cmd = 'echo ok'\n    match pathlib.Path(p).read_text():\n        case str() as cmd:\n            pass\n", "os.system(cmd)"),
+    "match_star": ("", "    cmd = 'echo ok'\n    match list(pathlib.Path(p).read_text()):\n        case [*cmd]:\n            pass\n", "os.system(cmd)"),
+    "match_mapping": ("", "    cmd = 'echo ok'\n    match {}:\n        case {**cmd}:\n            pass\n", "os.system(cmd)"),
+    "path_name": ("", "", "os.system('echo ' + pathlib.Path(p).name)"),
+    "path_readlink": ("", "", "os.system(str(pathlib.Path(p).readlink()))"),
+    "path_resolve": ("", "", "os.system(str(pathlib.Path(p).resolve()))"),
+    "path_glob": ("", "", "subprocess.run(['env', *(pathlib.Path(p).glob('*') if cond else [])])"),
+    "path_iterdir": ("", "", "subprocess.run(['env', *(pathlib.Path(p).iterdir() if cond else [])])"),
+    "path_walk": ("", "", "subprocess.run(['env', *(pathlib.Path(p).walk() if cond else [])])"),
+    "path_division": ("", "", "os.system(str(pathlib.Path.cwd() / p))"),
+    "path_subscript": ("", "    path = pathlib.Path(p)\n", "os.system(str(path[0]))"),
+    "none_vector": ("", "    cmd = tuple([sys.executable, p, P]) if cond else ('echo', 'ok')\n", "subprocess.run(cmd)"),
+    "none_shell": ("", "", "os.system('%s %s %s' % (sys.executable, p, shlex.quote(P)))"),
+    "class_open": ("class Session:\n    CMD = next(open('cmd.txt'))\n    def open(self):\n        pass\n    subprocess.run(['env', CMD])\n", "", "os.system('echo')"),
+    "overflow_splice": ("", "    parts = [pathlib.Path(p).read_text(), *('a' if cond else 'b'), *('a' if cond else 'b'), *('a' if cond else 'b'), *('a' if cond else 'b'), *('a' if cond else 'b'), *('a' if cond else 'b'), *('a' if cond else 'b')]\n", "subprocess.run(['env', *(parts if cond else [])])"),
+}
+
+
+@pytest.mark.parametrize("case", POSITIONAL_SOURCE_CASES)
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_positional_sources_and_untraced_values_fail_closed(tmp_path, case, entry):
+    if case.startswith("match_") and not hasattr(ast, "Match"):
+        pytest.skip("Pattern matching requires Python 3.10 or later")
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    for name, text in (("opts.py", "-c"), ("interpreter.py", "python3"), ("worker.py", "pass\n")):
+        (core / name).write_text(text, encoding="utf-8")
+    rel = "aegis_core/probe.py"
+    module, local, call = POSITIONAL_SOURCE_CASES[case]
+    source = ("import os, sys, pathlib, shlex, subprocess\nfrom types import SimpleNamespace\n"
+              "P = \"import os; os.system('id')\"\n" + module + "def launch(p, tail, cond):\n" + local
+              + "    " + call + "\n")
+    path = core / "probe.py"
+    if entry == "inventory":
+        path.write_text("import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n",
+                        encoding="utf-8")
+        table = ((rel, "<module>", "resolved-python-program", "Review the test-owned outer literal."),)
+        with pytest.raises(ValueError) as error:
+            process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+    else:
+        path.write_text(source, encoding="utf-8")
+        modules = dict(module_trees(tmp_path))
+        if entry == "selector":
+            errors = selector_gate_errors(modules, ())
+            assert errors and all(message.startswith("unreviewed selector site " + rel + ":") for message in errors)
+            with pytest.raises(ValueError) as error:
+                process_sites(tmp_path, selector_table=())
+            assert str(error.value) == errors[0]
+        else:
+            with pytest.raises(ValueError) as error:
+                refuse_literal_spawns(modules[rel], rel, modules)
+            assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("operand", ["'%s' % P", "'{}'.format(P)", "'{code}'.format(code=P)", "'{0}'.format(P)", "f'{P}'", "P + ''", "P"])
+@pytest.mark.parametrize("head", ["'python3'", "sys.executable"])
+def test_constant_program_transforms_are_resolved_and_inventoried(tmp_path, operand, head):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    source = ("import sys, subprocess\nP = \"import os; os.system('id')\"\n"
+              "subprocess.run([" + head + ", '-c', " + operand + "])\n")
+    (core / "probe.py").write_text("import sys, subprocess\nsubprocess.run([sys.executable, '-c', "
+                                   + repr(source) + "])\n", encoding="utf-8")
+    table = ((rel, "<module>", "resolved-python-program", "Review the test-owned outer literal."),)
+    sites = process_sites(tmp_path, selector_table=table)
+    assert sum(len(lines) for key, lines in sites.items() if key.endswith(":os.system")) == 1
+    assert sum(len(lines) for key, lines in sites.items() if key.endswith(":subprocess.run")) == 2
+
+
+@pytest.mark.parametrize("head", ["'python3'", "sys.executable"])
+def test_unchanged_capture_is_known_only_in_program_position(tmp_path, head):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "worker.py").write_text("import subprocess\nsubprocess.run(['worker'])\n", encoding="utf-8")
+    rel = "aegis_core/probe.py"
+    (core / "probe.py").write_text("import sys, pathlib, subprocess\n"
+        "CODE = pathlib.Path(__file__).with_name('worker.py').read_text(encoding='utf-8')\n"
+        "subprocess.run([" + head + ", '-c', CODE])\n", encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    refuse_literal_spawns(modules[rel], rel, modules)
+    table = ((rel, "<module>", "resolved-python-program", "Review the unchanged captured module program."),)
+    sites = process_sites(tmp_path, selector_table=table)
+    assert sites == {"process:" + rel + ":<module>:subprocess.run": [3],
+                     "process:aegis_core/worker.py:<module>:subprocess.run": [2]}
+
+
+STICKY_ARGV_CASES = {
+    wrapper + "_" + head_name + "_" + flag_name: (
+        "FLAG = pathlib.Path(__file__).with_name('opts.py').read_text(encoding='utf-8')\n"
+        if flag_name == "capture" else "",
+        "",
+        "subprocess.run([" + repr(wrapper) + ", " + head + ", " + flag + ", P])")
+    for wrapper in ("env", "nice", "timeout", "stdbuf", "xargs", "launcher")
+    for head_name, head in (("literal", "'python3'"), ("canonical", "sys.executable"))
+    for flag_name, flag in (("parameter", "flag"), ("capture", "FLAG"))
+}
+STICKY_ARGV_CASES.update({
+    "construction_" + name + "_" + head_name: ("", "    argv = " + expression.replace("HEAD", head) + "\n",
+                                               "os.system(argv)" if name in {"percent", "f_string", "join"}
+                                               else "subprocess.run(argv)")
+    for head_name, head in (("literal", "'python3'"), ("canonical", "sys.executable"))
+    for name, expression in (
+        ("tuple", "tuple([HEAD, flag, P])"),
+        ("list", "list((HEAD, flag, P))"),
+        ("slice", "[HEAD, flag, P][:]"),
+        ("add", "[HEAD] + [flag, P]"),
+        ("percent", "'%s %s %s' % (HEAD, flag, shlex.quote(P))"),
+        ("f_string", 'f"{HEAD} {flag} {shlex.quote(P)}"'),
+        ("join", "' '.join([HEAD, flag, shlex.quote(P)])"))
+})
+STICKY_ARGV_CASES["capture_program_with_unknown_tail"] = (
+    "CODE = pathlib.Path(__file__).with_name('worker.py').read_text(encoding='utf-8')\n",
+    "", "subprocess.run(['python3', '-c', CODE, flag])")
+
+
+@pytest.mark.parametrize("case", STICKY_ARGV_CASES)
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_unresolved_argv_evidence_survives_heads_and_constructions(tmp_path, case, entry):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "opts.py").write_text("-c", encoding="utf-8")
+    (core / "worker.py").write_text("pass\n", encoding="utf-8")
+    rel = "aegis_core/probe.py"
+    module, local, call = STICKY_ARGV_CASES[case]
+    source = ("import os, sys, pathlib, shlex, subprocess\n"
+              "P = \"import os; os.system('id')\"\n" + module
+              + "def launch(flag):\n" + local + "    " + call + "\n")
+    path = core / "probe.py"
+    if entry == "inventory":
+        path.write_text("import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n",
+                        encoding="utf-8")
+        table = ((rel, "<module>", "resolved-python-program", "Review the test-owned outer literal."),)
+        with pytest.raises(ValueError) as error:
+            process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+    else:
+        path.write_text(source, encoding="utf-8")
+        modules = dict(module_trees(tmp_path))
+        if entry == "selector":
+            assert selector_gate_errors(modules, ()) == ["unreviewed selector site " + rel + ":launch"]
+            with pytest.raises(ValueError) as error:
+                process_sites(tmp_path, selector_table=())
+            assert str(error.value) == "unreviewed selector site " + rel + ":launch"
+        else:
+            with pytest.raises(ValueError) as error:
+                refuse_literal_spawns(modules[rel], rel, modules)
+            assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("call", [
+    "os.system('echo ' + '{0.name}'.format(pathlib.Path(p)))",
+    "os.system('echo ' + '{0[0]}'.format([pathlib.Path(p)]))",
+    "subprocess.run(['echo', '{0.name}'.format(pathlib.Path(p))])",
+    "subprocess.run(['echo', '{0[0]}'.format([pathlib.Path(p)])])",
+    "subprocess.run([sys.executable, '-c', CODE if cond else 'pass'])",
+    "subprocess.run([sys.executable, '-c', p if cond else 'pass'])",
+], ids=["format_attribute_shell", "format_subscript_shell", "format_attribute_argv",
+        "format_subscript_argv", "conditional_capture", "conditional_parameter"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_correctness_0748_formats_and_conditional_programs_refuse(tmp_path, call, entry):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "worker.py").write_text("pass\n", encoding="utf-8")
+    rel = "aegis_core/probe.py"
+    source = ("import os, sys, pathlib, subprocess\n"
+              "CODE = pathlib.Path(__file__).with_name('worker.py').read_text(encoding='utf-8')\n"
+              "def launch(p, cond):\n    " + call + "\n")
+    path = core / "probe.py"
+    if entry == "inventory":
+        path.write_text("import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n",
+                        encoding="utf-8")
+        table = ((rel, "<module>", "resolved-python-program", "Review the test-owned outer literal."),)
+        with pytest.raises(ValueError) as error:
+            process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+    else:
+        path.write_text(source, encoding="utf-8")
+        modules = dict(module_trees(tmp_path))
+        if entry == "selector":
+            assert selector_gate_errors(modules, ()) == ["unreviewed selector site " + rel + ":launch"]
+            with pytest.raises(ValueError) as error:
+                process_sites(tmp_path, selector_table=())
+            assert str(error.value) == "unreviewed selector site " + rel + ":launch"
+        else:
+            with pytest.raises(ValueError) as error:
+                refuse_literal_spawns(modules[rel], rel, modules)
+            assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("expression", [
+    "['python3', '-m', module]",
+    "['python3', '-m', 'aegis_core.absent']",
+    "['env', 'python3', '-m', module]",
+    "tuple(['python3', '-m', module])",
+], ids=["parameter", "missing_module", "wrapper", "construction"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_unresolved_module_launches_use_module_refusals(tmp_path, expression, entry):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    source = "import subprocess\ndef launch(module):\n    subprocess.run(" + expression + ")\n"
+    path = core / "probe.py"
+    if entry == "inventory":
+        path.write_text("import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n",
+                        encoding="utf-8")
+        table = ((rel, "<module>", "resolved-python-program", "Review the test-owned outer literal."),)
+        if expression == "['python3', '-m', module]":
+            # ROUND-17c: retain this scenario as an accepted module-operand control.
+            sites = process_sites(tmp_path, selector_table=table)
+            assert sum(len(lines) for key, lines in sites.items() if key.endswith(":subprocess.run")) == 2
+            return
+        with pytest.raises(ValueError) as error:
+            process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python module"
+    else:
+        path.write_text(source, encoding="utf-8")
+        modules = dict(module_trees(tmp_path))
+        if entry == "selector":
+            assert selector_gate_errors(modules, ()) == ["unreviewed selector site " + rel + ":launch"]
+        else:
+            if expression == "['python3', '-m', module]":
+                refuse_literal_spawns(modules[rel], rel, modules)
+                assert literal_fixture_sites(tmp_path) == {"process:" + rel + ":launch:subprocess.run": [3]}
+                return
+            with pytest.raises(ValueError) as error:
+                refuse_literal_spawns(modules[rel], rel, modules)
+            assert str(error.value) == rel + ": unresolved Python module"
+
+
+@pytest.mark.parametrize("call", [
+    "subprocess.run([sys.executable, '-m', module])",
+    "subprocess.run(['python3', '-m', module])",
+    "subprocess.run([sys.executable, '-I', '-m', module])",
+    "subprocess.run([sys.executable, '-Im', module])",
+    "subprocess.run([sys.executable, '-m', CODE])",
+    "subprocess.run([sys.executable, '-m', pathlib.Path(module).read_text()])",
+    "subprocess.run(['display', '-m', module], executable=sys.executable)",
+    "subprocess.run([sys.executable, '-m', module], executable=None)",
+], ids=["canonical", "literal", "options", "bundled", "capture", "content", "override", "none_override"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_module_operand_positions_accept_unknown_names(tmp_path, call, entry):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "worker.py").write_text("import subprocess\nsubprocess.run(['worker'])\n", encoding="utf-8")
+    rel = "aegis_core/probe.py"
+    source = ("import sys, pathlib, subprocess\n"
+              "CODE = pathlib.Path(__file__).with_name('worker.py').read_text(encoding='utf-8')\n"
+              "def launch(module):\n    " + call + "\n")
+    path = core / "probe.py"
+    if entry == "inventory":
+        path.write_text("import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n",
+                        encoding="utf-8")
+        table = ((rel, "<module>", "resolved-python-program", "Review the test-owned outer literal."),)
+        sites = process_sites(tmp_path, selector_table=table)
+        assert sum(len(lines) for key, lines in sites.items() if key.endswith(":subprocess.run")) == 3
+        assert sum(len(lines) for key, lines in sites.items() if key.startswith(
+            "process:aegis_core/worker.py:")) == 1
+    else:
+        path.write_text(source, encoding="utf-8")
+        modules = dict(module_trees(tmp_path))
+        if entry == "selector":
+            assert selector_gate_errors(modules, ()) == ["unreviewed selector site " + rel + ":launch"]
+            table = ((rel, "launch", "resolved-python-program", "Review the test-owned module launch."),)
+            assert selector_gate_errors(modules, table) == []
+            sites = process_sites(tmp_path, selector_table=table)
+        else:
+            refuse_literal_spawns(modules[rel], rel, modules)
+            sites = literal_fixture_sites(tmp_path)
+        assert sites == {"process:" + rel + ":launch:subprocess.run": [4],
+                         "process:aegis_core/worker.py:<module>:subprocess.run": [2]}
+
+
+@pytest.mark.parametrize("call,message", [
+    ("subprocess.run([sys.executable, flag, CODE])", "unresolved Python -c program"),
+    ("subprocess.run([sys.executable, '-W', '-m', flag, CODE])", "unresolved Python module"),
+], ids=["selector_parameter", "module_text_is_option_data"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_module_operand_waiver_never_covers_selector_parameters(tmp_path, call, message, entry):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    source = ("import sys, subprocess\nCODE = 'pass'\ndef launch(flag):\n    " + call + "\n")
+    path = core / "probe.py"
+    if entry == "inventory":
+        path.write_text("import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n",
+                        encoding="utf-8")
+        table = ((rel, "<module>", "resolved-python-program", "Review the test-owned outer literal."),)
+        with pytest.raises(ValueError) as error:
+            process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": " + message
+    else:
+        path.write_text(source, encoding="utf-8")
+        modules = dict(module_trees(tmp_path))
+        if entry == "selector":
+            assert selector_gate_errors(modules, ()) == ["unreviewed selector site " + rel + ":launch"]
+        else:
+            with pytest.raises(ValueError) as error:
+                refuse_literal_spawns(modules[rel], rel, modules)
+            assert str(error.value) == rel + ": " + message
+
+
+@pytest.mark.parametrize("case", ["env_capture", "class_later_binding", "nested_class_later_binding",
+                                  "conditional_splice", "comprehension_filter"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_argon_0748_selector_sources_keep_uncertainty(tmp_path, case, entry):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "opts.py").write_text("-c", encoding="utf-8")
+    rel = "aegis_core/probe.py"
+    prefix = ("import sys, pathlib, subprocess\nP = \"import os; os.system('id')\"\n"
+              "FLAG = pathlib.Path(__file__).with_name('opts.py').read_text(encoding='utf-8')\n")
+    bodies = {
+        "env_capture": ("def launch():\n    subprocess.run(['env', sys.executable, FLAG, P])\n", "launch"),
+        "class_later_binding": ("class Spec:\n    subprocess.run([sys.executable, FLAG, P])\n    FLAG = '-I'\n", "Spec"),
+        "nested_class_later_binding": ("def launch():\n    class Spec:\n        subprocess.run([sys.executable, FLAG, P])\n        FLAG = '-I'\n", "launch.Spec"),
+        "conditional_splice": ("def launch(path):\n    subprocess.run(['env', *([] if pathlib.Path(path).read_text() else [])])\n", "launch"),
+        "comprehension_filter": ("def launch(path, items):\n    subprocess.run(['env', *[item for item in items if pathlib.Path(path).read_text()]])\n", "launch"),
+    }
+    body, scope = bodies[case]
+    source = prefix + body
+    path = core / "probe.py"
+    if entry == "inventory":
+        path.write_text("import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n",
+                        encoding="utf-8")
+        table = ((rel, "<module>", "resolved-python-program", "Review the test-owned outer literal."),)
+        with pytest.raises(ValueError) as error:
+            process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+    else:
+        path.write_text(source, encoding="utf-8")
+        modules = dict(module_trees(tmp_path))
+        if entry == "selector":
+            assert selector_gate_errors(modules, ()) == ["unreviewed selector site " + rel + ":" + scope]
+        else:
+            with pytest.raises(ValueError) as error:
+                refuse_literal_spawns(modules[rel], rel, modules)
+            assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_class_binding_before_the_launch_shadows_enclosing_capture(tmp_path, entry):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "opts.py").write_text("-c", encoding="utf-8")
+    rel = "aegis_core/probe.py"
+    source = ("import sys, pathlib, subprocess\nP = 'pass'\n"
+              "FLAG = pathlib.Path(__file__).with_name('opts.py').read_text(encoding='utf-8')\n"
+              "class Spec:\n    FLAG = '-I'\n    subprocess.run([sys.executable, FLAG, P])\n")
+    path = core / "probe.py"
+    if entry == "inventory":
+        path.write_text("import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n",
+                        encoding="utf-8")
+        table = ((rel, "<module>", "resolved-python-program", "Review the test-owned outer literal."),)
+        sites = process_sites(tmp_path, selector_table=table)
+        assert sum(len(lines) for key, lines in sites.items() if key.endswith(":subprocess.run")) == 2
+    else:
+        path.write_text(source, encoding="utf-8")
+        modules = dict(module_trees(tmp_path))
+        if entry == "selector":
+            assert selector_gate_errors(modules, ()) == []
+        else:
+            refuse_literal_spawns(modules[rel], rel, modules)
+        assert process_sites(tmp_path) == {"process:" + rel + ":Spec:subprocess.run": [6]}
+
+
+@pytest.mark.parametrize("body", [
+    "subprocess.run([sys.executable, '-c', '' + ('%s' % P)])",
+    "subprocess.run([sys.executable, '-c', ('%s' % P) + ''])",
+    "subprocess.run([sys.executable, '-c', f\"{'%s' % P}\"])",
+    "subprocess.run([sys.executable, '-c', '{}'.format('%s' % P)])",
+    "subprocess.run([sys.executable, '-c' + ('%s' % P)])",
+    "ARGV = [sys.executable, '-c', '' + ('%s' % P)]\nsubprocess.run(ARGV)",
+    "subprocess.run([sys.executable, f\"-c{'%s' % P}\"])",
+], ids=["left_concat", "right_concat", "f_string", "format", "attached", "stored_argv", "attached_f_string"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_argon_0748_constant_program_wrappers_resolve_and_count_once(tmp_path, body, entry):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    source = ("import sys, subprocess\nP = \"import os; os.system('id')\"\ndef launch():\n"
+              + "".join("    " + line + "\n" for line in body.splitlines()))
+    path = core / "probe.py"
+    if entry == "inventory":
+        path.write_text("import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n",
+                        encoding="utf-8")
+        table = ((rel, "<module>", "resolved-python-program", "Review the test-owned outer literal."),)
+        sites = process_sites(tmp_path, selector_table=table)
+        assert sum(len(lines) for key, lines in sites.items() if key.endswith(":subprocess.run")) == 2
+    else:
+        path.write_text(source, encoding="utf-8")
+        modules = dict(module_trees(tmp_path))
+        if entry == "selector":
+            assert selector_gate_errors(modules, ()) == ["unreviewed selector site " + rel + ":launch"]
+            table = ((rel, "launch", "resolved-python-program", "Review the test-owned resolved program."),)
+            sites = process_sites(tmp_path, selector_table=table)
+        else:
+            with pytest.raises(ValueError) as error:
+                refuse_literal_spawns(modules[rel], rel, modules)
+            assert str(error.value) == rel + ": process spawn inside a literal -c program"
+            return
+    assert sum(len(lines) for key, lines in sites.items() if key.endswith(":os.system")) == 1
+
+
+TOTALITY_REFUSAL_CASES = {
+    "conditional_class": "class Spec:\n    if sys.platform == 'win32':\n        FLAG = '-I'\n    subprocess.run([sys.executable, FLAG, P])\n",
+    "class_loop": "class Spec:\n    for item in range(2):\n        subprocess.run([sys.executable, FLAG, P])\n        FLAG = PROGRAM_FLAG\n",
+    "class_try": "class Spec:\n    try:\n        unknown()\n        FLAG = '-I'\n    except Exception:\n        pass\n    subprocess.run([sys.executable, FLAG, P])\n",
+    "class_with": "class Spec:\n    with context() as FLAG:\n        pass\n    subprocess.run([sys.executable, FLAG, P])\n",
+    "class_before_binding": "class Spec:\n    subprocess.run([sys.executable, FLAG, P])\n    FLAG = PROGRAM_FLAG\n",
+    "reexport_program": "from .middle import CODE\ndef launch():\n    subprocess.run([sys.executable, '-c', '%s' % CODE])\n",
+    "quote_percent": "def launch():\n    subprocess.run([sys.executable, '-c', '%s' % shlex.quote(P)])\n",
+    "quote_format": "def launch():\n    subprocess.run([sys.executable, '-c', '{}'.format(shlex.quote(P))])\n",
+    "shell_parameter": "def launch(flag, mode):\n    subprocess.run(['worker', flag, P], executable=sys.executable, shell=mode)\nlaunch('-c', False)\n",
+    "shell_resolved_text": "def launch(mode):\n    subprocess.run('python3 -c ' + shlex.quote(P), shell=mode)\nlaunch(True)\n",
+}
+
+
+@pytest.mark.parametrize("case", TOTALITY_REFUSAL_CASES)
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_totality_requires_a_verdict_for_every_unresolved_launch(tmp_path, case, entry):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "opts.py").write_text("-c", encoding="utf-8")
+    (core / "provider.py").write_text("CODE = \"import os; os.system('id')\"\n", encoding="utf-8")
+    (core / "middle.py").write_text("from .provider import CODE\n", encoding="utf-8")
+    rel = "aegis_core/probe.py"
+    flags = ("FLAG = '-I'\nPROGRAM_FLAG" if case in {"class_loop", "class_before_binding"} else "FLAG")
+    source = ("import sys, pathlib, subprocess, shlex\nP = \"import os; os.system('id')\"\n"
+              + flags + " = pathlib.Path(__file__).with_name('opts.py').read_text(encoding='utf-8')\n"
+              + TOTALITY_REFUSAL_CASES[case])
+    path = core / "probe.py"
+    if entry == "inventory":
+        path.write_text("import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n",
+                        encoding="utf-8")
+        table = ((rel, "<module>", "resolved-python-program", "Review the test-owned outer literal."),)
+        with pytest.raises(ValueError) as error:
+            process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+    else:
+        path.write_text(source, encoding="utf-8")
+        modules = dict(module_trees(tmp_path))
+        if entry == "selector":
+            errors = selector_gate_errors(modules, ())
+            assert errors and all(message.startswith("unreviewed selector site " + rel + ":") for message in errors)
+        else:
+            with pytest.raises(ValueError) as error:
+                refuse_literal_spawns(modules[rel], rel, modules)
+            assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+def test_spawn_totality_assigns_exactly_one_verdict_per_call():
+    rel = "aegis_core/probe.py"
+    modules = {rel: ast.parse("import sys, subprocess\n"
+        "subprocess.run(['echo', 'safe'])\n"
+        "def opaque(command):\n    subprocess.run(command)\n"
+        "def module_launch(name):\n    subprocess.run([sys.executable, '-m', name])\n")}
+    verdicts = spawn_totality(modules, ())
+    assert [(item.scope, item.verdict) for item in verdicts] == [
+        ("<module>", "inventoried"), ("opaque", "inventoried"), ("module_launch", "inventoried")]
+    assert len({id(item.node) for item in verdicts}) == 3
+    rows = ((rel, "opaque", "reviewed-dynamic", "Review the test-owned opaque command."),)
+    reviewed = spawn_totality(modules, rows)
+    assert [(item.scope, item.verdict) for item in reviewed] == [
+        ("<module>", "inventoried"), ("opaque", "reviewed"), ("module_launch", "inventoried")]
+
+
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+@pytest.mark.parametrize("consumed", [False, True])
+def test_totality_judges_unknown_argv_only_at_actual_spawn(tmp_path, entry, consumed):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    source = ("import subprocess, sys\n"
+              "def candidate(option):\n"
+              "    words = [sys.executable, option, 'print(1)']\n"
+              + ("    subprocess.run(words)\n" if consumed else "    return words\n"))
+    path = core / "probe.py"
+    if entry == "inventory":
+        path.write_text("import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n",
+                        encoding="utf-8")
+        table = ((rel, "<module>", "resolved-python-program", "Review the test-owned outer literal."),)
+        if consumed:
+            with pytest.raises(ValueError) as error:
+                process_sites(tmp_path, selector_table=table)
+            assert str(error.value) == rel + ": unresolved Python -c program"
+        else:
+            sites = process_sites(tmp_path, selector_table=table)
+            assert sum(len(lines) for key, lines in sites.items() if key.endswith(":subprocess.run")) == 1
+        return
+    path.write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        expected = ["unreviewed selector site " + rel + ":candidate"] if consumed else []
+        assert selector_gate_errors(modules, ()) == expected
+    elif consumed:
+        with pytest.raises(ValueError) as error:
+            refuse_literal_spawns(modules[rel], rel, modules)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+    else:
+        refuse_literal_spawns(modules[rel], rel, modules)
+
+
+@pytest.mark.parametrize("rel, scope", [
+    ("aegis_core/ast/runner.py", "_run_driver"),
+    ("aegis_cli/doctor.py", "_run_host_cli"),
+    ("aegis_cli/hooks/registrar.py", "_probe"),
+    ("aegis_cli/install_hosts.py", "_run_cli"),
+])
+def test_totality_launch_wrappers_have_reviewed_program_sources(rel, scope):
+    modules = {rel: ast.parse((REPO / rel).read_text(encoding="utf-8"))}
+    verdicts = spawn_totality(modules, SELECTOR_SITE_TABLE)
+    assert [(item.scope, item.verdict) for item in verdicts if item.rel == rel and item.scope == scope] == [
+        (scope, "reviewed")]
+
+
+ROUND19_UNRESOLVED_CALLS = {
+    "positional_shell": "def launch(mode):\n    subprocess.Popen('python3 -c ' + shlex.quote(P), -1, None, None, None, None, None, True, mode)\nlaunch(True)\n",
+    "returned_argv": "def build(flag):\n    return [sys.executable, flag, P]\ndef launch(flag):\n    subprocess.run(build(flag))\nlaunch('-c')\n",
+    "expanded_options": "def launch(command, options):\n    subprocess.run(command, **options)\nlaunch('python3 -c ' + shlex.quote(P), {'shell': True})\n",
+    "direct_builder": "def build(flag):\n    return [sys.executable, flag, P]\nsubprocess.run(build('-c'))\n",
+    "parameter": "def launch(command):\n    subprocess.run(command)\n",
+    "subscript": "def launch(commands):\n    subprocess.run(commands[0])\n",
+    "attribute": "def launch(config):\n    subprocess.run(config.command)\n",
+    "conditional": "def launch(first, second, choice):\n    subprocess.run(first if choice else second)\n",
+    "star_args": "def launch(args):\n    subprocess.run(*args)\n",
+    "positional_executable": "def launch(executable):\n    subprocess.Popen(['worker'], -1, executable)\n",
+}
+
+
+@pytest.mark.parametrize("case", ROUND19_UNRESOLVED_CALLS)
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round19_rejected_layouts_and_whole_commands_refuse(tmp_path, case, entry):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    source = ("import subprocess, sys, shlex\nP = \"import os; os.system('id')\"\n"
+              + ROUND19_UNRESOLVED_CALLS[case])
+    path = core / "probe.py"
+    if case in {"parameter", "subscript", "attribute", "conditional", "positional_executable", "expanded_options"}:
+        if entry == "inventory":
+            path.write_text("import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n",
+                            encoding="utf-8")
+            table = ((rel, "<module>", "resolved-python-program", "Review the test-owned outer literal."),)
+            sites = process_sites(tmp_path, selector_table=table)
+            assert sum(len(lines) for key, lines in sites.items() if key.endswith((":subprocess.run", ":subprocess.Popen"))) == 2
+            return
+        path.write_text(source, encoding="utf-8")
+        modules = dict(module_trees(tmp_path))
+        if entry == "selector":
+            # Positional executable/expanded-call syntax retain their structural review rules.
+            errors = selector_gate_errors(modules, ())
+            if case in {"positional_executable", "expanded_options"}:
+                assert errors and all(message.startswith("unreviewed selector site " + rel + ":") for message in errors)
+            else:
+                assert errors == []
+        else:
+            refuse_literal_spawns(modules[rel], rel, modules)
+        return
+    if entry == "inventory":
+        unreviewed = {rel: ast.parse(source)}
+        with pytest.raises(ValueError) as error:
+            refuse_literal_spawns(unreviewed[rel], rel, unreviewed)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+        path.write_text("import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n",
+                        encoding="utf-8")
+        table = ((rel, "<module>", "resolved-python-program", "Review the test-owned outer literal."),)
+        with pytest.raises(ValueError) as error:
+            process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+    else:
+        path.write_text(source, encoding="utf-8")
+        modules = dict(module_trees(tmp_path))
+        if entry == "selector":
+            errors = selector_gate_errors(modules, ())
+            assert errors and all(message.startswith("unreviewed selector site " + rel + ":") for message in errors)
+        else:
+            with pytest.raises(ValueError) as error:
+                refuse_literal_spawns(modules[rel], rel, modules)
+            assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+ARGON1322_CASES = {
+    "posix_path": "def launch(flag):\n    os.posix_spawn(path=sys.executable, argv=['worker', flag, P], env={})\nlaunch('-c')\n",
+    "exec_file": "def launch(flag):\n    os.execvp(file=sys.executable, args=['worker', flag, P])\nlaunch('-c')\n",
+    "partial_argv": "def launch(exe, flag):\n    subprocess.run([exe, flag, P])\n",
+    "empty_import_branch": "if sys.platform == 'win32':\n    from .safe import FLAG\nelse:\n    from .provider import FLAG\nsubprocess.run([sys.executable, FLAG, P])\n",
+    "bad_python": "subprocess.run([sys.executable, '-c', 'def broken('])\n",
+    "shell_program": "subprocess.run(['env', 'sh', '-c', 'python3 -c ' + shlex.quote(P)])\n",
+}
+
+
+@pytest.mark.parametrize("case", ARGON1322_CASES)
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_argon1322_preserves_unknown_branches_and_source_language(tmp_path, case, entry):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "safe.py").write_text("FLAG = '-I'\n", encoding="utf-8")
+    (core / "provider.py").write_text("import sys\n", encoding="utf-8")
+    rel = "aegis_core/probe.py"
+    source = ("import os, subprocess, sys, shlex\nP = \"import os; os.system('id')\"\n"
+              + ARGON1322_CASES[case])
+    path = core / "probe.py"
+    if entry == "inventory":
+        path.write_text("import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n",
+                        encoding="utf-8")
+        table = ((rel, "<module>", "resolved-python-program", "Review the test-owned outer literal."),)
+        if case == "shell_program":
+            sites = process_sites(tmp_path, selector_table=table)
+            assert sum(len(lines) for key, lines in sites.items() if key.endswith(":os.system")) == 1
+        elif case == "bad_python":
+            sites = process_sites(tmp_path, selector_table=table)
+            assert sum(len(lines) for key, lines in sites.items() if key.endswith(":subprocess.run")) == 2
+        else:
+            unreviewed = dict(module_trees(tmp_path))
+            unreviewed[rel] = ast.parse(source)
+            with pytest.raises(ValueError) as error:
+                refuse_literal_spawns(unreviewed[rel], rel, unreviewed)
+            assert str(error.value) == rel + ": unresolved Python -c program"
+            with pytest.raises(ValueError) as error:
+                process_sites(tmp_path, selector_table=table)
+            assert str(error.value) == rel + ": unresolved Python -c program"
+    else:
+        path.write_text(source, encoding="utf-8")
+        modules = dict(module_trees(tmp_path))
+        if entry == "selector":
+            errors = selector_gate_errors(modules, ())
+            assert errors and all(message.startswith("unreviewed selector site " + rel + ":") for message in errors)
+        elif case == "bad_python":
+            refuse_literal_spawns(modules[rel], rel, modules)
+        else:
+            with pytest.raises(ValueError) as error:
+                refuse_literal_spawns(modules[rel], rel, modules)
+            message = ("process spawn inside a literal -c program" if case == "shell_program"
+                       else "unresolved Python -c program")
+            assert str(error.value) == rel + ": " + message
+
+
+@pytest.mark.parametrize("python", [False, True])
+@pytest.mark.parametrize("route", ["direct", "alias", "nested"])
+def test_round19b_called_return_evidence_controls_unknown_launches(tmp_path, python, route):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    head = "sys.executable" if python else "'echo'"
+    source = "import subprocess, sys\ndef build(flag):\n    return [" + head + ", flag, 'pass']\n"
+    if route == "alias":
+        source += "runner = build\n"
+        call = "runner(flag)"
+    elif route == "nested":
+        source += "def wrapper(flag):\n    return build(flag)\n"
+        call = "wrapper(flag)"
+    else:
+        call = "build(flag)"
+    source += "def launch(flag):\n    subprocess.run(" + call + ")\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if python:
+        assert selector_gate_errors(modules, ()) == ["unreviewed selector site " + rel + ":launch"]
+        with pytest.raises(ValueError) as error:
+            refuse_literal_spawns(modules[rel], rel, modules)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+    else:
+        assert selector_gate_errors(modules, ()) == []
+        refuse_literal_spawns(modules[rel], rel, modules)
+        assert process_sites(tmp_path) == {"process:" + rel + ":launch:subprocess.run": [len(source.splitlines())]}
+
+
+@pytest.mark.parametrize("program", ["def broken(", "\x00", "\ud800"])
+def test_round21_invalid_constants_have_zero_child_spawns(tmp_path, program):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(program) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    table = ((rel, "<module>", "resolved-python-program", "Review the test-owned invalid Python literal."),)
+    refuse_literal_spawns(modules[rel], rel, modules)
+    assert process_sites(tmp_path, selector_table=table) == {"process:" + rel + ":<module>:subprocess.run": [2]}
+
+
+@pytest.mark.parametrize("head", ["'git'", "head"])
+def test_round20_literal_spawn_programs_refuse_under_any_head(tmp_path, head):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    source = ("import subprocess\ndef launch(head):\n    subprocess.run([" + head
+              + ", '-c', \"import os; os.system('id')\"])\n")
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    table = ((rel, "launch", "reviewed-dynamic", "Review the test-owned unresolved executable."),)
+    modules = dict(module_trees(tmp_path))
+    with pytest.raises(ValueError) as error:
+        refuse_literal_spawns(modules[rel], rel, modules)
+    assert str(error.value) == rel + (": process spawn inside a literal -c program"
+                                     if head == "'git'" else ": unresolved Python -c program")
+    sites = process_sites(tmp_path, selector_table=table)
+    assert sum(len(lines) for key, lines in sites.items() if key.endswith(":os.system")) == 1
+    assert sites["process:" + rel + ":launch:subprocess.run"] == [3]
+
+
+@pytest.mark.parametrize("case", ["reviewed_child", "unreviewed_sibling", "escape"])
+def test_round21_parent_review_does_not_authorize_unknown_children(tmp_path, case):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    child = ("import subprocess, sys\ndef child(flag):\n"
+             "    subprocess.run([sys.executable, flag, 'pass'])\nchild('-I')\n")
+    if case == "escape":
+        child = "import subprocess as backend\ncallback = backend.run\n"
+    source = "import subprocess, sys\ndef reviewed():\n    subprocess.run([sys.executable, '-c', " + repr(child) + "])\n"
+    if case == "unreviewed_sibling":
+        source += "def sibling(flag):\n    subprocess.run([sys.executable, flag, 'pass'])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    table = ((rel, "reviewed", "resolved-python-program", "Review only this outer literal site."),)
+    with pytest.raises(ValueError) as error:
+        process_sites(tmp_path, selector_table=table)
+    expected = ("unreviewed selector site " + rel + ":sibling" if case == "unreviewed_sibling"
+                else rel + ": process spawn inside a literal -c program" if case == "escape"
+                else rel + ": unresolved Python -c program")
+    assert str(error.value) == expected
+
+
+@pytest.mark.parametrize("mapping, argv, refuses", [
+    ("options", "['worker']", False),
+    ("{'executable': sys.executable}", "['worker', flag, 'pass']", True),
+    ("{'shell': True, 'executable': sys.executable}", "'import os; os.system(\\'id\\')'", True),
+])
+def test_round20_expanded_mapping_evidence_uses_explicit_keys(tmp_path, mapping, argv, refuses):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    source = ("import subprocess, sys\ndef launch(flag, options):\n    subprocess.run(" + argv
+              + ", **" + mapping + ")\n")
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if refuses:
+        with pytest.raises(ValueError) as error:
+            refuse_literal_spawns(modules[rel], rel, modules)
+        assert str(error.value) == rel + (": process spawn inside a literal -c program"
+                                         if "shell" in mapping else ": unresolved Python -c program")
+    else:
+        refuse_literal_spawns(modules[rel], rel, modules)
+        table = ((rel, "launch", "reviewed-dynamic", "Review the expanded mapping syntax without program evidence."),)
+        assert process_sites(tmp_path, selector_table=table) == {"process:" + rel + ":launch:subprocess.run": [3]}
+
+
+ROUND22_CALLABLES = {
+    "conditional_alias": "build = python_argv if use_python else native_argv\n    subprocess.run(build(flag))",
+    "conditional_callee": "subprocess.run((python_argv if use_python else native_argv)(flag))",
+    "bool_or": "build = python_argv or native_argv\n    subprocess.run(build(flag))",
+    "bool_and": "build = use_python and python_argv\n    subprocess.run(build(flag))",
+    "list_subscript": "build = [native_argv, python_argv][use_python]\n    subprocess.run(build(flag))",
+    "tuple_subscript": "subprocess.run((native_argv, python_argv)[use_python](flag))",
+    "dict_subscript": "builders = {'native': native_argv, 'python': python_argv}\n    subprocess.run(builders[use_python](flag))",
+    "unknown_candidate": "build = native_argv if use_python else unknown\n    subprocess.run(build(flag))",
+    "unknown_container": "subprocess.run(unknown[use_python](flag))",
+    "unsupported_candidate": "build = native_argv if use_python else choose(flag)\n    subprocess.run(build(flag))",
+    "unsupported_method": "build = unknown.format if use_python else native_argv\n    subprocess.run(build(flag))",
+}
+
+
+@pytest.mark.parametrize("case", [*ROUND22_CALLABLES, "method", "default"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round22_callable_selection_preserves_return_evidence(tmp_path, case, entry):
+    source = "import subprocess, sys\nP = \"import os; os.system('id')\"\n"
+    if case == "method":
+        source += ("class Builder:\n    def argv(self, flag):\n        return [sys.executable, flag, P]\n"
+                   "    def launch(self, flag):\n        subprocess.run(self.argv(flag))\n")
+    elif case == "default":
+        source += ("def build(flag, exe=sys.executable):\n    return [exe, flag, P]\n"
+                   "def launch(flag):\n    subprocess.run(build(flag))\n")
+    else:
+        source += ("def python_argv(flag):\n    return [sys.executable, flag, P]\n"
+                   "def native_argv(flag):\n    return ['echo', flag]\n"
+                   "def launch(flag, use_python, unknown):\n    " + ROUND22_CALLABLES[case] + "\n")
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        errors = selector_gate_errors(modules, ())
+        assert errors and all(message.startswith("unreviewed selector site " + rel + ":") for message in errors)
+    else:
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                refuse_literal_spawns(modules[rel], rel, modules)
+            else:
+                table = ((rel, "<module>", "resolved-python-program", "Review only the test-owned outer literal."),)
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("selection", [
+    "first if enabled else second", "first or second", "[first, second][enabled]",
+    "{'first': first, 'second': second}[enabled]",
+])
+def test_round22_native_callable_candidates_keep_no_program(tmp_path, selection):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    source = ("import subprocess\ndef first(flag):\n    return ['echo', flag]\n"
+              "def second(flag):\n    return ['git', flag]\n"
+              "def launch(flag, enabled):\n    build = " + selection + "\n    subprocess.run(build(flag))\n")
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    # ROUND-29: conditional and container selections are outside the closed allowlist.
+    assert selector_gate_errors(modules, ()) == ["unreviewed selector site " + rel + ":launch"]
+    with pytest.raises(ValueError) as error:
+        refuse_literal_spawns(modules[rel], rel, modules)
+    assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+ROUND22_KEYWORDS = {
+    "executable": "subprocess.run(['worker', flag, P], **{**{'executable': sys.executable}})",
+    "args": "subprocess.run(**{**{'args': [sys.executable, flag, P]}})",
+    "shell": "subprocess.run(flag, **{**{'shell': True, 'executable': sys.executable}})",
+    "path": "os.posix_spawn(**{**{'path': sys.executable, 'argv': ['worker', flag, P], 'env': {}}})",
+    "file": "os.execvp(**{**{'file': sys.executable, 'args': ['worker', flag, P]}})",
+    "deep": "subprocess.run(['worker', flag, P], **{**{**{'executable': sys.executable}}})",
+    "mixed_unknown": "subprocess.run(['worker', flag, P], **{**options, **{'executable': sys.executable}})",
+    "dict_override": "subprocess.run(['worker', flag, P], **{'executable': 'worker', **{'executable': sys.executable}})",
+}
+
+
+@pytest.mark.parametrize("case", ROUND22_KEYWORDS)
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round22_nested_literal_keywords_retain_launch_evidence(tmp_path, case, entry):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    source = ("import os, subprocess, sys\nP = \"import os; os.system('id')\"\n"
+              "def launch(flag, options):\n    " + ROUND22_KEYWORDS[case] + "\n")
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        errors = selector_gate_errors(modules, ())
+        assert errors and all(message.startswith("unreviewed selector site " + rel + ":") for message in errors)
+    else:
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                refuse_literal_spawns(modules[rel], rel, modules)
+            else:
+                table = ((rel, "<module>", "resolved-python-program", "Review only the test-owned outer literal."),)
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("case", ["dict_depth", "dict_words", "callable_depth", "callable_choices", "callable_cycle"])
+def test_round22_collector_limits_refuse_without_raw_exceptions(tmp_path, case):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    source = "import subprocess\n"
+    if case.startswith("dict_"):
+        if case == "dict_depth":
+            mapping = "{'executable': 'worker'}"
+            for _ in range(_MAX_DEPTH + 1):
+                mapping = "{**" + mapping + "}"
+        else:
+            mapping = "{" + ",".join(repr(str(i)) + ": 'worker'" for i in range(_MAX_WORDS + 1)) + "}"
+        source += "subprocess.run(['worker'], **" + mapping + ")\n"
+    else:
+        source += "def native(flag):\n    return ['echo', flag]\n"
+        if case == "callable_depth":
+            source += "a0 = native\n"
+            source += "".join("a" + str(i + 1) + " = a" + str(i) + "\n" for i in range(_MAX_DEPTH + 1))
+            function = "a" + str(_MAX_DEPTH + 1)
+        elif case == "callable_choices":
+            function = "[" + ",".join(["native"] * (_MAX_CHOICES + 1)) + "][flag]"
+        else:
+            source += "first = second\nsecond = first\n"
+            function = "first"
+        source += "def launch(flag):\n    subprocess.run((" + function + ")(flag))\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    assert selector_gate_errors(modules, ())
+    with pytest.raises(ValueError) as error:
+        refuse_literal_spawns(modules[rel], rel, modules)
+    assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("mapping", [
+    "{**{'args': [sys.executable, '-c', P]}}",
+    "{**{'executable': sys.executable, 'args': ['worker', '-c', P]}}",
+])
+def test_round22_resolved_nested_keywords_inventory_the_program(tmp_path, mapping):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    source = ("import subprocess, sys\nP = \"import os; os.system('id')\"\n"
+              "subprocess.run(**" + mapping + ")\n")
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    table = ((rel, "<module>", "resolved-python-program", "Review the test-owned resolved nested mapping."),)
+    modules = dict(module_trees(tmp_path))
+    with pytest.raises(ValueError) as error:
+        refuse_literal_spawns(modules[rel], rel, modules)
+    assert str(error.value) == rel + ": process spawn inside a literal -c program"
+    sites = process_sites(tmp_path, selector_table=table)
+    assert sum(len(lines) for key, lines in sites.items() if key.endswith(":os.system")) == 1
+
+
+@pytest.mark.parametrize("mapping", [
+    "{**options}", "{'executable': sys.executable, **{'executable': 'worker'}}",
+])
+def test_round22_nested_native_and_unknown_mappings_keep_no_program(tmp_path, mapping):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    source = ("import subprocess, sys\ndef launch(options):\n"
+              "    subprocess.run(['worker'], **" + mapping + ")\n")
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    refuse_literal_spawns(modules[rel], rel, modules)
+    table = ((rel, "launch", "reviewed-dynamic", "Review expanded kwargs without interpreter evidence."),)
+    sites = process_sites(tmp_path, selector_table=table)
+    assert sum(len(lines) for key, lines in sites.items() if key.endswith(":subprocess.run")) == 1
+
+
+@pytest.mark.parametrize("call", [
+    "os.execvp(file=exe, args=[sys.executable, flag, P])",
+    "os.execv(path=exe, argv=[sys.executable, flag, P])",
+    "os.execvpe(file=exe, args=[sys.executable, flag, P], env={})",
+    "os.spawnv(mode=0, path=exe, args=[sys.executable, flag, P])",
+    "os.spawnvp(mode=0, file=exe, args=[sys.executable, flag, P])",
+    "os.posix_spawn(path=exe, argv=[sys.executable, flag, P], env={})",
+    "os.execl(file=exe, args=[sys.executable, flag, P])",
+    "os.execl(file=exe, args=[sys.executable, flag, P], **options)",
+    "subprocess.Popen(args=[sys.executable, flag, P], executable=exe)",
+    "subprocess.run(P, shell=True, executable=exe)",
+])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round22_argon_keyword_arguments_preserve_program_evidence(tmp_path, call, entry):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    source = ("import os, subprocess, sys\nP = \"import os; os.system('id')\"\n"
+              "def launch(exe, flag, options):\n    " + call + "\n")
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ())
+    else:
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                refuse_literal_spawns(modules[rel], rel, modules)
+            else:
+                table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("receiver", ["self", "cls"])
+@pytest.mark.parametrize("python", [False, True])
+@pytest.mark.parametrize("method", ["build", "format"])
+def test_round22_argon_methods_enumerate_return_evidence(tmp_path, receiver, python, method):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    decorator = "    @classmethod\n" if receiver == "cls" else ""
+    head = "sys.executable" if python else "'echo'"
+    source = ("import subprocess, sys\nclass Runner:\n" + decorator + "    def " + method + "(" + receiver
+              + ", flag):\n        return [" + head + ", flag, 'pass']\n" + decorator
+              + "    def launch(" + receiver + ", flag):\n        subprocess.run(" + receiver + "." + method + "(flag))\n")
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if python:
+        assert selector_gate_errors(modules, ())
+        with pytest.raises(ValueError) as error:
+            refuse_literal_spawns(modules[rel], rel, modules)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+    else:
+        assert selector_gate_errors(modules, ()) == []
+        refuse_literal_spawns(modules[rel], rel, modules)
+        assert sum(len(lines) for key, lines in process_sites(tmp_path).items() if key.endswith(":subprocess.run")) == 1
+
+
+@pytest.mark.parametrize("prefix", [
+    "'env',", "'nice','-n','2',", "'timeout','5',", "'stdbuf','-oL',", "'xargs','-n','1',",
+    "'env','nice','-n','2','timeout','5',",
+])
+@pytest.mark.parametrize("head", ["sh", "python3"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round22_argon_wrappers_inventory_nested_programs(tmp_path, prefix, head, entry):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    source = "import subprocess, sys, shlex\nP = \"import os; os.system('id')\"\n"
+    command = "'python3 -c ' + shlex.quote(P)" if head == "sh" else "P"
+    flag = "-ec" if head == "sh" else "-c"
+    source += "subprocess.run([" + prefix + repr(head) + "," + repr(flag) + "," + command + "])\n"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ())
+    elif entry == "refusal":
+        with pytest.raises(ValueError) as error:
+            refuse_literal_spawns(modules[rel], rel, modules)
+        assert str(error.value) == rel + ": process spawn inside a literal -c program"
+    else:
+        table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+        sites = process_sites(tmp_path, selector_table=table)
+        assert sum(len(lines) for key, lines in sites.items() if key.endswith(":os.system")) == 1
+
+
+@pytest.mark.parametrize("program", ["\"python3 -c '\"", "program"])
+def test_round22_argon_uncertain_wrapped_shell_source_refuses(tmp_path, program):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    source = ("import subprocess\ndef launch(program):\n"
+              "    subprocess.run(['env', 'sh', '-ec', " + program + "])\n")
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    assert selector_gate_errors(modules, ())
+    with pytest.raises(ValueError) as error:
+        refuse_literal_spawns(modules[rel], rel, modules)
+    assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("head", ["sh", "python3"])
+def test_round22_argon_wrapper_tails_preserve_resolved_program(tmp_path, head):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    command = "'python3 -c ' + shlex.quote(P)" if head == "sh" else "P"
+    flag = "-ec" if head == "sh" else "-c"
+    source = ("import subprocess, shlex\nP = \"import os; os.system('id')\"\n"
+              "def launch(args):\n    subprocess.run(['env'," + repr(head) + "," + repr(flag) + ","
+              + command + ",*args])\n")
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    table = ((rel, "launch", "reviewed-dynamic", "Review only the dynamic argv after the resolved test program."),)
+    sites = process_sites(tmp_path, selector_table=table)
+    assert sum(len(lines) for key, lines in sites.items() if key.endswith(":os.system")) == 1
+
+
+ROUND23_EVIDENCE_CASES = {
+    "factory": "def choose(enabled):\n    return python_argv if enabled else native_argv\ndef launch(enabled, flag):\n    subprocess.run(choose(enabled)(flag))\n",
+    "factory_alias": "def choose(enabled):\n    return python_argv if enabled else native_argv\ndef launch(enabled, flag):\n    build = choose(enabled)\n    subprocess.run(build(flag))\n",
+    "default": "def launch(flag, build=python_argv):\n    subprocess.run(build(flag))\n",
+    "keyword_default": "def launch(flag, *, build=python_argv):\n    subprocess.run(build(flag))\n",
+    "default_alias": "def launch(flag, build=python_argv):\n    callback = build\n    subprocess.run(callback(flag))\n",
+    "parameter": "def launch(command):\n    subprocess.run(command)\n",
+    "attribute": "def launch(config):\n    subprocess.run(config.command)\n",
+    "comprehension": "def launch(commands):\n    subprocess.run([item for item in commands])\n",
+}
+
+
+@pytest.mark.parametrize("case", ROUND23_EVIDENCE_CASES)
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round23_unproven_evidence_defaults_to_unknown(tmp_path, case, entry):
+    source = ("import subprocess, sys\nP = \"import os; os.system('id')\"\n"
+              "def python_argv(flag):\n    return [sys.executable, flag, P]\n"
+              "def native_argv(flag):\n    return ['echo', flag]\n" + ROUND23_EVIDENCE_CASES[case])
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if case in {"parameter", "attribute", "comprehension"}:
+        # ROUND-23b withdraws blanket UNKNOWN; retain the existing NoProgram controls.
+        if entry == "selector":
+            assert selector_gate_errors(modules, ()) == []
+        elif entry == "refusal":
+            refuse_literal_spawns(modules[rel], rel, modules)
+        else:
+            table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+            sites = process_sites(tmp_path, selector_table=table)
+            assert sum(len(lines) for key, lines in sites.items() if key.endswith(":subprocess.run")) == 2
+        return
+    if entry == "selector":
+        assert selector_gate_errors(modules, ())
+    else:
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                refuse_literal_spawns(modules[rel], rel, modules)
+            else:
+                table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("method", ["format", "join", "replace", "split"])
+@pytest.mark.parametrize("alias", [False, True])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round23_method_names_never_prove_transforms(tmp_path, method, alias, entry):
+    source = ("import subprocess, sys\nP = \"import os; os.system('id')\"\n"
+              "class Builder:\n    def " + method + "(self, flag):\n        return [sys.executable, flag, P]\n")
+    if alias:
+        source += "    def launch(self, flag):\n        receiver = self\n        subprocess.run(receiver." + method + "(flag))\n"
+    else:
+        source += "def launch(builder, flag):\n    subprocess.run(builder." + method + "(flag))\n"
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ())
+    else:
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                refuse_literal_spawns(modules[rel], rel, modules)
+            else:
+                table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("call", [
+    "subprocess.run(['xargs', '-I{}', sys.executable, '-c', '{}'], input=shlex.quote(P)+'\\n', text=True)",
+    "subprocess.run(['xargs', '-I', '{}', sys.executable, '-c', '{}'])",
+    "subprocess.run(['xargs', '-i', sys.executable, '-c', '{}'])",
+    "subprocess.run(['xargs', '--replace={}', sys.executable, '-c', '{}'])",
+    "subprocess.run(['env', '-S', 'python3 -c {}'])",
+    "subprocess.run(['env', '--split-string=python3 -c {}'])",
+    "subprocess.run(['display', 'sh', '-ec', 'python3 -c '+shlex.quote(P)], executable='/usr/bin/env')",
+    "os.execv('/usr/bin/env', ['display', 'sh', '-ec', 'python3 -c '+shlex.quote(P)])",
+    "os.spawnv(0, '/usr/bin/env', ['display', 'sh', '-ec', 'python3 -c '+shlex.quote(P)])",
+    "subprocess.run(['env', '--future-option', 'python3', '-c', '{}'])",
+])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round23_wrapper_options_and_overrides_are_unknown(tmp_path, call, entry):
+    source = "import os, subprocess, sys, shlex\nP = \"import os; os.system('id')\"\n" + call + "\n"
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ())
+    else:
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                refuse_literal_spawns(modules[rel], rel, modules)
+            else:
+                table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("route", ["direct", "alias", "default", "keyword_default", "default_alias", "lambda_default"])
+@pytest.mark.parametrize("python", [False, True])
+def test_round23b_factory_and_default_candidates_keep_return_evidence(tmp_path, route, python):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    head = "sys.executable" if python else "'echo'"
+    source = ("import subprocess, sys\ndef build(flag):\n    return [" + head + ", flag, 'pass']\n"
+              "def choose(enabled):\n    return build if enabled else build\n")
+    if route == "direct":
+        source += "def launch(enabled, flag):\n    subprocess.run(choose(enabled)(flag))\n"
+    elif route == "alias":
+        source += "def launch(enabled, flag):\n    callback = choose(enabled)\n    subprocess.run(callback(flag))\n"
+    elif route == "lambda_default":
+        source += "launch = lambda flag, callback=build: subprocess.run(callback(flag))\n"
+    else:
+        signature = "flag, *, callback=build" if route == "keyword_default" else "flag, callback=build"
+        source += "def launch(" + signature + "):\n"
+        source += ("    alias = callback\n    subprocess.run(alias(flag))\n" if route == "default_alias"
+                   else "    subprocess.run(callback(flag))\n")
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    # ROUND-27b covers parameters; ROUND-29 also makes generic factory selections UNKNOWN.
+    assert selector_gate_errors(modules, ())
+    with pytest.raises(ValueError) as error:
+        refuse_literal_spawns(modules[rel], rel, modules)
+    assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("api,key", [
+    ("os.system", "command"), ("os.popen", "cmd"),
+    ("subprocess.getoutput", "cmd"), ("subprocess.getstatusoutput", "cmd"),
+])
+@pytest.mark.parametrize("bound", ["depth", "words"])
+@pytest.mark.parametrize("entry", ["refusal", "inventory", "literal_inventory"])
+def test_round24_keyword_expansion_bounds_refuse(tmp_path, api, key, bound, entry):
+    mapping = "{" + repr(key) + ": 'python3 -c ' + shlex.quote(P)}"
+    if bound == "depth":
+        mapping = "{**" * (_MAX_DEPTH + 1) + mapping + "}" * (_MAX_DEPTH + 1)
+    else:
+        mapping = "{" + ",".join(repr("padding" + str(index)) + ": 0" for index in range(_MAX_WORDS)) + ",**" + mapping + "}"
+    source = "import os, subprocess, shlex\nP = \"import os; os.system('id')\"\n" + api + "(**" + mapping + ")\n"
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry != "refusal":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    with pytest.raises(ValueError) as error:
+        if entry == "refusal":
+            refuse_literal_spawns(modules[rel], rel, modules)
+        elif entry == "inventory":
+            table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+            process_sites(tmp_path, selector_table=table)
+        else:
+            table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+            literal_process_sites(rel, modules[rel], CommandResolver(modules), selector_table=table)
+    expected = ("selector site limit " + rel + ":<module>" if entry == "inventory" and bound == "words"
+                else rel + ": unresolved Python -c program")
+    assert str(error.value) == expected
+
+
+@pytest.mark.parametrize("call", [
+    "os.execv(exe, *argv)", "os.execve(exe, *argv, {})",
+    "os.execvp(exe, *argv)", "os.execvpe(exe, *argv, {})",
+    "os.spawnv(0, exe, *argv)", "os.spawnve(0, exe, *argv, {})",
+    "os.spawnvp(0, exe, *argv)", "os.spawnvpe(0, exe, *argv, {})",
+    "os.execl(exe, *argv)", "os.execle(exe, *argv, {})",
+    "os.spawnl(0, exe, *argv)", "os.spawnle(0, exe, *argv, {})",
+    "os.execl(exe, 'display', *argv)", "os.execle(exe, 'display', *argv, {})",
+    "os.execlp(exe, 'display', *argv)", "os.execlpe(exe, 'display', *argv, {})",
+    "os.spawnl(0, exe, 'display', *argv)", "os.spawnle(0, exe, 'display', *argv, {})",
+    "os.spawnlp(0, exe, 'display', *argv)", "os.spawnlpe(0, exe, 'display', *argv, {})",
+    "subprocess.Popen(*argv, executable=exe)", "subprocess.run(*argv, executable=exe)",
+])
+@pytest.mark.parametrize("entry", ["refusal", "inventory"])
+def test_round24_starred_argv_slots_refuse(tmp_path, call, entry):
+    source = "import os, subprocess\ndef launch(exe, argv):\n    " + call + "\n"
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    with pytest.raises(ValueError) as error:
+        if entry == "refusal":
+            refuse_literal_spawns(modules[rel], rel, modules)
+        else:
+            table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+            process_sites(tmp_path, selector_table=table)
+    assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("call", [
+    "os.execv('echo', *argv)", "os.spawnv(0, 'echo', *argv)",
+    "os.execl('echo', *argv)", "os.spawnl(0, 'echo', *argv)",
+    "os.execl('echo', 'display', *argv)", "os.spawnl(0, 'echo', 'display', *argv)",
+    "subprocess.Popen(*argv, executable='echo')",
+    "subprocess.run(['python3', '-c', 'pass', *argv])",
+    "os.execv(sys.executable, ['worker', '-c', 'pass', *argv])",
+    "os.spawnv(0, sys.executable, ['worker', '-c', 'pass', *argv])",
+    "subprocess.getoutput(**options)",
+    "subprocess.getoutput(**{**{'cmd': 'echo ok'}})",
+])
+@pytest.mark.parametrize("entry", ["refusal", "inventory"])
+def test_round24_known_native_tails_and_unknown_mappings_keep_controls(tmp_path, call, entry):
+    source = "import os, subprocess, sys\ndef launch(argv, options):\n    " + call + "\n"
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "refusal":
+        refuse_literal_spawns(modules[rel], rel, modules)
+    else:
+        table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+        sites = process_sites(tmp_path, selector_table=table)
+        assert sum(len(lines) for key, lines in sites.items() if key.startswith("process:")) == 2
+
+
+@pytest.mark.parametrize("method", ["format", "join", "replace", "split"])
+@pytest.mark.parametrize("route", ["parameter", "default", "method_alias", "class_alternative"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round25_string_receiver_needs_every_binding_proven(tmp_path, method, route, entry):
+    source = ("import subprocess, sys\nP = \"import os; os.system('id')\"\n"
+              "class Builder:\n    def " + method + "(self, flag):\n        return [sys.executable, flag, P]\n")
+    if route == "class_alternative":
+        source += "def launch(flag, enabled):\n    builder = Builder() if enabled else 'echo'\n"
+    else:
+        signature = "flag, builder=None" if route == "default" else "builder, flag"
+        source += "def launch(" + signature + "):\n    if builder is None:\n        builder = 'echo'\n"
+    source += ("    method = builder." + method + "\n    subprocess.run(method(flag))\n" if route == "method_alias"
+               else "    subprocess.run(builder." + method + "(flag))\n")
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ())
+    else:
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                refuse_literal_spawns(modules[rel], rel, modules)
+            else:
+                table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("route", ["direct", "import_alias", "assignment_alias", "reexport", "keyword", "lambda"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round25_imported_callable_defaults_keep_unknown_evidence(tmp_path, route, entry):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    (core / "provider.py").write_text(
+        "import sys\nP = \"import os; os.system('id')\"\ndef build(flag):\n    return [sys.executable, flag, P]\n",
+        encoding="utf-8")
+    if route == "reexport":
+        (core / "exports.py").write_text("from .provider import build\n", encoding="utf-8")
+    source = "import subprocess\nfrom aegis_core." + ("exports" if route == "reexport" else "provider") + " import build"
+    source += " as imported\nbuild = imported\n" if route == "import_alias" else "\n"
+    if route == "assignment_alias":
+        source += "callback = build\n"
+    callback = "callback" if route == "assignment_alias" else "build"
+    if route == "lambda":
+        source += "launch = lambda flag, callback=" + callback + ": subprocess.run(callback(flag))\n"
+    else:
+        source += "def launch(flag, " + ("*, " if route == "keyword" else "") + "callback=" + callback + "):\n    subprocess.run(callback(flag))\n"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ())
+    else:
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                refuse_literal_spawns(modules[rel], rel, modules)
+            else:
+                table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("arguments", [
+    "['worker', '-c', CMD]", "['worker', '--command', CMD]", "['worker', '--command='+CMD]",
+    "['worker', '--session-command', CMD]", "['worker', '--session-command='+CMD]",
+    "['--', 'worker', '-c', CMD]",
+])
+@pytest.mark.parametrize("prefix", ["['su']", "['env', 'su']", "['busybox', 'su']"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round25_su_username_is_never_a_transparent_executable(tmp_path, arguments, prefix, entry):
+    source = ("import subprocess, shlex\nP = \"import os; os.system('id')\"\n"
+              "CMD = 'python3 -c ' + shlex.quote(P)\nsubprocess.run(" + prefix + " + " + arguments + ")\n")
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ())
+    else:
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                refuse_literal_spawns(modules[rel], rel, modules)
+            else:
+                table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("route", ["strings", "string_alias", "helper_default"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round25_proven_receivers_and_helper_defaults_keep_no_program(tmp_path, route, entry):
+    source = "import subprocess\nfrom shlex import quote\n"
+    if route == "helper_default":
+        source += "def launch(value, build=quote):\n    subprocess.run(build(value))\n"
+    else:
+        source += "def launch(value, condition):\n    builder = 'echo'\n    if condition:\n        builder = 'text'\n"
+        source += ("    method = builder.format\n    subprocess.run(method(value))\n" if route == "string_alias"
+                   else "    subprocess.run(builder.format(value))\n")
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    # ROUND-27b supersedes the callable-parameter acceptance in this control.
+    if route == "helper_default":
+        if entry == "selector":
+            assert selector_gate_errors(modules, ())
+        else:
+            with pytest.raises(ValueError) as error:
+                if entry == "refusal":
+                    refuse_literal_spawns(modules[rel], rel, modules)
+                else:
+                    table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+                    process_sites(tmp_path, selector_table=table)
+            assert str(error.value) == rel + ": unresolved Python -c program"
+        return
+    if entry == "selector":
+        assert selector_gate_errors(modules, ()) == []
+    elif entry == "refusal":
+        refuse_literal_spawns(modules[rel], rel, modules)
+    else:
+        table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+        sites = process_sites(tmp_path, selector_table=table)
+        assert sum(len(lines) for key, lines in sites.items() if key.endswith(":subprocess.run")) == 2
+
+
+@pytest.mark.parametrize("builtin", ["str", "repr", "ascii", "bytes"])
+@pytest.mark.parametrize("route", ["direct", "module_alias", "chained_alias", "closure_alias"])
+@pytest.mark.parametrize("signature", ["positional", "keyword", "lambda"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round26_unshadowed_builtin_defaults_keep_no_program(tmp_path, builtin, route, signature, entry):
+    source = "import subprocess\n"
+    default, indent = builtin, ""
+    if route == "module_alias":
+        source += "transform = " + builtin + "\n"
+        default = "transform"
+    elif route == "chained_alias":
+        source += "first = " + builtin + "\ntransform = first\n"
+        default = "transform"
+    elif route == "closure_alias":
+        source += "def factory():\n    transform = " + builtin + "\n"
+        default, indent = "transform", "    "
+    if signature == "lambda":
+        source += indent + "launch = lambda value, callback=" + default + ": subprocess.run(['echo', callback(value)])\n"
+    else:
+        source += indent + "def launch(value, " + ("*, " if signature == "keyword" else "") + "callback=" + default + "):\n"
+        source += indent + "    subprocess.run(['echo', callback(value)])\n"
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    # ROUND-27b supersedes this historical builtin-default NoProgram control.
+    if entry == "selector":
+        assert selector_gate_errors(modules, ())
+    else:
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                refuse_literal_spawns(modules[rel], rel, modules)
+            else:
+                table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("route", ["function", "alias", "import", "opaque", "rebound_alias", "mixed_alias", "callback_reassignment"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round26_shadowed_builtin_defaults_stay_unknown(tmp_path, route, entry):
+    source = ("import subprocess, sys\nP = \"import os; os.system('id')\"\n"
+              "def build(flag):\n    return [sys.executable, flag, P]\n")
+    default, indent = "str", ""
+    if route == "function":
+        source += "def str(flag):\n    return build(flag)\n"
+    elif route == "alias":
+        source += "str = build\n"
+    elif route == "import":
+        source += "from aegis_core.provider import build as str\n"
+    elif route == "opaque":
+        source += "def factory(str):\n"
+        indent = "    "
+    elif route == "callback_reassignment":
+        source += "from aegis_core.provider import build as imported\n"
+    else:
+        source += "transform = str\n"
+        source += "transform = build\n" if route == "rebound_alias" else "if enabled:\n    transform = build\n"
+        default = "transform"
+    source += indent + "def launch(flag, callback=" + default + "):\n"
+    if route == "callback_reassignment":
+        source += "    if enabled:\n        callback = imported\n"
+    source += indent + "    subprocess.run(callback(flag))\n"
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "provider.py").write_text("import sys\ndef build(flag):\n    return [sys.executable, flag, 'pass']\n", encoding="utf-8")
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ())
+    else:
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                refuse_literal_spawns(modules[rel], rel, modules)
+            else:
+                table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("builtin", ["str", "repr", "ascii", "bytes"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round26_builtin_defaults_walk_content_arguments(tmp_path, builtin, entry):
+    source = ("import subprocess\nfrom pathlib import Path\ndef launch(path, callback=" + builtin + "):\n"
+              "    subprocess.run(['echo', callback(Path(path).read_text())])\n")
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ())
+    else:
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                refuse_literal_spawns(modules[rel], rel, modules)
+            else:
+                table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("head,arguments", [
+    ("runuser", "['worker', '-c', CMD]"),
+    ("runuser", "['worker', '--command', CMD]"),
+    ("runuser", "['worker', '--command='+CMD]"),
+    ("runuser", "['worker', '--session-command', CMD]"),
+    ("runuser", "['worker', '--session-command='+CMD]"),
+    ("runuser", "['--', 'worker', '-c', CMD]"),
+    ("sg", "['group', '-c', CMD]"),
+])
+@pytest.mark.parametrize("prefix", [[], ["sudo"]])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round26_user_group_wrappers_remain_unknown_after_peeling(tmp_path, head, arguments, prefix, entry):
+    source = ("import subprocess, shlex\nP = \"import os; os.system('id')\"\n"
+              "CMD = 'python3 -c ' + shlex.quote(P)\nsubprocess.run(" + repr(prefix + [head]) + " + " + arguments + ")\n")
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ())
+    else:
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                refuse_literal_spawns(modules[rel], rel, modules)
+            else:
+                table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("route", ["lambda_default", "local_helper", "callable_alias", "reexport"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round26_argon_imported_helpers_never_have_empty_evidence(tmp_path, route, entry):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "provider.py").write_text(
+        "import sys\nP = \"import os; os.system('id')\"\ndef build(flag):\n    return [sys.executable, flag, P]\n",
+        encoding="utf-8")
+    if route == "reexport":
+        (core / "exports.py").write_text("from .provider import build\n", encoding="utf-8")
+    source = "import subprocess\nfrom aegis_core." + ("exports" if route == "reexport" else "provider") + " import build\n"
+    if route == "local_helper":
+        source += "def wrapper(flag):\n    return build(flag)\ndef launch(flag):\n    subprocess.run(wrapper(flag))\n"
+    else:
+        if route == "callable_alias":
+            source += "runner = build\n"
+        source += ("def launch(flag, callback=lambda flag: " + ("runner" if route == "callable_alias" else "build")
+                   + "(flag)):\n    subprocess.run(callback(flag))\n")
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ())
+    else:
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                refuse_literal_spawns(modules[rel], rel, modules)
+            else:
+                table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("route", ["direct", "method_alias", "local_import", "method_default"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round26_argon_imported_receiver_alternatives_need_proof(tmp_path, route, entry):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    (core / "provider.py").write_text(
+        "import sys\nP = \"import os; os.system('id')\"\nclass Builder:\n    def format(self, flag):\n"
+        "        return [sys.executable, flag, P]\nbuilder = Builder()\n", encoding="utf-8")
+    source = "import subprocess\n"
+    if route == "local_import":
+        source += "def launch(flag):\n    from aegis_core.provider import builder\n    if False:\n        builder = 'echo'\n"
+    else:
+        source += ("from aegis_core.provider import builder\nif False:\n    builder = 'echo'\ndef launch(flag"
+                   + (", method=builder.format" if route == "method_default" else "") + "):\n")
+    if route == "method_alias":
+        source += "    method = builder.format\n    subprocess.run(method(flag))\n"
+    else:
+        source += "    subprocess.run(" + ("method(flag)" if route == "method_default" else "builder.format(flag)") + ")\n"
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ())
+    else:
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                refuse_literal_spawns(modules[rel], rel, modules)
+            else:
+                table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("builtin", ["str", "repr", "ascii", "bytes", "list", "tuple"])
+@pytest.mark.parametrize("form", ["positional", "keyword", "lambda", "assignment_alias"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round27b_callable_default_overrides_need_review(tmp_path, builtin, form, entry):
+    source = ("import subprocess, sys\nP = \"import os; os.system('id')\"\n"
+              "def build(flag):\n    return [sys.executable, flag, P]\n")
+    default = builtin
+    if form == "assignment_alias":
+        source += "transform = " + builtin + "\n"
+        default = "transform"
+    if form == "lambda":
+        source += "launch = lambda value, callback=" + default + ": subprocess.run(callback(value))\n"
+    else:
+        source += "def launch(value, " + ("*, " if form == "keyword" else "") + "callback=" + default + "):\n    subprocess.run(callback(value))\n"
+    source += "def main(flag):\n    launch(flag, callback=build)\nmain(sys.argv[1])\n"
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ())
+    else:
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                refuse_literal_spawns(modules[rel], rel, modules)
+            else:
+                table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("case", ["default_str", "default_tuple", "no_default", "parameter_alias"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round27b_callable_parameters_are_unknown(tmp_path, case, entry):
+    source = "import subprocess\n"
+    if case == "default_str":
+        source += "def launch(value, callback=str):\n    subprocess.run(['echo', callback(value)])\n"
+    elif case == "default_tuple":
+        source += "def launch(convert=tuple):\n    subprocess.run(convert(['echo', 'ok']))\n"
+    else:
+        source += "def launch(value, callback):\n"
+        source += ("    operation = callback\n    subprocess.run(operation(value))\n" if case == "parameter_alias"
+                   else "    subprocess.run(callback(value))\n")
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ())
+    else:
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                refuse_literal_spawns(modules[rel], rel, modules)
+            else:
+                table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("command", [
+    "tuple(['echo', 'ok'])", "list(['echo', 'ok'])", "['echo', str(value)]",
+    "['echo', repr(value)]", "['echo', ascii(value)]", "['echo', bytes(value)]", "value",
+])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round27b_direct_builtins_and_plain_parameters_keep_models(tmp_path, command, entry):
+    source = "import subprocess\ndef launch(value):\n    subprocess.run(" + command + ")\n"
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ()) == []
+    elif entry == "refusal":
+        refuse_literal_spawns(modules[rel], rel, modules)
+    else:
+        table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+        sites = process_sites(tmp_path, selector_table=table)
+        assert sum(len(lines) for key, lines in sites.items() if key.endswith(":subprocess.run")) == 2
+
+
+@pytest.mark.parametrize("case", [
+    "factory", "lambda_factory", "quote_default", "class_loop", "class_deleted",
+    "imported_placeholder", "stream_return",
+])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round27_argon_callable_alternatives_require_review(tmp_path, case, entry):
+    source = "import subprocess\nfrom .provider import build\n"
+    if case in {"factory", "lambda_factory", "quote_default"}:
+        if case == "lambda_factory":
+            source += "choose = lambda callback=str: callback\n"
+        else:
+            default = "shlex.quote" if case == "quote_default" else "str"
+            source += "import shlex\ndef choose(callback=" + default + "):\n    return callback\n"
+        source += "def launch(flag):\n    subprocess.run(choose(build)(flag))\n"
+    elif case in {"class_loop", "class_deleted"}:
+        if case == "class_deleted":
+            source += "class Base:\n    callback = staticmethod(build)\n"
+        source += "class Spec" + ("(Base)" if case == "class_deleted" else "") + ":\n"
+        source += "    def callback(self, flag):\n        return ['echo', flag]\n"
+        source += ("    del callback\n" if case == "class_deleted"
+                   else "    for callback in (build,):\n        pass\n")
+        source += "    def launch(self, flag):\n        subprocess.run(self.callback(flag))\n"
+    elif case == "imported_placeholder":
+        source += ("class Spec:\n    def callback(self, flag=build):\n        return ['echo', 'ok']\n"
+                   "    def launch(self):\n        subprocess.run(self.callback())\n")
+    else:
+        source = ("import os\ndef read_cmd(p):\n    return next(open(p))\n"
+                  "def launch(p):\n    os.system(read_cmd(p))\n")
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    provider = ("import sys\nP = \"import os; os.system('id')\"\n"
+                "def build(flag):\n    return [sys.executable, flag, P]\n")
+    (core / "provider.py").write_text(provider, encoding="utf-8")
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ())
+    else:
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                refuse_literal_spawns(modules[rel], rel, modules)
+            else:
+                table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("case", [
+    "function", "method", "factory", "async", "called_decorator", "stacked", "shadowed", "opaque",
+])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round28_decorated_callables_require_review(tmp_path, case, entry):
+    source = ("import subprocess, sys\nP = \"import os; os.system('id')\"\n"
+              "def python_argv(source):\n    def wrapped(flag):\n"
+              "        return [sys.executable, flag, source(flag)]\n    return wrapped\n")
+    if case == "method":
+        source += ("def method_argv(source):\n    def wrapped(self, flag):\n"
+                   "        return [sys.executable, flag, source(self, flag)]\n    return wrapped\n"
+                   "class Runner:\n    @method_argv\n    def build(self, flag):\n        return P\n"
+                   "    def launch(self, flag):\n        subprocess.run(self.build(flag))\n")
+    elif case == "factory":
+        source += ("def python_factory(source):\n    def replacement():\n        def wrapped(flag):\n"
+                   "            return [sys.executable, flag, source()(flag)]\n"
+                   "        return wrapped\n    return replacement\n"
+                   "@python_factory\ndef factory():\n    def build(flag):\n        return P\n    return build\n"
+                   "def launch(flag):\n    subprocess.run(factory()(flag))\n")
+    elif case == "async":
+        source += ("def async_argv(source):\n    def wrapped(flag):\n"
+                   "        return [sys.executable, flag, P]\n    return wrapped\n"
+                   "@async_argv\nasync def build(flag):\n    return 'echo'\n"
+                   "def launch(flag):\n    subprocess.run(build(flag))\n")
+    elif case == "stacked":
+        source += ("class Runner:\n    @staticmethod\n    @python_argv\n    def build(flag):\n        return P\n"
+                   "    def launch(self, flag):\n        subprocess.run(self.build(flag))\n")
+    else:
+        decorator = "python_argv"
+        if case == "called_decorator":
+            source += "def make_decorator():\n    return python_argv\n"
+            decorator = "make_decorator()"
+        elif case == "shadowed":
+            source += "staticmethod = python_argv\n"
+            decorator = "staticmethod"
+        elif case == "opaque":
+            source += "from functools import lru_cache as decorate\n"
+            decorator = "decorate"
+        source += "@" + decorator + "\ndef build(flag):\n    return P\n"
+        source += "def launch(flag):\n    subprocess.run(build(flag))\n"
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ())
+    else:
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                refuse_literal_spawns(modules[rel], rel, modules)
+            else:
+                table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("factory", [False, True])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round28_enumerable_decorators_replace_original_return_evidence(tmp_path, factory, entry):
+    source = "import subprocess, sys\nP = \"import os; os.system('id')\"\n"
+    if factory:
+        source += ("def decorate(source):\n    def replacement():\n        def wrapped(flag):\n"
+                   "            return ['echo', flag]\n        return wrapped\n    return replacement\n"
+                   "@decorate\ndef factory():\n    def build(flag):\n"
+                   "        return [sys.executable, flag, P]\n    return build\n"
+                   "def launch(flag):\n    subprocess.run(factory()(flag))\n")
+    else:
+        source += ("def decorate(source):\n    def wrapped(flag):\n        return ['echo', flag]\n    return wrapped\n"
+                   "@decorate\ndef build(flag):\n    return [sys.executable, flag, P]\n"
+                   "def launch(flag):\n    subprocess.run(build(flag))\n")
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ()) == []
+    elif entry == "refusal":
+        refuse_literal_spawns(modules[rel], rel, modules)
+    else:
+        table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+        sites = process_sites(tmp_path, selector_table=table)
+        assert sum(len(lines) for key, lines in sites.items() if key.endswith(":subprocess.run")) == 2
+
+
+@pytest.mark.parametrize("descriptor", ["staticmethod", "classmethod"])
+@pytest.mark.parametrize("style", ["bare", "imported", "module"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round28_proven_descriptors_keep_native_calls(tmp_path, descriptor, style, entry):
+    source = "import subprocess\n"
+    decorator = descriptor
+    if style == "imported":
+        source += "from builtins import " + descriptor + " as descriptor\n"
+        decorator = "descriptor"
+    elif style == "module":
+        source += "import builtins\n"
+        decorator = "builtins." + descriptor
+    arguments = "cls, flag" if descriptor == "classmethod" else "flag"
+    source += ("class Runner:\n    @" + decorator + "\n    def build(" + arguments + "):\n"
+               "        return ['echo', flag]\n    def launch(self, flag):\n        subprocess.run(self.build(flag))\n")
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ()) == []
+    elif entry == "refusal":
+        refuse_literal_spawns(modules[rel], rel, modules)
+    else:
+        table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+        sites = process_sites(tmp_path, selector_table=table)
+        assert sum(len(lines) for key, lines in sites.items() if key.endswith(":subprocess.run")) == 2
+
+
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round28_decorator_choice_bound_requires_review(tmp_path, entry):
+    source = ("import subprocess\n" + "@staticmethod\n" * (_MAX_CHOICES + 1)
+              + "def build(flag):\n    return ['echo', flag]\n"
+              "def launch(flag):\n    subprocess.run(build(flag))\n")
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ())
+    else:
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                refuse_literal_spawns(modules[rel], rel, modules)
+            else:
+                table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("case", [
+    "instance_store", "instance_delete", "class_store", "subclass", "static_self", "unknown_base",
+    "map", "filter", "sorted_key", "min_key", "reduce", "builtin_argument", "argument_alias",
+    "builtin_conditional", "builtin_boolean", "builtin_subscript", "builtin_factory", "builtin_method",
+    "string_add", "string_branch", "keyword_executable", "keyword_args", "keyword_unknown",
+])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round28_correctness_addendum_requires_review(tmp_path, case, entry):
+    source = ("import subprocess, sys\nP = \"import os; os.system('id')\"\n"
+              "def build(flag):\n    return [sys.executable, flag, P]\n")
+    if case in {"instance_store", "instance_delete", "class_store", "subclass", "static_self", "unknown_base"}:
+        source += "class Runner:\n    def callback(self, flag):\n        return ['echo', flag]\n"
+        if case in {"instance_store", "instance_delete"}:
+            source += "    def __init__(self, callback):\n        self.callback = callback\n"
+            if case == "instance_delete":
+                source += "        del self.callback\n"
+        if case == "static_self":
+            source += "    @staticmethod\n"
+        source += "    def launch(self, flag):\n        subprocess.run(self.callback(flag))\n"
+        if case == "class_store":
+            source += "Runner.callback = build\n"
+        elif case == "subclass":
+            source += "class PythonRunner(Runner):\n    callback = staticmethod(build)\n"
+        elif case == "unknown_base":
+            source += "def derive(base):\n    class PythonRunner(base):\n        callback = staticmethod(build)\n    return PythonRunner\n"
+    elif case == "builtin_method":
+        source += ("class Runner:\n    def callback(self, flag):\n        return [sys.executable, flag, P]\n"
+                   "    def launch(self):\n        subprocess.run(str(self.callback))\n")
+    elif case in {"map", "filter", "sorted_key", "min_key", "reduce", "builtin_argument", "argument_alias",
+                  "builtin_conditional", "builtin_boolean", "builtin_subscript", "builtin_factory"}:
+        calls = {"map": "next(map(build, [flag]))", "filter": "next(filter(build, [flag]))",
+                 "sorted_key": "sorted([flag], key=build)", "min_key": "min([flag], key=build)",
+                 "reduce": "functools.reduce(lambda a, item: build(item), [flag], None)",
+                 "builtin_argument": "str(build)", "argument_alias": "str(callback)",
+                 "builtin_conditional": "str(build if flag else build)", "builtin_boolean": "str(build or build)",
+                 "builtin_subscript": "str([build][0])", "builtin_factory": "str(callback_factory())"}
+        source += ("import functools\ncallback = build\ndef callback_factory():\n    return build\n"
+                   "def launch(flag):\n    subprocess.run(" + calls[case] + ")\n")
+    elif case in {"string_add", "string_branch"}:
+        source += ("class Builder:\n    def __add__(self, other):\n        return self\n"
+                   "    def format(self, flag):\n        return [sys.executable, flag, P]\n")
+        expression = "builder + suffix" if case == "string_add" else "builder if enabled else 'echo'"
+        source += "def launch(builder, suffix, enabled, flag):\n    subprocess.run((" + expression + ").format(flag))\n"
+    else:
+        key = "'args'" if case == "keyword_args" else "'executable'"
+        source += "KEY = " + key + "\ndef launch(flag, unknown_key):\n"
+        if case == "keyword_args":
+            call = "subprocess.run(**{KEY: [sys.executable, flag, P]})"
+        else:
+            word = "unknown_key" if case == "keyword_unknown" else "KEY"
+            call = "subprocess.run(['worker', flag, P], **{" + word + ": sys.executable})"
+        source += "    " + call + "\n"
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ())
+    else:
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                refuse_literal_spawns(modules[rel], rel, modules)
+            else:
+                table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("python", [False, True])
+@pytest.mark.parametrize("entry", ["selector", "refusal"])
+def test_round28_cross_module_subclass_return_evidence(tmp_path, python, entry):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    source = ("import subprocess\nclass Base:\n    def callback(self, flag):\n        return ['echo', flag]\n"
+              "    def launch(self, flag):\n        subprocess.run(self.callback(flag))\n"
+              "from .provider import Child\n")
+    head = "sys.executable" if python else "'echo'"
+    provider = ("import sys\nfrom .probe import Base\nclass Child(Base):\n"
+                "    def callback(self, flag):\n        return [" + head + ", flag, 'pass']\n")
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    (core / "provider.py").write_text(provider, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert bool(selector_gate_errors(modules, ())) is python
+    elif python:
+        with pytest.raises(ValueError) as error:
+            refuse_literal_spawns(modules[rel], rel, modules)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+    else:
+        refuse_literal_spawns(modules[rel], rel, modules)
+
+
+@pytest.mark.parametrize("entry", ["refusal", "inventory"])
+def test_round28_dynamic_keyword_collision_preserves_module_label(tmp_path, entry):
+    source = ("import subprocess, sys\nKEY = 'executable'\ndef launch(module):\n"
+              "    subprocess.run([sys.executable, '-m', module], **{KEY: None}, **{KEY: None})\n")
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    with pytest.raises(ValueError) as error:
+        if entry == "refusal":
+            refuse_literal_spawns(modules[rel], rel, modules)
+        else:
+            table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+            process_sites(tmp_path, selector_table=table)
+    assert str(error.value) == rel + ": unresolved Python module"
+
+
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round28_classmethod_binding_does_not_depend_on_parameter_spelling(tmp_path, entry):
+    source = ("import subprocess\nclass Runner:\n    @classmethod\n    def callback(cls, flag):\n"
+              "        return ['echo', flag]\n    @classmethod\n    def launch(self, flag):\n"
+              "        subprocess.run(self.callback(flag))\n")
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ()) == []
+    elif entry == "refusal":
+        refuse_literal_spawns(modules[rel], rel, modules)
+    else:
+        table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+        sites = process_sites(tmp_path, selector_table=table)
+        assert sum(len(lines) for key, lines in sites.items() if key.endswith(":subprocess.run")) == 2
+
+
+@pytest.mark.parametrize("shape", ["if_def", "if_assign", "try", "for", "while", "with"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round29_conditional_override_keeps_inherited_evidence(tmp_path, shape, entry):
+    source = ("import subprocess, sys, contextlib\nP = \"import os; os.system('id')\"\n"
+              "class Base:\n    def callback(self, flag):\n        return [sys.executable, flag, P]\n"
+              "class Runner(Base):\n")
+    native = "def callback(self, flag):\n            return ['echo', flag]\n"
+    if shape == "if_def":
+        source += "    if sys.platform == 'win32':\n        " + native
+    elif shape == "if_assign":
+        source += "    if sys.platform == 'win32':\n        callback = lambda self, flag: ['echo', flag]\n"
+    elif shape == "try":
+        source += ("    try:\n        if sys.platform != 'win32':\n            raise RuntimeError()\n"
+                   "        " + native + "    except RuntimeError:\n        pass\n")
+    elif shape == "for":
+        source += "    for item in ([0] if sys.platform == 'win32' else []):\n        " + native
+    elif shape == "while":
+        source += "    while sys.platform == 'win32':\n        " + native + "        break\n"
+    else:
+        source += ("    with contextlib.suppress(RuntimeError):\n        if sys.platform != 'win32':\n"
+                   "            raise RuntimeError()\n        " + native)
+    source += "    def launch(self, flag):\n        subprocess.run(self.callback(flag))\n"
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ())
+    else:
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                refuse_literal_spawns(modules[rel], rel, modules)
+            else:
+                table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("selection", [
+    "list([build])[0]", "tuple([build])[0]", "sorted([build])[0]",
+    "dict([('builder', build)])['builder']", "[build][0]", "(build,)[0]", "{'builder': build}['builder']",
+])
+@pytest.mark.parametrize("alias", ["direct", "container", "callable", "constructor"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round29_container_callable_selections_are_unknown(tmp_path, selection, alias, entry):
+    source = ("import subprocess, sys\nP = \"import os; os.system('id')\"\n"
+              "def build(flag):\n    return [sys.executable, flag, P]\n")
+    if alias == "callable":
+        source += "callback = " + selection + "\n"
+        selection = "callback"
+    elif alias == "container":
+        container, _, index = selection.rpartition("[")
+        source += "callbacks = " + container + "\n"
+        selection = "callbacks[" + index
+    elif alias == "constructor":
+        if selection.startswith(("list(", "tuple(", "sorted(", "dict(")):
+            constructor, _, arguments = selection.partition("(")
+            source += "make = " + constructor + "\n"
+            selection = "make(" + arguments
+        else:
+            source += "callback = " + selection + "\n"
+            selection = "callback"
+    source += "def launch(flag):\n    subprocess.run(" + selection + "(flag))\n"
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ())
+    else:
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                refuse_literal_spawns(modules[rel], rel, modules)
+            else:
+                table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("builtin", ["min", "max", "sorted"])
+@pytest.mark.parametrize("expansion", ["literal", "nested", "opaque", "other_key", "alias"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round29_expanded_builtin_callbacks_require_review(tmp_path, builtin, expansion, entry):
+    mapping = {"literal": "{'key': build}", "nested": "{**{'key': build}}", "opaque": "options",
+               "other_key": "{'callback': build}", "alias": "{'key': build}"}[expansion]
+    source = ("import subprocess, sys\nP = \"import os; os.system('id')\"\n"
+              "def build(flag):\n    return [sys.executable, flag, P]\n")
+    if expansion == "alias":
+        source += "choose = " + builtin + "\n"
+        builtin = "choose"
+    source += "def launch(candidates, options):\n    subprocess.run(" + builtin + "(candidates, **" + mapping + "))\n"
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ())
+    else:
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                refuse_literal_spawns(modules[rel], rel, modules)
+            else:
+                table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("unrelated", ["write", "dynamic_write", "class_write", "exception", "builtin_alias"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round29_unrelated_owners_do_not_invalidate_native_methods(tmp_path, unrelated, entry):
+    source = ("import subprocess\nclass Runner:\n    def build(self, flag):\n        return ['echo', flag]\n"
+              "    def launch(self, flag):\n        subprocess.run(self.build(flag))\n")
+    if unrelated == "write":
+        source += "class Other:\n    def __init__(self):\n        self.build = None\n"
+    elif unrelated == "dynamic_write":
+        source += "class Other:\n    def __init__(self, name):\n        setattr(self, name, None)\n"
+    elif unrelated == "class_write":
+        source += "class Other:\n    pass\nOther.build = None\n"
+    elif unrelated == "exception":
+        source += "class Problem(Exception):\n    pass\n"
+    else:
+        source += "from builtins import Exception as Error\nclass Problem(Error):\n    pass\n"
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ()) == []
+    elif entry == "refusal":
+        refuse_literal_spawns(modules[rel], rel, modules)
+    else:
+        table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+        sites = process_sites(tmp_path, selector_table=table)
+        assert sum(len(lines) for key, lines in sites.items() if key.endswith(":subprocess.run")) == 2
+
+
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round29_recursive_callback_arguments_require_review(tmp_path, entry):
+    source = "import subprocess\ndef launch():\n    value = str(value)\n    subprocess.run(str(value))\n"
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ())
+    else:
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                refuse_literal_spawns(modules[rel], rel, modules)
+            else:
+                table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("argument", ["[build]", "(build,)", "{'callback': build}", "{build}"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round29_builtin_container_arguments_are_callable_bearing(tmp_path, argument, entry):
+    source = ("import subprocess, sys\ndef build(flag):\n    return [sys.executable, flag, 'pass']\n"
+              "def launch():\n    subprocess.run(str(" + argument + "))\n")
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ())
+    else:
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                refuse_literal_spawns(modules[rel], rel, modules)
+            else:
+                table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+@pytest.mark.parametrize("statement", [
+    "if enabled:\n    def build(flag):\n        return ['echo', flag]\n",
+    "if enabled:\n    build = lambda flag: ['echo', flag]\n",
+    "try:\n    def build(flag):\n        return ['echo', flag]\nexcept Exception:\n    pass\n",
+    "for item in options:\n    def build(flag):\n        return ['echo', flag]\n",
+    "while enabled:\n    def build(flag):\n        return ['echo', flag]\n    break\n",
+    "with manager:\n    def build(flag):\n        return ['echo', flag]\n",
+])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round29_conditional_module_binding_is_not_definite(tmp_path, statement, entry):
+    source = "import subprocess\n" + statement + "def launch(flag):\n    subprocess.run(build(flag))\n"
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        assert selector_gate_errors(modules, ())
+    else:
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                refuse_literal_spawns(modules[rel], rel, modules)
+            else:
+                table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+
+
+def round30_indent(source):
+    return "".join("    " + line + "\n" for line in source.splitlines())
+
+
+def round30_launch_outcome(tmp_path, source, entry, *, review):
+    core = tmp_path / "aegis_core"
+    core.mkdir()
+    rel = "aegis_core/probe.py"
+    if entry == "inventory":
+        source = "import subprocess, sys\nsubprocess.run([sys.executable, '-c', " + repr(source) + "])\n"
+    (core / "probe.py").write_text(source, encoding="utf-8")
+    modules = dict(module_trees(tmp_path))
+    if entry == "selector":
+        errors = selector_gate_errors(modules, ())
+        if review:
+            assert errors
+        else:
+            assert errors == []
+    elif review:
+        with pytest.raises(ValueError) as error:
+            if entry == "refusal":
+                refuse_literal_spawns(modules[rel], rel, modules)
+            else:
+                table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+                process_sites(tmp_path, selector_table=table)
+        assert str(error.value) == rel + ": unresolved Python -c program"
+    elif entry == "refusal":
+        refuse_literal_spawns(modules[rel], rel, modules)
+    else:
+        table = ((rel, "<module>", "resolved-python-program", "Review only the outer test literal."),)
+        sites = process_sites(tmp_path, selector_table=table)
+        assert sum(len(lines) for key, lines in sites.items() if key.endswith(":subprocess.run")) == 2
+
+
+@pytest.mark.parametrize("base", ["list", "tuple", "callable"])
+@pytest.mark.parametrize("binding", ["module", "local", "nested", "attribute_alias", "callable_alias"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round30_class_calls_are_not_function_evidence(tmp_path, base, binding, entry):
+    source = "import subprocess, sys\nP = \"import os; os.system('id')\"\n"
+    if base == "list":
+        builder = ("class Build(list):\n    def __init__(self, flag):\n"
+                   "        super().__init__([sys.executable, flag, P])\n")
+        call = "Build(flag)"
+    elif base == "tuple":
+        builder = ("class Build(tuple):\n    def __new__(cls, flag):\n"
+                   "        return super().__new__(cls, [sys.executable, flag, P])\n")
+        call = "Build(flag)"
+    else:
+        builder = "class Build:\n    def __call__(self, flag):\n        return [sys.executable, flag, P]\n"
+        call = "Build()(flag)"
+    if binding == "module":
+        source += builder + "def launch(flag):\n    subprocess.run(" + call + ")\n"
+    elif binding == "local":
+        source += "def launch(flag):\n" + round30_indent(builder)
+        source += "    subprocess.run(" + call + ")\n"
+    else:
+        if binding == "attribute_alias":
+            source += builder + "class Runner:\n    Build = Build\n"
+        else:
+            source += "class Runner:\n" + round30_indent(builder)
+        source += "    def launch(self, flag):\n"
+        if binding == "callable_alias":
+            source += "        build = self.Build\n        subprocess.run(" + call.replace("Build", "build") + ")\n"
+        else:
+            source += "        subprocess.run(" + call.replace("Build", "self.Build") + ")\n"
+    round30_launch_outcome(tmp_path, source, entry, review=True)
+
+
+@pytest.mark.parametrize("shape", ["if", "try", "for", "while", "with"])
+@pytest.mark.parametrize("scope", ["module", "class"])
+@pytest.mark.parametrize("alias", [False, True])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round30_class_alternatives_keep_each_fallback(tmp_path, shape, scope, alias, entry):
+    source = ("import contextlib, subprocess, sys\nP = \"import os; os.system('id')\"\n"
+              "class Base:\n    def callback(self, flag):\n        return [sys.executable, flag, P]\n")
+    launch = "    def launch(self, flag):\n        subprocess.run(self.callback(flag))\n"
+    fallback = "class Runner(Base):\n" + launch
+    native = "class Runner(Base):\n    def callback(self, flag):\n        return ['echo', flag]\n" + launch
+    if alias:
+        source += "class Native(Base):\n    def callback(self, flag):\n        return ['echo', flag]\n" + launch
+        source += "class Fallback(Base):\n" + launch
+        native, fallback = "Runner = Native\n", "Runner = Fallback\n"
+    if shape == "if":
+        alternatives = ("if sys.platform == 'win32':\n" + round30_indent(native)
+                        + "else:\n" + round30_indent(fallback))
+    elif shape == "try":
+        alternatives = ("try:\n    if sys.platform != 'win32':\n        raise RuntimeError()\n"
+                        + round30_indent(native) + "except RuntimeError:\n" + round30_indent(fallback))
+    else:
+        header = {"for": "for item in ([0] if sys.platform == 'win32' else []):\n",
+                  "while": "while sys.platform == 'win32':\n",
+                  "with": "with contextlib.suppress(RuntimeError):\n"}[shape]
+        body = native + ("break\n" if shape == "while" else "")
+        if shape == "with":
+            body = "if sys.platform != 'win32':\n    raise RuntimeError()\n" + body
+        alternatives = fallback + header + round30_indent(body)
+    source += "class Group:\n" + round30_indent(alternatives) if scope == "class" else alternatives
+    round30_launch_outcome(tmp_path, source, entry, review=True)
+
+
+@pytest.mark.parametrize("receiver", [
+    "self", "this", "cls", "klass", "class", "type_self", "module_instance", "local_instance",
+    "instance_alias", "unresolved",
+])
+@pytest.mark.parametrize("mutation", ["assign", "delete", "setattr", "delattr"])
+@pytest.mark.parametrize("owner", ["Runner", "Other"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round30_receiver_spelling_retains_write_owner(tmp_path, receiver, mutation, owner, entry):
+    source = ("import subprocess\nclass Runner:\n    def build(self, flag):\n        return ['echo', flag]\n"
+              "    def launch(self, flag):\n        subprocess.run(self.build(flag))\n")
+    if owner == "Other":
+        source += "class Other:\n    pass\n"
+    target = owner
+    prefix = ""
+    if receiver in {"self", "this", "cls", "klass", "type_self"}:
+        # Reopen via a subclass to keep the mutation in the owner's hierarchy.
+        source += "class Mutator(" + owner + "):\n"
+        argument = "self" if receiver == "type_self" else receiver
+        if receiver in {"cls", "klass"}:
+            source += "    @classmethod\n"
+        source += "    def configure(" + argument + "):\n"
+        prefix = "        "
+        target = "type(self)" if receiver == "type_self" else argument
+    elif receiver == "module_instance":
+        source += "instance = " + owner + "()\n"
+        target = "instance"
+    elif receiver == "instance_alias":
+        source += "instance = " + owner + "()\nalias = instance\n"
+        target = "alias"
+    elif receiver == "local_instance":
+        source += "def configure():\n    instance = " + owner + "()\n"
+        prefix, target = "    ", "instance"
+    elif receiver == "unresolved":
+        source += "def configure(instance):\n"
+        prefix, target = "    ", "instance"
+    statement = {"assign": target + ".build = None", "delete": "del " + target + ".build",
+                 "setattr": "setattr(" + target + ", 'build', None)",
+                 "delattr": "delattr(" + target + ", 'build')"}[mutation]
+    source += prefix + statement + "\n"
+    round30_launch_outcome(tmp_path, source, entry, review=owner == "Runner" or receiver == "unresolved")
+
+
+@pytest.mark.parametrize("base", ["Exception", "object", "list"])
+@pytest.mark.parametrize("route", ["direct", "chain", "local"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round30_builtin_base_aliases_remain_unrelated(tmp_path, base, route, entry):
+    source = ("import subprocess\nclass Runner:\n    def build(self, flag):\n        return ['echo', flag]\n"
+              "    def launch(self, flag):\n        subprocess.run(self.build(flag))\n")
+    alias = "Error = " + base + "\n"
+    if route == "chain":
+        alias += "Again = Error\n"
+    declaration = "class Problem(" + ("Again" if route == "chain" else "Error") + "):\n    pass\n"
+    source += "def configure():\n" + round30_indent(alias + declaration) if route == "local" else alias + declaration
+    round30_launch_outcome(tmp_path, source, entry, review=False)
+
+
+@pytest.mark.parametrize("route", ["parameter", "conditional", "rebound"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round30_builtin_base_aliases_require_identity_proof(tmp_path, route, entry):
+    source = ("import subprocess\nclass Runner:\n    def build(self, flag):\n        return ['echo', flag]\n"
+              "    def launch(self, flag):\n        subprocess.run(self.build(flag))\n")
+    if route == "parameter":
+        source += "def configure(Error):\n    class Problem(Error):\n        pass\n"
+    elif route == "conditional":
+        source += "Error = Exception if enabled else opaque\nclass Problem(Error):\n    pass\n"
+    else:
+        source += "Error = Exception\nError = opaque\nclass Problem(Error):\n    pass\n"
+    round30_launch_outcome(tmp_path, source, entry, review=True)
+
+
+@pytest.mark.parametrize("descriptor", ["instance", "classmethod"])
+@pytest.mark.parametrize("label", ["this", "klass", "builder"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round30_receiver_identity_uses_its_parameter_scope(tmp_path, descriptor, label, entry):
+    decorator = "    @classmethod\n" if descriptor == "classmethod" else ""
+    source = ("import subprocess\nclass Runner:\n" + decorator + "    def build(" + label
+              + ", flag):\n        return ['echo', flag]\n" + decorator + "    def launch(" + label
+              + ", flag):\n        subprocess.run(" + label + ".build(flag))\n")
+    round30_launch_outcome(tmp_path, source, entry, review=False)
+
+
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round30_other_receiver_label_does_not_capture_string_helpers(tmp_path, entry):
+    source = ("import subprocess\nclass Other:\n    def configure(builder):\n        pass\n"
+              "def launch(flag):\n    builder = 'echo'\n    subprocess.run(builder.format(flag))\n")
+    round30_launch_outcome(tmp_path, source, entry, review=False)
+
+
+@pytest.mark.parametrize("replacement", ["function", "assignment", "parameter", "decorator"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round30_rebound_class_constructor_has_unknown_owner(tmp_path, replacement, entry):
+    source = ("import subprocess\nclass Runner:\n    def build(self, flag):\n        return ['echo', flag]\n"
+              "    def launch(self, flag):\n        subprocess.run(self.build(flag))\n")
+    if replacement == "decorator":
+        source += "@opaque\nclass Other:\n    pass\n"
+    else:
+        source += "class Other:\n    pass\n"
+    if replacement == "function":
+        source += "def Other():\n    return Runner()\n"
+    elif replacement == "assignment":
+        source += "Other = opaque\n"
+    elif replacement == "parameter":
+        source += "def configure(Other):\n    setattr(Other(), 'build', None)\n"
+    if replacement != "parameter":
+        source += "setattr(Other(), 'build', None)\n"
+    round30_launch_outcome(tmp_path, source, entry, review=True)
+
+
+@pytest.mark.parametrize("construction", [
+    "new", "inherited_new", "deep_new", "diamond_new", "metaclass", "inherited_metaclass",
+    "metaclass_default", "conditional_meta", "new_alias", "new_assignment", "new_setattr", "dynamic_hook",
+])
+@pytest.mark.parametrize("route", ["call", "module", "local", "alias", "chain", "constructor_alias"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round31_unproven_constructor_results_have_unknown_owners(tmp_path, construction, route, entry):
+    source = ("import subprocess, sys\nP = \"import os; os.system('id')\"\n"
+              "def python_argv(flag):\n    return [sys.executable, flag, P]\n"
+              "class Runner:\n    def build(self, flag):\n        return ['echo', flag]\n"
+              "    def launch(self, flag):\n        subprocess.run(self.build(flag))\nrunner = Runner()\n")
+    new = "    def __new__(cls):\n        return runner\n"
+    if construction == "new":
+        source += "class Factory:\n" + new
+    elif construction in {"inherited_new", "deep_new", "diamond_new"}:
+        source += "class Parent:\n" + new
+        if construction == "deep_new":
+            source += "class Middle(Parent):\n    pass\nclass Factory(Middle):\n    pass\n"
+        elif construction == "diamond_new":
+            source += "class Plain:\n    pass\nclass Factory(Plain, Parent):\n    pass\n"
+        else:
+            source += "class Factory(Parent):\n    pass\n"
+    elif construction in {"metaclass", "inherited_metaclass", "metaclass_default", "conditional_meta"}:
+        source += "class Meta(type):\n"
+        source += ("    pass\n" if construction == "metaclass_default"
+                   else "    def __call__(cls):\n        return runner\n")
+        if construction == "inherited_metaclass":
+            source += "class Parent(metaclass=Meta):\n    pass\nclass Factory(Parent):\n    pass\n"
+        elif construction == "conditional_meta":
+            source += "Choice = type if enabled else Meta\nclass Factory(metaclass=Choice):\n    pass\n"
+        else:
+            source += "class Factory(metaclass=Meta):\n    pass\n"
+    else:
+        source += "def factory_new(cls):\n    return runner\nclass Factory:\n"
+        source += "    __new__ = factory_new\n" if construction == "new_alias" else "    pass\n"
+        if construction == "new_assignment":
+            source += "Factory.__new__ = factory_new\n"
+        elif construction == "new_setattr":
+            source += "setattr(Factory, '__new__', factory_new)\n"
+        elif construction == "dynamic_hook":
+            source += ("def configure_hook(name):\n    setattr(Factory, name, factory_new)\n"
+                       "configure_hook('__new__')\n")
+    if route == "call":
+        source += "Factory().build = python_argv\n"
+    elif route == "local":
+        source += "def configure():\n    instance = Factory()\n    instance.build = python_argv\nconfigure()\n"
+    else:
+        source += "Constructor = Factory\n" if route == "constructor_alias" else ""
+        source += "instance = " + ("Constructor" if route == "constructor_alias" else "Factory") + "()\n"
+        target = "instance"
+        if route in {"alias", "chain"}:
+            source += "alias = instance\n"
+            target = "alias"
+        if route == "chain":
+            source += "again = alias\n"
+            target = "again"
+        source += target + ".build = python_argv\n"
+    source += "runner.launch(sys.argv[1])\n"
+    round30_launch_outcome(tmp_path, source, entry, review=True)
+
+
+@pytest.mark.parametrize("construction", [
+    "plain", "inherited", "explicit_type", "type_alias", "builtin_base", "custom_init",
+    "unrelated_hook", "ordinary_class_mutation",
+])
+@pytest.mark.parametrize("route", ["module", "local", "alias"])
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round31_proven_constructors_keep_unrelated_owners(tmp_path, construction, route, entry):
+    source = ("import subprocess\nclass Runner:\n    def build(self, flag):\n        return ['echo', flag]\n"
+              "    def launch(self, flag):\n        subprocess.run(self.build(flag))\n")
+    if construction == "inherited":
+        source += "class Parent:\n    pass\nclass Other(Parent):\n    pass\n"
+    elif construction == "explicit_type":
+        source += "class Other(metaclass=type):\n    pass\n"
+    elif construction == "type_alias":
+        source += "Meta = type\nclass Other(metaclass=Meta):\n    pass\n"
+    elif construction == "builtin_base":
+        source += "class Other(list):\n    pass\n"
+    elif construction == "custom_init":
+        source += "class Other:\n    def __init__(self):\n        self.marker = None\n"
+    else:
+        source += "class Other:\n    pass\n"
+    if construction == "unrelated_hook":
+        source += "class Factory:\n    def __new__(cls):\n        return Runner()\n"
+    elif construction == "ordinary_class_mutation":
+        source += "setattr(Other, 'marker', None)\n"
+    if route == "local":
+        source += "def configure():\n    instance = Other()\n    instance.build = None\nconfigure()\n"
+    elif route == "alias":
+        source += "instance = Other()\nalias = instance\nalias.build = None\n"
+    else:
+        source += "instance = Other()\ninstance.build = None\n"
+    round30_launch_outcome(tmp_path, source, entry, review=False)
+
+
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round31_new_can_return_a_fresh_runner(tmp_path, entry):
+    source = ("import subprocess, sys\nP = \"import os; os.system('id')\"\n"
+              "def python_argv(flag):\n    return [sys.executable, flag, P]\n"
+              "class Runner:\n    def build(self, flag):\n        return ['echo', flag]\n"
+              "    def launch(self, flag):\n        subprocess.run(self.build(flag))\n"
+              "class Factory:\n    def __new__(cls):\n        return Runner()\n"
+              "obj = Factory()\nobj.build = python_argv\nobj.launch(sys.argv[1])\n")
+    round30_launch_outcome(tmp_path, source, entry, review=True)
+
+
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round31_constructor_proof_bound_requires_review(tmp_path, entry):
+    source = ("import subprocess, sys\ndef python_argv(flag):\n    return [sys.executable, flag, 'pass']\n"
+              "class Runner:\n    def build(self, flag):\n        return ['echo', flag]\n"
+              "    def launch(self, flag):\n        subprocess.run(self.build(flag))\n"
+              "class Base0:\n    pass\n")
+    for index in range(1, _MAX_DEPTH + 1):
+        source += "class Base" + str(index) + "(Base" + str(index - 1) + "):\n    pass\n"
+    source += "instance = Base" + str(_MAX_DEPTH) + "()\ninstance.build = python_argv\n"
+    round30_launch_outcome(tmp_path, source, entry, review=True)
+
+
+@pytest.mark.parametrize("entry", ["selector", "refusal", "inventory"])
+def test_round31_hook_write_through_unproven_class_alias_is_unknown(tmp_path, entry):
+    source = ("import subprocess, sys\ndef python_argv(flag):\n    return [sys.executable, flag, 'pass']\n"
+              "class Victim:\n    def build(self, flag):\n        return ['echo', flag]\n"
+              "    def launch(self, flag):\n        subprocess.run(self.build(flag))\n"
+              "class Runner:\n    pass\ndef redirect(cls):\n    return Runner\n"
+              "class Holder:\n    @redirect\n    class Factory:\n        pass\n"
+              "def factory_new(cls):\n    return Victim()\n"
+              "Holder.Factory.__new__ = factory_new\nobj = Runner()\nobj.build = python_argv\n"
+              "obj.launch(sys.argv[1])\n")
+    round30_launch_outcome(tmp_path, source, entry, review=True)
