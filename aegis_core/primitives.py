@@ -570,17 +570,24 @@ _DISPLAY_ATTRIBUTION_UNBOUNDED_CAP = 2048
 
 
 @lru_cache(maxsize=1)
-def _display_attribution_tables():
-    """Keep ordinary hook bootstrap free of the optional attribution helper."""
-    from aegis_core.display_attribution import compile_possible, max_match_width, may_match_visible
+def _display_attribution_width():
+    """Window geometry needs widths, never the optional attribution graph."""
+    from aegis_core.display_attribution import max_match_width
 
-    width = max_match_width((pattern for pattern, _relaxed, _replacement in _DISPLAY_SECRET_RULES),
-                            unbounded_cap=_DISPLAY_ATTRIBUTION_UNBOUNDED_CAP)
+    return max_match_width((pattern for pattern, _relaxed, _replacement in _DISPLAY_SECRET_RULES),
+                           unbounded_cap=_DISPLAY_ATTRIBUTION_UNBOUNDED_CAP)
+
+
+@lru_cache(maxsize=1)
+def _display_attribution_tables():
+    """Compile only when a window needs the conservative graph proof."""
+    from aegis_core.display_attribution import compile_possible, may_match_visible
+
     graph = compile_possible((pattern for pattern, _relaxed, replacement in _DISPLAY_SECRET_RULES
                               if replacement != '[REDACTED_PEM]'),
                              carried_patterns=(relaxed for _pattern, relaxed, replacement in _DISPLAY_SECRET_RULES
                                                if replacement != '[REDACTED_PEM]'))
-    return width, graph, may_match_visible
+    return _display_attribution_width(), graph, may_match_visible
 
 
 def _display_attribution_possible(runs, text, stats):
@@ -679,7 +686,7 @@ def _display_attribution_windows(text, index, source_map):
     """Merge windows in kept-character space; seals remain hard boundaries."""
     from aegis_core.display_attribution import project_window
 
-    width = _display_attribution_tables()[0]
+    width = _display_attribution_width()
     begin, offset, pending = 0, 0, None
     for start, end, kind, visible, _replacement, sealed in _display_render_spans(text, index):
         if sealed:
