@@ -19,6 +19,7 @@ from aegis_cli.cli import main
 from aegis_cli import team as cli_team
 from aegis_cli import msg as cli_msg
 from aegis_core import events, message_codec, model_select, storage, team, team_claims, team_profile, team_queue
+from aegis_core import team_writer_binding as binding
 
 
 # Captured on b13c9d8e before the adapter/policy move. Each digest covers the
@@ -644,6 +645,26 @@ def test_cli_unclaim_releases_lane_lease_and_preserves_refusal_envelope(workspac
     assert run(capsys, workspace, "unclaim", "ONE", "--expect", revision, "--lane", "writer", "--writer-stopped")[0] == 1
 
 
+def test_cli_unclaim_live_binding_defeats_stop_acknowledgement(workspace, capsys, monkeypatch):
+    if not binding.descriptor_supported():
+        pytest.skip("requires Linux process identity and confined storage")
+    home = workspace.parent / "passwd-home"
+    (home / ".config/aegis").mkdir(parents=True)
+    monkeypatch.setattr(team_claims, "pwd", SimpleNamespace(getpwuid=lambda uid: SimpleNamespace(pw_dir=str(home))))
+    added = team_queue.add(workspace, {"id": "ONE", "title": "Work", "paths": ["src/**"], "capabilities": []})
+    claimed = team_queue.claim(workspace, "ONE", expect=added["item"]["revision"], lane="writer")
+    lease = team.claim(workspace, "writer", ["src/**"])
+    assert binding.bind(str(home), workspace, "writer", os.getpid())["status"] == "ok"
+    revision = claimed["item"]["revision"]
+    path = workspace / ".aegis/state/team-queue.json"
+    before = path.read_bytes()
+    for flags in ([], ["--writer-stopped"], ["--writer-stopped"]):
+        code, result = run(capsys, workspace, "unclaim", "ONE", "--expect", revision, "--lane", "writer", *flags)
+        assert code == 1 and result["reason"] == "writer_live", result
+        assert result["schema"] == "aegis.team.queue.unclaim/v1" and "Stop the bound writer" in result["next_action"]
+        assert path.read_bytes() == before and team.read_leases(workspace).get("writer").oid == lease.oid
+
+
 def test_queue_cli_lifecycle_and_core_parity(workspace, capsys):
     item = {"id": "ONE", "title": "Core work", "paths": ["src/**"], "capabilities": ["core"]}
     code, added = run(capsys, workspace, "add", "--item", json.dumps(item))
@@ -1193,7 +1214,10 @@ def test_legacy_refusal_changes_only_by_optional_hint(workspace, capsys, monkeyp
 # under the original
 # module names. Digests cover [exit, complete stdout, complete stderr]; full raw
 # captures and source identities accompany the handoff.
-OPERATION_GOLDENS = {'cli-queue/add/valid/text': 'fe60c6c01c8f5adeaa653e6bf7a8fc21258ce0c4da7c1faeec909b181a56e5ff',
+OPERATION_GOLDENS = {'cli-queue/unclaim/writer_live/text': '34e3221632188bc94d258fdd8ceedd40ebe5d67e0c7d91f3eaed4709ec81a20e',
+ 'cli-queue/unclaim/writer_live/json': '34e3221632188bc94d258fdd8ceedd40ebe5d67e0c7d91f3eaed4709ec81a20e',
+ 'core-queue/unclaim/writer_live/dict': '34e3221632188bc94d258fdd8ceedd40ebe5d67e0c7d91f3eaed4709ec81a20e',
+ 'cli-queue/add/valid/text': 'fe60c6c01c8f5adeaa653e6bf7a8fc21258ce0c4da7c1faeec909b181a56e5ff',
  'cli-queue/add/valid/json': 'fe60c6c01c8f5adeaa653e6bf7a8fc21258ce0c4da7c1faeec909b181a56e5ff',
  'cli-queue/add/oversized/text': 'ba8f7e0d3282be2939562f05a367cd1be9b9fa507d02c11e6b5d507055e4e85f',
  'cli-queue/add/oversized/json': 'ba8f7e0d3282be2939562f05a367cd1be9b9fa507d02c11e6b5d507055e4e85f',
@@ -1818,7 +1842,7 @@ QUEUE_REFUSALS = {
               "capability_mismatch", "blocked", "profile_unavailable", "capacity_full", "item_done"),
     "release": ("item_missing", "stale_revision", "not_claimed", "lane_required", "lane_mismatch", "item_done"),
     "done": ("item_missing", "stale_revision", "not_claimed", "lane_required", "lane_mismatch", "lease_expired", "item_done"),
-    "unclaim": ("item_missing", "stale_revision", "not_claimed", "lane_mismatch", "writer_not_stopped", "invalid_item",
+    "unclaim": ("item_missing", "stale_revision", "not_claimed", "lane_mismatch", "writer_not_stopped", "writer_live", "invalid_item",
                 "credential_like_text", "unclaim_lease_refused", "unclaim_event_unavailable",
                 "unclaim_recovery_required", "item_done"),
     "compact": ("queue_history_limit",),
@@ -2021,6 +2045,8 @@ def _compat_queue_refusal(root, verb, case, value, row, arguments):
         state["items"]["ONE"]["expires_at"] = 99
     elif case == "writer_not_stopped":
         arguments["writer_stopped"] = False
+    elif case == "writer_live":
+        team.claim(root, "writer", ["src/**"], now=100, owner="owner", branch="lane/writer")
     elif case == "unclaim_lease_refused":
         team.claim(root, "foreign", ["src/**"], now=100, owner="foreign", branch="lane/writer")
     elif case == "unclaim_event_unavailable":
@@ -2256,7 +2282,7 @@ def _compat_observation(key, observation, root):
                for stream in (stdout, stderr)]
     actual = [code, *streams]
     digest = hashlib.sha256(json.dumps(actual, ensure_ascii=True).encode()).hexdigest()
-    assert digest == OPERATION_GOLDENS[key], key
+    assert digest == OPERATION_GOLDENS[key], (key, digest)
     return actual
 
 
@@ -2293,6 +2319,9 @@ def test_public_operation_byte_goldens(_operation_workspace, capsys, monkeypatch
             expected_reason = case
         if case == "unsupported_platform":
             monkeypatch.setattr(team_queue, "descriptor_supported", lambda: False)
+        elif case == "writer_live":
+            monkeypatch.setattr(binding, "judge", lambda home, found, summary:
+                                {"state": "unknown", "reason": "writer_bound", "leases": summary})
         elif case == "queue_lock_timeout":
             def refuse_lock(*args, **options):
                 raise storage.LockTimeoutError("boundary unavailable")

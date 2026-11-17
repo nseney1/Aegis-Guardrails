@@ -1,12 +1,13 @@
 """Recoverable unclaim transitions through the public queue service."""
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import hashlib
 import json
 import os
-from pathlib import PureWindowsPath
+from pathlib import Path, PureWindowsPath
 import shlex
 import shutil
 import subprocess
+from threading import Event
 import time
 from types import SimpleNamespace
 
@@ -14,6 +15,7 @@ import pytest
 
 from conftest import symlink_or_skip
 from aegis_core import events, gitsafe, storage, team, team_claims, team_queue as queue
+from aegis_core import team_writer_binding as binding
 from aegis_core.workspace.binding import resolve_cli_root
 
 
@@ -50,6 +52,557 @@ def unclaim(root, revision, **kwargs):
 
 def receipts(root):
     return [row for row in events.read(root).rows if row["detail"].get("action") == "unclaim"]
+
+
+@pytest.fixture
+def binding_home(make_store, monkeypatch):
+    home = make_store.parent / "passwd-home"
+    (home / ".config/aegis").mkdir(parents=True)
+    monkeypatch.setattr(team_claims, "pwd", SimpleNamespace(
+        getpwuid=lambda uid: SimpleNamespace(pw_dir=str(home))))
+    return str(home)
+
+
+def linked_writer(root):
+    """Create history only inside this disposable repository, not the checkout."""
+    subprocess.run(["git", "-C", str(root), "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                    "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "Test root"],
+                   check=True, capture_output=True, timeout=15)
+    linked = root.parent / "linked-writer"
+    subprocess.run(["git", "-C", str(root), "worktree", "add", "--detach", str(linked), "HEAD"],
+                   check=True, capture_output=True, timeout=15)
+    (linked / ".aegis").mkdir()
+    return linked
+
+
+@pytest.mark.parametrize("recovering", [False, True])
+@pytest.mark.parametrize("shape", ["depth-129", "depth-256", "cr", "lf", "crlf"])
+def test_unclaim_preserves_queue_workspace_contract(make_store, binding_home, monkeypatch, recovering, shape):
+    if recovering:
+        revision, _, _ = plant_pending(make_store, monkeypatch)
+    else:
+        revision, _ = held(make_store)
+    if shape.startswith("depth-"):
+        depth = int(shape.split("-")[1])
+        root = make_store.parent.joinpath(*(["d"] * (depth - str(make_store.parent).count("/"))))
+        root.parent.mkdir(parents=True)
+        assert str(root).count("/") == depth
+    else:
+        root = make_store.with_name("workspace" + {"cr": "\r", "lf": "\n", "crlf": "\r\n"}[shape] + "name")
+    make_store.rename(root)
+    assert queue.valid_workspace_spelling(str(root))
+    assert not (Path(binding_home) / ".config/aegis" / binding.NAME).exists()
+    result = unclaim(root, revision)
+    assert result["exit_code"] == 0 and result["item"]["state"] == "queued", result
+    assert team.read_leases(root).get("alpha") is None
+    assert len(receipts(root)) == 1
+    assert "unclaim" not in json.loads((root / ".aegis/state/team-queue.json").read_bytes())
+
+
+@pytest.mark.parametrize("recovering", [False, True])
+@pytest.mark.parametrize("depth", [128, 129, 256, 257, 258])
+def test_unclaim_preserves_queue_common_directory_contract(make_store, binding_home, monkeypatch, recovering, depth):
+    if recovering:
+        revision, _, _ = plant_pending(make_store, monkeypatch)
+    else:
+        revision, _ = held(make_store)
+    common = make_store.parent.joinpath(*(["g"] * (depth - str(make_store.parent).count("/"))))
+    common.parent.mkdir(parents=True)
+    (make_store / ".git").rename(common)
+    (make_store / ".git").write_text("gitdir: " + str(common) + "\n", encoding="utf-8")
+    assert str(common).count("/") == depth
+    assert gitsafe.common_dir(make_store) == common
+    assert not (Path(binding_home) / ".config/aegis" / binding.NAME).exists()
+    result = unclaim(make_store, revision)
+    assert result["exit_code"] == 0 and result["item"]["state"] == "queued", result
+    assert team.read_leases(make_store).get("alpha") is None
+    assert len(receipts(make_store)) == 1
+    assert "unclaim" not in json.loads((make_store / ".aegis/state/team-queue.json").read_bytes())
+
+
+@pytest.mark.parametrize("shape", ["depth", "cr", "lf", "crlf"])
+def test_binding_workspace_contract_remains_strict(make_store, binding_home, shape):
+    if not binding.descriptor_supported():
+        pytest.skip("requires Linux process identity and confined storage")
+    if shape == "depth":
+        root = make_store.parent.joinpath(*(["d"] * (129 - str(make_store.parent).count("/"))))
+    else:
+        root = make_store.with_name("workspace" + {"cr": "\r", "lf": "\n", "crlf": "\r\n"}[shape] + "name")
+    result = binding.bind(binding_home, root, "alpha", os.getpid())
+    assert result == {"status": "refused", "code": "state_unavailable", "reason": "unsafe or unreadable writer binding"}
+    assert not root.exists() and not (Path(binding_home) / ".config/aegis" / binding.NAME).exists()
+
+
+def test_binding_common_directory_contract_remains_strict(make_store, binding_home):
+    if not binding.descriptor_supported():
+        pytest.skip("requires Linux process identity and confined storage")
+    _, oid = held(make_store)
+    common = make_store.parent.joinpath(*(["g"] * (129 - str(make_store.parent).count("/"))))
+    common.parent.mkdir(parents=True)
+    (make_store / ".git").rename(common)
+    (make_store / ".git").write_text("gitdir: " + str(common) + "\n", encoding="utf-8")
+    result = binding.bind(binding_home, make_store, "alpha", os.getpid())
+    assert result == {"status": "refused", "code": "lease_unavailable", "reason": "writer lease is unavailable"}
+    assert team.read_leases(make_store).get("alpha").oid == oid
+    assert not (Path(binding_home) / ".config/aegis" / binding.NAME).exists()
+
+
+@pytest.mark.parametrize("linked", [False, True])
+@pytest.mark.parametrize("recovering", [False, True])
+def test_binding_publication_cannot_cross_final_unclaim_check(make_store, binding_home, monkeypatch, recovering, linked):
+    if not binding.descriptor_supported():
+        pytest.skip("requires Linux process identity and confined storage")
+    if recovering:
+        revision, oid, _ = plant_pending(make_store, monkeypatch)
+    else:
+        revision, oid = held(make_store)
+    writer_root = linked_writer(make_store) if linked else make_store
+    saved = team.read_leases(make_store).get("alpha")
+    ready, permit, finished = Event(), Event(), Event()
+    trace, timeouts = [], []
+    publish_binding, publish_queue = binding._publish_leaf, queue.atomic_write_bytes
+
+    def paused_binding(directory, data):
+        trace.append("binding_selected_lease")
+        ready.set()
+        if not permit.wait(timeout=10):
+            timeouts.append("binding_publication_barrier")
+            raise AssertionError("binding publication barrier timed out")
+        publish_binding(directory, data)
+        trace.append("binding_published")
+
+    def after_final_check(path, data, **kwargs):
+        state = json.loads(data)
+        if state["items"]["ONE"]["state"] == "queued":
+            trace.append("unclaim_final_check_passed")
+            permit.set()
+            if not finished.wait(timeout=5):
+                timeouts.append("binding_completion_barrier")
+                raise AssertionError("binding completion barrier timed out")
+            trace.append("unclaim_final_write")
+        return publish_queue(path, data, **kwargs)
+
+    def bind_writer():
+        try:
+            return binding.bind(binding_home, writer_root, "alpha", os.getpid())
+        finally:
+            finished.set()
+
+    def bounded_workspace_lock(root, timeout):
+        # A correct shared workspace exclusion may refuse while bind is paused.
+        return storage.locked(root, timeout=0.5)
+
+    monkeypatch.setattr(binding, "_publish_leaf", paused_binding)
+    monkeypatch.setattr(queue, "atomic_write_bytes", after_final_check)
+    monkeypatch.setattr(queue, "locked", bounded_workspace_lock)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(bind_writer)
+        try:
+            assert ready.wait(timeout=5), "binding did not reach its publication boundary"
+            released = unclaim(make_store, revision)
+        finally:
+            permit.set()
+        bound = pending.result(timeout=10)
+    assert timeouts == [], (timeouts, trace)
+    if bound["status"] == "ok" and released["exit_code"] == 0:
+        assert trace == ["binding_selected_lease", "unclaim_final_check_passed",
+                         "binding_published", "unclaim_final_write"], trace
+        assert team.read_leases(make_store).get("alpha") is None
+        assert saved.oid == oid
+        assert binding.judge(binding_home, team.LeaseSet((saved,), ()), {})["reason"] == "writer_bound"
+    assert not (bound["status"] == "ok" and released["exit_code"] == 0), {
+        "bind": bound, "unclaim": released, "trace": trace, "recovering": recovering}
+
+
+@pytest.mark.parametrize("recovering", [False, True])
+def test_binding_refuses_while_unclaim_holds_final_publication(make_store, binding_home, monkeypatch, recovering):
+    if not binding.descriptor_supported():
+        pytest.skip("requires Linux process identity and confined storage")
+    if recovering:
+        revision, _, _ = plant_pending(make_store, monkeypatch)
+    else:
+        revision, _ = held(make_store)
+    ready, permit = Event(), Event()
+    original = queue.atomic_write_bytes
+
+    def pause_final(path, data, **kwargs):
+        if json.loads(data)["items"]["ONE"]["state"] == "queued":
+            ready.set()
+            assert permit.wait(timeout=10), "unclaim final-publication barrier timed out"
+        return original(path, data, **kwargs)
+
+    monkeypatch.setattr(queue, "atomic_write_bytes", pause_final)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(unclaim, make_store, revision)
+        try:
+            assert ready.wait(timeout=5), "unclaim did not reach final publication"
+            result = binding.bind(binding_home, make_store, "alpha", os.getpid())
+            assert (result["status"], result.get("code")) == ("refused", "state_locked"), result
+        finally:
+            permit.set()
+        assert pending.result(timeout=10)["exit_code"] == 0
+    retried = binding.bind(binding_home, make_store, "alpha", os.getpid())
+    assert (retried["status"], retried["code"]) == ("refused", "lease_unavailable"), retried
+    assert binding.load(binding_home) == {}
+
+
+@pytest.mark.parametrize("linked", [False, True])
+@pytest.mark.parametrize("recovering", [False, True])
+def test_binding_judgements_share_the_workspace_exclusion(make_store, binding_home, monkeypatch, recovering, linked):
+    if not binding.descriptor_supported():
+        pytest.skip("requires Linux process identity and confined storage")
+    if recovering:
+        revision, _, _ = plant_pending(make_store, monkeypatch)
+    else:
+        revision, _ = held(make_store)
+    writer_root = linked_writer(make_store) if linked else make_store
+    original, attempts = binding.judge, []
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        def checked(home, found, summary):
+            attempt = pool.submit(binding.bind, binding_home, writer_root, "alpha", os.getpid())
+            attempts.append(attempt.result(timeout=5))
+            return original(home, found, summary)
+        monkeypatch.setattr(binding, "judge", checked)
+        result = unclaim(make_store, revision)
+    assert attempts and all((row["status"], row.get("code")) == ("refused", "state_locked") for row in attempts), attempts
+    assert result["exit_code"] == 0, result
+
+
+def test_binding_workspace_lock_symlink_cannot_redirect_or_publish(make_store, binding_home, tmp_path):
+    if not binding.descriptor_supported():
+        pytest.skip("requires Linux process identity and confined storage")
+    held(make_store)
+    lock = make_store / ".aegis/state/lock"
+    outside = tmp_path / "outside-lock"
+    outside.write_bytes(b"KEEP")
+    lock.unlink()
+    symlink_or_skip(outside, lock)
+    result = binding.bind(binding_home, make_store, "alpha", os.getpid())
+    assert (result["status"], result.get("code")) == ("refused", "lease_unavailable"), result
+    assert outside.read_bytes() == b"KEEP" and binding.load(binding_home) == {}
+
+
+def test_binding_common_lock_symlink_refuses_without_redirect_and_retries(make_store, binding_home, tmp_path):
+    if not binding.descriptor_supported():
+        pytest.skip("requires Linux process identity and confined storage")
+    revision, oid = held(make_store)
+    path = make_store / ".aegis/state/team-queue.json"
+    before = path.read_bytes()
+    common = gitsafe.common_dir(make_store)
+    lock = common / "aegis-writer.lock"
+    outside = tmp_path / "outside-common-lock"
+    outside.write_bytes(b"KEEP")
+    symlink_or_skip(outside, lock)
+    refused = binding.bind(binding_home, make_store, "alpha", os.getpid())
+    assert (refused["status"], refused.get("code")) == ("refused", "lease_unavailable"), refused
+    result = unclaim(make_store, revision)
+    assert (result["reason"], result["exit_code"]) == ("queue_io_unavailable", 1), result
+    assert path.read_bytes() == before and team.read_leases(make_store).get("alpha").oid == oid
+    assert outside.read_bytes() == b"KEEP" and binding.load(binding_home) == {}
+    lock.unlink()
+    assert unclaim(make_store, revision)["exit_code"] == 0
+
+
+def test_binding_indeterminate_git_layout_cannot_skip_exclusion(make_store, binding_home, monkeypatch):
+    if not binding.descriptor_supported():
+        pytest.skip("requires Linux process identity and confined storage")
+    revision, oid = held(make_store)
+    path = make_store / ".aegis/state/team-queue.json"
+    before = path.read_bytes()
+    monkeypatch.setattr(binding, "gitsafe", SimpleNamespace(**{**vars(gitsafe), "common_dir": lambda root: None}))
+    result = binding.bind(binding_home, make_store, "alpha", os.getpid())
+    assert (result["status"], result.get("code")) == ("refused", "lease_unavailable"), result
+    result = unclaim(make_store, revision)
+    assert (result["reason"], result["exit_code"]) == ("queue_io_unavailable", 1), result
+    assert path.read_bytes() == before and team.read_leases(make_store).get("alpha").oid == oid
+    assert binding.load(binding_home) == {}
+    monkeypatch.setattr(binding, "gitsafe", gitsafe)
+    assert unclaim(make_store, revision)["exit_code"] == 0
+
+
+@pytest.mark.parametrize("kind", ["worktree", "subdirectory", "bare"])
+def test_binding_indeterminate_exclusion_refuses_all_git_layouts(make_store, monkeypatch, kind):
+    root = make_store
+    if kind == "subdirectory":
+        root = make_store / "subdirectory"
+        root.mkdir()
+    elif kind == "bare":
+        root = make_store.parent / "bare"
+        subprocess.run(["git", "init", "--bare", "-q", str(root)], check=True, capture_output=True, timeout=15)
+    monkeypatch.setattr(binding, "gitsafe", SimpleNamespace(**{**vars(gitsafe), "common_dir": lambda root: None}))
+    with pytest.raises(binding.BindingLockRefused, match="^writer lease is unavailable$") as refused:
+        with binding.claim_exclusion(root):
+            pytest.fail("indeterminate Git layout admitted without exclusion")
+    assert refused.value.code == "lease_unavailable"
+
+
+def test_binding_unsupported_platform_refuses_before_creating_locks(tmp_path, monkeypatch):
+    home, workspace = tmp_path / "missing-home", tmp_path / "missing-workspace"
+    monkeypatch.setattr(binding, "descriptor_supported", lambda: False)
+    assert binding.bind(str(home), str(workspace), "alpha", os.getpid()) == {
+        "status": "refused", "code": "unsupported_platform",
+        "reason": "unsupported platform: writer binding unavailable"}
+    assert not home.exists() and not workspace.exists()
+
+
+def test_binding_shared_lock_contention_refuses_then_retries(make_store, binding_home):
+    if not binding.descriptor_supported():
+        pytest.skip("requires Linux process identity and confined storage")
+    held(make_store)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with storage.locked(make_store):
+            result = pool.submit(binding.bind, binding_home, make_store, "alpha", os.getpid()).result(timeout=5)
+        assert (result["status"], result.get("code")) == ("refused", "state_locked"), result
+    assert binding.load(binding_home) == {}
+    assert binding.bind(binding_home, make_store, "alpha", os.getpid()) == {"status": "ok"}
+
+
+def test_binding_failed_publication_releases_exclusions_and_retries(make_store, binding_home, monkeypatch):
+    if not binding.descriptor_supported():
+        pytest.skip("requires Linux process identity and confined storage")
+    held(make_store)
+
+    def failed(directory, data):
+        raise OSError("private-value")
+
+    original = binding._publish_leaf
+    monkeypatch.setattr(binding, "_publish_leaf", failed)
+    try:
+        result = binding.bind(binding_home, make_store, "alpha", os.getpid())
+    finally:
+        monkeypatch.setattr(binding, "_publish_leaf", original)
+    assert (result["status"], result.get("code")) == ("refused", "state_unavailable"), result
+    assert "private-value" not in json.dumps(result) and binding.load(binding_home) == {}
+    assert binding.bind(binding_home, make_store, "alpha", os.getpid()) == {"status": "ok"}
+
+
+@pytest.mark.parametrize("fault", ["missing-root", "invalid-state", "bad-caller", "bad-reason"])
+@pytest.mark.parametrize("ack", [False, True])
+def test_binding_absence_preserves_other_refusal_priorities(make_store, binding_home, fault, ack):
+    revision, oid = held(make_store)
+    path = make_store / ".aegis/state/team-queue.json"
+    if fault == "invalid-state":
+        path.write_bytes(b"{")
+    before = path.read_bytes()
+    root = make_store.parent / "missing-root" if fault == "missing-root" else make_store
+    result = queue.unclaim(root, "ONE", expect=revision, lane="alpha", now=102, writer_stopped=ack,
+                           caller="private-value\ncaller" if fault == "bad-caller" else "owner",
+                           reason="bad\nreason" if fault == "bad-reason" else "Waiting")
+    expected = "writer_not_stopped" if not ack else {
+        "missing-root": "queue_io_unavailable", "invalid-state": "invalid_queue_state",
+        "bad-caller": "invalid_arguments", "bad-reason": "invalid_item"}[fault]
+    assert result["reason"] == expected and result["exit_code"] == (2 if expected in ("invalid_arguments", "invalid_item") else 1), result
+    assert path.read_bytes() == before and team.read_leases(make_store).get("alpha").oid == oid
+    assert "private-value" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("source", ["missing-directory", "missing-binding", "live"])
+@pytest.mark.parametrize("ack", [False, True])
+@pytest.mark.parametrize("defect", ["bad-reason", "stale-revision"])
+def test_binding_combined_failure_precedence(make_store, binding_home, source, ack, defect):
+    revision, oid = held(make_store)
+    if source == "live":
+        if not binding.descriptor_supported():
+            pytest.skip("requires Linux process identity and confined storage")
+        assert binding.bind(binding_home, make_store, "alpha", os.getpid())["status"] == "ok"
+    elif source == "missing-directory":
+        (Path(binding_home) / ".config/aegis").rmdir()
+    path = make_store / ".aegis/state/team-queue.json"
+    before = path.read_bytes()
+    result = queue.unclaim(make_store, "ONE", expect="0" * 64 if defect == "stale-revision" else revision,
+                           lane="alpha", now=102, caller="owner", writer_stopped=ack,
+                           reason="bad\nreason" if defect == "bad-reason" else "Waiting")
+    assert path.read_bytes() == before and team.read_leases(make_store).get("alpha").oid == oid
+    expected = ("writer_live" if source == "live" else "writer_not_stopped" if not ack else
+                "invalid_item" if defect == "bad-reason" else "stale_revision")
+    assert (result["reason"], result["exit_code"]) == (expected, 2 if expected == "invalid_item" else 1), result
+    assert result["next_action"] == queue.refusal(expected, verb="unclaim")["next_action"]
+
+
+@pytest.mark.parametrize("ack", [False, True])
+@pytest.mark.parametrize("verdict", ["writer_bound", "no_bound_liveness_source", "identity_unavailable",
+    "binding_scope_mismatch", "bindings_unavailable", "writer_absent", "writer_replaced"])
+def test_binding_verdict_precedes_acknowledgement(make_store, binding_home, monkeypatch, ack, verdict):
+    revision, oid = held(make_store)
+    path = make_store / ".aegis/state/team-queue.json"
+    before = path.read_bytes()
+    calls = []
+
+    def judge(home, found, summary):
+        calls.append((home, found))
+        return {"state": "dead" if verdict in ("writer_absent", "writer_replaced") else "unknown",
+                "reason": verdict, "leases": summary}
+
+    monkeypatch.setattr(binding, "judge", judge)
+    result = queue.unclaim(make_store, "ONE", expect=revision, lane="alpha", now=102,
+                           caller="owner", writer_stopped=ack)
+    expected = ("writer_live" if verdict == "writer_bound" else
+                "writer_not_stopped" if verdict == "no_bound_liveness_source" else verdict)
+    if ack and verdict != "writer_bound":
+        assert result["exit_code"] == 0 and result["item"]["state"] == "queued", result
+    else:
+        assert result["reason"] == expected and result["exit_code"] == 1, result
+        assert path.read_bytes() == before and team.read_leases(make_store).get("alpha").oid == oid
+        assert receipts(make_store) == []
+    assert calls and all(found.get("alpha").oid == oid and len(found.leases) == 1 for _, found in calls)
+    assert all(home == binding_home for home, _ in calls)
+    assert all(str(home) != os.environ["HOME"] for home, _ in calls)
+
+
+def test_binding_live_refusal_retries_and_concurrent_callers(make_store, monkeypatch):
+    revision, oid = held(make_store)
+    path = make_store / ".aegis/state/team-queue.json"
+    before = path.read_bytes()
+    monkeypatch.setattr(binding, "judge", lambda home, found, summary:
+                        {"state": "unknown", "reason": "writer_bound", "leases": summary})
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pending = [pool.submit(unclaim, make_store, revision) for _ in range(2)]
+        results = [future.result(timeout=15) for future in pending]
+    results.append(unclaim(make_store, revision))
+    assert all(row["reason"] == "writer_live" and row["exit_code"] == 1 for row in results), results
+    assert path.read_bytes() == before and team.read_leases(make_store).get("alpha").oid == oid
+    monkeypatch.setattr(binding, "judge", lambda home, found, summary:
+                        {"state": "dead", "reason": "writer_absent", "leases": summary})
+    assert unclaim(make_store, revision)["exit_code"] == 0
+    assert len(receipts(make_store)) == 1
+
+
+@pytest.mark.parametrize("phase", ["before-release", "after-release", "before-final-publication"])
+def test_binding_appearing_during_unclaim_blocks_completion(make_store, monkeypatch, phase):
+    revision, oid = held(make_store)
+    path = make_store / ".aegis/state/team-queue.json"
+    original = queue._publish
+    before = path.read_bytes()
+    live = [False]
+
+    def judge(home, found, summary):
+        assert found.get("alpha").oid == oid
+        return {"state": "unknown", "reason": "writer_bound" if live[0] else "no_bound_liveness_source",
+                "leases": summary}
+
+    def publish(root, state, **kwargs):
+        if (phase == "before-release" and "unclaim" in state) or (
+                phase == "after-release" and state.get("unclaim", {}).get("released_lease_ids")) or "unclaim" not in state:
+            live[0] = True
+        return original(root, state, **kwargs)
+
+    monkeypatch.setattr(binding, "judge", judge)
+    monkeypatch.setattr(queue, "_publish", publish)
+    result = unclaim(make_store, revision)
+    assert result["reason"] == "writer_live" and result["exit_code"] == 1, result
+    assert json.loads(path.read_bytes())["items"]["ONE"]["state"] == "claimed"
+    if phase == "before-release":
+        assert path.read_bytes() == before
+        assert team.read_leases(make_store).get("alpha").oid == oid and receipts(make_store) == []
+    else:
+        assert "unclaim" in json.loads(path.read_bytes())
+        assert team.read_leases(make_store).get("alpha") is None
+    monkeypatch.setattr(queue, "_publish", original)
+    live[0] = False
+    assert unclaim(make_store, revision)["exit_code"] == 0
+    assert len(receipts(make_store)) == 1
+
+
+@pytest.mark.parametrize("released", [False, True])
+def test_binding_live_blocks_pending_recovery(make_store, monkeypatch, released):
+    revision, oid = held(make_store)
+    original = queue._publish
+
+    def crash(root, state, **kwargs):
+        if (released and "unclaim" not in state) or (not released and "unclaim" in state):
+            if not released:
+                original(root, state, **kwargs)
+            raise OSError("private-value")
+        return original(root, state, **kwargs)
+
+    monkeypatch.setattr(queue, "_publish", crash)
+    assert unclaim(make_store, revision)["reason"] == "unclaim_recovery_required"
+    monkeypatch.setattr(queue, "_publish", original)
+    path = make_store / ".aegis/state/team-queue.json"
+    before = path.read_bytes()
+    monkeypatch.setattr(binding, "judge", lambda home, found, summary:
+                        {"state": "unknown", "reason": "writer_bound", "leases": summary})
+    for _ in range(2):
+        result = unclaim(make_store, revision)
+        assert result["reason"] == "writer_live" and result["exit_code"] == 1, result
+        assert path.read_bytes() == before
+    assert (team.read_leases(make_store).get("alpha") is None) is released
+    monkeypatch.setattr(binding, "judge", lambda home, found, summary:
+                        {"state": "dead", "reason": "writer_absent", "leases": summary})
+    assert unclaim(make_store, revision)["exit_code"] == 0
+    assert len(receipts(make_store)) == 1
+
+
+@pytest.mark.parametrize("verdict", [None, {}, {"reason": []}, {"reason": "private-value\ntrailer"}])
+def test_binding_malformed_verdict_is_typed_and_private(make_store, binding_home, monkeypatch, verdict):
+    revision, oid = held(make_store)
+    monkeypatch.setattr(binding, "judge", lambda *args: verdict)
+    result = queue.unclaim(make_store, "ONE", expect=revision, lane="alpha", now=102, caller="owner")
+    assert result["reason"] == "bindings_unavailable" and result["exit_code"] == 1, result
+    assert "private-value" not in json.dumps(result) and "trailer" not in json.dumps(result)
+    assert team.read_leases(make_store).get("alpha").oid == oid
+
+
+def test_binding_real_live_identity_cannot_be_acknowledged(make_store, binding_home):
+    if not binding.descriptor_supported():
+        pytest.skip("requires Linux process identity and confined storage")
+    revision, oid = held(make_store)
+    assert binding.bind(binding_home, make_store, "alpha", os.getpid())["status"] == "ok"
+    path = make_store / ".aegis/state/team-queue.json"
+    before = path.read_bytes()
+    for ack in (False, True, True):
+        result = queue.unclaim(make_store, "ONE", expect=revision, lane="alpha", now=102,
+                               caller="owner", writer_stopped=ack)
+        assert result["reason"] == "writer_live" and result["exit_code"] == 1, result
+        assert path.read_bytes() == before and team.read_leases(make_store).get("alpha").oid == oid
+    assert receipts(make_store) == []
+
+
+def test_binding_unrelated_live_writer_does_not_block_item(make_store, binding_home):
+    if not binding.descriptor_supported():
+        pytest.skip("requires Linux process identity and confined storage")
+    revision, _ = held(make_store)
+    unrelated = team.claim(make_store, "beta", ["docs/**"], owner="owner", now=100)
+    assert binding.bind(binding_home, make_store, "beta", os.getpid())["status"] == "ok"
+    assert unclaim(make_store, revision)["exit_code"] == 0
+    assert team.read_leases(make_store).get("beta").oid == unrelated.oid
+
+
+@pytest.mark.parametrize("ack", [False, True])
+def test_binding_probe_unsupported_requires_explicit_ack(make_store, binding_home, monkeypatch, ack):
+    revision, oid = held(make_store)
+    monkeypatch.setattr(binding, "descriptor_supported", lambda: False)
+    result = queue.unclaim(make_store, "ONE", expect=revision, lane="alpha", now=102,
+                           caller="owner", writer_stopped=ack)
+    if ack:
+        assert result["exit_code"] == 0, result
+    else:
+        assert result["reason"] == "bindings_unavailable" and result["exit_code"] == 1, result
+        assert team.read_leases(make_store).get("alpha").oid == oid
+
+
+@pytest.mark.parametrize("case", ["absent", "symlink", "unreadable-home", "oversized", "malformed"])
+def test_binding_storage_refusals_and_absence_are_distinct(make_store, binding_home, monkeypatch, case):
+    revision, oid = held(make_store)
+    home = Path(binding_home)
+    config = home / ".config/aegis"
+    if case in ("absent", "symlink"):
+        config.rmdir()
+        if case == "symlink":
+            outside = make_store.parent / "outside"
+            outside.mkdir()
+            symlink_or_skip(outside, config, target_is_directory=True)
+    elif case == "unreadable-home":
+        def unavailable(uid):
+            raise OSError("private-value")
+        monkeypatch.setattr(team_claims, "pwd", SimpleNamespace(getpwuid=unavailable))
+    else:
+        (config / binding.NAME).write_bytes(b"x" * (binding.MAX_BYTES + 1) if case == "oversized" else b"{")
+    result = queue.unclaim(make_store, "ONE", expect=revision, lane="alpha", now=102, caller="owner")
+    assert result["reason"] == ("writer_not_stopped" if case == "absent" else "bindings_unavailable"), result
+    assert result["exit_code"] == 1 and "private-value" not in json.dumps(result)
+    assert team.read_leases(make_store).get("alpha").oid == oid
+    assert unclaim(make_store, revision)["exit_code"] == 0
 
 
 def test_unclaim_releases_intersecting_lease_and_records_once(make_store):
