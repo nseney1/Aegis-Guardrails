@@ -877,6 +877,49 @@ def test_hold_preserves_literal_windows_path_components(monkeypatch, capsys, jso
         assert json.loads(captured.out)["details"] == {"pin": pin, "target": target}
 
 
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("details", [None, (("candidates", "not a list"),), (("pin", 3),)])
+def test_hold_malformed_details_return_fixed_refusal(monkeypatch, capsys, details, json_mode):
+    from aegis_core.workspace.binding import WorkspaceBinding, WorkspaceHold
+
+    binding = WorkspaceBinding("hold", reason="pin_conflicts_with_target", details=details)
+
+    def refuse(args):
+        raise WorkspaceHold(binding)
+
+    monkeypatch.setattr("aegis_cli.cli._attach_workspace", refuse)
+    for _ in range(2):
+        assert main(["scan", "app.py"] + (["--json"] if json_mode else [])) == 2
+        captured = capsys.readouterr()
+        if json_mode:
+            payload = json.loads(captured.out)
+            assert payload["message"] == "guidance_projection_invalid_field"
+            assert payload["details"] == {}
+            assert list(payload) == ["status", "root", "source", "confidence", "reason", "message", "details",
+                                     "aegis_version", "checked_at", "scope"]
+        else:
+            assert captured.out == ""
+            assert captured.err == "Hold (pin_conflicts_with_target): guidance_projection_invalid_field\n"
+
+
+def test_text_hold_bounds_large_component_collection(monkeypatch, capsys):
+    from aegis_core.workspace.binding import WorkspaceBinding, WorkspaceHold
+
+    paths = ["x" * 5000 for _ in range(240)]
+    binding = WorkspaceBinding("hold", reason="pin_conflicts_with_target",
+                               details=(("pin", "pin"), ("target", "target"), ("candidates", paths)))
+
+    def refuse(args):
+        raise WorkspaceHold(binding)
+
+    monkeypatch.setattr("aegis_cli.cli._attach_workspace", refuse)
+    assert main(["scan", "app.py"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ("Hold (pin_conflicts_with_target): --workspace target resolves to target, "
+                            "but AEGIS_WORKSPACE pins pin; unset the pin or drop --workspace\n")
+
+
 @posix_names
 def test_ungoverned_workspace_preserves_literal_backslashes(tmp_path, capsys):
     bare = tmp_path / r"C:\tmp\repo"

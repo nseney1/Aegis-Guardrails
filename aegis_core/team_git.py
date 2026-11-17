@@ -27,7 +27,7 @@ import stat
 from threading import Lock
 from typing import Optional, Sequence, Tuple, Union
 
-from aegis_core import gitsafe, gitsafe_run, team_git_snapshot
+from aegis_core import gitsafe, gitsafe_policy, gitsafe_run, team_git_snapshot
 from aegis_core.errors import AegisError
 from aegis_core.team_git_snapshot import (
     GitRefusal, conversion_settings as _conversion_settings, decode_worktree as _decode_worktree,
@@ -38,8 +38,9 @@ from aegis_core.redaction import redact_insight_text
 
 __all__ = ["CommitIdentity", "GitRefusal", "GitStore", "Plan", "cas_fast_forward", "commit_tested",
            "descriptor_support", "ref_oid", "plan_merge", "plan_pick", "plan_revert", "snapshot_tree",
+           "validate_oid", "validate_message",
            # Export the internal runner-transfer surface for the lane guard's accounting.
-           "_current", "_publish", "_require_runner", "_snapshot_baselines", "_write_snapshot"]
+           "_current", "_publish", "_require_runner", "_snapshot_baselines", "_snapshot_fallback_objects", "_write_snapshot"]
 
 MAX_FILE_BYTES = 16 * 1024 * 1024
 MAX_SNAPSHOT_BYTES = 128 * 1024 * 1024
@@ -94,13 +95,15 @@ def descriptor_support() -> bool:
             and os.readlink in os.supports_dir_fd)
 
 
-def _oid(value: str) -> str:
+def validate_oid(value: str) -> str:
+    """Return one full object id or raise GitRefusal('invalid_oid'); no I/O."""
     if not isinstance(value, str) or len(value) not in (40, 64) or not _OID.fullmatch(value):
         raise GitRefusal("invalid_oid")
     return value
 
 
-def _message(value: str) -> bytes:
+def validate_message(value: str) -> bytes:
+    """Encode a bounded unsigned commit message or raise GitRefusal('invalid_message')."""
     if not isinstance(value, str) or len(value) > MAX_MESSAGE_BYTES:
         raise GitRefusal("invalid_message")
     try:
@@ -235,7 +238,7 @@ class GitStore:
     def object(self, oid: str, kind: str, *, max_bytes: Optional[int] = None, _runner=None) -> bytes:
         """Size before payload capture; only full validated ids reach cat-file."""
         _require_runner(_runner)
-        oid = _oid(oid)
+        oid = validate_oid(oid)
         if max_bytes is not None and (isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0):
             raise GitRefusal("invalid_object")
         limit = MAX_OBJECT_BYTES if max_bytes is None else min(MAX_OBJECT_BYTES, max_bytes)
@@ -245,7 +248,7 @@ class GitStore:
     def read_blob(self, tree: str, path: str, *, _runner=None) -> bytes:
         """Read an exact tree path from private objects, without filesystem opens."""
         _require_runner(_runner)
-        _oid(tree)
+        validate_oid(tree)
         if not isinstance(path, str) or len(path) > MAX_PATH_BYTES or "\0" in path:
             raise GitRefusal("unsafe_path")
         try:
@@ -352,7 +355,7 @@ def _read_path(root_fd: int, raw: bytes, remaining: int, *, attribute=False, att
         after = os.fstat(fd)
         if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
             raise GitRefusal("worktree_changed")
-        return mode, None if clean else b"".join(chunks), before
+        return mode, team_git_snapshot.STAT_CLEAN if clean else b"".join(chunks), before
     except FileNotFoundError:
         if observed:
             raise GitRefusal("conversion_unavailable" if attribute else "worktree_changed") from None
@@ -384,28 +387,26 @@ def _index_stamp(store):
 _CONFIG_QUERY = r"^core\.(autocrlf|safecrlf|filemode|symlinks|eol|trustctime|checkstat)$"
 
 
-def _snapshot_filters(store):
+def _conversion_run(store, argv, **kw):
+    """Map conversion-observation transport failures to the stable refusal."""
     try:
-        result = store._run(["config", "--null", "--name-only", "--get-regexp", r"^filter\."],
-                            allowed=(0, 1), stdout_limit=65536)
+        return store._run(argv, **kw)
     except OSError:
         raise GitRefusal("conversion_unavailable") from None
     except AegisError as exc:
         if _error_code(exc) not in ("git_failed", "git_timeout", "git_output_limit", "git_cleanup_failed"):
             raise
         raise GitRefusal("conversion_unavailable") from None
+
+
+def _snapshot_filters(store):
+    result = _conversion_run(store, ["config", "--null", "--name-only", "--get-regexp", r"^filter\."],
+                             allowed=(0, 1), stdout_limit=65536)
     return team_git_snapshot.filter_drivers(result.stdout, result.returncode)
 
 
 def _snapshot_config(store):
-    try:
-        team_git_snapshot.attribute_version(store._run(["version"], stdout_limit=256).stdout)
-    except OSError:
-        raise GitRefusal("conversion_unavailable") from None
-    except AegisError as exc:
-        if _error_code(exc) not in ("git_failed", "git_timeout", "git_output_limit", "git_cleanup_failed"):
-            raise
-        raise GitRefusal("conversion_unavailable") from None
+    team_git_snapshot.attribute_version(_conversion_run(store, ["version"], stdout_limit=256).stdout)
     raw = store._run(["config", "--null", "--get-regexp", _CONFIG_QUERY], allowed=(0, 1), stdout_limit=4096).stdout
     settings = _conversion_settings(raw)
     filters = _snapshot_filters(store)
@@ -414,16 +415,8 @@ def _snapshot_config(store):
 
 
 def _snapshot_rules(store, paths, tree, settings, filters):
-    names = ("filter", "text", "eol", "ident", "working-tree-encoding", "crlf")
-    try:
-        out = store._run(["check-attr", "-z", "--stdin", "--source", tree, *names],
-                         stdin=b"".join(path + b"\0" for path in paths)).stdout
-    except OSError:
-        raise GitRefusal("conversion_unavailable") from None
-    except AegisError as exc:
-        if _error_code(exc) not in ("git_failed", "git_timeout", "git_output_limit", "git_cleanup_failed"):
-            raise
-        raise GitRefusal("conversion_unavailable") from None
+    out = _conversion_run(store, [*gitsafe_policy.SNAPSHOT_SOURCE_PREFIX, tree, *gitsafe_policy.SNAPSHOT_ATTRIBUTES],
+                          stdin=b"".join(path + b"\0" for path in paths)).stdout
     attrs = team_git_snapshot.snapshot_attributes(out, paths)
     return team_git_snapshot.snapshot_rules(paths, attrs, settings, native_crlf=os.name == "nt",
                                             configured_filters=filters)
@@ -515,6 +508,20 @@ def _snapshot_attribute_entries(captured, fallbacks, objects, remaining, length)
     return team_git_snapshot.attribute_entries(sources, length), remaining
 
 
+def _snapshot_fallback_objects(store, fallbacks, remaining, runner):
+    """Fetch fallback attributes once, preserving object and aggregate budgets."""
+    _require_runner(runner)
+    if not fallbacks:
+        return {}
+    try:
+        return runner.read_private_objects(store.repo, list(dict.fromkeys(fallbacks.values())),
+            max_bytes=remaining, max_object_bytes=min(MAX_FILE_BYTES, MAX_OBJECT_BYTES))
+    except AegisError as exc:
+        if _error_code(exc) != "git_object_limit":
+            raise
+        raise GitRefusal("size_limit") from None
+
+
 @_lane_operation
 def _snapshot_rule_context(store, paths, entries, fallbacks, baseline, settings, filters, *, _runner=None):
     _require_runner(_runner)
@@ -544,13 +551,14 @@ def _snapshot_contents(store, root_fd, paths, baseline, rules, settings, oid_len
         if entry is None:
             continue
         mode, data, observed = entry
-        original_size = observed.st_size if data is None else len(data)
-        if data is not None and mode != "120000" and rules[path][3]:
+        skipped = data is team_git_snapshot.STAT_CLEAN
+        original_size = observed.st_size if skipped else len(data)
+        if not skipped and mode != "120000" and rules[path][3]:
             prior = baseline.get(path, ("100644", None, None))
             if not _index_clean(mode, data, observed, prior, settings, oid_length, index_time):
                 limit = MAX_SNAPSHOT_BYTES - total + (original_size if is_attribute else 0)
                 data = _decode_worktree(data, rules[path], min(MAX_FILE_BYTES, limit))
-        total += max(original_size, len(data) if data is not None else 0) - (original_size if is_attribute else 0)
+        total += max(original_size, len(data) if not skipped else 0) - (original_size if is_attribute else 0)
         if total > MAX_SNAPSHOT_BYTES:
             raise GitRefusal("size_limit")
         contents.append((path, mode, data, observed))
@@ -591,7 +599,7 @@ def _write_snapshot(store, entries, runner):
         store._run(["unpack-objects", "-q", "--strict"], stdin=pack)
     if records:
         store._run(["update-index", "-z", "--index-info"], stdin=b"".join(records))
-    return _oid(store._run(["write-tree"]).stdout.decode("ascii", "replace").strip())
+    return validate_oid(store._run(["write-tree"]).stdout.decode("ascii", "replace").strip())
 
 
 @_lane_operation
@@ -640,15 +648,7 @@ def snapshot_tree(store: GitStore, *, _runner=None) -> str:
             for entry in captured.values():
                 team_git_snapshot.check_filter_bytes(entry[1])
         fallbacks = team_git_snapshot.attribute_fallbacks(captured, baseline)
-        fallback_objects = {}
-        if fallbacks:
-            try:
-                fallback_objects = _runner.read_private_objects(store.repo, list(dict.fromkeys(fallbacks.values())),
-                    max_bytes=remaining, max_object_bytes=min(MAX_FILE_BYTES, MAX_OBJECT_BYTES))
-            except AegisError as exc:
-                if _error_code(exc) != "git_object_limit":
-                    raise
-                raise GitRefusal("size_limit") from None
+        fallback_objects = _snapshot_fallback_objects(store, fallbacks, remaining, _runner)
         if _index_stamp(store) != index_stamp:
             raise GitRefusal("worktree_changed")
         attribute_entries, remaining = _snapshot_attribute_entries(captured, fallbacks, fallback_objects, remaining, length)
@@ -681,18 +681,18 @@ def commit_tested(store: GitStore, tree: str, parent: Union[str, Sequence[str]],
                   message: str, identity: CommitIdentity, *, _runner=None) -> str:
     """Unsigned deterministic commit of exactly tree; no index refresh or ref move."""
     _require_runner(_runner)
-    data, env = _message(message), _identity(identity)
-    tree = _oid(tree)
+    data, env = validate_message(message), _identity(identity)
+    tree = validate_oid(tree)
     parents = (parent,) if isinstance(parent, str) else parent
     if not isinstance(parents, (tuple, list)) or not 1 <= len(parents) <= 8:
         raise GitRefusal("invalid_parent")
     args = ["commit-tree", tree]
     for oid in parents:
-        args.extend(("-p", _oid(oid)))
+        args.extend(("-p", validate_oid(oid)))
     store.object(tree, "tree")
     for oid in parents:
         store.object(oid, "commit")
-    return _oid(store._run(args, stdin=data, extra_env=env).stdout.decode().strip())
+    return validate_oid(store._run(args, stdin=data, extra_env=env).stdout.decode().strip())
 
 
 def _check_ref(store: GitStore, ref: str) -> None:
@@ -734,7 +734,7 @@ def _publish(store: GitStore, new: str, runner) -> None:
     listing = store._run(["rev-list", "--objects", "--no-object-names", new, "--not", "--all"]).stdout
     if len(listing) > MAX_OBJECTS * 65 or listing.count(b"\n") > MAX_OBJECTS:
         raise GitRefusal("size_limit")
-    objects = [_oid(raw.decode("ascii")) for raw in listing.splitlines()]
+    objects = [validate_oid(raw.decode("ascii")) for raw in listing.splitlines()]
     runner.read_private_objects(store.repo, objects, max_bytes=MAX_SNAPSHOT_BYTES,
         max_object_bytes=MAX_OBJECT_BYTES)
     if not objects:
@@ -766,9 +766,9 @@ def cas_fast_forward(store: GitStore, ref: str, expected: Optional[str], new: st
     """
     _require_runner(_runner)
     _check_ref(store, ref)
-    new = _oid(new)
+    new = validate_oid(new)
     if expected is not None:
-        _oid(expected)
+        validate_oid(expected)
     current = _current(store, ref, _runner)
     if current != expected and current != new:
         raise GitRefusal("cas_mismatch")
@@ -814,10 +814,10 @@ def _merge_flags(store: GitStore) -> tuple:
 
 
 def _merge(store: GitStore, tip: str, head: str, base: Optional[str] = None) -> Plan:
-    _oid(tip)
-    _oid(head)
+    validate_oid(tip)
+    validate_oid(head)
     if base is not None:
-        _oid(base)
+        validate_oid(base)
     flags = _merge_flags(store)
     args = ["merge-tree", "--write-tree", "--name-only", "-z"]
     if base is not None:
@@ -831,7 +831,7 @@ def _merge(store: GitStore, tip: str, head: str, base: Optional[str] = None) -> 
     fields = result.stdout.split(b"\0")
     if not fields:
         raise GitRefusal("invalid_object")
-    tree = _oid(fields[0].decode("ascii"))
+    tree = validate_oid(fields[0].decode("ascii"))
     if result.returncode == 0:
         return Plan("clean", tree)
     paths = []
@@ -852,7 +852,7 @@ def plan_merge(store: GitStore, tip: str, head: str, *, _runner=None) -> Plan:
 
 
 def _parents(store: GitStore, commit: str, *, records=None) -> Tuple[str, ...]:
-    commit = _oid(commit)
+    commit = validate_oid(commit)
     if records is not None and commit in records:
         return records[commit][0]
     data = store.object(commit, "commit")
@@ -860,7 +860,7 @@ def _parents(store: GitStore, commit: str, *, records=None) -> Tuple[str, ...]:
     if end < 0:
         raise GitRefusal("invalid_object")
     try:
-        parents = tuple(_oid(line[7:].decode("ascii")) for line in data[:end].splitlines() if line.startswith(b"parent "))
+        parents = tuple(validate_oid(line[7:].decode("ascii")) for line in data[:end].splitlines() if line.startswith(b"parent "))
     except UnicodeError:
         raise GitRefusal("invalid_object") from None
     if records is not None:
@@ -883,7 +883,7 @@ def _pick_sources(store: GitStore, sources: Sequence[str], records) -> Tuple[str
                                 parents[0] + ".." + parents[1]]).stdout
             if len(result) > MAX_PICKS * 65:
                 raise GitRefusal("size_limit")
-            expanded.extend(_oid(line.decode("ascii")) for line in result.splitlines())
+            expanded.extend(validate_oid(line.decode("ascii")) for line in result.splitlines())
         else:
             expanded.append(source)
         if len(expanded) > MAX_PICKS:
@@ -901,7 +901,7 @@ def plan_pick(store: GitStore, tip: str, sources: Sequence[str], identity: Commi
     paths and no commits. All intermediate objects remain private, even on failure.
     """
     _require_runner(_runner)
-    _oid(tip)
+    validate_oid(tip)
     _identity(identity)
     commits, records = [], {}
     for source in _pick_sources(store, sources, records):

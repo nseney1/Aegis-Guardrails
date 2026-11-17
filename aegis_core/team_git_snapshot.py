@@ -11,15 +11,17 @@ import hashlib
 import re
 import zlib
 
-from aegis_core import gitsafe
+from aegis_core import gitsafe, gitsafe_policy
 from aegis_core.workspace.git_objects import object_id
 
-__all__ = ["GitRefusal", "OID_PATTERN", "baseline_requests", "binary_text", "blob_pack", "check_filter_bytes", "check_filter_sources", "clean_bytes",
+__all__ = ["GitRefusal", "OID_PATTERN", "STAT_CLEAN", "baseline_requests", "binary_text", "blob_pack", "check_filter_bytes", "check_filter_sources", "clean_bytes",
            "clean_eol", "conversion_settings", "decode_worktree", "eol_rule", "filter_drivers", "index_clean", "index_matches",
            "index_records", "is_attribute_path", "preserved_paths", "snapshot_attributes", "snapshot_entries", "snapshot_rules",
            "attribute_version", "attribute_entries", "attribute_fallbacks", "deleted_attribute_rules"]
 
 OID_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+# Captured row state: payload reading was skipped under the index stat proof.
+STAT_CLEAN = object()
 MAX_ATTRIBUTE_LINE_BYTES = 2048
 MAX_ATTRIBUTE_FILE_BYTES = 100 * 1024 * 1024
 _CONTROL_BYTES = bytes((*range(8), 11, *range(14, 27), *range(28, 32), 127))
@@ -136,18 +138,19 @@ def eol_rule(values, settings, *, native_crlf):
 
 def snapshot_attributes(out, paths):
     """Check the source-query framing before parsing conversion attributes."""
-    if out.count(b"\0") != 3 * len(paths) * 6 or (out and not out.endswith(b"\0")):
+    if out.count(b"\0") != 3 * len(paths) * len(gitsafe_policy.SNAPSHOT_ATTRIBUTES) or (out and not out.endswith(b"\0")):
         raise GitRefusal("conversion_unavailable")
     return out.split(b"\0")
 
 
 def attribute_version(raw):
     """Bound the version observation before parsing the --source capability."""
+    action = "Install Git 2.40 or newer, then retry the snapshot."
     if type(raw) is not bytes or len(raw) > 256:
-        raise GitRefusal("conversion_unavailable")
+        raise GitRefusal("conversion_unavailable", next_action=action)
     found = re.fullmatch(rb"git version ([0-9]{1,5})\.([0-9]{1,5})(?:\.[0-9]{1,5})?[^\r\n]*\n?", raw)
     if found is None or tuple(int(value) for value in found.groups()) < (2, 40):
-        raise GitRefusal("conversion_unavailable")
+        raise GitRefusal("conversion_unavailable", next_action=action)
 
 
 def _attribute_body(data):
@@ -290,7 +293,7 @@ def check_filter_sources(attributes, baseline, objects, *, configured_filters):
 
 
 def snapshot_rules(paths, attrs, settings, *, native_crlf, configured_filters):
-    names = ("filter", "text", "eol", "ident", "working-tree-encoding", "crlf")
+    names = gitsafe_policy.SNAPSHOT_ATTRIBUTES
     rules = {}
     for index, path in enumerate(paths):
         values = {}
@@ -429,7 +432,7 @@ def index_clean(mode, data, observed, prior, settings, oid_length, index_time):
 def baseline_requests(contents, baseline, rules, *, configured_filters):
     """One batch for CRLF baselines and all attribute blobs when any driver exists."""
     wanted = [baseline[path][1] for path, mode, data, _ in contents if mode != "120000"
-            and data is not None and b"\r\n" in data and rules[path][0] == "auto" and path in baseline and baseline[path][1]]
+            and data is not STAT_CLEAN and b"\r\n" in data and rules[path][0] == "auto" and path in baseline and baseline[path][1]]
     if configured_filters:
         wanted.extend(oid for path, (_, oid, _) in baseline.items() if is_attribute_path(path) and oid)
     return wanted
@@ -446,6 +449,8 @@ def snapshot_entries(contents, settings, baseline, rules, preserved, oid_length,
         prior = baseline.get(path, ("100644", None, None))
         prior_mode = prior[0]
         unchanged = index_clean(mode, data, observed, prior, settings, oid_length, index_time)
+        if data is STAT_CLEAN and unchanged is not True:
+            raise GitRefusal("worktree_changed")
         if unchanged is True:
             entries.append((path, prior_mode, prior[1], None))
             continue

@@ -9,14 +9,14 @@ Reads neither create directories nor acquire a creating lock.
 from __future__ import annotations
 
 from builtins import list as array
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 import json
 from pathlib import Path
 import re
 import secrets
 import time
 
-from aegis_core import events, gitsafe, primitives, storage, team, team_claims, team_paths, team_profile
+from aegis_core import events, gitsafe, primitives, storage, team, team_claims, team_paths, team_profile, team_writer_binding
 from aegis_core.atomicio import atomic_write_bytes
 from aegis_core.redaction import redact_command_secrets
 from aegis_core.storage import locked
@@ -70,6 +70,12 @@ _NEXT = {
     "blocked": "Resolve the listed blockers, then list and retry the current revision.",
     "unclaim_lease_refused": "Inspect the named lease and its release command; reconcile ownership, then retry unclaim with the unchanged queue revision.",
     "writer_not_stopped": "Stop the lane's writer and queued jobs, verify their liveness in the host layer, then explicitly acknowledge this with --writer-stopped.",
+    "writer_live": "Stop the bound writer, then retry unclaim; --writer-stopped cannot override a verified live writer.",
+    "identity_unavailable": "Verify the bound writer has stopped, then retry unclaim with --writer-stopped; process identity could not be verified.",
+    "binding_scope_mismatch": "Reconcile the writer binding's boot and PID namespace, verify the writer has stopped, then retry unclaim with --writer-stopped.",
+    "bindings_unavailable": "Repair the owner-managed writer binding or verify the writer has stopped, then retry unclaim with --writer-stopped.",
+    "writer_absent": "Verify the writer and queued jobs have stopped, then explicitly acknowledge this with --writer-stopped.",
+    "writer_replaced": "Verify the original writer and queued jobs have stopped, then explicitly acknowledge this with --writer-stopped.",
     "unclaim_event_unavailable": "Ask the coordinator to reconcile the unreadable or oversized events log from trusted evidence before retrying unclaim; its bounded reader accepts at most 16 MiB.",
     "unclaim_recovery_required": "Use the concrete unclaim retry command and recorded caller in blockers after reconciling changed leases or unreadable events; pending intent remains reserved.",
 }
@@ -436,16 +442,9 @@ def _view(row, now, blockers=()):
 def normalize_branch(value):
     """Return one optional local branch, or QueueRefusal('invalid_arguments'). Performs no I/O."""
     try:
-        value = team._check_branch(value)
+        return team.normalize_branch(value)
     except team.TeamUsageError:
         raise QueueRefusal("invalid_arguments") from None
-    if value is None:
-        return None
-    prefix = "refs/heads/"
-    _require(not value.startswith("refs/") or value.startswith(prefix), "invalid_arguments")
-    name = value[len(prefix):] if value.startswith(prefix) else value
-    _require(bool(name) and name != "HEAD" and not name.startswith("refs/"), "invalid_arguments")
-    return name
 
 
 _branch_name = normalize_branch
@@ -735,8 +734,52 @@ def _unclaim(root, state, moment, caller, arguments):
     return {**result, "item": _view(row, moment, blockers)}
 
 
+def _unclaim_inputs(caller, arguments):
+    """Retain the original acknowledgement, reason, caller refusal order."""
+    _require(arguments["writer_stopped"], "writer_not_stopped")
+    arguments["reason"] = _text(arguments.get("reason", ""), empty=True)
+    try:
+        return _text(team.default_owner() if caller is None else caller, 200)
+    except QueueRefusal:
+        raise QueueRefusal("invalid_arguments") from None
+
+
+def _run_unclaim(root, moment, caller, arguments):
+    """Defer a bounded input refusal until a serialized live-writer check.
+
+    Without binding evidence the original input refusal wins, including when
+    workspace discovery, lock acquisition, or state observation also fails.
+    """
+    input_error = None
+    try:
+        caller = _unclaim_inputs(caller, arguments)
+    except QueueRefusal as error:
+        input_error = error
+    with ExitStack() as stack:
+        try:
+            root = _root(root)
+            stack.enter_context(locked(root, timeout=5.0))
+            stack.enter_context(team_writer_binding.claim_exclusion(root, validated_workspace=True))
+            state = _state(root)
+            team_claims.check_writer(root, state, arguments["identifier"],
+                                     arguments["lane"], arguments["writer_stopped"])
+        except team_claims.ClaimRefusal:
+            raise
+        except team_writer_binding.BindingLockRefused as error:
+            if input_error is not None:
+                raise input_error from None
+            raise QueueRefusal("queue_lock_timeout" if error.code == "state_locked" else "queue_io_unavailable") from None
+        except (QueueRefusal, storage.LockTimeoutError, OSError, ValueError, RuntimeError, gitsafe.GitError):
+            if input_error is not None:
+                raise input_error from None
+            raise
+        if input_error is not None:
+            raise input_error
+        return _unclaim(root, state, moment, caller, arguments)
+
+
 def _arguments(verb, valid_clock, caller, arguments):
-    """Validate and bound inputs before workspace discovery, locks or parsing state."""
+    """Validate structural inputs; _run_unclaim orders its remaining refusals."""
     _require(valid_clock, "invalid_arguments")
     include_done = arguments.pop("include_done", False)
     _require(type(include_done) is bool, "invalid_arguments")
@@ -761,8 +804,6 @@ def _arguments(verb, valid_clock, caller, arguments):
         _require((lane is None and verb not in ("claim", "unclaim")) or valid_lane(lane), "invalid_arguments")
     if verb == "unclaim":
         _require(type(arguments.get("writer_stopped")) is bool, "invalid_arguments")
-        _require(arguments["writer_stopped"], "writer_not_stopped")
-        arguments["reason"] = _text(arguments.get("reason", ""), empty=True)
     if verb == "claim":
         lane, ttl = arguments.get("lane"), arguments.get("ttl_s")
         _require(type(ttl) is int and 1 <= ttl <= team.MAX_TTL_S, "invalid_arguments")
@@ -771,9 +812,9 @@ def _arguments(verb, valid_clock, caller, arguments):
         except QueueRefusal:
             raise QueueRefusal("invalid_arguments") from None
     write = verb not in ("list", "audit")
-    if write:
+    if write and verb != "unclaim":
         try:
-            caller = _text(team.default_owner() if caller is None else caller, 200 if verb == "unclaim" else 256)
+            caller = _text(team.default_owner() if caller is None else caller, 256)
         except QueueRefusal:
             raise QueueRefusal("invalid_arguments") from None
     return include_done, capabilities, write, caller, view
@@ -802,14 +843,14 @@ def _run(root, verb, now=None, caller=None, **arguments):
     payload.update(refused=False, status="done", exit_code=0)
     try:
         include_done, capabilities, write, caller, view = _arguments(verb, valid_clock, caller, arguments)
+        if verb == "unclaim":
+            payload.update(_run_unclaim(root, moment, caller, arguments))
+            return _project(payload)
         root = _root(root)
         with locked(root, timeout=5.0) if write else nullcontext():
             state = _state(root)
-            if "unclaim" in state and verb != "unclaim":
+            if "unclaim" in state:
                 raise team_claims.recovery_refusal(state["unclaim"], root=root)
-            if verb == "unclaim":
-                payload.update(_unclaim(root, state, moment, caller, arguments))
-                return _project(payload)
             if verb == "compact":
                 payload.update(_compact(root, state, caller))
                 return _project(payload)

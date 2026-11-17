@@ -31,14 +31,13 @@ import ntpath
 import os
 import stat
 import sys
-import threading
 from typing import List, NamedTuple, Optional, Union
 
-from aegis_core.primitives import key_within, real_key, sanitize_display
-from aegis_core.redaction import redact_insight_text
+from aegis_core.primitives import key_within, real_key
+from aegis_core.pathlookup_gitcache import GitCache as BaseGitCache, ordinary_root
 
 __all__ = ["Hit", "INSIDE_FENCE", "RELATIVE_ENTRY", "descriptor_fence_supported", "GitCache",
-           "git_fence", "is_bare", "only_skipped", "which"]
+           "git_fence", "is_bare", "only_skipped", "ordinary_root", "which"]
 
 _MAX_FENCE_CHARS = 16384
 _MAX_COMPONENTS = 512
@@ -150,21 +149,6 @@ def _programs(directory: str, name: str) -> List[str]:
     return found
 
 
-def _inside(entry: str, fence: str, *, descriptors=None) -> bool:
-    """Whether resolving ``entry`` visits ``fence``. An unproven walk is inside.
-
-    Each literal component of the spelling and of every symlink target is walked
-    with no-follow metadata. ``..`` moves on that walked path and is never collapsed
-    out of the spelling first, so a detour through ``fence`` cannot hide behind it.
-    """
-    return _provenance_inside(entry, fence, descriptors=descriptors)
-
-
-def _inside_program(entry: str, fence: str, *, descriptors=None) -> bool:
-    """Program spellings use the same provenance predicate as their directories."""
-    return _inside(entry, fence, descriptors=descriptors)
-
-
 def _search(path: Optional[str]) -> List[str]:
     return (os.environ.get("PATH", os.defpath) if path is None else path).split(os.pathsep)
 
@@ -182,7 +166,7 @@ def _visible(programs: List[str], fence: Optional[str], *, descriptors=None) -> 
     """Programs whose resolved path is outside ``fence``. No fence keeps every program."""
     if fence is None:
         return programs
-    return [program for program in programs if not _inside_program(program, fence, descriptors=descriptors)]
+    return [program for program in programs if not _provenance_inside(program, fence, descriptors=descriptors)]
 
 
 def which(name: str, path: Optional[str] = None, outside: Optional[PathLike] = None,
@@ -199,7 +183,7 @@ def which(name: str, path: Optional[str] = None, outside: Optional[PathLike] = N
     for entry in _search(path):
         if not _absolute_entry(entry):
             continue
-        if fence is not None and (_inside_program(entry, fence, descriptors=descriptors) if fence_program else _inside(entry, fence, descriptors=descriptors)):
+        if fence is not None and _provenance_inside(entry, fence, descriptors=descriptors):
             continue
         found = _programs(entry, name)
         if fence_program:
@@ -229,11 +213,11 @@ def only_skipped(name: str, path: Optional[str] = None, outside: Optional[PathLi
         if not _absolute_entry(entry):
             programs = _programs(os.path.normpath(_PathSpelling.join(root, entry)), name)
             reason = RELATIVE_ENTRY
-        elif fence is not None and (_inside_program(entry, fence) if fence_program else _inside(entry, fence)):
+        elif fence is not None and _provenance_inside(entry, fence):
             programs = _programs(entry, name)
             reason = INSIDE_FENCE
         elif fence_program and fence is not None:
-            programs = [full for full in _programs(entry, name) if _inside_program(full, fence)]
+            programs = [full for full in _programs(entry, name) if _provenance_inside(full, fence)]
             reason = INSIDE_FENCE
         else:
             continue
@@ -405,8 +389,6 @@ def _relative_parts(target: str):
         letter, _rest = _PathSpelling.drive(target)
         if letter or _drive_less_rooted(target):
             return None
-    elif os.path.isabs(target):
-        return None
     if os.path.isabs(target):
         return None
     return _PathSpelling.split(target)
@@ -865,130 +847,12 @@ def git_fence(start=None, *, descriptors=None) -> str:
         return _fence_closed(text)
 
 
-class _RootCache:
-    """``store`` with each key prefixed by the fence captured for this call."""
+class GitCache(BaseGitCache):
+    """Bind ordinary-Git cache policy to this module's path-walk operations."""
 
-    __slots__ = ("_store", "fence")
-
-    def __init__(self, store, fence: Optional[str]) -> None:
-        self._store = store
-        self.fence = fence
-
-    def get(self, key, default=None):
-        with self._store._lock:
-            found = self._store.get((self.fence, key), default)
-        # Revalidate outside the lock: a walk must not run while the lock is held.
-        if found and self.fence is not None and _inside_program(found, self.fence, descriptors=False):
-            return default
-        return found
-
-    def __setitem__(self, key, value) -> None:
-        with self._store._lock:
-            self._store[(self.fence, key)] = value
-
-    def clear(self) -> None:
-        """Drop this fence's partition. ``GitCache.clear`` still drops every fence."""
-        with self._store._lock:
-            fence = self.fence
-            keys = [key for key in self._store if isinstance(key, tuple) and key[:1] == (fence,)]
-            for key in keys:
-                self._store.pop(key, None)
-
-    def error(self, error):
-        """Keep the ordinary refusal type/code and name its enclosing fence safely."""
-        def refuse(message, **details):
-            canonical = sanitize_display(self.fence, max_len=None)
-            redacted = redact_insight_text(canonical, max_len=max(1, len(canonical)))
-            shown = sanitize_display(redacted, max_len=256)
-            return error(message + "; excluding enclosing checkout " + shown, **details)
-        return refuse
-
-
-class _FenceCacheStore(dict):
-    """One reentrant lock for cache operations; iterators are stable snapshots."""
-
-    def __init__(self, *args, **kwargs):
-        self._lock = threading.RLock()
-        super().__init__(*args, **kwargs)
-
-    def __getitem__(self, key):
-        with self._lock:
-            return super().__getitem__(key)
-
-    def __setitem__(self, key, value):
-        with self._lock:
-            super().__setitem__(key, value)
-
-    def __delitem__(self, key):
-        with self._lock:
-            super().__delitem__(key)
-
-    def __contains__(self, key):
-        with self._lock:
-            return super().__contains__(key)
-
-    def __len__(self):
-        with self._lock:
-            return super().__len__()
-
-    def __iter__(self):
-        with self._lock:
-            return iter(tuple(super().keys()))
-
-    def get(self, key, default=None):
-        with self._lock:
-            return super().get(key, default)
-
-    def pop(self, key, *default):
-        with self._lock:
-            return super().pop(key, *default)
-
-    def popitem(self):
-        with self._lock:
-            return super().popitem()
-
-    def setdefault(self, key, default=None):
-        with self._lock:
-            return super().setdefault(key, default)
-
-    def clear(self):
-        with self._lock:
-            super().clear()
-
-    def copy(self):
-        with self._lock:
-            return super().copy()
-
-    def keys(self):
-        with self._lock:
-            return tuple(super().keys())
-
-    def items(self):
-        with self._lock:
-            return tuple(super().items())
-
-    def values(self):
-        with self._lock:
-            return tuple(super().values())
-
-    def update(self, *args, **kwargs):
-        if len(args) == 1 and isinstance(args[0], _FenceCacheStore):
-            incoming = args[0].copy()
-            incoming.update(kwargs)
-        else:
-            incoming = dict(*args, **kwargs)
-        with self._lock:
-            super().update(incoming)
-
-    def __ior__(self, other):
-        self.update(other)
-        return self
-
-
-
-class GitCache(_FenceCacheStore):
-    """Ordinary executable cache partitioned by each call's discovered workspace."""
-
-    def for_cwd(self, cwd=None) -> _RootCache:
-        # Metadata fence: the descriptor walk's component opens exceed the hook budget.
-        return _RootCache(self, _fence(git_fence(cwd, descriptors=False)))
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(
+            lambda cwd: _fence(git_fence(cwd, descriptors=False)),
+            lambda entry, fence: _provenance_inside(entry, fence, descriptors=False),
+            *args, **kwargs,
+        )

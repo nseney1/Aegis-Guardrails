@@ -26,7 +26,8 @@ rule into a system prompt, it returns only the rules for the changed files:
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from contextlib import nullcontext
+from dataclasses import asdict, dataclass, field, replace
 import json
 from pathlib import Path, PurePath
 import posixpath
@@ -45,11 +46,11 @@ from aegis_core.guidance_projection import (
 )
 from aegis_core.match import normalize_path, workspace_files
 from aegis_core.packs import MAX_RULE_BYTES
-from aegis_core import gitsafe, rule_integrity
+from aegis_core import gitsafe, match as rule_match, rule_integrity
 from aegis_core.rule_integrity import MANDATORY_SLOT_CAP
 from aegis_core.rule_inventory import RuleInventory, RuleInventoryError
 from aegis_core.rules import Rule, RuleCache, RuleSet, workspace_root
-from aegis_core.skills.slots import SlotRegistry
+from aegis_core.skills.slots import PLATFORM_SLOT_PROFILES, SlotRegistry, scan_registry
 from aegis_core.taxonomy import (
     JIT_DEFAULT_MAX_TOKENS,
     JIT_DEFAULT_RULE_COUNT_BUDGET,
@@ -86,6 +87,12 @@ RULE_CACHE = RuleCache()
 NO_CHANGES_TEXT = "No changed files detected. Governance guidance will be provided when files are modified."
 NO_MATCH_TEXT = "No governance rules match your current changes."
 _STATUS_FAIL = "FAIL"
+_COLD_SAMPLE_LIMIT, _COLD_LIST_LIMIT = 10, 20000
+_COLD_OUTPUT_LIMIT = 1024 * 1024
+_COLD_MATCH_BUDGET = 16384
+_COLD_NO_SAMPLE = "scan simulation: no sample"
+_SIM_SELECTED = "scan simulation: selected in all profiles"
+_SIM_OMITTED = "scan simulation: not selected in profiles: "
 
 
 def resolve_token_budget(workspace: Any, max_tokens: Optional[int] = None) -> int:
@@ -176,7 +183,8 @@ class _ScanResult(GuidanceResult):
 
 
 def _match(rule: Rule, matched: Tuple[str, ...], fitness: Fitness) -> _Match:
-    exact = any(normalize_path(p) == normalize_path(f) for p in rule.target_paths for f in matched)
+    exact = (any(rule.applies_to(f, exact=True) for f in matched) if isinstance(rule, _ColdRule)
+             else any(normalize_path(p) == normalize_path(f) for p in rule.target_paths for f in matched))
     return _Match(rule, matched, exact, fitness)
 
 
@@ -542,10 +550,12 @@ class _SimulationCache(RuleCache):
         super().__init__()
         self.captured = inventory, ruleset
         self.different_candidates: frozenset[str] = frozenset()
+        self.effective: Optional[RuleSet] = None
 
     def compare_candidates(self, effective: RuleSet) -> None:
         """Compare the full effective snapshot before any file matching occurs."""
         source = {rule.id: rule for rule in effective.rules}
+        self.effective = effective
         self.different_candidates = frozenset(
             rule.id for rule in self.captured[1].rules
             if rule.id not in source or source[rule.id].path != rule.path or source[rule.id].raw != rule.raw)
@@ -566,7 +576,7 @@ def simulate_rule_selection(workspace: Any, inventory: RuleInventory, ruleset: R
     Matching candidate bytes must
     match the captured effective rule; a concurrent edit or reviewed-base
     substitution never supplies a verdict about different candidate bytes.
-    Every refusal is fixed text, independent of rule input or exception text.
+    A served rule absent from that snapshot is judged as if accepted, at fitness 0.0. Refusals are fixed text.
     """
     candidates = ruleset.rules
     def refusal(reason: str) -> Dict[str, str]:
@@ -574,8 +584,6 @@ def simulate_rule_selection(workspace: Any, inventory: RuleInventory, ruleset: R
 
     if not callable(globals().get("select_guidance")):
         return refusal("scan API unavailable")
-    from aegis_core.skills.slots import PLATFORM_SLOT_PROFILES, scan_registry
-
     try:
         _check_simulation_inventory(inventory)
         cache = _SimulationCache(inventory, ruleset)
@@ -584,13 +592,12 @@ def simulate_rule_selection(workspace: Any, inventory: RuleInventory, ruleset: R
         if not isinstance(captured, _ScanResult):
             return refusal("scan projection failed")
         if not captured._projection.changed_files:
-            return refusal("no changed files")
-        selected = []
-        for profile in PLATFORM_SLOT_PROFILES:
-            result = captured.with_registry(scan_registry(profile, workspace))
-            if result.get("status") == _STATUS_FAIL or not isinstance(result, GuidanceResult):
+            messages = refusal("no changed files")
+        else:
+            selected = _simulation_profiles(captured, workspace)
+            if selected is None:
                 return refusal("scan projection failed")
-            selected.append(set(result.exposure_rule_ids()))
+            messages = _simulation_messages(cache, candidates, selected)
     except _SimulationLimit:
         return refusal("scan inputs over limit")
     except GuidanceProjectionError:
@@ -599,15 +606,174 @@ def simulate_rule_selection(workspace: Any, inventory: RuleInventory, ruleset: R
         return refusal("scan inputs unavailable")
     except (OSError, ValueError, RuntimeError):
         return refusal("scan inputs unavailable")
+    cold = _cold_candidates(cache, candidates)
+    if cold:
+        messages.update(_cold_messages(workspace, cache, captured, cold))
+    return messages
+
+
+def _simulation_profiles(captured: _ScanResult, workspace: Any) -> Optional[Dict[str, set]]:
+    selected: Dict[str, set] = {}
+    for profile in PLATFORM_SLOT_PROFILES:
+        result = captured.with_registry(scan_registry(profile, workspace))
+        if result.get("status") == _STATUS_FAIL or not isinstance(result, GuidanceResult):
+            return None
+        selected[profile] = set(result.exposure_rule_ids())
+    return selected
+
+
+def _simulation_messages(cache: _SimulationCache, candidates: Tuple[Rule, ...], selected: Dict[str, set]) -> Dict[str, str]:
     messages = {}
     for rule in candidates:
         if rule.id in cache.different_candidates:
             messages[rule.id] = "not evaluated: candidate differs from scan snapshot"
-        elif all(rule.id in identities for identities in selected):
-            messages[rule.id] = "scan simulation: selected in all profiles"
+        elif all(rule.id in identities for identities in selected.values()):
+            messages[rule.id] = _SIM_SELECTED
         else:
-            messages[rule.id] = "scan simulation: not selected in one or more profiles"
+            omitted = sorted(profile for profile, identities in selected.items() if rule.id not in identities)
+            messages[rule.id] = _SIM_OMITTED + ", ".join(omitted)
     return messages
+
+
+def _cold_candidates(cache: _SimulationCache, candidates: Tuple[Rule, ...]) -> Tuple[Rule, ...]:
+    effective = cache.effective
+    if effective is None:
+        return ()
+    installed = {rule.id for rule in effective.rules}
+    chosen: Dict[str, Rule] = {}
+    for rule in candidates:
+        if rule.served and rule.id not in installed:
+            chosen.setdefault(rule.id, rule)
+    return tuple(chosen.values())
+
+
+def _cold_refusal(rules: Tuple[Rule, ...], reason: str) -> Dict[str, str]:
+    return dict.fromkeys((rule.id for rule in rules), "not evaluated: " + reason)
+
+
+def _cold_path_ok(path: object) -> bool:
+    if not isinstance(path, str) or not 0 < len(path) <= 1024:
+        return False
+    if any(char in path for char in ("\x00", "\\", "\n", "\r")):
+        return False
+    if path.startswith("/") or PurePath(path).is_absolute():
+        return False
+    return all(part not in ("", ".", "..") for part in path.split("/"))
+
+
+def _cold_paths(workspace: Any) -> Optional[Tuple[str, ...]]:
+    # No stdin: capture never opens scratch. Retain an existing caller's custody.
+    with nullcontext() if gitsafe.custody_active() else gitsafe.custody(scratch=Path(workspace_root(workspace)).anchor, stdout_limit=_COLD_OUTPUT_LIMIT):
+        listed = gitsafe.list_files(workspace)
+    if not isinstance(listed, (list, tuple)):
+        return None
+    if len(listed) > _COLD_LIST_LIMIT:
+        raise _SimulationLimit
+    return tuple(sorted(path for path in listed if _cold_path_ok(path)))
+
+
+class _SimulationBudget(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class _ColdRule(Rule):
+    """A frozen source rule sharing the lint run's bounded, memoized matcher."""
+    _match_path: Optional[Callable[[Rule, str, bool], bool]] = field(default=None, repr=False, compare=False)
+
+    def applies_to(self, path: str, *, exact: bool = False) -> bool:
+        if self._match_path is None:
+            raise _SimulationBudget
+        return self._match_path(self, path, exact)
+
+    def matching_files(self, files: List[str]) -> List[str]:
+        return [path for path in dict.fromkeys(map(normalize_path, files)) if self.applies_to(path)]
+
+
+def _cold_rules(rules: Tuple[Rule, ...], remaining: List[int]) -> Tuple[Rule, ...]:
+    outcomes, targets = {}, {r.id: (r.skips_tests, tuple(dict.fromkeys(r.target_paths))) for r in rules}
+    def evaluate(pattern: str, path: str, exact: bool) -> bool:
+        if remaining[0] <= 0:
+            raise _SimulationBudget
+        remaining[0] -= 1  # Every step costs one, including cached negatives and ranking.
+        key = pattern, path, exact
+        if key not in outcomes:
+            outcomes[key] = normalize_path(pattern) == normalize_path(path) if exact else rule_match.matches(pattern, path)
+        return outcomes[key]
+    def applies(rule: Rule, path: str, exact: bool) -> bool:
+        if not exact and targets[rule.id][0] and rule_match.is_test_path(path):
+            return False
+        return any(evaluate(pattern, path, exact) for pattern in targets[rule.id][1])
+    return tuple(_ColdRule(**vars(replace(rule, meta={**rule.meta, "target_paths": targets[rule.id][1]})), _match_path=applies) for rule in rules)
+
+
+def _cold_sample(draft: Rule, paths: Tuple[str, ...]) -> List[str]:
+    sample: List[str] = []
+    for path in paths:
+        if draft.applies_to(path):
+            sample.append(path)
+            if len(sample) == _COLD_SAMPLE_LIMIT:
+                break
+    return sample
+
+
+def _cold_select(workspace: Any, captured: _ScanResult, ruleset: RuleSet, files: List[str], fitness_of: Callable[[List[Rule]], Dict[str, Fitness]]) -> Optional[Dict[str, set]]:
+    selected: Dict[str, set] = {}
+    projection = captured._projection
+    # Unaccepted sibling diagnostics are outside this as-if-accepted selection.
+    extras = {key: value for key, value in projection.extras.items() if key not in ("unreviewed_rules", "unreviewed_total")}
+    for profile in PLATFORM_SLOT_PROFILES:
+        result = select_guidance(ruleset, files, projection.budget, projection.token_budget, list(projection.stale), fitness_of, dict(extras), scan_registry(profile, workspace))
+        if not isinstance(result, GuidanceResult) or result.get("status") == _STATUS_FAIL:
+            return None
+        selected[profile] = set(result.exposure_rule_ids())
+    return selected
+
+
+def _cold_verdicts(workspace: Any, cache: _SimulationCache, captured: _ScanResult, drafts: Tuple[Rule, ...]) -> Dict[str, str]:
+    listed = _cold_paths(workspace)
+    effective = cache.effective
+    if listed is None or effective is None:
+        return _cold_refusal(drafts, "scan inputs unavailable")
+    installed = [rule for rule in effective.rules if rule.served]
+    fits = for_rules(workspace, installed, adjudications=Adjudications())
+    remaining = [_COLD_MATCH_BUDGET]
+    bounded = _cold_rules(effective.rules + drafts, remaining)
+    messages = {}
+    for index, rule in enumerate(bounded[len(effective.rules):]):
+        try:
+            if remaining[0] <= 0:
+                raise _SimulationBudget
+            rules = bounded[:len(effective.rules)] + (rule,)
+            files = _cold_sample(rules[-1], listed)
+            if not files:
+                messages[rule.id] = _COLD_NO_SAMPLE
+                continue
+            scored = {**fits, rule.id: Fitness(rule=rule.id, score=0.0)}
+            ruleset = RuleSet(rules, effective.ignored, effective.fingerprint)
+            selected = _cold_select(workspace, captured, ruleset, files, lambda served: {r.id: scored[r.id] for r in served})
+            if selected is None:
+                messages[rule.id] = "not evaluated: scan projection failed"
+                continue
+            omitted = sorted(name for name, identities in selected.items() if rule.id not in identities)
+            messages[rule.id] = _SIM_OMITTED + ", ".join(omitted) if omitted else _SIM_SELECTED
+        except _SimulationBudget:
+            messages.update(_cold_refusal(drafts[index:], "simulation budget exceeded"))
+            break
+    return messages
+
+
+def _cold_messages(workspace: Any, cache: _SimulationCache, captured: _ScanResult, drafts: Tuple[Rule, ...]) -> Dict[str, str]:
+    try:
+        return _cold_verdicts(workspace, cache, captured, drafts)
+    except _SimulationLimit:
+        return _cold_refusal(drafts, "scan inputs over limit")
+    except GuidanceProjectionError:
+        return _cold_refusal(drafts, "scan projection failed")
+    except gitsafe.GitError as exc:
+        return _cold_refusal(drafts, "scan inputs over limit" if exc.code == "git_output_limit" else "scan inputs unavailable")
+    except (OSError, ValueError, RuntimeError):
+        return _cold_refusal(drafts, "scan inputs unavailable")
 
 
 # Titles are branch-local text that reaches an agent: only the first few are listed.

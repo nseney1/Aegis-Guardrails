@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-from aegis_core import hosts
+from aegis_core import hosts, pathlookup
 from aegis_core._version import __version__
 from aegis_core.bootstrap import instructions_text
 from aegis_core.config import env_client, env_manager_registration, env_workspace
@@ -39,6 +39,7 @@ from aegis_core.taxonomy import MCP_DEFAULT_RATE_LIMITS
 from aegis_core.workspace.base import Workspace
 from aegis_core.workspace.binding import Attested, Registry, WorkspaceBinding, read_registry, resolve_binding
 from aegis_core.workspace.layout import UserLayout
+from aegis_core.workspace.diagnostics import project_binding
 
 from .projection import is_error_result
 from aegis_mcp.handlers.common import DEFAULT_CLIENT_PLATFORM, NOT_GOVERNED_MESSAGE
@@ -305,113 +306,11 @@ def _workspace_for(binding: WorkspaceBinding) -> Workspace:
     return _workspaces[key]
 
 
-_BINDING_MESSAGES = {
-    "pin_conflicts_with_host_root": (
-        "AEGIS_WORKSPACE pins {pin}, but the host reports the session in {host_roots}; "
-        "fix the pin or open the pinned project", ("pin", "host_roots")),
-    "pin_conflicts_with_registry": (
-        "AEGIS_WORKSPACE pins {pin}, but the files belong to the registered workspace {registered_root}",
-        ("pin", "registered_root")),
-    "host_root_conflicts_with_registry": (
-        "the host reports the session in {host_root}, but the files belong to the registered workspace "
-        "{registered_root}", ("host_root", "registered_root")),
-    "host_root_conflicts_with_registry_outside": (
-        "the host reports the session outside any Aegis workspace, but the files belong to "
-        "the registered workspace {registered_root}", ("registered_root",)),
-    "ambiguous_host_roots": (
-        "the host reports several Aegis workspaces and the call's files do not pick one; "
-        "pass the files you plan to edit", ()),
-    "cwd_conflicts_with_registry": (
-        "the server runs in the workspace {cwd_root}, but the files exist only in the registered "
-        "workspace(s) {candidates}; pass absolute paths", ("cwd_root", "candidates")),
-    "ambiguous_registry_selection": ("the files exist in several registered workspaces; pass absolute paths", ()),
-    "host_roots_not_governed": ("the host's workspace has no .aegis/", ()),
-    "no_workspace": ("no Aegis workspace resolves for this call", ()),
-    "pin_missing": ("AEGIS_WORKSPACE is set to {workspace}, which cannot be resolved", ()),
-    "pin_missing_directory": ("AEGIS_WORKSPACE is set to {workspace}, which is not a directory", ()),
-    "pin_not_a_workspace": ("AEGIS_WORKSPACE is set to {workspace}, which has no .aegis/ (run aegis init there)", ()),
-    "pin_denied": ("AEGIS_WORKSPACE is set to {workspace}, which is the home directory", ()),
-    "pin_denied_root": ("AEGIS_WORKSPACE is set to {workspace}, which is the filesystem root", ()),
-}
-
-
 def _unbound_result(binding: WorkspaceBinding) -> Dict[str, Any]:
     launch_pin = _workspace_pin or getattr(_canonical_workspace, "root", _canonical_workspace)
     if isinstance(launch_pin, os.PathLike):
         launch_pin = os.fspath(launch_pin)
-    raw = {"status": binding.status, "root": str(binding.root) if binding.root is not None else None,
-           "source": binding.source, "confidence": binding.confidence, "reason": binding.reason,
-           "_pin": launch_pin}
-    # Bound wrappers, path count and each raw component before copying details.
-    # With at most 256 projected items of 1024 characters, later joins are bounded too.
-    refusal = None
-    items = len(binding.details)
-    for value in raw.values():
-        if value is not None:
-            if not isinstance(value, str):
-                refusal = "guidance_projection_invalid_field"
-                break
-            if len(value) > MAX_GUIDANCE_CHARS:
-                refusal = GuidanceProjectionError.code
-                break
-    if items > 256:
-        refusal = GuidanceProjectionError.code
-    allowed = {"pin", "target", "cwd", "cwd_root", "host_root", "registered_root", "host_roots", "candidates"}
-    if refusal is None:
-        for key, value in binding.details:
-            if key not in allowed or not isinstance(value, list if key in {"host_roots", "candidates"} else str):
-                refusal = "guidance_projection_invalid_field"
-                break
-            items += len(value) if isinstance(value, list) else 1
-            if items > 256:
-                refusal = GuidanceProjectionError.code
-                break
-            for path in value if isinstance(value, list) else (value,):
-                if not isinstance(path, str):
-                    refusal = "guidance_projection_invalid_field"
-                    break
-                if len(path) > MAX_GUIDANCE_CHARS:
-                    refusal = GuidanceProjectionError.code
-                    break
-            if refusal is not None:
-                break
-    display = {}
-    for key, value in raw.items():
-        if value is None:
-            display[key] = None
-        else:
-            try:
-                name = project_error_name(value)
-            except GuidanceProjectionError as error:
-                name = error.code
-            display[key] = project_diagnostic(name, escaped=False)
-    projected_pin = display.pop("_pin")
-    details = {}
-    if refusal is None:
-        for key, value in binding.details:
-            shown = []
-            for path in value if isinstance(value, list) else (value,):
-                try:
-                    name = project_error_name(path)
-                except GuidanceProjectionError as error:
-                    name = error.code
-                shown.append(project_diagnostic(name, escaped=False))
-            details[key] = shown if isinstance(value, list) else shown[0]
-    kind = binding.reason
-    if kind == "host_root_conflicts_with_registry" and "host_root" not in details:
-        kind = "host_root_conflicts_with_registry_outside"
-    elif kind == "pin_missing" and binding.message.endswith("which is not a directory"):
-        kind = "pin_missing_directory"
-    elif kind == "pin_denied" and binding.message.endswith("which is the filesystem root"):
-        kind = "pin_denied_root"
-    template, required = _BINDING_MESSAGES.get(kind, ("workspace binding refused", ()))
-    if refusal is None and not all(key in details for key in required):
-        refusal = "guidance_projection_invalid_field"
-    display["details"] = details if refusal is None else {}
-    values = {key: ", ".join(value) if isinstance(value, list) else value for key, value in display["details"].items()}
-    values["workspace"] = projected_pin or values.get("pin") or display["root"] or "workspace"
-    message = refusal or template.format(**values)
-    display["message"] = project_diagnostic(message, escaped=False)
+    display = project_binding(binding, workspace=launch_pin)
     if binding.status == "hold":
         return {"status": "hold", "reason": display["reason"], "error": display["message"], "binding": display}
     if binding.status == "error":
@@ -562,6 +461,12 @@ def _initialize_queue(req_id, params):
     }}
 
 
+def _arm_ordinary_root(binding):
+    """Install the canonical root after discovery; the caller owns the reset token."""
+    root = os.path.normcase(os.fspath(binding.root)) if binding.bound else None
+    return pathlookup.ordinary_root.set(root)
+
+
 def _queue_claim_call(req_id, params):
     from . import queue_role
 
@@ -571,17 +476,31 @@ def _queue_claim_call(req_id, params):
         return _json_tool_result(req_id, invalid, True)
     if _queue_error is not None or _queue_grant is None:
         return _json_tool_result(req_id, queue_role.refusal(_queue_error or "role_missing"), True)
+    reset = None
     try:
         binding = _bind(params, {})
+        reset = _arm_ordinary_root(binding)
         if not binding.bound or str(binding.root) != _queue_grant.workspace:
             return _json_tool_result(req_id, queue_role.refusal("queue_io_unavailable"), True)
         result = execute_tool("aegis_team_queue_claim", args, queue_grant=_queue_grant, queue_session=_session_id)
         return _json_tool_result(req_id, result, bool(result.get("refused")))
     except Exception:
         return _json_tool_result(req_id, queue_role.refusal("queue_io_unavailable"), True)
+    finally:
+        if reset is not None:
+            pathlookup.ordinary_root.reset(reset)
 
 
 def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    # Discovery, including reentrant calls, always starts without a bound fence.
+    token = pathlookup.ordinary_root.set(None)
+    try:
+        return _handle_request(request)
+    finally:
+        pathlookup.ordinary_root.reset(token)
+
+
+def _handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     global _session_id, _client_platform, _client_name, _client_version, _roots_capable, _host_roots
 
     if not isinstance(request, dict):
@@ -678,6 +597,14 @@ def _repository_call(req_id, params, name, args):
     # The client never chooses the workspace or the attribution of what it reports.
     args = strip_server_owned(args)
     binding = _bind(params, args)
+    reset = _arm_ordinary_root(binding)
+    try:
+        return _finish_repository_call(req_id, name, args, binding)
+    finally:
+        pathlookup.ordinary_root.reset(reset)
+
+
+def _finish_repository_call(req_id, name, args, binding):
     if binding.bound:
         args["workspace"] = _workspace_for(binding)
         args["_binding"] = binding.source

@@ -16,11 +16,21 @@ successful dogfood runs and a 10,000-message fixture run. Owner acceptance is a
 separate gate: passing a test does not authorize a runtime importer.
 
 Phase 1 admits readers through the rollout contract in
-`tests/contract/test_mailbox_index_rollout.py`. The owner approved the doctor as
-the first and only admitted importer (MB-5 round 1b, Addendum A), read-only and in
-literal `mode="shadow"`. Every second importer is still refused. Indexed-only
-reads require separate owner acceptance; this admission does not change other
-phase-0 gates, mode guards or receiver attribute restrictions.
+`tests/contract/test_mailbox_index_rollout.py`. The owner approved the doctor
+(MB-5 round 1b, Addendum A), then `hierarchy_jobs.py`, `hierarchy_sweep.py`,
+`hierarchy_provision.py` and `hierarchy_provider_recovery.py` (MB-2 release ruling,
+2026-11-16). All five readers construct the index in literal `mode="shadow"`;
+unlisted importers remain refused. Sweep shares one derived summary per pass only
+after bounded descriptor walks prove the mailbox and delivery bytes and topology
+unchanged and accessible, and live pinned reads revalidate message and binding
+references. Changes, unavailable observations, unsupported descriptor capabilities
+or exhausted observation budgets require a fresh shadow summary. Any attempted
+wake, including a failure, invalidates the pass's summaries. Non-durable wake
+selection retains its original checks; durable receipt and marker checks always
+run live during reporting, and before selection only when durable mode was
+requested. Writes still use pinned publish, bind
+and ack APIs. Indexed-only reads require separate owner acceptance; this admission
+does not change other phase-0 gates, mode guards or receiver attribute restrictions.
 
 Track P's proposed store upgrade is a separate pinned change: file-plus-log
 publication, adoption and chain verification are not features of this index or

@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from aegis_core import gitsafe, gitsafe_run, team, team_git, team_gitops, team_qualify
+from aegis_core import gitsafe, gitsafe_run, team, team_git, team_gitops, team_qualify, team_queue
 from aegis_core import team_custody_checks as checks
 from tests.conftest import symlink_or_skip
 from tests.unit.core.test_team_git import IDENTITY, commit, git, make_store, shared_bytes
@@ -132,6 +132,84 @@ def test_lease_is_first_and_retry_is_effect_free(rig, changes):
 def test_branch_mismatch_precedes_head_and_has_resume_action(rig):
     error = refusal(rig, "branch_mismatch", read_branch=lambda: "other", expected_head=None)
     assert error.next_action == {"actor": "implementer", "command": "lane resume work"}
+
+
+def replace_lease_branch(rig, branch):
+    team.release(rig.repo, "work", expect=rig.lease.oid)
+    rig.lease = team.claim(rig.repo, "work", ["/src/**", "/shared.txt"], owner="team-1",
+                          branch=branch, now=100, ttl_s=60).lease
+
+
+def test_full_branch_lease_success_retry_and_concurrent_reads(rig, rig_template, tmp_path):
+    replace_lease_branch(rig, "refs/heads/lane/work")
+    before = state(rig)
+    assert run(rig) == rig.options["tested_tree"]
+    assert run(rig) == rig.options["tested_tree"]
+    with copied_rig(rig_template, tmp_path / "sibling") as sibling:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert list(pool.map(run, (rig, sibling))) == [rig_template.tree, rig_template.tree]
+        assert state(sibling) == rig_template.baseline
+    assert state(rig) == before
+
+
+@pytest.mark.parametrize("branch", ["refs/remotes/origin/lane/work", "refs/tags/lane/work",
+                                   "HEAD", "refs/heads/HEAD", None, "lane/other"],
+                         ids=["remote", "tag", "head", "heads-head", "missing", "other"])
+def test_nonlocal_or_different_lease_branch_refuses_before_head(rig, branch):
+    replace_lease_branch(rig, branch)
+    for _ in range(2):
+        error = refusal(rig, "branch_mismatch", expected_head=None)
+        assert error.next_action == {"actor": "implementer", "command": "lane resume work"}
+    replace_lease_branch(rig, "refs/heads/lane/work")
+    assert run(rig) == rig.options["tested_tree"]
+
+
+@pytest.mark.parametrize("branch", ["refs/remotes/origin/lane/work", "refs/tags/lane/work", "HEAD"],
+                         ids=["remote", "tag", "head"])
+def test_matching_nonlocal_branch_labels_still_refuse(rig, branch):
+    replace_lease_branch(rig, branch)
+    refusal(rig, "branch_mismatch", read_branch=lambda: branch, expected_head=None)
+
+
+def test_custody_uses_public_git_input_validators(rig, monkeypatch):
+    calls = []
+    def oid(value):
+        calls.append("oid")
+        return team_git.validate_oid(value)
+    def message(value):
+        calls.append("message")
+        return team_git.validate_message(value)
+    assert {"validate_oid", "validate_message"} <= set(team_git.__all__)
+    monkeypatch.setattr(checks, "team_git", SimpleNamespace(
+        **{**vars(team_git), "validate_oid": oid, "validate_message": message}))
+    assert run(rig) == rig.options["tested_tree"]
+    assert calls == ["oid", "oid", "message"]
+
+
+def test_queue_and_custody_use_public_local_branch_grammar(rig, monkeypatch):
+    calls = []
+    def branch(value):
+        calls.append(value)
+        return team.normalize_branch(value)
+    assert "normalize_branch" in team.__all__
+    adapter = SimpleNamespace(**{**vars(team), "normalize_branch": branch})
+    monkeypatch.setattr(checks, "team", adapter)
+    monkeypatch.setattr(team_queue, "team", adapter)
+    assert team_queue.normalize_branch("refs/heads/lane/work") == "lane/work"
+    assert run(rig) == rig.options["tested_tree"]
+    assert calls == ["refs/heads/lane/work", "lane/work", "lane/work"]
+
+
+@pytest.mark.parametrize("value", ["a" * 40, "0" * 64, "A" * 40, "a" * 39 + "\n",
+                                  "g" * 64, "a" * 65, None, b"a" * 40],
+                         ids=["sha1", "sha256", "uppercase", "newline", "nonhex", "size", "none", "bytes"])
+def test_public_object_id_grammar(value):
+    if type(value) is str and value in ("a" * 40, "0" * 64):
+        assert team_git.validate_oid(value) == value
+    else:
+        with pytest.raises(team_git.GitRefusal) as caught:
+            team_git.validate_oid(value)
+        assert caught.value.code == "invalid_oid"
 
 
 @pytest.mark.parametrize("value", [None, "b" * 40, "x" * 100000, ["a"]],

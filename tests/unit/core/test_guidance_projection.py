@@ -21,6 +21,18 @@ WITHHELD_TEXT = "guidance withheld: ambiguous structure"
 CONTROL_TEXT = "guidance withheld: control characters"
 
 
+@pytest.mark.parametrize("surface", ["field_signature", "assembly"])
+def test_projection_public_api_omits_unused_surfaces(surface: str):
+    from inspect import signature
+    import aegis_core.guidance_projection as projection
+
+    if surface == "field_signature":
+        assert tuple(signature(projection.project_field).parameters) == ("value", "registry")
+    else:
+        assert "project_assembled" not in projection.__all__
+        assert not hasattr(projection, "project_assembled")
+
+
 @pytest.fixture(autouse=True)
 def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     home = tmp_path / "home"
@@ -972,7 +984,7 @@ def test_unstripped_structure_is_projected_by_every_public_entry(
     elif entry == "guidance":
         assert render_scan_result({"guidance": body}, "claude-code", root)["guidance"].rstrip() == expected
     elif entry == "field":
-        assert project_field(body, body=False).rstrip() == expected
+        assert project_field(body).rstrip() == expected
     else:
         assert render_for_host(body, "claude-code", root)[0].rstrip() == expected
     assert path.read_bytes() == original
@@ -1031,7 +1043,7 @@ def test_completed_templates_share_evidence_exclusion_and_redaction(
     config.write_text(json.dumps({"v": 1, "slots": {"CUSTOM": secret}}), encoding="utf-8")
     _rule(root, template)
     if entry == "field":
-        rendered = project_field(template, SlotRegistry({"CUSTOM": secret}).sanitized(), body=False)
+        rendered = project_field(template, SlotRegistry({"CUSTOM": secret}).sanitized())
     elif entry == "host":
         rendered, warnings = render_for_host(template, host, root)
         assert warnings == []
@@ -2608,11 +2620,13 @@ def test_round20_arbitrary_heading_prefixes_are_text_and_are_redacted():
 
 
 @pytest.mark.parametrize("case", ["delimiter", "maximum"])
-def test_round20_assembly_keeps_complete_text_context_and_exact_limits(case: str):
-    from aegis_core.guidance_projection import MAX_GUIDANCE_CHARS, project_assembled, project_text
+def test_round20_field_and_text_keep_complete_context_and_exact_limits(case: str):
+    from aegis_core.guidance_projection import MAX_GUIDANCE_CHARS, project_field, project_text
 
     value = "Bearer\n       SecretBearerToken12345" if case == "delimiter" else "x" * MAX_GUIDANCE_CHARS
-    assert project_assembled(value) == project_text(value)
+    expected = "Bearer REDACTED" if case == "delimiter" else value
+    assert project_field(value) == expected
+    assert project_text(value) == expected
 
 
 @pytest.mark.parametrize("files", [["src/a.py", "## Evidence", "bad\x1bfile.py"],
@@ -3057,15 +3071,15 @@ def test_round23_auxiliary_preflight_does_not_budget_slot_expansion(field: str):
 
 
 @pytest.mark.parametrize("value", ["scalar", "list"])
-def test_round23_assembled_warning_and_scalar_auxiliary_slots_are_literal(value: str):
-    from aegis_core.guidance_projection import project_assembled, project_display_data
+def test_round23_warning_and_scalar_auxiliary_slots_are_literal(value: str):
+    from aegis_core.guidance_projection import project_display_data
 
     literal = chr(36) + "{TOOL_RUN}"
     source = "warn " + literal if value == "scalar" else ["warn " + literal]
     registry = SlotRegistry({"TOOL_RUN": "Bash"})
     assert project_display_data(source, registry) == source
-    assert project_assembled(source, registry, warnings=True) == source
-    assert project_assembled("Use " + literal, registry) == "Use Bash"
+    assert project_display_data({"warnings": source, "guidance": "Use " + literal}, registry) == {
+        "warnings": source, "guidance": "Use Bash"}
 
 
 def test_round23_instruction_preflight_still_refuses_expansion_before_allocation():
