@@ -102,6 +102,7 @@ __all__ = [
     "load_team",
     "load_team_at",
     "merge_metrics",
+    "normalize_branch",
     "parse_lease",
     "parse_team",
     "read_leases",
@@ -372,6 +373,15 @@ def _check_branch(value: object) -> Optional[str]:
     if value is not None and not _label_ok(value, spaces=False):
         raise TeamUsageError(f"branch must be 1 to {LABEL_MAX} characters with no spaces or control characters")
     return value  # type: ignore[return-value]
+
+
+def normalize_branch(value: object) -> Optional[str]:
+    """Return an optional short local branch or raise TeamUsageError; no I/O."""
+    value = _check_branch(value)
+    name = value.removeprefix("refs/heads/") if value is not None else None
+    if name is not None and (not name or name == "HEAD" or name.startswith("refs/")):
+        raise TeamUsageError("branch must name a local branch")
+    return name
 
 
 def default_owner() -> str:
