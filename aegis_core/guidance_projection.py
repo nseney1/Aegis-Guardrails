@@ -16,7 +16,7 @@ from aegis_core.guidance_grammar import (
 from aegis_core.taxonomy import JIT_DEFAULT_MAX_TOKENS, RULE_TYPES, WORDS_TO_TOKENS_FACTOR
 
 __all__ = ["CONTROL_GUIDANCE", "GuidanceProjectionError", "GuidanceResult", "MAX_GUIDANCE_CHARS",
-           "SLOT_REF_PATTERN", "WITHHELD_GUIDANCE", "checked_result_copy",
+           "SLOT_REF_PATTERN", "WITHHELD_GUIDANCE", "checked_result_copy", "projection_refusal_copy",
            "assembled_text", "project_assembled", "contains_control_characters", "estimate_tokens", "field_text", "finish_payload",
            "instruction_body", "normalize_layout", "redact_clean_text", "project_detail", "detail_instruction_visible", "project_display_data",
            "project_envelope_fields", "project_field", "project_identifier", "project_rule_entries",
@@ -30,6 +30,7 @@ WITHHELD_GUIDANCE = "guidance withheld: ambiguous structure"
 CONTROL_GUIDANCE = "guidance withheld: control characters"
 MAX_IDENTIFIER_ITEMS = 4096
 _IDENTIFIER_FIELDS = frozenset({"id", "name", "path", "_path", "matched_files", "files"})
+_CONTROL_CANDIDATES = re.compile(r"[^\t\n\r\x20-\x7e]")
 _DIAGNOSTIC_ESCAPES = re.compile(
     r"(?<!\\)(?:(?P<slashes>(?:\\\\)*\\)(?:(?P<space>[tnrvf])|(?P<point>x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8})"
     r"|N\{(?P<name>[^{}]*)(?P<closed>\}|(?=\{)|$))|\\+)"
@@ -77,9 +78,13 @@ class _ControlCharacters(GuidanceProjectionError):
 
 def contains_control_characters(text: str, start: int = 0, end: Optional[int] = None) -> bool:
     """The one refusal predicate, before any layout normalization or redaction."""
-    return any(unicodedata.category(text[i]) in {"Cf", "Cs"}
-               or (unicodedata.category(text[i]) == "Cc" and text[i] not in "\t\n\r")
-               for i in range(start, len(text) if end is None else end))
+    stop = len(text) if end is None else end
+    # Preserve range/index semantics for negative or out-of-range bounds,
+    # including short-circuiting before an otherwise invalid index is reached.
+    if start < 0 or stop > len(text):
+        return any(contains_control_characters(text[i]) for i in range(start, stop))
+    return any(unicodedata.category(match[0]) in {"Cc", "Cf", "Cs"}
+               for match in _CONTROL_CANDIDATES.finditer(text, start, stop))
 
 
 def normalize_layout(text: str, *, single_line: bool = False) -> str:
@@ -359,14 +364,17 @@ def project_diagnostic(text: str, *, escaped: bool = True) -> str:
         return GuidanceProjectionError.code
     try:
         canonical = "".join(" " if _diagnostic_space(ch) else ch for ch in text)
+        canonical = " ".join(canonical.split())
         # Each run starts once; named escapes end at the next brace or input end.
-        literal = (_DIAGNOSTIC_ESCAPES.sub(_diagnostic_escape, normalize_layout(canonical, single_line=True))
-                   if escaped else normalize_layout(canonical, single_line=True))
-        literal = normalize_layout(literal, single_line=True)
+        literal = _DIAGNOSTIC_ESCAPES.sub(_diagnostic_escape, canonical) if escaped else canonical
+        if escaped:
+            literal = " ".join(literal.split())
         # Malformed nesting may create a fresh escape. Refuse it rather than recursively reparsing.
         if escaped and any(_diagnostic_escape(match) != match[0] for match in _DIAGNOSTIC_ESCAPES.finditer(literal)):
             return "guidance_projection_invalid_field"
-        shown = redact_clean_text(literal)
+        # Canonicalization and escape replacement only remove characters or
+        # replace non-printables with spaces: size/control preflights still hold.
+        shown = _redact_labeled(literal, None)[0]
         return shown if len(shown) <= 1024 else clip_redacted(shown, 1021) + "..."
     except GuidanceProjectionError as error:
         return error.code
@@ -395,11 +403,16 @@ def project_identifier(value: Any, registry: Optional[_Slots] = None) -> str:
 
 
 def project_error_name(value: Any) -> str:
-    """A diagnostic name is either a safe whole identifier or its fixed refusal."""
+    """Redact a diagnostic name to a fixed point within the input character cap."""
     try:
-        return project_identifier(value)
+        for _ in range(MAX_GUIDANCE_CHARS):
+            projected = project_identifier(value)
+            if projected == value:
+                return projected
+            value = projected
     except _InvalidField:
         return _InvalidField.code
+    return _InvalidField.code
 
 
 # Schemas admit structure only at these envelope keys. Unknown keys are text,
@@ -614,6 +627,36 @@ def checked_result_copy(result: Dict[str, Any], registry: Optional[_Slots]) -> D
         return copied
 
     return mapping(result)
+
+
+def projection_refusal_copy(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Recognize a bounded canonical refusal before compatibility budgeting.
+
+    Plain/JSON copies have no private marker. Only the exact refusal shape,
+    fixed field/reason tokens and already projected paths receive the exemption.
+    Other envelopes still take the ordinary projection and budgeting route.
+    """
+    if type(result) is not dict or len(result) not in (2, 3):
+        return None
+    if any(type(key) is not str for key in result):
+        return None
+    if set(result) not in ({"status", "error"}, {"status", "error", "rule_errors"}):
+        return None
+    if type(result["status"]) is not str or type(result["error"]) is not str:
+        return None
+    if result["status"] != "FAIL" or result["error"] not in {
+            "guidance_projection_invalid_field", "guidance_projection_limit"}:
+        return None
+    snapshot = checked_result_copy(result, None)
+    reasons = {field + ": " + reason for field in ("hypothesis", "prediction", "detail", "matched_files")
+               for reason in ("invalid_field", "limit")}
+    # Bounds/type validation precedes inspection; eligibility uses the original
+    # reason so Evidence removal cannot manufacture a canonical refusal token.
+    for row in result.get("rule_errors", []):
+        if (set(row) != {"path", "error"} or type(row["error"]) is not str
+                or row["error"] not in reasons or project_error_name(row["path"]) != row["path"]):
+            return None
+    return snapshot
 
 
 def _stamp_tokens(result: Dict[str, Any]) -> int:

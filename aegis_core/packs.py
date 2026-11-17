@@ -46,7 +46,7 @@ from aegis_core.lifecycle.creation import require_servable_id
 from aegis_core.lifecycle.parsers import validate_rule_id
 from aegis_core.migrate import frontmatter_span, strip_derived
 from aegis_core.primitives import real_key, real_path, strict_loads
-from aegis_core.rule_inventory import RuleInventory, RuleInventoryEntry, RuleInventoryError
+from aegis_core.rule_inventory import MAX_RULE_BYTES, RuleInventory, RuleInventoryEntry, RuleInventoryError
 from aegis_core.rules import Rule, load_rules, workspace_root
 from aegis_core.storage import atomic_write_bytes, locked
 from aegis_core.taxonomy import DIR_RULE_TYPES, RULE_TYPE_DIRS
@@ -79,8 +79,6 @@ __all__ = [
 PACK_VERSION = 1
 MAX_PACK_BYTES = 8 * 1024 * 1024
 MAX_PACK_RULES = 500
-# A rule body is capped at 64 KiB elsewhere (lifecycle.creation); the frontmatter has room on top.
-MAX_RULE_BYTES = 128 * 1024
 MAX_ID_LENGTH = 128
 _BUNDLE_DOMAIN = b"aegis-rule-pack-v1\0"
 _BAD_PATH_CHARS = re.compile(r"[\\:\x00-\x1f\x7f]")
@@ -244,6 +242,8 @@ def _export_entry(rule: Rule) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     if rule.type not in RULE_TYPE_DIRS:
         return None, f"{rule.path}: it is not in a rule type directory"
     relative = f"{RULE_TYPE_DIRS[rule.type]}/{rule.id}.md"
+    if rule.size is not None and rule.size > MAX_RULE_BYTES:
+        return None, f"{relative}: {rule.size} bytes exceeds the {MAX_RULE_BYTES} byte limit"
     try:
         parse_pack_path(relative)
     except PackPathError as exc:

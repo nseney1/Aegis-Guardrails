@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from aegis_core import team_profile, team_supervisor
+from aegis_core import kernel_identity, team_profile, team_supervisor
 from aegis_core import team_supervisor_start as module
 
 
@@ -108,6 +108,44 @@ def test_success_records_identity_and_prevents_duplicate(tmp_path, monkeypatch):
     assert team_supervisor.load_state(root)["components"]["writer"]["failures"] == []
     assert run(module, root)["attempts"] == []
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("number,code", [(errno.EACCES, "state_locked"), (errno.EAGAIN, "state_locked"),
+    (errno.EWOULDBLOCK, "state_locked"), (errno.EIO, "state_unavailable")])
+def test_directory_lock_errors_keep_binding_mapping_and_retry(tmp_path, monkeypatch, number, code):
+    root, config = make_store(tmp_path)
+    calls = fake_process(monkeypatch)
+    boundary = kernel_identity.fcntl
+
+    def denied(*args):
+        raise OSError(number, "SECRET")
+
+    monkeypatch.setattr(kernel_identity, "fcntl", SimpleNamespace(**{**vars(boundary), "flock": denied}))
+    for _ in range(2):
+        assert run(module, root) == {"status": "refused", "code": code,
+                                   "reason": module._REASONS[code], "attempts": []}
+    assert not calls and not list(config.iterdir())
+    monkeypatch.setattr(kernel_identity, "fcntl", boundary)
+    assert run(module, root)["attempts"] == [{"id": "writer", "outcome": "started"}]
+    assert run(module, root)["attempts"] == [] and len(calls) == 1
+
+
+def test_unlock_error_keeps_success_and_never_duplicates(tmp_path, monkeypatch):
+    root, config = make_store(tmp_path)
+    calls = fake_process(monkeypatch)
+    boundary = kernel_identity.fcntl
+
+    def unlock_error(fd, operation):
+        if operation == boundary.LOCK_UN:
+            raise OSError(errno.EIO, "SECRET")
+        return boundary.flock(fd, operation)
+
+    monkeypatch.setattr(kernel_identity, "fcntl", SimpleNamespace(**{**vars(boundary), "flock": unlock_error}))
+    assert run(module, root)["attempts"] == [{"id": "writer", "outcome": "started"}]
+    frozen = {p.name: p.read_bytes() for p in config.iterdir()}
+    for _ in range(2):
+        assert run(module, root) == {"status": "ok", "attempts": []}
+    assert frozen == {p.name: p.read_bytes() for p in config.iterdir()} and len(calls) == 1
 
 
 def test_pid_reuse_is_dead_and_restarts(tmp_path, monkeypatch):
