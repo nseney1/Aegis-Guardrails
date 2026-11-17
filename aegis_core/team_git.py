@@ -27,7 +27,7 @@ import stat
 from threading import Lock
 from typing import Optional, Sequence, Tuple, Union
 
-from aegis_core import gitsafe, gitsafe_run, team_git_snapshot
+from aegis_core import gitsafe, gitsafe_policy, gitsafe_run, team_git_snapshot
 from aegis_core.errors import AegisError
 from aegis_core.team_git_snapshot import (
     GitRefusal, conversion_settings as _conversion_settings, decode_worktree as _decode_worktree,
@@ -40,7 +40,7 @@ __all__ = ["CommitIdentity", "GitRefusal", "GitStore", "Plan", "cas_fast_forward
            "descriptor_support", "ref_oid", "plan_merge", "plan_pick", "plan_revert", "snapshot_tree",
            "validate_oid", "validate_message",
            # Export the internal runner-transfer surface for the lane guard's accounting.
-           "_current", "_publish", "_require_runner", "_snapshot_baselines", "_write_snapshot"]
+           "_current", "_publish", "_require_runner", "_snapshot_baselines", "_snapshot_fallback_objects", "_write_snapshot"]
 
 MAX_FILE_BYTES = 16 * 1024 * 1024
 MAX_SNAPSHOT_BYTES = 128 * 1024 * 1024
@@ -355,7 +355,7 @@ def _read_path(root_fd: int, raw: bytes, remaining: int, *, attribute=False, att
         after = os.fstat(fd)
         if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
             raise GitRefusal("worktree_changed")
-        return mode, None if clean else b"".join(chunks), before
+        return mode, team_git_snapshot.STAT_CLEAN if clean else b"".join(chunks), before
     except FileNotFoundError:
         if observed:
             raise GitRefusal("conversion_unavailable" if attribute else "worktree_changed") from None
@@ -387,28 +387,26 @@ def _index_stamp(store):
 _CONFIG_QUERY = r"^core\.(autocrlf|safecrlf|filemode|symlinks|eol|trustctime|checkstat)$"
 
 
-def _snapshot_filters(store):
+def _conversion_run(store, argv, **kw):
+    """Map conversion-observation transport failures to the stable refusal."""
     try:
-        result = store._run(["config", "--null", "--name-only", "--get-regexp", r"^filter\."],
-                            allowed=(0, 1), stdout_limit=65536)
+        return store._run(argv, **kw)
     except OSError:
         raise GitRefusal("conversion_unavailable") from None
     except AegisError as exc:
         if _error_code(exc) not in ("git_failed", "git_timeout", "git_output_limit", "git_cleanup_failed"):
             raise
         raise GitRefusal("conversion_unavailable") from None
+
+
+def _snapshot_filters(store):
+    result = _conversion_run(store, ["config", "--null", "--name-only", "--get-regexp", r"^filter\."],
+                             allowed=(0, 1), stdout_limit=65536)
     return team_git_snapshot.filter_drivers(result.stdout, result.returncode)
 
 
 def _snapshot_config(store):
-    try:
-        team_git_snapshot.attribute_version(store._run(["version"], stdout_limit=256).stdout)
-    except OSError:
-        raise GitRefusal("conversion_unavailable") from None
-    except AegisError as exc:
-        if _error_code(exc) not in ("git_failed", "git_timeout", "git_output_limit", "git_cleanup_failed"):
-            raise
-        raise GitRefusal("conversion_unavailable") from None
+    team_git_snapshot.attribute_version(_conversion_run(store, ["version"], stdout_limit=256).stdout)
     raw = store._run(["config", "--null", "--get-regexp", _CONFIG_QUERY], allowed=(0, 1), stdout_limit=4096).stdout
     settings = _conversion_settings(raw)
     filters = _snapshot_filters(store)
@@ -417,16 +415,8 @@ def _snapshot_config(store):
 
 
 def _snapshot_rules(store, paths, tree, settings, filters):
-    names = ("filter", "text", "eol", "ident", "working-tree-encoding", "crlf")
-    try:
-        out = store._run(["check-attr", "-z", "--stdin", "--source", tree, *names],
-                         stdin=b"".join(path + b"\0" for path in paths)).stdout
-    except OSError:
-        raise GitRefusal("conversion_unavailable") from None
-    except AegisError as exc:
-        if _error_code(exc) not in ("git_failed", "git_timeout", "git_output_limit", "git_cleanup_failed"):
-            raise
-        raise GitRefusal("conversion_unavailable") from None
+    out = _conversion_run(store, [*gitsafe_policy.SNAPSHOT_SOURCE_PREFIX, tree, *gitsafe_policy.SNAPSHOT_ATTRIBUTES],
+                          stdin=b"".join(path + b"\0" for path in paths)).stdout
     attrs = team_git_snapshot.snapshot_attributes(out, paths)
     return team_git_snapshot.snapshot_rules(paths, attrs, settings, native_crlf=os.name == "nt",
                                             configured_filters=filters)
@@ -518,6 +508,20 @@ def _snapshot_attribute_entries(captured, fallbacks, objects, remaining, length)
     return team_git_snapshot.attribute_entries(sources, length), remaining
 
 
+def _snapshot_fallback_objects(store, fallbacks, remaining, runner):
+    """Fetch fallback attributes once, preserving object and aggregate budgets."""
+    _require_runner(runner)
+    if not fallbacks:
+        return {}
+    try:
+        return runner.read_private_objects(store.repo, list(dict.fromkeys(fallbacks.values())),
+            max_bytes=remaining, max_object_bytes=min(MAX_FILE_BYTES, MAX_OBJECT_BYTES))
+    except AegisError as exc:
+        if _error_code(exc) != "git_object_limit":
+            raise
+        raise GitRefusal("size_limit") from None
+
+
 @_lane_operation
 def _snapshot_rule_context(store, paths, entries, fallbacks, baseline, settings, filters, *, _runner=None):
     _require_runner(_runner)
@@ -547,13 +551,14 @@ def _snapshot_contents(store, root_fd, paths, baseline, rules, settings, oid_len
         if entry is None:
             continue
         mode, data, observed = entry
-        original_size = observed.st_size if data is None else len(data)
-        if data is not None and mode != "120000" and rules[path][3]:
+        skipped = data is team_git_snapshot.STAT_CLEAN
+        original_size = observed.st_size if skipped else len(data)
+        if not skipped and mode != "120000" and rules[path][3]:
             prior = baseline.get(path, ("100644", None, None))
             if not _index_clean(mode, data, observed, prior, settings, oid_length, index_time):
                 limit = MAX_SNAPSHOT_BYTES - total + (original_size if is_attribute else 0)
                 data = _decode_worktree(data, rules[path], min(MAX_FILE_BYTES, limit))
-        total += max(original_size, len(data) if data is not None else 0) - (original_size if is_attribute else 0)
+        total += max(original_size, len(data) if not skipped else 0) - (original_size if is_attribute else 0)
         if total > MAX_SNAPSHOT_BYTES:
             raise GitRefusal("size_limit")
         contents.append((path, mode, data, observed))
@@ -643,15 +648,7 @@ def snapshot_tree(store: GitStore, *, _runner=None) -> str:
             for entry in captured.values():
                 team_git_snapshot.check_filter_bytes(entry[1])
         fallbacks = team_git_snapshot.attribute_fallbacks(captured, baseline)
-        fallback_objects = {}
-        if fallbacks:
-            try:
-                fallback_objects = _runner.read_private_objects(store.repo, list(dict.fromkeys(fallbacks.values())),
-                    max_bytes=remaining, max_object_bytes=min(MAX_FILE_BYTES, MAX_OBJECT_BYTES))
-            except AegisError as exc:
-                if _error_code(exc) != "git_object_limit":
-                    raise
-                raise GitRefusal("size_limit") from None
+        fallback_objects = _snapshot_fallback_objects(store, fallbacks, remaining, _runner)
         if _index_stamp(store) != index_stamp:
             raise GitRefusal("worktree_changed")
         attribute_entries, remaining = _snapshot_attribute_entries(captured, fallbacks, fallback_objects, remaining, length)

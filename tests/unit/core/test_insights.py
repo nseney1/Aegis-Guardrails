@@ -1660,7 +1660,9 @@ S0 = {
                          "aegis_core.verification.test_runner"},
 }
 # The storage split accompanies storage at all three hook stages.
-NEW_MODULES = frozenset({"aegis_core.redaction", "aegis_core.storage_shared",
+NEW_MODULES = frozenset({
+    "aegis_core.pathlookup_gitcache",
+    "aegis_core.redaction", "aegis_core.storage_shared",
                          "aegis_core.gitsafe_run",
                          "aegis_core.gitsafe_policy",
                          *(f"aegis_core.insights.{m}" for m in INSIGHT_MODULES),

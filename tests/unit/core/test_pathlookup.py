@@ -20,12 +20,30 @@ from pathlib import Path
 import pytest
 
 from aegis_cli import cli
-from aegis_core import pathlookup
+from aegis_core import pathlookup, pathlookup_gitcache
 from aegis_core import gitsafe as bound_git
 from aegis_mcp import server
 from aegis_core.pathlookup import Hit, only_skipped, which
 
 EXE = ".exe" if os.name == "nt" else ""
+
+
+def test_git_cache_policy_and_bound_root_have_one_exported_home():
+    from aegis_core import pathlookup_gitcache
+
+    assert pathlookup_gitcache.__all__ == ["GitCache", "ordinary_root"]
+    assert issubclass(pathlookup.GitCache, pathlookup_gitcache.GitCache)
+    assert pathlookup.ordinary_root is pathlookup_gitcache.ordinary_root
+    assert "ordinary_root" in pathlookup.__all__
+    assert type(pathlookup.GitCache().for_cwd()).__module__ == pathlookup_gitcache.__name__
+
+
+def test_git_cache_keeps_dictionary_initialization_and_snapshot_updates():
+    cache = pathlookup.GitCache({("root", "git"): "program"}, inside_program="value")
+    assert cache.copy() == {("root", "git"): "program", "inside_program": "value"}
+    other = pathlookup.GitCache(fence_for_cwd="value")
+    other.update(cache)
+    assert dict(other.items()) == {**cache.copy(), "fence_for_cwd": "value"}
 
 
 def _program(directory: Path, name: str, data: bytes = b"#!/bin/sh\nexit 0\n") -> Path:
@@ -755,7 +773,7 @@ def test_ordinary_refusal_canonicalizes_redacts_then_truncates_its_fence():
         assert secret not in message and "\n" not in message
         shown = message.split("enclosing checkout ", 1)[1]
         assert shown == os.path.normcase(os.path.abspath(os.sep))
-        view = pathlookup._RootCache(pathlookup.GitCache(), root)
+        view = pathlookup_gitcache._RootCache(pathlookup.GitCache(), root)
         redacted = str(view.error(gitsafe.GitError)("git is not installed or not on PATH"))
         assert secret not in redacted and "\n" not in redacted and "[REDACTED" in redacted
         assert len(redacted.split("enclosing checkout ", 1)[1]) <= 256
@@ -1358,7 +1376,7 @@ def test_windows_short_names_trailing_dots_and_rooted_links_stay_closed():
         assert pathlookup._provenance_inside(r"C:\WORKSP~1\..\host", fence, descriptors=False) is True
         assert pathlookup.which("git.exe", path=r"C:\WORKSP~1\bin", outside=fence, fence_program=True, descriptors=False) is None
         cache = pathlookup.GitCache()
-        view = pathlookup._RootCache(cache, ntpath.normcase(fence))
+        view = pathlookup_gitcache._RootCache(cache, ntpath.normcase(fence))
         view[("git",)] = r"C:\WORKSP~1\bin\git.exe"
         assert view.get(("git",)) is None
 
@@ -1382,7 +1400,7 @@ def test_windows_short_names_trailing_dots_and_rooted_links_stay_closed():
             assert pathlookup.which(
                 "git.exe", path=link, outside=drive + r"\ws", fence_program=True, descriptors=False,
             ) is None
-            cross = pathlookup._RootCache(pathlookup.GitCache(), ntpath.normcase(drive + r"\ws"))
+            cross = pathlookup_gitcache._RootCache(pathlookup.GitCache(), ntpath.normcase(drive + r"\ws"))
             cross[("git",)] = link + r"\git.exe"
             assert cross.get(("git",)) is None
         assert pathlookup._relative_parts("C:sub") is None
@@ -1889,9 +1907,9 @@ def test_ordinary_root_fences_the_exact_directory_and_resets(tmp_path):
             assert pathlookup.GitCache().for_cwd(nested).fence == _carrier_fence(app)
             assert pathlookup.GitCache().for_cwd(enclosing).fence == _carrier_fence(app)
             assert walks == [], "a set carrier must not walk the outermost marker"
-            assert pathlookup._inside(str(app / "bin"), _carrier_fence(app))
-            assert not pathlookup._inside(str(enclosing / "bin"), _carrier_fence(app))
-            assert not pathlookup._inside(str(sibling), _carrier_fence(app))
+            assert pathlookup._provenance_inside(str(app / "bin"), _carrier_fence(app))
+            assert not pathlookup._provenance_inside(str(enclosing / "bin"), _carrier_fence(app))
+            assert not pathlookup._provenance_inside(str(sibling), _carrier_fence(app))
     finally:
         pathlookup.git_fence = original
     assert pathlookup.ordinary_root.get() is None
@@ -1934,8 +1952,8 @@ def test_ordinary_root_keeps_the_captured_directory_if_a_link_is_retargeted(tmp_
         symlink_or_skip(decoy, link, target_is_directory=True)
         fence = pathlookup.GitCache().for_cwd(decoy).fence
         assert fence == _carrier_fence(real)
-        assert pathlookup._inside(str(real / "bin"), fence)
-        assert not pathlookup._inside(str(decoy / "bin"), fence)
+        assert pathlookup._provenance_inside(str(real / "bin"), fence)
+        assert not pathlookup._provenance_inside(str(decoy / "bin"), fence)
 
 
 def test_ordinary_root_holds_when_the_descriptor_probe_is_false(tmp_path):
