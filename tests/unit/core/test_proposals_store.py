@@ -2467,20 +2467,20 @@ def test_expanding_url_credentials_refuse_before_proposal_publication(tmp_path):
 
 _GUIDANCE_MASK_GOLDENS = (
     ("HTTPS://u:pass@ci.example/path?sig=hidden#private",
-     "HTTPS://u:[REDACTED]@ci.example/path?sig=hidden#private"),
+     "HTTPS://u:[REDACTED]@ci.example/path#private"),
     ("ftp://u:pass@ci.example/path?sig=hidden#private",
-     "ftp://u:[REDACTED]@ci.example/path?sig=hidden#private"),
+     "ftp://u:[REDACTED]@ci.example/path#private"),
     ("SSH://u:pass@ci.example/path?sig=hidden#private",
-     "SSH://u:[REDACTED]@ci.example/path?sig=hidden#private"),
+     "SSH://u:[REDACTED]@ci.example/path#private"),
     ("git://u:pass@ci.example/path?sig=hidden#private",
-     "git://u:[REDACTED]@ci.example/path?sig=hidden#private"),
+     "git://u:[REDACTED]@ci.example/path#private"),
     ("s3://u:pass@ci.example/path?sig=hidden#private",
-     "s3://u:[REDACTED]@ci.example/path?sig=hidden#private"),
+     "s3://u:[REDACTED]@ci.example/path#private"),
     ("Custom+v1://u:pass@ci.example/path?sig=hidden#private",
-     "Custom+v1://u:[REDACTED]@ci.example/path?sig=hidden#private"),
+     "Custom+v1://u:[REDACTED]@ci.example/path#private"),
     ("http://192.0.2.1", "http://192.0.2.1"),
-    ("https://ci.example/job?sig=(hunter2)", "https://ci.example/job?sig=(hunter2)"),
-    ("redis://:hunter2@localhost/0", "redis://:hunter2@localhost/0"),
+    ("https://ci.example/job?sig=(hunter2)", "[REDACTED_URL]"),
+    ("redis://:hunter2@localhost/0", "redis://:[REDACTED]@localhost/0"),
     ("token=[REDACTED]", "token=REDACTED"),
 )
 
