@@ -163,6 +163,24 @@ def _build_parser(prog: str = PROG, *, error_policy=None) -> argparse.ArgumentPa
     return parser
 
 
+def _resolve_cli_binding(explicit, pin, accept=is_aegis_workspace):
+    """Keep discovery provenance separate from resolve_cli_root's fallback path."""
+    from aegis_core.workspace.binding import resolve_cli_root
+
+    discovered = None
+
+    def record(candidate):
+        nonlocal discovered
+        accepted = accept(candidate)
+        if accepted:
+            discovered = candidate
+        return accepted
+
+    root = resolve_cli_root(explicit, Path.cwd(), pin, accept=record)
+    # A returned pin passed the resolver's pin checks; a walk must have accepted it.
+    return root, root if pin or root == discovered else None
+
+
 def _attach_workspace(args: argparse.Namespace) -> None:
     """Resolve the workspace the command acts on (``args.ws``, ``args._project_root``).
 
@@ -180,9 +198,10 @@ def _attach_workspace(args: argparse.Namespace) -> None:
     from aegis_core.config import env_workspace
     from aegis_core.errors import WorkspaceNotFoundError
     from aegis_core.workspace.base import Workspace
-    from aegis_core.workspace.binding import check_pin_agrees, resolve_cli_root
+    from aegis_core.workspace.binding import check_pin_agrees
     from aegis_core.workspace.discovery import refuse_unmigrated_v3, unconverted_rule_files
 
+    args._ordinary_binding_root = None
     raw_ws = getattr(args, "workspace", None)
     args._workspace_arg = raw_ws
     pin = env_workspace()
@@ -205,7 +224,7 @@ def _attach_workspace(args: argparse.Namespace) -> None:
         args.ws = Workspace.for_init(raw_ws or Path.cwd())
     elif args.command == "migrate":
         # A legacy .soma/ is a workspace to migrate too.
-        root = resolve_cli_root(raw_ws, Path.cwd(), pin, accept=_migratable)
+        root, args._ordinary_binding_root = _resolve_cli_binding(raw_ws, pin, accept=_migratable)
         args.ws = None
         args._project_root = root
         args.workspace = str(root)
@@ -213,9 +232,9 @@ def _attach_workspace(args: argparse.Namespace) -> None:
     else:
         try:
             if args.command in _LEGACY_TOLERANT_COMMANDS:
-                root = resolve_cli_root(raw_ws, Path.cwd(), pin)
+                root, args._ordinary_binding_root = _resolve_cli_binding(raw_ws, pin)
             else:
-                root = resolve_cli_root(raw_ws, Path.cwd(), pin, accept=_refuse_legacy)
+                root, args._ordinary_binding_root = _resolve_cli_binding(raw_ws, pin, accept=_refuse_legacy)
                 refuse_unmigrated_v3(root)  # a pin is not walked
                 _check_upgrade_state(args.command, root, args=args)
             args.ws = Workspace(root=root)
@@ -517,10 +536,22 @@ def _invocation_policy(argv):
     return policy
 
 
+def _ordinary_bound_root(args: argparse.Namespace):
+    """Only explicit successful resolution can mark an ordinary invocation."""
+    return getattr(args, "_ordinary_binding_root", None)
+
+
 def main(argv: Optional[List[str]] = None, prog: str = PROG) -> int:
+    from aegis_core.pathlookup import ordinary_root
+
     argv = list(sys.argv[1:] if argv is None else argv)
     policy = _invocation_policy(argv)
-    return policy.run(partial(_main, argv, prog, policy))
+    # A nested invocation must discover its own binding without the caller's fence.
+    token = ordinary_root.set(None)
+    try:
+        return policy.run(partial(_main, argv, prog, policy))
+    finally:
+        ordinary_root.reset(token)
 
 
 def _main(argv: List[str], prog: str, policy=None) -> int:
@@ -556,9 +587,11 @@ def _main(argv: List[str], prog: str, policy=None) -> int:
         return 0
 
     command = get_default_registry().get(args.command)
+    from aegis_core import pathlookup
     from aegis_core.errors import WorkspaceError
     from aegis_core.workspace.binding import WorkspaceHold
 
+    ordinary_token = None
     try:
         try:
             if args.command != "workspace":
@@ -583,6 +616,9 @@ def _main(argv: List[str], prog: str, policy=None) -> int:
             else:
                 print(f"Error: {exc}", file=sys.stderr)
             return _WORKSPACE_ERROR_EXIT.get(args.command, 1)
+        bound_root = _ordinary_bound_root(args)
+        if bound_root is not None:
+            ordinary_token = pathlookup.ordinary_root.set(os.path.normcase(os.fspath(bound_root)))
         return command.execute(args)
     except KeyboardInterrupt:
         return 130
@@ -597,6 +633,9 @@ def _main(argv: List[str], prog: str, policy=None) -> int:
             message = str(e)
         print(f"Error: {message}", file=sys.stderr)
         return 1
+    finally:
+        if ordinary_token is not None:
+            pathlookup.ordinary_root.reset(ordinary_token)
 
 
 if __name__ == "__main__":
