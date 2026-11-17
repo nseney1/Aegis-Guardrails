@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from threading import Barrier, Event, Thread
+from threading import Barrier, Event, Lock, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -5793,3 +5793,133 @@ def test_public_caller_refusal_matrix_golden_bytes(repo, monkeypatch, entry):
         monkeypatch.setattr(gitsafe_run.LaneRunner, "run", run)
         monkeypatch.setattr(gitsafe_run.LaneRunner, "read_private_object", read)
         assert store.object(head, "commit").startswith(b"tree ")
+
+
+def _attribute_oid_calls(monkeypatch):
+    """Count attribute OID hashing through the snapshot module's own reference."""
+    calls, lock = [], Lock()
+    real = team_git_snapshot.object_id
+
+    def counted(data, oid_length=40, kind="blob"):
+        with lock:
+            calls.append((id(data), oid_length))
+        return real(data, oid_length, kind)
+
+    monkeypatch.setattr(team_git_snapshot, "object_id", counted)
+    return calls, real
+
+
+def _attribute_body_calls(sources, oid_length):
+    """Count body refusals without patching the helper."""
+    seen, previous = [], sys.getprofile()
+    code = team_git_snapshot._attribute_body.__code__
+
+    def observed(frame, event, _arg):
+        if event == "call" and frame.f_code is code:
+            seen.append(id(frame.f_locals["data"]))
+        if previous is not None:
+            previous(frame, event, _arg)
+
+    sys.setprofile(observed)
+    try:
+        produced = team_git_snapshot.attribute_entries(sources, oid_length)
+    finally:
+        sys.setprofile(previous)
+    return produced, seen
+
+
+def test_attribute_entries_memoizes_validated_body_and_oid_by_identity(monkeypatch):
+    """One call validates and hashes each retained bytes object once and emits every path."""
+    calls, real = _attribute_oid_calls(monkeypatch)
+    assert team_git_snapshot.attribute_entries({}, 40) == []
+    assert calls == []
+    mutable = bytearray(b"*.c text\n")
+    mutable_sources = {b"b/.gitattributes": mutable, b"a/.gitattributes": mutable}
+    mutable_entries = team_git_snapshot.attribute_entries(mutable_sources, 40)
+    assert [path for path, mode, oid, data in mutable_entries] == [
+        b"a/.gitattributes", b"b/.gitattributes"]
+    assert all(mode == "100644" and data is mutable and oid == real(bytes(mutable), 40)
+               for _, mode, oid, data in mutable_entries)
+    assert calls == [(id(mutable), 40), (id(mutable), 40)]
+    body = b"*.bin text\r\n" + (b"z" * (team_git_snapshot.MAX_ATTRIBUTE_LINE_BYTES - 1)) + b"\n"
+    alias = bytes(bytearray(body))
+    assert alias == body and alias is not body
+    sources = {b"z/.gitattributes": body, b"a/.gitattributes": body, b"m/.gitattributes": alias}
+    calls.clear()
+    entries = team_git_snapshot.attribute_entries(sources, 40)
+    assert [path for path, mode, oid, data in entries] == [
+        b"a/.gitattributes", b"m/.gitattributes", b"z/.gitattributes"]
+    assert [mode for _, mode, _, _ in entries] == ["100644", "100644", "100644"]
+    assert entries[0][3] is body and entries[2][3] is body and entries[1][3] is alias
+    assert entries[0][2] == entries[2][2] == real(body, 40)
+    assert entries[1][2] == real(alias, 40)
+    assert calls == [(id(body), 40), (id(alias), 40)]
+    wide = {b"d%03d/.gitattributes" % index: body for index in range(64)}
+    calls.clear()
+    wide_entries = team_git_snapshot.attribute_entries(wide, 64)
+    assert len(wide_entries) == 64
+    assert [path for path, _, _, _ in wide_entries] == sorted(wide)
+    assert {oid for _, _, oid, _ in wide_entries} == {real(body, 64)}
+    assert all(data is body and len(oid) == 64 for _, _, oid, data in wide_entries)
+    assert calls == [(id(body), 64)]
+    calls.clear()
+    retried, validated = _attribute_body_calls(sources, 40)
+    assert retried == entries
+    assert calls == [(id(body), 40), (id(alias), 40)]
+    assert validated == [id(body), id(alias)]
+    calls.clear()
+    barrier = Barrier(2)
+    shared = {b"p%02d/.gitattributes" % index: body for index in range(8)}
+
+    def once(_slot):
+        barrier.wait(5)
+        return team_git_snapshot.attribute_entries(shared, 40)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        concurrent = list(pool.map(once, (0, 1)))
+    assert concurrent[0] == concurrent[1]
+    assert len(concurrent[0]) == 8
+    assert {oid for _, _, oid, _ in concurrent[0]} == {real(body, 40)}
+    assert calls == [(id(body), 40), (id(body), 40)]
+    _, validated_again = _attribute_body_calls({b"a/.gitattributes": mutable, b"b/.gitattributes": mutable}, 40)
+    assert validated_again == [id(mutable), id(mutable)]
+
+
+@pytest.mark.parametrize("fault", ["nul", "bom", "long-line", "later-line", "exact-line", "file-cap"])
+def test_attribute_entries_malformed_body_refuses_before_hash_and_retries(monkeypatch, fault):
+    calls, real = _attribute_oid_calls(monkeypatch)
+    limit = team_git_snapshot.MAX_ATTRIBUTE_LINE_BYTES
+    original_cap = team_git_snapshot.MAX_ATTRIBUTE_FILE_BYTES
+    if fault == "nul":
+        body = b"*.bin text\n\0marker-value"
+    elif fault == "bom":
+        body = b"\xef\xbb\xbf*.bin text\n"
+    elif fault == "long-line":
+        body = b"x" * limit
+    elif fault == "later-line":
+        body = b"ok\n" + (b"y" * limit)
+    elif fault == "exact-line":
+        body = (b"z" * limit) + b"\n"
+    else:
+        body = b"*.bin text\n"
+        monkeypatch.setattr(team_git_snapshot, "MAX_ATTRIBUTE_FILE_BYTES", len(body))
+    good = b"*.ok text\r\n" + (b"q" * (limit - 1)) + b"\n"
+    sources = {b"a/.gitattributes": good, b"m/.gitattributes": body, b"z/.gitattributes": body}
+    with pytest.raises(tg.GitRefusal) as caught:
+        team_git_snapshot.attribute_entries(sources, 40)
+    assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+        "conversion_unavailable", "Lane Git operation refused: conversion_unavailable", None)
+    assert type(caught.value).__module__ == "aegis_core.team_git"
+    rendered = str(caught.value)
+    assert "marker-value" not in rendered and "gitattributes" not in rendered
+    assert body.decode("latin-1") not in rendered
+    assert calls == []
+    if fault == "file-cap":
+        monkeypatch.setattr(team_git_snapshot, "MAX_ATTRIBUTE_FILE_BYTES", original_cap)
+    calls.clear()
+    retried = team_git_snapshot.attribute_entries(
+        {b"b/.gitattributes": good, b"a/.gitattributes": good}, 40)
+    assert [(path, mode, oid, data is good) for path, mode, oid, data in retried] == [
+        (b"a/.gitattributes", "100644", real(good, 40), True),
+        (b"b/.gitattributes", "100644", real(good, 40), True)]
+    assert calls == [(id(good), 40)]
