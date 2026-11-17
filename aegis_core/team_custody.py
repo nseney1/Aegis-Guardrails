@@ -87,6 +87,13 @@ class CommitResult:
     tree: str
 
 
+# Immediate first read. Later polls double until the cap and never run past the window.
+# Tests replace this module's time binding so the window does not call the process sleeper.
+OBSERVATION_SECONDS = 5.0
+OBSERVATION_POLL_SECONDS = 0.01
+OBSERVATION_POLL_MAX_SECONDS = 0.1
+
+
 def _terminal(store, journal, lane, request_id, ref, *, wait=False):
     def observe(intent):
         oid = team_git.ref_oid(store, ref)
@@ -97,14 +104,23 @@ def _terminal(store, journal, lane, request_id, ref, *, wait=False):
         else:
             state = None if oid is None else {"ref": ref, "head": oid}
         return team_gitops.Observation(state)
-    deadline = time.monotonic() + 5.0 if wait else None
+    deadline = time.monotonic() + OBSERVATION_SECONDS if wait else None
+    delay = OBSERVATION_POLL_SECONDS
     while True:
         rows = journal.reconcile(lane, observe, request_id=request_id)
         terminal = next((row for row in (rows or journal.read().rows)
                          if row["kind"] in ("result", "tombstone") and row["request_id"] == request_id), None)
-        if terminal is not None or deadline is None or time.monotonic() >= deadline:
+        if terminal is not None or deadline is None:
             return terminal
-        time.sleep(0.01)
+        now = time.monotonic()
+        if now >= deadline:
+            return terminal
+        # Bound the wait before sleeping: poll cap and the time still inside the window.
+        step = min(delay, OBSERVATION_POLL_MAX_SECONDS, deadline - now)
+        if step <= 0:
+            return terminal
+        time.sleep(step)
+        delay = min(delay * 2.0, OBSERVATION_POLL_MAX_SECONDS)
 
 
 def _recover(store, journal, binding, tree, *, wait=False):

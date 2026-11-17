@@ -7,8 +7,7 @@ PACKAGES = ("aegis_core", "aegis_cli", "aegis_mcp", "aegis_sdk")
 FORBIDDEN = {"_within", "_is_within", "_inside", "_utc_now", "_utc_timestamp",
              "_now_iso", "_envelope", "_pack_envelope", "_parse_ts", "_stamp",
              "_read_blobs", "_git_blob_id"}
-# This wrapper compares canonical lookup keys, not arbitrary filesystem paths.
-ALLOWED = {("aegis_core/pathlookup.py", "_inside")}
+ALLOWED = set()
 
 
 def duplicate_primitives(root):

@@ -75,7 +75,7 @@ def _command(argv, cwd, stdin, grant=None):
     if args == ("update-ref", "--no-deref", "-z", "--stdin"):
         if grant != (tuple(argv), str(cwd), stdin): strict_refuse()
     elif not read_shape(args): strict_refuse()
-    if (args[:4] == ("check-attr", "-z", "--stdin", "--source")) != ("core.attributesFile=" in pairs): strict_refuse()
+    if (args[:len(gitsafe_policy.SNAPSHOT_SOURCE_PREFIX)] == gitsafe_policy.SNAPSHOT_SOURCE_PREFIX) != ("core.attributesFile=" in pairs): strict_refuse()
     return args, pairs
 def _argv(args, program, hardening, policy):
     argv = [program, *hardening, *args]
@@ -84,7 +84,7 @@ def _argv(args, program, hardening, policy):
         while position + 1 < len(argv) and argv[position] == "-c":
             position += 2
         extra = _LANE_OPTIONS if policy.strict_lane else ("-c", "gc.auto=0", "-c", "maintenance.auto=false")
-        if policy.strict_lane and tuple(argv[position:position + 4]) == ("check-attr", "-z", "--stdin", "--source"):
+        if policy.strict_lane and tuple(argv[position:position + len(gitsafe_policy.SNAPSHOT_SOURCE_PREFIX)]) == gitsafe_policy.SNAPSHOT_SOURCE_PREFIX:
             extra = (*extra, "-c", "core.attributesFile=")
         argv[position:position] = ["-c", f"core.hooksPath={os.devnull}", *extra]
     return argv
@@ -260,7 +260,7 @@ def _strict_argv(argv, cwd, env, stdin, *, lane, grant=None, effect_context=None
     if strict_root(cwd) != strict_root(lane.cwd) or not argv or argv[0] != lane._lane_binding.program: strict_refuse()
     args, pairs = _command(argv, cwd, stdin, grant)
     shared = args[0] in ("update-ref", "unpack-objects") and grant == (tuple(argv), str(cwd), stdin) if args else False
-    real_index = args[0] in ("ls-files", "check-attr") and env.get("GIT_INDEX_FILE") == str(lane._lane_binding.paths[2])
+    real_index = args[0] == "ls-files" and env.get("GIT_INDEX_FILE") == str(lane._lane_binding.paths[2])
     identity = {k: v for k, v in env.items() if k in IDENTITY_ENV}
     if env != lane.environment(identity, args=args, real_index=bool(real_index), shared=shared, effect_context=effect_context): strict_refuse()
     return args, pairs
@@ -329,10 +329,10 @@ class LaneRunner:
             raise error("Strict lane Git command refused.", code="git_custody_refused", process_started=False)
     def environment(self, env=None, *, args=(), real_index=False, shared=False, effect_context=None):
         supplied = identity_environment(env, args, environ_type=_ENVIRON_TYPE)
-        if real_index and tuple(args) not in READ_SHAPES or real_index and args[0] not in ("ls-files", "check-attr"): strict_refuse()
+        if real_index and (tuple(args) not in READ_SHAPES or args[0] != "ls-files"): strict_refuse()
         effective = {k: v for k, v in self._lane_binding.base.items() if k in LOCATION_ENV}
         effective.update(supplied)
-        if args[:4] == ("check-attr", "-z", "--stdin", "--source"):
+        if args[:len(gitsafe_policy.SNAPSHOT_SOURCE_PREFIX)] == gitsafe_policy.SNAPSHOT_SOURCE_PREFIX:
             effective["GIT_ATTR_NOSYSTEM"] = "1"
         if shared: effective["GIT_OBJECT_DIRECTORY"] = str(self._lane_binding.paths[0] / "objects")
         if real_index: effective["GIT_INDEX_FILE"] = str(self._lane_binding.paths[2])
