@@ -436,16 +436,9 @@ def _view(row, now, blockers=()):
 def normalize_branch(value):
     """Return one optional local branch, or QueueRefusal('invalid_arguments'). Performs no I/O."""
     try:
-        value = team._check_branch(value)
+        return team.normalize_branch(value)
     except team.TeamUsageError:
         raise QueueRefusal("invalid_arguments") from None
-    if value is None:
-        return None
-    prefix = "refs/heads/"
-    _require(not value.startswith("refs/") or value.startswith(prefix), "invalid_arguments")
-    name = value[len(prefix):] if value.startswith(prefix) else value
-    _require(bool(name) and name != "HEAD" and not name.startswith("refs/"), "invalid_arguments")
-    return name
 
 
 _branch_name = normalize_branch
