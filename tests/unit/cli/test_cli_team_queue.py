@@ -1598,8 +1598,8 @@ OPERATION_GOLDENS = {'cli-queue/add/valid/text': 'fe60c6c01c8f5adeaa653e6bf7a8fc
  'lease/renew/overlap/json': '647cb05945388bf8bb8cbac7158fdf055401c8b782b6711878f88fb20a4ec5ad',
  'lease/renew/lease_branch_missing/text': '0715ef45e961c5a713fb4c35557570d044f99ee000661edcd40c0c066efb007c',
  'lease/renew/lease_branch_missing/json': '44fef522ab1cf9140a7543178fe1af58a91c931f7d9577c8a83ada41a71b7b01',
- 'lease/renew/ambient_git_environment/text': 'd5428fe34dfe3e59f23d68539f9b5d76a8408e8f4ebc74aa14d976f2e1be5468',
- 'lease/renew/ambient_git_environment/json': 'fc11639403f8f2038b4f16d15e55554888fb37cea220e41b2fae530a2255eb8a',
+ 'lease/renew/ambient_git_environment/text': 'e81e14f1289b80c16f220afde4623219949648c83e7b8dfedf04baa338f75bdd',
+ 'lease/renew/ambient_git_environment/json': '17cc25e996203aa8121e0bbee08e72b3c127e0352d24d80c3106aaedac69a7d3',
  'lease/transfer/valid/text': '63f17ca024f7e2f4e71bf67a32ba41417d735f4a8cfcfc3aab4f1b1a8a54decd',
  'lease/transfer/valid/json': '24798401e162f8a8a6a1fb4b2ee48ab531b5a1b9f4e15362f07564d7ab341eb1',
  'lease/transfer/oversized/text': '8902de7d0dc899f5f8fe1ba099b3ad8bd16e42105c8533e9af2650dc9ad37e3d',
@@ -1652,8 +1652,8 @@ OPERATION_GOLDENS = {'cli-queue/add/valid/text': 'fe60c6c01c8f5adeaa653e6bf7a8fc
  'lease/gc/not_repository/json': 'bff937951fd06d909691fec5601f796b5b6a554ea7f26d2a2361ad3d1abc6e67',
  'lease/gc/git_io/text': '5eb8c567de2eb92345f530cf1160036829b0919addee75dc96304eab662df0e7',
  'lease/gc/git_io/json': 'edbdd9d2bb1f8d2a63ebe9e670aafaafb8be76ec012ce817ef7151955f8e5206',
- 'lease/gc/ambient_git_environment/text': 'd5428fe34dfe3e59f23d68539f9b5d76a8408e8f4ebc74aa14d976f2e1be5468',
- 'lease/gc/ambient_git_environment/json': 'f5f08fd0724c8b97b42d6c445952eeab7fb9c21a84a15e7844193ac41b872411',
+ 'lease/gc/ambient_git_environment/text': 'e81e14f1289b80c16f220afde4623219949648c83e7b8dfedf04baa338f75bdd',
+ 'lease/gc/ambient_git_environment/json': '3b45e8660b707b5e2a1717d2a2e65f089c49c11074512b7f0330e85426eacdc4',
  'lease/list/valid/text': '698c39ce3d2a0f4af9339c274d50aed6c28bd7790b611e060fd5e8ffd0fdf3b3',
  'lease/list/valid/json': 'edcb414811eb771b6857fe5297ed918449d30e8d96c84290ad92c0c88736f076',
  'lease/list/oversized/text': '8902de7d0dc899f5f8fe1ba099b3ad8bd16e42105c8533e9af2650dc9ad37e3d',
@@ -2480,21 +2480,19 @@ def test_cli_recovery_from_another_cwd_names_and_reaches_its_workspace(
         os.chdir(previous)
 
 
-@pytest.fixture(scope="session")
-def _operation_repository_seed(tmp_path_factory):
-    """Build the operation matrix's deterministic Git base once per worker."""
+def _build_operation_repository_seed(base, environ):
+    """Build the deterministic Git base using an explicit caller environment."""
     if not team_queue.descriptor_supported():
         pytest.skip("requires descriptor-relative nofollow operations")
     if shutil.which("git") is None:
         pytest.skip("requires git")
-    base = tmp_path_factory.mktemp("operation-repository-seed")
     root = base / "workspace"
     (root / ".aegis" / "rules").mkdir(parents=True)
     (root / ".aegis" / "team.json").write_text(
         json.dumps({"v": 1, "lanes": {"writer": ["src/**"]}}), encoding="utf-8")
     home = base / "home"
     home.mkdir()
-    environment = {**os.environ, "HOME": str(home), "USERPROFILE": str(home),
+    environment = {**environ, "HOME": str(home), "USERPROFILE": str(home),
                    "XDG_CONFIG_HOME": str(home / ".config"),
                    "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
                    "GIT_CONFIG_NOSYSTEM": "1",
@@ -2510,6 +2508,13 @@ def _operation_repository_seed(tmp_path_factory):
             capture_output=True, text=True, timeout=15)
         assert result.returncode == 0, result.stderr
     return root
+
+
+@pytest.fixture(scope="session")
+def _operation_repository_seed(tmp_path_factory):
+    """Build the operation matrix's deterministic Git base once per worker."""
+    return _build_operation_repository_seed(
+        tmp_path_factory.mktemp("operation-repository-seed"), os.environ)
 
 
 @pytest.fixture
@@ -2557,21 +2562,71 @@ def test_operation_seed_ignores_user_templates(tmp_path, configuration):
     else:
         environment["GIT_CONFIG_SYSTEM"] = str(config)
         environment.pop("GIT_CONFIG_NOSYSTEM")
-    source = Path(__file__).resolve().parents[3]
-    selection = "tests/unit/cli/test_cli_team_queue.py::test_public_operation_byte_goldens"
-    basetemp = tmp_path / "matrix"
-    result = subprocess.run(
-        [sys.executable, "-m", "pytest", selection + "[core-queue-add-valid-dict]",
-         selection + "[profile-config-presets-valid-text]", "-n", "0", "-q", "--basetemp", str(basetemp)],
-        cwd=source, env=environment, capture_output=True, text=True, timeout=60)
-    assert result.returncode == 0, result.stdout + result.stderr
-    seeds = [path for path in basetemp.glob("operation-repository-seed*/workspace")
-             if not path.parent.is_symlink()]
-    copies = [path for path in basetemp.glob("test_public_operation_byte_gol*/workspace")
-              if not path.parent.is_symlink()]
+    base = tmp_path / "seed"
+    base.mkdir()
+    seeds = [_build_operation_repository_seed(base, environment)]
+    copies = [shutil.copytree(seeds[0], tmp_path / ("copy-" + str(index)))
+              for index in range(2)]
     assert len(seeds) == 1 and len(copies) == 2
     for root in seeds + copies:
         for name in ("pre-commit", "commit-msg"):
             assert not (root / ".git" / "hooks" / name).exists()
         assert (root / ".git" / "refs" / "heads" / "main").read_text(encoding="ascii") == (
             root / ".git" / "refs" / "heads" / "lane" / "writer").read_text(encoding="ascii")
+        assert (root / ".git" / "refs" / "heads" / "main").read_bytes() == (
+            seeds[0] / ".git" / "refs" / "heads" / "main").read_bytes()
+
+
+@pytest.mark.parametrize("command", ("init", "symbolic-ref", "commit", "update-ref"))
+def test_operation_seed_git_failure_is_error_and_retry_succeeds(tmp_path, monkeypatch, command):
+    if not team_queue.descriptor_supported():
+        pytest.skip("requires descriptor-relative nofollow operations")
+    if shutil.which("git") is None:
+        pytest.skip("requires git")
+    processes = subprocess
+    failed = []
+
+    def run(arguments, **options):
+        if command in arguments and not failed:
+            failed.append(command)
+            if options.get("check"):
+                raise processes.CalledProcessError(86, arguments)
+            return processes.CompletedProcess(arguments, 86, stderr="injected seed git failure")
+        return processes.run(arguments, **options)
+
+    monkeypatch.setattr("tests.unit.cli.test_cli_team_queue.subprocess", SimpleNamespace(run=run))
+    base = tmp_path / "failed"
+    base.mkdir()
+    error = processes.CalledProcessError if command == "init" else AssertionError
+    with pytest.raises(error) as caught:
+        _build_operation_repository_seed(base, os.environ)
+    if command == "init":
+        assert caught.value.returncode == 86
+        assert caught.value.cmd[:2] == ["git", "init"]
+    else:
+        assert str(caught.value).splitlines()[0] == "injected seed git failure"
+    assert failed == [command]
+    retry = tmp_path / "retry"
+    retry.mkdir()
+    root = _build_operation_repository_seed(retry, os.environ)
+    assert (root / ".git" / "refs" / "heads" / "main").read_bytes() == (
+        root / ".git" / "refs" / "heads" / "lane" / "writer").read_bytes()
+
+
+@pytest.mark.parametrize("boundary", ("descriptor", "git"))
+def test_operation_seed_unsupported_boundary_skips(tmp_path, monkeypatch, boundary):
+    monkeypatch.setattr("tests.unit.cli.test_cli_team_queue.team_queue", SimpleNamespace(
+        descriptor_supported=lambda: boundary != "descriptor"))
+    monkeypatch.setattr("tests.unit.cli.test_cli_team_queue.shutil", SimpleNamespace(which=lambda name: None))
+    reason = ("requires descriptor-relative nofollow operations" if boundary == "descriptor"
+              else "requires git")
+    with pytest.raises(pytest.skip.Exception) as caught:
+        _build_operation_repository_seed(tmp_path, os.environ)
+    assert str(caught.value) == reason
+
+
+def test_operation_seed_template_check_skips_on_windows(tmp_path, monkeypatch):
+    monkeypatch.setattr("tests.unit.cli.test_cli_team_queue.os", SimpleNamespace(name="nt"))
+    with pytest.raises(pytest.skip.Exception) as caught:
+        test_operation_seed_ignores_user_templates(tmp_path, "home")
+    assert str(caught.value) == "requires executable POSIX Git hooks"

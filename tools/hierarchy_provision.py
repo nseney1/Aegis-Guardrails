@@ -172,6 +172,7 @@ if __name__ == "__main__" and getattr(sys, "_aegis_verified_runtime_entry", None
 sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from hierarchy_mailbox_index import MailboxIndex  # noqa: E402
 from hierarchy_mailbox import (MAX_RECORDS, SLUG, Mailbox, digest, encoded, endpoint_parts, initialize, integer,  # noqa: E402
                                matching, publish_file, read_bytes, require, safe_path, strings, text,
                                timestamp, writer_lock)
@@ -249,19 +250,21 @@ TEAM_KINDS = hierarchy_roles.team_kinds()
 TEAM_CLAUDE_REFUSED = ("background", "assistants", "add_dirs")
 
 
-def git(cwd, *arguments):
+def git(cwd, *arguments, planned=None):
+    environment = object_read_env()
+    environment = hierarchy_hosts.child_environment(environment, "no-host") if planned is not False else environment
     return subprocess.run(object_read_argv(*arguments), cwd=cwd,
-                          capture_output=True, text=True, timeout=60, env=object_read_env())
+                          capture_output=True, text=True, timeout=60, env=environment)
 
 
-def pin_source(source):
+def pin_source(source, *, planned=None):
     source = safe_path(text(source, "source"))
     require(source.is_dir(), "source checkout is unavailable: " + str(source))
-    head = git(source, "rev-parse", "--show-toplevel", "HEAD", "HEAD^{tree}")
+    head = git(source, "rev-parse", "--show-toplevel", "HEAD", "HEAD^{tree}", planned=planned)
     require(head.returncode == 0, "source checkout is not a git checkout: " + str(source))
     top, commit, tree = head.stdout.splitlines()
     require(Path(top).resolve() == source.resolve(), "source checkout must be the repository root: " + str(source))
-    require(not git(source, "status", "--porcelain").stdout.strip(),
+    require(not git(source, "status", "--porcelain", planned=planned).stdout.strip(),
             "source checkout must be clean so adapters run exact committed code")
     require((source / "tools" / "hierarchy_mailbox.py").is_file(), "source checkout has no mailbox helper")
     delegated_read("runtime source", hierarchy_runtime_source.verify,
@@ -302,7 +305,24 @@ def init(request):
     python = text(python, "python")
     require(Path(python).is_absolute(), "python path must be absolute")
     require_interpreter(python)
-    source, commit, tree = pin_source(request["source"])
+    record_path = base / "provision.json"
+    local_plan = delegated_read("host-plan.json", hierarchy_hosts.base_plan, base, initiative["id"])
+    plan_state = local_plan is not None
+    if record_path.exists() or record_path.is_symlink():
+        # Discovery cannot replace a retained refusal or select legacy inheritance
+        # from an unreadable record. A valid local plan still governs such a base.
+        plan_state = True if local_plan is not None else None
+        mailbox_root = None
+        try:
+            setup = read_json(record_path)
+            if isinstance(setup, dict) and setup.get("initiative") == initiative["id"] and "mailbox_root" in setup:
+                mailbox_root = safe_path(text(setup["mailbox_root"], "mailbox_root"))
+        except (ValueError, OSError):
+            pass
+        if mailbox_root is not None:
+            plan = delegated_read("host-plan.json", hierarchy_hosts.governing_plan, base, mailbox_root, initiative["id"])
+            plan_state = plan is not None
+    source, commit, tree = pin_source(request["source"], planned=plan_state)
     board = request.get("board")
     if board is not None:
         delegated_read("board record", Board(text(board, "board")).load)
@@ -312,7 +332,6 @@ def init(request):
     endpoints = {hierarchy + "/front-door": {}, hierarchy + "/orchestrator": {}, hierarchy + "/root": {}}
     endpoints.update({hierarchy + "/" + role: {} for role in roles})
     endpoints.update({hierarchy + "/lane/" + lane: {"kind": kind} for lane, kind in lanes.items()})
-    record_path = base / "provision.json"
     # A missing store is reported as such, before the lock would fail on its absent folder.
     delegated_read("workspace record", store.load)
     # Under the store lock from the start, so a busy store stops this before anything exists, and registration
@@ -1097,7 +1116,7 @@ def check_root_reads(request, endpoint):
         safe_path(text(request[name], name))
 
 
-def check_role_request(request, setup):
+def check_role_request(request, setup, *, planned=None):
     fields(request, {"base", "endpoint", "host"}, {"session", "cwd", "tools", "add_dirs", "model", "effort", "timeout_seconds", "assistants",
                                                    "reader_shell", "writable_roots", "tmpdir", "skip_git_repo_check", "background",
                                                    "kind", "source_repo", "lifecycle", "actor", "loop_state", "evidence"})
@@ -1119,7 +1138,7 @@ def check_role_request(request, setup):
         require(endpoint_parts(request["endpoint"])[1] != "root", "the ROOT decision adapter takes no source views")
         hierarchy_roles.require_source_views(request["endpoint"], mailbox.endpoint(request["endpoint"]).get("kind"))
         repository = safe_path(text(request["source_repo"], "source_repo"))
-        require(repository.is_absolute() and git(repository, "rev-parse", "--show-toplevel").returncode == 0,
+        require(repository.is_absolute() and git(repository, "rev-parse", "--show-toplevel", planned=planned).returncode == 0,
                 "source_repo must be an absolute path to a git repository")
     check_model_request(request)
     if "add_dirs" in request:
@@ -1147,7 +1166,8 @@ def check_role_request(request, setup):
     cwd = safe_path(text(request.get("cwd", setup["source"]), "cwd"))
     require(cwd.is_dir(), "cwd is not a directory: " + str(cwd))
     if host == CODEX and not request.get("skip_git_repo_check"):
-        require(git(cwd, "rev-parse", "--is-inside-work-tree").returncode == 0, "codex needs a cwd inside a git checkout")
+        require(git(cwd, "rev-parse", "--is-inside-work-tree", planned=planned).returncode == 0,
+                "codex needs a cwd inside a git checkout")
     return cwd, timeout, assistants
 
 
@@ -1237,9 +1257,9 @@ def add_role(request):
     mailbox = delegated_read("mailbox manifest", Mailbox, setup["mailbox_root"])
     endpoint = request.get("endpoint")
     mailbox.endpoint(endpoint)
-    cwd, timeout, assistants = check_role_request(request, setup)
-    host = request["host"]
     plan = delegated_read("host-plan.json", hierarchy_hosts.governing_plan, base, setup["mailbox_root"], setup["initiative"])
+    cwd, timeout, assistants = check_role_request(request, setup, planned=plan is not None)
+    host = request["host"]
     scope, stand_in = check_host_plan(plan, request, mailbox, endpoint, cwd) if plan is not None else (None, False)
     if plan is not None and (stand_in or endpoint_parts(endpoint)[1] == "root"):
         governing, home = governing_setup(setup["mailbox_root"], plan)
@@ -1437,7 +1457,8 @@ def codex_start(request):
     writer = hierarchy_roles.writer(registry_role(mailbox, request["endpoint"]))
     cwd = safe_path(text(request.get("cwd", setup["source"]), "cwd"))
     if not request.get("skip_git_repo_check"):
-        require(git(cwd, "rev-parse", "--is-inside-work-tree").returncode == 0, "codex needs a cwd inside a git checkout")
+        require(git(cwd, "rev-parse", "--is-inside-work-tree", planned=plan is not None).returncode == 0,
+                "codex needs a cwd inside a git checkout")
     # Returned, not written: the session and its generation exist only once add-role binds it.
     profile = codex_profile(str(cwd), writer=writer, servers={}, options=options, endpoint=request["endpoint"],
                             role=hierarchy_roles.role_name(request["endpoint"], mailbox.endpoint(request["endpoint"]).get("kind")),
@@ -1479,7 +1500,7 @@ def claude_start(request):
     tools, _ = role_tools(endpoint, mailbox, None)
     cwd = safe_path(text(request.get("cwd", setup["source"]), "cwd"))
     # Codex's requirement, kept so both hosts start a role in the same kind of folder.
-    require(git(cwd, "rev-parse", "--is-inside-work-tree").returncode == 0,
+    require(git(cwd, "rev-parse", "--is-inside-work-tree", planned=plan is not None).returncode == 0,
             "a claude-code start needs a cwd inside a git checkout")
     connection = base / "connections" / (endpoint.replace("/", "%2F") + ".start.json")
     connection.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1497,6 +1518,11 @@ def claude_start(request):
     return {**answer, "team": team} if team is not None else answer
 
 
+def mailbox_reader(mailbox):
+    """Keep the pinned mailbox outcome authoritative during reader rollout."""
+    return MailboxIndex(mailbox, mode="shadow")
+
+
 def old_root_state(old_root, hierarchy):
     """Everything read from a live root, which this never writes to. A held lock means unsure, so it refuses."""
     old = delegated_read("mailbox manifest", Mailbox, safe_path(text(old_root, "old_root")))
@@ -1505,7 +1531,7 @@ def old_root_state(old_root, hierarchy):
     locks = [old.root / ".write.lock", *old.root.glob(".wake-" + hierarchy + "%2F*.lock")]
     busy = [path.name for path in locks if path.exists()]
     require(not busy, "the old root is busy (%s); try again once that finishes" % ", ".join(busy))
-    records = delegated_read("mailbox records", old.messages)
+    records = delegated_read("mailbox records", mailbox_reader(old).messages)
     closed, accepted = old.dispatch_history(records)
     acceptances = {message["in_reply_to"]: message for message in accepted}
     in_order = sorted((row for row in records.values() if row["message"]["from"] in names or row["message"]["to"] in names),
@@ -1667,7 +1693,7 @@ def carry(request):
     message_id = "carried-work-" + record["brief"]["sha256"][:32]
     with writer_lock(new.root):
         current = delegated_read("mailbox manifest", Mailbox, new.root)
-        if message_id not in delegated_read("mailbox records", current.messages):
+        if message_id not in delegated_read("mailbox records", mailbox_reader(current).messages):
             binding = delegated_read("mailbox records", current.current_binding, root_endpoint)
             delegated_read("mailbox records", current.publish,
                            {"message_id": message_id, "from": root_endpoint, "to": orchestrator,
@@ -1769,7 +1795,7 @@ def carry_check(request):
     names, seen = set(record["endpoints"]), set(record["message_ids"])
     late = sorted(({"message_id": identifier, "type": row["message"]["type"], "from": row["message"]["from"], "to": row["message"]["to"],
                     "created_at": row["message"]["created_at"], "path": row["path"]}
-                   for identifier, row in delegated_read("mailbox records", old.messages).items()
+                   for identifier, row in delegated_read("mailbox records", mailbox_reader(old).messages).items()
                    if identifier not in seen and (row["message"]["from"] in names or row["message"]["to"] in names)),
                   key=lambda row: row["created_at"])
     changed = sorted(name for name in record["endpoints"]

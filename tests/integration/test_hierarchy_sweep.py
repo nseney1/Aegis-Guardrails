@@ -4,11 +4,15 @@ Hosts are the fake host on PATH, which reads and replies through the real adapte
 the tools work together, not that real sessions behave this way.
 """
 from datetime import datetime, timedelta, timezone
+import errno
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
+import select
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -20,6 +24,7 @@ from tests.integration.test_hierarchy_background import STUB
 from tests.integration.test_hierarchy_delivery import HELPER
 from tests.integration.test_hierarchy_mailbox import ROOT, git, invoke
 from tests.integration.test_hierarchy_provision import INITIATIVE, LANES, Setup, provision
+from tests.conftest import symlink_or_skip
 
 
 SWEEP = ROOT / "tools" / "hierarchy_sweep.py"
@@ -60,7 +65,7 @@ class Fleet(Setup):
         result = subprocess.run([sys.executable, "-I", str(SWEEP), "--store", str(store or self.workspace.store), *flags],
                                 capture_output=True, text=True, timeout=90, env=self.env())
         assert not result.stderr, result.stderr
-        assert result.returncode == expect, result.stdout
+        assert result.returncode in (expect if isinstance(expect, tuple) else (expect,)), result.stdout
         return json.loads(result.stdout)
 
     def launches(self):
@@ -104,6 +109,304 @@ def test_nothing_unread_means_nothing_is_launched(fleet):
     assert result["quiet"] is True and result["rows"] == []
     assert result["root_queue"] == [] and result["still_unread"] == []
     assert fleet.launches() == []
+
+
+@pytest.mark.parametrize("action", ["quiet", "publish", "cross_publish", "fail_once"])
+def test_sweep_shares_each_pass_summary_and_refreshes_after_wakes(fleet, monkeypatch, action):
+    import hierarchy_sweep as candidate
+
+    original = candidate.summaries
+    calls = []
+    other = second_initiative(fleet) if action == "cross_publish" else None
+
+    def observed(initiative, durable=False, **kwargs):
+        calls.append(initiative["id"])
+        if action == "fail_once" and len(calls) == 1:
+            raise ValueError("mailbox unavailable")
+        return original(initiative, durable, **kwargs)
+
+    def wake(initiative, name, summary, dry_run, durable=False):
+        if other is None:
+            fleet.send("pilot/orchestrator", "pilot/front-door", "published-during-wake")
+        else:
+            fleet.send("second/orchestrator", "second/front-door", "published-during-wake", root=other)
+        return {"initiative": initiative["id"], "endpoint": name, "state": "refused"}
+
+    monkeypatch.setattr("hierarchy_sweep.summaries", observed)
+    monkeypatch.setattr("hierarchy_sweep.wake_endpoint", wake)
+    if action in ("publish", "cross_publish"):
+        fleet.send("pilot/front-door", "pilot/orchestrator", "wake-trigger")
+    code, result = candidate.run(fleet.workspace.store, 1, (), False)
+    assert len(calls) == (1 if action == "quiet" else 4 if action == "cross_publish" else 2)
+    if action in ("publish", "cross_publish"):
+        assert code == 3
+        assert {row["endpoint"] for row in result["still_unread"]} == {
+            "pilot/orchestrator", "second/front-door" if other is not None else "pilot/front-door"}
+    elif action == "fail_once":
+        assert code == 3 and result["rows"][0]["error"] == "mailbox unavailable"
+    else:
+        assert code == 0 and result["quiet"] is True
+
+
+def test_sweep_failed_pass_does_not_reuse_a_previous_pass_summary(fleet, monkeypatch):
+    import hierarchy_sweep as candidate
+
+    other = second_initiative(fleet, priority=10)
+    fleet.send("pilot/front-door", "pilot/orchestrator", "wake-trigger")
+    original = candidate.summaries
+    second_reads = []
+
+    def observed(initiative, durable=False, **kwargs):
+        if initiative["id"] == "second":
+            second_reads.append(True)
+            if len(second_reads) == 2:
+                fleet.send("second/orchestrator", "second/front-door", "published-before-failure", root=other)
+                raise ValueError("later pass unavailable")
+        return original(initiative, durable, **kwargs)
+
+    def wake(initiative, name, summary, dry_run, durable=False):
+        return {"initiative": initiative["id"], "endpoint": name, "state": "started", "wake_exit": 0}
+
+    monkeypatch.setattr("hierarchy_sweep.summaries", observed)
+    monkeypatch.setattr("hierarchy_sweep.wake_endpoint", wake)
+    code, result = candidate.run(fleet.workspace.store, 2, (), False)
+    assert code == 3 and result["rounds"] == 1
+    assert len(second_reads) == 3
+    assert {row["endpoint"] for row in result["still_unread"]} == {"pilot/orchestrator", "second/front-door"}
+    assert result["rows"][-1]["error"] == "later pass unavailable"
+
+
+def test_sweep_revalidates_manifest_before_reusing_a_quiet_snapshot(fleet, monkeypatch):
+    import hierarchy_sweep as candidate
+
+    original = candidate.Mailbox
+    changed = []
+
+    class ChangedManifestMailbox(original):
+        def endpoint_delivery(self, directory, endpoint, records):
+            result = super().endpoint_delivery(directory, endpoint, records)
+            if not changed and endpoint == sorted(self.manifest["endpoints"])[-1]:
+                changed.append(True)
+                (self.root / "manifest.json").write_text(
+                    json.dumps({**self.manifest, "writer_limit": 2}), encoding="utf-8")
+                fleet.send("pilot/orchestrator", "pilot/front-door", "published-with-new-manifest")
+            return result
+
+    monkeypatch.setattr("hierarchy_sweep.Mailbox", ChangedManifestMailbox)
+    code, report = candidate.run(fleet.workspace.store, 1, (), True)
+    expected = [{"initiative": "pilot", "endpoint": "pilot/front-door", "unread_count": 1}]
+    assert code == 3 and report["still_unread"] == expected
+    assert report["rows"] == []
+    # A later run uses the current authority and does not retain the old pass.
+    code, report = candidate.run(fleet.workspace.store, 1, (), True, skip=("pilot/front-door",))
+    assert code == 3 and report["still_unread"] == expected
+    assert report["rows"][0]["state"] == "skipped"
+
+
+@pytest.mark.parametrize("change", [
+    "corrupt_message", "publish", "routing_symlink", "corrupt_binding", "corrupt_receipt", "remove_message",
+    "message_reformat", "binding_reformat", "receipt_reformat", "new_receipt",
+])
+def test_sweep_rechecks_all_summary_dependencies_after_an_external_change(fleet, monkeypatch, change):
+    import hierarchy_sweep as candidate
+
+    original_mailbox, original_summaries = candidate.Mailbox, candidate.summaries
+    fleet.send("pilot/orchestrator", "pilot/front-door", "seed")
+    box = original_mailbox(fleet.root)
+    binding = box.current_binding("pilot/front-door")
+    box.record_read(str(fleet.base / "delivery"), {
+        "from": "pilot/front-door", "host": binding["host"], "session": binding["session"],
+        "binding_generation": binding["generation"]}, ["seed"])
+    message_path = Path(box.messages()["seed"]["path"])
+    binding_path = fleet.root / "bindings/pilot/front-door/000001.json"
+    receipt_path = next((fleet.base / "delivery/reads/pilot/front-door").glob("*.json"))
+    later = second_initiative(fleet, identifier="later", priority=10)
+    before_manifest, mutated, builds = (fleet.root / "manifest.json").read_bytes(), [], []
+
+    class LaterMailbox(original_mailbox):
+        def __init__(self, root):
+            super().__init__(root)
+            if self.root != later or mutated:
+                return
+            mutated.append(True)
+            if change == "publish":
+                fleet.send("pilot/orchestrator", "pilot/front-door", "external-publication")
+            elif change == "routing_symlink":
+                directory = fleet.root / "pilot/orchestrator"
+                target = fleet.tmp / "old-orchestrator-routing"
+                directory.rename(target)
+                symlink_or_skip(target, directory, target_is_directory=True)
+            elif change == "remove_message":
+                message_path.unlink()
+            elif change == "message_reformat":
+                header, body = message_path.read_bytes()[4:].split(b"\n---\n\n", 1)
+                message_path.write_bytes(b"---\n" + json.dumps(json.loads(header), indent=2).encode() + b"\n---\n\n" + body)
+            elif change == "new_receipt":
+                (receipt_path.parent / "additional.json").write_bytes(receipt_path.read_bytes())
+            else:
+                path = {"corrupt_message": message_path, "corrupt_binding": binding_path,
+                        "corrupt_receipt": receipt_path, "binding_reformat": binding_path,
+                        "receipt_reformat": receipt_path}[change]
+                if change.endswith("reformat"):
+                    path.write_text(json.dumps(json.loads(path.read_bytes()), indent=2), encoding="utf-8")
+                else:
+                    path.write_bytes(b"garbage")
+
+    def observed(initiative, durable=False, **kwargs):
+        builds.append(initiative["id"])
+        return original_summaries(initiative, durable, **kwargs)
+
+    monkeypatch.setattr("hierarchy_sweep.Mailbox", LaterMailbox)
+    monkeypatch.setattr("hierarchy_sweep.summaries", observed)
+    code, report = candidate.run(fleet.workspace.store, 1, (), True)
+    assert mutated == [True] and fleet.launches() == []
+    assert (fleet.root / "manifest.json").read_bytes() == before_manifest
+    if change == "publish":
+        assert code == 3 and report["quiet"] is False
+        assert report["still_unread"] == [{"initiative": "pilot", "endpoint": "pilot/front-door", "unread_count": 1}]
+        assert report["rows"] == []
+    elif change.endswith("reformat") or change == "new_receipt":
+        assert code == 0 and report["quiet"] is True and report["rows"] == []
+        assert builds.count("pilot") == 2, "changed filesystem inputs require a fresh derived summary"
+    else:
+        with pytest.raises(ValueError) as expected:
+            pinned = original_mailbox(fleet.root)
+            pinned.endpoint_delivery(str(fleet.base / "delivery"), "pilot/front-door", pinned.messages())
+        assert code == 3 and report["quiet"] is False
+        assert report["rows"] == [{"initiative": "pilot", "state": "mailbox_error", "error": str(expected.value)[:512]}]
+
+
+@pytest.mark.parametrize("durable", [False, True])
+def test_non_durable_admission_defers_an_idle_marker_refusal_until_reporting(fleet, durable):
+    import hierarchy_sweep as candidate
+
+    fleet.send("pilot/front-door", "pilot/orchestrator", "healthy-unread")
+    target = fleet.tmp / "idle-marker-target"
+    target.write_text("fixture marker", encoding="utf-8")
+    symlink_or_skip(target, fleet.root / ".wake-pilot%2Ffront-door.lock")
+    report = fleet.sweep("--dry-run", *(("--durable",) if durable else ()), expect=3)
+    assert report["quiet"] is False
+    assert [row["state"] for row in report["rows"]] == (["mailbox_error"] if durable else ["would_wake", "mailbox_error"])
+    if not durable:
+        assert report["rows"][0]["endpoint"] == "pilot/orchestrator"
+    with pytest.raises(ValueError) as expected:
+        candidate.Mailbox(fleet.root).wake_marker("pilot/front-door")
+    assert report["rows"][-1]["error"] == str(expected.value)[:512]
+    assert fleet.launches() == []
+
+
+def test_sweep_without_descriptor_capabilities_refreshes_through_pin(fleet, monkeypatch):
+    import hierarchy_sweep as candidate
+
+    original, calls = candidate.summaries, []
+
+    def observed(initiative, durable=False, **kwargs):
+        calls.append(durable)
+        return original(initiative, durable, **kwargs)
+
+    monkeypatch.setattr("hierarchy_sweep.summary_cache_supported", lambda: False)
+    monkeypatch.setattr("hierarchy_sweep.summaries", observed)
+    code, report = candidate.run(fleet.workspace.store, 1, (), True)
+    assert code == 0 and report["quiet"] is True and report["rows"] == []
+    assert calls == [False, True]
+
+
+def test_durable_admission_preserves_the_first_endpoints_refusal(fleet):
+    import hierarchy_sweep as candidate
+
+    target = fleet.tmp / "idle-marker-target"
+    target.write_text("fixture marker", encoding="utf-8")
+    symlink_or_skip(target, fleet.root / ".wake-pilot%2Ffront-door.lock")
+    (fleet.root / "bindings/pilot/orchestrator/000001.json").write_bytes(b"invalid binding")
+    with pytest.raises(ValueError) as expected:
+        candidate.Mailbox(fleet.root).wake_marker("pilot/front-door")
+    report = fleet.sweep("--dry-run", "--durable", expect=3)
+    assert report["quiet"] is False
+    assert report["rows"] == [{"initiative": "pilot", "state": "mailbox_error", "error": str(expected.value)[:512]}]
+
+
+@pytest.mark.parametrize("limit", ["entries", "bytes", "names", "depth", "path"])
+def test_sweep_cache_budget_misses_close_every_descriptor(fleet, monkeypatch, limit):
+    import hierarchy_sweep as candidate
+
+    if not candidate.summary_cache_supported() or not Path("/proc/self/fd").is_dir():
+        pytest.skip("requires descriptor cache support and the Linux descriptor census")
+    mailbox = candidate.Mailbox(fleet.root)
+    initiative = {"delivery_dir": str(fleet.base / "delivery")}
+    assert candidate.summary_fingerprint(mailbox, initiative) is not None
+    if limit == "entries":
+        monkeypatch.setattr("hierarchy_sweep.CACHE_ENTRIES", 1)
+    elif limit == "bytes":
+        monkeypatch.setattr("hierarchy_sweep.CACHE_BYTES", 1)
+    elif limit == "names":
+        monkeypatch.setattr("hierarchy_sweep.CACHE_NAMES", 1)
+    elif limit == "depth":
+        monkeypatch.setattr("hierarchy_sweep.CACHE_DEPTH", 1)
+    else:
+        monkeypatch.setattr("hierarchy_sweep.CACHE_PATH", 1)
+    before = len(os.listdir("/proc/self/fd"))
+    for _ in range(3):
+        assert candidate.summary_fingerprint(mailbox, initiative) is None
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
+@pytest.mark.parametrize("failure", ["ancestor_symlink", "read_error", "scandir_error"])
+def test_sweep_descriptor_observation_refuses_races_and_closes_on_os_failures(fleet, monkeypatch, failure):
+    import hierarchy_sweep as candidate
+
+    if not candidate.summary_cache_supported() or not Path("/proc/self/fd").is_dir():
+        pytest.skip("requires descriptor cache support and the Linux descriptor census")
+    mailbox = candidate.Mailbox(fleet.root)
+    initiative = {"delivery_dir": str(fleet.base / "delivery")}
+    outside, retained = fleet.tmp / "outside-cache-root", fleet.tmp / "retained-pilot"
+    (outside / "mailbox").mkdir(parents=True)
+    (outside / "mailbox/canary").write_bytes(b"must not read outside the held root")
+    observed = []
+
+    class CacheOS:
+        name = os.name
+        O_RDONLY, O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK = os.O_RDONLY, os.O_DIRECTORY, os.O_NOFOLLOW, os.O_NONBLOCK
+        supports_dir_fd, supports_fd = os.supports_dir_fd, os.supports_fd
+        supports_follow_symlinks = os.supports_follow_symlinks
+        fstat, stat, close = staticmethod(os.fstat), staticmethod(os.stat), staticmethod(os.close)
+        fspath, fsencode = staticmethod(os.fspath), staticmethod(os.fsencode)
+        geteuid, getegid, getgroups = staticmethod(os.geteuid), staticmethod(os.getegid), staticmethod(os.getgroups)
+
+        @staticmethod
+        def open(name, flags, *, dir_fd=None):
+            if (failure == "ancestor_symlink" and not observed and name == fleet.base.name and
+                    dir_fd is not None and os.readlink("/proc/self/fd/%d" % dir_fd) == str(fleet.base.parent)):
+                observed.append("swapped")
+                fleet.base.rename(retained)
+                symlink_or_skip(outside, fleet.base, target_is_directory=True)
+            return os.open(name, flags, dir_fd=dir_fd)
+
+        @staticmethod
+        def read(descriptor, size):
+            assert not os.readlink("/proc/self/fd/%d" % descriptor).startswith(str(outside))
+            if failure == "read_error":
+                observed.append("read refused")
+                raise OSError(errno.EIO, "fixture cache read refused")
+            return os.read(descriptor, size)
+
+        @staticmethod
+        def scandir(descriptor):
+            if failure == "scandir_error":
+                observed.append("listing refused")
+                raise OSError(errno.EIO, "fixture cache listing refused")
+            return os.scandir(descriptor)
+
+    monkeypatch.setattr("hierarchy_sweep.os", CacheOS)
+    assert candidate.summary_cache_supported()
+    before = len(os.listdir("/proc/self/fd"))
+    try:
+        assert candidate.summary_fingerprint(mailbox, initiative) is None
+        assert observed
+        assert len(os.listdir("/proc/self/fd")) == before
+    finally:
+        if retained.exists():
+            fleet.base.unlink()
+            retained.rename(fleet.base)
 
 
 def test_mail_quiet_does_not_claim_that_untracked_work_is_complete(fleet):
@@ -193,39 +496,532 @@ def test_a_session_with_unread_mail_is_woken_and_reads_it(fleet):
 
 
 @posix_only
-def test_a_sweep_wake_in_background_mode_reports_the_idle_session_it_stopped(fleet):
-    stub, state = fleet.tmp / "claude_stub.py", fleet.tmp / "background-state"
-    stub.write_text(STUB, encoding="utf-8")
-    state.mkdir()
-    session, endpoint = fleet.orchestrator["session"], "pilot/orchestrator"
+@pytest.mark.parametrize("state", ["alive", "exited", "assertion_failure", "exit_race", "permission_error"])
+def test_background_mode_holder_cleanup_only_signals_live_handles(state):
     holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
-    (state / "old00000.row").write_text(json.dumps({
-        "id": "old00000", "sessionId": session, "status": "idle", "state": "blocked", "kind": "background",
-        "name": endpoint + "-g1", "pid": holder.pid}))
-    path = Path(fleet.orchestrator["wake_profile"])
-    profile = json.loads(path.read_text())
-    profile.update(mode="background", prompt_via="argv", control=[sys.executable, str(stub), str(state), "control"],
-                   argv=[sys.executable, str(stub), str(state), "reader", str(HELPER), str(fleet.root), endpoint,
-                         "claude-code", session, str(fleet.base / "delivery"), str(fleet.tmp / "stub-record.json"),
-                         "--bg", "--name", endpoint + "-g1", "--resume", session, "--"])
-    path.write_text(json.dumps(profile))
-    fleet.send("pilot/front-door", endpoint, "hello")
+    signals = []
+
+    def signal_group(pid, sig):
+        assert holder.returncode is None and holder.poll() is None, "signalled a reaped holder"
+        assert pid == holder.pid
+        signals.append((pid, sig))
+        if state == "exit_race":
+            if holder.poll() is None:
+                holder.kill()
+            holder.wait(timeout=5)
+            raise ProcessLookupError("holder exited before group signal")
+        if state == "permission_error":
+            raise PermissionError("group signal denied")
+        os.killpg(pid, sig)
+
     try:
-        row = fleet.sweep()["rows"][0]
-    finally:
-        holder.kill()
-        holder.wait(timeout=5)
-        for planted in state.glob("*.row"):
-            pid = json.loads(planted.read_text())["pid"]
-            if pid > 0:
+        if state == "exited":
+            if holder.poll() is None:
+                holder.kill()
+            holder.wait(timeout=5)
+        if state == "assertion_failure":
+            with pytest.raises(AssertionError, match="fixture assertion failed"):
                 try:
-                    os.killpg(pid, 9)
-                except (ProcessLookupError, PermissionError):
-                    pass
+                    raise AssertionError("fixture assertion failed")
+                finally:
+                    reap_background_mode_holder(holder, signal_group)
+        else:
+            reap_background_mode_holder(holder, signal_group)
+        assert holder.returncode is not None
+        assert signals == ([] if state == "exited" else [(holder.pid, 9)])
+        reap_background_mode_holder(holder, signal_group)
+        assert signals == ([] if state == "exited" else [(holder.pid, 9)]), "retry signalled a reaped holder"
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+        holder.wait(timeout=5)
+
+
+def reap_background_mode_holder(holder, signal_group, sig=9):
+    """Keep the OS signal boundary explicit so cleanup can be checked with real children."""
+    try:
+        if holder.poll() is None:
+            try:
+                signal_group(holder.pid, sig)
+            except (ProcessLookupError, PermissionError):
+                if holder.poll() is None:
+                    holder.kill()
+    finally:
+        holder.wait(timeout=5)
+
+
+@posix_only
+def test_a_sweep_wake_in_background_mode_reports_the_idle_session_it_stopped(fleet):
+    row = run_background_mode_sweep(fleet)
     assert row["state"] == "read" and row["read"] == ["hello"], row
     # The stop of the earlier idle session and how this turn ended must reach ROOT through the sweep row.
     assert row["stopped_idle"] == "old00000", row
     assert row["background"]["ended"] == "idle" and row["background"]["stop_confirmed"] is True, row
+
+
+def background_process_identity(pid, proc=Path("/proc")):
+    try:
+        fields = (proc / str(pid) / "stat").read_text().rpartition(")")[2].split()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    if len(fields) <= 19 or not fields[19].isdigit():
+        raise AssertionError("invalid process start identity")
+    return None if fields[0] in ("Z", "X") else int(fields[19])
+
+
+def background_reader_supported():
+    return sys.platform == "linux" and Path("/proc/self/stat").is_file()
+
+
+def require_background_reader_identity():
+    if not background_reader_supported():
+        pytest.skip("background reader cleanup needs Linux process start identities")
+    if not background_pidfd_supported():
+        raise RuntimeError("background reader cleanup requires pidfd signalling on " + sys.platform)
+
+
+def background_pidfd_supported():
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        return False
+    try:
+        fd = os.pidfd_open(os.getpid())
+    except OSError:
+        return False
+    try:
+        signal.pidfd_send_signal(fd, 0)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def observed_background_reader(state):
+    record = state / "reader-identity.json"
+    return json.loads(record.read_text()) if record.exists() else None
+
+
+def stop_observed_background_reader(observed, signal_reader=None, identity=background_process_identity, timeout=5,
+                                    open_pidfd=None):
+    if observed is None:
+        return
+    pid, started_at = observed
+    if started_at is None:
+        return
+    require_background_reader_identity()
+    opener = os.pidfd_open if open_pidfd is None else open_pidfd
+    sender = signal.pidfd_send_signal if signal_reader is None else signal_reader
+    try:
+        fd = opener(pid)
+    except ProcessLookupError:
+        return
+    try:
+        if identity(pid) != started_at:
+            return
+        try:
+            sender(fd, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        if not select.select([fd], [], [], timeout)[0]:
+            raise TimeoutError("background reader did not exit")
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize("state", ["live", "gone", "reused", "exit_race", "denied", "timeout"])
+def test_background_reader_cleanup_checks_identity_and_bounds_exit(state):
+    require_background_reader_identity()
+    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+    signals, descriptors = [], []
+
+    def open_bound(pid):
+        fd = os.pidfd_open(pid)
+        descriptors.append(fd)
+        return fd
+
+    def signal_reader(fd, sig):
+        assert holder.poll() is None
+        assert (holder.pid, background_process_identity(holder.pid)) == observed
+        signals.append((holder.pid, sig))
+        if state == "exit_race":
+            if holder.poll() is None:
+                holder.kill()
+            holder.wait(timeout=5)
+            raise ProcessLookupError("reader exited before group signal")
+        if state == "denied":
+            raise PermissionError("reader group signal denied")
+        if state != "timeout":
+            signal.pidfd_send_signal(fd, sig)
+
+    try:
+        observed = (holder.pid, background_process_identity(holder.pid))
+        assert observed[1] is not None
+        if state == "gone":
+            reap_background_mode_holder(holder, os.killpg)
+        target = (holder.pid, observed[1] + 1) if state == "reused" else observed
+        if state in ("denied", "timeout"):
+            error, message = ((PermissionError, "reader group signal denied") if state == "denied"
+                              else (TimeoutError, "background reader did not exit"))
+            with pytest.raises(error, match="^" + message + "$"):
+                stop_observed_background_reader(target, signal_reader, timeout=0, open_pidfd=open_bound)
+            assert holder.poll() is None
+            reap_background_mode_holder(holder, os.killpg)
+        else:
+            stop_observed_background_reader(target, signal_reader, open_pidfd=open_bound)
+        if state == "reused":
+            assert holder.poll() is None, "a different start identity must remain untouched"
+        else:
+            holder.wait(timeout=5)
+        expected = [] if state in ("gone", "reused") else [(holder.pid, signal.SIGTERM)]
+        assert signals == expected
+        stop_observed_background_reader(target, signal_reader, open_pidfd=open_bound)
+        assert signals == expected, "cleanup retry must not signal a departed or different process"
+        for fd in descriptors:
+            with pytest.raises(OSError) as caught:
+                os.fstat(fd)
+            assert caught.value.errno == errno.EBADF
+    finally:
+        reap_background_mode_holder(holder, os.killpg)
+
+
+def test_background_reader_cleanup_without_an_observation_does_not_signal():
+    def unexpected_signal(pid, sig):
+        raise AssertionError("an unobserved reader must not be signalled")
+
+    stop_observed_background_reader(None, unexpected_signal)
+    stop_observed_background_reader((1, None), unexpected_signal)
+
+
+def test_background_reader_identity_error_closes_bound_descriptor():
+    require_background_reader_identity()
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+    descriptors = []
+
+    def open_bound(pid):
+        fd = os.pidfd_open(pid)
+        descriptors.append(fd)
+        return fd
+
+    def denied_identity(pid):
+        raise PermissionError("reader identity read denied")
+
+    try:
+        observed = (child.pid, background_process_identity(child.pid))
+        with pytest.raises(PermissionError, match="^reader identity read denied$"):
+            stop_observed_background_reader(observed, identity=denied_identity, open_pidfd=open_bound)
+        assert child.poll() is None
+        for fd in descriptors:
+            with pytest.raises(OSError) as caught:
+                os.fstat(fd)
+            assert caught.value.errno == errno.EBADF
+    finally:
+        reap_background_mode_holder(child, os.killpg)
+
+
+@pytest.mark.parametrize("state,expected", [("S", 901), ("Z", None), ("X", None)])
+def test_background_reader_identity_handles_process_names_and_exit_states(tmp_path, state, expected):
+    process = tmp_path / "123"
+    process.mkdir()
+    (process / "stat").write_text("123 (name with ) and spaces) " + " ".join([state] + ["0"] * 18 + ["901"]))
+    assert background_process_identity(123, tmp_path) == expected
+
+
+def test_background_reader_identity_handles_missing_and_malformed_records(tmp_path):
+    assert background_process_identity(123, tmp_path) is None
+    process = tmp_path / "123"
+    process.mkdir()
+    (process / "stat").write_text("123 (short) S")
+    with pytest.raises(AssertionError, match="^invalid process start identity$"):
+        background_process_identity(123, tmp_path)
+
+
+def test_background_reader_identity_probe_skips_unsupported_platform(monkeypatch):
+    monkeypatch.setattr("tests.integration.test_hierarchy_sweep.background_reader_supported", lambda: False)
+    with pytest.raises(pytest.skip.Exception, match="^background reader cleanup needs Linux process start identities$"):
+        require_background_reader_identity()
+
+
+def test_background_reader_missing_pidfd_support_refuses_without_numeric_fallback(monkeypatch):
+    monkeypatch.setattr("tests.integration.test_hierarchy_sweep.background_pidfd_supported", lambda: False)
+    with pytest.raises(RuntimeError, match="^background reader cleanup requires pidfd signalling on " + sys.platform + "$"):
+        require_background_reader_identity()
+
+
+def publish_background_reader(state, child, fail_at=None):
+    def step(name):
+        if fail_at == name:
+            raise OSError("reader identity publication " + name + " failed")
+
+    record = state / "reader-identity.json"
+    temporary = state / "reader-identity.json.tmp"
+    try:
+        step("open")
+        stream = temporary.open("w", encoding="utf-8")
+        try:
+            step("write")
+            json.dump([child.pid, background_process_identity(child.pid)], stream)
+        finally:
+            stream.close()
+            step("close")
+        step("rename")
+        os.replace(temporary, record)
+    except BaseException:
+        reap_background_mode_holder(child, os.killpg, sig=signal.SIGTERM)
+        raise
+
+
+def exit_background_reader(signum, frame):
+    raise SystemExit(0)
+
+
+def run_background_reader_helper(argv, *, input, text, capture_output, check, pass_fds=()):
+    assert text and capture_output, "reader helper requires captured text"
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    try:
+        restore = ("import os, signal, sys; signal.pthread_sigmask(signal.SIG_SETMASK, "
+                   + repr(sorted(int(item) for item in previous)) + "); os.execv(sys.argv[1], sys.argv[1:])")
+        child = subprocess.Popen([sys.executable, "-c", restore, *argv],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 text=True, start_new_session=True, pass_fds=pass_fds)
+        with child.stdin, child.stdout, child.stderr:
+            try:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+                stdout, stderr = child.communicate(input)
+            finally:
+                signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+                reap_background_mode_holder(child, os.killpg)
+        if check and child.returncode:
+            raise subprocess.CalledProcessError(child.returncode, argv, output=stdout, stderr=stderr)
+        return subprocess.CompletedProcess(argv, child.returncode, stdout, stderr)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+@pytest.mark.parametrize("fail_at", ["open", "write", "close", "rename"])
+def test_background_reader_publication_failure_reaps_its_unpublished_child(tmp_path, fail_at):
+    require_background_reader_identity()
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+    try:
+        with pytest.raises(OSError, match="^reader identity publication " + fail_at + " failed$"):
+            publish_background_reader(tmp_path, child, fail_at)
+        assert child.poll() is not None, "unpublished reader survived publication failure"
+        assert not (tmp_path / "reader-identity.json").exists()
+    finally:
+        reap_background_mode_holder(child, os.killpg)
+    replacement = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+    try:
+        publish_background_reader(tmp_path, replacement)
+        publish_background_reader(tmp_path, replacement)
+        assert replacement.poll() is None
+        assert observed_background_reader(tmp_path) == [replacement.pid, background_process_identity(replacement.pid)]
+    finally:
+        reap_background_mode_holder(replacement, os.killpg)
+
+
+def test_background_reader_real_publication_open_error_reaps_child(tmp_path):
+    require_background_reader_identity()
+    (tmp_path / "reader-identity.json.tmp").mkdir()
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+    try:
+        with pytest.raises(IsADirectoryError):
+            publish_background_reader(tmp_path, child)
+        assert child.poll() is not None
+    finally:
+        reap_background_mode_holder(child, os.killpg)
+
+
+@pytest.mark.parametrize("stop_method", ["pidfd", "open", "write", "close", "rename"])
+def test_background_reader_pidfd_stop_reaps_helper_group_and_descendant(tmp_path, stop_method):
+    require_background_reader_identity()
+    definitions = (background_process_identity, reap_background_mode_holder,
+                   exit_background_reader, run_background_reader_helper)
+    imports = "import json, os, signal, subprocess, sys\nfrom pathlib import Path\n"
+    helper = (imports + inspect.getsource(background_process_identity) + '''
+grandchild = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+members = [[os.getpid(), background_process_identity(os.getpid())],
+           [grandchild.pid, background_process_identity(grandchild.pid)]]
+os.write(int(sys.argv[1]), (json.dumps(members) + "\\n").encode())
+grandchild.wait(timeout=60)
+''')
+    script = (imports + "\n".join(inspect.getsource(function) for function in definitions) + '''
+signal.signal(signal.SIGTERM, exit_background_reader)
+ready = int(sys.argv[1])
+run_background_reader_helper([sys.executable, "-c", sys.argv[2], str(ready)], input="", text=True,
+                             capture_output=True, check=True, pass_fds=(ready,))
+''')
+    ready_r, ready_w = os.pipe()
+    reader, members, member_fds = None, [], []
+    try:
+        reader = subprocess.Popen([sys.executable, "-c", script, str(ready_w), helper], pass_fds=(ready_w,),
+                                  start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        os.close(ready_w)
+        ready_w = None
+        assert select.select([ready_r], [], [], 5)[0], "helper group did not announce readiness"
+        members = json.loads(os.read(ready_r, 4096))
+        assert len(members) == 2 and all(start is not None for _, start in members)
+        assert os.getpgid(members[0][0]) == members[0][0]
+        assert os.getpgid(members[1][0]) == members[0][0]
+        for pid, start in members:
+            member_fds.append(os.pidfd_open(pid))
+            assert background_process_identity(pid) == start
+        observed = (reader.pid, background_process_identity(reader.pid))
+        if stop_method == "pidfd":
+            stop_observed_background_reader(observed)
+        else:
+            with pytest.raises(OSError, match="^reader identity publication " + stop_method + " failed$"):
+                publish_background_reader(tmp_path, reader, fail_at=stop_method)
+        reader.wait(timeout=5)
+        assert all(select.select([fd], [], [], 5)[0] for fd in member_fds), "helper group did not exit"
+        assert all(background_process_identity(pid) != start for pid, start in members)
+    finally:
+        try:
+            if reader is not None:
+                try:
+                    stop_observed_background_reader((reader.pid, background_process_identity(reader.pid)))
+                finally:
+                    reap_background_mode_holder(reader, os.killpg)
+        finally:
+            try:
+                for fd in member_fds:
+                    try:
+                        if not select.select([fd], [], [], 0)[0]:
+                            signal.pidfd_send_signal(fd, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    assert select.select([fd], [], [], 5)[0], "helper rescue did not exit"
+            finally:
+                try:
+                    for fd in member_fds:
+                        os.close(fd)
+                finally:
+                    os.close(ready_r)
+                    if ready_w is not None:
+                        os.close(ready_w)
+
+
+def test_background_reader_reuse_after_identity_check_never_signals_replacement():
+    require_background_reader_identity()
+    original = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+    descriptors, replacement_signals = [], []
+
+    def open_bound(pid):
+        fd = os.pidfd_open(pid)
+        descriptors.append(fd)
+        return fd
+
+    def identity_then_exit(pid):
+        result = background_process_identity(pid)
+        if original.poll() is None:
+            original.kill()
+        original.wait(timeout=5)
+        return result
+
+    def signal_bound(handle, sig):
+        if handle in descriptors:
+            signal.pidfd_send_signal(handle, sig)
+        else:
+            # Model a numeric PID now resolving to the replacement process.
+            replacement_signals.append(sig)
+
+    try:
+        observed = (original.pid, background_process_identity(original.pid))
+        stop_observed_background_reader(observed, signal_bound, identity=identity_then_exit, open_pidfd=open_bound)
+        assert replacement_signals == [], "numeric signal reached replacement after identity check"
+        for fd in descriptors:
+            with pytest.raises(OSError) as caught:
+                os.fstat(fd)
+            assert caught.value.errno == errno.EBADF
+    finally:
+        reap_background_mode_holder(original, os.killpg)
+
+
+def background_reader_stub():
+    launch = 'row = next(row for row in rows() if row["id"] == identifier)\nrow["pid"] = child.pid'
+    assert STUB.count(launch) == 1, "background launch seam changed"
+    capture = 'publish_background_reader(Path(state), child)\n'
+    failure = '''
+if sys.argv[2:4] == ["control", "agents"]:
+    folder = Path(sys.argv[1])
+    if (folder / "fail-after-launch").exists() and (folder / "reader-identity.json").exists():
+        sys.exit(7)
+'''
+    helper_call = 'subprocess.run([sys.executable, "-I", helper,'
+    assert STUB.count(helper_call) == 1, "background helper seam changed"
+    definitions = (background_process_identity, reap_background_mode_holder, publish_background_reader,
+                   exit_background_reader, run_background_reader_helper)
+    setup = '\nif sys.argv[2] == "turn":\n    signal.signal(signal.SIGTERM, exit_background_reader)\n'
+    return ("import json, os, signal, subprocess, sys\nfrom pathlib import Path\n"
+            + "\n".join(inspect.getsource(function) for function in definitions) + setup + failure
+            + STUB.replace(launch, capture + launch).replace(helper_call, 'run_background_reader_helper([sys.executable, "-I", helper,'))
+
+
+@posix_only
+def test_background_mode_failure_after_reader_launch_stops_only_the_observed_reader(fleet):
+    require_background_reader_identity()
+    bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+    state = fleet.tmp / "background-state"
+    signals = []
+
+    def signal_reader(fd, sig):
+        observed = observed_background_reader(state)
+        assert observed is not None and sig == signal.SIGTERM
+        assert background_process_identity(observed[0]) == observed[1]
+        signals.append((observed[0], sig))
+        signal.pidfd_send_signal(fd, sig)
+
+    try:
+        with pytest.raises(RuntimeError, match="^fixture failure after reader launch$"):
+            run_background_mode_sweep(fleet, fail_after_launch=True, signal_reader=signal_reader)
+        observed = observed_background_reader(state)
+        assert observed is not None, "failure must occur after reader launch"
+        assert signals == [(observed[0], signal.SIGTERM)], "teardown must signal exactly the observed reader"
+        assert background_process_identity(observed[0]) != observed[1], "reader escaped teardown"
+        calls = [json.loads(line) for line in (state / "calls.log").read_text().splitlines()]
+        assert ["stop", "old00000"] in calls
+        assert ["stop", fleet.orchestrator["session"][:8]] not in calls
+        assert bystander.poll() is None
+    finally:
+        try:
+            # Rescue the real detached child even when the regression assertion fails.
+            stop_observed_background_reader(observed_background_reader(state))
+        finally:
+            reap_background_mode_holder(bystander, os.killpg)
+
+
+def run_background_mode_sweep(fleet, fail_after_launch=False, signal_reader=None):
+    require_background_reader_identity()
+    stub, state = fleet.tmp / "claude_stub.py", fleet.tmp / "background-state"
+    stub.write_text(background_reader_stub(), encoding="utf-8")
+    state.mkdir()
+    if fail_after_launch:
+        (state / "fail-after-launch").touch()
+    session, endpoint = fleet.orchestrator["session"], "pilot/orchestrator"
+    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+    try:
+        (state / "old00000.row").write_text(json.dumps({
+            "id": "old00000", "sessionId": session, "status": "idle", "state": "blocked", "kind": "background",
+            "name": endpoint + "-g1", "pid": holder.pid}))
+        path = Path(fleet.orchestrator["wake_profile"])
+        profile = json.loads(path.read_text())
+        profile.update(mode="background", prompt_via="argv", control=[sys.executable, str(stub), str(state), "control"],
+                       argv=[sys.executable, str(stub), str(state), "reader", str(HELPER), str(fleet.root), endpoint,
+                             "claude-code", session, str(fleet.base / "delivery"), str(fleet.tmp / "stub-record.json"),
+                             "--bg", "--name", endpoint + "-g1", "--resume", session, "--"])
+        path.write_text(json.dumps(profile))
+        fleet.send("pilot/front-door", endpoint, "hello")
+        row = fleet.sweep(expect=(0, 3) if fail_after_launch else 0)["rows"][0]
+        if fail_after_launch:
+            assert row["state"] == "refused" and row["error"] == "could not list background sessions: exit 7", row
+            observed = observed_background_reader(state)
+            assert observed is not None and observed[1] is not None
+            assert background_process_identity(observed[0]) == observed[1], "reader must be live before fixture failure"
+            raise RuntimeError("fixture failure after reader launch")
+    finally:
+        try:
+            reap_background_mode_holder(holder, os.killpg)
+        finally:
+            stop_observed_background_reader(observed_background_reader(state), signal_reader)
+    return row
 
 
 @posix_only

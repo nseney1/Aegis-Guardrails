@@ -41,6 +41,7 @@ PACKAGES = ("aegis_core", "aegis_cli", "aegis_mcp", "aegis_sdk")
 CORE_LAYERS: Dict[str, int] = {
     "aegis_core._version": 0,
     "aegis_core.diagnostic_messages": 0,
+    "aegis_core.display_attribution": 0,
     "aegis_core.errors": 0,
     "aegis_core.taxonomy": 0,
     # Canonical message records and untrusted views (stdlib only).
@@ -65,6 +66,8 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.gitsafe_policy": 0,
     "aegis_core.gitsafe_run": 0,
     "aegis_core.team_claims": 2,
+    "aegis_core.team_custody": 1,
+    "aegis_core.team_custody_checks": 1,
     "aegis_core.team_git": 0,
     "aegis_core.atomicio": 0,
     # Read-only repository facts keyed by full object ids; imports gitsafe and errors only.
@@ -75,6 +78,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.argv": 0,
     # GitHub CLI transport over gitsafe and pathlookup, with no trust-policy dependency.
     "aegis_core.ghcli": 0,
+    "aegis_core.pathlookup_fence": 0,
     # Path containment, strict JSON and UTC timestamps (stdlib only).
     "aegis_core.primitives": 0,
     "aegis_core.proposals": 2,
@@ -89,10 +93,13 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.stats": 0,
     "aegis_core.workspace": 0,
     "aegis_core.rule_lint": 2,
+    "aegis_core.rule_lint_capture": 2,
+    "aegis_core.rule_lint_grammar": 2,
     "aegis_core.rules": 1,
     "aegis_core.rule_inventory": 1,
     "aegis_core.yaml_engine": 1,
     "aegis_core.match": 1,
+    "aegis_core.team_writer_binding": 1,
     "aegis_core.telemetry_engine": 1,
     "aegis_core.fitness": 1,
     "aegis_core.ast": 1,
@@ -102,7 +109,16 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team": 1,
     "aegis_core.team_host_adapter": 0,
     "aegis_core.team_host_agy": 1,
+    "aegis_core.team_isolation_capability": 0,
+    "aegis_core.team_isolation_mounts": 0,
+    "aegis_core.team_isolation_verify": 0,
     "aegis_core.team_lease_custody": 0,
+    "aegis_core.team_mailbox": 1,
+    "aegis_core.team_mailbox_index": 1,
+    "aegis_core.team_mailbox_index_scan": 0,
+    "aegis_core.team_mailbox_pager": 0,
+    "aegis_core.team_mailbox_primitives": 0,
+    "aegis_core.team_mailbox_store": 0,
     "aegis_core.team_metrics": 1,
     "aegis_core.team_paths": 1,
     "aegis_core.team_profile": 1,
@@ -126,6 +142,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.guidance_projection": 0,
     # Host hook payload normalization (stdlib only).
     "aegis_core.hook_events": 1,
+    "aegis_core.kernel_identity": 0,
     # Pure AST inspection of lane declarations and pytest configuration.
     "aegis_core.lane_ast": 0,
     # The post-lane gate (aegis check --lane): team, matcher, gitsafe and events.

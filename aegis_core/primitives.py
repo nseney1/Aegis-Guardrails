@@ -1,4 +1,4 @@
-"""The primitives every layer shares, one home each (layer 0, standard library only): path
+"""The primitives every layer shares, one home each (layer 0): path
 containment, strict JSON, UTC timestamps and the line identity of a finding. Copies of these
 disagreed at their edges (a looped path inside or outside, ``1e999`` read as infinity, a naive
 datetime read as local time or UTC).
@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import bisect
 from datetime import datetime, timezone
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -16,6 +17,10 @@ import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from aegis_core._version import __version__
+from aegis_core.redaction import (
+    SECRET_REPLACEMENTS as _DISPLAY_HOOK_SECRETS,
+    TOKEN_REDACTIONS as _DISPLAY_TOKEN_SECRETS,
+)
 
 __all__ = [
     "DuplicateKeyError",
@@ -368,65 +373,538 @@ def aegis_import_root() -> str:
 
 
 _DISPLAY_CONTROLS = re.compile(r'[\x00-\x1f\x7f-\x9f]')
+_DISPLAY_PLAIN = re.compile(r'[^\x00-\x1f\x7f-\x9f]+')
+_DISPLAY_PARAMETERS = re.compile(r'[\x30-\x3f]+')
+_DISPLAY_INTERMEDIATES = re.compile(r'[\x20-\x2f]+')
+_DISPLAY_IGNORED = re.compile(r'[\x00-\x08\x0b-\x17\x19\x1c-\x1f\x7f-\x8f\x91-\x97\x99-\x9a\x9c]+')
+_DISPLAY_ESCAPE_KINDS = {'[': 'csi', 'P': 'dcs', ']': 'osc', 'X': 'sos', '^': 'pm', '_': 'apc'}
+_DISPLAY_C1_KINDS = dict(zip('\x90\x98\x9b\x9d\x9e\x9f', ('dcs', 'sos', 'csi', 'osc', 'pm', 'apc')))
+_DISPLAY_SECRET_RULES = tuple(
+    (pattern, re.compile(pattern.pattern.replace(r'(?<![A-Za-z0-9])', '')),
+     replacement.replace(r'\1REDACTED', r'\1[REDACTED]'))
+    for pattern, replacement in dict((*_DISPLAY_HOOK_SECRETS, *_DISPLAY_TOKEN_SECRETS)).items()
+)
+_DISPLAY_PEM_PATTERN = next(pattern for pattern, _relaxed, replacement in _DISPLAY_SECRET_RULES
+                            if replacement == '[REDACTED_PEM]')
+# Derive both bounded marker grammars from the shared rule's BEGIN grammar.
+_DISPLAY_PEM_BEGIN = re.compile(_DISPLAY_PEM_PATTERN.pattern.partition(r'[\s\S]*?')[0])
+_DISPLAY_PEM_END = re.compile(_DISPLAY_PEM_BEGIN.pattern.replace('-----BEGIN ', '-----END ', 1))
+# A single C-level probe avoids one Python call per rule at every carried ']'
+# in abandoned strings. Global case folding makes this a conservative superset;
+# each actual rule still validates its candidates with its own flags below.
+_DISPLAY_BOUNDARY_CANDIDATE = re.compile('|'.join(
+    '(?:' + relaxed.pattern.replace('(?i)', '') + ')'
+    for _pattern, relaxed, replacement in _DISPLAY_SECRET_RULES if replacement != '[REDACTED_PEM]'), re.IGNORECASE)
+# Searches may start at the core key word or bare ://: optional word/scheme
+# context is irrelevant to existence, and backtracking over it dominates long
+# non-secret runs. Anchored probes and actual rules retain that context above.
+_DISPLAY_SEARCH_CANDIDATE = re.compile('|'.join(
+    '(?:' + relaxed.pattern.replace('(?i)', '').replace(r'[A-Za-z0-9_]{0,32}', '', 1)
+    .replace(r'(?:[a-z][a-z0-9+.-]{0,31})?', '') + ')'
+    for _pattern, relaxed, replacement in _DISPLAY_SECRET_RULES if replacement != '[REDACTED_PEM]'), re.IGNORECASE)
+_DISPLAY_SEGMENT_CANDIDATE = re.compile(
+    _DISPLAY_SEARCH_CANDIDATE.pattern + '|(?:' + _DISPLAY_PEM_BEGIN.pattern + ')', re.IGNORECASE)
+
+
+def _display_matches(original, relaxed, text, boundaries, *, pos=0, endpos=None, charge=None):
+    """Merge ordinary and carried starts once, retaining bounded overlaps."""
+    endpos = len(text) if endpos is None else endpos
+    if charge is None:
+        ordinary = iter(original.finditer(text, pos, endpos))
+    else:
+        from aegis_core.display_attribution import overlapping_matches
+
+        ordinary = overlapping_matches(original, text, pos, endpos, charge)
+    candidate = next(ordinary, None)
+    last_start = -1
+    for boundary in boundaries:
+        while candidate is not None and candidate.start() <= boundary:
+            last_start = candidate.start()
+            yield candidate
+            candidate = next(ordinary, None)
+        if boundary == last_start:
+            continue
+        if charge is not None and not charge(endpos - boundary + 1):
+            return
+        carried = relaxed.match(text, boundary, endpos)
+        if carried is not None:
+            last_start = carried.start()
+            yield carried
+    if candidate is not None:
+        yield candidate
+    yield from ordinary
+
+
+def _display_pem_spans(text, pos, endpos):
+    """Each BEGIN gets its own label's next END, or the detection segment's end."""
+    ends = {}
+    for marker in _DISPLAY_PEM_END.finditer(text, pos, endpos):
+        ends.setdefault(marker.group('pem_label'), []).append((marker.start(), marker.end()))
+    for marker in _DISPLAY_PEM_BEGIN.finditer(text, pos, endpos):
+        matches = ends.get(marker.group('pem_label'), ())
+        index = bisect.bisect_left(matches, (marker.end(),))
+        end = matches[index][1] if index < len(matches) else endpos
+        yield marker.start(), end, '[REDACTED_PEM]'
+
+
+def _display_secret_spans(text, boundaries, *, pos=0, endpos=None, include_pem=True, charge=None):
+    """Detect before masking, keeping backreference context outside secret spans."""
+    endpos = len(text) if endpos is None else endpos
+    probe = (_DISPLAY_SEGMENT_CANDIDATE if include_pem else _DISPLAY_SEARCH_CANDIDATE).search(text, pos, endpos)
+    if probe is None:
+        return
+    if include_pem and probe.group('pem_label') is not None and _DISPLAY_SEARCH_CANDIDATE.search(text, pos, endpos) is None:
+        yield from _display_pem_spans(text, pos, endpos)
+        return
+    boundaries = [start for start in boundaries if pos <= start < endpos
+                  and _DISPLAY_BOUNDARY_CANDIDATE.match(text, start, endpos) is not None]
+    for original, relaxed, replacement in _DISPLAY_SECRET_RULES:
+        if replacement == '[REDACTED_PEM]':
+            if include_pem:
+                yield from _display_pem_spans(text, pos, endpos)
+            continue
+        for candidate in _display_matches(original, relaxed, text, boundaries, pos=pos, endpos=endpos, charge=charge):
+            start, end = candidate.span()
+            payload = candidate.expand(replacement)
+            if replacement.startswith(r'\1'):
+                start = candidate.end(1)
+                payload = candidate.expand(replacement[2:])
+                if replacement.endswith('@'):
+                    end -= 1
+                    payload = payload[:-1]
+            if end - start != len(payload) or not text.startswith(payload, start, end):
+                yield start, end, payload
+
+
+def _display_segmented_secret_spans(text, boundaries, segments):
+    """Hard separators and sealed strings cannot be consumed by any rule."""
+    if _DISPLAY_SEGMENT_CANDIDATE.search(text) is None:
+        return
+    for start, end in segments:
+        # Reject irrelevant runs with one bounded C-level probe, preserving the
+        # abandoned-string deadline without copying a run or suffix to match.
+        if _DISPLAY_SEGMENT_CANDIDATE.search(text, start, end) is None:
+            continue
+        left = bisect.bisect_left(boundaries, start)
+        right = bisect.bisect_left(boundaries, end)
+        starts = boundaries[left:right]
+        if not starts or starts[0] != start:
+            starts.insert(0, start)
+        yield from _display_secret_spans(text, starts, pos=start, endpos=end)
+
+
+def _display_mapped_secret_spans(text, boundaries, source_map, *, segments=None, include_pem=True, pos=0, charge=None):
+    """Map a detection view's spans back through its compressed source runs."""
+    offsets = [row[1] for row in source_map]
+
+    def to_source(position):
+        index = bisect.bisect_right(offsets, position) - 1
+        return source_map[index][0] + position - offsets[index]
+
+    spans = (_display_secret_spans(text, boundaries, include_pem=include_pem, pos=pos, charge=charge) if segments is None else
+             _display_segmented_secret_spans(text, boundaries, segments))
+    for start, end, payload in spans:
+        yield to_source(start), to_source(end - 1) + 1, payload
+
+
+def _display_secret_masks(canonical, deleted, separator_segments, deleted_segments, attributable, *, source):
+    """Union detection views in source coordinates, then project one mask.
+
+    Each map entry is (source start, canonical start, length), compressed by
+    emitted run. No per-control map or copied suffix is needed for matching.
+    Source separators are hard segment edges; suppressed strings seal both
+    source views so hidden detection context cannot mask visible ordinary text.
+
+    Suppressed printable finals also admit bounded optional-byte attribution.
+    Its budget exhaustion masks only the candidate window in source space.
+    """
+    text, boundaries, source_map = canonical
+    if not text:
+        return text
+    source_starts = [row[0] for row in source_map]
+    output_starts = [row[1] for row in source_map]
+
+    def to_output(position):
+        index = bisect.bisect_right(source_starts, position) - 1
+        return 0 if index < 0 else output_starts[index] + min(position - source_starts[index], source_map[index][2])
+
+    spans = list(_display_mapped_secret_spans(text, boundaries, source_map))
+    # A canonical PEM extent covering every emitted character already fixes
+    # the complete visible mask. Source views cannot extend that coverage.
+    last_source = source_map[-1][0] + source_map[-1][2]
+    if any(start == source_starts[0] and end == last_source and payload == '[REDACTED_PEM]'
+           for start, end, payload in spans):
+        return '[REDACTED_PEM]'
+    # Both source views share renderer-normalized text and its source map.
+    # Their segments differ: one stops at removals, the other joins over them.
+    spans.extend(_display_mapped_secret_spans(*deleted, segments=separator_segments))
+    # Identical text, starts and maps have identical source spans; reuse them.
+    if separator_segments != deleted_segments and (deleted != canonical or len(deleted_segments) > 1):
+        spans.extend(_display_mapped_secret_spans(*deleted, segments=deleted_segments))
+    if attributable:
+        extra, _stats = _display_attribution(*source, canonical)
+        spans.extend(extra)
+    merged = []
+    for start, end, payload in sorted(spans, key=lambda span: (span[0], -span[1])):
+        if merged and start < merged[-1][1]:
+            if end > merged[-1][1]:
+                merged[-1] = (merged[-1][0], end, '[REDACTED]')
+        else:
+            merged.append((start, end, payload))
+    shown, cursor = [], 0
+    for start, end, payload in merged:
+        start, end = to_output(start), to_output(end)
+        if start == end:
+            continue
+        shown.extend((text[cursor:start], payload))
+        cursor = end
+    shown.append(text[cursor:])
+    return ''.join(shown)
+
+
+_DISPLAY_ATTRIBUTION_RATE = 1024
+_DISPLAY_ATTRIBUTION_CEILING = 4194304
+# The existing PEM row is unbounded, but PEM attribution remains out of scope.
+# Any unbounded row contributes this documented radius instead of infinity.
+_DISPLAY_ATTRIBUTION_UNBOUNDED_CAP = 2048
+
+
+@lru_cache(maxsize=1)
+def _display_attribution_tables():
+    """Keep ordinary hook bootstrap free of the optional attribution helper."""
+    from aegis_core.display_attribution import compile_possible, max_match_width, may_match_visible
+
+    width = max_match_width((pattern for pattern, _relaxed, _replacement in _DISPLAY_SECRET_RULES),
+                            unbounded_cap=_DISPLAY_ATTRIBUTION_UNBOUNDED_CAP)
+    graph = compile_possible((pattern for pattern, _relaxed, replacement in _DISPLAY_SECRET_RULES
+                              if replacement != '[REDACTED_PEM]'),
+                             carried_patterns=(relaxed for _pattern, relaxed, replacement in _DISPLAY_SECRET_RULES
+                                               if replacement != '[REDACTED_PEM]'))
+    return width, graph, may_match_visible
+
+
+def _display_attribution_possible(runs, text, stats):
+    _width, graph, may_match_visible = _display_attribution_tables()
+    possible = may_match_visible(graph, text, runs, lambda amount: _display_attribution_charge(stats, amount),
+                                 start_at=int(runs[0][0] < stats['start']))
+    if not stats['exhausted']:
+        stats['coverage'] = 'possible' if possible else 'no_match'
+    return possible
+
+
+def _display_attribution_charge(stats, amount):
+    """Charge before allocation or regex work; never overshoot the ceiling."""
+    if stats['exhausted'] or amount > stats['limit'] - stats['steps']:
+        stats['exhausted'] = True
+        stats['coverage'] = 'exhausted'
+        return False
+    stats['steps'] += amount
+    return True
+
+
+def _display_attribution_view(text, runs, variant):
+    """An interpretation with the same ordinary/carried starts as the renderer."""
+    chunks, boundaries, source_map = [], [], []
+    offset, bit, previous_end, previous_kind = 0, 0, -1, None
+    for start, end, kind, visible, replacement, _sealed in runs:
+        if not visible:
+            selected = variant & (1 << bit)
+            bit += 1
+            if not selected:
+                continue
+        chunks.append(text[start:end] if replacement is None else replacement)
+        source_map.append((start, offset, end - start))
+        if start != previous_end or kind != previous_kind:
+            boundaries.append(offset)
+        offset += end - start
+        previous_end, previous_kind = end, kind
+    return ''.join(chunks), boundaries, source_map
+
+
+def _display_attribute_segment(text, start, end, runs, stats):
+    """Explore shared-rule interpretations, or mask only this window.
+
+    A step is a source unit inspected/copied or a charged regex input unit.
+    Each variant reserves source length times every ordinary/carried rule
+    probe before construction. Shared non-PEM regex widths are bounded; PEM
+    label attribution is deliberately outside this search's contract.
+    """
+    size = end - start
+    stats['limit'] = min(_DISPLAY_ATTRIBUTION_CEILING, stats['limit'] + _DISPLAY_ATTRIBUTION_RATE * size)
+    refused = (start, end, '[REDACTED]')
+    if not _display_attribution_charge(stats, size + (len(runs) if runs is not None else 0)):
+        return refused
+    if runs is None:
+        stats['coverage'] = 'possible'
+        return refused
+    rules = sum(replacement != '[REDACTED_PEM]' for _original, _relaxed, replacement in _DISPLAY_SECRET_RULES)
+    # The run count bounds carried starts; no regex or candidate string is
+    # built until the complete search fits. Never construct an enormous 2**n.
+    cost = size * (2 + rules * (2 + len(runs)))
+    maximum = (stats['limit'] - stats['steps']) // cost
+    variants = 1
+    for _start, _end, _kind, visible, _replacement, _sealed in runs:
+        if not visible:
+            if variants > maximum // 2:
+                return refused if _display_attribution_possible(runs, text, stats) else None
+            variants *= 2
+    if variants > maximum:
+        return refused if _display_attribution_possible(runs, text, stats) else None
+    found = None
+    for variant in range(variants):
+        if not _display_attribution_charge(stats, cost):
+            return refused
+        view = _display_attribution_view(text, runs, variant)
+        if not view[0]:
+            continue
+        # One context character prevents a clipped plain run from acquiring
+        # a new ordinary/carried start. It can never begin a secret span.
+        pos = int(runs[0][0] < start)
+        charge = lambda amount: _display_attribution_charge(stats, amount)
+        for left, right, payload in _display_mapped_secret_spans(*view, include_pem=False, pos=pos, charge=charge):
+            if found is None:
+                found = left, right, payload
+            else:
+                # One envelope per candidate: disjoint attribution intervals
+                # and PEM labels remain outside the admitted contract.
+                found = (min(left, found[0]), max(right, found[1]),
+                         payload if payload == found[2] else '[REDACTED]')
+        if stats['exhausted']:
+            return refused
+    stats['coverage'] = 'complete'
+    return found
+
+
+def _display_attribution_windows(text, index, source_map):
+    """Merge windows in kept-character space; seals remain hard boundaries."""
+    from aegis_core.display_attribution import project_window
+
+    width = _display_attribution_tables()[0]
+    begin, offset, pending = 0, 0, None
+    for start, end, kind, visible, _replacement, sealed in _display_render_spans(text, index):
+        if sealed:
+            if pending is not None:
+                yield project_window(pending, offset, source_map)
+            begin, pending = offset, None
+        elif kind == 4 and not visible:
+            left, right = max(begin, offset - width), offset + width
+            if pending is not None and left <= pending[1]:
+                pending = pending[0], right, pending[2], end
+            else:
+                if pending is not None:
+                    yield project_window(pending, offset, source_map)
+                pending = left, right, start, end
+        if visible:
+            offset += end - start
+    if pending is not None:
+        yield project_window(pending, offset, source_map)
+
+
+def _display_attribution(text, index, canonical=None):
+    """Each merged window owns a budget; exhaustion cannot affect its peers."""
+    canonical = _display_views(text, index)[0] if canonical is None else canonical
+    spans, budgets = [], []
+    rows = iter(_display_render_spans(text, index))
+    row = next(rows, None)
+    for begin, end, detection_start, detection_end in _display_attribution_windows(text, index, canonical[2]):
+        runs = [] if end - begin <= _DISPLAY_ATTRIBUTION_CEILING else None
+        while row is not None and row[0] < end:
+            start, stop, kind, visible, replacement, sealed = row
+            if stop > begin and runs is not None and (visible or (kind == 4 and not sealed)):
+                if start < begin and visible and replacement is None:
+                    runs.append((begin - 1, begin, kind, True, None, 0))
+                runs.append((max(start, begin), min(stop, end), kind, visible, replacement, sealed))
+            if stop > end:
+                break
+            row = next(rows, None)
+        stats = {'steps': 0, 'limit': 0, 'exhausted': False, 'coverage': 'pending', 'start': begin, 'end': end,
+                 'source_length': end - begin, 'detection_start': detection_start, 'detection_end': detection_end}
+        span = _display_attribute_segment(text, begin, end, runs, stats)
+        budgets.append(stats)
+        if span is not None:
+            spans.append(span)
+    return spans, {'steps': sum(b['steps'] for b in budgets), 'limit': sum(b['limit'] for b in budgets),
+                   'exhausted': any(b['exhausted'] for b in budgets), 'windows': budgets}
+
+
+def _display_escape_limit(text, index, literal_until):
+    """Legacy suppression and string state, decided once at an ESC."""
+    size = len(text)
+    if index + 1 < size:
+        kind = text[index + 1]
+        if kind in (']', 'P') and index >= literal_until:
+            end = index + 2
+            while end < size and text[end] != '\n':
+                if text[end] == '\x07':
+                    return end + 1, end + 1, literal_until
+                if text[end] == '\x1b' and end + 1 < size and text[end + 1] == '\\':
+                    return end + 2, end + 2, literal_until
+                end += 1
+            # Nested abandoned strings share the already inspected suffix.
+            literal_until = end
+        if kind == '[':
+            end = index + 2
+            while end < size and text[end] in '0123456789;?':
+                end += 1
+            if end < size and ('a' <= text[end] <= 'z' or 'A' <= text[end] <= 'Z'):
+                return end + 1, 0, literal_until
+        if kind in '=><NOM78c':
+            return index + 2, 0, literal_until
+    return index + 1, 0, literal_until
+
+
+def _display_header_run(text, index, limit, mode, phase):
+    """Advance the renderer's header state and identify this printable run."""
+    char = text[index]
+    if mode == 'escape' and phase == 1 and char in _DISPLAY_ESCAPE_KINDS:
+        return index + 1, 1, _DISPLAY_ESCAPE_KINDS[char], 1
+    if mode not in (None, 'escape') and phase <= 2:
+        run = _DISPLAY_PARAMETERS.match(text, index, limit)
+        if run is not None:
+            return run.end(), 2, mode, 2
+    if mode is not None:
+        run = _DISPLAY_INTERMEDIATES.match(text, index, limit)
+        if run is not None:
+            return run.end(), 3, mode, 3
+        if ((mode == 'escape' and '\x30' <= char <= '\x7e') or
+                (mode in ('csi', 'dcs') and '\x40' <= char <= '\x7e')):
+            return index + 1, 4, None, 0
+    return _DISPLAY_PLAIN.match(text, index, limit).end(), 0, None, 0
+
+
+def _display_render_spans(text, index):
+    """Emit (start, end, provenance, visible, replacement, sealed-string end).
+
+    Header state and byte suppression live in this one machine. No second
+    parser infers what BEL, whitespace, cancellation or abandonment meant.
+    Plain=0, introducer=1, parameter=2, intermediate=3, final=4, control=5.
+    """
+    if index:
+        yield 0, index, 0, True, None, 0
+    size = len(text)
+    literal_until = string_until = drop_until = 0
+    mode, phase = None, 0
+    while index < size:
+        if string_until and index >= string_until:
+            string_until, mode, phase = 0, None, 0
+        char = text[index]
+        if char == '\x1b' and not string_until:
+            drop_until, string_until, literal_until = _display_escape_limit(text, index, literal_until)
+            mode, phase = 'escape', 1
+            yield index, index + 1, 1, False, None, string_until
+            index += 1
+            continue
+        if char in _DISPLAY_C1_KINDS and not string_until:
+            mode, phase = _DISPLAY_C1_KINDS[char], 1
+            yield index, index + 1, 1, False, None, 0
+            index += 1
+            continue
+        if ord(char) < 32 or 127 <= ord(char) <= 159:
+            if char in ('\n', '\t'):
+                if char == '\n' and mode in ('osc', 'dcs', 'sos', 'pm', 'apc'):
+                    mode, phase = None, 0
+                yield index, index + 1, 5, index >= drop_until, ' ', string_until
+                index += 1
+            else:
+                if char in ('\x18', '\x1a'):
+                    mode, phase = None, 0
+                run = _DISPLAY_IGNORED.match(text, index, string_until or size)
+                end = run.end() if run is not None else index + 1
+                yield index, end, 5, False, None, string_until
+                index = end
+            continue
+        limit = string_until or size
+        end, kind, mode, phase = _display_header_run(text, index, limit, mode, phase)
+        yield index, end, kind, index >= drop_until, None, string_until
+        index = end
+
+
+def _display_views(text, index):
+    """Build canonical/deleted views and their maps from renderer events once."""
+    shown, boundaries, source_map = [], [], []
+    deleted, deleted_boundaries, deleted_map = [], [], []
+    separator_segments, deleted_segments = [], []
+    previous_seal, deleted_split = 0, True
+    offset = deleted_offset = 0
+    previous_end = deleted_end = -1
+    previous_kind = deleted_kind = None
+    attributable = False
+    for start, end, kind, visible, replacement, sealed in _display_render_spans(text, index):
+        attributable = attributable or (kind == 4 and not visible and not sealed)
+        if sealed != previous_seal:
+            deleted_split = True
+        printable = replacement is None and ord(text[start]) >= 32 and not 127 <= ord(text[start]) <= 159
+        chunk = text[start:end] if printable else replacement
+        if visible:
+            shown.append(chunk)
+            source_map.append((start, offset, end - start))
+            if start != previous_end or kind != previous_kind:
+                boundaries.append(offset)
+            offset += end - start
+            previous_end, previous_kind = end, kind
+        if printable or visible:
+            deleted.append(chunk)
+            deleted_map.append((start, deleted_offset, end - start))
+            if start != deleted_end or kind != deleted_kind or deleted_split:
+                deleted_boundaries.append(deleted_offset)
+            if separator_segments and start == deleted_end and sealed == previous_seal:
+                separator_segments[-1] = (separator_segments[-1][0], deleted_offset + end - start)
+            else:
+                separator_segments.append((deleted_offset, deleted_offset + end - start))
+            if deleted_split:
+                deleted_segments.append((deleted_offset, deleted_offset + end - start))
+                deleted_split = False
+            else:
+                deleted_segments[-1] = (deleted_segments[-1][0], deleted_offset + end - start)
+            deleted_offset += end - start
+            deleted_end, deleted_kind = end, kind
+        previous_seal = sealed
+    return ((''.join(shown), boundaries, source_map),
+            (''.join(deleted), deleted_boundaries, deleted_map), separator_segments, deleted_segments, attributable)
+
+
+def _display_text_views(text, index):
+    """Probe non-secret output without allocating maps/segments for every run."""
+    shown, deleted = [], []
+    attributable = False
+    for start, end, kind, visible, replacement, sealed in _display_render_spans(text, index):
+        attributable = attributable or (kind == 4 and not visible and not sealed)
+        printable = replacement is None and ord(text[start]) >= 32 and not 127 <= ord(text[start]) <= 159
+        if printable:
+            chunk = text[start:end]
+            deleted.append(chunk)
+            if visible:
+                shown.append(chunk)
+        elif visible:
+            shown.append(replacement)
+            deleted.append(replacement)
+    return ''.join(shown), ''.join(deleted), attributable
 
 
 def sanitize_display(text: object, max_len: Optional[int] = 80) -> str:
-    """Strip supported ANSI escapes and controls in linear time, then truncate.
+    """Keep legacy non-secret display bytes; mask control-adjacent secrets before clipping.
 
-    A newline or end-of-input abandons an unterminated OSC/DCS string, preserving
-    its printable text. Each span is inspected at most twice, even with nested
-    unterminated introducers. Plain text bypasses the character loop.
+    A newline or end-of-input abandons an unterminated OSC/DCS string. Its
+    printable kind and payload stay visible, but cannot hide a secret's left
+    boundary. Control scans are linear; repeated removed controls share one
+    boundary rather than allocating state for every input character.
+    Plain text retains the existing fast path and downstream redaction policy.
     """
     text = str(text)
     first_control = _DISPLAY_CONTROLS.search(text)
-    if first_control is None:
-        return text[:max_len - 3] + '...' if max_len is not None and len(text) > max_len else text
-    index = first_control.start()
-    shown = [text[:index]]
-    size = len(text)
-    literal_until = 0
-    while index < size:
-        char = text[index]
-        if char == '\x1b' and index + 1 < size:
-            kind = text[index + 1]
-            if kind in (']', 'P') and index >= literal_until:
-                end = index + 2
-                while end < size and text[end] != '\n':
-                    if text[end] == '\x07':
-                        index = end + 1
-                        break
-                    if text[end] == '\x1b' and end + 1 < size and text[end + 1] == '\\':
-                        index = end + 2
-                        break
-                    end += 1
-                else:
-                    # No string beginning before this boundary can terminate.
-                    # Render that span normally without rescanning its suffixes.
-                    literal_until = end
-                    shown.append(kind)
-                    index += 2
-                continue
-            if kind == '[':
-                end = index + 2
-                while end < size and text[end] in '0123456789;?':
-                    end += 1
-                if end < size and ('a' <= text[end] <= 'z' or 'A' <= text[end] <= 'Z'):
-                    index = end + 1
-                else:
-                    # Keep the legacy printable portion of an unsupported CSI,
-                    # consuming its parameter run once even when no final exists.
-                    shown.append(text[index + 1:end])
-                    index = end
-                continue
-            if kind in '=><NOM78c':
-                index += 2
-                continue
-        if char in ('\n', '\t'):
-            shown.append(' ')
-        elif ord(char) >= 32 and not 127 <= ord(char) <= 159:
-            shown.append(char)
-        index += 1
-    text = ''.join(shown)
+    if first_control is not None:
+        index = first_control.start()
+        if _DISPLAY_SEGMENT_CANDIDATE.match(text) is None:
+            canonical, deleted, attributable = _display_text_views(text, index)
+            # The relaxed probe also covers matches within a source segment:
+            # hard separators cannot contribute any part of a credential.
+            if (not attributable and _DISPLAY_SEGMENT_CANDIDATE.search(canonical) is None
+                    and _DISPLAY_SEGMENT_CANDIDATE.search(deleted) is None):
+                text = canonical
+            else:
+                text = _display_secret_masks(*_display_views(text, index), source=(text, index))
+        else:
+            text = _display_secret_masks(*_display_views(text, index), source=(text, index))
     if max_len is not None and len(text) > max_len:
         text = text[:max_len - 3] + '...'
     return text

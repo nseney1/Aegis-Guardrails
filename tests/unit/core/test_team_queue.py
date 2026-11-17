@@ -1,16 +1,1086 @@
 """Queue behaviour through its service, with real storage and process races."""
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 import json
 import multiprocessing
 import os
 import shutil
 import subprocess
+import threading
 from types import SimpleNamespace
+from unittest.mock import patch as queue_patch
 
 import pytest
 
 from conftest import symlink_or_skip
 from aegis_core import atomicio, primitives, storage, storage_confined, team, team_queue as queue
+from aegis_core.redaction import redact_command_secrets
+
+
+_RACE_CONTROL = SimpleNamespace()
+
+
+class _PipeReadiness:
+    """A one-byte readiness message, with no lock shared with a worker."""
+    def __init__(self, reader, writer):
+        self.reader, self.writer = reader, writer
+        self.pause = None
+        self.signaled = False
+        # Optional (set-event, hold-event) pairs. Unset on the normal path.
+        self.after_poll = None
+        self.before_assign = None
+        # Parent-only. Spawn pickles this as None, so a child never sees hooks.
+        self.phase = None
+
+    def set(self):
+        self.writer.send_bytes(b"r")
+        if self.pause is not None:
+            self.pause.wait(30)
+
+    def _claim_ready(self):
+        """First observer records signaled and publishes the helper latch."""
+        with _OBSERVE_LOCK:
+            first = not self.signaled
+            self.signaled = True
+        if not first:
+            return
+        phase = self.phase
+        observe = None if phase is None else phase.observed
+        if observe is not None:
+            observe()
+
+    def wait(self, timeout):
+        if self.signaled:
+            return True
+        phase = self.phase
+        hook = None if phase is None else phase.before_poll
+        if hook is not None:
+            hook[0].set()
+            hook[1].wait(30)
+        if self.signaled:
+            return True
+        polled = self.reader.poll(timeout)
+        # Publish the helper latch before a test hook can run. Poll does not
+        # consume the byte, so a later observer still sees it. The child
+        # process has no callback installed.
+        if polled:
+            self._claim_ready()
+        hook = self.after_poll
+        if hook is None and phase is not None:
+            hook = phase.after_pipe
+        if polled and hook is not None:
+            hook[0].set()
+            hook[1].wait(30)
+        return self.signaled or polled
+
+    def is_set(self):
+        if self.signaled:
+            return True
+        if not self.reader.poll(0):
+            return False
+        with _OBSERVE_LOCK:
+            if self.signaled:
+                return True
+            if not self.reader.poll(0):
+                return False
+            try:
+                raw = self.reader.recv_bytes(1)
+            except (EOFError, OSError):
+                return False
+            if raw != b"r":
+                return False
+            try:
+                self.writer.send_bytes(raw)
+            except (EOFError, OSError):
+                return False
+            self.signaled = True
+        # Latch before any hook, while the byte is back in the pipe.
+        phase = self.phase
+        observe = None if phase is None else phase.observed
+        if observe is not None:
+            observe()
+        hook = self.before_assign
+        if hook is not None:
+            hook[0].set()
+            hook[1].wait(30)
+        return True
+
+
+class _PipeRelease:
+    """Closing the parent writer releases every polling child reader."""
+    def __init__(self, *, reader=None, writer=None, waiting=None):
+        self.reader, self.writer, self.waiting = reader, writer, waiting
+
+    def set(self):
+        self.writer.close()
+
+    def wait(self, timeout):
+        if self.waiting is not None:
+            self.waiting.send_bytes(b"w")
+        return self.reader.poll(timeout)
+
+
+class _PipeControls:
+    def __init__(self, context):
+        self.connections = []
+        try:
+            reader, writer = context.Pipe(duplex=False)
+            self.connections.extend((reader, writer))
+            self.entered = _PipeReadiness(reader, writer)
+            reader, writer = context.Pipe(duplex=False)
+            self.connections.extend((reader, writer))
+            self.release = _PipeRelease(writer=writer)
+            # A worker receives no release writer, so parent close means EOF.
+            self.worker_release = _PipeRelease(reader=reader)
+        except BaseException:
+            self.close()
+            raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *error):
+        self.close()
+
+    def close(self):
+        for connection in self.connections:
+            connection.close()
+
+
+def _readiness_pause_worker(entered, release, action):
+    if action == "terminate-ready":
+        entered.pause = release
+    entered.set()
+    release.wait(30)
+
+
+def _readiness_probe(action):
+    from threading import Thread
+    context = multiprocessing.get_context("spawn")
+    connections = []
+    process = None
+    watchdog = None
+    try:
+        ready_reader, ready_writer = context.Pipe(duplex=False)
+        connections.extend((ready_reader, ready_writer))
+        release_reader, release_writer = context.Pipe(duplex=False)
+        connections.extend((release_reader, release_writer))
+        waiting_reader, waiting_writer = context.Pipe(duplex=False)
+        connections.extend((waiting_reader, waiting_writer))
+        entered = _PipeReadiness(ready_reader, ready_writer)
+        release = _PipeRelease(writer=release_writer)
+        worker_release = _PipeRelease(reader=release_reader, waiting=waiting_writer)
+        process = context.Process(target=_readiness_pause_worker,
+            args=(entered, worker_release, action))
+        process.start()
+        assert waiting_reader.poll(5), "worker did not enter the readiness/release wait"
+        assert waiting_reader.recv_bytes(1) == b"w"
+        if action == "kill-waiter":
+            process.kill()
+        else:
+            process.terminate()
+        process.join(0.5)
+        if process.is_alive():
+            process.kill()
+        process.join(2)
+        assert not process.is_alive()
+        watchdog = Thread(target=release.set, daemon=True)
+        watchdog.start()
+        watchdog.join(1)
+        assert not watchdog.is_alive()
+        return entered.is_set()
+    finally:
+        if process is not None and process.pid is not None:
+            if process.is_alive():
+                process.terminate()
+            process.join(0.5)
+            if process.is_alive():
+                process.kill()
+            process.join(2)
+            if not process.is_alive():
+                process.close()
+        for connection in connections:
+            connection.close()
+
+
+@pytest.mark.parametrize("action", ["terminate-ready", "kill-waiter"])
+def test_pipe_controls_survive_terminated_readiness_and_killed_waiter(action):
+    assert _spawn_race(_readiness_probe, [action], timeout=8) == [True]
+    assert multiprocessing.active_children() == []
+
+
+def _race_process(worker, argument, writer, initializer, initargs, after_send):
+    try:
+        try:
+            if initializer is not None:
+                initializer(*initargs)
+            outcome = {"status": "ok", "value": worker(argument)}
+            message = json.dumps(outcome, ensure_ascii=True).encode("ascii")
+            if len(message) > 65536:
+                raise AssertionError("spawned race result exceeds 65536 bytes")
+        except BaseException as error:
+            try:
+                kind = redact_command_secrets(primitives.sanitize_display(
+                    type(error).__name__, max_len=None))[:80]
+                detail = redact_command_secrets(primitives.sanitize_display(
+                    str(error), max_len=None))[:512]
+            except BaseException:
+                kind, detail = "AssertionError", "race worker failed while formatting its diagnostic"
+            outcome = {"status": "error", "kind": kind, "message": detail}
+            message = json.dumps(outcome, ensure_ascii=True).encode("ascii")
+        try:
+            writer.send_bytes(message)
+        except OSError:
+            raise SystemExit(1) from None
+        if outcome["status"] != "ok":
+            raise SystemExit(1)
+        if after_send is not None:
+            after_send()
+    finally:
+        writer.close()
+
+
+# Process launch, including an injected delay, is outside the readiness clock.
+_LAUNCH_LIMIT = 20
+# Parent-local. A spawned worker reimports this module and gets its own lock.
+_OBSERVE_LOCK = threading.Lock()
+# Readiness allowance shared with the rescue watchdogs. It starts when the
+# helper publishes, after the workers are launched, and a slow start inside
+# it is not part of the fault deadline.
+_READY_LIMIT = 5
+# Joins after terminate, after kill, and for the result readers.
+_REAP_LIMIT = 0.5 + 2 + 2
+# The success-path retry spawn runs before the watchdog is told the test finished.
+_RETRY_LIMIT = 3
+# Pre-publication stall for rescue-grace regressions. Past the startup bound,
+# and shorter than the tightest spawn fault + cleanup pair (race_list).
+_SPAWN_GRACE_HOLD = _READY_LIMIT + 0.35
+# In-process observation does not wait for a spawned interpreter.
+_PROMPT_STARTUP = 0.5
+_PROMPT_HOLD = 0.9
+# A peer waiting for the blocked worker must outlast the startup allowance.
+_PEER_LIMIT = _READY_LIMIT + 5
+
+
+class _PhaseStart:
+    """The instant a helper begins its readiness wait."""
+
+    def __init__(self):
+        from threading import Event
+        self.event = Event()
+        self.instant = None
+        self.accepted = Event()
+        self.ready = Event()
+        self.t_ready = None
+        # Wakes the unset wait on publication or finish. Not a readiness signal.
+        self.wake = Event()
+        # Per-call hooks. Unset on the normal path. Not a module global.
+        self.before_ready = None
+        self.after_ready = None
+        self.observed = None
+        self.before_poll = None
+        self.after_pipe = None
+        self.hold_cancel = None
+
+    def publish(self):
+        from time import monotonic
+        if self.instant is None:
+            self.instant = monotonic()
+        self.event.set()
+
+    def wait(self, timeout):
+        return self.event.wait(timeout)
+
+
+def _latch_ready(ready, phase):
+    """Publish the helper latch once. t_ready is recorded in this same block.
+
+    A helper stalled for longer than fault + cleanup between observation and
+    publication is a hang by definition.
+    """
+    from time import monotonic
+    if ready is not None and ready.is_set():
+        return
+    hook = None if phase is None else phase.before_ready
+    if hook is not None:
+        hook[0].set()
+        hook[1].wait(30)
+    if phase is not None and phase.t_ready is None:
+        phase.t_ready = monotonic()
+    if ready is not None:
+        ready.set()
+    if phase is not None:
+        phase.wake.set()
+
+
+def _publish_ready(source, ready, phase):
+    """Set the helper latch once, at the moment this helper observes source.
+
+    A helper stalled for longer than fault + cleanup between observation and
+    publication is a hang by definition.
+    """
+    if phase is not None:
+        phase.publish()
+
+    def publish():
+        _latch_ready(ready, phase)
+
+    previous = None
+    if phase is not None:
+        previous = phase.observed
+        phase.observed = publish
+        # The child already holds a pickled pipe whose phase is None.
+        source.phase = phase
+    try:
+        observed = source.wait(_READY_LIMIT)
+    finally:
+        if phase is not None:
+            phase.observed = previous
+    if not observed:
+        return False
+    _latch_ready(ready, phase)
+    hook = None if phase is None else phase.after_ready
+    if hook is not None:
+        hook[0].set()
+        hook[1].wait(30)
+    return True
+
+
+def _start_phased_watchdog(release, *, launch, startup, fault, cleanup, phase):
+    """Rescue only after the full grace bound, never at startup expiry alone.
+
+    While phase.ready is unset this waits startup + fault + cleanup from the
+    published instant. Once the helper publishes, the deadline is phase.t_ready
+    + fault + cleanup. t_ready is recorded in the same block as the publication.
+    This never polls a pipe and never decides readiness itself. finish() wakes
+    the wait and does not set the latch.
+    """
+    from threading import Event, Thread
+    from time import monotonic
+    done, rescued = Event(), Event()
+    ready = phase.ready
+
+    def rescue():
+        phase.wait(launch)
+        if done.is_set() or phase.instant is None:
+            if phase.instant is None and not done.is_set():
+                rescued.set()
+            release.set()
+            return
+        total = startup + fault + cleanup
+        remaining = total - (monotonic() - phase.instant)
+        if remaining < 0:
+            remaining = 0
+        phase.wake.wait(remaining)
+        if not ready.is_set():
+            if not done.is_set():
+                rescued.set()
+            release.set()
+            return
+        phase.accepted.set()
+        limit = phase.t_ready + fault + cleanup - monotonic()
+        if limit < 0:
+            limit = 0
+        if not done.wait(limit):
+            rescued.set()
+        release.set()
+
+    def finish():
+        done.set()
+        phase.event.set()
+        phase.wake.set()
+
+    watchdog = Thread(target=rescue, daemon=True)
+    watchdog.start()
+    return finish, rescued, ready, watchdog
+
+
+def _join_started(thread, timeout):
+    """Join a thread only when start() succeeded."""
+    if thread is not None and thread.ident is not None:
+        thread.join(timeout)
+
+
+def _wait_or_cancel(event, cancel, timeout):
+    """True when event is set and cancel is not. cancel ends the wait."""
+    from time import monotonic
+    deadline = monotonic() + timeout
+    while not cancel.is_set():
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return event.is_set()
+        if event.wait(min(0.05, remaining)):
+            return not cancel.is_set()
+    return False
+
+
+def _poll_or_cancel(reader, cancel, timeout):
+    """True when the pipe is ready and cancel is not. cancel ends the poll."""
+    from time import monotonic
+    deadline = monotonic() + timeout
+    while not cancel.is_set():
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return reader.poll(0)
+        if reader.poll(min(0.05, remaining)):
+            return not cancel.is_set()
+    return False
+
+
+def _end_consumer_call(cancel, release_helper, phase, finish, consumer, watchdog,
+                       watchdog_bound, paused=None):
+    """Set this call's cancel, join every started thread, and assert each stopped.
+
+    Callers close pipes only after this returns. cancel is set before any join.
+    The consumer join bound is the documented 2s. A pause thread, when this call
+    armed one, is released and joined here too.
+    """
+    cancel.set()
+    release_helper.set()
+    phase.after_pipe = None
+    if finish is not None:
+        finish()
+    _join_started(consumer, 2)
+    _join_started(watchdog, watchdog_bound)
+    if paused is not None:
+        _release_publication_hold(phase, paused)
+    assert consumer is None or not consumer.is_alive()
+    assert watchdog is None or not watchdog.is_alive()
+    assert paused is None or not paused.is_alive()
+
+
+def _release_publication_hold(phase, thread):
+    """Clear this call's hook and finish its pause thread."""
+    cancel = phase.hold_cancel
+    phase.hold_cancel = None
+    hook = phase.before_ready
+    phase.before_ready = None
+    if cancel is not None:
+        cancel.set()
+    if hook is not None:
+        hook[0].set()
+        hook[1].set()
+    _join_started(thread, 2)
+
+
+def _arm_pre_publication_hold(phase, bound):
+    """Suspend the helper after observation and before it publishes the latch.
+
+    The hook lives on this phase. Installation and thread start share one
+    cleanup, so a start failure leaves no hook and no thread.
+    """
+    from threading import Event, Thread
+    saw, hold, cancel = Event(), Event(), Event()
+
+    def pause():
+        try:
+            if saw.wait(30):
+                cancel.wait(bound)  # Crosses startup expiry; shorter than fault + cleanup.
+        finally:
+            hold.set()
+
+    thread = Thread(target=pause, daemon=True)
+    try:
+        phase.hold_cancel = cancel
+        phase.before_ready = (saw, hold)
+        thread.start()
+    except BaseException:
+        phase.before_ready = None
+        phase.hold_cancel = None
+        cancel.set()
+        saw.set()
+        hold.set()
+        _join_started(thread, 1)
+        raise
+    return hold, thread
+
+
+def _spawn_race(worker, arguments, *, timeout=30, initializer=None, initargs=(), after_send=None,
+                ready=None, launch_delay=0, phase=None):
+    """Own each spawned worker and escalate cleanup without unbounded joins.
+
+    timeout is measured from start unless ready is given. ready is an event the
+    worker sets once it has entered the fault; the deadline then restarts so
+    spawn latency is not part of that bound. The default remains 30s.
+    """
+    from concurrent.futures import FIRST_EXCEPTION, Future, wait
+    from threading import Event, Thread
+    from time import monotonic
+    context = multiprocessing.get_context("spawn")
+    processes, connections, readers, pending = [], [], [], []
+
+    def receive(reader, future):
+        try:
+            raw = reader.recv_bytes(65536)
+            text = primitives.json_preflight(raw, max_bytes=65536, max_depth=32,
+                max_nodes=4096, max_items=4096, max_string=65536)
+            outcome = primitives.strict_loads(text)
+            assert isinstance(outcome, dict), "invalid spawned race outcome"
+            if outcome.get("status") == "ok" and set(outcome) == {"status", "value"}:
+                future.set_result(outcome["value"])
+                return
+            assert set(outcome) == {"status", "kind", "message"}, "invalid spawned race failure"
+            assert outcome["status"] == "error", "invalid spawned race failure status"
+            kind, message = outcome["kind"], outcome["message"]
+            assert isinstance(kind, str) and len(kind) <= 80, "invalid spawned race error kind"
+            assert isinstance(message, str) and len(message) <= 512, "invalid spawned race error message"
+            error_type = {"ValueError": ValueError, "TimeoutError": FutureTimeoutError}.get(kind, AssertionError)
+            future.set_exception(error_type(message))
+        except EOFError:
+            future.set_exception(FutureTimeoutError("spawned race worker exited without a result"))
+        except BaseException:
+            future.set_exception(AssertionError("invalid spawned race outcome"))
+
+    try:
+        if launch_delay:
+            Event().wait(launch_delay)  # Injected launch time, before the readiness wait.
+        deadline = monotonic() + timeout
+        for argument in arguments:
+            reader, writer = context.Pipe(duplex=False)
+            connections.extend((reader, writer))
+            process = context.Process(target=_race_process,
+                args=(worker, argument, writer, initializer, initargs, after_send))
+            processes.append(process)
+            process.start()
+            writer.close()
+            future = Future()
+            pending.append(future)
+            thread = Thread(target=receive, args=(reader, future), daemon=True)
+            readers.append(thread)
+            thread.start()
+        if ready is not None:
+            # Poll only. The helper sets phase.ready at that observation, before
+            # any later consumer of the byte. Peers still see it. The deadline
+            # restarts from the latch, not from before the helper call.
+            latch = None if phase is None else phase.ready
+            if not _publish_ready(ready, latch, phase):
+                raise AssertionError("blocked worker did not enter")
+            origin = monotonic()
+            if phase is not None and phase.t_ready is not None:
+                origin = phase.t_ready
+            deadline = origin + timeout
+        completed, incomplete = wait(pending, timeout=max(0, deadline - monotonic()),
+                                     return_when=FIRST_EXCEPTION)
+        for future in completed:
+            if future.exception() is not None:
+                future.result()
+        if incomplete:
+            raise FutureTimeoutError()
+        for process in processes:
+            process.join(max(0, deadline - monotonic()))
+            if process.is_alive():
+                raise FutureTimeoutError()
+            if process.exitcode != 0:
+                raise AssertionError("race worker exited with status " + str(process.exitcode))
+        return [future.result() for future in pending]
+    finally:
+        try:
+            for process in processes:
+                if process.pid is not None and process.is_alive():
+                    process.terminate()
+            deadline = monotonic() + 0.5
+            for process in processes:
+                if process.pid is not None:
+                    process.join(max(0, deadline - monotonic()))
+            for process in processes:
+                if process.pid is not None and process.is_alive():
+                    process.kill()
+            deadline = monotonic() + 2
+            for process in processes:
+                if process.pid is not None:
+                    process.join(max(0, deadline - monotonic()))
+            deadline = monotonic() + 2
+            for thread in readers:
+                if thread.ident is not None:
+                    thread.join(max(0, deadline - monotonic()))
+            assert not any(process.is_alive() for process in processes), "race worker survived kill"
+            assert not any(thread.is_alive() for thread in readers), "race result reader did not stop"
+        finally:
+            for connection in connections:
+                connection.close()
+            for process in processes:
+                if not process.is_alive():
+                    process.close()
+
+
+def _hang_after_race_result():
+    from threading import Event, Thread
+    Thread(target=Event().wait, args=(30,), daemon=False).start()
+
+
+def _exit_after_race_result():
+    raise SystemExit(7)
+
+
+@pytest.mark.parametrize("shutdown", ["hang", "exit"])
+def test_spawn_race_requires_clean_exit_after_result(shutdown):
+    callback = _hang_after_race_result if shutdown == "hang" else _exit_after_race_result
+    expected = FutureTimeoutError if shutdown == "hang" else AssertionError
+    message = None if shutdown == "hang" else "^race worker exited with status 7$"
+    with pytest.raises(expected, match=message):
+        _spawn_race(_race_control_worker, ["return"], timeout=5, after_send=callback)
+    assert multiprocessing.active_children() == []
+    assert _spawn_race(_race_control_worker, ["return"]) == ["spawn"]
+    assert multiprocessing.active_children() == []
+
+
+def test_consumed_readiness_byte_is_not_a_false_rescue():
+    """Helper observes the byte; a later is_set leaves that byte in place."""
+    from threading import Event, Thread
+    context = multiprocessing.get_context("spawn")
+    reader, writer = context.Pipe(duplex=False)
+    entered = _PipeReadiness(reader, writer)
+    release, polled, release_poll = Event(), Event(), Event()
+    entered.after_poll = (polled, release_poll)
+    phase = _PhaseStart()
+    finish, rescued, seen, watchdog = _start_phased_watchdog(
+        release, launch=_LAUNCH_LIMIT, startup=_READY_LIMIT,
+        fault=2, cleanup=_REAP_LIMIT, phase=phase)
+    worker = Thread(target=entered.set, daemon=True)
+
+    def helper():
+        assert _publish_ready(entered, phase.ready, phase), "helper did not observe readiness"
+
+    helper_thread = Thread(target=helper, daemon=True)
+    try:
+        worker.start()
+        helper_thread.start()
+        assert polled.wait(5), "helper did not see the readiness byte"
+        assert entered.is_set(), "helper observation was not visible to is_set"
+        assert reader.poll(0), "is_set consumed the readiness byte"
+        release_poll.set()
+        assert phase.accepted.wait(5), "watchdog did not accept the helper latch"
+        assert seen.is_set(), "helper did not publish the readiness latch"
+        assert not rescued.is_set(), "a later is_set marked a rescue"
+    finally:
+        release_poll.set()
+        finish()
+        if worker.ident is not None:
+            worker.join(2)
+        if helper_thread.ident is not None:
+            helper_thread.join(2)
+        if watchdog.ident is not None:
+            watchdog.join(_READY_LIMIT + 2)
+        writer.close()
+        reader.close()
+    assert not watchdog.is_alive()
+    assert not helper_thread.is_alive()
+    assert entered.signaled
+    assert not rescued.is_set()
+
+
+def test_rescue_grace_on_consumed_readiness_byte():
+    """Startup expiry before publication is not a rescue for the consumed-byte caller."""
+    from threading import Event, Thread
+    assert _PROMPT_STARTUP < _PROMPT_HOLD < 2 + _REAP_LIMIT
+    context = multiprocessing.get_context("spawn")
+    reader, writer = context.Pipe(duplex=False)
+    entered = _PipeReadiness(reader, writer)
+    release, polled, release_poll = Event(), Event(), Event()
+    entered.after_poll = (polled, release_poll)
+    phase = _PhaseStart()
+    paused = None
+    finish = None
+    watchdog = None
+    worker = None
+    helper_thread = None
+    rescued = None
+    try:
+        _hold, paused = _arm_pre_publication_hold(phase, _PROMPT_HOLD)
+        finish, rescued, seen, watchdog = _start_phased_watchdog(
+            release, launch=_LAUNCH_LIMIT, startup=_PROMPT_STARTUP,
+            fault=2, cleanup=_REAP_LIMIT, phase=phase)
+        worker = Thread(target=entered.set, daemon=True)
+
+        def helper():
+            assert _publish_ready(entered, phase.ready, phase), "helper did not observe readiness"
+
+        helper_thread = Thread(target=helper, daemon=True)
+        worker.start()
+        helper_thread.start()
+        assert polled.wait(5), "helper did not see the readiness byte"
+        assert entered.is_set(), "helper observation was not visible to is_set"
+        assert reader.poll(0), "is_set consumed the readiness byte"
+        release_poll.set()
+        assert phase.accepted.wait(2), "watchdog did not accept the helper latch"
+        assert seen.is_set(), "helper did not publish the readiness latch"
+        assert not rescued.is_set(), "startup expiry before publication marked a rescue"
+    finally:
+        _release_publication_hold(phase, paused)
+        release_poll.set()
+        if finish is not None:
+            finish()
+        _join_started(worker, 2)
+        _join_started(helper_thread, 2)
+        _join_started(watchdog, _PROMPT_STARTUP + 2 + _REAP_LIMIT + 1)
+        writer.close()
+        reader.close()
+    assert not watchdog.is_alive()
+    assert not helper_thread.is_alive()
+    assert entered.signaled
+    assert rescued is not None and not rescued.is_set()
+
+
+def test_is_set_before_helper_poll_is_not_a_false_rescue():
+    """is_set is the first observer and leaves the byte for a later poll."""
+    from threading import Event, Thread
+    context = multiprocessing.get_context("spawn")
+    reader, writer = context.Pipe(duplex=False)
+    entered = _PipeReadiness(reader, writer)
+    release = Event()
+    at_poll, release_poll = Event(), Event()
+    consumed, release_assign = Event(), Event()
+    phase = _PhaseStart()
+    finish = None
+    watchdog = None
+    worker = None
+    helper_thread = None
+    checker = None
+    try:
+        phase.before_poll = (at_poll, release_poll)
+        entered.before_assign = (consumed, release_assign)
+        finish, rescued, seen, watchdog = _start_phased_watchdog(
+            release, launch=_LAUNCH_LIMIT, startup=_PROMPT_STARTUP,
+            fault=2, cleanup=_REAP_LIMIT, phase=phase)
+        worker = Thread(target=entered.set, daemon=True)
+
+        def helper():
+            assert _publish_ready(entered, phase.ready, phase), "helper did not observe readiness"
+
+        helper_thread = Thread(target=helper, daemon=True)
+        checker = Thread(target=entered.is_set, daemon=True)
+        worker.start()
+        assert reader.poll(5), "worker did not send readiness"
+        helper_thread.start()
+        assert at_poll.wait(5), "helper did not reach the readiness poll"
+        checker.start()
+        assert consumed.wait(5), "is_set did not observe the readiness byte"
+        assert reader.poll(0), "is_set consumed the readiness byte"
+        assert entered.signaled, "is_set did not record readiness before its hook"
+        assert seen.is_set(), "is_set did not publish the helper latch before its hook"
+        release_assign.set()
+        release_poll.set()
+        helper_thread.join(2)
+        assert phase.accepted.wait(2), "watchdog did not accept the helper latch"
+        assert not rescued.is_set(), "is_set before the helper poll marked a rescue"
+    finally:
+        release_assign.set()
+        release_poll.set()
+        phase.before_poll = None
+        if finish is not None:
+            finish()
+        _join_started(checker, 2)
+        _join_started(worker, 2)
+        _join_started(helper_thread, 2)
+        _join_started(watchdog, _PROMPT_STARTUP + 2 + _REAP_LIMIT + 1)
+        writer.close()
+        reader.close()
+    assert not watchdog.is_alive()
+    assert not helper_thread.is_alive()
+    assert not rescued.is_set()
+
+
+def _init_visible_ready(entered, release, seen_writer):
+    _race_control_init(entered, release, 0)
+    _RACE_CONTROL.seen_writer = seen_writer
+
+
+def _raise_after_peer_visible(action):
+    if action == "blocked":
+        _RACE_CONTROL.entered.set()
+        assert _RACE_CONTROL.release.wait(60), "control was not released"
+        return "released"
+    assert _RACE_CONTROL.entered.wait(_PEER_LIMIT), "blocked peer did not enter"
+    _RACE_CONTROL.seen_writer.send_bytes(b"s")
+    raise ValueError("race control failed")
+
+
+def test_byte_consumed_before_observer_poll_is_not_a_false_rescue():
+    """Helper sees the byte; the parent consumes it before any later poll."""
+    from threading import Event, Thread
+    context = multiprocessing.get_context("spawn")
+    seen_reader, seen_writer = context.Pipe(duplex=False)
+    helper_polled, release_helper, cancel = Event(), Event(), Event()
+    phase = _PhaseStart()
+    controls = None
+    finish = None
+    watchdog = None
+    consumer = None
+    try:
+        controls = _PipeControls(context)
+        entered, release = controls.entered, controls.release
+        phase.after_pipe = (helper_polled, release_helper)
+        finish, rescued, _seen, watchdog = _start_phased_watchdog(
+            release, launch=_LAUNCH_LIMIT, startup=_READY_LIMIT,
+            fault=2, cleanup=_REAP_LIMIT + _RETRY_LIMIT, phase=phase)
+
+        def consume():
+            try:
+                if not _wait_or_cancel(helper_polled, cancel, 15):
+                    return
+                if not _poll_or_cancel(seen_reader, cancel, 15):
+                    return
+                if seen_reader.recv_bytes(1) != b"s":
+                    return
+                entered.is_set()
+            finally:
+                release_helper.set()
+
+        consumer = Thread(target=consume, daemon=True)
+        consumer.start()
+        with pytest.raises(ValueError, match="^race control failed$"):
+            _spawn_race(_raise_after_peer_visible, ["raise", "blocked"], timeout=2,
+                        ready=entered, initializer=_init_visible_ready,
+                        initargs=(entered, controls.worker_release, seen_writer),
+                        phase=phase)
+        accepted = phase.accepted.wait(_READY_LIMIT + 2)
+        assert accepted and not rescued.is_set(), (
+            "consuming the readiness byte before a watchdog poll marked a rescue")
+    finally:
+        try:
+            _end_consumer_call(
+                cancel, release_helper, phase, finish, consumer, watchdog, 10)
+        finally:
+            try:
+                if controls is not None:
+                    controls.close()
+            finally:
+                seen_reader.close()
+                seen_writer.close()
+
+
+def test_rescue_grace_on_byte_consumed_before_observer_poll():
+    """Startup expiry before publication is not a rescue for the consumed-byte spawn."""
+    from threading import Event, Thread
+    fault, cleanup = 2, _REAP_LIMIT + _RETRY_LIMIT
+    assert _READY_LIMIT < _SPAWN_GRACE_HOLD < fault + cleanup
+    context = multiprocessing.get_context("spawn")
+    seen_reader, seen_writer = context.Pipe(duplex=False)
+    helper_polled, release_helper, cancel = Event(), Event(), Event()
+    phase = _PhaseStart()
+    controls = None
+    paused = None
+    finish = None
+    watchdog = None
+    consumer = None
+    try:
+        _hold, paused = _arm_pre_publication_hold(phase, _SPAWN_GRACE_HOLD)
+        controls = _PipeControls(context)
+        entered, release = controls.entered, controls.release
+        phase.after_pipe = (helper_polled, release_helper)
+        finish, rescued, _seen, watchdog = _start_phased_watchdog(
+            release, launch=_LAUNCH_LIMIT, startup=_READY_LIMIT,
+            fault=fault, cleanup=cleanup, phase=phase)
+
+        def consume():
+            try:
+                if not _wait_or_cancel(helper_polled, cancel, 15):
+                    return
+                if not _poll_or_cancel(seen_reader, cancel, 15):
+                    return
+                if seen_reader.recv_bytes(1) != b"s":
+                    return
+                entered.is_set()
+            finally:
+                release_helper.set()
+
+        consumer = Thread(target=consume, daemon=True)
+        consumer.start()
+        with pytest.raises(ValueError, match="^race control failed$"):
+            _spawn_race(_raise_after_peer_visible, ["raise", "blocked"], timeout=fault,
+                        ready=entered, initializer=_init_visible_ready,
+                        initargs=(entered, controls.worker_release, seen_writer),
+                        phase=phase)
+        assert phase.accepted.wait(2), "watchdog did not accept the helper latch"
+        assert not rescued.is_set(), "startup expiry before publication marked a rescue"
+    finally:
+        try:
+            _end_consumer_call(
+                cancel, release_helper, phase, finish, consumer, watchdog,
+                _READY_LIMIT + fault + cleanup + 1, paused)
+        finally:
+            try:
+                if controls is not None:
+                    controls.close()
+            finally:
+                seen_reader.close()
+                seen_writer.close()
+
+
+def test_preemption_between_readiness_wait_and_latch_is_not_a_false_rescue():
+    """A timed stall before publication must not rescue a live fault."""
+    fault, cleanup = 2, _REAP_LIMIT + _RETRY_LIMIT
+    assert _READY_LIMIT < _SPAWN_GRACE_HOLD < fault + cleanup
+    phase = _PhaseStart()
+    paused = None
+    context = multiprocessing.get_context("spawn")
+    try:
+        _hold, paused = _arm_pre_publication_hold(phase, _SPAWN_GRACE_HOLD)
+        with _PipeControls(context) as controls:
+            entered, release = controls.entered, controls.release
+            finish = None
+            watchdog = None
+            try:
+                finish, rescued, _seen, watchdog = _start_phased_watchdog(
+                    release, launch=_LAUNCH_LIMIT, startup=_READY_LIMIT,
+                    fault=fault, cleanup=cleanup, phase=phase)
+                with pytest.raises(FutureTimeoutError):
+                    _spawn_race(_race_control_worker, ["blocked", "blocked"], timeout=fault,
+                                ready=entered, initializer=_race_control_init,
+                                initargs=(entered, controls.worker_release, 0), phase=phase)
+                assert phase.accepted.wait(2), "watchdog did not accept the helper latch"
+                assert not rescued.is_set(), (
+                    "preemption before publication marked a rescue")
+                assert multiprocessing.active_children() == []
+            finally:
+                if finish is not None:
+                    finish()
+                _join_started(watchdog, _READY_LIMIT + fault + cleanup + 1)
+                assert watchdog is None or not watchdog.is_alive()
+    finally:
+        _release_publication_hold(phase, paused)
+
+
+def test_rescue_grace_on_blocked_spawn():
+    """Startup expiry before publication is not a rescue for the blocked spawn."""
+    fault, cleanup = 2, _REAP_LIMIT + _RETRY_LIMIT
+    assert _READY_LIMIT < _SPAWN_GRACE_HOLD < fault + cleanup
+    phase = _PhaseStart()
+    paused = None
+    context = multiprocessing.get_context("spawn")
+    try:
+        _hold, paused = _arm_pre_publication_hold(phase, _SPAWN_GRACE_HOLD)
+        with _PipeControls(context) as controls:
+            entered, release = controls.entered, controls.release
+            finish = None
+            watchdog = None
+            try:
+                finish, rescued, _seen, watchdog = _start_phased_watchdog(
+                    release, launch=_LAUNCH_LIMIT, startup=_READY_LIMIT,
+                    fault=fault, cleanup=cleanup, phase=phase)
+                with pytest.raises(FutureTimeoutError):
+                    _spawn_race(_race_control_worker, ["blocked", "blocked"], timeout=fault,
+                                ready=entered, initializer=_race_control_init,
+                                initargs=(entered, controls.worker_release, 0), phase=phase)
+                assert phase.accepted.wait(2), "watchdog did not accept the helper latch"
+                assert not rescued.is_set(), "startup expiry before publication marked a rescue"
+                assert multiprocessing.active_children() == []
+            finally:
+                if finish is not None:
+                    finish()
+                _join_started(watchdog, _READY_LIMIT + fault + cleanup + 1)
+                assert watchdog is None or not watchdog.is_alive()
+    finally:
+        _release_publication_hold(phase, paused)
+
+
+def _race_control_init(entered, release, startup_delay=0):
+    _RACE_CONTROL.entered, _RACE_CONTROL.release = entered, release
+    _RACE_CONTROL.startup_delay = startup_delay
+
+
+def _race_control_worker(action):
+    if action == "return":
+        return multiprocessing.get_start_method()
+    if action == "raise":
+        assert _RACE_CONTROL.entered.wait(_PEER_LIMIT), "blocked peer did not enter"
+        raise ValueError("race control failed")
+    if action == "exit":
+        assert _RACE_CONTROL.entered.wait(_PEER_LIMIT), "blocked peer did not enter"
+        os._exit(7)
+    delay = getattr(_RACE_CONTROL, "startup_delay", 0)
+    if delay:
+        from threading import Event
+        Event().wait(delay)  # Injected before readiness; the fault clock starts later.
+    if action == "ignore":
+        import signal
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    _RACE_CONTROL.entered.set()
+    assert _RACE_CONTROL.release.wait(60), "control was not released"
+    if action == "ignore":
+        os._exit(0)
+    return "released"
+
+
+@pytest.mark.parametrize("startup_delay,launch_delay", [(0, 0), (3, 0), (3, 3)])
+@pytest.mark.parametrize("action,timeout", [("blocked", 2), ("exit", 2), ("raise", 2),
+                                         ("raise-later", 2), ("ignore", 2)])
+def test_spawn_race_failure_reaps_workers_before_retry(action, timeout, startup_delay,
+                                                       launch_delay):
+    if action == "ignore" and os.name != "posix":
+        pytest.skip("requires POSIX SIGTERM handlers")
+    context = multiprocessing.get_context("spawn")
+    with _PipeControls(context) as controls:
+        entered, release = controls.entered, controls.release
+        phase = _PhaseStart()
+        finish, rescued, _seen, watchdog = _start_phased_watchdog(
+            release, launch=_LAUNCH_LIMIT, startup=_READY_LIMIT,
+            fault=timeout, cleanup=_REAP_LIMIT + _RETRY_LIMIT, phase=phase)
+        try:
+            expected = ValueError if action in {"raise", "raise-later"} else FutureTimeoutError
+            message = "^race control failed$" if action in {"raise", "raise-later"} else None
+            actions = (["ignore"] * 2 if action == "ignore" else
+                       ["raise", "blocked"] if action == "raise" else
+                       ["blocked", "raise"] if action == "raise-later" else ["blocked", action])
+            with pytest.raises(expected, match=message):
+                _spawn_race(_race_control_worker, actions, timeout=timeout, ready=entered,
+                            initializer=_race_control_init,
+                            initargs=(entered, controls.worker_release, startup_delay),
+                            launch_delay=launch_delay, phase=phase)
+            assert entered.is_set(), "failure control never reached its blocked worker"
+            assert not rescued.is_set(), "pool shutdown waited for the blocked worker"
+            assert multiprocessing.active_children() == []
+            assert _spawn_race(_race_control_worker, ["return"] * 2) == ["spawn"] * 2
+            assert multiprocessing.active_children() == []
+        finally:
+            finish()
+            if watchdog.ident is not None:
+                watchdog.join(10)
+            assert not watchdog.is_alive()
+
+
+@pytest.mark.parametrize("action", ["blocked", "exit", "raise", "raise-later", "ignore"])
+def test_rescue_grace_before_publication_on_spawn_failure(action):
+    """Startup expiry before publication still yields the spawn-race fault."""
+    if action == "ignore" and os.name != "posix":
+        pytest.skip("requires POSIX SIGTERM handlers")
+    fault, cleanup = 2, _REAP_LIMIT + _RETRY_LIMIT
+    assert _READY_LIMIT < _SPAWN_GRACE_HOLD < fault + cleanup
+    phase = _PhaseStart()
+    paused = None
+    context = multiprocessing.get_context("spawn")
+    try:
+        _hold, paused = _arm_pre_publication_hold(phase, _SPAWN_GRACE_HOLD)
+        with _PipeControls(context) as controls:
+            entered, release = controls.entered, controls.release
+            finish = None
+            watchdog = None
+            try:
+                finish, rescued, _seen, watchdog = _start_phased_watchdog(
+                    release, launch=_LAUNCH_LIMIT, startup=_READY_LIMIT,
+                    fault=fault, cleanup=cleanup, phase=phase)
+                expected = ValueError if action in {"raise", "raise-later"} else FutureTimeoutError
+                message = "^race control failed$" if action in {"raise", "raise-later"} else None
+                actions = (["ignore"] * 2 if action == "ignore" else
+                           ["raise", "blocked"] if action == "raise" else
+                           ["blocked", "raise"] if action == "raise-later" else ["blocked", action])
+                with pytest.raises(expected, match=message):
+                    _spawn_race(_race_control_worker, actions, timeout=fault, ready=entered,
+                                initializer=_race_control_init,
+                                initargs=(entered, controls.worker_release, 0), phase=phase)
+                assert phase.accepted.wait(2), "watchdog did not accept the helper latch"
+                assert entered.is_set(), "failure control never reached its blocked worker"
+                assert not rescued.is_set(), "startup expiry before publication marked a rescue"
+                assert multiprocessing.active_children() == []
+                assert _spawn_race(_race_control_worker, ["return"] * 2) == ["spawn"] * 2
+                assert multiprocessing.active_children() == []
+            finally:
+                if finish is not None:
+                    finish()
+                _join_started(watchdog, _READY_LIMIT + fault + cleanup + 1)
+                assert watchdog is None or not watchdog.is_alive()
+    finally:
+        _release_publication_hold(phase, paused)
 
 
 @pytest.mark.parametrize("limit,bound", [("bytes", 0), ("depth", 2), ("nodes", 11),
@@ -96,13 +1166,9 @@ def test_shared_json_byte_limit_is_utf8_before_parsing(raw, as_bytes):
         primitives.json_preflight(value, **limits)
 
 
-def test_json_preflight_callers_share_no_concurrent_state(make_store):
+def _threaded_json_preflight(arguments):
     from aegis_core import team_profile
-    root = make_store
-    target = root.joinpath(*team_profile.REPO_PATH)
-    target.parent.mkdir(mode=0o700, parents=True)
-    target.write_bytes(b'{"version":1}')
-    expected = team_profile.load(root, user_root=root)
+    root, expected = arguments
     def observe(index):
         raw = json.dumps(item()) if index % 2 else "["
         inline = queue.parse_item(raw)
@@ -111,6 +1177,16 @@ def test_json_preflight_callers_share_no_concurrent_state(make_store):
         return inline["refused"]
     with ThreadPoolExecutor(max_workers=3) as workers:
         assert list(workers.map(observe, range(24))) == [i % 2 == 0 for i in range(24)]
+
+
+def test_json_preflight_callers_share_no_concurrent_state(make_store):
+    from aegis_core import team_profile
+    root = make_store
+    target = root.joinpath(*team_profile.REPO_PATH)
+    target.parent.mkdir(mode=0o700, parents=True)
+    target.write_bytes(b'{"version":1}')
+    expected = team_profile.load(root, user_root=root)
+    _spawn_race(_threaded_json_preflight, [(root, expected)])
 
 
 @pytest.mark.parametrize("verb", ["add", "list", "audit", "compact", "claim", "release", "unclaim", "done"])
@@ -220,6 +1296,12 @@ def test_partial_view_empty_failure_and_retry(make_store, verb, view):
     if verb == "audit":
         assert retried["findings"] == [] and retried["affected_items"] == []
         assert retried["counts"] == {"items": 1, "findings": 0, "affected_items": 0}
+    _spawn_race(_threaded_partial_view_retry, [(root, verb, view, retried)])
+
+
+def _threaded_partial_view_retry(arguments):
+    root, verb, view, retried = arguments
+    observe = getattr(queue, verb)
     with ThreadPoolExecutor(max_workers=3) as workers:
         futures = [workers.submit(observe, root, view=view, now=102) for _ in range(3)]
         assert [future.result(timeout=30) for future in futures] == [retried] * 3
@@ -244,12 +1326,17 @@ def test_partial_view_unsupported_platform(tmp_path, monkeypatch, verb, view):
     assert result["reason"] == "unsupported_platform" and result["exit_code"] == 1
 
 
-def test_fingerprint_view_concurrency_expiry_and_revision_authority(make_store):
-    root = make_store
-    revision = add(root)
+def _threaded_fingerprint_views(root):
     with ThreadPoolExecutor(max_workers=3) as workers:
         futures = [workers.submit(queue.list, root, view="fingerprint", now=101) for _ in range(3)]
         results = [future.result(timeout=30) for future in futures]
+    return results
+
+
+def test_fingerprint_view_concurrency_expiry_and_revision_authority(make_store):
+    root = make_store
+    revision = add(root)
+    results = _spawn_race(_threaded_fingerprint_views, [root])[0]
     assert results[0] == results[1] == results[2]
     token = results[0]["claimable_fingerprint"]
     assert queue.claim(root, "ONE", expect=token, lane="alpha", capabilities=["core"], now=101)["reason"] == "stale_revision"
@@ -329,8 +1416,7 @@ def test_claim_cas_expiry_release_done_and_retry(make_store):
 def test_concurrent_process_claims_have_one_winner(make_store):
     root = make_store
     revision = add(root)
-    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
-        results = list(pool.map(race_claim, [(root, revision)] * 2, timeout=30))
+    results = _spawn_race(race_claim, [(root, revision)] * 2)
     assert sorted(result["refused"] for result in results) == [False, True]
     assert next(result for result in results if result["refused"])["reason"] == "stale_revision"
 
@@ -431,9 +1517,8 @@ def test_concurrent_overlapping_lease_scopes_have_one_winner(make_store):
     root = make_store
     first = add(root, paths=["/src/one.py"])
     second = add(root, "TWO", paths=["/src/*.txt"])
-    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
-        results = list(pool.map(race_scoped_claim, [(root, first, "ONE", "alpha"),
-                                                  (root, second, "TWO", "beta")], timeout=30))
+    results = _spawn_race(race_scoped_claim, [(root, first, "ONE", "alpha"),
+                                            (root, second, "TWO", "beta")])
     assert sorted(row["refused"] for row in results) == [False, True]
     loser = next(row for row in results if row["refused"])
     assert loser["reason"] == "blocked"
@@ -850,8 +1935,7 @@ def test_concurrent_finishes_emit_one_transition(make_store, verb):
     from aegis_core import events
     revision = add(make_store)
     claimed = claim(make_store, revision)
-    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
-        results = list(pool.map(race_finish, [(make_store, verb, claimed["item"]["revision"])] * 2, timeout=30))
+    results = _spawn_race(race_finish, [(make_store, verb, claimed["item"]["revision"])] * 2)
     assert sorted(result["refused"] for result in results) == [False, True]
     assert next(result for result in results if result["refused"])["reason"] == "stale_revision"
     receipts = [row["detail"] for row in events.read(make_store).rows
@@ -894,9 +1978,8 @@ def test_added_dependencies_and_unobserved_lease_conditions_are_visible(make_sto
 def test_concurrent_disjoint_claims_enforce_writer_capacity(make_store):
     first = add(make_store, paths=["/src/one.py"])
     second = add(make_store, "TWO", paths=["/docs/one.md"])
-    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
-        results = list(pool.map(race_scoped_claim, [(make_store, first, "ONE", "alpha"),
-            (make_store, second, "TWO", "beta")], timeout=30))
+    results = _spawn_race(race_scoped_claim, [(make_store, first, "ONE", "alpha"),
+                                            (make_store, second, "TWO", "beta")])
     assert sorted(result["refused"] for result in results) == [False, True]
     assert next(result for result in results if result["refused"])["reason"] == "capacity_full"
 
@@ -1039,8 +2122,7 @@ def test_compaction_concurrency_failure_and_retry(make_store, monkeypatch):
     assert "private-value" not in json.dumps(refused)
     assert path.read_bytes() == before
     monkeypatch.setattr(queue, "atomic_write_bytes", atomicio.atomic_write_bytes)
-    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
-        results = list(pool.map(race_compact, [make_store] * 2, timeout=30))
+    results = _spawn_race(race_compact, [make_store] * 2)
     assert all(not row["refused"] for row in results)
     assert sorted(row["removed_count"] for row in results) == [0, 1]
     assert queue.list(make_store, include_done=True, now=104)["items"] == []
@@ -1221,9 +2303,8 @@ def race_branch_claim(arguments):
 
 def test_concurrent_claims_record_only_the_winners_branch(make_store):
     revision = add(make_store)
-    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
-        results = list(pool.map(race_branch_claim, [(make_store, revision, "lane/a"),
-                                                  (make_store, revision, "lane/b")], timeout=30))
+    results = _spawn_race(race_branch_claim, [(make_store, revision, "lane/a"),
+                                            (make_store, revision, "lane/b")])
     assert sorted(result["refused"] for result in results) == [False, True]
     winner = next(result for result in results if not result["refused"])
     assert next(result for result in results if result["refused"])["reason"] == "stale_revision"
@@ -1386,10 +2467,15 @@ def test_findings_state_and_expiry_match_full_views_after_retry(make_store, stat
     assert failed["reason"] == "invalid_queue_state" and failed["exit_code"] == 1
     assert failed == queue.audit(root, view="full", now=moment)
     path.write_bytes(original)
+    _spawn_race(_threaded_audit_findings, [(root, moment, findings)])
+    assert path.read_bytes() == original
+
+
+def _threaded_audit_findings(arguments):
+    root, moment, findings = arguments
     with ThreadPoolExecutor(max_workers=3) as workers:
         futures = [workers.submit(queue.audit, root, view="findings", now=moment) for _ in range(3)]
         assert [future.result(timeout=30) for future in futures] == [findings] * 3
-    assert path.read_bytes() == original
 
 
 @pytest.mark.parametrize("branch,unsupported", [
@@ -1522,6 +2608,148 @@ def race_list(arguments):
     return queue.list(root, now=moment)
 
 
+def _blocked_race_list(arguments):
+    original = queue._read
+
+    def blocked(*args, **kwargs):
+        delay = getattr(_RACE_CONTROL, "startup_delay", 0)
+        if delay:
+            from threading import Event
+            Event().wait(delay)  # Injected before readiness; the fault clock starts later.
+        _RACE_CONTROL.entered.set()
+        assert _RACE_CONTROL.release.wait(30), "queue.list read was not released"
+        return original(*args, **kwargs)
+
+    with queue_patch.object(queue, "_read", blocked):
+        return race_list(arguments)
+
+
+@pytest.mark.parametrize("startup_delay,launch_delay", [(0, 0), (3, 0), (3, 3)])
+def test_race_list_blocked_inside_queue_list_is_reaped(make_store, startup_delay, launch_delay):
+    add(make_store)
+    context = multiprocessing.get_context("spawn")
+    with _PipeControls(context) as controls:
+        entered, release = controls.entered, controls.release
+        fault_timeout = 2
+        phase = _PhaseStart()
+        finish, rescued, _seen, watchdog = _start_phased_watchdog(
+            release, launch=_LAUNCH_LIMIT, startup=_READY_LIMIT,
+            fault=fault_timeout, cleanup=_REAP_LIMIT, phase=phase)
+        try:
+            with pytest.raises(FutureTimeoutError):
+                _spawn_race(_blocked_race_list, [(make_store, 101), (make_store, 102)],
+                            timeout=fault_timeout, ready=entered,
+                            initializer=_race_control_init,
+                            initargs=(entered, controls.worker_release, startup_delay),
+                            launch_delay=launch_delay, phase=phase)
+            assert entered.is_set(), "queue.list did not reach the read boundary"
+            assert not rescued.is_set(), "queue.list cleanup waited for the blocked read"
+            assert multiprocessing.active_children() == []
+        finally:
+            finish()
+            if watchdog.ident is not None:
+                watchdog.join(_READY_LIMIT + 2)
+            assert not watchdog.is_alive()
+
+
+def _rescue_grace_on_blocked_list(root):
+    """Shared with the start-failure regression. root is used only after setup."""
+    fault, cleanup = 2, _REAP_LIMIT
+    assert _READY_LIMIT < _SPAWN_GRACE_HOLD < fault + cleanup
+    phase = _PhaseStart()
+    paused = None
+    context = multiprocessing.get_context("spawn")
+    try:
+        _hold, paused = _arm_pre_publication_hold(phase, _SPAWN_GRACE_HOLD)
+        with _PipeControls(context) as controls:
+            entered, release = controls.entered, controls.release
+            finish = None
+            watchdog = None
+            try:
+                finish, rescued, _seen, watchdog = _start_phased_watchdog(
+                    release, launch=_LAUNCH_LIMIT, startup=_READY_LIMIT,
+                    fault=fault, cleanup=cleanup, phase=phase)
+                with pytest.raises(FutureTimeoutError):
+                    _spawn_race(_blocked_race_list, [(root, 101), (root, 102)],
+                                timeout=fault, ready=entered, initializer=_race_control_init,
+                                initargs=(entered, controls.worker_release, 0), phase=phase)
+                assert phase.accepted.wait(2), "watchdog did not accept the helper latch"
+                assert entered.is_set(), "queue.list did not reach the read boundary"
+                assert not rescued.is_set(), "startup expiry before publication marked a rescue"
+                assert multiprocessing.active_children() == []
+            finally:
+                if finish is not None:
+                    finish()
+                _join_started(watchdog, _READY_LIMIT + fault + cleanup + 1)
+                assert watchdog is None or not watchdog.is_alive()
+    finally:
+        _release_publication_hold(phase, paused)
+
+
+def test_rescue_grace_on_race_list(make_store):
+    """Startup expiry before publication is not a rescue for the blocked queue.list."""
+    add(make_store)
+    _rescue_grace_on_blocked_list(make_store)
+
+
+@pytest.mark.parametrize("caller,fail_at", [
+    ("grace-consumed-byte", 1), ("grace-consumed-byte", 3),
+    ("grace-byte-before-poll", 1), ("grace-byte-before-poll", 3),
+    ("grace-preemption", 1), ("grace-preemption", 2),
+    ("grace-blocked-spawn", 1), ("grace-blocked-spawn", 2),
+    ("grace-spawn-failure", 1), ("grace-spawn-failure", 2),
+    ("grace-race-list", 1), ("grace-race-list", 2),
+    ("before-poll", 1), ("before-poll", 2),
+    ("consumer-byte", 1), ("consumer-byte", 2), ("consumer-byte", 3),
+    ("grace-byte-before-poll", 4)])
+def test_setup_start_failure_leaves_no_hook_or_thread(monkeypatch, caller, fail_at):
+    """Thread.start raising RuntimeError leaves no phase hook and no live thread.
+
+    fail_at 1 is the first start (the pause thread, or the watchdog when that
+    caller has no pause). A later index is a partial start: every thread that
+    did start is finished. consumer-byte 3 and grace-byte-before-poll 4 are the
+    result reader, after the consumer is already waiting. Cleanup cancels that
+    wait and joins the consumer before either pipe closes.
+    """
+    from time import monotonic
+    original = threading.Thread.start
+    seen = {"n": 0}
+
+    def start(self):
+        seen["n"] += 1
+        if seen["n"] == fail_at:
+            raise RuntimeError("start failed")
+        return original(self)
+
+    monkeypatch.setattr("tests.unit.core.test_team_queue.threading.Thread.start", start)
+    before = {thread.ident for thread in threading.enumerate() if thread.is_alive()}
+    with pytest.raises(RuntimeError, match="^start failed$"):
+        if caller == "grace-consumed-byte":
+            test_rescue_grace_on_consumed_readiness_byte()
+        elif caller == "grace-byte-before-poll":
+            test_rescue_grace_on_byte_consumed_before_observer_poll()
+        elif caller == "grace-preemption":
+            test_preemption_between_readiness_wait_and_latch_is_not_a_false_rescue()
+        elif caller == "grace-blocked-spawn":
+            test_rescue_grace_on_blocked_spawn()
+        elif caller == "grace-spawn-failure":
+            test_rescue_grace_before_publication_on_spawn_failure("blocked")
+        elif caller == "grace-race-list":
+            _rescue_grace_on_blocked_list(None)
+        elif caller == "before-poll":
+            test_is_set_before_helper_poll_is_not_a_false_rescue()
+        else:
+            test_byte_consumed_before_observer_poll_is_not_a_false_rescue()
+    living = {thread.ident for thread in threading.enumerate() if thread.is_alive()}
+    assert living <= before
+    ready = threading.Event()
+    phase = _PhaseStart()
+    started = monotonic()
+    _latch_ready(ready, phase)
+    assert ready.is_set() and phase.before_ready is None and phase.before_poll is None
+    assert phase.after_pipe is None and monotonic() - started < 1
+
+
 def test_valid_pending_intent_stays_recoverable(make_store):
     path, state, _row = _pending_state(make_store)
     before = _write_state(path, state)
@@ -1542,8 +2770,7 @@ def test_valid_pending_intent_stays_recoverable(make_store):
 def test_concurrent_pending_lists_name_the_same_workspace(make_store):
     path, state, _row = _pending_state(make_store)
     before = _write_state(path, state)
-    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
-        results = list(pool.map(race_list, [(make_store, 101), (make_store, 102)], timeout=30))
+    results = _spawn_race(race_list, [(make_store, 101), (make_store, 102)])
     assert path.read_bytes() == before
     commands = []
     for result in results:
@@ -1633,8 +2860,7 @@ def test_malformed_pending_intent_retries_after_repair(make_store):
     path, state, _row = _pending_state(make_store)
     state["unclaim"] = "private-value"
     before = _write_state(path, state)
-    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
-        results = list(pool.map(race_list, [(make_store, 101), (make_store, 102)], timeout=30))
+    results = _spawn_race(race_list, [(make_store, 101), (make_store, 102)])
     assert [result["reason"] for result in results] == ["invalid_queue_state", "invalid_queue_state"]
     assert all("private-value" not in json.dumps(result) for result in results)
     assert path.read_bytes() == before
@@ -1643,3 +2869,332 @@ def test_malformed_pending_intent_retries_after_repair(make_store):
     _write_state(path, repaired)
     restored = queue.list(make_store, now=103)
     assert not restored["refused"], restored
+
+
+_PUBLIC_PREDICATES = ("valid_key", "valid_lane", "valid_revision", "check_capabilities", "normalize_branch")
+_QUEUE_ARGUMENT_NEXT = "Use the documented queue arguments and the revision returned by list."
+_ITEM_NEXT = "Supply a bounded queue item with the documented fields and single-line values."
+
+
+def _predicate_result(kind, value):
+    """One public predicate outcome. Refusal codes stay fixed; values are not echoed."""
+    if kind == "key":
+        return queue.valid_key(value)
+    if kind == "lane":
+        return queue.valid_lane(value)
+    if kind == "revision":
+        return queue.valid_revision(value)
+    if kind == "capabilities":
+        try:
+            checked = queue.check_capabilities(value)
+        except queue.QueueRefusal as error:
+            assert error.reason == "invalid_item" and str(error) == "invalid_item"
+            return error.reason
+        assert checked == value
+        return "ok"
+    if kind == "branch":
+        try:
+            return queue.normalize_branch(value)
+        except queue.QueueRefusal as error:
+            assert error.reason == "invalid_arguments" and str(error) == "invalid_arguments"
+            assert type(error) is queue.QueueRefusal
+            return error.reason
+    raise AssertionError(kind)
+
+
+def _predicate_spy(order, name, real):
+    def spy(*args, **kwargs):
+        order.append(name)
+        return real(*args, **kwargs)
+
+    return spy
+
+
+def _watch_predicates(monkeypatch):
+    """Spy the public predicates through literal module attributes."""
+    order = []
+    key, lane = queue.valid_key, queue.valid_lane
+    revision, capabilities = queue.valid_revision, queue.check_capabilities
+    branch = queue.normalize_branch
+    monkeypatch.setattr(queue, "valid_key", _predicate_spy(order, "valid_key", key))
+    monkeypatch.setattr(queue, "valid_lane", _predicate_spy(order, "valid_lane", lane))
+    monkeypatch.setattr(queue, "valid_revision", _predicate_spy(order, "valid_revision", revision))
+    monkeypatch.setattr(queue, "check_capabilities", _predicate_spy(order, "check_capabilities", capabilities))
+    monkeypatch.setattr(queue, "normalize_branch", _predicate_spy(order, "normalize_branch", branch))
+    return order
+
+
+def _refuse_workspace_io(monkeypatch):
+    def unavailable(*args, **kwargs):
+        pytest.fail("field validation must finish before workspace IO")
+
+    # descriptor_supported is the public probe _root calls before any descriptor I/O.
+    monkeypatch.setattr(queue, "descriptor_supported", unavailable)
+
+
+def _assert_fixed_refusal(result, reason, action):
+    rendered = json.dumps(result)
+    assert result["reason"] == reason and result["exit_code"] == 2 and result["refused"] is True
+    assert result["next_action"] == action and result["status"] == "refused"
+    assert "\n" not in rendered and "\r" not in rendered
+    assert "private-value" not in rendered and "injected" not in rendered
+    assert "private-value injected" not in rendered and "private-valueinjected" not in rendered
+    return rendered
+
+
+def test_field_predicates_are_one_public_source():
+    for name in _PUBLIC_PREDICATES:
+        assert name in queue.__all__
+    assert queue._key is queue.valid_key
+    assert queue._lane is queue.valid_lane
+    assert queue._branch_name is queue.normalize_branch
+    assert queue.valid_key("ONE") is True and queue.valid_key("A" * 64) is True
+    assert queue.valid_key("A" * 65) is False and queue.valid_key("bad id") is False
+    assert queue.valid_key("ONE\ninjected") is False and queue.valid_key("") is False
+    assert queue.valid_key(None) is False and queue.valid_key(1) is False
+    assert queue.valid_lane("alpha") is True and queue.valid_lane("Alpha") is False
+    assert queue.valid_lane("a..b") is False and queue.valid_lane("alpha.lock") is False
+    assert queue.valid_lane("a" * 64) is False and queue.valid_lane("alpha\ninjected") is False
+    assert queue.valid_revision("a" * 64) is True and queue.valid_revision("ab" * 32) is True
+    assert queue.valid_revision("A" * 64) is False and queue.valid_revision("a" * 63) is False
+    assert queue.valid_revision("a" * 63 + "\n") is False and queue.valid_revision("g" * 64) is False
+    assert queue.valid_revision(None) is False and queue.valid_revision(b"a" * 64) is False
+    assert queue.check_capabilities(["core", "review"]) == ["core", "review"]
+    assert queue.check_capabilities(["c" + str(i) for i in range(queue.MAX_FIELDS)])
+    with pytest.raises(queue.QueueRefusal, match="^invalid_item$"):
+        queue.check_capabilities(["c" + str(i) for i in range(queue.MAX_FIELDS + 1)])
+    with pytest.raises(queue.QueueRefusal, match="^invalid_item$"):
+        queue.check_capabilities(["core", "core"])
+    with pytest.raises(queue.QueueRefusal, match="^invalid_item$"):
+        queue.check_capabilities(("core",))
+    with pytest.raises(queue.QueueRefusal, match="^invalid_item$"):
+        queue.check_capabilities(["bad id"])
+    with pytest.raises(queue.QueueRefusal, match="^invalid_item$"):
+        queue.check_capabilities(["core\ninjected"])
+    assert queue.normalize_branch(None) is None
+    assert queue.normalize_branch("lane/alpha") == "lane/alpha"
+    assert queue.normalize_branch("refs/heads/lane/alpha") == "lane/alpha"
+    for branch in ("refs/tags/private-value", "refs/heads/HEAD", "HEAD", "refs/heads/",
+                   "private-value topic", "private-value\ninjected", "", 1):
+        with pytest.raises(queue.QueueRefusal, match="^invalid_arguments$") as caught:
+            queue.normalize_branch(branch)
+        assert caught.value.reason == "invalid_arguments"
+        assert "private-value" not in str(caught.value) and "injected" not in str(caught.value)
+        assert "\n" not in str(caught.value)
+
+
+def test_public_predicates_are_stable_across_threads():
+    cases = (
+        ("key", "ONE", True), ("key", "bad id", False), ("key", "ONE\ninjected", False),
+        ("lane", "alpha", True), ("lane", "a..b", False), ("lane", "alpha.lock", False),
+        ("revision", "a" * 64, True), ("revision", "A" * 64, False), ("revision", None, False),
+        ("capabilities", ["core", "review"], "ok"), ("capabilities", ["core", "core"], "invalid_item"),
+        ("capabilities", ["core\ninjected"], "invalid_item"),
+        ("branch", None, None), ("branch", "refs/heads/lane/alpha", "lane/alpha"),
+        ("branch", "refs/tags/private-value", "invalid_arguments"),
+        ("branch", "private-value topic", "invalid_arguments"),
+        ("branch", "private-value\ninjected", "invalid_arguments"),
+    )
+    expected = [_predicate_result(kind, value) == wanted for kind, value, wanted in cases]
+
+    def batch(_index):
+        return [_predicate_result(kind, value) == wanted for kind, value, wanted in cases]
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        assert list(pool.map(batch, range(8))) == [expected] * 8
+
+
+@pytest.mark.parametrize("identifier,revision,lane", [
+    ("bad id", "a" * 64, "alpha"),
+    ("ONE\ninjected", "a" * 64, "alpha"),
+    ("", "a" * 64, "alpha"),
+    ("A" * 65, "a" * 64, "alpha"),
+    ("ONE", "A" * 64, "alpha"),
+    ("ONE", "a" * 63, "alpha"),
+    ("ONE", "a" * 63 + "\ninjected", "alpha"),
+    ("ONE", "g" * 64, "alpha"),
+    ("ONE", None, "alpha"),
+    ("ONE", "a" * 64, "a..b"),
+    ("ONE", "a" * 64, "alpha.lock"),
+    ("ONE", "a" * 64, "Alpha"),
+    ("ONE", "a" * 64, "alpha\ninjected"),
+    ("ONE", "a" * 64, ""),
+], ids=["spaced-id", "multiline-id", "empty-id", "long-id", "upper-revision", "short-revision",
+        "multiline-revision", "nonhex-revision", "revision-type", "parent-lane", "lock-lane",
+        "upper-lane", "multiline-lane", "empty-lane"])
+def test_malformed_claim_fields_share_predicates_before_io(monkeypatch, identifier, revision, lane):
+    key_ok, revision_ok = queue.valid_key(identifier), queue.valid_revision(revision)
+    order = _watch_predicates(monkeypatch)
+    _refuse_workspace_io(monkeypatch)
+    result = queue.claim("/workspace", identifier, expect=revision, lane=lane,
+                         capabilities=["core"], branch="lane/alpha", now=100)
+    _assert_fixed_refusal(result, "invalid_arguments", _QUEUE_ARGUMENT_NEXT)
+    assert order and order[0] == "valid_key"
+    if not key_ok:
+        assert order == ["valid_key"]
+    elif not revision_ok:
+        assert order == ["valid_key", "valid_revision"]
+    else:
+        assert order[:4] == ["valid_key", "valid_revision", "check_capabilities", "valid_lane"]
+        assert "normalize_branch" not in order
+
+
+@pytest.mark.parametrize("branch", ["refs/tags/private-value", "refs/remotes/origin/x", "HEAD",
+    "refs/heads/HEAD", "refs/heads/", "private-value topic", "private-value\ninjected", "", 1],
+    ids=["tags", "remote", "head", "heads-head", "empty-name", "spaces", "multiline", "empty", "type"])
+def test_invalid_branch_uses_public_normalizer_before_io(monkeypatch, branch):
+    order = _watch_predicates(monkeypatch)
+    _refuse_workspace_io(monkeypatch)
+    result = queue.claim("/workspace", "ONE", expect="a" * 64, lane="alpha", capabilities=["core"],
+                         branch=branch, now=100)
+    _assert_fixed_refusal(result, "invalid_arguments", _QUEUE_ARGUMENT_NEXT)
+    assert order[-1] == "normalize_branch"
+    assert queue.normalize_branch("refs/heads/lane/alpha") == "lane/alpha"
+
+
+def test_duplicate_capabilities_precede_lane_branch_and_io(monkeypatch):
+    order = _watch_predicates(monkeypatch)
+    _refuse_workspace_io(monkeypatch)
+    result = queue.claim("/workspace", "ONE", expect="a" * 64, lane="a..b", capabilities=["core", "core"],
+                         branch="refs/tags/private-value", now=100)
+    _assert_fixed_refusal(result, "invalid_arguments", _QUEUE_ARGUMENT_NEXT)
+    assert order == ["valid_key", "valid_revision", "check_capabilities"]
+    listed = queue.list("/workspace", capabilities=["core", "core"], now=100)
+    _assert_fixed_refusal(listed, "invalid_arguments", _QUEUE_ARGUMENT_NEXT)
+    assert order[-1] == "check_capabilities"
+    added = queue.add("/workspace", item(capabilities=["core", "core"]), now=100)
+    _assert_fixed_refusal(added, "invalid_item", _ITEM_NEXT)
+
+
+def test_invalid_ttl_precedes_branch_normalization(monkeypatch):
+    order = _watch_predicates(monkeypatch)
+    _refuse_workspace_io(monkeypatch)
+    result = queue.claim("/workspace", "ONE", expect="a" * 64, lane="alpha", capabilities=["core"],
+                         branch="refs/tags/private-value", ttl_s=0, now=100)
+    _assert_fixed_refusal(result, "invalid_arguments", _QUEUE_ARGUMENT_NEXT)
+    assert "normalize_branch" not in order and "valid_lane" in order
+
+
+@pytest.mark.parametrize("verb", ["claim", "release", "unclaim", "done"])
+def test_mutation_verbs_use_public_key_before_io(monkeypatch, verb):
+    order = _watch_predicates(monkeypatch)
+    _refuse_workspace_io(monkeypatch)
+    arguments = {"expect": "a" * 64, "now": 100}
+    if verb == "claim":
+        arguments.update(lane="alpha", capabilities=["core"])
+    elif verb == "unclaim":
+        arguments.update(lane="alpha", writer_stopped=True, reason="private-value\ninjected")
+    elif verb == "done":
+        arguments.update(lane="alpha")
+    result = getattr(queue, verb)("/workspace", "bad id", **arguments)
+    _assert_fixed_refusal(result, "invalid_arguments", _QUEUE_ARGUMENT_NEXT)
+    assert order == ["valid_key"]
+
+
+def test_capability_refusal_keeps_caller_category(monkeypatch):
+    _refuse_workspace_io(monkeypatch)
+    secret = "sk-" + "a" * 24
+    added = queue.add("/workspace", item(capabilities=[secret]), now=100)
+    claimed = queue.claim("/workspace", "ONE", expect="a" * 64, lane="alpha",
+                          capabilities=[secret], now=100)
+    listed = queue.list("/workspace", capabilities=[secret], now=100)
+    assert added["reason"] == "invalid_item" and added["exit_code"] == 2
+    assert claimed["reason"] == "invalid_arguments" and claimed["exit_code"] == 2
+    assert listed["reason"] == "invalid_arguments" and listed["exit_code"] == 2
+    rendered = json.dumps((added, claimed, listed))
+    assert secret not in rendered and "\n" not in rendered
+
+
+def test_valid_predicates_hit_unsupported_platform_probe(tmp_path, monkeypatch):
+    probed = []
+
+    def unsupported():
+        probed.append("platform")
+        return False
+
+    monkeypatch.setattr(queue, "descriptor_supported", unsupported)
+    assert queue.valid_key("ONE") and queue.valid_lane("alpha") and queue.valid_revision("a" * 64)
+    assert queue.check_capabilities(["core"]) == ["core"]
+    assert queue.normalize_branch("refs/heads/lane/alpha") == "lane/alpha"
+    result = queue.claim(tmp_path, "ONE", expect="a" * 64, lane="alpha", capabilities=["core"],
+                         branch="refs/heads/lane/alpha", now=100)
+    assert result["reason"] == "unsupported_platform" and result["exit_code"] == 1
+    assert probed == ["platform"]
+    assert "refs/heads/lane/alpha" not in json.dumps(result)
+    assert result["next_action"]
+
+
+def test_predicate_failures_leave_state_and_retry(make_store):
+    revision = add(make_store)
+    path = make_store / ".aegis" / "state" / "team-queue.json"
+    before = path.read_bytes()
+    refusals = [
+        {"identifier": "bad id"},
+        {"identifier": "ONE\ninjected"},
+        {"expect": "A" * 64},
+        {"expect": "a" * 63 + "\ninjected"},
+        {"lane": "a..b"},
+        {"lane": "alpha\ninjected"},
+        {"capabilities": ["core", "core"]},
+        {"branch": "refs/tags/private-value"},
+        {"branch": "private-value topic"},
+        {"branch": "private-value\ninjected"},
+    ]
+    for override in refusals:
+        arguments = {"identifier": "ONE", "expect": revision, "lane": "alpha", "capabilities": ["core"],
+                     "branch": "lane/alpha", "now": 101}
+        arguments.update(override)
+        identifier = arguments.pop("identifier")
+        result = queue.claim(make_store, identifier, **arguments)
+        _assert_fixed_refusal(result, "invalid_arguments", _QUEUE_ARGUMENT_NEXT)
+        assert path.read_bytes() == before
+    claimed = queue.claim(make_store, "ONE", expect=revision, lane="alpha", capabilities=["core"],
+                          branch="refs/heads/lane/alpha", now=101)
+    assert not claimed["refused"], claimed
+    assert claimed["item"]["branch"] == "lane/alpha"
+    released = queue.release(make_store, "ONE", expect=claimed["item"]["revision"], lane="alpha", now=102)
+    assert not released["refused"], released
+    again = queue.claim(make_store, "ONE", expect=released["item"]["revision"], lane="alpha",
+                        capabilities=["core", "review"], branch="lane/alpha", now=103)
+    assert not again["refused"] and again["item"]["branch"] == "lane/alpha"
+
+
+def race_public_predicate_claim(arguments):
+    root, revision, mode = arguments
+    if mode == "accept":
+        result = queue.claim(root, "ONE", expect=revision, lane="alpha", capabilities=["core"],
+                             branch="refs/heads/lane/alpha", ttl_s=10, now=101)
+    elif mode == "id":
+        result = queue.claim(root, "bad id", expect=revision, lane="alpha", capabilities=["core"], now=101)
+    elif mode == "revision":
+        result = queue.claim(root, "ONE", expect="A" * 64, lane="alpha", capabilities=["core"], now=101)
+    elif mode == "lane":
+        result = queue.claim(root, "ONE", expect=revision, lane="alpha\ninjected", capabilities=["core"], now=101)
+    elif mode == "capabilities":
+        result = queue.claim(root, "ONE", expect=revision, lane="alpha", capabilities=["core", "core"], now=101)
+    elif mode == "branch":
+        result = queue.claim(root, "ONE", expect=revision, lane="alpha", capabilities=["core"],
+                             branch="private-value\ninjected", now=101)
+    else:
+        raise AssertionError(mode)
+    item_view = result.get("item")
+    return {"refused": result["refused"], "reason": result.get("reason"), "exit_code": result.get("exit_code"),
+            "branch": None if item_view is None else item_view.get("branch")}
+
+
+def test_concurrent_predicate_refusals_leave_one_claim(make_store):
+    revision = add(make_store)
+    modes = ["accept", "id", "revision", "lane", "capabilities", "branch"]
+    results = _spawn_race(race_public_predicate_claim, [(make_store, revision, mode) for mode in modes])
+    rendered = json.dumps(results)
+    assert "private-value" not in rendered and "injected" not in rendered and "\n" not in rendered
+    refused = [row for row in results if row["refused"]]
+    accepted = [row for row in results if not row["refused"]]
+    assert [row["reason"] for row in refused] == ["invalid_arguments"] * 5
+    assert [row["exit_code"] for row in refused] == [2] * 5
+    assert accepted == [{"refused": False, "reason": None, "exit_code": 0, "branch": "lane/alpha"}]
+    stored = queue.list(make_store, now=102)["items"][0]
+    assert stored["branch"] == "lane/alpha" and stored["state"] == "claimed"
+    retry = queue.claim(make_store, "ONE", expect=stored["revision"], lane="alpha",
+                        capabilities=["core"], branch="lane/alpha", now=112)
+    assert not retry["refused"] and retry["item"]["branch"] == "lane/alpha"

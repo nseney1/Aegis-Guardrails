@@ -28,10 +28,13 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-from aegis_core import hosts
+from aegis_core import hosts, pathlookup
 from aegis_core._version import __version__
 from aegis_core.bootstrap import instructions_text
 from aegis_core.config import env_client, env_manager_registration, env_workspace
+from aegis_core.guidance_projection import (
+    MAX_GUIDANCE_CHARS, GuidanceProjectionError, project_error_name, project_diagnostic,
+)
 from aegis_core.taxonomy import MCP_DEFAULT_RATE_LIMITS
 from aegis_core.workspace.base import Workspace
 from aegis_core.workspace.binding import Attested, Registry, WorkspaceBinding, read_registry, resolve_binding
@@ -42,7 +45,8 @@ from aegis_mcp.handlers.common import DEFAULT_CLIENT_PLATFORM, NOT_GOVERNED_MESS
 from aegis_mcp.handlers.msg import message_result
 from .registry import TOOL_ARGUMENTS, TOOL_DEFINITIONS
 from .stdio_reader import FrameError, MANAGER_MAX_BYTES, REPOSITORY_MAX_BYTES, input_stream, read_frame
-from .tools import SERVER_INJECTED, model_argument_refusal, queue_argument_refusal, execute_tool, is_known_tool
+from .tools import (SERVER_INJECTED, model_argument_refusal, queue_argument_refusal,
+                    execute_tool, is_known_tool)
 
 # Arguments only the server may set: what it injects, plus names no schema declares that a
 # client might still send. A client value is dropped before dispatch, so the workspace, the
@@ -68,6 +72,8 @@ _client_version: str = ""
 _session_id: Optional[str] = None
 # Set by run_stdio_server when the pin is unusable: every tools/call answers with it.
 _workspace_error: Optional[WorkspaceBinding] = None
+# Snapshot the launch spelling for diagnostics, including unusable pins. Never output raw.
+_workspace_pin: Optional[str] = None
 _server_cwd: Optional[str] = None
 _claude_project_dir: Optional[str] = None
 _roots_capable: bool = False
@@ -95,6 +101,7 @@ def fresh_state() -> Dict[str, Any]:
         "_client_version": "",
         "_session_id": None,
         "_workspace_error": None,
+        "_workspace_pin": None,
         "_server_cwd": None,
         "_claude_project_dir": None,
         "_roots_capable": False,
@@ -148,7 +155,7 @@ def send_response(response: Dict[str, Any]):
 
 
 def _error(req_id: Any, code: int, message: str) -> Dict[str, Any]:
-    return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
+    return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": project_diagnostic(message)}}
 
 
 def send_error(id: Any, code: int, message: str):
@@ -176,11 +183,16 @@ def _identify(params: Dict[str, Any]) -> Tuple[str, str, str]:
     host = hosts.identify(name)
     registered = env_client()
     if registered:
-        try:
-            host = hosts.get(registered).id
-        except KeyError:
-            print(f"aegis-mcp: AEGIS_CLIENT={registered!r} names no known host; "
-                  "identifying the client by clientInfo", file=sys.stderr)
+        unknown = len(registered) > MAX_GUIDANCE_CHARS
+        if not unknown:
+            try:
+                host = hosts.get(registered).id
+            except KeyError:
+                unknown = True
+        if unknown:
+            shown = project_diagnostic(registered)
+            print(project_diagnostic(f"aegis-mcp: AEGIS_CLIENT={shown!r} names no known host; "
+                                     "identifying the client by clientInfo"), file=sys.stderr)
     return host, name, version
 
 
@@ -277,7 +289,12 @@ def _bind(params: Dict[str, Any], args: Dict[str, Any]) -> WorkspaceBinding:
     raw_files = args.get("files")
     files = [f for f in raw_files if isinstance(f, str)] if isinstance(raw_files, list) else None
     pin = getattr(_canonical_workspace, "root", _canonical_workspace)
-    return resolve_binding(pin=pin, attested=_attested(params), files=files, cwd=_server_cwd, registry=_registry())
+    try:
+        return resolve_binding(pin=pin, attested=_attested(params), files=files, cwd=_server_cwd, registry=_registry())
+    except OSError:
+        return WorkspaceBinding("error", source="pin" if pin else None,
+                                reason="pin_missing" if pin else "no_workspace",
+                                message="workspace validation could not be completed")
 
 
 def _workspace_for(binding: WorkspaceBinding) -> Workspace:
@@ -288,12 +305,118 @@ def _workspace_for(binding: WorkspaceBinding) -> Workspace:
     return _workspaces[key]
 
 
+_BINDING_MESSAGES = {
+    "pin_conflicts_with_host_root": (
+        "AEGIS_WORKSPACE pins {pin}, but the host reports the session in {host_roots}; "
+        "fix the pin or open the pinned project", ("pin", "host_roots")),
+    "pin_conflicts_with_registry": (
+        "AEGIS_WORKSPACE pins {pin}, but the files belong to the registered workspace {registered_root}",
+        ("pin", "registered_root")),
+    "host_root_conflicts_with_registry": (
+        "the host reports the session in {host_root}, but the files belong to the registered workspace "
+        "{registered_root}", ("host_root", "registered_root")),
+    "host_root_conflicts_with_registry_outside": (
+        "the host reports the session outside any Aegis workspace, but the files belong to "
+        "the registered workspace {registered_root}", ("registered_root",)),
+    "ambiguous_host_roots": (
+        "the host reports several Aegis workspaces and the call's files do not pick one; "
+        "pass the files you plan to edit", ()),
+    "cwd_conflicts_with_registry": (
+        "the server runs in the workspace {cwd_root}, but the files exist only in the registered "
+        "workspace(s) {candidates}; pass absolute paths", ("cwd_root", "candidates")),
+    "ambiguous_registry_selection": ("the files exist in several registered workspaces; pass absolute paths", ()),
+    "host_roots_not_governed": ("the host's workspace has no .aegis/", ()),
+    "no_workspace": ("no Aegis workspace resolves for this call", ()),
+    "pin_missing": ("AEGIS_WORKSPACE is set to {workspace}, which cannot be resolved", ()),
+    "pin_missing_directory": ("AEGIS_WORKSPACE is set to {workspace}, which is not a directory", ()),
+    "pin_not_a_workspace": ("AEGIS_WORKSPACE is set to {workspace}, which has no .aegis/ (run aegis init there)", ()),
+    "pin_denied": ("AEGIS_WORKSPACE is set to {workspace}, which is the home directory", ()),
+    "pin_denied_root": ("AEGIS_WORKSPACE is set to {workspace}, which is the filesystem root", ()),
+}
+
+
 def _unbound_result(binding: WorkspaceBinding) -> Dict[str, Any]:
+    launch_pin = _workspace_pin or getattr(_canonical_workspace, "root", _canonical_workspace)
+    if isinstance(launch_pin, os.PathLike):
+        launch_pin = os.fspath(launch_pin)
+    raw = {"status": binding.status, "root": str(binding.root) if binding.root is not None else None,
+           "source": binding.source, "confidence": binding.confidence, "reason": binding.reason,
+           "_pin": launch_pin}
+    # Bound wrappers, path count and each raw component before copying details.
+    # With at most 256 projected items of 1024 characters, later joins are bounded too.
+    refusal = None
+    items = len(binding.details)
+    for value in raw.values():
+        if value is not None:
+            if not isinstance(value, str):
+                refusal = "guidance_projection_invalid_field"
+                break
+            if len(value) > MAX_GUIDANCE_CHARS:
+                refusal = GuidanceProjectionError.code
+                break
+    if items > 256:
+        refusal = GuidanceProjectionError.code
+    allowed = {"pin", "target", "cwd", "cwd_root", "host_root", "registered_root", "host_roots", "candidates"}
+    if refusal is None:
+        for key, value in binding.details:
+            if key not in allowed or not isinstance(value, list if key in {"host_roots", "candidates"} else str):
+                refusal = "guidance_projection_invalid_field"
+                break
+            items += len(value) if isinstance(value, list) else 1
+            if items > 256:
+                refusal = GuidanceProjectionError.code
+                break
+            for path in value if isinstance(value, list) else (value,):
+                if not isinstance(path, str):
+                    refusal = "guidance_projection_invalid_field"
+                    break
+                if len(path) > MAX_GUIDANCE_CHARS:
+                    refusal = GuidanceProjectionError.code
+                    break
+            if refusal is not None:
+                break
+    display = {}
+    for key, value in raw.items():
+        if value is None:
+            display[key] = None
+        else:
+            try:
+                name = project_error_name(value)
+            except GuidanceProjectionError as error:
+                name = error.code
+            display[key] = project_diagnostic(name, escaped=False)
+    projected_pin = display.pop("_pin")
+    details = {}
+    if refusal is None:
+        for key, value in binding.details:
+            shown = []
+            for path in value if isinstance(value, list) else (value,):
+                try:
+                    name = project_error_name(path)
+                except GuidanceProjectionError as error:
+                    name = error.code
+                shown.append(project_diagnostic(name, escaped=False))
+            details[key] = shown if isinstance(value, list) else shown[0]
+    kind = binding.reason
+    if kind == "host_root_conflicts_with_registry" and "host_root" not in details:
+        kind = "host_root_conflicts_with_registry_outside"
+    elif kind == "pin_missing" and binding.message.endswith("which is not a directory"):
+        kind = "pin_missing_directory"
+    elif kind == "pin_denied" and binding.message.endswith("which is the filesystem root"):
+        kind = "pin_denied_root"
+    template, required = _BINDING_MESSAGES.get(kind, ("workspace binding refused", ()))
+    if refusal is None and not all(key in details for key in required):
+        refusal = "guidance_projection_invalid_field"
+    display["details"] = details if refusal is None else {}
+    values = {key: ", ".join(value) if isinstance(value, list) else value for key, value in display["details"].items()}
+    values["workspace"] = projected_pin or values.get("pin") or display["root"] or "workspace"
+    message = refusal or template.format(**values)
+    display["message"] = project_diagnostic(message, escaped=False)
     if binding.status == "hold":
-        return {"status": "hold", "reason": binding.reason, "error": binding.message, "binding": binding.as_dict()}
+        return {"status": "hold", "reason": display["reason"], "error": display["message"], "binding": display}
     if binding.status == "error":
-        return {"status": "FAIL", "error": binding.message, "binding": binding.as_dict()}
-    return {"status": "not_governed", "error": NOT_GOVERNED_MESSAGE, "binding": binding.as_dict()}
+        return {"status": "FAIL", "error": display["message"], "binding": display}
+    return {"status": "not_governed", "error": NOT_GOVERNED_MESSAGE, "binding": display}
 
 
 def _tool_result(req_id: Any, text: str, is_error: bool) -> Dict[str, Any]:
@@ -439,6 +562,12 @@ def _initialize_queue(req_id, params):
     }}
 
 
+def _arm_ordinary_root(binding):
+    """Install the canonical root after discovery; the caller owns the reset token."""
+    root = os.path.normcase(os.fspath(binding.root)) if binding.bound else None
+    return pathlookup.ordinary_root.set(root)
+
+
 def _queue_claim_call(req_id, params):
     from . import queue_role
 
@@ -448,17 +577,31 @@ def _queue_claim_call(req_id, params):
         return _json_tool_result(req_id, invalid, True)
     if _queue_error is not None or _queue_grant is None:
         return _json_tool_result(req_id, queue_role.refusal(_queue_error or "role_missing"), True)
+    reset = None
     try:
         binding = _bind(params, {})
+        reset = _arm_ordinary_root(binding)
         if not binding.bound or str(binding.root) != _queue_grant.workspace:
             return _json_tool_result(req_id, queue_role.refusal("queue_io_unavailable"), True)
         result = execute_tool("aegis_team_queue_claim", args, queue_grant=_queue_grant, queue_session=_session_id)
         return _json_tool_result(req_id, result, bool(result.get("refused")))
     except Exception:
         return _json_tool_result(req_id, queue_role.refusal("queue_io_unavailable"), True)
+    finally:
+        if reset is not None:
+            pathlookup.ordinary_root.reset(reset)
 
 
 def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    # Discovery, including reentrant calls, always starts without a bound fence.
+    token = pathlookup.ordinary_root.set(None)
+    try:
+        return _handle_request(request)
+    finally:
+        pathlookup.ordinary_root.reset(token)
+
+
+def _handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     global _session_id, _client_platform, _client_name, _client_version, _roots_capable, _host_roots
 
     if not isinstance(request, dict):
@@ -508,7 +651,7 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if method.startswith("notifications/"):
         return None
     if method not in ("tools/list", "tools/call"):
-        return _error(req_id, -32601, f"Method not found: {method}")
+        return _error(req_id, -32601, f"Method not found: {project_diagnostic(method)}")
     if _session_id is None:
         return _error(req_id, -32002, "Server not initialized")
     if method == "tools/list":
@@ -536,7 +679,7 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             return _message_refusal(req_id, "E_FORMAT")
         return _error(req_id, -32602, "Tool arguments must be an object.")
     if not is_known_tool(name):
-        return _error(req_id, -32602, f"Unknown tool: {name}")
+        return _error(req_id, -32602, f"Unknown tool: {project_diagnostic(name)}")
     if not _check_rate_limit(name):
         max_calls, window = _RATE_LIMITS[name]
         return _error(req_id, -32000, f"Rate limit exceeded for '{name}': max {max_calls} calls per {window}s")
@@ -555,6 +698,14 @@ def _repository_call(req_id, params, name, args):
     # The client never chooses the workspace or the attribution of what it reports.
     args = strip_server_owned(args)
     binding = _bind(params, args)
+    reset = _arm_ordinary_root(binding)
+    try:
+        return _finish_repository_call(req_id, name, args, binding)
+    finally:
+        pathlookup.ordinary_root.reset(reset)
+
+
+def _finish_repository_call(req_id, name, args, binding):
     if binding.bound:
         args["workspace"] = _workspace_for(binding)
         args["_binding"] = binding.source
@@ -584,6 +735,10 @@ def _repository_call(req_id, params, name, args):
             return _tool_result(req_id, json.dumps({"error": "model_io_unavailable"}), True)
         if name in ("aegis_msg_read", "aegis_msg_write"):
             return _message_failure(req_id, exc)
+        if name == "aegis_scan":
+            message = project_diagnostic(str(exc))
+            print(f"aegis-mcp: {message}", file=sys.stderr)
+            return _tool_result(req_id, f"Tool execution failed: {message}", True)
         traceback.print_exc(file=sys.stderr)
         return _tool_result(req_id, f"Tool execution failed: {exc}", True)
     if name in ("aegis_msg_read", "aegis_msg_write"):
@@ -624,7 +779,7 @@ def _manager_call(req_id, params):
     try:
         validate_call(name, args)
     except ValueError as exc:
-        return _error(req_id, -32602, str(exc))
+        return _error(req_id, -32602, project_diagnostic(str(exc)))
     if _manager_error is not None:
         return _tool_result(req_id, json.dumps(_manager_error), True)
     if not _check_rate_limit(name):
@@ -636,13 +791,13 @@ def _manager_call(req_id, params):
         with contextlib.redirect_stdout(sys.stderr):
             result = execute(_manager_config, _manager_digest, provenance, name, args)
     except (ValueError, OSError) as exc:
-        return _tool_result(req_id, json.dumps({"status": "FAIL", "error": str(exc)}), True)
+        return _tool_result(req_id, json.dumps({"status": "FAIL", "error": project_diagnostic(str(exc))}), True)
     return _json_tool_result(req_id, result, is_error_result(result))
 
 
 def _start(environ: Optional[Dict[str, str]] = None, *, queue_registration=None) -> None:
     """Reset the connection state and read what the process was started with."""
-    global _canonical_workspace, _workspace_error, _server_cwd, _claude_project_dir
+    global _canonical_workspace, _workspace_error, _workspace_pin, _server_cwd, _claude_project_dir
     global _manager_config, _manager_digest, _manager_error
     for attr, value in fresh_state().items():
         globals()[attr] = value
@@ -656,6 +811,7 @@ def _start(environ: Optional[Dict[str, str]] = None, *, queue_registration=None)
         _server_cwd = None
     _claude_project_dir = env.get("CLAUDE_PROJECT_DIR") or None
     pin = env_workspace(env)
+    _workspace_pin = pin
     registration = env_manager_registration(env)
     if registration is not None:
         _manager_config, _manager_digest = registration
@@ -667,11 +823,21 @@ def _start(environ: Optional[Dict[str, str]] = None, *, queue_registration=None)
                               "error": "manager registration requires an absolute config path and its SHA256"}
         return
     if pin:
-        checked = resolve_binding(pin=pin)
+        if len(pin) > MAX_GUIDANCE_CHARS:
+            checked = WorkspaceBinding("error", source="pin", reason="pin_missing",
+                                       message=GuidanceProjectionError.code)
+        else:
+            try:
+                checked = resolve_binding(pin=pin)
+            except OSError:
+                # Marker/stat failures are as binding-fatal as path-resolution failures.
+                # Never retain or echo the exception's path or text.
+                checked = WorkspaceBinding("error", source="pin", reason="pin_missing",
+                                           message="workspace validation could not be completed")
         if checked.status == "error":
             # Stay up so the host does not mark the server failed; tools/call explains why.
             _workspace_error = checked
-            print(f"aegis-mcp: {checked.message}", file=sys.stderr)
+            print(f"aegis-mcp: {_unbound_result(checked)['error']}", file=sys.stderr)
         else:
             _canonical_workspace = pin
 
@@ -695,8 +861,8 @@ def harden_process() -> bool:
 
 def run_stdio_server(*, queue_registration=None):
     harden_process()
-    _start(queue_registration=queue_registration)
     try:
+        _start(queue_registration=queue_registration)
         stream = input_stream(sys.stdin)
         max_bytes = REPOSITORY_MAX_BYTES if _manager_config is None else MANAGER_MAX_BYTES
         while True:
@@ -739,8 +905,14 @@ def run_stdio_server(*, queue_registration=None):
                 response = handle_request(request)
                 if response is not None and "id" in request:
                     send_response(response)
-            except Exception:
-                traceback.print_exc(file=sys.stderr)
+            except Exception as exc:
+                params = request.get("params")
+                if (request.get("method") == "tools/call" and isinstance(params, dict)
+                        and params.get("name") == "aegis_scan"):
+                    message = project_diagnostic(str(exc))
+                    print(f"aegis-mcp: {message}", file=sys.stderr)
+                else:
+                    traceback.print_exc(file=sys.stderr)
                 if "id" in request:
                     send_error(_safe_id(request["id"]), -32603, "Internal error")
             for message in take_outbox():

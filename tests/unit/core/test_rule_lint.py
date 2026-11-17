@@ -13,10 +13,15 @@ import glob
 import os
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import aegis_core.rule_lint as lint
+import aegis_core.scan as scan_service
+import aegis_core.rules as rule_schema
+import aegis_core.gitsafe as git_service
+from tests import helpers_humangate as hg
 
 from aegis_cli.init import install_rules
 from aegis_core.lifecycle.constants import PROTECTED_RULES
@@ -405,14 +410,14 @@ def test_lint_paper_gates_refuse_but_unchanged_amendment_only_warns(extra):
     assert not lint_rule(data, path, original=changed).ok
 
 
-def test_lint_target_paths_are_warning_only_and_simulation_is_explicitly_deferred():
+def test_lint_target_paths_are_warning_only_and_simulation_needs_context():
     from aegis_core.rule_lint import lint_rule
 
     data = lint_bytes().replace(b"target_paths: [src/**]\n", b"")
     result = lint_rule(data, LINT_PATH)
     assert result.ok and "target_paths" in lint_codes(result)
     simulation = next(f for f in result.findings if f.check == 7)
-    assert simulation.message == "not evaluated: pending M2C-SCAN-SIM"
+    assert simulation.message == "not evaluated: no scan workspace"
 
 
 def test_lint_gate_dry_run_counts_real_ast_hits_without_running_sources():
@@ -1535,11 +1540,15 @@ def test_lint_unescaped_comment_and_escaped_quotes_keep_control_provenance():
         assert "concrete_command" not in lint_codes(result)
 
 
-def test_lint_inline_triple_ticks_in_evidence_do_not_hide_following_sections():
+def test_lint_evidence_tail_does_not_reenter_guidance_at_notes():
+    from aegis_core.guidance_projection import project_detail
+
     body = ("## Do\nUse the ${SLOT.TEST_RUNNER} capability.\n## Evidence\n```observed```\n"
             "## Notes\nRun `Bash` with `pytest -q` and ${SLOT.UNKNOWN}.\n")
     result = lint.lint_rule(lint_bytes(body=body), LINT_PATH)
-    assert {"unknown_slot", "vendor_name", "concrete_command"} <= lint_codes(result)
+    assert project_detail(body) == "## Do Use the ${SLOT.TEST_RUNNER} capability."
+    assert result.ok
+    assert not {"unknown_slot", "vendor_name", "concrete_command"} & lint_codes(result)
 
 
 def test_lint_inline_triple_tick_do_instruction_does_not_leak_evidence():
@@ -1799,7 +1808,7 @@ def test_lint_plain_oversized_documentation_uses_loader_classification_without_y
         entries = kwargs["inventory"].entries
         assert all(len(entry.content) <= lint.MAX_RULE_BYTES for entry in entries)
         prefixes = [entry for entry in entries if entry.relative_path == path]
-        assert len(prefixes) == (0 if ending else 1)
+        assert len(prefixes) == 1  # Invalid bytes beyond capture cannot change classification.
         for entry in prefixes:
             assert split_frontmatter(entry.content.decode("utf-8-sig"))[0] == "none"
         calls.append(entries)
@@ -1809,12 +1818,7 @@ def test_lint_plain_oversized_documentation_uses_loader_classification_without_y
     results = lint.lint_workspace(root)
     by_path = {r.path: r for r in results}
     assert {r.path for r in records} == set(by_path)
-    if ending:
-        assert "too_large" in lint_codes(by_path[path])
-        if target.stem == "sample":
-            assert all("duplicate" in lint_codes(r) for r in results)
-    else:
-        assert len(results) == 1 and results[0].ok
+    assert len(results) == 1 and results[0].ok
     assert len(calls) == 1
 
 
@@ -2052,11 +2056,8 @@ def test_lint_bounded_frontmatter_preserves_unicode_boundaries_and_encoding_erro
     records = load_rules(root).rules
     results = lint.lint_workspace(root)
     assert {r.path for r in results} == {r.path for r in records}
-    if invalid_tail:
-        assert len(results) == 2 and all("duplicate" in lint_codes(r) for r in results)
-        assert "too_large" in lint_codes(next(r for r in results if r.path == path))
-    else:
-        assert len(results) == 1 and results[0].ok
+    # The coordinator's bounded-prefix ruling makes the uncaptured tail irrelevant.
+    assert len(results) == 1 and results[0].ok
 
 
 def test_lint_oversized_gate_does_not_capture_sources_from_its_frontmatter_prefix(tmp_path, monkeypatch):
@@ -2251,3 +2252,656 @@ def test_lint_addendum_role_slots_exempt_only_their_control_segment(role):
 def test_lint_addendum_capability_slots_still_unwrap_concrete_commands():
     do = "Run `$" "{SLOT.TOOL_RUN} pytest -q`."
     assert "concrete_command" in lint_codes(lint.lint_rule(lint_bytes(do=do), LINT_PATH))
+
+
+def scan_simulation_row(result):
+    rows = [finding for finding in result.findings if finding.check == 7]
+    assert len(rows) == 1
+    assert (rows[0].code, rows[0].severity) == ("scan_simulation", "warning")
+    return rows[0].message
+
+
+@pytest.mark.parametrize("scenario,expected", [
+    ("selected", "scan simulation: selected in all profiles"),
+    ("tokens", "scan simulation: not selected in profiles: antigravity, claude-code, codex-cli, gemini-cli, generic"),
+    ("mandatory", "scan simulation: not selected in profiles: antigravity, claude-code, codex-cli, gemini-cli, generic"),
+    ("fitness", "scan simulation: not selected in profiles: antigravity, claude-code, codex-cli, gemini-cli, generic"),
+])
+def test_lint_scan_simulation_matches_real_scan_and_cli(tmp_path, monkeypatch, capsys, scenario, expected):
+    import argparse
+    import json
+    from aegis_cli.rule import RuleCommand, run_rule
+    from aegis_core.fitness import compute
+    from aegis_core.skills.slots import PLATFORM_SLOT_PROFILES, scan_registry
+
+    root = lint_root(tmp_path)
+    monkeypatch.setattr(git_service, "changed_files", lambda *a, **k: ["src/a.py"])
+    (root / ".aegis/config.json").write_text(json.dumps({"jit": {"max_tokens": 200 if scenario == "tokens" else 2000}}), encoding="utf-8")
+    if scenario == "mandatory":
+        data = lint_bytes(extra="forbid_ast:\n  calls: [eval]\n").replace(b"advisory", b"gate")
+        (root / LINT_PATH).write_bytes(data)
+        for name in ("a", "b"):
+            (root / LINT_PATH).with_name(name + ".md").write_bytes(data.replace(b"id: sample", b"id: " + name.encode()))
+    if scenario == "fitness":
+        for name in ("a", "b", "c"):
+            (root / LINT_PATH).with_name(name + ".md").write_bytes(lint_bytes().replace(b"id: sample", b"id: " + name.encode()))
+        monkeypatch.setattr(scan_service, "for_rules", lambda ws, rules, **k: {
+            r.id: compute({"tp": 100 if r.id != "sample" else 0, "fp": 0}) for r in rules})
+    before = {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    verdicts = []
+    for profile in PLATFORM_SLOT_PROFILES:
+        actual = scan_service.scan(root, ["src/a.py"], registry=scan_registry(profile, root))
+        assert actual.get("status") != "FAIL"
+        verdicts.append("sample" in actual.exposure_rule_ids())
+    assert all(verdicts) is (scenario == "selected")
+    for _ in range(2):
+        result = lint.lint_workspace(root, [LINT_PATH])[0]
+        assert scan_simulation_row(result) == expected
+        parser = argparse.ArgumentParser()
+        RuleCommand().configure_parser(parser)
+        args = parser.parse_args(["lint", LINT_PATH, "--json", "--workspace", str(root)])
+        assert run_rule(args) == 0
+        row = json.loads(capsys.readouterr().out)["results"][0]
+        assert [f["message"] for f in row["findings"] if f["check"] == 7] == [expected]
+    assert before == {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+
+@pytest.mark.parametrize("failure,expected", [
+    ("profile", "not evaluated: scan projection failed"),
+    ("profile_raise", "not evaluated: scan projection failed"),
+    ("api", "not evaluated: scan API unavailable"),
+    ("simulation_api", "not evaluated: scan API unavailable"),
+    ("files", "not evaluated: no changed files"),
+    ("io", "not evaluated: scan inputs unavailable"),
+])
+def test_lint_scan_simulation_fixed_failures_and_retry(tmp_path, monkeypatch, failure, expected):
+    root = lint_root(tmp_path)
+    monkeypatch.setattr(git_service, "changed_files", lambda *a, **k: ["src/a.py"])
+    real_select, real_simulate, real_changes = scan_service.select_guidance, scan_service.simulate_rule_selection, git_service.changed_files
+    if failure in {"profile", "profile_raise"}:
+        def refuse_profile(*args, **kwargs):
+            result = real_select(*args, **kwargs)
+
+            def refuse(registry):
+                from aegis_core.guidance_projection import GuidanceProjectionError
+
+                if failure == "profile_raise":
+                    raise GuidanceProjectionError("UNTRUSTED")
+                return {"status": "FAIL", "error": "UNTRUSTED"}
+
+            result.with_registry = refuse
+            return result
+
+        monkeypatch.setattr(scan_service, "select_guidance", refuse_profile)
+    elif failure == "api":
+        monkeypatch.setattr(scan_service, "select_guidance", None)
+    elif failure == "simulation_api":
+        monkeypatch.setattr(scan_service, "simulate_rule_selection", None)
+    elif failure == "files":
+        monkeypatch.setattr(git_service, "changed_files", lambda *a, **k: [])
+    else:
+        def unavailable(*args, **kwargs):
+            raise OSError("UNTRUSTED")
+
+        monkeypatch.setattr(git_service, "changed_files", unavailable)
+    assert scan_simulation_row(lint.lint_workspace(root, [LINT_PATH])[0]) == expected
+    monkeypatch.setattr(scan_service, "select_guidance", real_select)
+    monkeypatch.setattr(scan_service, "simulate_rule_selection", real_simulate)
+    monkeypatch.setattr(git_service, "changed_files", real_changes)
+    assert scan_simulation_row(lint.lint_workspace(root, [LINT_PATH])[0]) == "scan simulation: selected in all profiles"
+
+
+def test_lint_scan_simulation_concurrent_calls_use_one_snapshot(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    root = lint_root(tmp_path)
+    monkeypatch.setattr(git_service, "changed_files", lambda *a, **k: ["src/a.py"])
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(lambda _: lint.lint_workspace(root, [LINT_PATH])[0], range(6), timeout=15))
+    assert all(scan_simulation_row(r) == "scan simulation: selected in all profiles" for r in results)
+    assert all(r == results[0] for r in results)
+
+
+@pytest.mark.parametrize("mutation", ["replace", "remove"])
+def test_lint_scan_simulation_keeps_captured_candidate_bytes(tmp_path, monkeypatch, mutation):
+    root = lint_root(tmp_path)
+    original_module = scan_service.rule_integrity
+    original = original_module.effective
+
+    def replace_before_capture(*args, **kwargs):
+        if mutation == "replace":
+            (root / LINT_PATH).write_bytes(lint_bytes(do="A concurrent replacement."))
+        else:
+            (root / LINT_PATH).unlink()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(git_service, "changed_files", lambda *a, **k: ["src/a.py"])
+    monkeypatch.setattr(scan_service, "rule_integrity", SimpleNamespace(effective=replace_before_capture, IntegrityError=original_module.IntegrityError))
+    assert scan_simulation_row(lint.lint_workspace(root, [LINT_PATH])[0]) == "scan simulation: selected in all profiles"
+    monkeypatch.setattr(scan_service, "rule_integrity", original_module)
+    (root / LINT_PATH).write_bytes(lint_bytes())
+    assert scan_simulation_row(lint.lint_workspace(root, [LINT_PATH])[0]) == "scan simulation: selected in all profiles"
+
+
+def test_lint_scan_simulation_never_reloads_candidate_bytes(tmp_path, monkeypatch):
+
+    root = lint_root(tmp_path)
+    monkeypatch.setattr(git_service, "changed_files", lambda *a, **k: ["src/a.py"])
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("simulation reopened rule files after lint's bounded capture")
+
+    monkeypatch.setattr(scan_service, "RULE_CACHE", SimpleNamespace(snapshot=forbidden))
+    assert scan_simulation_row(lint.lint_workspace(root, [LINT_PATH])[0]) == "scan simulation: selected in all profiles"
+
+
+def test_lint_scan_simulation_does_not_parse_oversized_unselected_rules(tmp_path, monkeypatch):
+
+    root = lint_root(tmp_path)
+    (root / LINT_PATH).with_name("large.md").write_bytes(lint_bytes().replace(b"id: sample", b"id: large") + b"x" * lint.MAX_RULE_BYTES)
+    monkeypatch.setattr(git_service, "changed_files", lambda *a, **k: ["src/a.py"])
+    original = rule_schema.load_rules
+
+    def bounded_loader(workspace, inventory=None):
+        assert inventory is not None
+        assert all(len(entry.content) <= lint.MAX_RULE_BYTES for entry in inventory.entries)
+        return original(workspace, inventory=inventory)
+
+    monkeypatch.setattr(rule_schema, "load_rules", bounded_loader)
+    assert scan_simulation_row(lint.lint_workspace(root, [LINT_PATH])[0]) == "not evaluated: scan inputs over limit"
+
+
+@pytest.mark.parametrize("limit", ["file", "total", "count"])
+def test_lint_scan_simulation_bounds_precede_selection(monkeypatch, limit):
+    import hashlib
+    from dataclasses import replace
+    from aegis_core.rule_inventory import RuleInventory, RuleInventoryEntry
+    from aegis_core.rules import load_rules
+
+    data = lint_bytes()
+    entry = RuleInventoryEntry(LINT_PATH, LINT_PATH, data, hashlib.sha256(data).hexdigest(), len(data))
+    inventory = RuleInventory((entry,), "bounded-test")
+    ruleset = load_rules("/", inventory=inventory)
+    if limit == "file":
+        entries = (replace(entry, content=b"x" * (lint.MAX_RULE_BYTES + 1)),)
+    elif limit == "total":
+        entries = (replace(entry, content=b"x" * lint.MAX_RULE_BYTES),) * (lint.MAX_RULE_TOTAL // lint.MAX_RULE_BYTES + 1)
+    else:
+        entries = (entry,) * (lint.MAX_RULES + 1)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("over-limit inputs reached effective rule loading")
+
+    monkeypatch.setattr(scan_service, "rule_integrity", SimpleNamespace(effective=forbidden, IntegrityError=scan_service.rule_integrity.IntegrityError))
+    assert scan_service.simulate_rule_selection("/", replace(inventory, entries=entries), ruleset) == {
+        "sample": "not evaluated: scan inputs over limit"}
+
+
+def test_lint_scan_simulation_captures_fitness_once_for_all_profiles(tmp_path, monkeypatch):
+
+    root = lint_root(tmp_path)
+    monkeypatch.setattr(git_service, "changed_files", lambda *a, **k: ["src/a.py"])
+    calls, original = [], scan_service.for_rules
+
+    def capture(workspace, rules, **kwargs):
+        calls.append(tuple(r.id for r in rules))
+        return original(workspace, rules, **kwargs)
+
+    monkeypatch.setattr(scan_service, "for_rules", capture)
+    assert scan_simulation_row(lint.lint_workspace(root, [LINT_PATH])[0]) == "scan simulation: selected in all profiles"
+    assert calls == [("sample",)]
+
+
+@pytest.mark.parametrize("body,visible", [
+    ("## Evidence\nObserved context.\n## Do\nUse the capability.\n", False),
+    ("## Do\nKeep " + "x" * 272 + " ${SLOT.MODEL_FAST}\n", True),
+    ("## Do\nKeep " + "x" * 240 + " ghp_" + "a" * 60 + "\n", True),
+    ("## Do\n" + "x" * 294 + "\n", True),
+    ("## Do\n" + "x" * 295 + "\n", False),
+    ("## Context\none\ntwo\nthree\nfour\nfive\n## Do\nRead.\n", True),
+    ("## Context\none\ntwo\nthree\nfour\nfive\nsix\n## Do\nRead.\n", False),
+], ids=["evidence_first", "slot_crossing_300", "cleaned_instruction", "exact_300", "over_300", "line_eight", "line_nine"])
+def test_lint_do_window_uses_served_detail_and_retries(body, visible):
+    from concurrent.futures import ThreadPoolExecutor
+
+    data = lint_bytes(body=body)
+    first = lint.lint_rule(data, LINT_PATH)
+    assert ("do_window" not in lint_codes(first)) is visible
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(lambda _: lint.lint_rule(data, LINT_PATH), range(6), timeout=15))
+    assert all(result == first for result in results)
+
+
+@pytest.mark.parametrize("body,visible", [
+    ("## Evidence\nObserved context.\n## Do\nUse the capability.\n", False),
+    ("## Do\nKeep " + "x" * 272 + " ${SLOT.MODEL_FAST}\n", True),
+    ("## Do\nKeep " + "x" * 240 + " ghp_" + "a" * 60 + "\n", True),
+], ids=["evidence_first", "slot_crossing_300", "cleaned_instruction"])
+def test_lint_do_window_agrees_with_real_scan_detail(tmp_path, body, visible):
+    from aegis_core.guidance_projection import project_detail
+    from aegis_core.skills.slots import PLATFORM_SLOT_PROFILES, scan_registry
+
+    root = lint_root(tmp_path)
+    (root / LINT_PATH).write_bytes(lint_bytes(body=body))
+    result = lint.lint_workspace(root, [LINT_PATH])[0]
+    assert ("do_window" not in lint_codes(result)) is visible
+    if "${SLOT.MODEL_FAST}" in body:
+        assert body.index("${SLOT.") < 300 < len(body)
+    for profile in PLATFORM_SLOT_PROFILES:
+        registry = scan_registry(profile, root)
+        detail = project_detail(body, registry)
+        scanned = scan_service.scan(root, ["src/a.py"], registry=registry)
+        assert "sample" in scanned.exposure_rule_ids()
+        if detail:
+            assert "   Detail: " + detail + "\n" in scanned["guidance"]
+        else:
+            assert "   Detail: " not in scanned["guidance"]
+
+
+@pytest.mark.parametrize("body,prefix,visible", [
+    ("## Do\nRead.\n", "## Do\nRead.", True),
+    ("## Do\nRead.\n## Evidence\n" + "x" * (1024 * 1024 + 1), "## Do\nRead.", True),
+    ("## Evidence\nObserved.\n## Do\nRead.", "## Do\nRead.", False),
+    ("## Do\n${SLOT.TOOL_READ} safely.\n", "## Do\n${SLOT.TOOL_READ} safely.", True),
+    ("## Do\n" + "x" * 295, "## Do\n" + "x" * 295, False),
+    ("## Do\nRead.\n", None, False),
+    ("## Do\nRead.\n", {}, False),
+    ("## Do\nRead.\n", "x" * (1024 * 1024 + 1), False),
+    ("x" * (1024 * 1024 + 1), "## Do\nRead.", False),
+    ("## Do\nRead.\x00", "## Do\nRead.", False),
+    ("## Do\nRead.", "## Do\nRead.\u202e", False),
+    ("## Do\n${SLOT.TOOL_READ}", "## Do\n${SLOT.TOOL_READ}", False),
+], ids=["visible", "excluded_large_tail", "evidence_first", "slot", "clipped", "no_instruction", "invalid_prefix", "prefix_limit", "body_limit", "body_control", "prefix_control", "ambiguous_heading"])
+def test_public_detail_instruction_visibility_refusals(body, prefix, visible):
+    from aegis_core.guidance_projection import detail_instruction_visible
+    from aegis_core.skills.slots import DEFAULT_SLOTS, SlotRegistry
+
+    # The final case deliberately makes the slot's replacement a heading.
+    registry = SlotRegistry({**DEFAULT_SLOTS, "TOOL_READ": "Read" if visible else "## Evidence"})
+    assert detail_instruction_visible(body, prefix, registry) is visible
+
+
+def reviewed_lint_fixture(tmp_path, reviewed_target, candidate_target, amended):
+    root = lint_root(tmp_path / "repo")
+    (root / LINT_PATH).unlink()
+    repo = hg.Repo(root, hg.Home(tmp_path / "home"))
+    path = ".aegis/rules/invariants/sample.md"
+    reviewed = (lint_bytes(do="Read reviewed data.", extra="forbid_ast:\n  calls: [eval]\n")
+                .replace(b"type: trap", b"type: invariant").replace(b"advisory", b"gate")
+                .replace(b"src/**", reviewed_target.encode()))
+    repo.write(path, reviewed.decode())
+    repo.write("src/a.py", "value = 1\n")
+    repo.commit("fixture baseline")
+    repo.git("update-ref", "refs/remotes/origin/main", "HEAD")
+    repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    repo.branch("work")
+    candidate = reviewed.replace(reviewed_target.encode(), candidate_target.encode())
+    if amended:
+        candidate = candidate.replace(b"Read reviewed data.", b"Read candidate data.")
+    (root / path).write_bytes(candidate)
+    repo.write("src/a.py", "value = 2\n")
+    return root, path, reviewed
+
+
+@pytest.mark.parametrize("body,expected_codes,retained,reviewed_targets", [
+    ("## Context\nNote.\n### Evidence\nObserved.\n## Do\n" + "x" * 500,
+     {"do_window"}, "## Context Note.", None),
+    ("## Do\nRead safely.\n## Evidence\u00a0\nRun `pytest -q` ${SLOT.UNKNOWN}.\n",
+     {"unknown_slot", "concrete_command"}, "pytest -q", None),
+    ("## Do\nRead safely.\n## \u00a0Evidence\nRun `pytest -q` ${SLOT.UNKNOWN}.\n",
+     {"unknown_slot", "concrete_command"}, "pytest -q", None),
+    ("## Context\n" + "-" * 5 + "BEGIN PRIVATE KEY" + "-" * 5 + "\n## Do\n" + "x" * 500,
+     {"do_window"}, "[REDACTED_PEM]", None),
+    pytest.param(None, set(), None, ("legacy/**", "src/**"),
+                 marks=pytest.mark.skipif(not hg.git_ok(), reason="needs git")),
+    pytest.param(None, set(), None, ("src/**", "src/**"),
+                 marks=pytest.mark.skipif(not hg.git_ok(), reason="needs git")),
+    pytest.param(None, set(), None, ("src/**", "legacy/**"),
+                 marks=pytest.mark.skipif(not hg.git_ok(), reason="needs git")),
+], ids=["level_three_evidence", "trailing_unicode_evidence", "leading_unicode_evidence", "pem_hides_do",
+        "reviewed_unmatched", "reviewed_matched", "candidate_unmatched"])
+def test_argon_0935_lint_grammar_agrees_with_served_scan(tmp_path, body, expected_codes, retained, reviewed_targets):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.guidance_projection import project_detail
+
+    if reviewed_targets is None:
+        root = lint_root(tmp_path)
+        path = LINT_PATH
+        (root / path).write_bytes(lint_bytes(body=body))
+    else:
+        root, path, reviewed = reviewed_lint_fixture(tmp_path, *reviewed_targets, True)
+    scanned = scan_service.scan(root, ["src/a.py"])
+    if reviewed_targets is None:
+        assert retained in project_detail(body)
+        assert "   Detail: " + project_detail(body) + "\n" in scanned["guidance"]
+    else:
+        assert scan_service.rule_integrity.effective(root).ruleset.rules[0].raw == reviewed
+        assert ("sample" in scanned.exposure_rule_ids()) is (reviewed_targets[0] == "src/**")
+    result = lint.lint_workspace(root, [path])[0]
+    assert expected_codes <= lint_codes(result)
+    assert result.ok is (not expected_codes)
+    if reviewed_targets is not None:
+        assert scan_simulation_row(result) == "not evaluated: candidate differs from scan snapshot"
+    assert lint.lint_workspace(root, [path])[0] == result
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        retries = list(pool.map(lambda _: lint.lint_workspace(root, [path])[0], range(3), timeout=30))
+    assert all(retry == result for retry in retries)
+
+
+@pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+@pytest.mark.parametrize("reviewed_target,candidate_target,amended", [
+    ("legacy/**", "src/**", True),
+    ("src/**", "src/**", True),
+    ("src/**", "legacy/**", True),
+    ("legacy/**", "legacy/**", False),
+    ("src/**", "src/**", False),
+], ids=["reviewed_unmatched", "reviewed_matched", "candidate_unmatched", "same_unmatched", "same_matched"])
+def test_argon_0935_reviewed_bytes_checked_before_matching(tmp_path, reviewed_target, candidate_target, amended):
+    from concurrent.futures import ThreadPoolExecutor
+
+    root, path, reviewed = reviewed_lint_fixture(tmp_path, reviewed_target, candidate_target, amended)
+    effective = scan_service.rule_integrity.effective(root)
+    assert effective.ruleset.rules[0].raw == reviewed
+    actual = scan_service.scan(root, ["src/a.py"])
+    assert ("sample" in actual.exposure_rule_ids()) is (reviewed_target == "src/**")
+    expected = ("not evaluated: candidate differs from scan snapshot" if amended else
+                "scan simulation: selected in all profiles" if reviewed_target == "src/**" else
+                "scan simulation: not selected in profiles: antigravity, claude-code, codex-cli, gemini-cli, generic")
+    for _ in range(2):
+        assert scan_simulation_row(lint.lint_workspace(root, [path])[0]) == expected
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(lambda _: lint.lint_workspace(root, [path])[0], range(3), timeout=30))
+    assert all(scan_simulation_row(result) == expected for result in results)
+    (root / path).write_bytes(reviewed)
+    recovered = lint.lint_workspace(root, [path])[0]
+    assert scan_simulation_row(recovered) == ("scan simulation: selected in all profiles" if reviewed_target == "src/**"
+                                             else "scan simulation: not selected in profiles: antigravity, claude-code, codex-cli, gemini-cli, generic")
+
+
+@pytest.mark.parametrize("code", ["git_timeout", "git_failed", "privacy_refused"])
+def test_argon_0935_git_custody_refusals_are_fixed_and_retry(tmp_path, monkeypatch, code):
+    from concurrent.futures import ThreadPoolExecutor
+
+    root = lint_root(tmp_path)
+    real_run = git_service.run
+
+    def unavailable(*args, **kwargs):
+        assert git_service.custody_active()
+        raise git_service.GitError("UNTRUSTED_GIT_DIAGNOSTIC", code=code)
+
+    def lint_under_custody(_):
+        with git_service.custody(scratch=root):
+            return lint.lint_workspace(root, [LINT_PATH])[0]
+
+    monkeypatch.setattr(git_service, "run", unavailable)
+    monkeypatch.setattr(git_service, "changed_files", lambda *a, **k: ["src/a.py"])
+    with git_service.custody(scratch=root):
+        with pytest.raises(git_service.GitError) as caught:
+            scan_service.scan(root, ["src/a.py"])
+        assert caught.value.code == code
+        result = lint.lint_workspace(root, [LINT_PATH])[0]
+    assert scan_simulation_row(result) == "not evaluated: scan inputs unavailable"
+    assert "UNTRUSTED" not in repr(result)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(lint_under_custody, range(3), timeout=15))
+    assert all(scan_simulation_row(result) == "not evaluated: scan inputs unavailable" for result in results)
+    monkeypatch.setattr(git_service, "run", real_run)
+    assert not git_service.custody_active()
+    assert scan_simulation_row(lint.lint_workspace(root, [LINT_PATH])[0]) == "scan simulation: selected in all profiles"
+
+
+@pytest.mark.parametrize("items,decision,fragment", [
+    (["## Do\nRead.\n"], 1, "Read."),
+    (["## Context\nNote.\n### Evidence\n## Do\nHidden."], 0, None),
+    (["## Do\nRead.\n## Evidence\n\x00"], 1, "Read."),
+    (["## Do\nRead.\n## Evidence\u00a0\nKeep this."], 1, "Read."),
+    (["```text\n## Do\nFenced.\n```\n"], 0, None),
+    (["<pre>\n## Do\nLiteral.\n</pre>\n"], 0, None),
+    (["    ## Do\n    Code.\n"], 0, None),
+    (["## Do\n-\n    -\n- Read.\n"], 1, "- Read."),
+    (["## Do\n    Code.\nRead.\n"], 1, "Read."),
+    (["## Do\n```${SLOT.TEST_RUNNER}```\n## Evidence\nObserved."], 1, "```${SLOT.TEST_RUNNER}```"),
+    (["## Do", "Read."], 1, "Read."),
+    (["## Do\nRead.\n```text\n## Evidence\n```\n"], -1, None),
+    (["## Do\nRead.\x00"], -3, None),
+    (["## Do\n" + "x" * (1024 * 1024 + 1)], -4, None),
+    (["x"] * 257, -4, None),
+    ([None], -2, None),
+], ids=["instruction", "level_three_evidence", "excluded_control", "unicode_evidence", "fenced_do", "html_do",
+        "indented_do", "empty_markers", "indented_instruction", "inline_triple", "item_boundary", "ambiguous",
+        "control", "character_limit", "item_limit", "mixed"])
+def test_public_raw_do_instruction_span(items, decision, fragment):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.guidance_grammar import heading_has_slot, raw_do_instruction_span
+    from aegis_core.guidance_projection import contains_control_characters
+
+    result = raw_do_instruction_span(items, heading_has_slot, contains_control_characters)
+    assert result[0] == decision
+    if decision == 1:
+        assert items[result[1]][result[2]:result[3]] == fragment
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        retries = list(pool.map(lambda _: raw_do_instruction_span(items, heading_has_slot, contains_control_characters), range(3), timeout=15))
+    assert all(retry == result for retry in retries)
+
+
+def assert_heading_lint_scan_agreement(body, instruction, expected, *, instruction_visible=None):
+    import hashlib
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.fitness import compute
+    from aegis_core.guidance_projection import project_detail
+    from aegis_core.rule_inventory import RuleInventory, RuleInventoryEntry
+    from aegis_core.skills.slots import DEFAULT_SLOTS, PLATFORM_SLOT_PROFILES, SlotRegistry
+
+    if instruction_visible is None:
+        instruction_visible = expected
+    data = lint_bytes(body=body)
+    entry = RuleInventoryEntry(LINT_PATH, LINT_PATH, data, hashlib.sha256(data).hexdigest(), len(data))
+    ruleset = rule_schema.load_rules("/", inventory=RuleInventory((entry,), "heading-matrix"))
+    for profile in PLATFORM_SLOT_PROFILES.values():
+        registry = SlotRegistry({**DEFAULT_SLOTS, **profile}).sanitized()
+        scanned = scan_service.select_guidance(ruleset, ["src/a.py"], 3, 2000, [],
+                                               lambda rules: {r.id: compute({}) for r in rules}, registry=registry)
+        detail = project_detail(body, registry)
+        assert scanned.exposure_rule_ids() == ("sample",)
+        assert "   Detail: " + detail + "\n" in scanned["guidance"]
+        assert (instruction in detail) is instruction_visible
+    result = lint.lint_rule(data, LINT_PATH)
+    assert result.ok is expected
+    assert ("do_window" not in lint_codes(result)) is expected
+    assert lint.lint_rule(data, LINT_PATH) == result
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        retries = list(pool.map(lambda _: lint.lint_rule(data, LINT_PATH), range(3), timeout=15))
+    assert all(retry == result for retry in retries)
+
+
+@pytest.mark.parametrize("position", ["", " ", "   ", "> ", "- "],
+                         ids=["column_zero", "one_space", "three_spaces", "blockquote", "list_item"])
+@pytest.mark.parametrize("kind,heading,expected", [
+    ("opening", "## Do", True),
+    ("boundary", "## Context", False),
+    ("subsection", "### Notes", False),
+], ids=["opening", "section_boundary", "subsection"])
+def test_formal_1306_heading_matrix_matches_scan(position, kind, heading, expected):
+    if kind == "opening":
+        body = position + heading + "\nRead.\n"
+        instruction = "Read."
+        expected = position == ""
+    elif kind == "boundary":
+        body = "## Do\n" + position + heading + "\nNote.\n## Do\n" + "x" * 500
+        instruction = "x" * 500
+    else:
+        body = "## Do\n" + position + heading + "\n" + "x" * 500
+        instruction = "x" * 500
+    assert_heading_lint_scan_agreement(body, instruction, expected,
+                                       instruction_visible=kind == "opening" or expected)
+
+
+@pytest.mark.parametrize("body", [
+    "## Do\n ## Context\nNote.\n## Do\n" + "x" * 500,
+    "## Do\n ### Notes\n" + "x" * 500,
+], ids=["correctness_verbatim", "security_verbatim"])
+def test_formal_1306_reviewer_bodies_match_scan(body):
+    assert_heading_lint_scan_agreement(body, "x" * 500, False)
+
+
+@pytest.mark.parametrize("position", ["", " ", "   ", "> ", "- "],
+                         ids=["column_zero", "one_space", "three_spaces", "blockquote", "list_item"])
+@pytest.mark.parametrize("title,reserved", [("Evidence", True), ("evidence### \t", True), ("Evidence\u00a0", False)],
+                         ids=["reserved", "closing_hashes", "unicode_tail"])
+def test_formal_1306_evidence_decisions_stay_unchanged(position, title, reserved):
+    from aegis_core.guidance_grammar import heading_has_slot, raw_evidence_span
+    from aegis_core.guidance_projection import contains_control_characters
+
+    body = position + "## " + title + "\nDiscard.\n"
+    decision, item, start = raw_evidence_span([body], heading_has_slot, contains_control_characters)
+    expected = (1 if not position else -1) if reserved else 0
+    assert decision == expected
+    assert item == 0
+    if reserved:
+        assert start == 0
+
+
+@pytest.mark.parametrize("prefix,opens", [
+    ("", True), (" ", False), ("  ", False), ("   ", False),
+    ("    ", False), ("     ", False), ("\t", False), (" \t", False),
+    ("> ", False), ("- ", False), ("> - ", False), ("1. ", False),
+    ("- > ", False), ("\u00a0", False),
+], ids=["column_zero", "one_space", "two_spaces", "three_spaces", "four_spaces", "five_spaces",
+        "tab", "space_tab", "blockquote", "list_item", "quoted_list", "ordered_list", "list_quote", "unicode_space"])
+@pytest.mark.parametrize("section", ["orphan", "context", "already_open"])
+def test_argon_1333_do_opening_requires_top_level_heading(prefix, opens, section):
+    from aegis_core.guidance_grammar import heading_has_slot, raw_do_instruction_span
+    from aegis_core.guidance_projection import contains_control_characters
+
+    body = {"orphan": "", "context": "## Context\n", "already_open": "## Do\n"}[section]
+    body += prefix + "## Do\nNote.\n"
+    if section != "orphan":
+        body += "## Do\n" + "x" * 500
+    span = raw_do_instruction_span([body], heading_has_slot, contains_control_characters)
+    instruction = "Note." if opens else ("x" * 500 if section != "orphan" else None)
+    assert span[0] == (1 if instruction is not None else 0)
+    if instruction is not None:
+        assert body[span[2]:span[3]] == instruction
+    assert_heading_lint_scan_agreement(body, "Note." if section == "orphan" else "x" * 500, opens,
+                                       instruction_visible=True if section == "orphan" else False)
+
+
+def test_argon_1333_indented_do_reproducer_matches_scan():
+    body = "## Context\n    ## Do\nNote.\n## Do\n" + "x" * 500
+    assert_heading_lint_scan_agreement(body, "x" * 500, False)
+
+
+@pytest.mark.parametrize("marker,indent", [("-", "  "), ("+", "  "), ("*", "  "),
+                                         ("1.", "   "), ("1)", "   ")],
+                         ids=["dash", "plus", "star", "ordered_dot", "ordered_paren"])
+@pytest.mark.parametrize("section", ["context", "already_open"])
+def test_formal_1408_list_continuation_cannot_open_do(marker, indent, section):
+    from aegis_core.guidance_grammar import heading_has_slot, raw_do_instruction_span
+    from aegis_core.guidance_projection import contains_control_characters
+
+    body = {"context": "## Context\n", "already_open": "## Do\n"}[section]
+    body += marker + " item\n\n" + indent + "## Do\n" + indent + "Note.\n\n## Do\n" + "x" * 500
+    span = raw_do_instruction_span([body], heading_has_slot, contains_control_characters)
+    assert span[0] == 1
+    expected_instruction = marker + " item" if section == "already_open" else "x" * 500
+    assert body[span[2]:span[3]] == expected_instruction
+    assert_heading_lint_scan_agreement(body, "x" * 500, section == "already_open", instruction_visible=False)
+
+
+def test_formal_1408_reviewer_body_matches_scan():
+    body = "## Context\n- item\n\n  ## Do\n  Note.\n\n## Do\n" + "x" * 500
+    assert_heading_lint_scan_agreement(body, "x" * 500, False)
+
+
+@pytest.mark.parametrize("leading", [" ", "  ", "   ", "    ", "\t", "\u00a0"],
+                         ids=["one_space", "two_spaces", "three_spaces", "four_spaces", "tab", "nbsp"])
+@pytest.mark.parametrize("kind", ["plain", "pem"])
+def test_argon_1408_leading_whitespace_cannot_change_do_discovery(leading, kind):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.guidance_grammar import heading_has_slot, raw_do_instruction_span
+    from aegis_core.guidance_projection import contains_control_characters, detail_instruction_visible
+    from aegis_core.skills.slots import DEFAULT_SLOTS, PLATFORM_SLOT_PROFILES, SlotRegistry
+
+    body = leading + "## Do\n"
+    if kind == "pem":
+        body += "-" * 5 + "BEGIN PRIVATE KEY" + "-" * 5 + "\n## Do\n" + "x" * 500
+    else:
+        body += "Read.\n"
+    span = raw_do_instruction_span([body], heading_has_slot, contains_control_characters)
+    assert span[0] == (1 if kind == "pem" else 0)
+    if kind == "pem":
+        assert body[span[2]:span[3]] == "x" * 500
+    for profile in (None, *PLATFORM_SLOT_PROFILES.values()):
+        registry = SlotRegistry({**DEFAULT_SLOTS, **profile}).sanitized() if profile is not None else None
+        assert detail_instruction_visible(body, body.rstrip("\n"), registry) is False
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            results = list(pool.map(lambda _: detail_instruction_visible(body, body.rstrip("\n"), registry), range(3), timeout=15))
+        assert results == [False] * 3
+    assert_heading_lint_scan_agreement(body, "x" * 500 if kind == "pem" else "Read.", False,
+                                       instruction_visible=kind == "plain")
+
+
+@pytest.mark.parametrize("leading", ["", "\n", "\n \t\n", "\u00a0\n", "\r\n"],
+                         ids=["column_zero", "blank_line", "spaced_blank_lines", "nbsp_blank_line", "crlf"])
+def test_argon_1408_preserved_blank_lines_keep_real_instruction_visible(leading):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.guidance_projection import detail_instruction_visible
+
+    body = leading + "## Do\nRead.\n"
+    assert detail_instruction_visible(body, body.rstrip("\n")) is True
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(lambda _: detail_instruction_visible(body, body.rstrip("\n")), range(3), timeout=15))
+    assert results == [True] * 3
+    assert_heading_lint_scan_agreement(body, "Read.", True)
+
+
+@pytest.mark.parametrize("separator", ["\u2028", "\u2029"], ids=["line_separator", "paragraph_separator"])
+@pytest.mark.parametrize("opening", [
+    "##{separator} Do\n",
+    "## {separator}Do\n",
+    "## Do{separator}\n",
+    "## {separator}Do{separator}\n",
+    "## Do\n##{separator} Do\n",
+    "## Do\n## {separator}Do\n",
+    "## Do\n## Do{separator}\n",
+], ids=["marker_title", "title_start", "title_end", "title_edges",
+        "next_line_marker_title", "next_line_title_start", "next_line_title_end"])
+def test_formal_1446_raw_and_rendered_do_divergence_is_refused(separator, opening):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.guidance_projection import detail_instruction_visible
+    from aegis_core.skills.slots import DEFAULT_SLOTS, PLATFORM_SLOT_PROFILES, SlotRegistry
+
+    body = opening.format(separator=separator)
+    body += "-" * 5 + "BEGIN PRIVATE KEY" + "-" * 5 + "\n## Do\n" + "x" * 500
+    for profile in (None, *PLATFORM_SLOT_PROFILES.values()):
+        registry = SlotRegistry({**DEFAULT_SLOTS, **profile}).sanitized() if profile is not None else None
+        assert detail_instruction_visible(body, body, registry) is False
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            results = list(pool.map(lambda _: detail_instruction_visible(body, body, registry), range(3), timeout=15))
+        assert results == [False] * 3
+    assert_heading_lint_scan_agreement(body, "x" * 500, False)
+
+
+@pytest.mark.parametrize("value", ["Read.\nNext.", "## Context\nRead.\n## Do\nNext.", "\nRead."],
+                         ids=["shortened_span", "changed_section", "shifted_start"])
+def test_formal_1446_expansion_cannot_change_raw_instruction_span(value):
+    from aegis_core.guidance_projection import detail_instruction_visible, project_detail
+
+    body = "## Do\n${SLOT.TEST_RUNNER}"
+    registry = {"TEST_RUNNER": value}
+    assert "Read." in project_detail(body, registry)
+    assert detail_instruction_visible(body, body, registry) is False
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"], ids=["lf", "crlf", "cr"])
+@pytest.mark.parametrize("separator", ["", "\u2028", "\u2029"], ids=["plain", "line_separator", "paragraph_separator"])
+def test_formal_1446_same_raw_instruction_survives_layout_and_expansion(newline, separator):
+    from aegis_core.guidance_projection import detail_instruction_visible
+    from aegis_core.skills.slots import DEFAULT_SLOTS, PLATFORM_SLOT_PROFILES, SlotRegistry
+
+    body = newline.join(["## Context", "${SLOT.MODEL_FAST}", "## Do", separator,
+                         "${SLOT.TOOL_READ} safely.  ", ""])
+    for profile in PLATFORM_SLOT_PROFILES.values():
+        registry = SlotRegistry({**DEFAULT_SLOTS, **profile}).sanitized()
+        assert detail_instruction_visible(body, body, registry) is True
+    assert_heading_lint_scan_agreement(body, "safely.", True)

@@ -5,6 +5,10 @@ from typing import Any, Optional
 from pathlib import Path
 
 from aegis_core.primitives import sanitize_display
+from aegis_core.guidance_grammar import clip_redacted
+from aegis_core.guidance_projection import (
+    MAX_GUIDANCE_CHARS, GuidanceProjectionError, project_diagnostic as _project_diagnostic,
+)
 
 from aegis_mcp.handlers.core import handle_scan
 from aegis_mcp.handlers.governance import handle_create_rule, handle_list_rules
@@ -270,9 +274,43 @@ def is_known_tool(name: Any) -> bool:
     return isinstance(name, str) and (name in _TOOL_HANDLERS or name == "aegis_team_queue_claim")
 
 
-def _shown(value: Any) -> str:
-    text = repr(value)
-    return text if len(text) <= 60 else text[:57] + "..."
+def _shown(value: Any, *, _checked: bool = False) -> str:
+    """Keep ordinary repr wording, bounding structure before formatting any external value."""
+    if not _checked:
+        pending, items, size = [(value, 0)], 1, 0
+        while pending:
+            item, depth = pending.pop()
+            if depth > 32:
+                return GuidanceProjectionError.code
+            if isinstance(item, str):
+                size += len(item)
+                if size > MAX_GUIDANCE_CHARS:
+                    return GuidanceProjectionError.code
+            elif type(item) is int:
+                if item.bit_length() > 4096:
+                    return GuidanceProjectionError.code
+            elif isinstance(item, (list, tuple, dict)):
+                items += len(item) * (2 if isinstance(item, dict) else 1)
+                if items > 256:
+                    return GuidanceProjectionError.code
+                if isinstance(item, dict):
+                    pending.extend((key, depth + 1) for key in item)
+                    pending.extend((part, depth + 1) for part in item.values())
+                else:
+                    pending.extend((part, depth + 1) for part in item)
+            elif item is not None and type(item) not in (bool, float):
+                return "guidance_projection_invalid_field"
+    if isinstance(value, str):
+        text = repr(_project_diagnostic(value))
+    elif isinstance(value, dict):
+        text = "{" + ", ".join(_shown(key, _checked=True) + ": " + _shown(part, _checked=True)
+                               for key, part in value.items()) + "}"
+    elif isinstance(value, (list, tuple)):
+        text = ", ".join(_shown(part, _checked=True) for part in value)
+        text = "[" + text + "]" if isinstance(value, list) else "(" + text + ("," if len(value) == 1 else "") + ")"
+    else:
+        text = repr(value)
+    return text if len(text) <= 60 else clip_redacted(text, 57) + "..."
 
 
 def _invalid_scalar(name: str, args: dict) -> Optional[str]:
@@ -287,12 +325,15 @@ def _invalid_scalar(name: str, args: dict) -> Optional[str]:
         if value is None or spec.get("type") not in _SCALAR_TYPES:
             continue
         python_types, expected = _SCALAR_TYPES[spec["type"]]
+        label = repr(_project_diagnostic(key))
+        if isinstance(value, str) and len(value) > MAX_GUIDANCE_CHARS:
+            return _project_diagnostic(value)
         if not isinstance(value, python_types) or (spec["type"] == "integer" and isinstance(value, bool)):
-            return f"Invalid {key!r}: {_shown(value)}. Expected {expected}."
+            return _project_diagnostic(f"Invalid {label}: {_shown(value)}. Expected {expected}.")
         if "enum" in spec and value not in spec["enum"]:
-            return f"Invalid {key!r}: {_shown(value)}. Expected one of {spec['enum']}."
+            return _project_diagnostic(f"Invalid {label}: {_shown(value)}. Expected one of {spec['enum']}.")
         if "maxLength" in spec and len(value) > spec["maxLength"]:
-            return f"Invalid {key!r}: {len(value)} characters. Expected at most {spec['maxLength']}."
+            return _project_diagnostic(f"Invalid {label}: {len(value)} characters. Expected at most {spec['maxLength']}.")
     return None
 
 
@@ -329,9 +370,20 @@ def execute_tool(name: str, args: dict, *, client_arguments: bool = False, queue
         if any(k not in TOOL_ARGUMENTS[name] and k not in SERVER_INJECTED for k in args):
             return CodecError("E_FORMAT").as_dict()
         return _TOOL_HANDLERS[name](args)
-    unknown = sorted(k for k in args if k not in TOOL_ARGUMENTS[name] and k not in SERVER_INJECTED)
+    unknown, size = [], 0
+    for key in args:
+        if key in TOOL_ARGUMENTS[name] or key in SERVER_INJECTED:
+            continue
+        if type(key) is not str:
+            return {"status": "FAIL", "error": "guidance_projection_invalid_field"}
+        size += len(key)
+        if len(unknown) >= 256 or size > MAX_GUIDANCE_CHARS:
+            return {"status": "FAIL", "error": GuidanceProjectionError.code}
+        unknown.append(key)
     if unknown:
-        return {"status": "FAIL", "error": f"Unknown argument(s) for {name}: {unknown}"}
+        shown = [_project_diagnostic(key) for key in sorted(unknown)]
+        return {"status": "FAIL", "error": _project_diagnostic(
+            f"Unknown argument(s) for {_project_diagnostic(name)}: {shown}")}
     invalid = _invalid_scalar(name, args)
     if invalid:
         return {"status": "FAIL", "error": invalid}

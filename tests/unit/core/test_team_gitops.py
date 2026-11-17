@@ -2810,8 +2810,10 @@ def test_display_canonicalizes_then_redacts_then_truncates_every_string_field():
     shown = gitops.display_row({hostile: {"actor": hostile, "state": "x" * 500 + " token=" + secret}})
     encoded = json.dumps(shown)
     assert secret not in encoded and "\u001b" not in encoded
-    assert "ghp_REDACTED" in encoded
-    assert len(shown["ghp_REDACTED"]["state"]) <= gitops.DISPLAY_LIMIT
+    assert "[REDACTED_VCS_TOKEN]" in encoded
+    assert all(secret[index:index + 4] not in encoded for index in range(len(secret) - 3))
+    assert shown["[REDACTED_VCS_TOKEN]"]["actor"] == "[REDACTED_VCS_TOKEN]"
+    assert len(shown["[REDACTED_VCS_TOKEN]"]["state"]) <= gitops.DISPLAY_LIMIT
 
 
 @pytest.mark.parametrize("root", ["relative", "null\x00root", "bad\ud800root"])

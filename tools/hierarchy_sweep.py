@@ -21,21 +21,31 @@ Neither changes `quiet`, which stays about mail.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
+import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 
 sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from hierarchy_mailbox import (MAX_DELIVERY_IDS, Mailbox, endpoint_parts, parse_time, read_json, require,  # noqa: E402
+from hierarchy_mailbox_index import MailboxIndex  # noqa: E402
+from hierarchy_mailbox import (MAX_BYTES, MAX_DELIVERY_IDS, MAX_RECORDS, Mailbox, encoded, endpoint_parts, parse_time, read_json, require,  # noqa: E402
                                safe_path)
 from hierarchy_meter import ROOT_LIMIT_SECONDS, measure  # noqa: E402
 from hierarchy_wake import wake  # noqa: E402
 from hierarchy_workspace import Store  # noqa: E402
 from hierarchy_lifecycle import Lifecycle  # noqa: E402
+
+
+def mailbox_reader(mailbox):
+    """Keep the pinned mailbox outcome authoritative during reader rollout."""
+    return MailboxIndex(mailbox, mode="shadow")
 
 
 MAX_ROUNDS = 100
@@ -51,6 +61,159 @@ OWED = {"orchestrator": {("router", "info"), ("front-door", "info"), ("lane", "r
         "lane": {("orchestrator", "dispatch")},
         "decider": {("orchestrator", "info")}}
 FINISHED = {"exited", "timed_out"}
+
+# These limits bound optional cache observations, never mailbox admission.
+CACHE_ENTRIES = 2 * MAX_RECORDS
+CACHE_BYTES = 64 * 1024 * 1024
+CACHE_NAMES = 4 * 1024 * 1024
+CACHE_DEPTH = 64
+CACHE_PATH = 4096
+
+
+class _Uncacheable(Exception):
+    pass
+
+
+def summary_cache_supported():
+    return (os.name == "posix" and all(getattr(os, name, 0) for name in
+            ("O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK")) and
+            {"open", "stat"} <= {f.__name__ for f in os.supports_dir_fd} and
+            "stat" in {f.__name__ for f in os.supports_follow_symlinks} and
+            "scandir" in {f.__name__ for f in os.supports_fd} and
+            all(hasattr(os, name) for name in ("geteuid", "getegid", "getgroups")))
+
+
+def _cache_mark(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+            info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+@contextmanager
+def _cache_open(name, parent=None, directory=False):
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    if directory:
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(name, flags, dir_fd=parent)
+    try:
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def _cache_root(path):
+    text = os.fspath(path)
+    if len(text) > CACHE_PATH or len(os.fsencode(text)) > CACHE_PATH:
+        raise _Uncacheable
+    parts = Path(text).parts
+    if not parts or parts[0] != "/" or len(parts) > CACHE_DEPTH or ".." in parts:
+        raise _Uncacheable
+    with ExitStack() as opened:
+        descriptor = opened.enter_context(_cache_open("/", directory=True))
+        chain = [("/", _cache_mark(os.fstat(descriptor))[:5])]
+        for name in parts[1:]:
+            try:
+                child = opened.enter_context(_cache_open(name, descriptor, True))
+            except FileNotFoundError:
+                # A missing delivery branch is a valid observed empty input.
+                try:
+                    os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                except FileNotFoundError:
+                    yield None, (*chain, (name, None))
+                    return
+                raise _Uncacheable
+            descriptor = child
+            chain.append((name, _cache_mark(os.fstat(descriptor))[:5]))
+        yield descriptor, tuple(chain)
+
+
+def _cache_file(descriptor, info, digest, budget):
+    if not 0 <= info.st_size <= MAX_BYTES or budget["bytes"] + info.st_size + 1 > CACHE_BYTES:
+        raise _Uncacheable
+    budget["bytes"] += info.st_size + 1
+    remaining = info.st_size
+    while remaining:
+        chunk = os.read(descriptor, min(65536, remaining))
+        if not chunk:
+            raise _Uncacheable
+        digest.update(chunk)
+        remaining -= len(chunk)
+    if os.read(descriptor, 1):
+        raise _Uncacheable
+
+
+def _cache_entry(parent, name, digest, budget, depth, skip_wakes):
+    info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    directory = stat.S_ISDIR(info.st_mode)
+    if not directory and not stat.S_ISREG(info.st_mode):
+        raise _Uncacheable
+    digest.update(b"N" + os.fsencode(name) + b"\0" + repr(_cache_mark(info)).encode("ascii"))
+    with _cache_open(name, parent, directory) as descriptor:
+        if _cache_mark(os.fstat(descriptor)) != _cache_mark(info):
+            raise _Uncacheable
+        if directory:
+            _cache_tree(descriptor, digest, budget, depth + 1, skip_wakes)
+        else:
+            _cache_file(descriptor, info, digest, budget)
+        if (_cache_mark(os.fstat(descriptor)) != _cache_mark(info) or
+                _cache_mark(os.stat(name, dir_fd=parent, follow_symlinks=False)) != _cache_mark(info)):
+            raise _Uncacheable
+
+
+def _cache_tree(descriptor, digest, budget, depth=0, skip_wakes=False):
+    if depth > CACHE_DEPTH:
+        raise _Uncacheable
+    before = _cache_mark(os.fstat(descriptor))
+    digest.update(b"D" + repr(before).encode("ascii"))
+    names = []
+    with os.scandir(descriptor) as entries:
+        for entry in entries:
+            budget["entries"] += 1
+            budget["names"] += len(os.fsencode(entry.name))
+            if budget["entries"] > CACHE_ENTRIES or budget["names"] > CACHE_NAMES:
+                raise _Uncacheable
+            # Non-durable admission must not inspect wake markers. Reporting
+            # always obtains them live through the pinned wake_marker API.
+            if depth == 0 and skip_wakes and entry.name.startswith(".wake-"):
+                continue
+            names.append(entry.name)
+    for name in sorted(names):
+        _cache_entry(descriptor, name, digest, budget, depth, skip_wakes)
+    if _cache_mark(os.fstat(descriptor)) != before:
+        raise _Uncacheable
+
+
+def summary_fingerprint(mailbox, initiative):
+    """Prove unchanged accessible bytes/topology, or require a fresh PIN view.
+
+    No descriptor survives this call. Unsupported capabilities, budgets and
+    observation races disable reuse; they never substitute a cache refusal for
+    the canonical reader's outcome.
+    """
+    if not summary_cache_supported():
+        return None
+    try:
+        delivery = initiative["delivery_dir"]
+        if not isinstance(delivery, str) or len(delivery) > CACHE_PATH:
+            return None
+        credentials = (os.geteuid(), os.getegid(), tuple(sorted(os.getgroups())))
+        digest = hashlib.sha256(encoded(mailbox.manifest) + repr(credentials).encode("ascii"))
+        budget = {"entries": 0, "bytes": 0, "names": 0}
+        for index, path in enumerate((mailbox.root, mailbox.delivery_directory(delivery))):
+            digest.update(b"R" + os.fsencode(path) + b"\0")
+            with _cache_root(path) as (descriptor, chain):
+                digest.update(repr(chain).encode("utf-8", "surrogatepass"))
+                if descriptor is not None:
+                    _cache_tree(descriptor, digest, budget, skip_wakes=index == 0)
+            # Confirm that every named ancestor still identifies the held walk.
+            with _cache_root(path) as (_, confirmed):
+                if confirmed != chain:
+                    raise _Uncacheable
+        if credentials != (os.geteuid(), os.getegid(), tuple(sorted(os.getgroups()))):
+            raise _Uncacheable
+        return digest.digest()
+    except (OSError, ValueError, UnicodeError, _Uncacheable):
+        return None
 
 
 def profile_for(mailbox_root, endpoint, binding):
@@ -168,8 +331,10 @@ def wake_endpoint(initiative, name, summary, dry_run, durable=False):
 
 def endpoint_summary(mailbox, initiative, name, records, durable):
     summary = mailbox.endpoint_delivery(initiative["delivery_dir"], name, records)[1]
-    if not durable:
-        return summary
+    return durable_summary(mailbox, initiative, name, records, summary) if durable else summary
+
+
+def durable_summary(mailbox, initiative, name, records, summary):
     # The summary has no generation on woken_unread and caps its IDs, so durable mode reads the receipts it came
     # from and the full unread set, each unread ID with when it was published.
     directory = initiative["delivery_dir"]
@@ -181,17 +346,48 @@ def endpoint_summary(mailbox, initiative, name, records, durable):
             "wakes": mailbox.delivery_receipts(directory, "wakes", name, records)}
 
 
-def summaries(initiative, durable=False):
+def summary_records(initiative):
     mailbox = Mailbox(initiative["mailbox_root"])
-    records = mailbox.messages()
-    found = {name: endpoint_summary(mailbox, initiative, name, records, durable)
-             for name in sorted(mailbox.manifest["endpoints"])}
-    return found, mailbox.open_job_requests(records), records
+    records = mailbox_reader(mailbox).messages()
+    return mailbox, records
+
+
+def summaries(initiative, durable=False, *, snapshots=None):
+    mailbox, records = summary_records(initiative)
+    before = summary_fingerprint(mailbox, initiative) if snapshots is not None else None
+    base, found = {}, {}
+    for name in sorted(mailbox.manifest["endpoints"]):
+        summary = endpoint_summary(mailbox, initiative, name, records, False)
+        base[name] = summary
+        found[name] = durable_summary(mailbox, initiative, name, records, summary) if durable else summary
+    result = base, mailbox.open_job_requests(records), records
+    if snapshots is not None and before is not None and summary_fingerprint(mailbox, initiative) == before:
+        snapshots[initiative["id"]] = result, before
+    return found, result[1], records
+
+
+def cached_summary(initiative, cached):
+    """Revalidate current PIN inputs before sharing the pass's derived result."""
+    mailbox, records = summary_records(initiative)
+    before = summary_fingerprint(mailbox, initiative)
+    if before is None or before != cached[1] or records != cached[0][2]:
+        return None
+    # Stored message/checkpoint references also query paths outside the two
+    # byte trees. Keep their pinned metadata validation live, including idle
+    # endpoints' histories. A refusal propagates with its original diagnostic.
+    base, jobs, records = cached[0]
+    found = {}
+    for name in sorted(mailbox.manifest["endpoints"]):
+        mailbox.bindings(name)
+        found[name] = durable_summary(mailbox, initiative, name, records, base[name])
+    if summary_fingerprint(mailbox, initiative) != before:
+        return None
+    return found, jobs, records
 
 
 def fresh_summary(initiative, name):
     mailbox = Mailbox(initiative["mailbox_root"])
-    return endpoint_summary(mailbox, initiative, name, mailbox.messages(), True)
+    return endpoint_summary(mailbox, initiative, name, mailbox_reader(mailbox).messages(), True)
 
 
 def is_root(endpoint):
@@ -275,12 +471,15 @@ def stalled_dispatch(name, summary, records):
                             "accepted_at": ack["created_at"]} for ack in waiting]}
 
 
-def sweep_round(initiatives, rows, tried, broken, dry_run, durable=False, skip=frozenset()):
+def sweep_round(initiatives, rows, tried, broken, dry_run, durable=False, skip=frozenset(), snapshots=None):
     """One pass in priority order. Returns how many turns it started."""
     woken = 0
+    if snapshots is not None:
+        snapshots.clear()
     for initiative in initiatives:
         try:
-            found = summaries(initiative, durable)[0]
+            snapshot = summaries(initiative, durable, snapshots=snapshots)
+            found = snapshot[0]
         except ERRORS as exc:
             if initiative["id"] not in broken:
                 broken.add(initiative["id"])
@@ -300,6 +499,10 @@ def sweep_round(initiatives, rows, tried, broken, dry_run, durable=False, skip=f
                              "unread_count": summary["unread_count"]})
                 continue
             row = wake_endpoint(initiative, name, summary, dry_run, durable)
+            if snapshots is not None:
+                # Even a refused wake can publish mail across initiatives. The
+                # report needs a new pass after any attempted wake.
+                snapshots.clear()
             rows.append(row)
             woken += "wake_exit" in row
     return woken
@@ -314,13 +517,15 @@ def root_time(binding):
     return {**row, "state": meter["state"], "active_seconds": meter["active_seconds"], "limit": meter["limit"]}
 
 
-def remaining(initiatives, broken=None, rows=None):
+def remaining(initiatives, broken=None, rows=None, snapshots=None):
     """Described from the mailboxes as they are now, because a round's own view goes stale as turns publish."""
     still_unread, root_queue, root_sessions, silent, stalled = [], [], {}, [], []
     for initiative in initiatives:
         try:
             # Durable summaries carry the receipts and marker the silent and stalled checks read.
-            found, jobs, records = summaries(initiative, durable=True)
+            cached = None if snapshots is None else snapshots.get(initiative["id"])
+            reused = cached_summary(initiative, cached) if cached is not None else None
+            found, jobs, records = reused if reused is not None else summaries(initiative, durable=True)
             judged = {name: (silent_role(name, summary, records), stalled_dispatch(name, summary, records))
                       for name, summary in found.items()}
         except ERRORS as exc:
@@ -368,10 +573,10 @@ def run(store_path, rounds, chosen, dry_run, lifecycle_path=None, *, durable=Fal
                        "work_complete": False, "lifecycle": lifecycle, "rows": rows, "still_unread": still_unread,
                        "root_queue": root_queue, "root_time": root_times, "rotate_needed": [],
                        "silent_roles": silent, "stalled_dispatches": stalled}
-    completed = 0
-    while completed < rounds and sweep_round(initiatives, rows, tried, broken, dry_run, durable, skip):
+    completed, snapshots = 0, {}
+    while completed < rounds and sweep_round(initiatives, rows, tried, broken, dry_run, durable, skip, snapshots):
         completed += 1
-    still_unread, root_queue, root_times, silent, stalled = remaining(initiatives, broken, rows)
+    still_unread, root_queue, root_times, silent, stalled = remaining(initiatives, broken, rows, snapshots)
     rotate = [{key: row[key] for key in ("initiative", "endpoint", "session")}
               for row in rows if row["state"] == "rotate_needed"]
     mail_quiet = not still_unread and not root_queue and not broken

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import os
 from pathlib import Path
 import re
@@ -485,7 +486,7 @@ def test_timeout_and_missing_git_raise_git_error(monkeypatch, tmp_path: Path):
 
     (tmp_path / "no-git").mkdir()
     monkeypatch.setenv("PATH", str(tmp_path / "no-git"))
-    with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH$"):
+    with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH"):
         gitsafe.run(["status"], tmp_path)
 
 
@@ -522,7 +523,7 @@ def test_a_git_planted_behind_an_empty_or_relative_path_entry_is_never_run(tmp_p
     assert not marker.exists(), "a git found through a relative PATH entry was run"
 
     monkeypatch.setenv("PATH", entry)
-    with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH$"):
+    with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH"):
         gitsafe.run(["--version"], repo)
     assert not marker.exists()
 
@@ -532,12 +533,11 @@ def test_on_windows_the_current_directory_is_not_searched_for_git(tmp_path, monk
     # in a cloned repository, its git.exe would run.
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setenv("PATHEXT", os.pathsep.join([".COM", ".EXE", ".BAT", ".CMD"]))
-    for where in (tmp_path / "repo", tmp_path / "Git" / "cmd"):
-        where.mkdir(parents=True)
-        (where / "git.exe").write_bytes(b"MZ")
-        (where / "git.exe").chmod(0o755)
-    monkeypatch.chdir(tmp_path / "repo")
-    monkeypatch.setenv("PATH", str(tmp_path / "Git" / "cmd"))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "git.exe").write_bytes(b"MZ")
+    (repo / "git.exe").chmod(0o755)
+    monkeypatch.chdir(repo)
     started = []
 
     def record(argv, **kwargs):
@@ -545,8 +545,12 @@ def test_on_windows_the_current_directory_is_not_searched_for_git(tmp_path, monk
         return subprocess.CompletedProcess(argv, 0, b"", b"")
 
     monkeypatch.setattr(gitsafe.subprocess, "run", record)
-    gitsafe.run(["status"], tmp_path / "repo")
-    assert started == [str(tmp_path / "Git" / "cmd" / "git.exe")]
+    with _outside_programs(repo) as host:
+        (host / "git.exe").write_bytes(b"MZ")
+        (host / "git.exe").chmod(0o755)
+        monkeypatch.setenv("PATH", str(host))
+        gitsafe.run(["status"], repo)
+        assert started == [str(host / "git.exe")]
 
 
 # ── The fsmonitor regression (red team blocker) ──────────────────────────────
@@ -2080,7 +2084,8 @@ def test_twenty_git_calls_with_one_path_look_git_up_once(tmp_path, monkeypatch, 
     for _ in range(20):
         assert gitsafe.run(["--version"], tmp_path).returncode == 0
     assert asked == ["git"]
-    assert os.path.samefile(gitsafe.git_executable(), shutil.which("git")) and asked == ["git"]
+    # The same non-workspace cwd shares one fence. A bare lookup fences the process cwd instead.
+    assert os.path.samefile(gitsafe.git_executable(cwd=tmp_path), shutil.which("git")) and asked == ["git"]
 
 
 def _copy_git(directory: Path) -> Path:
@@ -2095,15 +2100,16 @@ def _copy_git(directory: Path) -> Path:
 def test_a_new_path_finds_its_own_git_and_a_deleted_git_fails_loudly(tmp_path, monkeypatch, fresh_git_lookup):
     copy = _copy_git(tmp_path / "other")
     monkeypatch.setenv("PATH", str(tmp_path / "other"))
-    assert gitsafe.git_executable() == str(copy)
-    assert gitsafe.run(["--version"], tmp_path).returncode == 0
+    cwd = _foreign_cwd(tmp_path)
+    assert gitsafe.git_executable(cwd=cwd) == str(copy)
+    assert gitsafe.run(["--version"], cwd).returncode == 0
     saved = copy.read_bytes()
     copy.unlink()
-    with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH$"):
-        gitsafe.run(["--version"], tmp_path)
+    with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH"):
+        gitsafe.run(["--version"], cwd)
     copy.write_bytes(saved)
     copy.chmod(0o755)
-    assert gitsafe.run(["--version"], tmp_path).returncode == 0
+    assert gitsafe.run(["--version"], cwd).returncode == 0
 
 
 def test_a_cached_git_never_outlives_a_path_that_only_holds_a_relative_entry(tmp_path, monkeypatch,
@@ -2113,9 +2119,617 @@ def test_a_cached_git_never_outlives_a_path_that_only_holds_a_relative_entry(tmp
     monkeypatch.chdir(tmp_path / "repo")
     assert gitsafe.run(["--version"], tmp_path).returncode == 0  # cached under the real PATH
     monkeypatch.setenv("PATH", ".")
-    with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH$"):
+    with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH"):
         gitsafe.run(["--version"], tmp_path)
     assert not marker.exists()
+
+
+def _worktree(path: Path) -> Path:
+    """A work tree marker only: ordinary resolution must not need git history to find it."""
+    path.mkdir(parents=True, exist_ok=True)
+    gitdir = path / ".git"
+    if not gitdir.exists():
+        gitdir.mkdir()
+    return path
+
+
+def _under(path: str, root: Path) -> bool:
+    candidate, base = os.path.normcase(os.path.realpath(path)), os.path.normcase(os.path.realpath(root))
+    return candidate == base or candidate.startswith(base.rstrip(os.sep) + os.sep)
+
+
+@pytest.fixture(autouse=True)
+def isolated_program_marker_boundary(tmp_path):
+    """Model a clean ancestor namespace; never inherit the developer's dotfiles repo.
+
+    All markers within the real fixture remain visible, including hostile child
+    markers. Only the product's OS reference changes; shared OS functions and
+    owner records are untouched. Pathlookup's own tests retain the real ancestors.
+    """
+    from types import SimpleNamespace
+    from aegis_core import pathlookup
+    original = pathlookup.os
+    locator = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else "/dev/fd"
+
+    def stat(path, *args, **kwargs):
+        fd = kwargs.get("dir_fd")
+        if path == ".git" and fd is not None:
+            parent = os.path.realpath(locator + "/" + str(fd))
+            if not _under(parent, tmp_path):
+                raise FileNotFoundError(2, "fixture marker outside filesystem model")
+        elif os.path.basename(path) == ".git" and not _under(os.path.dirname(path), tmp_path):
+            raise FileNotFoundError(2, "fixture marker outside filesystem model")
+        return os.stat(path, *args, **kwargs)
+
+    def lexists(path):
+        if os.path.basename(path) == ".git" and not _under(os.path.dirname(path), tmp_path):
+            return False
+        return os.path.lexists(path)
+
+    pathlookup.os = SimpleNamespace(**{**vars(os), "stat": stat,
+        "path": SimpleNamespace(**{**vars(os.path), "lexists": lexists}),
+        "supports_dir_fd": {stat if fn is os.stat else fn for fn in os.supports_dir_fd},
+        "supports_follow_symlinks": {stat if fn is os.stat else fn for fn in os.supports_follow_symlinks}})
+    try:
+        yield
+    finally:
+        pathlookup.os = original
+
+
+def _foreign_cwd(root: Path) -> Path:
+    """A real read-only cwd whose enclosing fence does not contain our fixture."""
+    import tempfile
+    from aegis_core import pathlookup
+    for candidate in (ROOT, Path(sys.executable).parent, Path(tempfile.gettempdir()), Path("/usr")):
+        if not candidate.is_dir():
+            continue
+        fence = pathlookup.git_fence(candidate) or str(candidate.resolve())
+        if not _under(str(root), Path(fence)):
+            return candidate
+    raise AssertionError("fixture requires a cwd outside its enclosing checkout")
+
+
+@contextlib.contextmanager
+def _outside_programs(cwd: Path):
+    """Host program fixtures live outside the entire enclosing checkout."""
+    import tempfile
+    from aegis_core import pathlookup
+    fence = pathlookup.git_fence(cwd) or str(cwd.resolve())
+    parent = Path(tempfile.gettempdir()) if _under(str(ROOT), Path(fence)) else ROOT / ".pytest_cache"
+    assert not _under(str(parent), Path(fence)), "fixture needs an outside program directory"
+    parent.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="gitsafe-ruling-", dir=parent) as directory:
+        yield Path(directory)
+
+
+@contextlib.contextmanager
+def _temporary_env(updates):
+    """Restore PATH (and any other keys) without a new monkeypatch fixture site."""
+    previous = {name: os.environ.get(name) for name in updates}
+    missing = {name for name in updates if name not in os.environ}
+    os.environ.update(updates)
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if name in missing:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+@contextlib.contextmanager
+def _temporary_cwd(path):
+    previous = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(previous)
+
+
+def test_ordinary_read_skips_an_in_workspace_git_then_retries(tmp_path, fresh_git_lookup):
+    """Empty cache: cwd's work tree is excluded, a miss refuses, and a later outside git runs."""
+    ws = _worktree(tmp_path / "ws")
+    (ws / "sub").mkdir()
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+    with _temporary_env({"PATH": os.pathsep.join((str(ws / "bin"), _REAL_GIT_DIR))}):
+        proc = gitsafe.run(["--version"], ws / "sub")
+    assert proc.returncode == 0 and proc.stdout.startswith(b"git version")
+    assert not marker.exists()
+    with _temporary_env({"PATH": str(ws / "bin")}):
+        with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH"):
+            gitsafe.run(["--version"], ws)
+    assert not marker.exists()
+    with _temporary_env({"PATH": _REAL_GIT_DIR}):
+        retried = gitsafe.run(["--version"], ws)
+    assert retried.returncode == 0 and retried.stdout.startswith(b"git version")
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("kind", ["directory", "gitfile", "symlink"])
+@pytest.mark.parametrize("fallback", [False, True], ids=["host-probe", "forced-fallback"])
+def test_ordinary_child_markers_cannot_shrink_the_workspace_fence(tmp_path, fresh_git_lookup, kind, fallback):
+    from conftest import symlink_or_skip
+    from aegis_core import pathlookup
+    ws = _worktree(tmp_path / "ws")
+    sub = ws / "sub"
+    sub.mkdir()
+    if kind == "directory":
+        (sub / ".git").mkdir()
+    elif kind == "gitfile":
+        (sub / ".git").write_text("gitdir: " + str(ws / ".git") + "\n", encoding="utf-8")
+    else:
+        symlink_or_skip(ws / ".git", sub / ".git", target_is_directory=True)
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+    probe = pathlookup.descriptor_fence_supported
+    if fallback:
+        pathlookup.descriptor_fence_supported = lambda: False
+    try:
+        with _temporary_env({"PATH": os.pathsep.join((str(ws / "bin"), _REAL_GIT_DIR))}):
+            result = gitsafe.run(["--version"], sub)
+    finally:
+        pathlookup.descriptor_fence_supported = probe
+    assert not marker.exists(), "child-controlled Git metadata narrowed the executable fence"
+    assert result.returncode == 0 and result.stdout.startswith(b"git version")
+
+
+def test_ordinary_cache_primed_for_another_root_does_not_run_the_workspace_git(tmp_path, fresh_git_lookup):
+    ws = _worktree(tmp_path / "ws")
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+    planted = next((ws / "bin").iterdir())
+    other = _foreign_cwd(ws)
+    with _temporary_env({"PATH": os.pathsep.join((str(ws / "bin"), _REAL_GIT_DIR))}):
+        primed = gitsafe.git_executable(cwd=other)
+        assert os.path.samefile(primed, planted)
+        proc = gitsafe.run(["--version"], ws)
+        assert proc.returncode == 0 and proc.stdout.startswith(b"git version")
+        assert not marker.exists()
+        assert not _under(gitsafe.git_executable(cwd=ws), ws)
+
+
+def test_child_marker_cache_priming_and_removal_keep_the_outer_fence(tmp_path, monkeypatch, fresh_git_lookup):
+    ws = _worktree(tmp_path / "ws")
+    child = _worktree(ws / "child")
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+    asked = _counting_which(monkeypatch)
+    with _temporary_env({"PATH": os.pathsep.join((str(ws / "bin"), _REAL_GIT_DIR))}):
+        for present in (True, False, True):
+            if not present:
+                (child / ".git").rmdir()
+            elif not (child / ".git").exists():
+                (child / ".git").mkdir()
+            result = gitsafe.run(["--version"], child)
+            assert not marker.exists()
+            assert result.stdout.startswith(b"git version")
+    assert asked == ["git"]
+
+
+def test_equivalent_fence_spellings_share_the_same_cache_partition(tmp_path):
+    from types import SimpleNamespace
+    from aegis_core import pathlookup
+    ws = _worktree(tmp_path / "ws")
+    program = shutil.which("git")
+    cache = pathlookup.GitCache()
+    original, probe = pathlookup.os, pathlookup.descriptor_fence_supported
+
+    def realpath(path):
+        value = os.path.realpath(path)
+        return value if value == os.sep else value + os.sep
+
+    pathlookup.os = SimpleNamespace(**{**vars(original), "path": SimpleNamespace(
+        **{**vars(original.path), "realpath": realpath})})
+    pathlookup.descriptor_fence_supported = lambda: False
+    try:
+        cache.for_cwd(ws)[("fixture",)] = program
+        pathlookup.os = original
+        assert cache.for_cwd(ws).get(("fixture",)) == program
+    finally:
+        pathlookup.os = original
+        pathlookup.descriptor_fence_supported = probe
+
+
+@pytest.mark.parametrize("kind", ["pure", "workspace", "protocol", "bytes"])
+def test_ordinary_pathlike_cwd_keeps_the_workspace_fence(tmp_path, fresh_git_lookup, kind):
+    from pathlib import PurePath
+    from aegis_core.workspace.base import Workspace
+    ws = _worktree(tmp_path / "ws")
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+
+    class NamedPath(os.PathLike):
+        def __fspath__(self):
+            return str(ws)
+
+        def __str__(self):
+            return str(ws)
+
+    class BytesPath(os.PathLike):
+        def __fspath__(self):
+            return os.fsencode(str(ws))
+
+        def __str__(self):
+            return str(ws)
+
+    cwd = {"pure": PurePath(ws), "workspace": Workspace(ws), "protocol": NamedPath(),
+           "bytes": BytesPath()}[kind]
+    with _temporary_env({"PATH": os.pathsep.join((str(ws / "bin"), _REAL_GIT_DIR))}):
+        result = gitsafe.run(["--version"], cwd)
+    assert result.returncode == 0 and result.stdout.startswith(b"git version")
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("case", ["wrong-return", "large", "nul", "components", "unsupported"])
+def test_malformed_pathlike_cwd_has_a_typed_refusal(tmp_path, fresh_git_lookup, case):
+    values = {"wrong-return": 42, "large": "x" * 16385, "nul": "bad\0path",
+              "components": os.sep + os.sep.join(["component"] * 513)}
+
+    class MalformedPath(os.PathLike):
+        def __fspath__(self):
+            return values[case]
+
+    cwd = 123 if case == "unsupported" else MalformedPath()
+    with _temporary_env({"PATH": _REAL_GIT_DIR}):
+        with pytest.raises(gitsafe.GitError) as caught:
+            gitsafe.run(["--version"], cwd)
+    assert caught.value.code == "ERR_AEGIS"
+    assert "123" not in str(caught.value)
+
+
+@pytest.mark.parametrize("case", ["type", "os", "value", "runtime"])
+def test_pathlike_fspath_exception_propagates_unchanged(tmp_path, fresh_git_lookup, case):
+    failures = {"type": TypeError, "os": OSError, "value": ValueError, "runtime": RuntimeError}
+
+    class MalformedPath(os.PathLike):
+        def __fspath__(self):
+            raise failures[case]("private-path-protocol-diagnostic")
+
+    with _temporary_env({"PATH": _REAL_GIT_DIR}):
+        with pytest.raises(failures[case], match="^private-path-protocol-diagnostic$"):
+            gitsafe.run(["--version"], MalformedPath())
+
+
+@pytest.mark.parametrize("fallback", [False, True], ids=["host-probe", "forced-fallback"])
+@pytest.mark.parametrize("inside", [True, False], ids=["inside-workspace", "owner-prefix"])
+def test_ordinary_cwd_alias_cannot_discard_its_enclosing_fence(tmp_path, monkeypatch, fresh_git_lookup, fallback, inside):
+    from conftest import symlink_or_skip
+    from aegis_core import pathlookup
+    ws = _worktree(tmp_path / "ws")
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+    alias = (ws if inside else tmp_path) / "jump"
+    asked = _counting_which(monkeypatch)
+    probe = pathlookup.descriptor_fence_supported
+    if fallback:
+        pathlookup.descriptor_fence_supported = lambda: False
+    try:
+        with _temporary_env({"PATH": os.pathsep.join((str(ws / "bin"), _REAL_GIT_DIR))}):
+            for target in ((_foreign_cwd(ws) if inside else ws), ws):
+                if alias.exists():
+                    alias.unlink()
+                symlink_or_skip(target, alias, target_is_directory=True)
+                result = gitsafe.run(["--version"], alias)
+                assert not marker.exists(), "cwd alias discarded the enclosing workspace"
+                assert result.returncode == 0 and result.stdout.startswith(b"git version")
+    finally:
+        pathlookup.descriptor_fence_supported = probe
+    assert asked == ["git"]
+
+
+def test_ordinary_refusal_reports_enclosing_checkout_and_retries(tmp_path, fresh_git_lookup):
+    from aegis_core import pathlookup
+    from aegis_core.primitives import sanitize_display
+    from aegis_core.redaction import redact_insight_text
+    ws = _worktree(tmp_path / "ws")
+    child = _worktree(ws / "child")
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+    with _temporary_env({"PATH": str(ws / "bin")}):
+        for _attempt in range(2):
+            with pytest.raises(gitsafe.GitError) as caught:
+                gitsafe.run(["--version"], child)
+            assert caught.value.code == "ERR_AEGIS"
+            assert "enclosing checkout" in str(caught.value)
+            canonical = sanitize_display(pathlookup.git_fence(ws), max_len=None)
+            expected = sanitize_display(redact_insight_text(canonical, max_len=len(canonical)), max_len=256)
+            assert str(caught.value).endswith(expected)
+    with _temporary_env({"PATH": _REAL_GIT_DIR}):
+        assert gitsafe.run(["--version"], child).stdout.startswith(b"git version")
+    assert not marker.exists()
+
+
+def test_marker_replacement_between_fence_and_lookup_cannot_narrow_it(tmp_path, fresh_git_lookup):
+    from threading import Event, Thread
+    from aegis_core import pathlookup
+    ws = _worktree(tmp_path / "ws")
+    child = _worktree(ws / "child")
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+    ready, replaced, failures = Event(), Event(), []
+    real = pathlookup.which
+
+    def replace():
+        if not ready.wait(5):
+            failures.append("lookup did not reach the boundary")
+            return
+        try:
+            (child / ".git").rename(child / ".git-old")
+            (child / ".git").write_text("gitdir: " + str(ws / ".git") + "\n", encoding="utf-8")
+        except OSError:
+            failures.append("marker replacement failed")
+        finally:
+            replaced.set()
+
+    def lookup(name, *args, **kwargs):
+        ready.set()
+        assert replaced.wait(5), "replacement did not complete"
+        return real(name, *args, **kwargs)
+
+    worker = Thread(target=replace)
+    pathlookup.which = lookup
+    worker.start()
+    try:
+        with _temporary_env({"PATH": os.pathsep.join((str(ws / "bin"), _REAL_GIT_DIR))}):
+            result = gitsafe.run(["--version"], child)
+    finally:
+        ready.set()
+        worker.join(10)
+        pathlookup.which = real
+    assert not worker.is_alive() and not failures
+    assert not marker.exists()
+    assert result.stdout.startswith(b"git version")
+
+
+def test_ordinary_exclusion_follows_the_call_cwd_not_the_process_cwd(tmp_path, fresh_git_lookup):
+    ws = _worktree(tmp_path / "ws")
+    (ws / "sub").mkdir()
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+    other = tmp_path / "other"
+    other.mkdir()
+    with _temporary_cwd(other), _temporary_env({"PATH": os.pathsep.join((str(ws / "bin"), _REAL_GIT_DIR))}):
+        proc = gitsafe.run(["--version"], ws / "sub")
+    assert proc.returncode == 0 and proc.stdout.startswith(b"git version")
+    assert not marker.exists()
+
+
+def test_ordinary_read_skips_an_outside_alias_into_the_workspace(tmp_path, fresh_git_lookup):
+    from conftest import symlink_or_skip
+    real_git = shutil.which("git")
+    ws = _worktree(tmp_path / "ws")
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+    planted = next((ws / "bin").iterdir())
+    with _outside_programs(ws) as outside:
+        alias = outside / "alias-bin"
+        symlink_or_skip(ws / "bin", alias, target_is_directory=True)
+        symlink_or_skip(planted, outside / planted.name)
+        with _temporary_env({"PATH": os.pathsep.join((str(alias), str(outside), _REAL_GIT_DIR))}):
+            proc = gitsafe.run(["--version"], ws)
+            assert proc.returncode == 0 and proc.stdout.startswith(b"git version")
+            assert not marker.exists()
+            resolved = gitsafe.git_executable(cwd=ws)
+    assert not _under(resolved, ws)
+    assert os.path.samefile(resolved, real_git)
+
+
+def test_cached_outside_alias_retargeted_into_workspace_is_not_run(tmp_path, fresh_git_lookup):
+    from conftest import symlink_or_skip
+    real_git = shutil.which("git")
+    ws = _worktree(tmp_path / "ws")
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+    planted = next((ws / "bin").iterdir())
+    with _outside_programs(ws) as outside:
+        alias = outside / Path(real_git).name
+        symlink_or_skip(real_git, alias)
+        with _temporary_env({"PATH": os.pathsep.join((str(outside), _REAL_GIT_DIR))}):
+            assert os.path.samefile(gitsafe.git_executable(cwd=ws), alias)
+            alias.unlink()
+            symlink_or_skip(planted, alias)
+            result = gitsafe.run(["--version"], ws)
+            assert result.returncode == 0 and result.stdout.startswith(b"git version")
+            assert not marker.exists()
+            alias.unlink()
+            symlink_or_skip(real_git, alias)
+            assert gitsafe.run(["--version"], ws).stdout.startswith(b"git version")
+
+
+def test_in_fence_directory_alias_cannot_be_retargeted_before_spawn(tmp_path, fresh_git_lookup):
+    from types import SimpleNamespace
+    from conftest import symlink_or_skip
+    ws = _worktree(tmp_path / "ws")
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+    alias = ws / "host-git"
+    symlink_or_skip(_REAL_GIT_DIR, alias, target_is_directory=True)
+    original = gitsafe.subprocess
+
+    def launch(argv, **options):
+        alias.unlink()
+        symlink_or_skip(ws / "bin", alias, target_is_directory=True)
+        return subprocess.run(argv, **options)
+
+    gitsafe.subprocess = SimpleNamespace(**{**vars(subprocess), "run": launch})
+    try:
+        with _temporary_env({"PATH": os.pathsep.join((str(alias), _REAL_GIT_DIR))}):
+            result = gitsafe.run(["--version"], ws)
+    finally:
+        gitsafe.subprocess = original
+    assert not marker.exists()
+    assert result.stdout.startswith(b"git version")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX parent traversal follows directory symlinks")
+def test_ordinary_parent_traversal_cannot_hide_a_mutable_workspace_component(tmp_path, fresh_git_lookup):
+    from types import SimpleNamespace
+    from conftest import symlink_or_skip
+    ws = _worktree(tmp_path / "ws")
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "host-bin", marker)
+    outside = tmp_path / "host-bin"
+    outside.mkdir()
+    program = Path(shutil.which("git"))
+    symlink_or_skip(program, outside / program.name)
+    first, changed = tmp_path / "outside" / "deep", ws / "inside" / "deep"
+    first.mkdir(parents=True)
+    changed.mkdir(parents=True)
+    alias = ws / "pivot"
+    symlink_or_skip(first, alias, target_is_directory=True)
+    entry = str(alias) + os.sep + ".." + os.sep + ".." + os.sep + "host-bin"
+    original = gitsafe.subprocess
+
+    def launch(argv, **options):
+        alias.unlink()
+        symlink_or_skip(changed, alias, target_is_directory=True)
+        return subprocess.run(argv, **options)
+
+    gitsafe.subprocess = SimpleNamespace(**{**vars(subprocess), "run": launch})
+    try:
+        with _temporary_env({"PATH": os.pathsep.join((entry, _REAL_GIT_DIR))}):
+            result = gitsafe.run(["--version"], ws)
+    finally:
+        gitsafe.subprocess = original
+    assert not marker.exists(), "parent traversal hid a mutable workspace component"
+    assert result.returncode == 0 and result.stdout.startswith(b"git version")
+
+
+def test_cache_primed_before_workspace_symlink_retarget_is_skipped(tmp_path, fresh_git_lookup):
+    """A cached outside symlink is dropped once its target walks through the fence and back out."""
+    from conftest import symlink_or_skip
+    from aegis_core import pathlookup
+    real_git = shutil.which("git")
+    ws = _worktree(tmp_path / "ws")
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+    decoy = ws / "decoy"
+    decoy.mkdir()
+    with _outside_programs(ws) as outside:
+        alias = outside / Path(real_git).name
+        symlink_or_skip(real_git, alias)
+        with _temporary_env({"PATH": os.pathsep.join((str(outside), _REAL_GIT_DIR))}):
+            primed = gitsafe.git_executable(cwd=ws)
+            assert os.path.samefile(primed, alias)
+            alias.unlink()
+            ups = len(decoy.parts) - 1
+            target = os.path.join(str(decoy), *([os.pardir] * ups), *Path(real_git).parts[1:])
+            symlink_or_skip(target, alias)
+            assert os.path.normcase(os.path.realpath(alias)) == os.path.normcase(os.path.realpath(real_git))
+            assert os.path.normcase(str(ws)) in os.path.normcase(target)
+            found = gitsafe.git_executable(cwd=ws)
+            assert found != str(alias)
+            assert os.path.samefile(found, real_git)
+            assert pathlookup._inside(str(alias), pathlookup.git_fence(ws))
+            result = gitsafe.run(["--version"], ws)
+    assert result.returncode == 0 and result.stdout.startswith(b"git version")
+    assert not marker.exists()
+
+
+def test_discovery_failure_in_subdirectory_refuses_before_spawn(tmp_path, fresh_git_lookup):
+    from aegis_core import pathlookup
+    ws = _worktree(tmp_path / "ws")
+    sub = ws / "sub"
+    sub.mkdir()
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+
+    def unavailable(*args, **kwargs):
+        raise OSError("untrusted-discovery-diagnostic")
+
+    descriptors, lexical = pathlookup._fence_descriptors, pathlookup._fence_lexical
+    pathlookup._fence_descriptors = unavailable
+    pathlookup._fence_lexical = unavailable
+    try:
+        with _temporary_env({"PATH": str(ws / "bin")}):
+            with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH"):
+                gitsafe.run(["--version"], sub)
+    finally:
+        pathlookup._fence_descriptors, pathlookup._fence_lexical = descriptors, lexical
+    assert not marker.exists()
+    with _temporary_env({"PATH": _REAL_GIT_DIR}):
+        assert gitsafe.run(["--version"], sub).stdout.startswith(b"git version")
+
+
+def test_ordinary_exclusion_holds_when_descriptor_probe_is_false(tmp_path, fresh_git_lookup):
+    from aegis_core import pathlookup
+    ws = _worktree(tmp_path / "ws")
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+    probe = pathlookup.descriptor_fence_supported
+    pathlookup.descriptor_fence_supported = lambda: False
+    try:
+        with _temporary_env({"PATH": os.pathsep.join((str(ws / "bin"), _REAL_GIT_DIR))}):
+            proc = gitsafe.run(["--version"], ws)
+    finally:
+        pathlookup.descriptor_fence_supported = probe
+    assert proc.returncode == 0 and proc.stdout.startswith(b"git version")
+    assert not marker.exists()
+
+
+def test_fence_discovery_oserror_refuses_with_git_error(tmp_path, fresh_git_lookup):
+    from aegis_core import pathlookup
+    ws = _worktree(tmp_path / "ws")
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+
+    def boom(*args, **kwargs):
+        raise OSError("discovery failed")
+
+    opening, lexical = pathlookup._open_directory, pathlookup._fence_lexical
+    pathlookup._open_directory = boom
+    pathlookup._fence_lexical = boom
+    try:
+        with _temporary_env({"PATH": str(ws / "bin")}):
+            with pytest.raises(gitsafe.GitError, match="^git is not installed or not on PATH"):
+                gitsafe.run(["--version"], ws)
+    finally:
+        pathlookup._open_directory, pathlookup._fence_lexical = opening, lexical
+    assert not marker.exists()
+
+
+def test_concurrent_roots_do_not_serve_each_others_workspace_git(tmp_path, fresh_git_lookup):
+    from threading import Barrier, Thread
+    ws_a, ws_b = _worktree(tmp_path / "a"), _worktree(tmp_path / "b")
+    marker_a, marker_b = tmp_path / "PWNED-A", tmp_path / "PWNED-B"
+    _plant_git(ws_a / "bin", marker_a)
+    _plant_git(ws_b / "bin", marker_b)
+    barrier, found, errors = Barrier(8), [], []
+
+    def resolve(root):
+        try:
+            barrier.wait(10)
+            found.append((root, gitsafe.git_executable(cwd=root)))
+        except Exception as exc:
+            errors.append(exc)
+
+    with _temporary_env({"PATH": os.pathsep.join((str(ws_a / "bin"), str(ws_b / "bin"), _REAL_GIT_DIR))}):
+        workers = [Thread(target=resolve, args=(root,)) for root in (ws_a, ws_b) for _ in range(4)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(15)
+    assert not errors and not any(worker.is_alive() for worker in workers)
+    assert not marker_a.exists() and not marker_b.exists()
+    assert found and all(not _under(path, root) for root, path in found)
+
+
+def test_ordinary_resolution_closes_fence_descriptors(tmp_path, fresh_git_lookup):
+    if not os.path.isdir("/proc/self/fd"):
+        pytest.skip("descriptor leak check needs /proc/self/fd")
+    ws = _worktree(tmp_path / "ws")
+    marker = tmp_path / "PWNED"
+    _plant_git(ws / "bin", marker)
+    with _temporary_env({"PATH": os.pathsep.join((str(ws / "bin"), _REAL_GIT_DIR))}):
+        before = len(os.listdir("/proc/self/fd"))
+        proc = gitsafe.run(["--version"], ws)
+        after = len(os.listdir("/proc/self/fd"))
+    assert proc.returncode == 0 and proc.stdout.startswith(b"git version")
+    assert not marker.exists()
+    assert before == after
 
 
 # ── scrubbed(): evidence ignores the caller's local GIT_* variables (R-trust-19) ──
@@ -5446,6 +6060,7 @@ def test_effect_capture_preserves_issued_bindings(repo, tmp_path, effect_lock, b
 @pytest.mark.parametrize("operation", ["hook", "trailers", "export", "sync"])
 def test_ordinary_trusted_caller_environment_goldens(repo, tmp_path, fake_home, monkeypatch, operation):
     from types import SimpleNamespace
+    from aegis_core import pathlookup as ordinary_fence
     target = repo
     sync_repo = None
     if operation == "sync":
@@ -5467,8 +6082,9 @@ def test_ordinary_trusted_caller_environment_goldens(repo, tmp_path, fake_home, 
         return real_which(name, **options)
     gitsafe._reset_for_tests()
     monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(which=lookup))
-    observed = []
+    observed, fences = [], []
     def launch(argv, **options):
+        fences.append(ordinary_fence.git_fence(options["cwd"]))
         observed.append((argv, options.copy()))
         return subprocess.run(argv, **options)
     monkeypatch.setattr(gitsafe, "subprocess", SimpleNamespace(**{**vars(subprocess), "run": launch}))
@@ -5503,7 +6119,11 @@ def test_ordinary_trusted_caller_environment_goldens(repo, tmp_path, fake_home, 
         # Keep actual environment values out of pytest's assertion diagnostics.
         identical = actual == expected
         assert identical, "ordinary caller environment bytes changed"
-    assert selected and lookups and all(name == "git" and options == {} for name, options in lookups)
+    assert fences and len(set(fences)) == 1
+    worktree = fences[0]
+    # Ordinary resolution asks for the metadata walk. The environment bytes above stay the golden.
+    expected_lookup = {} if worktree is None else {"outside": worktree, "fence_program": True, "descriptors": False}
+    assert selected and lookups and all(name == "git" and options == expected_lookup for name, options in lookups)
 
 
 def test_strict_resolver_binds_windows_extensions_to_effective_environment(tmp_path, monkeypatch):
@@ -5666,9 +6286,30 @@ def test_ordinary_git_lookup_retains_plain_environment_fence(tmp_path, monkeypat
     gitsafe._reset_for_tests()
     try:
         assert gitsafe.git_executable(environ=source, cwd=tmp_path) == sys.executable
-        assert seen == [("git", {} if source is None else {"path": source.get("PATH", os.defpath), "outside": tmp_path})]
+        expected = {"outside": os.path.normcase(os.path.realpath(tmp_path)), "fence_program": True, "descriptors": False} if source is None else {"path": source.get("PATH", os.defpath), "outside": tmp_path}
+        assert seen == [("git", expected)]
     finally:
         gitsafe._reset_for_tests()
+
+
+def test_alternating_roots_look_git_up_once_per_fence(tmp_path, monkeypatch, fresh_git_lookup):
+    """A miss drops only that fence's partition, so the other root stays cached."""
+    from types import SimpleNamespace
+    left, right = _worktree(tmp_path / "left"), _worktree(tmp_path / "right")
+    calls = []
+
+    def which(name, **options):
+        calls.append(os.path.normcase(str(options.get("outside"))))
+        return sys.executable
+
+    monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(which=which))
+    assert gitsafe.git_executable(cwd=left) == sys.executable
+    assert gitsafe.git_executable(cwd=right) == sys.executable
+    assert gitsafe.git_executable(cwd=left) == sys.executable
+    assert calls == [os.path.normcase(str(left)), os.path.normcase(str(right))]
+    gitsafe._reset_for_tests()
+    assert gitsafe.git_executable(cwd=left) == sys.executable
+    assert calls[-1] == os.path.normcase(str(left))
 
 
 @pytest.mark.usefixtures("strict_program")
@@ -5821,6 +6462,7 @@ def test_ordinary_git_shims_preserve_script_identity(repo, tmp_path, monkeypatch
 # Exact AST proofs are reserved for refusals before lookup or mixed variants.
 # A changed body invalidates its proof; new construction sites need a guard.
 _STRICT_SITE_PROOFS = {
+    ('test_gitsafe', 'test_bound_root_does_not_change_supplied_or_unsupported_strict_lookup'): ('489c9f1bb9b60e968c51f0bd9a741dadf130f2404e7f4fe9643fc01923e15cfb', 'The program probe is forced false; custody_program must refuse unsupported_effect_platform before spawn on every platform.'),
     ('test_gitsafe', 'test_effect_descriptor_refused_before_any_spawn'): ('f440d542ccf05a986720fb51cdadb1b5a38a54c0c776d783a4c8c4f2fa72e07b', 'Invalid receipt descriptors refuse in pass_through before executable lookup.'),
     ('test_gitsafe', 'test_effect_unsupported_platform_is_a_pre_spawn_refusal'): ('4480e3b2ef2f7c06b1c60a74288dd00df9da0584dae64c5a8a765ec7437174ba', 'The effect-platform probe is forced false; pass_through refuses before lookup.'),
     ('test_gitsafe', 'test_effect_write_roots_refuse_before_expansion'): ('f8042b05a19e1caa57c0370d7e57ff2c964a11d522499873180c6f8ad4bada44', 'Invalid or oversized root containers refuse before executable lookup.'),
@@ -6230,3 +6872,112 @@ def test_effect_cleanup_keeps_timeout_class_and_closes_every_stream(fault):
     finally:
         for stream in streams:
             stream.close()
+
+
+def _bound_fence(path):
+    from aegis_core.primitives import real_key
+    return real_key(os.fspath(path))
+
+
+@contextlib.contextmanager
+def _bound_ordinary_root(path):
+    from aegis_core import pathlookup
+    token = pathlookup.ordinary_root.set(_bound_fence(path))
+    try:
+        yield
+    finally:
+        pathlookup.ordinary_root.reset(token)
+
+
+def test_bound_root_runs_enclosing_git_skips_workspace_git_and_retries(tmp_path, fresh_git_lookup):
+    """Git in the enclosing checkout is outside the owner root; git inside it is still refused."""
+    from aegis_core import pathlookup
+    from aegis_core.primitives import sanitize_display
+    from aegis_core.redaction import redact_insight_text
+    enclosing = _worktree(tmp_path / "home-dotfiles")
+    secret = "AKIAIOSFODNN7EXAMPLE"
+    app = _worktree(enclosing / secret)
+    (app / "sub").mkdir()
+    inside = tmp_path / "INSIDE"
+    outside = tmp_path / "OUTSIDE"
+    _plant_git(app / "bin", inside)
+    _plant_git(enclosing / "bin", outside)
+    planted = os.pathsep.join((str(app / "bin"), str(enclosing / "bin")))
+    with _temporary_env({"PATH": planted}):
+        with pytest.raises(gitsafe.GitError) as unbound:
+            gitsafe.run(["--version"], app / "sub")
+    assert unbound.value.code == "ERR_AEGIS"
+    assert not inside.exists() and not outside.exists()
+    with _bound_ordinary_root(app):
+        with _temporary_env({"PATH": planted}):
+            allowed = gitsafe.run(["--version"], app / "sub")
+        assert allowed.returncode == 0
+        assert outside.exists() and not inside.exists()
+        outside.unlink()
+        with _temporary_env({"PATH": str(app / "bin")}):
+            with pytest.raises(gitsafe.GitError) as refused:
+                gitsafe.run(["--version"], app)
+        fence = pathlookup.GitCache().for_cwd(app).fence
+        canonical = sanitize_display(fence, max_len=None)
+        expected = sanitize_display(redact_insight_text(canonical, max_len=max(1, len(canonical))), max_len=256)
+        assert refused.value.code == "ERR_AEGIS"
+        assert str(refused.value).endswith(expected)
+        assert secret not in str(refused.value)
+        assert "[REDACTED_AWS]" in str(refused.value)
+        assert "\n" not in str(refused.value) and "\r" not in str(refused.value)
+        assert not inside.exists()
+        with _temporary_env({"PATH": _REAL_GIT_DIR}):
+            retried = gitsafe.run(["--version"], app)
+        assert retried.returncode == 0 and retried.stdout.startswith(b"git version")
+        assert not inside.exists()
+    assert pathlookup.ordinary_root.get() is None
+    with _temporary_env({"PATH": planted}):
+        with pytest.raises(gitsafe.GitError):
+            gitsafe.run(["--version"], app)
+    assert not outside.exists() and not inside.exists()
+
+
+def test_bound_root_holds_for_ordinary_lookup_when_descriptors_are_unavailable(tmp_path, fresh_git_lookup):
+    from aegis_core import pathlookup
+    enclosing = _worktree(tmp_path / "home-dotfiles")
+    app = _worktree(enclosing / "app")
+    marker = tmp_path / "PWNED"
+    _plant_git(enclosing / "bin", marker)
+    probe = pathlookup.descriptor_fence_supported
+    pathlookup.descriptor_fence_supported = lambda: False
+    try:
+        with _bound_ordinary_root(app):
+            with _temporary_env({"PATH": str(enclosing / "bin")}):
+                result = gitsafe.run(["--version"], app)
+            assert pathlookup.GitCache().for_cwd(app).fence == _bound_fence(app)
+    finally:
+        pathlookup.descriptor_fence_supported = probe
+    assert result.returncode == 0 and marker.exists()
+    assert pathlookup.ordinary_root.get() is None
+
+
+def test_bound_root_does_not_change_supplied_or_unsupported_strict_lookup(tmp_path, monkeypatch, fresh_git_lookup):
+    from types import SimpleNamespace
+    from aegis_core import pathlookup
+    enclosing = _worktree(tmp_path / "home-dotfiles")
+    app = _worktree(enclosing / "app")
+    seen = []
+    real = pathlookup.which
+
+    def which(name, *args, **kwargs):
+        seen.append(kwargs.get("outside"))
+        return real(name, *args, **kwargs)
+
+    monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(**{**vars(pathlookup), "which": which}))
+    with _bound_ordinary_root(app):
+        assert gitsafe.git_executable(cwd=enclosing) == real("git", path=os.environ.get("PATH", os.defpath),
+                                                              outside=_bound_fence(app), fence_program=True, descriptors=False)
+        seen.clear()
+        assert gitsafe.git_executable(environ={"PATH": _REAL_GIT_DIR}, cwd=enclosing)
+        assert seen and all(os.path.normcase(os.path.realpath(item)) != _bound_fence(app) for item in seen)
+        monkeypatch.setattr(gitsafe_run, "_program_supported", lambda: False)
+        with pytest.raises(gitsafe.GitError) as caught:
+            gitsafe.custody_program(enclosing, environ={"PATH": _REAL_GIT_DIR})
+    assert caught.value.code == "unsupported_effect_platform"
+    assert caught.value.process_started is False
+    assert pathlookup.ordinary_root.get() is None
