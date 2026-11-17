@@ -10,7 +10,10 @@ from datetime import datetime, timedelta, timezone
 import re
 from typing import Optional
 
-from hierarchy_mailbox import MAX_INBOX_RESPONSE_BYTES, MAX_RECORDS, SLUG, integer, matching, require
+if __package__:
+    from .hierarchy_mailbox import MAX_INBOX_RESPONSE_BYTES, MAX_RECORDS, SLUG, integer, matching, require
+else:
+    from hierarchy_mailbox import MAX_INBOX_RESPONSE_BYTES, MAX_RECORDS, SLUG, integer, matching, require
 
 __all__ = ["InboxPager", "InboxRequest", "assemble_inbox", "bounded_inbox", "parse_inbox_time"]
 

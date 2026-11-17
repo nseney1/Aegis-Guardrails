@@ -136,3 +136,53 @@ def test_diagnostic_malformed_escapes_refuse_without_echo_and_retry_concurrently
 
     with ThreadPoolExecutor(max_workers=3) as pool:
         assert list(pool.map(refusing_then_retry, range(6), timeout=15)) == ["plain"] * 6
+
+
+@pytest.mark.parametrize("passes", [1, 2, 18, 31, 32, 33])
+def test_error_name_fixed_point_has_a_32_pass_budget(passes, monkeypatch):
+    source = "plain" if passes == 1 else "ghp_" + "A" * (247 * (passes - 2) + 20)
+    original = projection.project_identifier
+    calls = []
+
+    def tracked(value):
+        calls.append(value)
+        return original(value)
+
+    monkeypatch.setattr(projection, "project_identifier", tracked)
+    expected = "plain" if passes == 1 else (
+        "ghp_REDACTED" if passes <= 32 else "guidance_projection_invalid_field")
+    assert projection.project_error_name(source) == expected
+    assert len(calls) == min(passes, 32)
+    assert projection.project_error_name(expected) == expected
+    assert projection.project_error_name("retry") == "retry"
+
+
+@pytest.mark.parametrize("value", [None, "", "name\nsecond", "name\rsecond", "name\u200d"])
+def test_error_name_invalid_fields_refuse_without_echo_then_retry(value):
+    assert projection.project_error_name(value) == "guidance_projection_invalid_field"
+    assert projection.project_error_name("retry") == "retry"
+
+
+def test_error_name_character_cap_precedes_content_checks(monkeypatch):
+    source = "a" * projection.MAX_GUIDANCE_CHARS
+    assert projection.project_error_name(source) == source
+
+    def unexpected(value):
+        pytest.fail("oversized names must refuse before content checks")
+
+    monkeypatch.setattr(projection, "contains_control_characters", unexpected)
+    with pytest.raises(projection.GuidanceProjectionError, match="^guidance_projection_limit$") as caught:
+        projection.project_error_name(source + "a")
+    assert caught.value.code == "guidance_projection_limit"
+
+
+def test_error_name_budget_is_per_call_on_concurrent_refusal_and_retry():
+    source = "ghp_" + "A" * (247 * 31 + 20)
+
+    def refusing_then_retry(_):
+        assert projection.project_error_name(source) == "guidance_projection_invalid_field"
+        assert projection.project_error_name("ghp_" + "A" * 1024) == "ghp_REDACTED"
+        return projection.project_error_name("retry")
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(refusing_then_retry, range(6), timeout=15)) == ["retry"] * 6

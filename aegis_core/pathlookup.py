@@ -26,6 +26,7 @@ so a caller can report such a host as unknown rather than absent.
 """
 from __future__ import annotations
 
+from contextvars import ContextVar
 import errno
 import ntpath
 import os
@@ -38,7 +39,7 @@ from aegis_core.primitives import key_within, real_key, sanitize_display
 from aegis_core.redaction import redact_insight_text
 
 __all__ = ["Hit", "INSIDE_FENCE", "RELATIVE_ENTRY", "descriptor_fence_supported", "GitCache",
-           "git_fence", "is_bare", "only_skipped", "which"]
+           "git_fence", "is_bare", "only_skipped", "ordinary_root", "which"]
 
 _MAX_FENCE_CHARS = 16384
 _MAX_COMPONENTS = 512
@@ -986,9 +987,13 @@ class _FenceCacheStore(dict):
 
 
 
+# Only invocation adapters set this, using a canonical root from completed binding.
+ordinary_root = ContextVar("aegis_gitsafe_ordinary_root", default=None)
+
+
 class GitCache(_FenceCacheStore):
     """Ordinary executable cache partitioned by each call's discovered workspace."""
 
     def for_cwd(self, cwd=None) -> _RootCache:
-        # Metadata fence: the descriptor walk's component opens exceed the hook budget.
-        return _RootCache(self, _fence(git_fence(cwd, descriptors=False)))
+        # Bound root when this invocation set one; else the metadata outermost marker.
+        return _RootCache(self, ordinary_root.get() or _fence(git_fence(cwd, descriptors=False)))

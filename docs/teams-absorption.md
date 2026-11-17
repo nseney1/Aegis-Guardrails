@@ -142,3 +142,73 @@ wrappers and remaining callers, with command-derived counts. TA-0 retires no
 wrapper or legacy source; its additions are packaging, guard tests and this
 contract. TA-1 and TA-4 follow this skeleton when their family leases clear;
 TA-2 and TA-5 precede their dependent GM items, and TA-8 follows all family ports.
+
+## TA-1b index and pager services
+
+`aegis_core.team_mailbox_index.Index` accepts the TA-1a `Mailbox`, whose store,
+role table, host table and clock remain the only sources of authority. The
+scanner and bounded change evidence live in `team_mailbox_index_scan`; the
+inbox selection and flush accounting live in `team_mailbox_pager`. No core
+module imports the local tools. These modules register no CLI or MCP entry
+point and change no host-plan discovery or existing adapter behavior. The
+legacy index adoption gate remains unchanged.
+
+The core index reads and hashes every live record through the store's held
+root before reusing a parsed header. It checks policy, routing, duplicate IDs
+and reply targets on every call. The legacy tool's pathname metadata reuse is
+not carried into this service: the store provides descriptor-confined bytes,
+and a matching pathname stat is insufficient authority to skip that read.
+Complete scans publish the parsed memo; record count and aggregate history
+bytes remain capped. Returned objects are independent copies. Shadow mode
+compares with the product mailbox; explicit indexed mode uses the same live
+validation. Unknown IDs and malformed history produce `MailboxRefusal` with
+code 1, reason and next action. Busy writers retain the TA-1a `BusyError` type;
+the index and pager do not create locks or match exception text.
+
+The pager accepts a sized history of at most 10,000 records, checks the entire
+history before selection, and bounds brief bytes before decoding. A preview
+validates and sorts once, then walks that ordered history without sorting per
+page. Live reads validate their newly supplied history each time. The O97
+measurement covers 100 pages of 10,000 keys, with timings and sort counts in
+the writer handoff. Cursor pairs and retained binding cutoffs have count caps;
+only a successfully staged and flushed response commits delivery state.
+Each pager belongs to one serialized transport connection; concurrent previews
+use isolated copies and confer no read or delivery authority.
+
+PRUNE-LEDGER TA-1b: replaced one legacy import line with four package/script
+compatible import lines (net +3), and retired 0 wrappers in this part.
+The 1,000-line index and 326-line pager remain in tools until their callers are
+ported and the family switch is qualified. The index scanner, evidence, query
+and comparison implementations and the pager selection/flush implementation
+can then be dropped from those copies. TA-1h owns the pinned mailbox relocation;
+this part changes no pinned bytes. Added-line counts and remaining callers are
+recorded from the candidate tree in the handoff.
+
+Preview accepts the same injected brief-status port as live paging. Checkpoint
+brief/pending lists retain the store's 256-entry cap, and decoded brief bytes
+share an allocation budget derived from 100 message briefs plus 256 checkpoint
+briefs. Missing ports and transport I/O failures refuse
+through the same typed boundary before staging delivery state.
+
+The pager keeps stored bytes, decoded structure and transport bytes separate.
+The TA-1a store/publisher enforce the stored-record and aggregate stored-history
+byte ceilings. Pager history validation bounds decoded message characters,
+nodes, containers and depth, allowing the body and record wrapper added after
+header parsing. It never ASCII-serializes history to enforce a storage budget.
+Endpoint selection precedes all expanded-row checks. Each selected response row
+has its own structural budget; metadata has a separate budget allowing expanded
+checkpoint briefs. A combined candidate page does not inherit one record's node
+ceiling. The supplied renderer and byte pager enforce the response ceiling,
+including mandatory metadata and the first message. Accepted Unicode bodies and
+maximum-size briefs remain readable, and their expansion cannot refuse another
+endpoint's read.
+
+The index coalesces coverage loss in a bounded pending record independent of
+the latest reconciliation diagnostic. An ordinary matching read cannot recover
+an earlier canonical scan's original bytes or clear that record. A successful
+`verify()` includes `verification_unavailable` with reason `baseline_unavailable`
+and scope `all_returned_records` before acknowledging evidence. It retires the
+gap only when its current indexed/canonical scans match; a verification that
+reconciles again reports the gap and keeps it pending. Failed verification
+preserves it for retry, including when bytes A were returned as canonical B and
+subsequently restored to A.

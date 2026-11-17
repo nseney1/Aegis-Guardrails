@@ -529,8 +529,9 @@ def _check_simulation_inventory(inventory: RuleInventory) -> None:
         raise _SimulationLimit
     total = 0
     for entry in inventory.entries:
-        total += len(entry.content)
-        if len(entry.content) > MAX_RULE_BYTES or total > 8 * 1024 * 1024:
+        size = max(entry.size, len(entry.content))
+        total += size
+        if size > MAX_RULE_BYTES or total > 8 * 1024 * 1024:
             raise _SimulationLimit
 
 
@@ -584,12 +585,12 @@ def simulate_rule_selection(workspace: Any, inventory: RuleInventory, ruleset: R
             return refusal("scan projection failed")
         if not captured._projection.changed_files:
             return refusal("no changed files")
-        selected = []
+        selected = {}
         for profile in PLATFORM_SLOT_PROFILES:
             result = captured.with_registry(scan_registry(profile, workspace))
             if result.get("status") == _STATUS_FAIL or not isinstance(result, GuidanceResult):
                 return refusal("scan projection failed")
-            selected.append(set(result.exposure_rule_ids()))
+            selected[profile] = set(result.exposure_rule_ids())
     except _SimulationLimit:
         return refusal("scan inputs over limit")
     except GuidanceProjectionError:
@@ -602,10 +603,11 @@ def simulate_rule_selection(workspace: Any, inventory: RuleInventory, ruleset: R
     for rule in candidates:
         if rule.id in cache.different_candidates:
             messages[rule.id] = "not evaluated: candidate differs from scan snapshot"
-        elif all(rule.id in identities for identities in selected):
+        elif all(rule.id in identities for identities in selected.values()):
             messages[rule.id] = "scan simulation: selected in all profiles"
         else:
-            messages[rule.id] = "scan simulation: not selected in one or more profiles"
+            omitted = sorted(profile for profile, identities in selected.items() if rule.id not in identities)
+            messages[rule.id] = "scan simulation: not selected in profiles: " + ", ".join(omitted)
     return messages
 
 
