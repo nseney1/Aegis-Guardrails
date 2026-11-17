@@ -16,7 +16,8 @@ import tempfile
 
 
 # dogfood doc successor (PIN-RB2B, owner-approved 2026-11-11)
-MANIFEST_SHA256 = "c85316f5e1aeb55d038611d9a275d8f94a656dd5fd72d4c25bfe955f314aa596"
+# lifecycle fixture peer timeout successor (PIN-FLAKE-LIFECYCLE, owner-approved 2026-11-17)
+MANIFEST_SHA256 = "300b3d8d1bf06cf3c3f6f8670d146e966b32a7660931f034734e2477eefa5708"
 # fd-ownership successor (MAILBOX-FD-1 round 2, owner-approved 2026-11-11T13:13Z); historical corpus pins retained.
 MAILBOX_SHA256 = "472c96ab7959f5fbcfdee2e3d3a11a78864b0eb7a708029a1e419f410825a905"
 # Small-change terminal writer successor; historical request/corpus pins are retained.
