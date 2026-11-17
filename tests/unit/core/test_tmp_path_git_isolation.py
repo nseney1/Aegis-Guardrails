@@ -673,5 +673,8 @@ def test_separator_refusal_canonicalizes_and_redacts_the_path(tmp_path, repo_roo
     output = result.stdout + result.stderr
     assert result.returncode == pytest.ExitCode.USAGE_ERROR, output
     assert "a" * 24 not in output
-    assert "ghp_REDACTED" in output
+    assert "[REDACTED_VCS_TOKEN]" in output
+    source_credential = credential.replace("\r", "")
+    assert all(source_credential[index:index + 4] not in output
+               for index in range(len(source_credential) - 3))
     assert "ceiling:" in output
