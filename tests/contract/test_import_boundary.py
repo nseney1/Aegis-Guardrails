@@ -105,6 +105,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.telemetry_engine": 1,
     "aegis_core.fitness": 1,
     "aegis_core.ast": 1,
+    "aegis_core.scan_simulation": 2,
     "aegis_core.skills": 1,
     "aegis_core.command_safety": 1,
     # Team leases and team.json: gitsafe, config, events and the matcher.
