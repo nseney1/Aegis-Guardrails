@@ -5384,6 +5384,18 @@ PROOF_REGISTRATION_GROUPS = {
         ((0,), 'Fixture setenv operation; environment, path or restoration API outside the module-attribute census.'),
     ('tests/unit/core/test_workspace_model.py', 'TestWorkspaceModel.test_workspace_resolve_walkup', 'fixture', 'monkeypatch.delenv', False):
         ((0, 1), 'Fixture delenv operation; environment, path or restoration API outside the module-attribute census.'),
+    ('tests/unit/core/test_workspace_target.py', 'target_home', 'fixture', 'monkeypatch.setenv', False):
+        ((0, 1, 2, 3), 'TARGET-OBSERVER-CORE: isolate temporary HOME, USERPROFILE, XDG_CONFIG_HOME and Git config.'),
+    ('tests/unit/core/test_workspace_target.py', 'target_home', 'fixture', 'monkeypatch.delenv', False):
+        ((0, 1), 'TARGET-OBSERVER-CORE: remove inherited repository and host selectors in the temporary-home fixture.'),
+    ('tests/unit/core/test_workspace_target.py', 'target_home', 'fixture', 'monkeypatch.chdir', False):
+        ((0,), 'TARGET-OBSERVER-CORE: enter the test-owned temporary home; pytest restores cwd.'),
+    ('tests/unit/core/test_workspace_target.py', 'test_ambient_namespace_cannot_select_the_observed_head', 'fixture', 'monkeypatch.setenv', False):
+        ((0,), 'TARGET-OBSERVER-CORE r2: set the test-owned ambient Git namespace to verify child selector clearing.'),
+    ('tests/unit/core/test_workspace_target.py', 'test_ambient_namespace_cannot_select_the_observed_head', 'fixture', 'monkeypatch.delenv', False):
+        ((0,), 'TARGET-OBSERVER-CORE r2: remove the test namespace for the successful retry control; pytest restores the environment.'),
+    ('tests/unit/core/test_workspace_target.py', 'test_bound_workspace_outside_git_reports_no_repository', 'fixture', 'monkeypatch.setenv', False):
+        ((0,), 'TARGET-OBSERVER-CORE: apply the same Git discovery ceiling to the precondition and observer.'),
     ('tests/unit/mcp/conftest.py', 'fresh_server', 'fixture', 'monkeypatch.delenv', False):
         ((0,), 'Fixture delenv operation; environment, path or restoration API outside the module-attribute census.'),
     ('tests/unit/mcp/test_binding_guards.py', 'cwd_with_a_governed_child', 'fixture', 'monkeypatch.chdir', False):
