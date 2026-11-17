@@ -67,6 +67,44 @@ def test_simulation_refuses_oversized_size_only_inventory_before_selection(tmp_p
             "oversized": "not evaluated: scan inputs over limit"}
 
 
+def test_simulation_names_only_omitted_builtin_profiles_on_retry_and_concurrently(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import json
+
+    from aegis_core.rule_inventory import inventory_rules
+    from aegis_core.rules import load_rules
+    from aegis_core.skills.slots import PLATFORM_SLOT_PROFILES, scan_registry
+
+    path = _rule(tmp_path, "sample")
+    path.write_text(
+        "---\nid: sample\ntype: trap\nhypothesis: Read safely\ntarget_paths: [src/**]\n---\n## Do\n"
+        + "Use ${SLOT.TOOL_READ}. " * 10, encoding="utf-8")
+    monkeypatch.setattr(scan_service.gitsafe, "changed_files", lambda *a, **k: ["src/a.py"])
+    inventory = inventory_rules(tmp_path)
+    ruleset = load_rules(tmp_path, inventory=inventory)
+    sweep = {}
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        for budget in range(100, 513):
+            (tmp_path / ".aegis/config.json").write_text(json.dumps({"jit": {"max_tokens": budget}}), encoding="utf-8")
+            scanned = {
+                profile: scan(tmp_path, ["src/a.py"], registry=scan_registry(profile, tmp_path))
+                for profile in PLATFORM_SLOT_PROFILES}
+            assert all(result.get("status") != "FAIL" for result in scanned.values()), (budget, scanned)
+            omitted = sorted(
+                profile for profile, result in scanned.items() if "sample" not in result.exposure_rule_ids())
+            sweep[budget] = omitted
+            message = ("scan simulation: not selected in profiles: " + ", ".join(omitted)
+                       if omitted else "scan simulation: selected in all profiles")
+            for _ in range(2):
+                assert scan_service.simulate_rule_selection(tmp_path, inventory, ruleset) == {"sample": message}, sweep
+            results = list(pool.map(
+                lambda _: scan_service.simulate_rule_selection(tmp_path, inventory, ruleset), range(6), timeout=15))
+            assert results == [{"sample": message}] * 6, sweep
+    assert any(len(omitted) == len(PLATFORM_SLOT_PROFILES) for omitted in sweep.values()), sweep
+    assert any(0 < len(omitted) < len(PLATFORM_SLOT_PROFILES) for omitted in sweep.values()), sweep
+    assert any(not omitted for omitted in sweep.values()), sweep
+
+
 def test_scan_returns_the_rules_whose_patterns_match(tmp_path: Path) -> None:
     _rule(tmp_path, "trap-src", targets=("src/**/*.py",))  # **/ is zero dirs: src/a.py matches
     _rule(tmp_path, "trap-docs", targets=("docs/*.md",))

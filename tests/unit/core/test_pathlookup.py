@@ -12,12 +12,17 @@ from __future__ import annotations
 
 import contextlib
 import os
+import shutil
 import stat
 import sys
 from pathlib import Path
 
 import pytest
 
+from aegis_cli import cli
+from aegis_core import pathlookup
+from aegis_core import gitsafe as bound_git
+from aegis_mcp import server
 from aegis_core.pathlookup import Hit, only_skipped, which
 
 EXE = ".exe" if os.name == "nt" else ""
@@ -1820,3 +1825,702 @@ def test_descriptor_alias_roots_refuse_and_close_then_retry(tmp_path, clean_chec
     assert roots
     assert len(os.listdir("/proc/self/fd")) == before
     assert pathlookup.git_fence(ws) == str(ws)
+
+
+@pytest.fixture
+def ordinary_home(tmp_path):
+    """Own the test's cwd and environment; restore both before tmp_path cleanup."""
+    home = tmp_path / "home"
+    home.mkdir()
+    previous_cwd, previous_env = os.getcwd(), dict(os.environ)
+    os.environ.update(HOME=str(home), USERPROFILE=str(home))
+    os.environ.pop("AEGIS_WORKSPACE", None)
+    os.environ.pop("AEGIS_CLIENT", None)
+    os.chdir(home)
+    try:
+        yield home
+    finally:
+        os.chdir(previous_cwd)
+        os.environ.clear()
+        os.environ.update(previous_env)
+
+
+def _carrier_fence(path):
+    from aegis_core import pathlookup
+    return pathlookup.real_key(os.fspath(path))
+
+
+@contextlib.contextmanager
+def _ordinary_root(path):
+    from aegis_core import pathlookup
+    token = pathlookup.ordinary_root.set(_carrier_fence(path))
+    try:
+        yield
+    finally:
+        pathlookup.ordinary_root.reset(token)
+
+
+def test_ordinary_root_fences_the_exact_directory_and_resets(tmp_path):
+    from aegis_core import pathlookup
+    enclosing = tmp_path / "enclosing"
+    (enclosing / ".git").mkdir(parents=True)
+    app = enclosing / "app"
+    (app / ".git").mkdir(parents=True)
+    nested = app / "nested"
+    nested.mkdir()
+    (app / "bin").mkdir()
+    (enclosing / "bin").mkdir()
+    sibling = tmp_path / "app-twin"
+    sibling.mkdir()
+    unbound = pathlookup.GitCache().for_cwd(nested).fence
+    assert unbound == pathlookup._fence(pathlookup.git_fence(nested, descriptors=False))
+    assert _carrier_fence(app) != unbound
+    walks = []
+    original = pathlookup.git_fence
+
+    def counted(*args, **kwargs):
+        walks.append(args)
+        return original(*args, **kwargs)
+
+    pathlookup.git_fence = counted
+    try:
+        with _ordinary_root(app):
+            assert walks == [], "installing the carrier must not rediscover or re-enter binding"
+            assert pathlookup.GitCache().for_cwd(nested).fence == _carrier_fence(app)
+            assert pathlookup.GitCache().for_cwd(enclosing).fence == _carrier_fence(app)
+            assert walks == [], "a set carrier must not walk the outermost marker"
+            assert pathlookup._inside(str(app / "bin"), _carrier_fence(app))
+            assert not pathlookup._inside(str(enclosing / "bin"), _carrier_fence(app))
+            assert not pathlookup._inside(str(sibling), _carrier_fence(app))
+    finally:
+        pathlookup.git_fence = original
+    assert pathlookup.ordinary_root.get() is None
+    assert pathlookup.GitCache().for_cwd(nested).fence == unbound
+
+
+def test_ordinary_root_exception_and_nested_scopes_restore_the_outer_fence(tmp_path):
+    from aegis_core import pathlookup
+    outer = tmp_path / "outer"
+    inner = tmp_path / "inner"
+    outer.mkdir()
+    inner.mkdir()
+    unbound = pathlookup.GitCache().for_cwd(outer).fence
+    try:
+        with _ordinary_root(outer):
+            try:
+                with _ordinary_root(inner):
+                    assert pathlookup.GitCache().for_cwd(outer).fence == _carrier_fence(inner)
+                    raise RuntimeError("fixture failure")
+            except RuntimeError:
+                assert pathlookup.GitCache().for_cwd(outer).fence == _carrier_fence(outer)
+            raise RuntimeError("outer failure")
+    except RuntimeError:
+        pass
+    assert pathlookup.ordinary_root.get() is None
+    assert pathlookup.GitCache().for_cwd(outer).fence == unbound
+
+
+def test_ordinary_root_keeps_the_captured_directory_if_a_link_is_retargeted(tmp_path):
+    from conftest import symlink_or_skip
+    from aegis_core import pathlookup
+    real = tmp_path / "real"
+    decoy = tmp_path / "decoy"
+    (real / "bin").mkdir(parents=True)
+    (decoy / "bin").mkdir(parents=True)
+    link = tmp_path / "link"
+    symlink_or_skip(real, link, target_is_directory=True)
+    with _ordinary_root(link):
+        link.unlink()
+        symlink_or_skip(decoy, link, target_is_directory=True)
+        fence = pathlookup.GitCache().for_cwd(decoy).fence
+        assert fence == _carrier_fence(real)
+        assert pathlookup._inside(str(real / "bin"), fence)
+        assert not pathlookup._inside(str(decoy / "bin"), fence)
+
+
+def test_ordinary_root_holds_when_the_descriptor_probe_is_false(tmp_path):
+    from aegis_core import pathlookup
+    enclosing = tmp_path / "enclosing"
+    (enclosing / ".git").mkdir(parents=True)
+    app = enclosing / "app"
+    app.mkdir()
+    probe = pathlookup.descriptor_fence_supported
+    pathlookup.descriptor_fence_supported = lambda: False
+    try:
+        outermost = pathlookup._fence(pathlookup.git_fence(app, descriptors=False))
+        assert outermost != _carrier_fence(app)
+        with _ordinary_root(app):
+            assert pathlookup.descriptor_fence_supported() is False
+            assert pathlookup.GitCache().for_cwd(app).fence == _carrier_fence(app)
+            assert pathlookup.GitCache().for_cwd(app).fence != outermost
+    finally:
+        pathlookup.descriptor_fence_supported = probe
+    assert pathlookup.ordinary_root.get() is None
+
+
+def test_ordinary_roots_stay_inside_their_threads(tmp_path):
+    from threading import Barrier, Thread
+    from aegis_core import pathlookup
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    left.mkdir()
+    right.mkdir()
+    barrier = Barrier(2)
+    found = []
+
+    def worker(root):
+        with _ordinary_root(root):
+            barrier.wait(5)
+            found.append(pathlookup.GitCache().for_cwd(root).fence)
+        found.append(("after", pathlookup.ordinary_root.get()))
+
+    parent = pathlookup.ordinary_root.set(_carrier_fence(tmp_path))
+    assert parent is not None
+    inherited = _carrier_fence(tmp_path)
+    try:
+        threads = [Thread(target=worker, args=(root,)) for root in (left, right)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+            assert not thread.is_alive()
+        assert pathlookup.GitCache().for_cwd(tmp_path).fence == inherited
+    finally:
+        pathlookup.ordinary_root.reset(parent)
+    assert sorted(item for item in found if not isinstance(item, tuple)) == sorted(
+        [_carrier_fence(left), _carrier_fence(right)])
+    # Reset drops that thread's fence. Context-copying threads restore the inherited
+    # value; a thread that started empty restores None. Neither keeps a worker fence.
+    after = [item for item in found if isinstance(item, tuple)]
+    assert len(after) == 2 and after[0] == after[1]
+    assert after[0] == ("after", after[0][1]) and after[0][1] in (None, inherited)
+    assert after[0][1] not in (_carrier_fence(left), _carrier_fence(right))
+    assert pathlookup.ordinary_root.get() is None
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="descriptor listing needs /proc/self/fd")
+def test_ordinary_root_opens_no_file_descriptor(tmp_path):
+    from aegis_core import pathlookup
+    before = os.listdir("/proc/self/fd")
+    with _ordinary_root(tmp_path):
+        assert pathlookup.GitCache().for_cwd(tmp_path).fence == _carrier_fence(tmp_path)
+    assert os.listdir("/proc/self/fd") == before
+
+
+def test_cli_arms_the_ordinary_root_only_after_a_finished_bind(tmp_path, monkeypatch, ordinary_home):
+    from types import SimpleNamespace
+    from aegis_cli.cli import main
+    from aegis_cli.registry import get_default_registry
+    home = ordinary_home
+    enclosing = tmp_path / "enclosing"
+    (enclosing / ".git").mkdir(parents=True)
+    app = enclosing / "app"
+    (app / ".aegis").mkdir(parents=True)
+    (app / ".git").mkdir()
+    during = []
+    state = {"command": False}
+    original_cache = bound_git._GIT_FOUND
+
+    def for_cwd(cwd=None):
+        if not state["command"]:
+            during.append(pathlookup.ordinary_root.get())
+        return original_cache.for_cwd(cwd)
+
+    monkeypatch.setattr(bound_git, "_GIT_FOUND", SimpleNamespace(for_cwd=for_cwd, clear=original_cache.clear))
+    commands = {}
+
+    def install(name, fn):
+        command = get_default_registry().get(name)
+        commands.setdefault(name, command.execute)
+
+        def execute(args):
+            state["command"] = True
+            try:
+                return fn(args)
+            finally:
+                state["command"] = False
+
+        command.execute = execute
+
+    try:
+        def bound_execute(args):
+            during.append(("execute", pathlookup.ordinary_root.get()))
+            during.append(("fence", pathlookup.GitCache().for_cwd(app).fence))
+            return 0
+
+        def boom(args):
+            during.append(("boom", pathlookup.ordinary_root.get()))
+            raise RuntimeError("status fixture")
+
+        install("status", bound_execute)
+        assert main(["status", "--workspace", str(app), "--plain"]) == 0
+        install("status", boom)
+        assert main(["status", "--workspace", str(app), "--plain"]) == 1
+        assert pathlookup.ordinary_root.get() is None
+
+        def unbound_execute(args):
+            during.append(("doctor", pathlookup.ordinary_root.get()))
+            return 0
+
+        install("doctor", unbound_execute)
+        assert main(["doctor", "--workspace", str(home)]) == 0
+
+        def migrate_execute(args):
+            during.append(("migrate", pathlookup.ordinary_root.get()))
+            return 0
+
+        install("migrate", migrate_execute)
+        assert main(["migrate", "--workspace", str(app)]) == 0
+
+        def workspace_execute(args):
+            during.append(("workspace", pathlookup.ordinary_root.get()))
+            return 0
+
+        install("workspace", workspace_execute)
+        assert main(["workspace", "status"]) == 0
+    finally:
+        for name, execute in commands.items():
+            get_default_registry().get(name).execute = execute
+    executes = [item for item in during if isinstance(item, tuple)]
+    assert executes[0][0] == "execute"
+    assert executes[0][1] == _carrier_fence(app)
+    assert executes[1] == ("fence", _carrier_fence(app))
+    assert _carrier_fence(app) != pathlookup._fence(pathlookup.git_fence(app, descriptors=False))
+    assert all(value is None for value in during if not isinstance(value, tuple))
+    assert ("boom", _carrier_fence(app)) in executes
+    assert ("doctor", None) in executes
+    assert ("migrate", _carrier_fence(app)) in executes
+    assert ("workspace", None) in executes
+    assert pathlookup.ordinary_root.get() is None
+
+
+def test_mcp_arms_the_ordinary_root_after_resolve_binding(tmp_path, monkeypatch, ordinary_home):
+    home = ordinary_home
+    enclosing = tmp_path / "enclosing"
+    (enclosing / ".git").mkdir(parents=True)
+    apps = []
+    for name in ("one", "two"):
+        app = enclosing / name
+        (app / ".aegis").mkdir(parents=True)
+        (app / ".git").mkdir()
+        (app / "src").mkdir()
+        apps.append(app.resolve())
+    saved = {key: getattr(server, key) for key in server.fresh_state()}
+    seen = []
+    real_resolve = server.resolve_binding
+
+    def resolve_binding(**kwargs):
+        seen.append(("resolve", pathlookup.ordinary_root.get()))
+        return real_resolve(**kwargs)
+
+    def execute_tool(name, args, **kwargs):
+        root = args["workspace"].root if "workspace" in args else None
+        fence = None if root is None else pathlookup.GitCache().for_cwd(root).fence
+        seen.append(("tool", name, pathlookup.ordinary_root.get(), fence))
+        if name == "aegis_report_outcome":
+            raise RuntimeError("tool fixture")
+        return {"status": "ok"}
+
+    monkeypatch.setattr(server, "resolve_binding", resolve_binding)
+    monkeypatch.setattr(server, "execute_tool", execute_tool)
+    try:
+        server._start()
+        initialized = server.handle_request({
+            "jsonrpc": "2.0", "id": 0, "method": "initialize",
+            "params": {"clientInfo": {"name": "codex-mcp-client", "version": "1"}, "capabilities": {}},
+        })
+        assert initialized["result"]["protocolVersion"]
+        for number, app in enumerate(apps, start=1):
+            response = server.handle_request({
+                "jsonrpc": "2.0", "id": number, "method": "tools/call",
+                "params": {"name": "aegis_list_rules", "arguments": {},
+                           "_meta": {"x-codex-turn-metadata": {"workspaces": {str(app): {"has_changes": False}}}}},
+            })
+            assert response["result"]["isError"] is False
+            assert pathlookup.ordinary_root.get() is None
+        failed = server.handle_request({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "aegis_report_outcome", "arguments": {},
+                       "_meta": {"x-codex-turn-metadata": {"workspaces": {str(apps[0]): {"has_changes": False}}}}},
+        })
+        assert failed["result"]["isError"] is True
+        assert pathlookup.ordinary_root.get() is None
+        server._server_cwd = str(home)
+        unbound = server.handle_request({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"name": "aegis_scan", "arguments": {}},
+        })
+        assert "result" in unbound
+    finally:
+        for key, value in saved.items():
+            setattr(server, key, value)
+    resolves = [item for item in seen if item[0] == "resolve"]
+    tools = [item for item in seen if item[0] == "tool"]
+    assert resolves and all(item[1] is None for item in resolves)
+    bound_tools = [item for item in tools if item[1] == "aegis_list_rules"]
+    assert [item[3] for item in bound_tools] == [_carrier_fence(app) for app in apps]
+    assert all(item[2] == item[3] for item in bound_tools)
+    assert ("tool", "aegis_report_outcome", _carrier_fence(apps[0]), _carrier_fence(apps[0])) in tools
+    scan = [item for item in tools if item[1] == "aegis_scan"]
+    assert scan and all(item[2] is None for item in scan)
+    assert pathlookup.ordinary_root.get() is None
+
+
+def test_queue_claim_arms_the_ordinary_root_after_bind_and_resets_on_failure(tmp_path, monkeypatch, ordinary_home):
+    from aegis_core.workspace.binding import WorkspaceBinding
+    app = (tmp_path / "app").resolve()
+    app.mkdir()
+    saved = {key: getattr(server, key) for key in server.fresh_state()}
+    seen = []
+
+    def bind(params, args):
+        seen.append(("bind", pathlookup.ordinary_root.get()))
+        return WorkspaceBinding("bound", root=app, source="walk_up", confidence="inferred")
+
+    def execute(name, args, **kwargs):
+        seen.append(("tool", pathlookup.GitCache().for_cwd(app).fence))
+        if len([item for item in seen if item[0] == "tool"]) > 1:
+            raise RuntimeError("claim fixture")
+        return {"ok": True}
+
+    monkeypatch.setattr("aegis_mcp.queue_role.claim_argument_refusal", lambda arguments: None)
+    server._queue_grant = type("Grant", (), {"workspace": str(app), "session": "s"})()
+    server._queue_error = None
+    server._session_id = "s"
+    monkeypatch.setattr(server, "_bind", bind)
+    monkeypatch.setattr(server, "execute_tool", execute)
+    try:
+        first = server._queue_claim_call(1, {"arguments": {}})
+        assert first["result"]["isError"] is False
+        assert pathlookup.ordinary_root.get() is None
+        second = server._queue_claim_call(2, {"arguments": {}})
+        assert second["result"]["isError"] is True
+        assert pathlookup.ordinary_root.get() is None
+    finally:
+        for key, value in saved.items():
+            setattr(server, key, value)
+    assert seen[0] == ("bind", None)
+    assert seen[1] == ("tool", _carrier_fence(app))
+    assert seen[2] == ("bind", None)
+    assert seen[3] == ("tool", _carrier_fence(app))
+    assert pathlookup.ordinary_root.get() is None
+
+
+def test_nested_cli_invocation_discovers_unbound_and_restores_caller(tmp_path, monkeypatch, ordinary_home):
+    from aegis_cli.registry import get_default_registry
+
+    home = ordinary_home
+    app = tmp_path / "app"
+    (app / ".aegis").mkdir(parents=True)
+    seen = []
+    attach = cli._attach_workspace
+
+    def attach_workspace(args):
+        seen.append(("bind", args.command, pathlookup.ordinary_root.get()))
+        return attach(args)
+
+    def doctor(args):
+        seen.append(("execute", args.command, pathlookup.ordinary_root.get()))
+        return 0
+
+    def status(args):
+        seen.append(("execute", args.command, pathlookup.ordinary_root.get()))
+        assert cli.main(["doctor", "--workspace", str(home)]) == 0
+        seen.append(("restored", pathlookup.ordinary_root.get()))
+        return 0
+
+    monkeypatch.setattr(cli, "_attach_workspace", attach_workspace)
+    status_command = get_default_registry().get("status")
+    doctor_command = get_default_registry().get("doctor")
+    status_execute, doctor_execute = status_command.execute, doctor_command.execute
+    status_command.execute, doctor_command.execute = status, doctor
+    try:
+        assert cli.main(["status", "--workspace", str(app), "--plain"]) == 0
+    finally:
+        status_command.execute, doctor_command.execute = status_execute, doctor_execute
+    assert seen == [("bind", "status", None), ("execute", "status", _carrier_fence(app)),
+                    ("bind", "doctor", None), ("execute", "doctor", None),
+                    ("restored", _carrier_fence(app))]
+    assert pathlookup.ordinary_root.get() is None
+
+
+def test_nested_mcp_invocation_discovers_unbound_and_restores_caller(tmp_path, monkeypatch, ordinary_home):
+
+    home = ordinary_home
+    app = tmp_path / "app"
+    (app / ".aegis").mkdir(parents=True)
+    saved = {key: getattr(server, key) for key in server.fresh_state()}
+    seen = []
+    resolve = server.resolve_binding
+
+    def resolve_binding(**kwargs):
+        seen.append(("bind", pathlookup.ordinary_root.get()))
+        return resolve(**kwargs)
+
+    def execute(name, args):
+        seen.append((name, pathlookup.ordinary_root.get()))
+        if name == "aegis_list_rules":
+            nested = server.handle_request({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "aegis_scan", "arguments": {}}})
+            assert nested["result"]["isError"] is False
+            seen.append(("restored", pathlookup.ordinary_root.get()))
+        return {"status": "ok"}
+
+    monkeypatch.setattr(server, "resolve_binding", resolve_binding)
+    monkeypatch.setattr(server, "execute_tool", execute)
+    try:
+        server._start()
+        server._server_cwd = str(home)
+        initialized = server.handle_request({"jsonrpc": "2.0", "id": 0, "method": "initialize",
+            "params": {"clientInfo": {"name": "codex-mcp-client", "version": "1"}, "capabilities": {}}})
+        assert "result" in initialized
+        result = server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "aegis_list_rules", "arguments": {},
+                "_meta": {"x-codex-turn-metadata": {"workspaces": {str(app): {}}}}}})
+        assert result["result"]["isError"] is False
+    finally:
+        for key, value in saved.items():
+            setattr(server, key, value)
+    assert seen == [("bind", None), ("aegis_list_rules", _carrier_fence(app)),
+                    ("bind", None), ("aegis_scan", None), ("restored", _carrier_fence(app))]
+    assert pathlookup.ordinary_root.get() is None
+
+
+@pytest.fixture
+def ordinary_unbound_repo(tmp_path, ordinary_home):
+    """An uninitialized child under a marked checkout with an executable Git trap."""
+    real_git = shutil.which("git")
+    if real_git is None:
+        pytest.skip("needs git")
+    repo = tmp_path / "unbound-repo"
+    (repo / ".git").mkdir(parents=True)
+    sub = repo / "sub"
+    sub.mkdir()
+    binary = repo / "bin"
+    binary.mkdir()
+    marker = tmp_path / "unbound-git-executed"
+    if os.name == "nt":
+        (binary / "git.cmd").write_text(
+            f'@echo ran>> "{marker}"\n@"{real_git}" %*\n', encoding="utf-8")
+    else:
+        import shlex
+
+        trap = binary / "git"
+        trap.write_text('#!/bin/sh\nprintf ran >> ' + shlex.quote(str(marker)) +
+                        '\nexec ' + shlex.quote(real_git) + ' "$@"\n', encoding="utf-8")
+        trap.chmod(0o755)
+    os.environ["PATH"] = os.pathsep.join((str(binary), os.path.dirname(real_git), os.defpath))
+    bound_git._reset_for_tests()
+    try:
+        yield repo, sub, marker
+    finally:
+        bound_git._reset_for_tests()
+
+
+@contextlib.contextmanager
+def _ordinary_cwd(directory):
+    previous = os.getcwd()
+    os.chdir(directory)
+    try:
+        yield
+    finally:
+        os.chdir(previous)
+
+
+@pytest.mark.parametrize("explicit", [False, True], ids=["cwd", "workspace"])
+@pytest.mark.parametrize("command", ["status", "doctor", "migrate"])
+def test_unresolved_cli_commands_keep_outermost_git_fence(ordinary_unbound_repo, monkeypatch, command, explicit):
+    repo, sub, marker = ordinary_unbound_repo
+    selected = []
+    original = cli._ordinary_bound_root
+
+    def ordinary_bound_root(args):
+        root = original(args)
+        selected.append(root)
+        return root
+
+    monkeypatch.setattr(cli, "_ordinary_bound_root", ordinary_bound_root)
+    argv = [command, "--plain"]
+    if command == "doctor":
+        argv += ["--github"]
+    if explicit:
+        argv += ["--workspace", str(sub)]
+    with _ordinary_cwd(sub):
+        result = cli.main(argv)
+    assert not marker.exists(), "an unresolved public CLI command executed checkout Git"
+    assert selected == [None], "a fallback directory is not a completed binding"
+    assert result == 0
+    assert pathlookup.ordinary_root.get() is None
+    assert pathlookup.GitCache().for_cwd(sub).fence != _carrier_fence(sub)
+
+
+def test_unresolved_init_has_no_ordinary_root(ordinary_unbound_repo):
+    from aegis_cli.registry import get_default_registry
+
+    repo, sub, marker = ordinary_unbound_repo
+    command = get_default_registry().get("init")
+    original = command.execute
+    seen = []
+
+    def execute(args):
+        seen.append(pathlookup.ordinary_root.get())
+        assert bound_git.run(["--version"], sub).returncode == 0
+        return 0
+
+    command.execute = execute
+    try:
+        assert cli.main(["init", "--workspace", str(sub), "--plain"]) == 0
+    finally:
+        command.execute = original
+    assert not marker.exists(), "initialization trusted a directory before binding"
+    assert seen == [None]
+    assert pathlookup.ordinary_root.get() is None
+
+
+@pytest.mark.parametrize("attested", [False, True], ids=["cwd", "host-root"])
+@pytest.mark.parametrize("tool", ["aegis_list_rules", "aegis_scan", "aegis_report_outcome"])
+def test_unresolved_mcp_requests_keep_outermost_git_fence(ordinary_unbound_repo, monkeypatch, tool, attested):
+    import json
+
+    repo, sub, marker = ordinary_unbound_repo
+    saved = {key: getattr(server, key) for key in server.fresh_state()}
+    original = server._arm_ordinary_root
+    selected = []
+
+    def arm(binding):
+        token = original(binding)
+        selected.append((binding.status, pathlookup.ordinary_root.get()))
+        return token
+
+    monkeypatch.setattr(server, "_arm_ordinary_root", arm)
+    try:
+        server._start()
+        server._server_cwd = str(sub)
+        server.handle_request({"jsonrpc": "2.0", "id": 0, "method": "initialize",
+            "params": {"clientInfo": {"name": "codex-mcp-client", "version": "1"}, "capabilities": {}}})
+        params = {"name": tool, "arguments": {"workspace": str(sub)}}
+        if attested:
+            params["_meta"] = {"x-codex-turn-metadata": {"workspaces": {str(sub): {}}}}
+        response = server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params})
+        payload = json.loads(response["result"]["content"][0]["text"])
+        assert response["result"]["isError"] is (tool != "aegis_scan")
+        assert payload["status"] == "not_governed"
+    finally:
+        for key, value in saved.items():
+            setattr(server, key, value)
+    assert selected == [("unbound", None)]
+    assert not marker.exists()
+    assert pathlookup.ordinary_root.get() is None
+    assert pathlookup.GitCache().for_cwd(sub).fence != _carrier_fence(sub)
+
+
+@pytest.mark.parametrize("pinned", [False, True], ids=["discovered", "pin"])
+@pytest.mark.parametrize("legacy", [False, True], ids=["workspace", "migration"])
+def test_cli_binding_provenance_resets_on_failure_and_retries(ordinary_unbound_repo, pinned, legacy):
+    from aegis_cli.registry import get_default_registry
+    from tests.contract.test_legacy_ratchet import REQUIRED_WORDS
+
+    repo, sub, marker = ordinary_unbound_repo
+    workspace_marker = sub / ("." + REQUIRED_WORDS[0] if legacy else ".aegis")
+    workspace_marker.mkdir()
+    deep = sub / "deep"
+    deep.mkdir()
+    name = "migrate" if legacy else "status"
+    command = get_default_registry().get(name)
+    original = command.execute
+    seen = []
+
+    def execute(args):
+        seen.append(pathlookup.ordinary_root.get())
+        assert bound_git.run(["--version"], deep).returncode == 0
+        return 0
+
+    if pinned:
+        os.environ["AEGIS_WORKSPACE"] = str(sub)
+    command.execute = execute
+    try:
+        argv = [name, "--workspace", str(deep), "--plain"]
+        with _ordinary_cwd(deep):
+            assert cli.main(argv) == 0
+            assert seen == [_carrier_fence(sub)]
+            assert marker.exists(), "a completed binding should permit Git in its enclosing checkout"
+            marker.unlink()
+            workspace_marker.rmdir()
+            assert cli.main(argv) == (1 if pinned else 0)
+            assert not marker.exists(), "failed discovery reused a previous invocation's bound root"
+            assert seen == ([_carrier_fence(sub)] if pinned else [_carrier_fence(sub), None])
+            assert pathlookup.ordinary_root.get() is None
+            workspace_marker.mkdir()
+            assert cli.main(argv) == 0
+            assert seen[-1] == _carrier_fence(sub) and marker.exists()
+    finally:
+        command.execute = original
+    assert pathlookup.ordinary_root.get() is None
+
+
+def test_cli_discovery_result_survives_marker_removal_before_execution(ordinary_unbound_repo, monkeypatch):
+    from aegis_cli.registry import get_default_registry
+
+    repo, sub, marker = ordinary_unbound_repo
+    workspace_marker = sub / ".aegis"
+    workspace_marker.mkdir()
+    accept = cli._refuse_legacy
+
+    def remove_after_accept(candidate):
+        accepted = accept(candidate)
+        if accepted:
+            workspace_marker.rmdir()
+        return accepted
+
+    monkeypatch.setattr(cli, "_refuse_legacy", remove_after_accept)
+    command = get_default_registry().get("status")
+    original = command.execute
+    seen = []
+
+    def execute(args):
+        seen.append(pathlookup.ordinary_root.get())
+        assert bound_git.run(["--version"], sub).returncode == 0
+        return 0
+
+    command.execute = execute
+    try:
+        assert cli.main(["status", "--workspace", str(sub), "--plain"]) == 0
+    finally:
+        command.execute = original
+    assert seen == [_carrier_fence(sub)] and marker.exists()
+    assert not workspace_marker.exists()
+    assert pathlookup.ordinary_root.get() is None
+
+
+def test_concurrent_cli_resolutions_do_not_share_discovery_provenance(ordinary_unbound_repo):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from aegis_cli.registry import get_default_registry
+
+    repo, sub, marker = ordinary_unbound_repo
+    bound = repo / "bound"
+    (bound / ".aegis").mkdir(parents=True)
+    command = get_default_registry().get("status")
+    original = command.execute
+    barrier = Barrier(2)
+    seen = {}
+
+    def execute(args):
+        barrier.wait(5)
+        seen[args.workspace] = (pathlookup.ordinary_root.get(), bound_git.git_executable(cwd=args.workspace))
+        return 0
+
+    command.execute = execute
+    try:
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            calls = [workers.submit(cli.main, ["status", "--workspace", str(root), "--plain"])
+                     for root in (bound, sub)]
+            assert [call.result(timeout=10) for call in calls] == [0, 0]
+    finally:
+        command.execute = original
+    assert seen[str(bound.resolve())][0] == _carrier_fence(bound)
+    assert seen[str(sub.resolve())][0] is None
+    assert Path(seen[str(bound.resolve())][1]).parent == repo / "bin"
+    assert Path(seen[str(sub.resolve())][1]).parent != repo / "bin"
+    assert not marker.exists(), "executable lookup must not itself launch a program"
+    assert pathlookup.ordinary_root.get() is None
