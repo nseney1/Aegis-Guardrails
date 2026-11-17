@@ -16,9 +16,12 @@ from aegis_core.workspace.git_objects import object_id
 
 __all__ = ["GitRefusal", "OID_PATTERN", "baseline_requests", "binary_text", "blob_pack", "check_filter_bytes", "check_filter_sources", "clean_bytes",
            "clean_eol", "conversion_settings", "decode_worktree", "eol_rule", "filter_drivers", "index_clean", "index_matches",
-           "index_records", "is_attribute_path", "preserved_paths", "snapshot_attributes", "snapshot_entries", "snapshot_rules"]
+           "index_records", "is_attribute_path", "preserved_paths", "snapshot_attributes", "snapshot_entries", "snapshot_rules",
+           "attribute_version", "attribute_entries", "attribute_fallbacks", "deleted_attribute_rules"]
 
 OID_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+MAX_ATTRIBUTE_LINE_BYTES = 2048
+MAX_ATTRIBUTE_FILE_BYTES = 100 * 1024 * 1024
 _CONTROL_BYTES = bytes((*range(8), 11, *range(14, 27), *range(28, 32), 127))
 
 _INDEX_STAT = re.compile(rb"  ctime: ([0-9]{1,20}):([0-9]{1,10})\n  mtime: ([0-9]{1,20}):([0-9]{1,10})\n"
@@ -132,10 +135,109 @@ def eol_rule(values, settings, *, native_crlf):
 
 
 def snapshot_attributes(out, paths):
-    """Check captured check-attr framing before observing conversion config."""
+    """Check the source-query framing before parsing conversion attributes."""
     if out.count(b"\0") != 3 * len(paths) * 6 or (out and not out.endswith(b"\0")):
         raise GitRefusal("conversion_unavailable")
     return out.split(b"\0")
+
+
+def attribute_version(raw):
+    """Bound the version observation before parsing the --source capability."""
+    if type(raw) is not bytes or len(raw) > 256:
+        raise GitRefusal("conversion_unavailable")
+    found = re.fullmatch(rb"git version ([0-9]{1,5})\.([0-9]{1,5})(?:\.[0-9]{1,5})?[^\r\n]*\n?", raw)
+    if found is None or tuple(int(value) for value in found.groups()) < (2, 40):
+        raise GitRefusal("conversion_unavailable")
+
+
+def _attribute_body(data):
+    """Refuse ambiguous attribute bytes before hashing or retaining an OID."""
+    if (len(data) >= MAX_ATTRIBUTE_FILE_BYTES or data.startswith(b"\xef\xbb\xbf") or b"\0" in data):
+        raise GitRefusal("conversion_unavailable")
+    start = 0
+    while start < len(data):
+        end = data.find(b"\n", start, start + MAX_ATTRIBUTE_LINE_BYTES + 1)
+        if end < 0:
+            end = len(data)
+        if end - start >= MAX_ATTRIBUTE_LINE_BYTES:
+            raise GitRefusal("conversion_unavailable")
+        start = end + 1
+
+
+def _attribute_row(cached, data):
+    """Call-local row for one immutable bytes object, or None when it must be redone."""
+    if type(data) is not bytes:
+        return None
+    row = cached.get(id(data))
+    if row is not None and row[0] is data:
+        return row
+    return None
+
+
+def attribute_entries(sources, oid_length):
+    """Raw captured bytes, without applying their own text/encoding rules."""
+    # Git v2.43.0 attr.c:335-338,674-760: file input strips a leading BOM
+    # and CRLF; blob input stops at NUL, retains CR, and lacks the file cap.
+    # Refuse all ambiguous forms; never normalize the captured source bytes.
+    # One call scans and hashes each retained bytes object once, then emits
+    # every path. Another object with equal contents is processed again.
+    cached = {}
+    for data in sources.values():
+        if _attribute_row(cached, data) is None:
+            _attribute_body(data)
+            if type(data) is bytes:
+                cached[id(data)] = [data, None]
+    entries = []
+    for path, data in sorted(sources.items()):
+        row = _attribute_row(cached, data)
+        if row is None or row[1] is None:
+            oid = object_id(data, oid_length)
+            if row is not None:
+                row[1] = oid
+        else:
+            oid = row[1]
+        entries.append((path, "100644", oid, data))
+    return entries
+
+
+def attribute_fallbacks(captured, baseline):
+    """Select bindable stage-0 sources; keep paths distinct for budget charges."""
+    wanted = {}
+    for path, (mode, oid, cache) in baseline.items():
+        if path.rpartition(b"/")[2] != b".gitattributes" or path in captured or not oid:
+            continue
+        if mode not in ("100644", "100755") or cache is None or cache[9] & 0x3000:
+            raise GitRefusal("conversion_unavailable")
+        wanted[path] = oid
+    return wanted
+
+
+def deleted_attribute_rules(paths, baseline, fallbacks, indexed, captured):
+    """Refuse ambiguous index-deletion order rather than restore stale rules."""
+    result = dict(captured)
+    for path in paths:
+        if path in fallbacks:
+            continue
+        applicable = []
+        directory = path.rpartition(b"/")[0]
+        while True:
+            source = (directory + b"/" if directory else b"") + b".gitattributes"
+            if source in fallbacks:
+                applicable.append(source)
+            if not directory:
+                break
+            directory = directory.rpartition(b"/")[0]
+        if not applicable:
+            continue
+        # Git processes tracked entries in index order before untracked adds.
+        # A tracked path preceding every applicable deletion sees the old rules.
+        if path in baseline and all(path < source for source in applicable):
+            result[path] = indexed[path]
+        elif len(applicable) != 1 or indexed[path] != captured[path]:
+            # Equal endpoints with multiple deletions cannot prove intermediate
+            # contexts equal. Keep the fallback conservative in that case too.
+            raise GitRefusal("conversion_unavailable")
+    return result
 
 
 def filter_drivers(raw, status):

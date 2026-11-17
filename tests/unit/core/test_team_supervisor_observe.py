@@ -11,6 +11,9 @@ import pytest
 
 from aegis_core import gitsafe, storage_confined, team, team_hosts, team_profile, team_queue
 from aegis_core import team_supervisor_observe as module
+from aegis_core import team_writer_binding
+from tests.conftest import symlink_or_skip
+from tests.helpers_writer_binding import lease as _lane_lease, make_home as _binding_home
 
 
 def make_store(tmp_path):
@@ -19,13 +22,6 @@ def make_store(tmp_path):
     root = tmp_path.resolve() / "workspace"
     (root / ".aegis").mkdir(parents=True)
     return root
-
-
-def symlink_or_skip(link, target, directory=False):
-    try:
-        link.symlink_to(target, target_is_directory=directory)
-    except (OSError, NotImplementedError):
-        pytest.skip("symlinks unavailable")
 
 
 def profile(source="subscription-window", pair=False):
@@ -111,7 +107,7 @@ def test_root_swapped_during_service_does_not_publish_redirected_facts(
     def swapped(path):
         root.rename(parked)
         if symlink:
-            symlink_or_skip(root, other, directory=True)
+            symlink_or_skip(other, root, target_is_directory=True)
         else:
             root.mkdir()
         return team.LeaseSet((lease(),))
@@ -125,7 +121,7 @@ def test_root_swapped_during_service_does_not_publish_redirected_facts(
 def test_linked_workspace_never_reaches_repository_services(tmp_path, monkeypatch, services):
     root = make_store(tmp_path)
     link = root.with_name("link")
-    symlink_or_skip(link, root, directory=True)
+    symlink_or_skip(root, link, target_is_directory=True)
     def unexpected(root):
         pytest.fail("linked workspace reached lease reads")
     monkeypatch.setattr(team, "read_leases", unexpected)
@@ -414,7 +410,7 @@ def test_real_lease_records_never_prove_liveness(tmp_path, case):
     if case == "symlink":
         outside = tmp_path / "ref-target"
         outside.write_bytes(result.stdout)
-        symlink_or_skip(ref, outside)
+        symlink_or_skip(outside, ref)
     else:
         ref.write_bytes(result.stdout)
     for _ in range(2):
@@ -494,3 +490,260 @@ def test_bad_bounded_preflight_never_reaches_services(tmp_path, monkeypatch, ser
         assert_git_unknown(result, "leases_unavailable")
         assert "secret" not in repr(result)
     assert calls == ["count", "count"]
+
+
+def _run_bound(root, home, now=100):
+    return module.observe(profile(), workspace_root=root, now=now, usage_adapter=adapter(),
+                          user_root=str(home))
+
+
+def _with_lane(lease, lane):
+    return team.Lease(
+        lane=lane, role=lease.role, owner=lease.owner, claim_id=lease.claim_id, gen=lease.gen,
+        branch=lease.branch, paths=lease.paths, ts=lease.ts, ttl_s=lease.ttl_s, oid=lease.oid,
+        parsed=lease.path_set,
+    )
+
+
+def _write_bindings(home, records):
+    payload = {"version": 1, "bindings": records}
+    data = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    path = home / ".config" / "aegis" / team_writer_binding.NAME
+    path.write_bytes(data)
+    os.chmod(path, 0o600)
+    return path
+
+
+def _identity_record(pid, ticks, scope, claim=None, gen=1):
+    return {"boot_id": scope["boot_id"], "claim_id": "a" * 16 if claim is None else claim,
+            "gen": gen, "pid": pid, "pid_namespace": scope["pid_namespace"], "start_ticks": ticks}
+
+
+def test_omitted_user_root_does_not_read_bindings(tmp_path, monkeypatch, services):
+    root = make_store(tmp_path)
+
+    def refused(*args, **kwargs):
+        pytest.fail("binding reader called")
+
+    monkeypatch.setattr(team_writer_binding, "judge", refused)
+    monkeypatch.setattr(team_writer_binding, "load", refused)
+    row = observations(run(root))["writer_dead"]
+    assert row == {"state": "unknown", "reason": "no_bound_liveness_source",
+                   "leases": {"state": "known", "live": 0, "expired": 0, "unreadable": 0}}
+    assert "lanes" not in row
+
+
+def test_user_root_without_a_file_keeps_lease_counts(tmp_path, monkeypatch, services):
+    root = make_store(tmp_path)
+    home = _binding_home(tmp_path)
+    monkeypatch.setattr(team, "read_leases", lambda root: team.LeaseSet((_lane_lease(),)))
+    plain = observations(run(root))["writer_dead"]
+    bound = observations(_run_bound(root, home))["writer_dead"]
+    assert bound["leases"] == plain["leases"]
+    assert bound["state"] == "unknown"
+    assert bound["reason"] == "no_bound_liveness_source"
+    assert bound["lanes"] == [{"lane": "writer", "state": "unknown", "reason": "no_bound_liveness_source"}]
+
+
+def test_preflight_failure_skips_the_binding_file(tmp_path, monkeypatch, services):
+    root = make_store(tmp_path)
+    home = _binding_home(tmp_path)
+    monkeypatch.setattr(gitsafe, "run_checked", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("TOKEN=secret")))
+    monkeypatch.setattr(team_writer_binding, "judge", lambda *args, **kwargs: pytest.fail("judge called"))
+    monkeypatch.setattr(team_writer_binding, "load", lambda *args, **kwargs: pytest.fail("load called"))
+    result = _run_bound(root, home)
+    row = observations(result)["writer_dead"]
+    assert row["leases"]["reason"] == "leases_unavailable"
+    assert "lanes" not in row
+    assert "TOKEN" not in repr(result)
+
+
+def test_unsupported_descriptor_skips_bindings_when_home_is_set(tmp_path, monkeypatch, services):
+    monkeypatch.setattr(module, "descriptor_supported", lambda: False)
+    monkeypatch.setattr(team_writer_binding, "judge", lambda *args, **kwargs: pytest.fail("judge called"))
+    result = module.observe(profile(), workspace_root=tmp_path, now=100, usage_adapter=adapter(),
+                            user_root=str(tmp_path / "zzmarker-home"))
+    row = observations(result)["writer_dead"]
+    assert row["leases"] == {"state": "unknown", "reason": "unsupported_platform"}
+    assert "lanes" not in row
+
+
+def test_absent_writer_is_dead_and_ticks_and_match_follow_the_table(tmp_path, monkeypatch, services):
+    root = make_store(tmp_path)
+    home = _binding_home(tmp_path)
+    scope = team_writer_binding._scope()
+    identity = team_writer_binding.process_identity(os.getpid())
+    gone = 2147483647
+    if os.path.exists("/proc/%s" % gone):
+        pytest.skip("sentinel pid is live")
+    monkeypatch.setattr(team, "read_leases", lambda root: team.LeaseSet((_lane_lease(),)))
+    _write_bindings(home, {"writer": _identity_record(gone, 1, scope)})
+    dead = observations(_run_bound(root, home))["writer_dead"]
+    assert dead["state"] == "dead"
+    assert dead["reason"] == "writer_absent"
+    assert dead["lanes"] == [{"lane": "writer", "state": "dead", "reason": "writer_absent"}]
+    _write_bindings(home, {"writer": _identity_record(identity["pid"], identity["start_ticks"] + 1, scope)})
+    replaced = observations(_run_bound(root, home))["writer_dead"]
+    assert replaced["state"] == "dead" and replaced["reason"] == "writer_replaced"
+    _write_bindings(home, {"writer": _identity_record(identity["pid"], identity["start_ticks"], scope)})
+    bound = observations(_run_bound(root, home))["writer_dead"]
+    assert bound["state"] == "unknown" and bound["reason"] == "writer_bound"
+
+
+def test_scope_mismatch_does_not_probe_the_recorded_pid(tmp_path, monkeypatch, services):
+    root = make_store(tmp_path)
+    home = _binding_home(tmp_path)
+    scope = team_writer_binding._scope()
+    identity = team_writer_binding.process_identity(os.getpid())
+    record = _identity_record(identity["pid"], identity["start_ticks"], scope)
+    record["boot_id"] = "00000000-0000-4000-8000-000000000000"
+    _write_bindings(home, {"writer": record})
+    monkeypatch.setattr(team, "read_leases", lambda root: team.LeaseSet((_lane_lease(),)))
+
+    def probed(pid):
+        raise AssertionError("probed")
+
+    monkeypatch.setattr(team_writer_binding, "process_identity", probed)
+    row = observations(_run_bound(root, home))["writer_dead"]
+    assert row["state"] == "unknown"
+    assert row["reason"] == "binding_scope_mismatch"
+    assert row["lanes"] == [{"lane": "writer", "state": "unknown", "reason": "binding_scope_mismatch"}]
+    record["boot_id"] = scope["boot_id"]
+    record["pid_namespace"] = "pid:[9]" if scope["pid_namespace"] != "pid:[9]" else "pid:[8]"
+    _write_bindings(home, {"writer": record})
+    again = observations(_run_bound(root, home))["writer_dead"]
+    assert again["reason"] == "binding_scope_mismatch"
+
+
+def test_claim_or_gen_mismatch_ignores_the_record(tmp_path, monkeypatch, services):
+    root = make_store(tmp_path)
+    home = _binding_home(tmp_path)
+    scope = team_writer_binding._scope()
+    identity = team_writer_binding.process_identity(os.getpid())
+    record = _identity_record(identity["pid"], identity["start_ticks"], scope, claim="b" * 16, gen=2)
+    _write_bindings(home, {"writer": record})
+    monkeypatch.setattr(team, "read_leases", lambda root: team.LeaseSet((_lane_lease(),)))
+    row = observations(_run_bound(root, home))["writer_dead"]
+    assert row["reason"] == "no_bound_liveness_source"
+    assert row["lanes"] == [{"lane": "writer", "state": "unknown", "reason": "no_bound_liveness_source"}]
+    record["claim_id"] = "a" * 16
+    _write_bindings(home, {"writer": record})
+    again = observations(_run_bound(root, home))["writer_dead"]
+    assert again["reason"] == "no_bound_liveness_source"
+
+
+def test_leftover_binding_without_a_lease_is_ignored(tmp_path, monkeypatch, services):
+    root = make_store(tmp_path)
+    home = _binding_home(tmp_path)
+    scope = team_writer_binding._scope()
+    _write_bindings(home, {"writer": _identity_record(1, 1, scope)})
+    monkeypatch.setattr(team, "read_leases", lambda root: team.LeaseSet())
+    row = observations(_run_bound(root, home))["writer_dead"]
+    assert row["state"] == "unknown"
+    assert row["reason"] == "no_bound_liveness_source"
+    assert row["lanes"] == []
+    assert row["leases"]["live"] == 0
+
+
+def test_expired_lease_uses_the_stored_triple_not_expiry(tmp_path, monkeypatch, services):
+    root = make_store(tmp_path)
+    home = _binding_home(tmp_path)
+    scope = team_writer_binding._scope()
+    identity = team_writer_binding.process_identity(os.getpid())
+    expired = _lane_lease(ts=10, ttl=10)
+    monkeypatch.setattr(team, "read_leases", lambda root: team.LeaseSet((expired,)))
+    _write_bindings(home, {"writer": _identity_record(identity["pid"], identity["start_ticks"], scope)})
+    alive = observations(_run_bound(root, home))["writer_dead"]
+    assert alive["reason"] == "writer_bound"
+    assert alive["leases"]["expired"] == 1
+    _write_bindings(home, {"writer": _identity_record(2147483647, 1, scope)})
+    if os.path.exists("/proc/2147483647"):
+        pytest.skip("sentinel pid is live")
+    dead = observations(_run_bound(root, home))["writer_dead"]
+    assert dead["state"] == "dead" and dead["reason"] == "writer_absent"
+
+
+def test_unreadable_sibling_keeps_the_top_level_unknown(tmp_path, monkeypatch, services):
+    root = make_store(tmp_path)
+    home = _binding_home(tmp_path)
+    scope = team_writer_binding._scope()
+    _write_bindings(home, {"writer": _identity_record(2147483647, 1, scope)})
+    if os.path.exists("/proc/2147483647"):
+        pytest.skip("sentinel pid is live")
+    bad = team.Unreadable("other", "refs/aegis/lanes/other", "c" * 40, "TOKEN=secret")
+    monkeypatch.setattr(team, "read_leases", lambda root: team.LeaseSet((_lane_lease(),), (bad,)))
+    result = _run_bound(root, home)
+    row = observations(result)["writer_dead"]
+    assert row["state"] == "unknown" and row["reason"] == "unreadable_lease"
+    assert row["lanes"] == [{"lane": "writer", "state": "dead", "reason": "writer_absent"}]
+    assert "TOKEN" not in repr(result) and "secret" not in repr(result)
+
+
+def test_missing_self_witness_is_not_death(tmp_path, monkeypatch, services):
+    root = make_store(tmp_path)
+    home = _binding_home(tmp_path)
+    scope = team_writer_binding._scope()
+    _write_bindings(home, {"writer": _identity_record(2147483646, 1, scope)})
+    monkeypatch.setattr(team, "read_leases", lambda root: team.LeaseSet((_lane_lease(),)))
+
+    def witness(pid):
+        if pid == os.getpid():
+            raise team_writer_binding._Refusal("identity_unavailable")
+        return None
+
+    monkeypatch.setattr(team_writer_binding, "process_identity", witness)
+    row = observations(_run_bound(root, home))["writer_dead"]
+    assert row["state"] == "unknown" and row["reason"] == "identity_unavailable"
+    assert row["lanes"][0]["reason"] == "identity_unavailable"
+
+
+def test_unsafe_binding_keeps_other_observations_and_echoes_nothing(tmp_path, monkeypatch, services):
+    root = make_store(tmp_path)
+    home = _binding_home(tmp_path)
+    path = home / ".config" / "aegis" / "writer-bindings.json"
+    path.write_bytes(b'{"TOKEN":"secret","path":"/zzmarker/evil"}\n')
+    os.chmod(path, 0o600)
+    marker = tmp_path / "workspace-marker"
+    marker.write_text("workspace-bytes", encoding="utf-8")
+    before = path.read_bytes()
+    monkeypatch.setattr(team, "read_leases", lambda root: team.LeaseSet((_lane_lease(),)))
+    fds = set(os.listdir("/proc/self/fd"))
+    result = _run_bound(root, home)
+    row = observations(result)["writer_dead"]
+    assert row["state"] == "unknown" and row["reason"] == "bindings_unavailable"
+    assert "lanes" not in row
+    assert row["leases"]["live"] == 1
+    assert result["observations"]["audit"]["state"] == "clean"
+    assert result["observations"]["disk"]["state"] in ("healthy", "below_floor", "unknown")
+    assert result["observations"]["usage"]["state"] == "known"
+    assert result["observations"]["capacity"]["state"] == "available"
+    assert path.read_bytes() == before
+    assert marker.read_text(encoding="utf-8") == "workspace-bytes"
+    assert set(os.listdir("/proc/self/fd")) == fds
+    rendered = repr(result)
+    assert "TOKEN" not in rendered and "zzmarker" not in rendered and "secret" not in rendered
+
+
+def test_multiline_lane_is_omitted_and_blocks_aggregate_death(tmp_path, monkeypatch, services):
+    root = make_store(tmp_path)
+    home = _binding_home(tmp_path)
+    scope = team_writer_binding._scope()
+    gone = 2147483647
+    if os.path.exists("/proc/%s" % gone):
+        pytest.skip("sentinel pid is live")
+    plain = _lane_lease(lane="plain")
+    broken = _with_lane(_lane_lease(lane="writer"), "alpha\nbeta")
+    _write_bindings(home, {"plain": _identity_record(gone, 1, scope)})
+    monkeypatch.setattr(team, "read_leases", lambda root: team.LeaseSet((plain, broken)))
+    row = observations(_run_bound(root, home))["writer_dead"]
+    assert row["state"] == "unknown"
+    assert row["reason"] == "no_bound_liveness_source"
+    assert row["lanes"] == [{"lane": "plain", "state": "dead", "reason": "writer_absent"}]
+    assert "alphabeta" not in repr(row)
+    secret = _with_lane(_lane_lease(lane="writer"), "\x00token=abcdSECRET " + ("b" * 60))
+    monkeypatch.setattr(team, "read_leases", lambda root: team.LeaseSet((secret,)))
+    shown = observations(_run_bound(root, home))["writer_dead"]["lanes"][0]["lane"]
+    assert "abcdSECRET" not in shown
+    assert "REDACTED" in shown
+    assert len(shown) == 63
+    assert "\n" not in shown

@@ -438,6 +438,8 @@ def render_scan_result(result: Dict[str, Any], host: Optional[str],
     truncation, selection and budgeting even when called after a raw scan.
     Ordinary dictionaries are projected from a bounded private copy and receive
     final token accounting. Opaque overflow refuses as guidance_projection_budget.
+    Checked projection refusals retain their fixed code and diagnostic locations
+    independently of the guidance token budget, including plain/JSON copies.
     The agent reads this output, so
     values are sanitized before they are inlined, and ignored keys or a config file
     that cannot be parsed are reported in ``result["warnings"]`` (H5). Slot loading
@@ -491,9 +493,15 @@ def _render_plain_result(source: Dict[str, Any], registry: Optional[SlotRegistry
                          identities: tuple[str, ...] = (),
                          staged_mandatory_count: Optional[int] = None) -> Dict[str, Any]:
     from copy import deepcopy
-    from aegis_core.guidance_projection import GuidanceProjectionError, checked_result_copy, finish_payload
+    from aegis_core.guidance_projection import (
+        GuidanceProjectionError, checked_result_copy, finish_payload, projection_refusal_copy,
+    )
 
     try:
+        refusal = projection_refusal_copy(source)
+        if refusal is not None:
+            return _PlainScanResult(deepcopy(refusal), replay_source if replay_source is not None else refusal,
+                                    identities=(), mandatory_count=0)
         snapshot = checked_result_copy(source, registry)
         result = deepcopy(snapshot)
         if registry is not None:

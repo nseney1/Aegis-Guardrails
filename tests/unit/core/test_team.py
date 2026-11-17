@@ -2341,12 +2341,82 @@ def test_cli_liveness_rejects_ambient_repository_selectors_before_both_phases(
         payload = json.loads(result.stdout)
         assert (result.returncode, payload.get("reason"), payload.get("message"), result.stderr) == (
             1, "ambient_git_environment", "ambient_git_environment", "")
-        assert payload.get("next_action") == "Unset Git repository selectors, then retry."
+        assert payload.get("next_action") == "Unset " + selector + " in the environment, then retry."
     assert (_ref(repo, "docs"), _ref(other, "docs")) == (first.oid, first.oid)
     code, payload, _ = lease_cli(*args)
     assert code == 0
     assert _ref(other, "docs") == first.oid
     assert _ref(repo, "docs") != first.oid
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+@pytest.mark.parametrize("action", ["renew", "gc"])
+def test_cli_lease_ambient_names_are_sorted_bounded_secret_free_and_retry(
+        repo, lease_cli, lease_now, monkeypatch, as_json, action):
+    from types import SimpleNamespace
+
+    old = team.claim(repo, "docs", ["docs/**"], branch="main", owner="o@h", ttl_s=60, now=lease_now - 100)
+    secret = "ghp_" + "c" * 36
+    keys = ["GIT_CONFIG_KEY_%02d" % index for index in reversed(range(20))]
+    label = ", ".join(sorted(keys)[:16]) + " (+4 more)"
+    args = ("renew", "docs", "--expect", old.oid) if action == "renew" else ("gc",)
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": dict.fromkeys(keys, secret)}))
+    try:
+        for _ in range(2):
+            code, output, err = lease_cli(*args, as_json=as_json)
+            assert code == 1
+            if as_json:
+                assert output["reason"] == output["message"] == "ambient_git_environment" and err == ""
+                assert output["next_action"] == "Unset " + label + " in the environment, then retry."
+            else:
+                assert output == ""
+                assert err == "ambient_git_environment\nUnset " + label + " in the environment, then retry.\n"
+            assert secret not in json.dumps(output) + err
+            assert _ref(repo, "docs") == old.oid
+    finally:
+        monkeypatch.setattr(team_lease_custody, "os", os)
+    code, payload, err = lease_cli(*args)
+    assert code == 0 and err == ""
+    assert payload["status"] == ("renewed" if action == "renew" else "collected")
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+@pytest.mark.parametrize("prefix", ["GIT_CONFIG_KEY_REDACTEDx", "GIT_CONFIG_VALUE_REDACTEDx", "GIT_CUSTOM_REDACTEDx"])
+@pytest.mark.parametrize("kind", ["github", "aws", "pem", "entropy"])
+def test_cli_lease_ambient_embedded_credentials_are_masked_and_retry(
+        repo, lease_cli, lease_now, monkeypatch, as_json, prefix, kind):
+    from types import SimpleNamespace
+
+    samples = {"github": "".join(("gh", "p_", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8")),
+               "aws": "".join(("AK", "IA", "9F8E7D6C5B4A3210")),
+               "pem": "".join(("-----BEGIN ", "RSA ", "PRIVATE KEY-----")),
+               "entropy": "".join(("aB9zQ2mL7xK4", "pR6vT1nH8jF3", "sW5cD0yG9uE2"))}
+    secret = samples[kind]
+    key = prefix + secret
+    environment = {key: "private-value"}
+    retained = prefix.startswith("GIT_CUSTOM_")
+    if retained:
+        environment.update({"GIT_PADDING_%02d" % index: "private-value" for index in range(56)})
+    label = "<non-standard Git variable name>" + (" (+56 more)" if retained else "")
+    old = team.claim(repo, "docs", ["docs/**"], branch="main", owner="o@h", now=lease_now)
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    try:
+        for _ in range(2):
+            code, output, err = lease_cli("renew", "docs", "--expect", old.oid, as_json=as_json)
+            assert code == 1
+            if as_json:
+                assert output["reason"] == output["message"] == "ambient_git_environment" and err == ""
+                assert output["next_action"] == "Unset " + label + " in the environment, then retry."
+            else:
+                assert output == ""
+                assert err == "ambient_git_environment\nUnset " + label + " in the environment, then retry.\n"
+            text = json.dumps(output) + err
+            assert secret not in text and key not in text and "private-value" not in text
+            assert _ref(repo, "docs") == old.oid
+    finally:
+        monkeypatch.setattr(team_lease_custody, "os", os)
+    code, payload, err = lease_cli("renew", "docs", "--expect", old.oid)
+    assert code == 0 and payload["status"] == "renewed" and err == ""
 
 
 @pytest.mark.parametrize("action", ["renew", "gc"])
