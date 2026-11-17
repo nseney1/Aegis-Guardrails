@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import bisect
 from datetime import datetime, timezone
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -405,10 +406,15 @@ _DISPLAY_SEGMENT_CANDIDATE = re.compile(
     _DISPLAY_SEARCH_CANDIDATE.pattern + '|(?:' + _DISPLAY_PEM_BEGIN.pattern + ')', re.IGNORECASE)
 
 
-def _display_matches(original, relaxed, text, boundaries, *, pos=0, endpos=None):
+def _display_matches(original, relaxed, text, boundaries, *, pos=0, endpos=None, charge=None):
     """Merge ordinary and carried starts once, retaining bounded overlaps."""
     endpos = len(text) if endpos is None else endpos
-    ordinary = iter(original.finditer(text, pos, endpos))
+    if charge is None:
+        ordinary = iter(original.finditer(text, pos, endpos))
+    else:
+        from aegis_core.display_attribution import overlapping_matches
+
+        ordinary = overlapping_matches(original, text, pos, endpos, charge)
     candidate = next(ordinary, None)
     last_start = -1
     for boundary in boundaries:
@@ -418,6 +424,8 @@ def _display_matches(original, relaxed, text, boundaries, *, pos=0, endpos=None)
             candidate = next(ordinary, None)
         if boundary == last_start:
             continue
+        if charge is not None and not charge(endpos - boundary + 1):
+            return
         carried = relaxed.match(text, boundary, endpos)
         if carried is not None:
             last_start = carried.start()
@@ -439,22 +447,23 @@ def _display_pem_spans(text, pos, endpos):
         yield marker.start(), end, '[REDACTED_PEM]'
 
 
-def _display_secret_spans(text, boundaries, *, pos=0, endpos=None):
+def _display_secret_spans(text, boundaries, *, pos=0, endpos=None, include_pem=True, charge=None):
     """Detect before masking, keeping backreference context outside secret spans."""
     endpos = len(text) if endpos is None else endpos
-    probe = _DISPLAY_SEGMENT_CANDIDATE.search(text, pos, endpos)
+    probe = (_DISPLAY_SEGMENT_CANDIDATE if include_pem else _DISPLAY_SEARCH_CANDIDATE).search(text, pos, endpos)
     if probe is None:
         return
-    if probe.group('pem_label') is not None and _DISPLAY_SEARCH_CANDIDATE.search(text, pos, endpos) is None:
+    if include_pem and probe.group('pem_label') is not None and _DISPLAY_SEARCH_CANDIDATE.search(text, pos, endpos) is None:
         yield from _display_pem_spans(text, pos, endpos)
         return
     boundaries = [start for start in boundaries if pos <= start < endpos
                   and _DISPLAY_BOUNDARY_CANDIDATE.match(text, start, endpos) is not None]
     for original, relaxed, replacement in _DISPLAY_SECRET_RULES:
         if replacement == '[REDACTED_PEM]':
-            yield from _display_pem_spans(text, pos, endpos)
+            if include_pem:
+                yield from _display_pem_spans(text, pos, endpos)
             continue
-        for candidate in _display_matches(original, relaxed, text, boundaries, pos=pos, endpos=endpos):
+        for candidate in _display_matches(original, relaxed, text, boundaries, pos=pos, endpos=endpos, charge=charge):
             start, end = candidate.span()
             payload = candidate.expand(replacement)
             if replacement.startswith(r'\1'):
@@ -484,7 +493,7 @@ def _display_segmented_secret_spans(text, boundaries, segments):
         yield from _display_secret_spans(text, starts, pos=start, endpos=end)
 
 
-def _display_mapped_secret_spans(text, boundaries, source_map, *, segments=None):
+def _display_mapped_secret_spans(text, boundaries, source_map, *, segments=None, include_pem=True, pos=0, charge=None):
     """Map a detection view's spans back through its compressed source runs."""
     offsets = [row[1] for row in source_map]
 
@@ -492,13 +501,13 @@ def _display_mapped_secret_spans(text, boundaries, source_map, *, segments=None)
         index = bisect.bisect_right(offsets, position) - 1
         return source_map[index][0] + position - offsets[index]
 
-    spans = (_display_secret_spans(text, boundaries) if segments is None else
+    spans = (_display_secret_spans(text, boundaries, include_pem=include_pem, pos=pos, charge=charge) if segments is None else
              _display_segmented_secret_spans(text, boundaries, segments))
     for start, end, payload in spans:
         yield to_source(start), to_source(end - 1) + 1, payload
 
 
-def _display_secret_masks(canonical, deleted, separator_segments, deleted_segments):
+def _display_secret_masks(canonical, deleted, separator_segments, deleted_segments, attributable, *, source):
     """Union detection views in source coordinates, then project one mask.
 
     Each map entry is (source start, canonical start, length), compressed by
@@ -506,8 +515,8 @@ def _display_secret_masks(canonical, deleted, separator_segments, deleted_segmen
     Source separators are hard segment edges; suppressed strings seal both
     source views so hidden detection context cannot mask visible ordinary text.
 
-    Crafted text that interleaves escape sequences with a credential's own
-    bytes is out of scope, tracked by SANITIZE-CRAFTED-INTERLEAVING.
+    Suppressed printable finals also admit bounded optional-byte attribution.
+    Its budget exhaustion masks only the candidate window in source space.
     """
     text, boundaries, source_map = canonical
     if not text:
@@ -532,6 +541,9 @@ def _display_secret_masks(canonical, deleted, separator_segments, deleted_segmen
     # Identical text, starts and maps have identical source spans; reuse them.
     if separator_segments != deleted_segments and (deleted != canonical or len(deleted_segments) > 1):
         spans.extend(_display_mapped_secret_spans(*deleted, segments=deleted_segments))
+    if attributable:
+        extra, _stats = _display_attribution(*source, canonical)
+        spans.extend(extra)
     merged = []
     for start, end, payload in sorted(spans, key=lambda span: (span[0], -span[1])):
         if merged and start < merged[-1][1]:
@@ -548,6 +560,171 @@ def _display_secret_masks(canonical, deleted, separator_segments, deleted_segmen
         cursor = end
     shown.append(text[cursor:])
     return ''.join(shown)
+
+
+_DISPLAY_ATTRIBUTION_RATE = 1024
+_DISPLAY_ATTRIBUTION_CEILING = 4194304
+# The existing PEM row is unbounded, but PEM attribution remains out of scope.
+# Any unbounded row contributes this documented radius instead of infinity.
+_DISPLAY_ATTRIBUTION_UNBOUNDED_CAP = 2048
+
+
+@lru_cache(maxsize=1)
+def _display_attribution_tables():
+    """Keep ordinary hook bootstrap free of the optional attribution helper."""
+    from aegis_core.display_attribution import compile_possible, max_match_width, may_match_visible
+
+    width = max_match_width((pattern for pattern, _relaxed, _replacement in _DISPLAY_SECRET_RULES),
+                            unbounded_cap=_DISPLAY_ATTRIBUTION_UNBOUNDED_CAP)
+    graph = compile_possible((pattern for pattern, _relaxed, replacement in _DISPLAY_SECRET_RULES
+                              if replacement != '[REDACTED_PEM]'),
+                             carried_patterns=(relaxed for _pattern, relaxed, replacement in _DISPLAY_SECRET_RULES
+                                               if replacement != '[REDACTED_PEM]'))
+    return width, graph, may_match_visible
+
+
+def _display_attribution_possible(runs, text, stats):
+    _width, graph, may_match_visible = _display_attribution_tables()
+    possible = may_match_visible(graph, text, runs, lambda amount: _display_attribution_charge(stats, amount),
+                                 start_at=int(runs[0][0] < stats['start']))
+    if not stats['exhausted']:
+        stats['coverage'] = 'possible' if possible else 'no_match'
+    return possible
+
+
+def _display_attribution_charge(stats, amount):
+    """Charge before allocation or regex work; never overshoot the ceiling."""
+    if stats['exhausted'] or amount > stats['limit'] - stats['steps']:
+        stats['exhausted'] = True
+        stats['coverage'] = 'exhausted'
+        return False
+    stats['steps'] += amount
+    return True
+
+
+def _display_attribution_view(text, runs, variant):
+    """An interpretation with the same ordinary/carried starts as the renderer."""
+    chunks, boundaries, source_map = [], [], []
+    offset, bit, previous_end, previous_kind = 0, 0, -1, None
+    for start, end, kind, visible, replacement, _sealed in runs:
+        if not visible:
+            selected = variant & (1 << bit)
+            bit += 1
+            if not selected:
+                continue
+        chunks.append(text[start:end] if replacement is None else replacement)
+        source_map.append((start, offset, end - start))
+        if start != previous_end or kind != previous_kind:
+            boundaries.append(offset)
+        offset += end - start
+        previous_end, previous_kind = end, kind
+    return ''.join(chunks), boundaries, source_map
+
+
+def _display_attribute_segment(text, start, end, runs, stats):
+    """Explore shared-rule interpretations, or mask only this window.
+
+    A step is a source unit inspected/copied or a charged regex input unit.
+    Each variant reserves source length times every ordinary/carried rule
+    probe before construction. Shared non-PEM regex widths are bounded; PEM
+    label attribution is deliberately outside this search's contract.
+    """
+    size = end - start
+    stats['limit'] = min(_DISPLAY_ATTRIBUTION_CEILING, stats['limit'] + _DISPLAY_ATTRIBUTION_RATE * size)
+    refused = (start, end, '[REDACTED]')
+    if not _display_attribution_charge(stats, size + (len(runs) if runs is not None else 0)):
+        return refused
+    if runs is None:
+        stats['coverage'] = 'possible'
+        return refused
+    rules = sum(replacement != '[REDACTED_PEM]' for _original, _relaxed, replacement in _DISPLAY_SECRET_RULES)
+    # The run count bounds carried starts; no regex or candidate string is
+    # built until the complete search fits. Never construct an enormous 2**n.
+    cost = size * (2 + rules * (2 + len(runs)))
+    maximum = (stats['limit'] - stats['steps']) // cost
+    variants = 1
+    for _start, _end, _kind, visible, _replacement, _sealed in runs:
+        if not visible:
+            if variants > maximum // 2:
+                return refused if _display_attribution_possible(runs, text, stats) else None
+            variants *= 2
+    if variants > maximum:
+        return refused if _display_attribution_possible(runs, text, stats) else None
+    found = None
+    for variant in range(variants):
+        if not _display_attribution_charge(stats, cost):
+            return refused
+        view = _display_attribution_view(text, runs, variant)
+        if not view[0]:
+            continue
+        # One context character prevents a clipped plain run from acquiring
+        # a new ordinary/carried start. It can never begin a secret span.
+        pos = int(runs[0][0] < start)
+        charge = lambda amount: _display_attribution_charge(stats, amount)
+        for left, right, payload in _display_mapped_secret_spans(*view, include_pem=False, pos=pos, charge=charge):
+            if found is None:
+                found = left, right, payload
+            else:
+                # One envelope per candidate: disjoint attribution intervals
+                # and PEM labels remain outside the admitted contract.
+                found = (min(left, found[0]), max(right, found[1]),
+                         payload if payload == found[2] else '[REDACTED]')
+        if stats['exhausted']:
+            return refused
+    stats['coverage'] = 'complete'
+    return found
+
+
+def _display_attribution_windows(text, index, source_map):
+    """Merge windows in kept-character space; seals remain hard boundaries."""
+    from aegis_core.display_attribution import project_window
+
+    width = _display_attribution_tables()[0]
+    begin, offset, pending = 0, 0, None
+    for start, end, kind, visible, _replacement, sealed in _display_render_spans(text, index):
+        if sealed:
+            if pending is not None:
+                yield project_window(pending, offset, source_map)
+            begin, pending = offset, None
+        elif kind == 4 and not visible:
+            left, right = max(begin, offset - width), offset + width
+            if pending is not None and left <= pending[1]:
+                pending = pending[0], right, pending[2], end
+            else:
+                if pending is not None:
+                    yield project_window(pending, offset, source_map)
+                pending = left, right, start, end
+        if visible:
+            offset += end - start
+    if pending is not None:
+        yield project_window(pending, offset, source_map)
+
+
+def _display_attribution(text, index, canonical=None):
+    """Each merged window owns a budget; exhaustion cannot affect its peers."""
+    canonical = _display_views(text, index)[0] if canonical is None else canonical
+    spans, budgets = [], []
+    rows = iter(_display_render_spans(text, index))
+    row = next(rows, None)
+    for begin, end, detection_start, detection_end in _display_attribution_windows(text, index, canonical[2]):
+        runs = [] if end - begin <= _DISPLAY_ATTRIBUTION_CEILING else None
+        while row is not None and row[0] < end:
+            start, stop, kind, visible, replacement, sealed = row
+            if stop > begin and runs is not None and (visible or (kind == 4 and not sealed)):
+                if start < begin and visible and replacement is None:
+                    runs.append((begin - 1, begin, kind, True, None, 0))
+                runs.append((max(start, begin), min(stop, end), kind, visible, replacement, sealed))
+            if stop > end:
+                break
+            row = next(rows, None)
+        stats = {'steps': 0, 'limit': 0, 'exhausted': False, 'coverage': 'pending', 'start': begin, 'end': end,
+                 'source_length': end - begin, 'detection_start': detection_start, 'detection_end': detection_end}
+        span = _display_attribute_segment(text, begin, end, runs, stats)
+        budgets.append(stats)
+        if span is not None:
+            spans.append(span)
+    return spans, {'steps': sum(b['steps'] for b in budgets), 'limit': sum(b['limit'] for b in budgets),
+                   'exhausted': any(b['exhausted'] for b in budgets), 'windows': budgets}
 
 
 def _display_escape_limit(text, index, literal_until):
@@ -651,7 +828,9 @@ def _display_views(text, index):
     offset = deleted_offset = 0
     previous_end = deleted_end = -1
     previous_kind = deleted_kind = None
+    attributable = False
     for start, end, kind, visible, replacement, sealed in _display_render_spans(text, index):
+        attributable = attributable or (kind == 4 and not visible and not sealed)
         if sealed != previous_seal:
             deleted_split = True
         printable = replacement is None and ord(text[start]) >= 32 and not 127 <= ord(text[start]) <= 159
@@ -681,13 +860,15 @@ def _display_views(text, index):
             deleted_end, deleted_kind = end, kind
         previous_seal = sealed
     return ((''.join(shown), boundaries, source_map),
-            (''.join(deleted), deleted_boundaries, deleted_map), separator_segments, deleted_segments)
+            (''.join(deleted), deleted_boundaries, deleted_map), separator_segments, deleted_segments, attributable)
 
 
 def _display_text_views(text, index):
     """Probe non-secret output without allocating maps/segments for every run."""
     shown, deleted = [], []
-    for start, end, _kind, visible, replacement, _sealed in _display_render_spans(text, index):
+    attributable = False
+    for start, end, kind, visible, replacement, sealed in _display_render_spans(text, index):
+        attributable = attributable or (kind == 4 and not visible and not sealed)
         printable = replacement is None and ord(text[start]) >= 32 and not 127 <= ord(text[start]) <= 159
         if printable:
             chunk = text[start:end]
@@ -697,7 +878,7 @@ def _display_text_views(text, index):
         elif visible:
             shown.append(replacement)
             deleted.append(replacement)
-    return ''.join(shown), ''.join(deleted)
+    return ''.join(shown), ''.join(deleted), attributable
 
 
 def sanitize_display(text: object, max_len: Optional[int] = 80) -> str:
@@ -714,16 +895,16 @@ def sanitize_display(text: object, max_len: Optional[int] = 80) -> str:
     if first_control is not None:
         index = first_control.start()
         if _DISPLAY_SEGMENT_CANDIDATE.match(text) is None:
-            canonical, deleted = _display_text_views(text, index)
+            canonical, deleted, attributable = _display_text_views(text, index)
             # The relaxed probe also covers matches within a source segment:
             # hard separators cannot contribute any part of a credential.
-            if (_DISPLAY_SEGMENT_CANDIDATE.search(canonical) is None
+            if (not attributable and _DISPLAY_SEGMENT_CANDIDATE.search(canonical) is None
                     and _DISPLAY_SEGMENT_CANDIDATE.search(deleted) is None):
                 text = canonical
             else:
-                text = _display_secret_masks(*_display_views(text, index))
+                text = _display_secret_masks(*_display_views(text, index), source=(text, index))
         else:
-            text = _display_secret_masks(*_display_views(text, index))
+            text = _display_secret_masks(*_display_views(text, index), source=(text, index))
     if max_len is not None and len(text) > max_len:
         text = text[:max_len - 3] + '...'
     return text
