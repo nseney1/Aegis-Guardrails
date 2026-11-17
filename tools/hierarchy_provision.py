@@ -23,6 +23,7 @@ Binding grants no authority, and a generated profile is not proof that a host wi
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
 import hashlib
 import json
 import math
@@ -32,6 +33,7 @@ import re
 import shutil
 import subprocess
 import sys
+from threading import Lock
 import uuid
 
 JSON_LIMIT_BYTES = 262144
@@ -1518,9 +1520,84 @@ def claude_start(request):
     return {**answer, "team": team} if team is not None else answer
 
 
+class _MailboxReader:
+    """Keep binding and locking inside public read callables."""
+    def __init__(self, mailbox):
+        read_lock = Lock()
+        with read_lock:
+            index = MailboxIndex(mailbox, mode="shadow")
+
+        def read_messages():
+            with read_lock:
+                return index.messages()
+
+        def read_message(message_id):
+            with read_lock:
+                return index.get(message_id)
+
+        def read_mode():
+            with read_lock:
+                return index.mode
+
+        def read_divergence():
+            with read_lock:
+                return index.last_divergence
+
+        def read_reconciliation():
+            with read_lock:
+                return index.last_reconciliation
+
+        def read_changes():
+            with read_lock:
+                return index.content_changed
+
+        self.read_messages = read_messages
+        self.read_message = read_message
+        self.read_mode = read_mode
+        self.read_divergence = read_divergence
+        self.read_reconciliation = read_reconciliation
+        self.read_changes = read_changes
+
+    def messages(self):
+        return self.read_messages()
+
+    def get(self, message_id):
+        return self.read_message(message_id)
+
+    @property
+    def mode(self):
+        return self.read_mode()
+
+    @property
+    def last_divergence(self):
+        return self.read_divergence()
+
+    @property
+    def last_reconciliation(self):
+        return self.read_reconciliation()
+
+    @property
+    def content_changed(self):
+        return self.read_changes()
+
+
+_MAILBOX_READERS = OrderedDict()
+_MAILBOX_READERS_LOCK = Lock()
+
+
 def mailbox_reader(mailbox):
-    """Keep the pinned mailbox outcome authoritative during reader rollout."""
-    return MailboxIndex(mailbox, mode="shadow")
+    """Reuse locked shadow state only for this exact Mailbox authority."""
+    # The retained index owns mailbox, keeping its identity live until eviction.
+    key = (mailbox.root, os.getpid(), id(mailbox))
+    with _MAILBOX_READERS_LOCK:
+        reader = _MAILBOX_READERS.get(key)
+        if reader is None:
+            if len(_MAILBOX_READERS) >= 16:
+                _MAILBOX_READERS.popitem(last=False)
+            reader = _MailboxReader(mailbox)
+            _MAILBOX_READERS[key] = reader
+        _MAILBOX_READERS.move_to_end(key)
+        return reader
 
 
 def old_root_state(old_root, hierarchy):
