@@ -76,6 +76,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.argv": 0,
     # GitHub CLI transport over gitsafe and pathlookup, with no trust-policy dependency.
     "aegis_core.ghcli": 0,
+    "aegis_core.pathlookup_fence": 0,
     # Path containment, strict JSON and UTC timestamps (stdlib only).
     "aegis_core.primitives": 0,
     "aegis_core.proposals": 2,
