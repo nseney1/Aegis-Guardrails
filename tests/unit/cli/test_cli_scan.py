@@ -439,7 +439,8 @@ def test_dispatcher_workspace_refusals_project_paths(tmp_path, monkeypatch, caps
             assert "guidance_projection_invalid_field" in captured.err
             assert "which is not a directory" in captured.err
         elif case == "long":
-            assert captured.err.rstrip().endswith("...")
+            assert captured.err.rstrip().endswith(", which is not a directory")
+            assert "... [display-only]" in captured.err
         else:
             assert "REDACTED" in captured.err
 
@@ -839,6 +840,37 @@ def test_hold_clips_each_bounded_component_once(monkeypatch, capsys):
     assert all(len(value) == 1024 and value.endswith("...") for value in payload["details"].values())
 
 
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("identity", ["p" * 5000, "Bearer\t" + "S" * 30 + "\n" + "p" * 5000,
+                                      "ghp_" + "S" * 30 + "/" + "p" * 5000],
+                         ids=["long", "controls", "secret"])
+@pytest.mark.parametrize("reason", ["pin_conflicts_with_target", "pin_conflicts_with_cwd"])
+def test_hold_keeps_recovery_after_long_identities(monkeypatch, capsys, json_mode, identity, reason):
+    from aegis_core.workspace.binding import WorkspaceBinding, WorkspaceHold
+
+    binding = WorkspaceBinding("hold", reason=reason,
+                               details=(("pin", identity), ("target", identity),
+                                        ("cwd", identity), ("cwd_root", identity)))
+
+    def refuse(args):
+        raise WorkspaceHold(binding)
+
+    monkeypatch.setattr("aegis_cli.cli._attach_workspace", refuse)
+    for _ in range(2):
+        assert main(["scan", "app.py"] + (["--json"] if json_mode else [])) == 2
+        captured = capsys.readouterr()
+        if json_mode:
+            payload = json.loads(captured.out)
+            assert captured.err == "" and payload["reason"] == reason
+            message = payload["message"]
+        else:
+            assert captured.out == ""
+            message = captured.err.removeprefix(f"Hold ({reason}): ").rstrip("\n")
+        assert "unset the pin" in message and len(message) <= 1024
+        assert "S" * 30 not in captured.out + captured.err
+        assert "\n" not in message and "\t" not in message
+
+
 @pytest.mark.parametrize("number", [errno.EACCES, errno.ENAMETOOLONG, errno.ELOOP, errno.ENOTDIR])
 def test_post_binding_scan_marker_error_retains_workspace_exit(ws, monkeypatch, capsys, number):
     from aegis_cli import scan
@@ -999,7 +1031,11 @@ def test_workspace_refusals_bound_original_components_before_composition(ws, mon
     assert "guidance_projection_limit" not in captured.err
     assert "CANONICAL-PRIVATE-FILENAME" not in captured.err and "resolution denied" not in captured.err
     assert len(captured.err.rstrip("\n")) == len("Error: ") + 1024
-    assert captured.err.endswith("...\n")
+    suffix = {"plain": ", which has no .aegis/ (run aegis init there)",
+              "missing": ", which is not a directory", "root": ", which is the filesystem root",
+              "pin_resolution": " cannot be resolved", "target_resolution": " cannot be resolved"}[kind]
+    assert captured.err.endswith(suffix + "\n")
+    assert "... [display-only]" in captured.err
 
 
 @pytest.mark.parametrize("kind,target", [("nested", "~/../.."), ("root", "~")])

@@ -1067,7 +1067,30 @@ def test_large_normalized_startup_pin_is_clipped_without_double_counting(home, t
     is_error, payload = _payload(frames[1])
     assert is_error and payload["binding"]["reason"] == "pin_not_a_workspace"
     assert "guidance_projection_limit" not in captured.err + json.dumps(payload)
-    assert len(payload["error"]) == 1024 and payload["error"].endswith("...")
+    assert len(payload["error"]) == 1024
+    assert payload["error"].endswith(", which has no .aegis/ (run aegis init there)")
+    assert "... [display-only]" in payload["error"]
+
+
+@pytest.mark.parametrize("identity", ["h" * 5000, "Bearer\t" + "S" * 30 + "\n" + "h" * 5000,
+                                      "ghp_" + "S" * 30 + "/" + "h" * 5000],
+                         ids=["long", "controls", "secret"])
+def test_scan_binding_keeps_recovery_after_long_host_roots(home, monkeypatch, capsys, identity):
+    from aegis_core.workspace.binding import WorkspaceBinding
+
+    binding = WorkspaceBinding("hold", reason="pin_conflicts_with_host_root",
+                               details=(("pin", "pinned"), ("host_roots", [identity, "h" * 5000])))
+    monkeypatch.setattr(server, "_bind", lambda params, args: binding)
+    frames = _serve(monkeypatch, capsys, [_init(), _call(1, "aegis_scan", {}), _call(2, "aegis_scan", {})])
+    for req_id in (1, 2):
+        is_error, payload = _payload(frames[req_id])
+        assert is_error and payload["status"] == "hold"
+        assert payload["reason"] == "pin_conflicts_with_host_root"
+        assert payload["error"] == payload["binding"]["message"]
+        assert "fix the pin or open the pinned project" in payload["error"]
+        assert len(payload["error"]) <= 1024 and "... [display-only]" in payload["error"]
+        assert "S" * 30 not in json.dumps(payload)
+        assert "\n" not in payload["error"] and "\t" not in payload["error"]
 
 
 def test_valid_component_collection_is_clipped_independently(home, monkeypatch, capsys):
