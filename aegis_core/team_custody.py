@@ -27,6 +27,7 @@ import hashlib
 import time
 
 from aegis_core import gitops_rows, team_git, team_gitops, team_qualify
+from aegis_core.team_git import UNKNOWN_OUTCOME_CODES as _UNKNOWN
 from aegis_core import team_custody_checks as checks
 from aegis_core.errors import AegisError
 from aegis_core.team_custody_checks import CustodyRefused
@@ -49,7 +50,6 @@ REFUSALS = {
     "invalid_parent": "commit parent is invalid",
     "store_closed": "commit requires an active private store",
 }
-_UNKNOWN = frozenset(("ref_update_unknown", "git_cleanup_failed", "git_timeout", "git_output_limit"))
 _ERRORS = (AegisError, OSError, ValueError, TypeError, RecursionError)
 # A code proves the refused gate, not the absence of a concurrent or saved intent.
 # Construction failures therefore retain observation-only advice for any intent.

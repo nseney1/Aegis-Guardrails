@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from aegis_core import gitsafe, gitsafe_run, gitops_fds, team_git as tg, team_git_snapshot
+from aegis_core import gitsafe, gitsafe_policy, gitsafe_run, gitops_fds, team_git as tg, team_git_snapshot
 from aegis_core import team, team_lease_custody
 from tests.unit.core.test_gitsafe import LANE_MODULES, strict_program, strict_program_guard
 
@@ -4963,7 +4963,8 @@ def test_snapshot_source_version_refuses_before_capture_and_retries(repo, monkey
             with pytest.raises(tg.GitRefusal) as caught:
                 tg.snapshot_tree(store)
             assert (caught.value.code, str(caught.value), caught.value.next_action) == (
-                "conversion_unavailable", "Lane Git operation refused: conversion_unavailable", None)
+                "conversion_unavailable", "Lane Git operation refused: conversion_unavailable",
+                "Install Git 2.40 or newer, then retry the snapshot.")
         assert queries == []
         restore()
         assert store.read_blob(tg.snapshot_tree(store), "x") == b"base\n"
@@ -5009,12 +5010,18 @@ def test_snapshot_source_query_closed_grammar_and_environment(repo, monkeypatch,
         assert env["GIT_INDEX_FILE"] == str(store.scratch / "index")
 
 
-@pytest.mark.parametrize("phase", ["version", "check-attr"])
+def test_snapshot_attribute_policy_requires_source_tree():
+    names = ("filter", "text", "eol", "ident", "working-tree-encoding", "crlf")
+    assert not gitsafe_policy.read_shape(("check-attr", "-z", "--stdin", *names))
+    assert gitsafe_policy.read_shape(("check-attr", "-z", "--stdin", "--source", "a" * 40, *names))
+
+
+@pytest.mark.parametrize("phase", ["version", "check-attr", "filters"])
 @pytest.mark.parametrize("failure", ["os-error", "git_failed", "git_timeout", "git_output_limit", "git_cleanup_failed"])
 def test_snapshot_attribute_observation_failure_refuses_and_retries(repo, monkeypatch, phase, failure):
     context = make_store(repo)
     def failed(real, args, *rest, **kwargs):
-        if args[:1] == [phase]:
+        if args[:1] == [phase] or phase == "filters" and args[-1:] == [r"^filter\."]:
             if failure == "os-error":
                 raise OSError(errno.EACCES, "private token=never-echo")
             raise gitsafe.GitError("private token=never-echo", code=failure)
@@ -5534,6 +5541,45 @@ def test_snapshot_stat_shortcut_payload_counts_and_retry(repo, monkeypatch, stat
             assert (len(reads) == 0) == (state == "clean")
         assert trees[0] == trees[1]
         assert store.read_blob(trees[0], "x") == (b"dirty payload\n" if state == "dirty" else b"base\n")
+
+
+@pytest.mark.parametrize("confirmation", [False, None], ids=["dirty", "indeterminate"])
+def test_snapshot_stat_skip_disagreement_refuses_and_retries(repo, monkeypatch, confirmation):
+    context = make_store(repo)
+    os.utime(repo / "x", ns=(1000000000000000000, 1000000000000000000))
+    git(repo, "update-index", "--refresh")
+    expected = git(repo, "rev-parse", "HEAD^{tree}").decode().strip()
+    before = shared_bytes(repo)
+    reached, resume, observations = Event(), Event(), []
+    real = team_git_snapshot.index_clean
+    def disagree(*args):
+        observations.append(args[1])
+        reached.set()
+        assert resume.wait(5), "stat-clean confirmation was never released"
+        return confirmation
+    with context as store:
+        monkeypatch.setattr(team_git_snapshot, "index_clean", disagree)
+        for _ in range(2):
+            reached.clear()
+            resume.clear()
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(tg.snapshot_tree, store)
+                try:
+                    assert reached.wait(5), "snapshot never reached stat-clean confirmation"
+                    with pytest.raises(tg.GitRefusal) as busy:
+                        tg.snapshot_tree(store)
+                    assert busy.value.code == "store_busy"
+                finally:
+                    resume.set()
+                with pytest.raises(tg.GitRefusal) as caught:
+                    future.result(timeout=5)
+                assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+                    "worktree_changed", "Lane Git operation refused: worktree_changed", None)
+        assert len(observations) == 2
+        monkeypatch.setattr(team_git_snapshot, "index_clean", real)
+        assert tg.snapshot_tree(store) == expected
+        assert tg.snapshot_tree(store) == expected
+    assert shared_bytes(repo) == before
 
 
 @pytest.mark.parametrize("over_wire", [False, True], ids=["under-wire-budget", "over-wire-budget"])
