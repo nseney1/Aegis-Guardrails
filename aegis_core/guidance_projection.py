@@ -17,7 +17,7 @@ from aegis_core.taxonomy import JIT_DEFAULT_MAX_TOKENS, RULE_TYPES, WORDS_TO_TOK
 
 __all__ = ["CONTROL_GUIDANCE", "GuidanceProjectionError", "GuidanceResult", "MAX_GUIDANCE_CHARS",
            "SLOT_REF_PATTERN", "WITHHELD_GUIDANCE", "checked_result_copy", "projection_refusal_copy",
-           "assembled_text", "project_assembled", "contains_control_characters", "estimate_tokens", "field_text", "finish_payload",
+           "assembled_text", "contains_control_characters", "estimate_tokens", "field_text", "finish_payload",
            "instruction_body", "normalize_layout", "redact_clean_text", "project_detail", "detail_instruction_visible", "project_display_data",
            "project_envelope_fields", "project_field", "project_identifier", "project_rule_entries",
            "project_text", "project_diagnostic", "project_display_text", "project_error_name", "raw_rule_text"]
@@ -264,7 +264,7 @@ def detail_instruction_visible(body: str, prefix: Optional[str], registry: Optio
         return False
 
 
-def project_field(value: Any, registry: Optional[_Slots] = None, *, body: bool = False) -> str | list[str]:
+def project_field(value: Any, registry: Optional[_Slots] = None) -> str | list[str]:
     if value is None:
         return ""
     if isinstance(value, str):
@@ -478,11 +478,6 @@ def _retained_value(value, *, auxiliary=False):
     except _ControlCharacters:
         return [CONTROL_GUIDANCE] if is_list else CONTROL_GUIDANCE
     return retained if is_list else retained[0] if retained else ""
-
-
-def project_assembled(value, registry=None, *, warnings=False):
-    """An incoming assembly is untrusted text, without presentation protection."""
-    return project_field(_retained_value(value, auxiliary=warnings), None if warnings else registry)
 
 
 def _project_auxiliary(value):
