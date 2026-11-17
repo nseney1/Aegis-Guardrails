@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-import hashlib
 import os
 from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Tuple
 
@@ -156,7 +155,7 @@ def _inventory_at(root: str, commit: str, working: Optional[RuleInventory] = Non
     missing: List[Tuple[str, str]] = []
     for path, oid in sorted(blobs.items()):
         local = present.get(path)
-        if local is not None and _same_blob(local.content, oid):
+        if local is not None and local.size <= rule_inventory.MAX_RULE_BYTES and _same_blob(local.content, oid):
             entries.append(local)
         else:
             missing.append((path, oid))
@@ -164,12 +163,10 @@ def _inventory_at(root: str, commit: str, working: Optional[RuleInventory] = Non
     for path, oid in missing:
         data = contents[oid]
         entries.append(
-            RuleInventoryEntry(
+            rule_inventory.captured_entry(
                 path,
                 os.path.join(root, *path.split("/")),
                 data,
-                hashlib.sha256(data).hexdigest(),
-                len(data),
             )
         )
     entries.sort(key=lambda e: e.relative_path)
@@ -377,9 +374,20 @@ def _key_changes(base: Rule, head: Rule) -> List[str]:
     )
 
 
+def _oversized(rule: Optional[Rule]) -> bool:
+    return rule is not None and rule.size is not None and rule.size > rule_inventory.MAX_RULE_BYTES
+
+
 def weakenings(base: Rule, head: Optional[Rule], renames: Optional[Mapping[str, str]] = None) -> List[Weakening]:
     """How ``head`` binds less than the reviewed ``base``, in a fixed order. An ``applies_to`` change is
     not among them: check_ci reports it for a rule of any rank (``_applies_to_changed``)."""
+    if _oversized(base):
+        # Empty content on a refused record is not an empty policy. Its bounded
+        # fingerprint and actual size are the only available comparison evidence.
+        if head is not None and (base.size, base.digest) == (head.size, head.digest):
+            return []
+        return [Weakening("deleted", base.id, base.path,
+                          GuidanceMessage("deleted", MESSAGE_TEMPLATES["deleted_2"], {"error": "too_large"}))]
     if head is None or not head.ok:
         detail = GuidanceMessage("deleted", MESSAGE_TEMPLATES["deleted"], {}) if head is None else \
             GuidanceMessage("deleted", MESSAGE_TEMPLATES["deleted_2"], {"error": str(head.error)})
@@ -455,13 +463,17 @@ class Effective:
 
 
 def _compose(root: str, head: RuleSet, base: RuleSet, anchor: BaseAnchor) -> Effective:
+    refused = tuple(r for r in base.rules if _oversized(r))
+    refused_ids = {r.id for r in refused}
     base_all = {r.id: r for r in base.rules if r.ok}
     binding = {rule_id: r for rule_id, r in base_all.items() if r.rank >= 2}
-    served: List[Rule] = []
+    served: List[Rule] = list(refused)
     unreviewed: List[Unreviewed] = []
     widened: List[Tuple[int, Rule, Tuple[str, ...]]] = []
     seen_ok, seen_any = set(), set()
     for rule in head.rules:
+        if rule.id in refused_ids:
+            continue  # A working replacement cannot remove a reviewed refusal.
         seen_any.add(rule.id)
         if not rule.ok:
             served.append(rule)
@@ -721,22 +733,25 @@ def check_ci(workspace: Any, base: str, head: str = "HEAD", *, pull_request: Any
     prefix = _prefix(root)
     base_rules = load_rules(root, inventory=_inventory_at(root, merge))
     head_rules = load_rules(root, inventory=_inventory_at(root, head_commit))
+    refused_base = {r.id: r for r in base_rules.rules if _oversized(r)}
+    head_records = {r.path: r for r in head_rules.rules}
     renames = _renames(root, merge, head_commit, prefix)
 
     found: List[Weakening] = []
     checked = 0
     # A binding rule's applies_to finding comes last among its own; then each other rule's, any rank.
     for rule in base_rules.rules:
-        if rule.ok and rule.rank >= 2:
+        if (rule.ok and rule.rank >= 2) or _oversized(rule):
             checked += 1
-            branch = head_rules.get(rule.id)
+            branch = head_records.get(rule.path) if _oversized(rule) else head_rules.get(rule.id)
             found += weakenings(rule, branch, renames)
-            if branch is not None and _applies_to_changed(rule, branch):
+            if rule.ok and branch is not None and _applies_to_changed(rule, branch):
                 found.append(Weakening("applies_to", rule.id, branch.path,
                                        GuidanceMessage("applies_to", MESSAGE_TEMPLATES["applies_to"], {})))
     for rule in head_rules.rules:
-        reviewed = base_rules.get(rule.id)
-        if rule.ok and not (reviewed is not None and reviewed.rank >= 2) and _applies_to_changed(reviewed, rule):
+        reviewed = refused_base.get(rule.id) or base_rules.get(rule.id)
+        if (rule.ok and not _oversized(reviewed) and not (reviewed is not None and reviewed.rank >= 2)
+                and _applies_to_changed(reviewed, rule)):
             found.append(Weakening("applies_to", rule.id, rule.path,
                                    GuidanceMessage("applies_to", MESSAGE_TEMPLATES["applies_to"], {})))
     head_files: List[str] = []

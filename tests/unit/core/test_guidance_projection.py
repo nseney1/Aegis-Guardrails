@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -194,18 +195,42 @@ def test_pure_projection_excludes_all_body_evidence_and_keeps_unknown_slots():
 
 @pytest.mark.parametrize("field", ["source", "expanded"])
 def test_projection_resource_limits_refuse_with_a_fixed_scan_code(tmp_path: Path, field: str):
-    oversized = "x" * (1024 * 1024 + 1)
-    _rule(tmp_path, oversized if field == "source" else "${SLOT.MODEL_FAST}" * 14000)
+    from aegis_core.guidance_projection import GuidanceProjectionError, MAX_GUIDANCE_CHARS, project_text
+    from aegis_core.packs import MAX_RULE_BYTES
+
+    paths = []
+    if field == "source":
+        # Retain the literal per-body guard through its public projection API;
+        # disk-backed scan now reaches the aggregate guard with bounded files.
+        with pytest.raises(GuidanceProjectionError, match="^guidance_projection_limit$"):
+            project_text("x" * (MAX_GUIDANCE_CHARS + 1))
+        for index in range(9):
+            path = _rule(tmp_path, "", hypothesis="", rule_id=f"r{index}")
+            text = path.read_text(encoding="utf-8").replace(
+                "hypothesis: ''\n", "hypothesis:\n" + ("  - " + "x" * 4096 + "\n") * 31,
+            )
+            path.write_bytes(text.encode("utf-8"))
+            assert path.stat().st_size == 127258 <= MAX_RULE_BYTES
+            paths.append(path)
+    else:
+        path = _rule(tmp_path, "${X}" * 13108)
+        assert path.stat().st_size <= MAX_RULE_BYTES
+        paths.append(path)
 
     def read(_):
-        return scan(tmp_path, ["src/a.py"], registry=SlotRegistry({"MODEL_FAST": "m" * 80}))
+        if field == "source":
+            return scan(tmp_path, ["src/a.py"], budget=9, max_tokens=2000000)
+        return scan(tmp_path, ["src/a.py"], registry=SlotRegistry({"X": "m" * 80}))
 
-    assert read(None) == {"status": "FAIL", "error": "guidance_projection_limit"}
+    expected = {"status": "FAIL", "error": "guidance_projection_limit"}
+    if field == "expanded":
+        expected["rule_errors"] = [{"path": ".aegis/rules/traps/projection.md", "error": "detail: limit"}]
+    assert read(None) == expected
     with ThreadPoolExecutor(max_workers=3) as pool:
-        assert list(pool.map(read, range(3))) == [
-            {"status": "FAIL", "error": "guidance_projection_limit"},
-        ] * 3
+        assert list(pool.map(read, range(3))) == [expected] * 3
 
+    for path in paths:
+        path.unlink()
     _rule(tmp_path, "Repaired instructions.\n", hypothesis="Repaired.")
     assert "Detail: Repaired instructions.\n" in read(None)["guidance"]
 
@@ -596,7 +621,9 @@ def test_unsupported_metadata_types_refuse_without_stringifying(tmp_path: Path, 
     path = _rule(root, "Read.")
     path.write_text(path.read_text().replace("hypothesis: 'Keep instructions safe.'",
                                             "hypothesis: " + json.dumps(value)), encoding="utf-8")
-    assert scan(root, ["src/a.py"]) == {"status": "FAIL", "error": "guidance_projection_invalid_field"}
+    assert scan(root, ["src/a.py"]) == {
+        "status": "FAIL", "error": "guidance_projection_invalid_field",
+        "rule_errors": [{"path": ".aegis/rules/traps/projection.md", "error": "hypothesis: invalid_field"}]}
 
 
 def test_list_metadata_limit_is_checked_before_projection():
@@ -1057,6 +1084,7 @@ def test_failed_projection_does_not_record_successful_scan_compliance(tmp_path: 
     monkeypatch.setattr(handler_core, "_record_scan", lambda *args: records.append(args))
     assert handle_scan({"workspace": str(tmp_path), "files": ["src/a.py"]}) == {
         "status": "FAIL", "error": "guidance_projection_invalid_field",
+        "rule_errors": [{"path": ".aegis/rules/traps/projection.md", "error": "hypothesis: invalid_field"}],
     }
     assert records == []
 
@@ -1115,7 +1143,8 @@ def test_raw_body_limits_refuse_before_decoding_or_splitting(tmp_path: Path, raw
     rule = replace(load_rules(tmp_path).served[0], raw=raw)
     result = select_guidance(RuleSet((rule,)), ["src/a.py"], 3, 2000, [],
                              lambda rules: {r.id: compute({}) for r in rules})
-    assert result == {"status": "FAIL", "error": "guidance_projection_limit"}
+    assert result == {"status": "FAIL", "error": "guidance_projection_limit",
+                      "rule_errors": [{"path": ".aegis/rules/traps/projection.md", "error": "detail: limit"}]}
 
 
 def test_host_projection_limit_returns_fixed_withholding():
@@ -1371,7 +1400,9 @@ def test_unrepresentable_canonical_identifier_refuses_without_echo(tmp_path: Pat
     rule = replace(load_rules(tmp_path).served[0], id="unsafe\nidentifier")
     result = select_guidance(RuleSet((rule,)), ["src/a.py"], 3, 2000, [],
                              lambda rules: {r.id: compute({}) for r in rules})
-    assert result == {"status": "FAIL", "error": "guidance_projection_invalid_field"}
+    assert result == {"status": "FAIL", "error": "guidance_projection_invalid_field",
+                      "rule_errors": [{"path": rule.path, "error": "detail: invalid_field"}]}
+    assert "unsafe" not in json.dumps(result)
 
 
 def test_failed_rule_envelope_projects_identifiers_and_error_text(tmp_path: Path):
@@ -2040,22 +2071,35 @@ def test_round16_scan_body_excludes_expanded_evidence_before_projection_limits(
 ):
     from aegis_cli.cli import main
     from aegis_core.guidance_projection import MAX_GUIDANCE_CHARS
+    from aegis_core.packs import MAX_RULE_BYTES
 
     root = tmp_path / "repo"
     config = isolated_home / ".aegis" / "config.json"
     config.parent.mkdir()
-    config.write_text(json.dumps({"v": 1, "slots": {"HEAD": "Evidence", "BIG": "x" * 80}}), encoding="utf-8")
-    suffix = {"controls": "$a\x00b " * 4100, "expansion": "${SLOT.BIG}" * 14000,
+    slots = {"HEAD": "Evidence", "BIG": "x" * 80}
+    if tail == "expansion":
+        slots["X"] = "x" * 80
+    config.write_text(json.dumps({"v": 1, "slots": slots}), encoding="utf-8")
+    suffix = {"controls": "$a\x00b " * 4100, "expansion": "${X}" * 13107,
               "source": "x" * (MAX_GUIDANCE_CHARS + 1)}[tail]
-    _rule(root, "Keep safe.\n## ${SLOT.HEAD}\n" + suffix)
+    path = _rule(root, "Keep safe.\n## ${SLOT.HEAD}\n" + suffix)
+    assert (path.stat().st_size > MAX_RULE_BYTES) == (tail == "source")
     if surface == "scan":
-        registry = SlotRegistry({"HEAD": "Evidence", "BIG": "x" * 80}).sanitized()
+        registry = SlotRegistry(slots).sanitized()
         result = scan(root, ["src/a.py"], registry=registry)
     elif surface == "cli":
-        assert main(["--workspace", str(root), "scan", "src/a.py", "--json"]) == 0
+        assert main(["--workspace", str(root), "scan", "src/a.py", "--json"]) == int(tail == "source")
         result = json.loads(capsys.readouterr().out)
     else:
         result = handle_scan({"workspace": str(root), "files": ["src/a.py"]})
+    if tail == "source":
+        assert result["status"] == "FAIL"
+        assert result["rule_errors"] == [{
+            "path": ".aegis/rules/traps/projection.md",
+            "error": f"{path.stat().st_size} bytes exceeds the {MAX_RULE_BYTES} byte limit (too_large)",
+        }]
+        assert "guidance" not in result
+        return
     assert "Detail: " + WITHHELD_TEXT + "\n" in result["guidance"]
     assert "SLOT." not in result["guidance"]
 
@@ -2537,7 +2581,8 @@ def test_round20_overlong_raw_evidence_heading_refuses_before_classification(tmp
     rule = replace(original, raw=raw)
     assert select_guidance(RuleSet((rule,)), ["src/a.py"], 3, 2000, [],
                            lambda rules: {r.id: compute({}) for r in rules}) == {
-        "status": "FAIL", "error": "guidance_projection_limit"}
+        "status": "FAIL", "error": "guidance_projection_limit",
+        "rule_errors": [{"path": ".aegis/rules/traps/projection.md", "error": "detail: limit"}]}
 
 
 @pytest.mark.parametrize("collection", ["stats", "rules_base", "relevant_rules", "stale_rules"])
@@ -2584,7 +2629,8 @@ def test_round20_selection_refuses_bad_files_without_an_evidence_cut(tmp_path: P
     rule = replace(original, meta=dict(original.meta, target_paths=["**"]))
     assert select_guidance(RuleSet((rule,)), files, 3, 2000, [],
                            lambda rules: {r.id: compute({}) for r in rules}) == {
-        "status": "FAIL", "error": "guidance_projection_invalid_field"}
+        "status": "FAIL", "error": "guidance_projection_invalid_field",
+        "rule_errors": [{"path": ".aegis/rules/traps/projection.md", "error": "matched_files: invalid_field"}]}
 
 
 @pytest.mark.parametrize("collection", ["stale_rules", "rule_errors", "omitted_mandatory"])
@@ -3151,3 +3197,387 @@ def test_round24_indeterminate_policy_metadata_has_a_conservative_default(entry)
 
     result = CompatibilityResult(relevant_rules=[dict(entry, name="one")])
     assert result.staged_mandatory_count() == 1
+
+
+@pytest.mark.parametrize("surface", ["core", "mcp", "user", "mcp_user"])
+@pytest.mark.parametrize("case", ["number", "boolean", "mapping", "mixed_list", "prediction",
+                                  "source", "expanded", "two", "minimal", "secret_path", pytest.param(
+                                      "control_path", marks=pytest.mark.skipif(
+                                          os.name == "nt", reason="Windows filename controls"))])
+def test_selection_refusal_locations_agree_across_public_surfaces(
+    tmp_path: Path, isolated_home: Path, monkeypatch: pytest.MonkeyPatch, surface: str, case: str
+):
+    from aegis_core.scan import scan_user_layer
+    from aegis_core.packs import MAX_RULE_BYTES
+
+    token_budget = [1]
+    if case == "minimal":
+        monkeypatch.setattr(core_config, "env_max_jit_tokens", lambda: token_budget[0])
+    root = isolated_home if surface in {"user", "mcp_user"} else tmp_path / "repo"
+    secret = "ghp_" + "S" * 36
+    config = isolated_home / ".aegis" / "config.json"
+    config.parent.mkdir(exist_ok=True)
+    slots = {"MODEL_FAST": "m" * 80}
+    if case == "expanded":
+        slots["X"] = "m" * 80
+    config.write_text(json.dumps({"v": 1, "slots": slots}), encoding="utf-8")
+    registry = SlotRegistry(slots)
+    path = _rule(root, "Read.")
+    bad_field, reason = "hypothesis", "invalid_field"
+    if case in {"source", "expanded"}:
+        path = _rule(root, "x" * (1024 * 1024 + 1) if case == "source" else "${X}" * 13108)
+        assert (path.stat().st_size > MAX_RULE_BYTES) == (case == "source")
+        bad_field, reason = "detail", "limit"
+    else:
+        if case == "prediction":
+            path = _rule(root, "Read.", rule_id="second")
+            bad_field = "prediction"
+        values = {"number": 3, "boolean": False, "mapping": {"unsafe": secret}, "mixed_list": [secret, 3]}
+        old = "prediction: Unsafe guidance is refused." if bad_field == "prediction" else "hypothesis: 'Keep instructions safe.'"
+        path.write_text(path.read_text(encoding="utf-8").replace(
+            old, bad_field + ": " + json.dumps(values.get(case, {"unsafe": secret}))), encoding="utf-8")
+    paths = [path]
+    if case == "two":
+        second = _rule(root, "Read.", rule_id="second")
+        second.write_text(second.read_text(encoding="utf-8").replace("hypothesis: 'Keep instructions safe.'",
+                                                                  "hypothesis: false"), encoding="utf-8")
+        paths.append(second)
+    if case in {"secret_path", "control_path"}:
+        new_id = secret if case == "secret_path" else "bad\x1bname"
+        path.write_text(path.read_text(encoding="utf-8").replace("id: projection", "id: " + json.dumps(new_id)),
+                        encoding="utf-8")
+        paths = [path.rename(path.with_name(new_id + ".md"))]
+    rows = [{"path": ("guidance_projection_invalid_field" if case == "control_path" else
+                      p.relative_to(root).as_posix().replace(secret, "ghp_REDACTED")),
+             "error": bad_field + ": " + reason} for p in paths]
+    expected = {"status": "FAIL", "error": "guidance_projection_" + reason, "rule_errors": rows}
+    if case == "source":
+        refusal = f"{path.stat().st_size} bytes exceeds the {MAX_RULE_BYTES} byte limit (too_large)"
+        rows[0]["error"] = refusal
+        expected["error"] = ("1 rule file(s) cannot be served, so no partial rule set is returned: "
+                             + rows[0]["path"] + ": " + refusal
+                             + ". Fix or move them; `aegis status` lists them.")
+
+    def read(_):
+        if surface == "core":
+            return scan(root, ["src/a.py"], registry=registry)
+        if surface == "mcp":
+            return handle_scan({"workspace": str(root), "files": ["src/a.py"]})
+        if surface == "user":
+            return scan_user_layer(["src/a.py"], registry=registry)
+        return handle_scan({"_unbound": "no_workspace", "files": ["src/a.py"]})
+
+    assert read(None) == expected
+    assert read(None) == expected
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(read, range(3))) == [expected] * 3
+    assert secret not in json.dumps(expected)
+    if case == "control_path":
+        paths = [paths[0].rename(paths[0].with_name("repaired.md"))]
+    for p in paths:
+        p.write_text("---\nid: " + p.stem + "\ntype: trap\nhypothesis: Safe\n"
+                     "prediction: Safe\ntarget_paths: ['src/*.py']\n---\nRead.\n", encoding="utf-8")
+    if case == "minimal":
+        token_budget[0] = None
+    assert read(None).get("status") != "FAIL"
+
+
+@pytest.mark.parametrize("count,path_chars", [(681, 1), (682, 1), (120, 10000)])
+def test_selection_refusal_envelope_bounds_keep_the_original_code(tmp_path: Path, count: int, path_chars: int):
+    from dataclasses import replace
+    from aegis_core.fitness import compute
+    from aegis_core.rules import RuleSet, load_rules
+    from aegis_core.scan import select_guidance
+
+    _rule(tmp_path, "Read.")
+    original = load_rules(tmp_path).served[0]
+    rules = tuple(replace(original, id="r" + str(i), path="p" * path_chars,
+                          meta=dict(original.meta, hypothesis=False)) for i in range(count))
+    result = select_guidance(RuleSet(rules), ["src/a.py"], count, 1, [],
+                             lambda served: {r.id: compute({}) for r in served})
+    assert result["status"] == "FAIL"
+    assert result["error"] == "guidance_projection_invalid_field"
+    if count == 681:
+        assert result["rule_errors"] == [{"path": "p", "error": "hypothesis: invalid_field"}] * count
+    else:
+        assert result == {"status": "FAIL", "error": "guidance_projection_invalid_field"}
+
+
+def test_selection_refusal_unprojectable_location_keeps_the_original_code(tmp_path: Path):
+    from dataclasses import replace
+    from aegis_core.fitness import compute
+    from aegis_core.guidance_projection import MAX_GUIDANCE_CHARS
+    from aegis_core.rules import RuleSet, load_rules
+    from aegis_core.scan import select_guidance
+
+    _rule(tmp_path, "Read.")
+    original = load_rules(tmp_path).served[0]
+    rule = replace(original, path="p" * (MAX_GUIDANCE_CHARS + 1), meta=dict(original.meta, hypothesis=False))
+    assert select_guidance(RuleSet((rule,)), ["src/a.py"], 3, 1, [],
+                           lambda served: {r.id: compute({}) for r in served}) == {
+        "status": "FAIL", "error": "guidance_projection_invalid_field"}
+
+
+def test_selection_refusal_registry_retry_reuses_the_captured_snapshot(tmp_path: Path):
+    from aegis_core.packs import MAX_RULE_BYTES
+
+    path = _rule(tmp_path, "${X}" * 13108)
+    assert path.stat().st_size <= MAX_RULE_BYTES
+    large = SlotRegistry({"X": "m" * 80})
+    result = scan(tmp_path, ["src/a.py"], registry=large)
+    expected = {"status": "FAIL", "error": "guidance_projection_limit",
+                "rule_errors": [{"path": ".aegis/rules/traps/projection.md", "error": "detail: limit"}]}
+    assert result == expected
+    assert result.with_registry(large) == expected
+    small = result.with_registry(SlotRegistry({"X": "fast"}))
+    assert [rule["name"] for rule in small["relevant_rules"]] == ["projection"]
+    assert result == expected
+    assert small.with_registry(large) == expected
+
+
+@pytest.mark.parametrize("field", ["hypothesis", "prediction"])
+def test_selection_refusal_attributes_list_display_limits(tmp_path: Path, field: str):
+    from dataclasses import replace
+    from aegis_core.fitness import compute
+    from aegis_core.guidance_projection import MAX_GUIDANCE_CHARS
+    from aegis_core.rules import RuleSet, load_rules
+    from aegis_core.scan import select_guidance
+
+    _rule(tmp_path, "Read.")
+    original = load_rules(tmp_path).served[0]
+    rule = replace(original, meta=dict(original.meta, **{field: ["x" * (MAX_GUIDANCE_CHARS - 1), ""]}))
+    result = select_guidance(RuleSet((rule,)), ["src/a.py"], 3, 2000, [],
+                             lambda served: {r.id: compute({}) for r in served})
+    assert result == {"status": "FAIL", "error": "guidance_projection_limit",
+                      "rule_errors": [{"path": rule.path, "error": field + ": limit"}]}
+
+
+@pytest.mark.parametrize("route", ["bound", "dict", "json"])
+@pytest.mark.parametrize("host", ["claude-code", "codex-cli", "unknown"])
+def test_checked_refusal_locations_survive_compatibility_rendering(tmp_path: Path, route: str, host: str):
+    from aegis_core.skills.slots import render_scan_result
+
+    root = tmp_path / "repo"
+    for index in range(100):
+        path = _rule(root, "Read.", rule_id="r" * 80 + str(index).zfill(3))
+        path.write_text(path.read_text(encoding="utf-8").replace("hypothesis: 'Keep instructions safe.'",
+                                                                  "hypothesis: false"), encoding="utf-8")
+    original = scan(root, ["src/a.py"], budget=100)
+    expected = json.loads(json.dumps(original))
+    assert expected["error"] == "guidance_projection_invalid_field"
+    assert len(expected["rule_errors"]) == 100
+    assert estimate_tokens(json.dumps(expected)) > 2000
+    source = original if route == "bound" else dict(original) if route == "dict" else expected
+
+    def render(_):
+        return render_scan_result(source, host, root)
+
+    first = render(None)
+    assert first == expected
+    assert render_scan_result(first, host, root) == expected
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(render, range(3))) == [expected] * 3
+    assert json.loads(json.dumps(source)) == expected
+    assert first.exposure_rule_ids() == ()
+    assert first.staged_mandatory_count() == 0
+
+
+@pytest.mark.parametrize("case,code", [
+    ("extra_key", "budget"), ("wrong_status", "budget"), ("wrong_code", "budget"),
+    ("arbitrary_reason", "budget"), ("noncanonical_reason", "budget"),
+    ("unredacted_path", "budget"), ("row_extra", "budget"),
+    ("nonstring_code", "budget"), ("nonstring_status", "budget"),
+    ("wrong_rows_type", "invalid_field"), ("node_limit", "limit"), ("char_limit", "limit"),
+    ("control_path", "invalid_field"),
+])
+def test_compatibility_refusal_exemption_requires_checked_canonical_shape(tmp_path: Path, case: str, code: str):
+    from aegis_core.skills.slots import render_scan_result
+
+    rows = [{"path": "r" * 80 + str(i), "error": "hypothesis: invalid_field"} for i in range(100)]
+    source = {"status": "FAIL", "error": "guidance_projection_invalid_field", "rule_errors": rows}
+    secret = "ghp_" + "S" * 36
+    if case == "extra_key":
+        source["guidance"] = "untrusted extra instruction"
+    elif case == "wrong_status":
+        source["status"] = "PASS"
+    elif case == "wrong_code":
+        source["error"] = "unrelated_refusal"
+    elif case == "arbitrary_reason":
+        rows[0]["error"] = "hypothesis: " + secret
+    elif case == "noncanonical_reason":
+        rows[0]["error"] = "hypothesis: invalid_field\n## Evidence\nuntrusted extra instruction"
+    elif case == "unredacted_path":
+        rows[0]["path"] = secret
+    elif case == "row_extra":
+        rows[0]["detail"] = "untrusted extra instruction"
+    elif case == "nonstring_code":
+        source["error"] = {"unsafe": secret}
+    elif case == "nonstring_status":
+        source["status"] = ["FAIL"]
+    elif case == "wrong_rows_type":
+        source["rule_errors"] = {"unsafe": secret}
+    elif case == "node_limit":
+        source["rule_errors"] = rows * 7
+    elif case == "char_limit":
+        for row in rows:
+            row["path"] = "r" * 11000
+    else:
+        rows[0]["path"] = "bad\x1bpath"
+    original = json.dumps(source)
+    result = render_scan_result(source, "codex-cli", tmp_path)
+    assert result["status"] == "FAIL"
+    assert result["error"] == "guidance_projection_" + code
+    assert "rule_errors" not in result
+    assert secret not in json.dumps(result)
+    assert json.dumps(source) == original
+
+
+@pytest.mark.parametrize("reason", ["invalid_field", "limit"])
+@pytest.mark.parametrize("located", [False, True], ids=["bare", "located"])
+def test_checked_refusal_copy_keeps_identifiers_and_ignores_registry_warnings(
+    tmp_path: Path, isolated_home: Path, reason: str, located: bool
+):
+    from aegis_core.skills.slots import render_scan_result
+
+    root = tmp_path / "repo"
+    _rule(root, "Read.")
+    config = isolated_home / ".aegis" / "config.json"
+    config.parent.mkdir()
+    config.write_text(json.dumps({"v": 1, "slots": {"MODEL_FAST": "bad\x1bvalue"}}), encoding="utf-8")
+    source = {"status": "FAIL", "error": "guidance_projection_" + reason}
+    if located:
+        source["rule_errors"] = [
+            {"path": "${SLOT.MODEL_FAST}/ghp_REDACTED.md", "error": field + ": " + reason}
+            for field in ("hypothesis", "prediction", "detail", "matched_files")]
+    expected = json.loads(json.dumps(source))
+    result = render_scan_result(source, "codex-cli", root)
+    assert result == expected
+    assert render_scan_result(result, "claude-code", root) == expected
+    assert result.with_registry(SlotRegistry({"MODEL_FAST": "fast"}, warnings=["registry warning"])) == expected
+    assert source == expected
+
+
+@pytest.mark.parametrize("route", ["dict", "json"])
+def test_checked_refusal_retry_snapshot_is_independent_of_public_rows(tmp_path: Path, route: str):
+    from aegis_core.skills.slots import render_scan_result
+
+    expected = {"status": "FAIL", "error": "guidance_projection_invalid_field",
+                "rule_errors": [{"path": "one.md", "error": "hypothesis: invalid_field"}]}
+    source = dict(expected) if route == "dict" else json.loads(json.dumps(expected))
+    result = render_scan_result(source, "codex-cli", tmp_path)
+    result["rule_errors"][0]["path"] = "changed.md"
+    result["rule_errors"][0]["error"] = "changed"
+    assert source == expected
+    assert render_scan_result(result, "codex-cli", tmp_path) == expected
+    assert result.with_registry(SlotRegistry({})) == expected
+
+
+@pytest.mark.parametrize("include_first", [False, True], ids=["single", "two_rules"])
+@pytest.mark.parametrize("identifier", ["id", "path"])
+def test_identifier_refusal_keeps_all_locations_and_the_first_code(
+    tmp_path: Path, identifier: str, include_first: bool
+):
+    from dataclasses import replace
+    from aegis_core.fitness import compute
+    from aegis_core.guidance_projection import MAX_GUIDANCE_CHARS
+    from aegis_core.rules import RuleSet, load_rules
+    from aegis_core.scan import select_guidance
+
+    _rule(tmp_path, "Read.", rule_id="a-first")
+    original = load_rules(tmp_path).served[0]
+    raw = original.raw + b"x" * (MAX_GUIDANCE_CHARS + 1)
+    first = replace(original, raw=raw)
+    second = replace(original, id="bad\x1bname" if identifier == "id" else "b-second",
+                     path=".aegis/rules/traps/bad\x1bname.md", raw=raw)
+    ruleset = RuleSet((first, second) if include_first else (second,))
+    expected = {"status": "FAIL", "error": "guidance_projection_" + ("limit" if include_first else "invalid_field"),
+                "rule_errors": ([{"path": first.path, "error": "detail: limit"}] if include_first else []) +
+                [{"path": "guidance_projection_invalid_field", "error": "detail: invalid_field"}]}
+
+    def read(_):
+        return select_guidance(ruleset, ["src/a.py"], 3, 2000, [],
+                               lambda served: {rule.id: compute({}) for rule in served})
+
+    assert read(None) == expected
+    assert read(None) == expected
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(read, range(3))) == [expected] * 3
+    repaired = replace(second, id="b-second", path=".aegis/rules/traps/b-second.md", raw=original.raw)
+    result = select_guidance(RuleSet((original, repaired)), ["src/a.py"], 3, 2000, [],
+                             lambda served: {rule.id: compute({}) for rule in served})
+    assert [rule["name"] for rule in result["relevant_rules"]] == ["a-first", "b-second"]
+
+
+@pytest.mark.parametrize("length", [300, 1024])
+@pytest.mark.parametrize("row,prefix,suffix", [
+    (0, "-----BEGIN " + "RSA PRIVATE KEY-----", "-----END " + "RSA PRIVATE KEY-----"),
+    (1, "https://user:", "@example.invalid"),
+    (2, "eyJ" + "A" * 512 + "." + "B" * 1024 + ".", ""),
+    (3, "AKIA", ""),
+    (4, "ASIA", ""),
+    (5, "AGPA", ""),
+    (6, "ghp_", ""),
+    (7, "gho_", ""),
+    (8, "github_pat_", ""),
+    (9, "glpat-", ""),
+    (10, "sk_live_", ""),
+    (11, "sk-proj-", ""),
+    (12, "AIza", ""),
+    (13, "xoxb-", ""),
+    (14, "Bearer ", ""),
+    (15, "password=", ""),
+    (16, "password is ", ""),
+], ids=["pem", "url", "jwt", "aws_key", "aws_session", "aws_identity", "github",
+        "github_oauth", "github_pat", "gitlab", "api_key", "openai", "google", "slack",
+        "bearer", "keyed", "natural_language"])
+def test_diagnostic_name_projection_is_idempotent_for_bounded_redaction_rows(
+    length: int, row: int, prefix: str, suffix: str
+):
+    from aegis_core.guidance_projection import project_error_name
+    from aegis_core.redaction import SECRET_REPLACEMENTS
+
+    token = prefix + "A" * (min(length, 512) if row == 1 else length) + suffix
+    assert SECRET_REPLACEMENTS[row][0].search(token) is not None
+    source = ".aegis/rules/traps/" + token + ".md"
+    projected = project_error_name(source)
+    assert projected != source
+    assert project_error_name(projected) == projected
+
+
+@pytest.mark.parametrize("route", ["bound", "dict", "json"])
+@pytest.mark.parametrize("reason", ["invalid_field", "limit"])
+@pytest.mark.parametrize("count", [1, 128], ids=["one_location", "over_token_budget"])
+def test_long_token_refusal_locations_survive_every_rendering_route(
+    tmp_path: Path, route: str, reason: str, count: int
+):
+    from dataclasses import replace
+    from aegis_core.fitness import compute
+    from aegis_core.guidance_projection import MAX_GUIDANCE_ITEMS
+    from aegis_core.rules import RuleSet, load_rules
+    from aegis_core.scan import select_guidance
+    from aegis_core.skills.slots import render_scan_result
+
+    _rule(tmp_path, "Read.")
+    original = load_rules(tmp_path).served[0]
+    path = ".aegis/rules/traps/ghp_" + "A" * 300 + ".md"
+    hypothesis = False if reason == "invalid_field" else ["Read."] * (MAX_GUIDANCE_ITEMS + 1)
+    rules = tuple(replace(original, id=f"rule-{i:03}", path=path,
+                          meta=dict(original.meta, hypothesis=hypothesis)) for i in range(count))
+    direct = select_guidance(RuleSet(rules), ["src/a.py"], count, 2000, [],
+                             lambda served: {rule.id: compute({}) for rule in served})
+    expected = json.loads(json.dumps(direct))
+    assert expected["error"] == "guidance_projection_" + reason
+    assert len(expected["rule_errors"]) == count
+    if count > 1:
+        assert estimate_tokens(json.dumps(expected)) > 2000
+    source = direct if route == "bound" else dict(direct) if route == "dict" else json.loads(json.dumps(direct))
+    result = render_scan_result(source, "codex-cli", tmp_path)
+    assert result == expected
+    assert result["rule_errors"] == [
+        {"path": ".aegis/rules/traps/ghp_REDACTED.md", "error": "hypothesis: " + reason}
+    ] * count
+    assert render_scan_result(result, "claude-code", tmp_path) == expected
+    assert result.with_registry(SlotRegistry({"MODEL_FAST": "fast"})) == expected
+    assert result.exposure_rule_ids() == ()
+    assert result.staged_mandatory_count() == 0
+    assert json.loads(json.dumps(source)) == expected

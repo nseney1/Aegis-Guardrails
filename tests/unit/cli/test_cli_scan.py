@@ -16,8 +16,116 @@ from types import SimpleNamespace
 
 import pytest
 
+import aegis_core.config as core_config
+import aegis_core.scan as core_scan
 from aegis_cli.cli import _build_parser, main
+from aegis_core.workspace.layout import UserLayout
 from tests.conftest import symlink_or_skip
+
+
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("secret_path", [False, True], ids=["plain", "redacted"])
+def test_long_refusal_path_never_clips_the_field_or_reason(ws, monkeypatch, capsys, json_mode, secret_path):
+    from dataclasses import replace
+    from aegis_core.fitness import compute
+    from aegis_core.rules import RuleSet, load_rules
+    from aegis_core.scan import select_guidance
+
+    secret = "ghp_" + "S" * 36
+    name = "a" * 970 + "-" + secret if secret_path else "a" * 1010
+    original = load_rules(ws).served[0]
+    rule = replace(original, id=name, path=".aegis/rules/traps/" + name + ".md",
+                   meta=dict(original.meta, enforcement="gate", hypothesis=3))
+    assert rule.mandatory
+    payload = select_guidance(RuleSet((rule,)), ["src/app.py"], 3, 2000, [],
+                              lambda served: {item.id: compute({}) for item in served})
+    assert payload["rule_errors"][0]["error"] == "hypothesis: invalid_field"
+    monkeypatch.setattr(core_scan, "scan", lambda *args, **kwargs: payload)
+    assert main(["scan", "src/app.py"] + (["--json"] if json_mode else [])) == 1
+    captured = capsys.readouterr()
+    assert secret not in captured.out + captured.err
+    if json_mode:
+        assert captured.err == ""
+        assert json.loads(captured.out) == payload
+    else:
+        assert captured.out == ""
+        code, location, repair = captured.err.splitlines()
+        assert code == "Error: guidance_projection_invalid_field"
+        assert location.startswith("Error: .aegis/rules/traps/")
+        assert location.endswith("...: hypothesis: invalid_field")
+        assert len(location) <= len("Error: ") + 1024
+        assert repair == "Fix the field type and run `aegis rule lint <path>`."
+
+
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("case", ["number", "boolean", "mapping", "mixed_list", "prediction", "source",
+                                  "expanded", "two", "minimal", "secret_path", pytest.param(
+                                      "control_path", marks=pytest.mark.skipif(
+                                          os.name == "nt", reason="Windows filename controls"))])
+def test_projection_refusal_prints_locations_and_fixed_repair(ws, monkeypatch, capsys, json_mode, case):
+    from aegis_core.packs import MAX_RULE_BYTES
+    from aegis_core.scan import scan
+    from aegis_core.skills.slots import SlotRegistry
+    if case == "minimal":
+        monkeypatch.setattr(core_config, "env_max_jit_tokens", lambda: 1)
+    home = ws.parent / "home"
+    config = home / ".aegis" / "config.json"
+    config.parent.mkdir(parents=True)
+    slots = {"MODEL_FAST": "m" * 80}
+    if case == "expanded":
+        slots["X"] = "m" * 80
+    config.write_text(json.dumps({"v": 1, "slots": slots}), encoding="utf-8")
+    monkeypatch.setattr(UserLayout, "current", classmethod(lambda cls: UserLayout(home)))
+    path = ws / ".aegis" / "rules" / "traps" / "trap-src-python.md"
+    secret = "ghp_" + "S" * 36
+    field, reason = "hypothesis", "invalid_field"
+    if case in {"source", "expanded"}:
+        body = "x" * (1024 * 1024 + 1) if case == "source" else "${X}" * 13108
+        path.write_text(path.read_text(encoding="utf-8") + body, encoding="utf-8")
+        assert (path.stat().st_size > MAX_RULE_BYTES) == (case == "source")
+        field, reason = "detail", "limit"
+    else:
+        if case == "prediction":
+            second = path.with_name("second.md")
+            second.write_text(path.read_text(encoding="utf-8").replace("id: trap-src-python", "id: second"), encoding="utf-8")
+            path = second
+            field = "prediction"
+        lines = path.read_text(encoding="utf-8").splitlines()
+        values = {"number": 3, "boolean": False, "mapping": {"unsafe": secret}, "mixed_list": [secret, 3]}
+        path.write_text("\n".join(field + ": " + json.dumps(values.get(case, {"unsafe": secret}))
+                                  if line.startswith(field + ":") else line for line in lines) + "\n", encoding="utf-8")
+    if case == "two":
+        second = path.with_name("second.md")
+        second.write_text(path.read_text(encoding="utf-8").replace("id: trap-src-python", "id: second"), encoding="utf-8")
+    if case in {"secret_path", "control_path"}:
+        new_id = secret if case == "secret_path" else "bad\x1bname"
+        path.write_text(path.read_text(encoding="utf-8").replace("id: trap-src-python", "id: " + json.dumps(new_id)),
+                        encoding="utf-8")
+        path = path.rename(path.with_name(new_id + ".md"))
+    expected = scan(ws, ["src/app.py"], registry=SlotRegistry(slots))
+    assert expected["rule_errors"]
+    if case == "source":
+        assert expected["rule_errors"] == [{
+            "path": path.relative_to(ws).as_posix(),
+            "error": f"{path.stat().st_size} bytes exceeds the {MAX_RULE_BYTES} byte limit (too_large)",
+        }]
+    assert main(["scan", "src/app.py"] + (["--json"] if json_mode else [])) == 1
+    captured = capsys.readouterr()
+    assert secret not in captured.out + captured.err
+    assert "\x1b" not in captured.out + captured.err
+    if json_mode:
+        assert captured.err == ""
+        assert json.loads(captured.out) == expected
+    elif case == "source":
+        assert captured.out == ""
+        assert captured.err == "Error: " + expected["error"] + "\n"
+    else:
+        assert captured.out == ""
+        rows = "".join("Error: " + row["path"] + ": " + row["error"] + "\n" for row in expected["rule_errors"])
+        repair = ("Fix the field type and run `aegis rule lint <path>`." if reason == "invalid_field" else
+                  "Shorten the instruction or slot expansion and run `aegis rule lint <path>`.")
+        assert captured.err == "Error: guidance_projection_" + reason + "\n" + rows + repair + "\n"
+        assert field + ": " + reason in captured.err
 
 
 def _workspace(root: Path) -> Path:

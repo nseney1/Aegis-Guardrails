@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import aegis_core.rule_inventory as rule_inventory_module
 from aegis_core.rule_inventory import RuleInventoryError
 from aegis_core.rules import RuleCache, lf_digest, load_rules
 from tests.conftest import symlink_or_skip
@@ -493,10 +495,11 @@ def test_an_io_failure_after_a_warm_cache_raises_instead_of_serving_stale_rules(
     path = _write(tmp_path, "traps/t.md", _rule("t"))
     cache = RuleCache()
     assert cache.get(tmp_path).get("t") is not None
+    monkeypatch.setattr(rule_inventory_module, "os", SimpleNamespace(**{**vars(os), "stat": os.stat}))
     real = getattr(inventory.os, call)
 
     def denied(target, *args, **kwargs):
-        if os.fspath(target) == str(path):
+        if os.fspath(target) in {str(path), path.name}:
             raise PermissionError(f"simulated {call} denial")
         return real(target, *args, **kwargs)
 

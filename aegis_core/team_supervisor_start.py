@@ -14,10 +14,9 @@ from pathlib import Path
 import re
 import stat
 import subprocess
-import sys
 import time
 
-from aegis_core import storage_confined
+from aegis_core import kernel_identity, storage_confined
 from aegis_core.primitives import json_preflight
 from aegis_core.team_supervisor import (
     COMPONENTS, STATE_NAME, STATE_MAX_BYTES, SupervisorError, empty_state,
@@ -50,62 +49,24 @@ class _Refusal(ValueError):
 
 def descriptor_supported():
     """Linux start ticks and POSIX directory locks are required; no fallback by PID."""
-    return sys.platform == "linux" and storage_confined.descriptor_supported()
+    return kernel_identity.descriptor_supported()
 
 
 def process_identity(pid):
-    """Read kernel identity, never a repository PID file; unknown is not dead."""
+    """Read shared kernel identity while retaining the starter refusal contract."""
     if not descriptor_supported():
         raise _Refusal("unsupported_platform")
-    if type(pid) is not int or not 1 <= pid <= 2147483647:
-        raise _Refusal("identity_unavailable")
     try:
-        with storage_confined.confined_file(Path("/proc"), (str(pid), "stat")) as handle:
-            data = handle.read_bytes(4096)
-        # comm may contain spaces, parentheses and newlines. Start ticks are field 22.
-        prefix, separator, tail = data.rpartition(b") ")
-        if not separator or not prefix.startswith(str(pid).encode("ascii") + b" ("):
-            raise _Refusal("identity_unavailable")
-        fields = tail.split()
-        if len(fields) < 20 or not fields[19].isdigit() or len(fields[19]) > 20:
-            raise _Refusal("identity_unavailable")
-        if fields[0] in (b"Z", b"X", b"x"):
-            return None
-        return {"pid": pid, "start_ticks": int(fields[19])}
-    except storage_confined.ConfinedFileError as error:
-        if error.reason == "missing" and pid != os.getpid():
-            if process_identity(os.getpid()) is None:
-                raise _Refusal("identity_unavailable")
-            return None
-        raise _Refusal("identity_unavailable") from None
-
-
-def _namespace():
-    """Inspect kernel links on parent descriptors borrowed from confined storage."""
-    with storage_confined.confined_file(Path("/proc"), ("self",)) as handle:
-        # Reading self, rather than following it, also checks that numeric PIDs
-        # mean the same thing in this proc mount and the caller's PID namespace.
-        own_pid = os.readlink("self", dir_fd=handle._parent)
-        if own_pid != str(os.getpid()):
-            raise _Refusal("identity_unavailable")
-    with storage_confined.confined_file(Path("/proc"), (own_pid, "ns", "pid")) as handle:
-        namespace = os.readlink("pid", dir_fd=handle._parent)
-        if len(namespace) > 26 or _PID_NAMESPACE.fullmatch(namespace) is None:
-            raise _Refusal("identity_unavailable")
-        return namespace
+        return kernel_identity.process_identity(pid, confined_file=storage_confined.confined_file)
+    except kernel_identity.IdentityError as error:
+        code = "unsupported_platform" if error.reason == "unsupported" else "identity_unavailable"
+        raise _Refusal(code) from None
 
 
 def _scope():
     try:
-        with storage_confined.confined_file(Path("/proc"), ("sys", "kernel", "random", "boot_id")) as handle:
-            data = handle.read_bytes(37)
-        if len(data) not in (36, 37) or len(data) == 37 and data[-1:] != b"\n":
-            raise _Refusal("identity_unavailable")
-        boot = data[:36].decode("ascii")
-        if _BOOT_ID.fullmatch(boot) is None:
-            raise _Refusal("identity_unavailable")
-        return {"boot_id": boot, "pid_namespace": _namespace()}
-    except (storage_confined.ConfinedFileError, OSError, UnicodeError):
+        return kernel_identity.scope(confined_file=storage_confined.confined_file, readlink=os.readlink)
+    except kernel_identity.IdentityError:
         raise _Refusal("identity_unavailable") from None
 
 
@@ -125,15 +86,12 @@ def _state_directory(home):
 
 @contextmanager
 def _locked(directory):
-    import fcntl
     try:
-        fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        raise _Refusal("state_locked") from None
-    try:
-        yield
-    finally:
-        fcntl.flock(directory, fcntl.LOCK_UN)
+        with kernel_identity.owner_directory_lock(directory):
+            yield
+    except kernel_identity.IdentityError as error:
+        code = "state_locked" if error.reason == "locked" else "state_unavailable"
+        raise _Refusal(code) from None
 
 
 def _pairs(pairs):

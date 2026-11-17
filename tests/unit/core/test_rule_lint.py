@@ -1808,7 +1808,7 @@ def test_lint_plain_oversized_documentation_uses_loader_classification_without_y
         entries = kwargs["inventory"].entries
         assert all(len(entry.content) <= lint.MAX_RULE_BYTES for entry in entries)
         prefixes = [entry for entry in entries if entry.relative_path == path]
-        assert len(prefixes) == (0 if ending else 1)
+        assert len(prefixes) == 1  # Invalid bytes beyond capture cannot change classification.
         for entry in prefixes:
             assert split_frontmatter(entry.content.decode("utf-8-sig"))[0] == "none"
         calls.append(entries)
@@ -1818,12 +1818,7 @@ def test_lint_plain_oversized_documentation_uses_loader_classification_without_y
     results = lint.lint_workspace(root)
     by_path = {r.path: r for r in results}
     assert {r.path for r in records} == set(by_path)
-    if ending:
-        assert "too_large" in lint_codes(by_path[path])
-        if target.stem == "sample":
-            assert all("duplicate" in lint_codes(r) for r in results)
-    else:
-        assert len(results) == 1 and results[0].ok
+    assert len(results) == 1 and results[0].ok
     assert len(calls) == 1
 
 
@@ -2061,11 +2056,8 @@ def test_lint_bounded_frontmatter_preserves_unicode_boundaries_and_encoding_erro
     records = load_rules(root).rules
     results = lint.lint_workspace(root)
     assert {r.path for r in results} == {r.path for r in records}
-    if invalid_tail:
-        assert len(results) == 2 and all("duplicate" in lint_codes(r) for r in results)
-        assert "too_large" in lint_codes(next(r for r in results if r.path == path))
-    else:
-        assert len(results) == 1 and results[0].ok
+    # The coordinator's bounded-prefix ruling makes the uncaptured tail irrelevant.
+    assert len(results) == 1 and results[0].ok
 
 
 def test_lint_oversized_gate_does_not_capture_sources_from_its_frontmatter_prefix(tmp_path, monkeypatch):
@@ -2271,9 +2263,9 @@ def scan_simulation_row(result):
 
 @pytest.mark.parametrize("scenario,expected", [
     ("selected", "scan simulation: selected in all profiles"),
-    ("tokens", "scan simulation: not selected in one or more profiles"),
-    ("mandatory", "scan simulation: not selected in one or more profiles"),
-    ("fitness", "scan simulation: not selected in one or more profiles"),
+    ("tokens", "scan simulation: not selected in profiles: antigravity, claude-code, codex-cli, gemini-cli, generic"),
+    ("mandatory", "scan simulation: not selected in profiles: antigravity, claude-code, codex-cli, gemini-cli, generic"),
+    ("fitness", "scan simulation: not selected in profiles: antigravity, claude-code, codex-cli, gemini-cli, generic"),
 ])
 def test_lint_scan_simulation_matches_real_scan_and_cli(tmp_path, monkeypatch, capsys, scenario, expected):
     import argparse
@@ -2614,7 +2606,7 @@ def test_argon_0935_reviewed_bytes_checked_before_matching(tmp_path, reviewed_ta
     assert ("sample" in actual.exposure_rule_ids()) is (reviewed_target == "src/**")
     expected = ("not evaluated: candidate differs from scan snapshot" if amended else
                 "scan simulation: selected in all profiles" if reviewed_target == "src/**" else
-                "scan simulation: not selected in one or more profiles")
+                "scan simulation: not selected in profiles: antigravity, claude-code, codex-cli, gemini-cli, generic")
     for _ in range(2):
         assert scan_simulation_row(lint.lint_workspace(root, [path])[0]) == expected
     with ThreadPoolExecutor(max_workers=3) as pool:
@@ -2623,7 +2615,7 @@ def test_argon_0935_reviewed_bytes_checked_before_matching(tmp_path, reviewed_ta
     (root / path).write_bytes(reviewed)
     recovered = lint.lint_workspace(root, [path])[0]
     assert scan_simulation_row(recovered) == ("scan simulation: selected in all profiles" if reviewed_target == "src/**"
-                                             else "scan simulation: not selected in one or more profiles")
+                                             else "scan simulation: not selected in profiles: antigravity, claude-code, codex-cli, gemini-cli, generic")
 
 
 @pytest.mark.parametrize("code", ["git_timeout", "git_failed", "privacy_refused"])

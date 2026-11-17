@@ -52,13 +52,12 @@ def _discover_forbid_ast_rules(
     not hold ``repo_root`` at all, the working tree. ``reviewed=False`` enforces the working tree
     as is: ``aegis check --record`` runs on an exported snapshot, which no base describes.
 
-    Returns (rules, broken): a rule file that cannot be loaded and names forbid_ast, or
-    whose forbid_ast is malformed, would enforce nothing, so each is returned as
-    (relative path, reason) for the caller to fail closed on instead of being dropped.
-    ``broken`` reads the working tree too, so a malformed new gate fails before it is merged.
-    An unsafe rules tree or an unreadable BASE raises, which the caller also fails on.
+    Returns (rules, broken). Broken entries are (relative path, reason): oversized
+    records from either source, damaged files naming forbid_ast, or malformed specs.
+    The working tree is checked too, so a malformed new gate fails before merge.
+    An unsafe rules tree or an unreadable BASE raises and fails closed.
     """
-    from aegis_core import rule_integrity
+    from aegis_core import rule_integrity, rule_inventory
     from aegis_core.rules import RuleCache, workspace_root
 
     root = workspace_root(repo_root)
@@ -77,17 +76,18 @@ def _discover_forbid_ast_rules(
     broken: list[tuple[str, str]] = []
     for ruleset, collect in ((cache.get(root), False), (enforced, True)):
         for rule in ruleset.rules:
-            if not rule.ok:
-                # Only a file that names the key can declare it: a damaged note does not gate.
-                if b"forbid_ast" in rule.raw and not collect:
-                    broken.append((rule.path, rule.error or "cannot be loaded"))
+            if not rule.ok or (rule.size or 0) > rule_inventory.MAX_RULE_BYTES:
+                if ((rule.size or 0) > rule_inventory.MAX_RULE_BYTES
+                        or b"forbid_ast" in rule.raw and not collect) and not any(
+                        path == rule.path for path, _reason in broken):
+                    broken.append((rule.path, rule.error or "too_large"))
                 continue
             if rule.expired or "forbid_ast" not in rule.meta:
                 continue
             spec = rule.meta.get("forbid_ast")
             spec_error = _forbid_ast_spec_error(spec)
             if spec_error:
-                if (rule.path, spec_error) not in broken:
+                if not any(path == rule.path for path, _reason in broken):
                     broken.append((rule.path, spec_error))
             elif collect:
                 discovered.append((rule, spec))
