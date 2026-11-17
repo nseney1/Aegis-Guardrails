@@ -8,9 +8,11 @@ listed but still served.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import aegis_core.scan as scan_service
 from aegis_core import sync
 from aegis_core.scan import MANDATORY_SLOT_CAP, NO_CHANGES_TEXT, RULE_CACHE, scan
 from aegis_core.telemetry_engine import ledger
@@ -42,6 +44,27 @@ def _fresh_cache():
 
 def _names(result: dict) -> list:
     return [r["name"] for r in result["relevant_rules"]]
+
+
+def test_simulation_refuses_oversized_size_only_inventory_before_selection(tmp_path, monkeypatch):
+    from aegis_core.rule_inventory import MAX_RULE_BYTES, inventory_rules
+    from aegis_core.rules import load_rules
+
+    path = _rule(tmp_path, "oversized", "invariant")
+    with path.open("ab") as stream:
+        stream.write(b"x" * MAX_RULE_BYTES)
+    inventory = inventory_rules(tmp_path)
+    assert inventory.entries[0].content == b"" and inventory.entries[0].size > MAX_RULE_BYTES
+    ruleset = load_rules(tmp_path, inventory=inventory)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("oversized source reached effective selection")
+
+    monkeypatch.setattr(scan_service, "rule_integrity", SimpleNamespace(
+        effective=forbidden, IntegrityError=scan_service.rule_integrity.IntegrityError))
+    for _ in range(2):
+        assert scan_service.simulate_rule_selection(tmp_path, inventory, ruleset) == {
+            "oversized": "not evaluated: scan inputs over limit"}
 
 
 def test_scan_returns_the_rules_whose_patterns_match(tmp_path: Path) -> None:
