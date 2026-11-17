@@ -15,7 +15,7 @@ import sys
 import time
 import uuid
 
-from aegis_core import primitives, storage, storage_confined, team_queue
+from aegis_core import kernel_identity, primitives, storage, storage_confined, team_queue
 from aegis_core.workspace.layout import UserLayout
 
 MAX_BYTES = 65536
@@ -279,16 +279,16 @@ def _policy(value, registration):
 
 
 def process_identity():
-    """Read only fixed OS-owned proc records, through descriptor confinement."""
-    with storage_confined.confined_file("/proc", ("sys", "kernel", "random", "boot_id")) as handle:
-        boot = handle.read_bytes(128).decode("ascii").strip()
-    # /proc/self is a kernel symlink; use our numeric PID, never follow that link.
-    with storage_confined.confined_file("/proc", (str(os.getpid()), "stat")) as handle:
-        raw = handle.read_bytes(4096).decode("ascii")
-    require(re.fullmatch(r"[0-9a-f-]{36}", boot) is not None)
-    fields = raw[raw.rfind(")") + 2:].split()
-    require(len(fields) >= 20 and fields[19].isdigit())
-    return {"boot_id": boot, "pid": os.getpid(), "start_ticks": int(fields[19])}
+    """Read shared kernel facts without changing the process-specific session key."""
+    try:
+        process = kernel_identity.process_identity(os.getpid(), confined_file=storage_confined.confined_file)
+        require(process is not None)
+        return {"boot_id": kernel_identity.boot_id(confined_file=storage_confined.confined_file), **process}
+    except kernel_identity.IdentityError as error:
+        reason = {"invalid": "role_invalid", "missing": "role_missing", "unsafe": "role_invalid",
+                  "too_large": "role_invalid", "invalid_path": "role_invalid",
+                  "unsupported": "unsupported_platform"}.get(error.reason, "role_io_unavailable")
+        raise RoleRefusal(reason) from None
 
 
 def _session_parts(process):
