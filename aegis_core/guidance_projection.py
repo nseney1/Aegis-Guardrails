@@ -29,6 +29,7 @@ SLOT_REF_PATTERN = re.compile(r"\$\{(?:SLOT|RULE)\.([A-Za-z0-9_\-]+)\}|\$\{([A-Z
 WITHHELD_GUIDANCE = "guidance withheld: ambiguous structure"
 CONTROL_GUIDANCE = "guidance withheld: control characters"
 MAX_IDENTIFIER_ITEMS = 4096
+_MAX_ERROR_NAME_PASSES = 32
 _IDENTIFIER_FIELDS = frozenset({"id", "name", "path", "_path", "matched_files", "files"})
 _CONTROL_CANDIDATES = re.compile(r"[^\t\n\r\x20-\x7e]")
 _DIAGNOSTIC_ESCAPES = re.compile(
@@ -403,9 +404,11 @@ def project_identifier(value: Any, registry: Optional[_Slots] = None) -> str:
 
 
 def project_error_name(value: Any) -> str:
-    """Redact a diagnostic name to a fixed point within the input character cap."""
+    """Return a fixed point within 32 passes, or the fixed invalid-field refusal."""
     try:
-        for _ in range(MAX_GUIDANCE_CHARS):
+        # Bounded token rows can expose another match on each whole-name pass.
+        # Count the equality check too; never publish an unconfirmed fixed point.
+        for _ in range(_MAX_ERROR_NAME_PASSES):
             projected = project_identifier(value)
             if projected == value:
                 return projected
