@@ -429,6 +429,66 @@ def test_unreadable_scope_writes_nothing(tmp_path, monkeypatch):
     assert not leaf(home).exists()
 
 
+@pytest.mark.parametrize("field,value", [
+    ("boot_id", "abcdefab-1234-1234-1234-123456789abc"),
+    ("pid_namespace", "pid:[54321]"),
+])
+@pytest.mark.parametrize("existing", [False, True])
+def test_scope_change_during_lease_refuses_then_retries(tmp_path, monkeypatch, field, value, existing):
+    home = make_home(tmp_path)
+    workspace = make_store(tmp_path)
+    use_leases(monkeypatch, found(lease()))
+    if existing:
+        assert call_bind(home, workspace) == {"status": "ok"}
+    frozen = leaf(home).read_bytes() if existing else None
+    original = binding._scope()
+    scope = dict(original)
+    monkeypatch.setattr(binding, "_scope", lambda: dict(scope))
+
+    def changed(workspace, lane):
+        scope[field] = value
+        return lease(lane)
+
+    monkeypatch.setattr(binding, "_selected_lease", changed)
+    for _ in range(2):
+        scope.update(original)
+        assert call_bind(home, workspace) == _refusal("identity_unavailable")
+        assert (leaf(home).read_bytes() if existing else None) == frozen
+        assert leaf(home).exists() == existing
+    use_leases(monkeypatch, found(lease()))
+    assert call_bind(home, workspace) == {"status": "ok"}
+
+
+def test_scope_change_under_concurrent_bind_never_publishes(tmp_path, monkeypatch):
+    home = make_home(tmp_path)
+    workspace = make_store(tmp_path)
+    scope = binding._scope()
+    started, release = threading.Event(), threading.Event()
+    monkeypatch.setattr(binding, "_scope", lambda: dict(scope))
+
+    def changed(workspace, lane):
+        started.set()
+        assert release.wait(5)
+        scope["pid_namespace"] = "pid:[54321]"
+        return lease(lane)
+
+    monkeypatch.setattr(binding, "_selected_lease", changed)
+    result = {}
+    thread = threading.Thread(target=lambda: result.update(call_bind(home, workspace)))
+    thread.start()
+    try:
+        assert started.wait(5)
+        assert call_bind(home, workspace) == _refusal("state_locked")
+    finally:
+        release.set()
+        thread.join(5)
+    assert not thread.is_alive()
+    assert result == _refusal("identity_unavailable")
+    assert not leaf(home).exists()
+    use_leases(monkeypatch, found(lease()))
+    assert call_bind(home, workspace) == {"status": "ok"}
+
+
 def test_absent_pid_writes_nothing(tmp_path, monkeypatch):
     home = make_home(tmp_path)
     workspace = make_store(tmp_path)
