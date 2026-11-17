@@ -21,6 +21,10 @@ __all__ = ["compile_possible", "max_match_width", "may_match_visible", "overlapp
 _UNBOUNDED = sre_parse.parse(r'[\s\S]*').getwidth()[1]
 _GRAPH_LIMIT = 32768
 _REPEAT_LIMIT = 2048
+# Per-search cache bounds. Each transition retains at most two DFA state
+# endpoints (duplicates count); units also bound their NFA/context members.
+_DFA_STATE_LIMIT = 2048
+_DFA_UNIT_LIMIT = 65536
 _CATEGORIES = dict(CATEGORY_DIGIT=r'\d', CATEGORY_NOT_DIGIT=r'\D', CATEGORY_SPACE=r'\s',
                    CATEGORY_NOT_SPACE=r'\S', CATEGORY_WORD=r'\w', CATEGORY_NOT_WORD=r'\W')
 
@@ -112,18 +116,49 @@ def compile_possible(patterns, *, carried_patterns=()):
     return (tuple(graph), roots, carried) if supported else None
 
 
-def may_match_visible(grammar, text, runs, charge, *, start_at=0):
+def _possible_transition(graph, roots, states, previous, char, visible, charge):
+    """Expand one NFA transition, charging each visit before expansion."""
+    pending = list(states | {(root, False) for root in roots})
+    visited, after = set(), set(states) if char is not None and not visible else set()
+    while pending:
+        state, touched = pending.pop()
+        if (state, touched) in visited:
+            continue
+        if not charge(1):
+            return True, frozenset()
+        visited.add((state, touched))
+        if state == 0:
+            if touched:
+                return True, frozenset()
+            continue
+        matcher, targets = graph[state]
+        if matcher is None:
+            pending.extend((target, touched) for target in targets)
+        elif isinstance(matcher, tuple):
+            positive, predicate = matcher
+            if any((prior is not None and predicate.fullmatch(prior) is not None) == positive
+                   for prior in previous):
+                pending.extend((target, touched) for target in targets)
+        elif char is not None and matcher.fullmatch(char) is not None:
+            after.update((target, touched or visible) for target in targets)
+    return False, frozenset(after)
+
+
+def may_match_visible(grammar, text, runs, charge, *, start_at=0, memoize=True):
     """Return False only after proving no match touches a visible character.
 
-    Each graph-state visit is charged before expansion. An unknown grammar or
-    exhausted budget returns True conservatively. Optional final characters
-    can be skipped; visible characters are mandatory. No variant strings are
-    materialized. Merging (node, touched-visible) states loses no possibility.
+    Misses charge each graph-state visit; hits charge one transition before
+    lookup. Cache keys retain lookbehind context and start/boundary eligibility.
+    The bounded lazy DFA belongs to this call, so retries and concurrent callers
+    share no mutable state. On either cache cap, resume ordinary NFA expansion
+    under the same window budget. Unknown/exhausted searches return True.
     """
     if grammar is None:
         return True
     graph, roots, carried_roots = grammar
-    states = set()
+    states = frozenset()
+    memo = {} if memoize and _DFA_STATE_LIMIT else None
+    retained = 0
 
     def units():
         previous_end, previous_kind, optional = -1, None, False
@@ -133,35 +168,29 @@ def may_match_visible(grammar, text, runs, charge, *, start_at=0):
                 yield char, visible, boundary and offset == 0
             previous_end, previous_kind, optional = end, kind, not visible
 
-    previous = {None}
+    previous = frozenset({None})
     for position, (char, visible, boundary) in enumerate(chain(units(), [(None, False, False)])):
+        # Reserve lookup/key work before allocating context or successor sets.
+        if not charge(1):
+            return True
+        key = (states, previous, char, visible, boundary, position >= start_at) if memo is not None else None
+        cached = memo.get(key) if memo is not None else None
+        if cached is not None:
+            states, previous = cached
+            continue
         starts = chain(roots, carried_roots if boundary else ()) if position >= start_at else ()
-        pending = list(states | {(root, False) for root in starts})
-        visited, after = set(), set(states) if char is not None and not visible else set()
-        while pending:
-            state, touched = pending.pop()
-            if (state, touched) in visited:
-                continue
-            if not charge(1):
-                return True
-            visited.add((state, touched))
-            if state == 0:
-                if touched:
-                    return True
-                continue
-            matcher, targets = graph[state]
-            if matcher is None:
-                pending.extend((target, touched) for target in targets)
-            elif isinstance(matcher, tuple):
-                positive, predicate = matcher
-                if any((prior is not None and predicate.fullmatch(prior) is not None) == positive
-                       for prior in previous):
-                    pending.extend((target, touched) for target in targets)
-            elif char is not None and matcher.fullmatch(char) is not None:
-                after.update((target, touched or visible) for target in targets)
-        states = after
-        if char is not None:
-            previous = {char} if visible else previous | {char}
+        found, after = _possible_transition(graph, starts, states, previous, char, visible, charge)
+        if found:
+            return True
+        prior = previous if char is None else frozenset({char}) if visible else previous | {char}
+        if memo is not None:
+            cost = len(states) + len(previous) + len(after) + len(prior)
+            if 2 * (len(memo) + 1) <= _DFA_STATE_LIMIT and cost <= _DFA_UNIT_LIMIT - retained:
+                memo[key] = after, prior
+                retained += cost
+            else:
+                memo = None
+        states, previous = after, prior
     return False
 
 
