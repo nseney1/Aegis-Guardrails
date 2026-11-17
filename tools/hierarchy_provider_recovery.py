@@ -11,8 +11,14 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hierarchy_jobs import JOB_ID, recovery_status  # noqa: E402
 from hierarchy_lifecycle import Lifecycle, provider_handle  # noqa: E402
+from hierarchy_mailbox_index import MailboxIndex  # noqa: E402
 from hierarchy_mailbox import Mailbox, SHA256, SLUG, matching, require  # noqa: E402
 from hierarchy_workspace import Store  # noqa: E402
+
+
+def mailbox_reader(mailbox):
+    """Keep the pinned mailbox outcome authoritative during reader rollout."""
+    return MailboxIndex(mailbox, mode="shadow")
 
 
 PROVIDER_SCHEMA = "aegis.provider-recovery/v1"
@@ -61,7 +67,7 @@ def job_status(store_path, job_id, recipes_path=None):
     original_request = False
     if "mailbox_root" in initiative:
         try:
-            record = Mailbox(initiative["mailbox_root"]).messages().get(message_id)
+            record = mailbox_reader(Mailbox(initiative["mailbox_root"])).get(message_id)
             original_request = record is not None and record["message"]["type"] == "job_request"
         except (ValueError, OSError, UnicodeError):
             # Missing mailbox visibility remains explicit orphan/unknown evidence.

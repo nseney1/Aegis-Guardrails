@@ -6728,7 +6728,8 @@ def test_jobs2_argon_mailbox_only_error_does_not_participate_in_another_owners_f
             store.unlink()
         if retained.exists():
             retained.rename(store)
-    assert enumerated == swapped == [True]
+    assert enumerated == [True, True]  # shadow retries once on a PIN-only refusal
+    assert swapped == [True]
     assert [row for row in report["rows"] if row.get("initiative") == "empty"] == [
         {"initiative": "empty", "state": "mailbox_error", "error": "fixture mailbox enumeration denied"}]
     assert sum(row.get("reason") == "post_grant_step_failed" for row in report["rows"]) == 1
