@@ -38,6 +38,7 @@ from aegis_core.redaction import redact_insight_text
 
 __all__ = ["CommitIdentity", "GitRefusal", "GitStore", "Plan", "cas_fast_forward", "commit_tested",
            "descriptor_support", "ref_oid", "plan_merge", "plan_pick", "plan_revert", "snapshot_tree",
+           "validate_oid", "validate_message",
            # Export the internal runner-transfer surface for the lane guard's accounting.
            "_current", "_publish", "_require_runner", "_snapshot_baselines", "_write_snapshot"]
 
@@ -94,13 +95,15 @@ def descriptor_support() -> bool:
             and os.readlink in os.supports_dir_fd)
 
 
-def _oid(value: str) -> str:
+def validate_oid(value: str) -> str:
+    """Return one full object id or raise GitRefusal('invalid_oid'); no I/O."""
     if not isinstance(value, str) or len(value) not in (40, 64) or not _OID.fullmatch(value):
         raise GitRefusal("invalid_oid")
     return value
 
 
-def _message(value: str) -> bytes:
+def validate_message(value: str) -> bytes:
+    """Encode a bounded unsigned commit message or raise GitRefusal('invalid_message')."""
     if not isinstance(value, str) or len(value) > MAX_MESSAGE_BYTES:
         raise GitRefusal("invalid_message")
     try:
@@ -235,7 +238,7 @@ class GitStore:
     def object(self, oid: str, kind: str, *, max_bytes: Optional[int] = None, _runner=None) -> bytes:
         """Size before payload capture; only full validated ids reach cat-file."""
         _require_runner(_runner)
-        oid = _oid(oid)
+        oid = validate_oid(oid)
         if max_bytes is not None and (isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0):
             raise GitRefusal("invalid_object")
         limit = MAX_OBJECT_BYTES if max_bytes is None else min(MAX_OBJECT_BYTES, max_bytes)
@@ -245,7 +248,7 @@ class GitStore:
     def read_blob(self, tree: str, path: str, *, _runner=None) -> bytes:
         """Read an exact tree path from private objects, without filesystem opens."""
         _require_runner(_runner)
-        _oid(tree)
+        validate_oid(tree)
         if not isinstance(path, str) or len(path) > MAX_PATH_BYTES or "\0" in path:
             raise GitRefusal("unsafe_path")
         try:
@@ -591,7 +594,7 @@ def _write_snapshot(store, entries, runner):
         store._run(["unpack-objects", "-q", "--strict"], stdin=pack)
     if records:
         store._run(["update-index", "-z", "--index-info"], stdin=b"".join(records))
-    return _oid(store._run(["write-tree"]).stdout.decode("ascii", "replace").strip())
+    return validate_oid(store._run(["write-tree"]).stdout.decode("ascii", "replace").strip())
 
 
 @_lane_operation
@@ -681,18 +684,18 @@ def commit_tested(store: GitStore, tree: str, parent: Union[str, Sequence[str]],
                   message: str, identity: CommitIdentity, *, _runner=None) -> str:
     """Unsigned deterministic commit of exactly tree; no index refresh or ref move."""
     _require_runner(_runner)
-    data, env = _message(message), _identity(identity)
-    tree = _oid(tree)
+    data, env = validate_message(message), _identity(identity)
+    tree = validate_oid(tree)
     parents = (parent,) if isinstance(parent, str) else parent
     if not isinstance(parents, (tuple, list)) or not 1 <= len(parents) <= 8:
         raise GitRefusal("invalid_parent")
     args = ["commit-tree", tree]
     for oid in parents:
-        args.extend(("-p", _oid(oid)))
+        args.extend(("-p", validate_oid(oid)))
     store.object(tree, "tree")
     for oid in parents:
         store.object(oid, "commit")
-    return _oid(store._run(args, stdin=data, extra_env=env).stdout.decode().strip())
+    return validate_oid(store._run(args, stdin=data, extra_env=env).stdout.decode().strip())
 
 
 def _check_ref(store: GitStore, ref: str) -> None:
@@ -734,7 +737,7 @@ def _publish(store: GitStore, new: str, runner) -> None:
     listing = store._run(["rev-list", "--objects", "--no-object-names", new, "--not", "--all"]).stdout
     if len(listing) > MAX_OBJECTS * 65 or listing.count(b"\n") > MAX_OBJECTS:
         raise GitRefusal("size_limit")
-    objects = [_oid(raw.decode("ascii")) for raw in listing.splitlines()]
+    objects = [validate_oid(raw.decode("ascii")) for raw in listing.splitlines()]
     runner.read_private_objects(store.repo, objects, max_bytes=MAX_SNAPSHOT_BYTES,
         max_object_bytes=MAX_OBJECT_BYTES)
     if not objects:
@@ -766,9 +769,9 @@ def cas_fast_forward(store: GitStore, ref: str, expected: Optional[str], new: st
     """
     _require_runner(_runner)
     _check_ref(store, ref)
-    new = _oid(new)
+    new = validate_oid(new)
     if expected is not None:
-        _oid(expected)
+        validate_oid(expected)
     current = _current(store, ref, _runner)
     if current != expected and current != new:
         raise GitRefusal("cas_mismatch")
@@ -814,10 +817,10 @@ def _merge_flags(store: GitStore) -> tuple:
 
 
 def _merge(store: GitStore, tip: str, head: str, base: Optional[str] = None) -> Plan:
-    _oid(tip)
-    _oid(head)
+    validate_oid(tip)
+    validate_oid(head)
     if base is not None:
-        _oid(base)
+        validate_oid(base)
     flags = _merge_flags(store)
     args = ["merge-tree", "--write-tree", "--name-only", "-z"]
     if base is not None:
@@ -831,7 +834,7 @@ def _merge(store: GitStore, tip: str, head: str, base: Optional[str] = None) -> 
     fields = result.stdout.split(b"\0")
     if not fields:
         raise GitRefusal("invalid_object")
-    tree = _oid(fields[0].decode("ascii"))
+    tree = validate_oid(fields[0].decode("ascii"))
     if result.returncode == 0:
         return Plan("clean", tree)
     paths = []
@@ -852,7 +855,7 @@ def plan_merge(store: GitStore, tip: str, head: str, *, _runner=None) -> Plan:
 
 
 def _parents(store: GitStore, commit: str, *, records=None) -> Tuple[str, ...]:
-    commit = _oid(commit)
+    commit = validate_oid(commit)
     if records is not None and commit in records:
         return records[commit][0]
     data = store.object(commit, "commit")
@@ -860,7 +863,7 @@ def _parents(store: GitStore, commit: str, *, records=None) -> Tuple[str, ...]:
     if end < 0:
         raise GitRefusal("invalid_object")
     try:
-        parents = tuple(_oid(line[7:].decode("ascii")) for line in data[:end].splitlines() if line.startswith(b"parent "))
+        parents = tuple(validate_oid(line[7:].decode("ascii")) for line in data[:end].splitlines() if line.startswith(b"parent "))
     except UnicodeError:
         raise GitRefusal("invalid_object") from None
     if records is not None:
@@ -883,7 +886,7 @@ def _pick_sources(store: GitStore, sources: Sequence[str], records) -> Tuple[str
                                 parents[0] + ".." + parents[1]]).stdout
             if len(result) > MAX_PICKS * 65:
                 raise GitRefusal("size_limit")
-            expanded.extend(_oid(line.decode("ascii")) for line in result.splitlines())
+            expanded.extend(validate_oid(line.decode("ascii")) for line in result.splitlines())
         else:
             expanded.append(source)
         if len(expanded) > MAX_PICKS:
@@ -901,7 +904,7 @@ def plan_pick(store: GitStore, tip: str, sources: Sequence[str], identity: Commi
     paths and no commits. All intermediate objects remain private, even on failure.
     """
     _require_runner(_runner)
-    _oid(tip)
+    validate_oid(tip)
     _identity(identity)
     commits, records = [], {}
     for source in _pick_sources(store, sources, records):

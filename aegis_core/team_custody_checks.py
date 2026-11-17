@@ -21,7 +21,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from itertools import islice
-import re
 import time
 
 from aegis_core import match, team, team_git, team_paths, team_qualify
@@ -56,10 +55,6 @@ _ACTIONS = {
     "path_outside_team": ("orchestrator", "restore the path or obtain covering team policy"),
     "invalid_message": ("implementer", "provide a bounded message without approval or exemption trailers"),
 }
-_OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
-# Keep the public commit_tested message contract, including all forbidden trailers.
-# The private team_git validator is deliberately not imported.
-_FORBIDDEN = re.compile(r"^\s*Aegis-(?:Approve(?:-Insight)?|Exempt-Test)\s*:", re.I | re.M)
 _READ_ERRORS = (AegisError, OSError, ValueError, TypeError, RecursionError)
 
 
@@ -90,7 +85,13 @@ def _lane(value):
 
 
 def _oid(value):
-    return type(value) is str and len(value) in (40, 64) and _OID.fullmatch(value) is not None
+    if type(value) is not str:
+        return False
+    try:
+        team_git.validate_oid(value)
+    except team_git.GitRefusal:
+        return False
+    return True
 
 
 def _read(code, callback, *args, lane=None):
@@ -162,15 +163,9 @@ def _policy_paths(policy, lane):
 
 
 def _message(value):
-    # Character cap before UTF-8 allocation; byte cap before trailer parsing.
-    if type(value) is not str or not 1 <= len(value) <= team_git.MAX_MESSAGE_BYTES:
+    if type(value) is not str:
         raise CustodyRefused("invalid_message")
-    try:
-        data = value.encode("utf-8")
-    except UnicodeError:
-        raise CustodyRefused("invalid_message") from None
-    if len(data) > team_git.MAX_MESSAGE_BYTES or b"\0" in data or _FORBIDDEN.search(value):
-        raise CustodyRefused("invalid_message")
+    _read("invalid_message", team_git.validate_message, value)
 
 
 def check_preconditions(store, *, lane, owner, expected_head, tested_tree, required_legs,
@@ -194,8 +189,11 @@ def check_preconditions(store, *, lane, owner, expected_head, tested_tree, requi
             or lease.expired(now if now is not None else _read("lease_not_live", time.time, lane=lane))):
         raise CustodyRefused("lease_not_live", lane=lane)
     branch = _read("branch_mismatch", read_branch, lane=lane)
-    if type(branch) is not str or not branch or len(branch) > team.LABEL_MAX or lease.branch != branch:
-        raise CustodyRefused("branch_mismatch", lane=lane)
+    try:
+        if type(branch) is not str or team.normalize_branch(lease.branch) != team.normalize_branch(branch):
+            raise CustodyRefused("branch_mismatch", lane=lane)
+    except team.TeamUsageError:
+        raise CustodyRefused("branch_mismatch", lane=lane) from None
     if not _oid(expected_head) or _read("head_mismatch", read_head) != expected_head:
         raise CustodyRefused("head_mismatch")
     if not _oid(tested_tree) or len(tested_tree) != len(expected_head):
