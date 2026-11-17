@@ -172,6 +172,7 @@ if __name__ == "__main__" and getattr(sys, "_aegis_verified_runtime_entry", None
 sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from hierarchy_mailbox_index import MailboxIndex  # noqa: E402
 from hierarchy_mailbox import (MAX_RECORDS, SLUG, Mailbox, digest, encoded, endpoint_parts, initialize, integer,  # noqa: E402
                                matching, publish_file, read_bytes, require, safe_path, strings, text,
                                timestamp, writer_lock)
@@ -1517,6 +1518,11 @@ def claude_start(request):
     return {**answer, "team": team} if team is not None else answer
 
 
+def mailbox_reader(mailbox):
+    """Keep the pinned mailbox outcome authoritative during reader rollout."""
+    return MailboxIndex(mailbox, mode="shadow")
+
+
 def old_root_state(old_root, hierarchy):
     """Everything read from a live root, which this never writes to. A held lock means unsure, so it refuses."""
     old = delegated_read("mailbox manifest", Mailbox, safe_path(text(old_root, "old_root")))
@@ -1525,7 +1531,7 @@ def old_root_state(old_root, hierarchy):
     locks = [old.root / ".write.lock", *old.root.glob(".wake-" + hierarchy + "%2F*.lock")]
     busy = [path.name for path in locks if path.exists()]
     require(not busy, "the old root is busy (%s); try again once that finishes" % ", ".join(busy))
-    records = delegated_read("mailbox records", old.messages)
+    records = delegated_read("mailbox records", mailbox_reader(old).messages)
     closed, accepted = old.dispatch_history(records)
     acceptances = {message["in_reply_to"]: message for message in accepted}
     in_order = sorted((row for row in records.values() if row["message"]["from"] in names or row["message"]["to"] in names),
@@ -1687,7 +1693,7 @@ def carry(request):
     message_id = "carried-work-" + record["brief"]["sha256"][:32]
     with writer_lock(new.root):
         current = delegated_read("mailbox manifest", Mailbox, new.root)
-        if message_id not in delegated_read("mailbox records", current.messages):
+        if message_id not in delegated_read("mailbox records", mailbox_reader(current).messages):
             binding = delegated_read("mailbox records", current.current_binding, root_endpoint)
             delegated_read("mailbox records", current.publish,
                            {"message_id": message_id, "from": root_endpoint, "to": orchestrator,
@@ -1789,7 +1795,7 @@ def carry_check(request):
     names, seen = set(record["endpoints"]), set(record["message_ids"])
     late = sorted(({"message_id": identifier, "type": row["message"]["type"], "from": row["message"]["from"], "to": row["message"]["to"],
                     "created_at": row["message"]["created_at"], "path": row["path"]}
-                   for identifier, row in delegated_read("mailbox records", old.messages).items()
+                   for identifier, row in delegated_read("mailbox records", mailbox_reader(old).messages).items()
                    if identifier not in seen and (row["message"]["from"] in names or row["message"]["to"] in names)),
                   key=lambda row: row["created_at"])
     changed = sorted(name for name in record["endpoints"]
