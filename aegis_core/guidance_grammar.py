@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import codecs
+from bisect import bisect_right
 import re
 from aegis_core.redaction import (
-    SECRET_REPLACEMENTS, RedactionRefusal, clip_atomic_text, remove_url_credentials,
+    SECRET_REPLACEMENTS, URL_USERINFO_RE, RedactionRefusal, check_guidance_text, clip_atomic_text,
+    guidance_url_plan,
+    remove_url_credentials as remove_url_credentials,  # Retain the existing import identity contract.
 )
 
 __all__ = ["bounded_rule_text", "clip_redacted", "copy_retained_items",
@@ -19,40 +22,126 @@ def clip_redacted(text, limit):
         raise ValueError("guidance_projection_limit") from None
 
 
+def _remap_atoms(atoms, edits):
+    """Move interval endpoints through edits; never rediscover URL syntax."""
+    if not atoms:
+        return atoms
+    starts, ends, shifts = [e[0] for e in edits], [e[1] for e in edits], [0]
+    for lo, hi, shown, _prefix, _atomic in edits:
+        shifts.append(shifts[-1] + len(shown) - (hi - lo))
+
+    def point(position, right):
+        index = bisect_right(ends, position)
+        if index < len(edits) and starts[index] < position:
+            return starts[index] + shifts[index] + (len(edits[index][2]) if right else 0)
+        return position + shifts[index]
+
+    moved = []
+    for lo, hi, plan, marker in atoms:
+        first, last = point(lo, False), point(hi, True)
+        # Carry the original owning marker through shifts, without parsing the
+        # rewritten URL. An edit consuming it retires that identity.
+        if marker is not None:
+            position = lo + marker
+            index = bisect_right(ends, position)
+            marker = (None if index < len(edits) and starts[index] <= position
+                      else point(position, False) - first)
+        index = bisect_right(ends, lo)
+        if index < len(edits) and starts[index] < hi:
+            plan = None
+        if moved and first < moved[-1][1]:
+            previous = moved.pop()
+            first, last, plan, marker = previous[0], max(last, previous[1]), None, None
+        moved.append((first, last, plan, marker))
+    return moved
+
+
+def _apply_edits(text, labels, atoms, edits, limit):
+    if not edits:
+        return text, labels, atoms
+    if len(text) + sum(len(shown) - (hi - lo) for lo, hi, shown, _p, _a in edits) > limit:
+        raise ValueError("guidance_projection_limit")
+    parts, attributed, end = [], [], 0
+    for lo, hi, shown, prefix, _atomic in edits:
+        parts.extend((text[end:lo], shown))
+        if labels is not None:
+            attributed.extend(labels[end:lo])
+            if prefix is not None:
+                first, last = prefix
+                attributed.extend(labels[first:last])
+                attributed.extend([labels[min(last, len(labels) - 1)]] * (len(shown) - (last - first)))
+            elif shown:
+                attributed.extend([labels[lo]] * len(shown))
+        end = hi
+    parts.append(text[end:])
+    if labels is not None:
+        attributed.extend(labels[end:])
+    return "".join(parts), attributed if labels is not None else None, _remap_atoms(atoms, edits)
+
+
+def _mask_labeled(text, labels, limit, atoms):
+    """Shared matches touching URLs consume the entire connected URL union."""
+    for pattern, replacement in SECRET_REPLACEMENTS:
+        edits, index = [], 0
+        for match in pattern.finditer(text):
+            lo, hi = match.span()
+            if edits and edits[-1][4] and hi <= edits[-1][1]:
+                continue
+            while index < len(atoms) and atoms[index][1] < lo:
+                index += 1
+            touches = index < len(atoms) and atoms[index][0] <= hi
+            # Userinfo belongs to the dedicated original-byte URL policy.
+            if touches and pattern.pattern == URL_USERINFO_RE.pattern:
+                containing = index + (atoms[index][1] == lo)
+                if (containing < len(atoms) and atoms[containing][0] <= lo
+                        and hi <= atoms[containing][1]
+                        and atoms[containing][3] is not None
+                        and match.start(1) + match.group(1).find("://")
+                        == atoms[containing][0] + atoms[containing][3]):
+                    continue
+            if touches:
+                first = index
+                while first > 0 and atoms[first - 1][1] >= atoms[first][0]:
+                    first -= 1
+                lo = min(lo, atoms[first][0])
+                last = first
+                while last < len(atoms) and atoms[last][0] <= hi:
+                    hi = max(hi, atoms[last][1])
+                    last += 1
+                shown, prefix, atomic = "[REDACTED_URL]", None, True
+            else:
+                shown = match.expand(replacement)
+                prefix = match.span(1) if replacement.startswith(r"\1") else None
+                atomic = False
+            while edits and lo <= edits[-1][1] and (atomic or edits[-1][4]):
+                previous = edits.pop()
+                lo, hi = min(lo, previous[0]), max(hi, previous[1])
+                shown, prefix, atomic = "[REDACTED_URL]", None, True
+            edits.append((lo, hi, shown, prefix, atomic))
+        text, labels, atoms = _apply_edits(text, labels, atoms, edits, limit)
+    return text, labels, atoms
+
+
 def redact_labeled(text, labels, limit):
-    """One canonical redaction pass; retain only line/item attribution."""
+    """Parse original URLs once, then mask and rewrite their atomic intervals."""
     try:
-        text = remove_url_credentials(text, limit=limit, policy="guidance")
+        check_guidance_text(text, limit=limit)
+        if labels is not None and (type(labels) is not list or len(labels) != len(text)):
+            raise ValueError("guidance_projection_limit")
+        atoms = [(lo, hi, (lo, changes), marker - lo)
+                 for lo, hi, changes, marker in guidance_url_plan(text, limit=limit)]
     except RedactionRefusal:
         raise ValueError("guidance_projection_limit") from None
-    for pattern, replacement in SECRET_REPLACEMENTS:
-        parts, attributed, end, size = [], [], 0, 0
-        for match in pattern.finditer(text):
-            shown = match.expand(replacement)
-            size += match.start() - end + len(shown)
-            if size > limit:
-                raise ValueError("guidance_projection_limit")
-            parts.extend((text[end:match.start()], shown))
-            if labels is None:
-                end = match.end()
-                continue
-            attributed.extend(labels[end:match.start()])
-            if replacement.startswith(r"\1"):
-                first, last = match.span(1)
-                attributed.extend(labels[first:last])
-                suffix = len(shown) - (last - first)
-                attributed.extend([labels[min(last, len(labels) - 1)]] * suffix)
-            else:
-                attributed.extend([labels[match.start()]] * len(shown))
-            end = match.end()
-        if not parts:
-            continue
-        if size + len(text) - end > limit:
-            raise ValueError("guidance_projection_limit")
-        parts.append(text[end:])
-        if labels is not None:
-            attributed.extend(labels[end:])
-        text, labels = "".join(parts), attributed if labels is not None else None
+    text, labels, atoms = _mask_labeled(text, labels, limit, atoms)
+    edits = []
+    for lo, _hi, plan, _marker in atoms:
+        if plan is not None:
+            origin, changes = plan
+            edits.extend((lo + first - origin, lo + last - origin, shown, None, False)
+                         for first, last, shown in changes)
+    text, labels, atoms = _apply_edits(text, labels, atoms, edits, limit)
+    if edits:
+        text, labels, atoms = _mask_labeled(text, labels, limit, atoms)
     return text, labels
 
 
