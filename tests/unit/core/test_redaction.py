@@ -46,7 +46,10 @@ REPO = Path(real_path(__file__)).parents[3]
 # aegis_core/pathlookup.py, tests/unit/core/test_gitsafe.py.
 # Coordinator CEILING RULING TA-1a 2026-11-16T22:57:17Z also reviewed:
 # aegis_core/team_mailbox_primitives.py (TA-1a).
-REDACTION_PARSE_CEILING = 78
+# 78 -> 82 (2026-11-17 coordinator, shared reviewed raise after #617; tip measured 78): aegis_core/workspace/diagnostics.py and
+# tests/unit/core/test_workspace_diagnostics.py (WORKSPACE-RECOVERY-FRAME, public clip_atomic_text), aegis_core/team_board.py (TA-1d),
+# aegis_core/merge_queue.py (GM-9).
+REDACTION_PARSE_CEILING = 82
 
 
 def assignment_values(statement):
