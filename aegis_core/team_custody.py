@@ -51,6 +51,24 @@ REFUSALS = {
 }
 _UNKNOWN = frozenset(("ref_update_unknown", "git_cleanup_failed", "git_timeout", "git_output_limit"))
 _ERRORS = (AegisError, OSError, ValueError, TypeError, RecursionError)
+# A code proves the refused gate, not the absence of a concurrent or saved intent.
+# Construction failures therefore retain observation-only advice for any intent.
+_ACTIONS = {
+    "unsupported_platform": "use a host with descriptor-relative commit custody support",
+    "governance_refused": "obtain governance approval for the tested bytes before retrying commit custody",
+    "invalid_request": "provide valid commit request and actor identifiers",
+    "request_conflict": "inspect the recorded request binding and restore its original inputs; never repeat its effect",
+    "request_closed": "inspect the terminal commit result; never retry this request's effect",
+    "journal_failed": "restore journal access and reconcile by observation; never repeat an existing intent's effect",
+    "git_failed": "inspect the Git failure and commit journal; reconcile any existing intent by observation; never repeat its effect",
+    "cas_mismatch": "inspect the lane ref and terminal commit result; never repeat this request's effect",
+    "ref_update_unknown": "inspect the commit intent and reconcile by observation; never repeat its effect",
+    "invalid_identity": "provide a valid commit identity and reconcile any existing intent by observation; never repeat its effect",
+    "invalid_message": "provide a bounded commit message without forbidden trailers and reconcile any existing intent by observation; never repeat its effect",
+    "invalid_oid": "provide valid commit object identities and reconcile any existing intent by observation; never repeat its effect",
+    "invalid_parent": "provide a valid commit parent and reconcile any existing intent by observation; never repeat its effect",
+    "store_closed": "open an active private Git store and reconcile any existing intent by observation; never repeat its effect",
+}
 
 
 class CommitRefused(ValueError):
@@ -59,7 +77,7 @@ class CommitRefused(ValueError):
     def __init__(self, code):
         super().__init__(REFUSALS[code])
         self.code = code
-        self.next_action = {"actor": "custodian", "command": "inspect the commit intent and reconcile by observation; never repeat its effect"}
+        self.next_action = {"actor": "custodian", "command": _ACTIONS[code]}
 
 
 @dataclass(frozen=True)
