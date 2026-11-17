@@ -17,6 +17,8 @@ __all__ = [
     "outside_roots",
     "OID",
     "READ_SHAPES",
+    "SNAPSHOT_ATTRIBUTES",
+    "SNAPSHOT_SOURCE_PREFIX",
     "strict_refuse",
     "bounded_args",
     "strict_root",
@@ -62,6 +64,8 @@ def outside_roots(path, roots):
     return target is not None and all(not key_within(candidate, root)
         for root in roots for candidate in (target, spelling))
 OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+SNAPSHOT_ATTRIBUTES = ("filter", "text", "eol", "ident", "working-tree-encoding", "crlf")
+SNAPSHOT_SOURCE_PREFIX = ("check-attr", "-z", "--stdin", "--source")
 READ_SHAPES = frozenset((
     ("version",), ("read-tree", "--empty"), ("write-tree",),
     ("ls-files", "--cached", "--others", "--exclude-standard", "-z"),
@@ -73,7 +77,6 @@ READ_SHAPES = frozenset((
     ("rev-parse", "--git-path", "index"),
     ("rev-parse", "--git-common-dir", "--show-prefix", "--is-shallow-repository", "--show-toplevel"),
     *(("rev-parse", option) for option in ("--git-common-dir", "--show-prefix", "--show-toplevel")),
-    ("check-attr", "-z", "--stdin", "filter", "text", "eol", "ident", "working-tree-encoding", "crlf"),
     ("config", "--null", "--get-regexp", r"^core\.(autocrlf|safecrlf|filemode|symlinks|eol|trustctime|checkstat)$"),
     ("config", "--null", "--name-only", "--get-regexp", r"^filter\."),
     ("config", "--show-scope", "--null", "--name-only", "--get-regexp", r"^merge\..+\.driver$"),
@@ -109,9 +112,10 @@ def _literal_path(value):
             and all(p not in ("", ".", "..", ".git") for p in value.split("/")))
 def read_shape(args):
     if args in READ_SHAPES: return True
-    if args[:4] == ("check-attr", "-z", "--stdin", "--source"):
-        return (len(args) == 11 and full_oid(args[4])
-                and args[5:] == ("filter", "text", "eol", "ident", "working-tree-encoding", "crlf"))
+    if args[:len(SNAPSHOT_SOURCE_PREFIX)] == SNAPSHOT_SOURCE_PREFIX:
+        position = len(SNAPSHOT_SOURCE_PREFIX)
+        return (len(args) == position + 1 + len(SNAPSHOT_ATTRIBUTES) and full_oid(args[position])
+                and args[position + 1:] == SNAPSHOT_ATTRIBUTES)
     if len(args) == 2 and args[0] == "read-tree": return full_oid(args[1])
     if len(args) == 2 and args[0] == "check-ref-format": return ref_name(args[1])
     if len(args) == 3 and args[0] == "cat-file" and args[1] in ("blob", "tree", "commit", "-t"): return full_oid(args[2])
