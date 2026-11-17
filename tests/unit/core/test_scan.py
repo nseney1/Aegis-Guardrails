@@ -93,6 +93,24 @@ def test_simulation_names_only_omitted_builtin_profiles_on_retry_and_concurrentl
             omitted = sorted(
                 profile for profile, result in scanned.items() if "sample" not in result.exposure_rule_ids())
             sweep[budget] = omitted
+
+        classes = {}
+        for budget, omitted in sweep.items():
+            classes.setdefault(tuple(omitted), []).append(budget)
+        budgets = list(sweep)
+        transitions = [
+            (before, after) for before, after in zip(budgets, budgets[1:])
+            if sweep[before] != sweep[after]]
+        sampled = {
+            budget for members in classes.values() for budget in (members[0], members[-1])}
+        sampled.update(budget for transition in transitions for budget in transition)
+        assert {tuple(sweep[budget]) for budget in sampled} == set(classes), sweep
+        assert all(members[0] in sampled and members[-1] in sampled for members in classes.values()), sweep
+        assert all(before in sampled and after in sampled for before, after in transitions), sweep
+
+        for budget in sorted(sampled):
+            (tmp_path / ".aegis/config.json").write_text(json.dumps({"jit": {"max_tokens": budget}}), encoding="utf-8")
+            omitted = sweep[budget]
             message = ("scan simulation: not selected in profiles: " + ", ".join(omitted)
                        if omitted else "scan simulation: selected in all profiles")
             for _ in range(2):
