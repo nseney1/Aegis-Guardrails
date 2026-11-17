@@ -150,23 +150,54 @@ def attribute_version(raw):
         raise GitRefusal("conversion_unavailable")
 
 
+def _attribute_body(data):
+    """Refuse ambiguous attribute bytes before hashing or retaining an OID."""
+    if (len(data) >= MAX_ATTRIBUTE_FILE_BYTES or data.startswith(b"\xef\xbb\xbf") or b"\0" in data):
+        raise GitRefusal("conversion_unavailable")
+    start = 0
+    while start < len(data):
+        end = data.find(b"\n", start, start + MAX_ATTRIBUTE_LINE_BYTES + 1)
+        if end < 0:
+            end = len(data)
+        if end - start >= MAX_ATTRIBUTE_LINE_BYTES:
+            raise GitRefusal("conversion_unavailable")
+        start = end + 1
+
+
+def _attribute_row(cached, data):
+    """Call-local row for one immutable bytes object, or None when it must be redone."""
+    if type(data) is not bytes:
+        return None
+    row = cached.get(id(data))
+    if row is not None and row[0] is data:
+        return row
+    return None
+
+
 def attribute_entries(sources, oid_length):
     """Raw captured bytes, without applying their own text/encoding rules."""
     # Git v2.43.0 attr.c:335-338,674-760: file input strips a leading BOM
     # and CRLF; blob input stops at NUL, retains CR, and lacks the file cap.
     # Refuse all ambiguous forms; never normalize the captured source bytes.
+    # One call scans and hashes each retained bytes object once, then emits
+    # every path. Another object with equal contents is processed again.
+    cached = {}
     for data in sources.values():
-        if (len(data) >= MAX_ATTRIBUTE_FILE_BYTES or data.startswith(b"\xef\xbb\xbf") or b"\0" in data):
-            raise GitRefusal("conversion_unavailable")
-        start = 0
-        while start < len(data):
-            end = data.find(b"\n", start, start + MAX_ATTRIBUTE_LINE_BYTES + 1)
-            if end < 0:
-                end = len(data)
-            if end - start >= MAX_ATTRIBUTE_LINE_BYTES:
-                raise GitRefusal("conversion_unavailable")
-            start = end + 1
-    return [(path, "100644", object_id(data, oid_length), data) for path, data in sorted(sources.items())]
+        if _attribute_row(cached, data) is None:
+            _attribute_body(data)
+            if type(data) is bytes:
+                cached[id(data)] = [data, None]
+    entries = []
+    for path, data in sorted(sources.items()):
+        row = _attribute_row(cached, data)
+        if row is None or row[1] is None:
+            oid = object_id(data, oid_length)
+            if row is not None:
+                row[1] = oid
+        else:
+            oid = row[1]
+        entries.append((path, "100644", oid, data))
+    return entries
 
 
 def attribute_fallbacks(captured, baseline):

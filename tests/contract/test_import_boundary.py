@@ -65,6 +65,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.gitsafe_policy": 0,
     "aegis_core.gitsafe_run": 0,
     "aegis_core.team_claims": 2,
+    "aegis_core.team_custody": 1,
     "aegis_core.team_custody_checks": 1,
     "aegis_core.team_git": 0,
     "aegis_core.atomicio": 0,
@@ -76,6 +77,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.argv": 0,
     # GitHub CLI transport over gitsafe and pathlookup, with no trust-policy dependency.
     "aegis_core.ghcli": 0,
+    "aegis_core.pathlookup_fence": 0,
     # Path containment, strict JSON and UTC timestamps (stdlib only).
     "aegis_core.primitives": 0,
     "aegis_core.proposals": 2,
@@ -106,9 +108,13 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team": 1,
     "aegis_core.team_host_adapter": 0,
     "aegis_core.team_host_agy": 1,
+    "aegis_core.team_isolation_capability": 0,
     "aegis_core.team_isolation_mounts": 0,
     "aegis_core.team_isolation_verify": 0,
     "aegis_core.team_lease_custody": 0,
+    "aegis_core.team_mailbox": 1,
+    "aegis_core.team_mailbox_primitives": 0,
+    "aegis_core.team_mailbox_store": 0,
     "aegis_core.team_metrics": 1,
     "aegis_core.team_paths": 1,
     "aegis_core.team_profile": 1,
@@ -132,6 +138,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.guidance_projection": 0,
     # Host hook payload normalization (stdlib only).
     "aegis_core.hook_events": 1,
+    "aegis_core.kernel_identity": 0,
     # Pure AST inspection of lane declarations and pytest configuration.
     "aegis_core.lane_ast": 0,
     # The post-lane gate (aegis check --lane): team, matcher, gitsafe and events.
