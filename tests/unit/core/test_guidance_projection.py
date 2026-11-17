@@ -195,18 +195,42 @@ def test_pure_projection_excludes_all_body_evidence_and_keeps_unknown_slots():
 
 @pytest.mark.parametrize("field", ["source", "expanded"])
 def test_projection_resource_limits_refuse_with_a_fixed_scan_code(tmp_path: Path, field: str):
-    oversized = "x" * (1024 * 1024 + 1)
-    _rule(tmp_path, oversized if field == "source" else "${SLOT.MODEL_FAST}" * 14000)
+    from aegis_core.guidance_projection import GuidanceProjectionError, MAX_GUIDANCE_CHARS, project_text
+    from aegis_core.packs import MAX_RULE_BYTES
+
+    paths = []
+    if field == "source":
+        # Retain the literal per-body guard through its public projection API;
+        # disk-backed scan now reaches the aggregate guard with bounded files.
+        with pytest.raises(GuidanceProjectionError, match="^guidance_projection_limit$"):
+            project_text("x" * (MAX_GUIDANCE_CHARS + 1))
+        for index in range(9):
+            path = _rule(tmp_path, "", hypothesis="", rule_id=f"r{index}")
+            text = path.read_text(encoding="utf-8").replace(
+                "hypothesis: ''\n", "hypothesis:\n" + ("  - " + "x" * 4096 + "\n") * 31,
+            )
+            path.write_bytes(text.encode("utf-8"))
+            assert path.stat().st_size == 127258 <= MAX_RULE_BYTES
+            paths.append(path)
+    else:
+        path = _rule(tmp_path, "${X}" * 13108)
+        assert path.stat().st_size <= MAX_RULE_BYTES
+        paths.append(path)
 
     def read(_):
-        return scan(tmp_path, ["src/a.py"], registry=SlotRegistry({"MODEL_FAST": "m" * 80}))
+        if field == "source":
+            return scan(tmp_path, ["src/a.py"], budget=9, max_tokens=2000000)
+        return scan(tmp_path, ["src/a.py"], registry=SlotRegistry({"X": "m" * 80}))
 
-    expected = {"status": "FAIL", "error": "guidance_projection_limit",
-                "rule_errors": [{"path": ".aegis/rules/traps/projection.md", "error": "detail: limit"}]}
+    expected = {"status": "FAIL", "error": "guidance_projection_limit"}
+    if field == "expanded":
+        expected["rule_errors"] = [{"path": ".aegis/rules/traps/projection.md", "error": "detail: limit"}]
     assert read(None) == expected
     with ThreadPoolExecutor(max_workers=3) as pool:
         assert list(pool.map(read, range(3))) == [expected] * 3
 
+    for path in paths:
+        path.unlink()
     _rule(tmp_path, "Repaired instructions.\n", hypothesis="Repaired.")
     assert "Detail: Repaired instructions.\n" in read(None)["guidance"]
 
@@ -2047,22 +2071,35 @@ def test_round16_scan_body_excludes_expanded_evidence_before_projection_limits(
 ):
     from aegis_cli.cli import main
     from aegis_core.guidance_projection import MAX_GUIDANCE_CHARS
+    from aegis_core.packs import MAX_RULE_BYTES
 
     root = tmp_path / "repo"
     config = isolated_home / ".aegis" / "config.json"
     config.parent.mkdir()
-    config.write_text(json.dumps({"v": 1, "slots": {"HEAD": "Evidence", "BIG": "x" * 80}}), encoding="utf-8")
-    suffix = {"controls": "$a\x00b " * 4100, "expansion": "${SLOT.BIG}" * 14000,
+    slots = {"HEAD": "Evidence", "BIG": "x" * 80}
+    if tail == "expansion":
+        slots["X"] = "x" * 80
+    config.write_text(json.dumps({"v": 1, "slots": slots}), encoding="utf-8")
+    suffix = {"controls": "$a\x00b " * 4100, "expansion": "${X}" * 13107,
               "source": "x" * (MAX_GUIDANCE_CHARS + 1)}[tail]
-    _rule(root, "Keep safe.\n## ${SLOT.HEAD}\n" + suffix)
+    path = _rule(root, "Keep safe.\n## ${SLOT.HEAD}\n" + suffix)
+    assert (path.stat().st_size > MAX_RULE_BYTES) == (tail == "source")
     if surface == "scan":
-        registry = SlotRegistry({"HEAD": "Evidence", "BIG": "x" * 80}).sanitized()
+        registry = SlotRegistry(slots).sanitized()
         result = scan(root, ["src/a.py"], registry=registry)
     elif surface == "cli":
-        assert main(["--workspace", str(root), "scan", "src/a.py", "--json"]) == 0
+        assert main(["--workspace", str(root), "scan", "src/a.py", "--json"]) == int(tail == "source")
         result = json.loads(capsys.readouterr().out)
     else:
         result = handle_scan({"workspace": str(root), "files": ["src/a.py"]})
+    if tail == "source":
+        assert result["status"] == "FAIL"
+        assert result["rule_errors"] == [{
+            "path": ".aegis/rules/traps/projection.md",
+            "error": f"{path.stat().st_size} bytes exceeds the {MAX_RULE_BYTES} byte limit (too_large)",
+        }]
+        assert "guidance" not in result
+        return
     assert "Detail: " + WITHHELD_TEXT + "\n" in result["guidance"]
     assert "SLOT." not in result["guidance"]
 
@@ -3171,6 +3208,7 @@ def test_selection_refusal_locations_agree_across_public_surfaces(
     tmp_path: Path, isolated_home: Path, monkeypatch: pytest.MonkeyPatch, surface: str, case: str
 ):
     from aegis_core.scan import scan_user_layer
+    from aegis_core.packs import MAX_RULE_BYTES
 
     token_budget = [1]
     if case == "minimal":
@@ -3179,12 +3217,16 @@ def test_selection_refusal_locations_agree_across_public_surfaces(
     secret = "ghp_" + "S" * 36
     config = isolated_home / ".aegis" / "config.json"
     config.parent.mkdir(exist_ok=True)
-    config.write_text(json.dumps({"v": 1, "slots": {"MODEL_FAST": "m" * 80}}), encoding="utf-8")
-    registry = SlotRegistry({"MODEL_FAST": "m" * 80})
+    slots = {"MODEL_FAST": "m" * 80}
+    if case == "expanded":
+        slots["X"] = "m" * 80
+    config.write_text(json.dumps({"v": 1, "slots": slots}), encoding="utf-8")
+    registry = SlotRegistry(slots)
     path = _rule(root, "Read.")
     bad_field, reason = "hypothesis", "invalid_field"
     if case in {"source", "expanded"}:
-        path = _rule(root, "x" * (1024 * 1024 + 1) if case == "source" else "${SLOT.MODEL_FAST}" * 14000)
+        path = _rule(root, "x" * (1024 * 1024 + 1) if case == "source" else "${X}" * 13108)
+        assert (path.stat().st_size > MAX_RULE_BYTES) == (case == "source")
         bad_field, reason = "detail", "limit"
     else:
         if case == "prediction":
@@ -3209,6 +3251,12 @@ def test_selection_refusal_locations_agree_across_public_surfaces(
                       p.relative_to(root).as_posix().replace(secret, "ghp_REDACTED")),
              "error": bad_field + ": " + reason} for p in paths]
     expected = {"status": "FAIL", "error": "guidance_projection_" + reason, "rule_errors": rows}
+    if case == "source":
+        refusal = f"{path.stat().st_size} bytes exceeds the {MAX_RULE_BYTES} byte limit (too_large)"
+        rows[0]["error"] = refusal
+        expected["error"] = ("1 rule file(s) cannot be served, so no partial rule set is returned: "
+                             + rows[0]["path"] + ": " + refusal
+                             + ". Fix or move them; `aegis status` lists them.")
 
     def read(_):
         if surface == "core":
@@ -3271,14 +3319,17 @@ def test_selection_refusal_unprojectable_location_keeps_the_original_code(tmp_pa
 
 
 def test_selection_refusal_registry_retry_reuses_the_captured_snapshot(tmp_path: Path):
-    _rule(tmp_path, "${SLOT.MODEL_FAST}" * 14000)
-    large = SlotRegistry({"MODEL_FAST": "m" * 80})
+    from aegis_core.packs import MAX_RULE_BYTES
+
+    path = _rule(tmp_path, "${X}" * 13108)
+    assert path.stat().st_size <= MAX_RULE_BYTES
+    large = SlotRegistry({"X": "m" * 80})
     result = scan(tmp_path, ["src/a.py"], registry=large)
     expected = {"status": "FAIL", "error": "guidance_projection_limit",
                 "rule_errors": [{"path": ".aegis/rules/traps/projection.md", "error": "detail: limit"}]}
     assert result == expected
     assert result.with_registry(large) == expected
-    small = result.with_registry(SlotRegistry({"MODEL_FAST": "fast"}))
+    small = result.with_registry(SlotRegistry({"X": "fast"}))
     assert [rule["name"] for rule in small["relevant_rules"]] == ["projection"]
     assert result == expected
     assert small.with_registry(large) == expected
