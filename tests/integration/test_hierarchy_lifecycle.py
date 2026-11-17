@@ -659,7 +659,8 @@ def _initial_file_digest(path):
 
 
 @contextmanager
-def initial_runtime_boundary(api, tmp_path, monkeypatch, fault=None, *, actor_count=6):
+def initial_runtime_boundary(api, tmp_path, monkeypatch, fault=None, *, actor_count=6,
+                            peer_finished=None):
     """Stand in for external Rust/kernel readback, with real owned sockets/pipes.
 
     Copied from H test8bd6a78b, with an absent canonical root and a planned
@@ -731,7 +732,9 @@ def initial_runtime_boundary(api, tmp_path, monkeypatch, fault=None, *, actor_co
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client.connect(str(endpoint))
         peer, _ = listener.accept()
-        peer.settimeout(2)
+        # The test body owns idle time between requests. Teardown's shutdown
+        # interrupts the blocking read; its bounded join still detects a stuck peer.
+        peer.settimeout(None)
         peer_read, host_write = os.pipe()
         host_read, peer_write = os.pipe()
         reader, writer = os.fdopen(host_read, "rb", 0), os.fdopen(host_write, "wb", 0)
@@ -850,6 +853,9 @@ def initial_runtime_boundary(api, tmp_path, monkeypatch, fault=None, *, actor_co
                                           "epoch": 17, "nonce": nonce, "result": result}))
                 except Exception as error:
                     errors.append(error)
+                finally:
+                    if peer_finished is not None:
+                        peer_finished.set()
 
             thread = threading.Thread(target=rust_control, daemon=True)
             thread.start()
@@ -878,6 +884,47 @@ def initial_runtime_boundary(api, tmp_path, monkeypatch, fault=None, *, actor_co
                 cleanup.callback(client.close)
         assert thread is None or not thread.is_alive(), "external Rust stand-in did not stop"
         assert not errors, errors
+
+
+@pytest.mark.parametrize("malformed", [False, True])
+def test_initial_runtime_peer_survives_idle_gap_and_preserves_errors(tmp_path, monkeypatch, malformed):
+    from tools import hierarchy_host_authority as host
+
+    def exchange(control, reply):
+        value = {"schema": "aegis.protected-initial-control/v1", "id": 1,
+                 "epoch": 0, "nonce": "a" * 64,
+                 "method": "describe", "params": {}}
+        control.sendall(_initial_control_frame(value))
+        response = json.loads(reply.readline())
+        channel = response["result"]["channel_witness"]
+        assert response == {"schema": value["schema"], "id": 1, "epoch": 17,
+                            "nonce": value["nonce"], "result": {"channel_witness": channel}}
+        return channel
+
+    def exercise():
+        peer_finished = threading.Event()
+        with initial_runtime_boundary(host, tmp_path, monkeypatch,
+                                      peer_finished=peer_finished) as inputs:
+            control = inputs[0]
+            control.settimeout(15)
+            with control.makefile("rb", buffering=0) as reply:
+                channel = exchange(control, reply)
+                # Deliberately leave the peer idle beyond its former two-second
+                # deadline. This is an input schedule, not a speed assertion.
+                threading.Event().wait(2.2)
+                assert not peer_finished.is_set(), "peer stopped during a test-controlled idle gap"
+                if malformed:
+                    control.sendall(b"{invalid-json}\n")
+                    assert peer_finished.wait(15), "peer did not report malformed input"
+                else:
+                    # Repeat the valid request after the idle gap.
+                    assert exchange(control, reply) == channel
+
+    if malformed:
+        with pytest.raises(AssertionError, match="JSONDecodeError"):
+            exercise()
+    else:
+        exercise()
 
 
 
