@@ -44,7 +44,9 @@ REPO = Path(real_path(__file__)).parents[3]
 # aegis_core/team_lease_custody.py, tests/helpers_reviewed_sources.py,
 # aegis_core/primitives.py, tests/unit/core/test_primitives.py,
 # aegis_core/pathlookup.py, tests/unit/core/test_gitsafe.py.
-REDACTION_PARSE_CEILING = 77
+# Coordinator CEILING RULING TA-1a 2026-11-16T22:57:17Z also reviewed:
+# aegis_core/team_mailbox_primitives.py (TA-1a).
+REDACTION_PARSE_CEILING = 78
 
 
 def assignment_values(statement):
