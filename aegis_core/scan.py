@@ -529,8 +529,9 @@ def _check_simulation_inventory(inventory: RuleInventory) -> None:
         raise _SimulationLimit
     total = 0
     for entry in inventory.entries:
-        total += len(entry.content)
-        if len(entry.content) > MAX_RULE_BYTES or total > 8 * 1024 * 1024:
+        size = max(entry.size, len(entry.content))
+        total += size
+        if size > MAX_RULE_BYTES or total > 8 * 1024 * 1024:
             raise _SimulationLimit
 
 
