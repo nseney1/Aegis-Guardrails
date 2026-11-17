@@ -31,6 +31,11 @@ __all__ = [
     "clip_rendered_text",
     "clip_atomic_text",
     "remove_url_credentials",
+    "remove_guidance_url_queries",
+    "mask_guidance_url_authorities",
+    "check_guidance_text",
+    "guidance_url_plan",
+    "URL_USERINFO_RE",
     "REDACTION_MARKER_RE",
     "RedactionRefusal",
     "command_token",
@@ -51,6 +56,9 @@ _PEM_TAIL = r"-----END (?:[A-Z0-9]+ ){0,4}PRIVATE KEY(?: BLOCK)?-----"
 _KEYS = ("(?:password|passwd|pwd|secret|token|api_?key|access_?key|private_?key|client_?secret|credential|"
          "authorization|auth(?![A-Za-z]))")
 _SCHEMES = "(?:basic|digest|token|negotiate)"
+_URL_USERINFO = re.compile(
+    "(?i)((?:" + _NB + "[a-z][a-z0-9+.-]{0,31})?://[^\\s:/@]{1,128}:)[^\\s@/]{1,512}@")
+URL_USERINFO_RE = _URL_USERINFO
 # Built by concatenation, never as an rf-string: f-string formatting turns a {4,} quantifier
 # into the tuple "(4,)". Token quantifiers are bounded; PEM consumes once to its END or EOF.
 _SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str, str], ...] = tuple(
@@ -59,7 +67,7 @@ _SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str, str], ...] = tuple(
         # so repeated BEGIN markers cannot retry scans over the same unterminated body.
         (_PEM_HEAD + r"[\s\S]*?(?:-----END (?P=pem_label)-----|\Z)", "[REDACTED_PEM]", "[REDACTED_PEM]"),
         # The scheme is optional because Tier A blocks a bare "://user:<password>@host" too.
-        ("(?i)((?:" + _NB + "[a-z][a-z0-9+.-]{0,31})?://[^\\s:/@]{1,128}:)[^\\s@/]{1,512}@", r"\1[REDACTED]@",
+        (_URL_USERINFO.pattern, r"\1[REDACTED]@",
          r"\1[REDACTED]@"),
         (_NB + r"eyJ[A-Za-z0-9_-]{8,512}\.[A-Za-z0-9_-]{4,1024}\.[A-Za-z0-9_-]{4,512}", "[REDACTED_JWT]",
          "[REDACTED_JWT]"),
@@ -640,20 +648,223 @@ def _ambiguous_url_authority(authority):
     return not host or host.startswith(":") or "[" in host or "]" in host or host.count(":") > 1
 
 
+def check_guidance_text(value, *, limit):
+    """Validate original guidance before masking, matching or allocating spans."""
+    _check_cleaner(value, limit, "guidance")
+    if len(value) > limit:
+        _refuse_cleaner("too_large")
+
+
+def _guidance_start(value, position):
+    """Find the next unowned marker and at most 32 ASCII scheme characters."""
+    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    characters = letters + "0123456789+.-"
+    marker = value.find("://", position)
+    if marker < 0:
+        return None
+    start, floor = marker, max(position, marker - 32)
+    while start > floor and value[start - 1] in characters:
+        start -= 1
+    while start < marker and value[start] not in letters:
+        start += 1
+    return start, marker + 3
+
+
+_GUIDANCE_EMBEDDED_AUTHORITY_LIMIT = 4096
+
+
+def _guidance_embedded_userinfo(value, start, stop):
+    """Find embedded markers and credential-bearing or unresolved authorities.
+
+    Each authority is scanned at most once, up to 4096 characters. Its owning
+    URL end is also a valid terminator; exhausting the bound fails closed.
+    """
+    marker = value.find("://", start, stop)
+    embedded = marker >= 0
+    while marker >= 0:
+        first = marker + 3
+        bound = min(stop, first + _GUIDANCE_EMBEDDED_AUTHORITY_LIMIT)
+        position = first
+        while position < bound:
+            char = value[position]
+            if char in "/?#" or char.isspace():
+                break
+            if char == "@":
+                return True, True
+            position += 1
+        if position == bound and bound < stop:
+            return True, True
+        marker = value.find("://", first, stop)
+    return embedded, False
+
+
+def _guidance_urls(value):
+    """Parse original start/end, authority and delimiters once per URL."""
+    current = _guidance_start(value, 0)
+    while current is not None:
+        start, scheme_end = current
+        markdown = value[max(0, start - 2):start] == "]("
+        depth, end, escaped = 0, scheme_end, False
+        while end < len(value):
+            char = value[end]
+            if char.isspace():
+                break
+            if markdown:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == "(":
+                    depth += 1
+                elif char == ")":
+                    if not depth:
+                        break
+                    depth -= 1
+            end += 1
+        boundaries = [value.find(char, scheme_end, end) for char in "/?#"]
+        authority_end = min((position for position in boundaries if position >= 0), default=end)
+        at = value.rfind("@", scheme_end, authority_end)
+        colon = value.find(":", scheme_end, at) if at >= 0 else -1
+        host = at + 1 if at >= 0 else scheme_end
+        query, fragment = boundaries[1:]
+        tail = min((position for position in (query, fragment) if position >= 0), default=end)
+        later_at = value.rfind("@", authority_end, end)
+        authority_colon = value.find(":", scheme_end, authority_end)
+        # A delimiter before a later @ remains ambiguous in serving. A colon
+        # in the bounded authority also makes a later @ possible split userinfo.
+        ambiguous = later_at >= 0 and (tail < later_at or authority_colon >= 0)
+        embedded, embedded_userinfo = _guidance_embedded_userinfo(value, scheme_end, end)
+        split_userinfo = embedded_userinfo or (embedded and later_at >= 0 and authority_colon >= 0)
+        ambiguous = ambiguous or embedded_userinfo
+        if fragment >= 0 and query > fragment:
+            query = -1
+        # A later marker belongs to this URL, including any apparent query or
+        # anchor on that embedded spelling. Remove that tail conservatively.
+        if embedded:
+            query = query if query >= 0 else fragment
+            fragment = -1
+        closer = _guidance_closer_start(value, scheme_end, end)
+        # A paired bracket after an ambiguous @ still belongs to the consumed
+        # span. Keeping it inside the mask preserves the terminal prose closers.
+        bracket = later_at + 1 if ambiguous and later_at >= 0 else host
+        if value.startswith("[", bracket):
+            close = value.find("]", bracket + 1, end)
+            if close >= 0:
+                closer = max(closer, close + 1)
+        yield start, scheme_end, end, at, colon, query, fragment, closer, ambiguous, split_userinfo
+        current = _guidance_start(value, end)
+
+
+def _guidance_closer_start(value, start, stop):
+    """Find terminal prose punctuation without splitting an opaque mask."""
+    opening = value.rfind("[", start, stop)
+    mask = REDACTION_MARKER_RE.match(value, opening, stop) if opening >= start else None
+    mask_end = mask.end() if mask is not None else -1
+    end = stop
+    while end > start and value[end - 1] in _URL_CLOSERS and end != mask_end:
+        end -= 1
+    # Never restore a question mark as a fresh query delimiter.
+    return max(end, value.rfind("?", start, stop) + 1)
+
+
+def _guidance_characters(value, start, stop, edits):
+    for lo, hi, shown in edits:
+        for position in range(start, lo):
+            yield value[position]
+        yield from shown
+        start = hi
+    for position in range(start, stop):
+        yield value[position]
+
+
+def _guidance_balance(value, start, stop, edits=()):
+    balance, escaped = [0, 0], False
+    for char in _guidance_characters(value, start, stop, edits):
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char in "()":
+            balance[0] += 1 if char == "(" else -1
+        elif char in "[]":
+            balance[1] += 1 if char == "[" else -1
+    return tuple(balance)
+
+
+def _guidance_url_plan(value, limit, *, queries, authorities):
+    """Plans contain original offsets and constant replacements, never secrets."""
+    check_guidance_text(value, limit=limit)
+    plans = []
+    for start, scheme_end, stop, at, colon, query, fragment, closer, ambiguous, split_userinfo in _guidance_urls(value):
+        whole = (authorities and (start == scheme_end - 3 or ambiguous)) or (queries and split_userinfo)
+        # Compatibility helpers expose deletion spans only. Consume ambiguous
+        # embedded userinfo entirely rather than returning any password bytes.
+        edits = [(start, closer, "[REDACTED_URL]" if authorities else "")] if whole else []
+        if not whole:
+            if authorities and colon >= 0 and value[colon + 1:at] != "[REDACTED]":
+                edits.append((colon + 1, at, "[REDACTED]"))
+            if queries and query >= 0:
+                edits.append((query, fragment if fragment >= 0 else closer, ""))
+        if (authorities and edits and _guidance_balance(value, start, stop)
+                != _guidance_balance(value, start, stop, edits)):
+            edits = [(start, stop, "[REDACTED_URL]")]
+        plans.append((start, stop, tuple(edits), scheme_end - 3))
+    return tuple(plans)
+
+
+def guidance_url_plan(value, *, limit):
+    """Return (start, end, edits, marker) original offsets for atomic URLs."""
+    return _guidance_url_plan(value, limit, queries=True, authorities=True)
+
+
+def remove_guidance_url_queries(value, *, limit):
+    """Query-only compatibility primitive; return original deletion offsets."""
+    plans = _guidance_url_plan(value, limit, queries=True, authorities=False)
+    removed = tuple((lo, hi) for _start, _stop, edits, _marker in plans for lo, hi, _shown in edits)
+    parts, end = [], 0
+    for start, stop in removed:
+        parts.append(value[end:start])
+        end = stop
+    parts.append(value[end:])
+    return "".join(parts), removed
+
+
+def mask_guidance_url_authorities(value, labels, *, limit):
+    """Authority-only compatibility primitive, planned from its original input."""
+    check_guidance_text(value, limit=limit)
+    if labels is not None and (type(labels) is not list or len(labels) != len(value)):
+        _refuse_cleaner("invalid")
+    plans = _guidance_url_plan(value, limit, queries=False, authorities=True)
+    edits = [edit for _start, _stop, changes, _marker in plans for edit in changes]
+    if len(value) + sum(len(shown) - (hi - lo) for lo, hi, shown in edits) > limit:
+        _refuse_cleaner("too_large")
+    parts, attributed, end = [], [], 0
+    for first, last, marker in edits:
+        parts.extend((value[end:first], marker))
+        if labels is not None:
+            attributed.extend(labels[end:first])
+            attributed.extend([labels[first]] * len(marker))
+        end = last
+    if not parts:
+        return value, labels
+    parts.append(value[end:])
+    if labels is not None:
+        attributed.extend(labels[end:])
+    return "".join(parts), attributed if labels is not None else None
+
+
 def remove_url_credentials(value, *, limit, policy="proposal"):
     """Apply the caller's URL policy alongside shared-table masking.
 
     The proposal policy drops userinfo/query/fragment and joins whitespace.
-    Guidance retains URL structure and whitespace byte for byte. Input is
+    Guidance drops only queries, retaining userinfo, fragments and whitespace. Input is
     bounded before tokenization; the result is bounded before publication.
     Unknown policies, non-string values and invalid limits refuse as invalid.
     This boundary never formats signed trailers.
     """
     _check_cleaner(value, limit, policy)
     if policy == "guidance":
-        if len(value) > limit:
-            _refuse_cleaner("too_large")
-        return value
+        return remove_guidance_url_queries(value, limit=limit)[0]
 
     def token(raw):
         marker = raw.find("://")
