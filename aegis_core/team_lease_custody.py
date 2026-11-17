@@ -19,11 +19,14 @@ from __future__ import annotations
 
 from contextlib import contextmanager, ExitStack
 from contextvars import ContextVar
+from heapq import nsmallest
+from itertools import islice
 import os
 from pathlib import Path
+import re
 import stat
 
-from aegis_core import gitsafe, gitsafe_run, storage_confined
+from aegis_core import gitsafe, gitsafe_policy, gitsafe_run, storage_confined
 
 __all__ = ["custody", "verify", "next_action", "descriptor_supported"]
 
@@ -31,18 +34,79 @@ _ACTIVE = ContextVar("aegis_lease_repository", default=None)
 _SCRATCH = "aegis-lease-scratch"
 _LIMIT = 65536
 _SELECTORS = (gitsafe_run.LOCAL_ENV - {"GIT_NO_REPLACE_OBJECTS"}) | {"GIT_NAMESPACE"}
+_DISPLAY_NAMES = (_SELECTORS | gitsafe_policy.LOCAL_ENV | gitsafe_policy.LOCATION_ENV
+                  | {"PATH", "HOME", "USERPROFILE", "XDG_CONFIG_HOME"})
+_NUMBERED_NAME = re.compile(r"GIT_CONFIG_(?:KEY|VALUE)_[0-9]{1,6}\Z")
 
 
 def next_action(reason):
-    """Closed recovery text; no repository, environment or exception text escapes."""
-    return {"ambient_git_environment": "Unset Git repository selectors, then retry.",
-            "lease_branch_missing": "Restore the recorded branch, then retry.",
+    """Closed recovery text, except bounded and allowlisted environment names."""
+    if reason == "ambient_git_environment":
+        return _ambient_advice(_ambient_label())
+    return {"lease_branch_missing": "Restore the recorded branch, then retry.",
             "liveness_unknown": "Restore private Git metadata, then retry."}.get(reason, "")
 
 
+def _display_name(key):
+    # Bound work before hashing or parsing, and never send attacker-controlled
+    # suffixes to display: arbitrary identifiers can defeat redaction rules.
+    if len(key) <= 128 and (key in _DISPLAY_NAMES or _NUMBERED_NAME.fullmatch(key) is not None):
+        return key
+    return "<non-standard Git variable name>"
+
+
+def _ambient_label():
+    # Count failures inspect keys only; other failures retain at most 513 key
+    # references. Oversized values are measured, never copied or formatted.
+    environment = os.environ
+    try:
+        if len(environment) > 512:
+            names, count = nsmallest(16, environment), len(environment)
+        else:
+            offending, retained = set(), set()
+            for key, value in islice(environment.items(), 513):
+                if len(key) > 128 or len(value) > 65536:
+                    offending.add(key)
+                if len(key) > 128:
+                    continue
+                upper = key.upper()
+                if upper in _SELECTORS or upper.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
+                    offending.add(key)
+                if upper.startswith("GIT_") or upper in ("PATH", "HOME", "USERPROFILE", "XDG_CONFIG_HOME"):
+                    retained.add(key)
+            # Explicit selectors and size violations must remain visible even
+            # when many otherwise allowed Git variables overflow retention.
+            overflow = retained - offending if len(retained) > 56 else set()
+            names = nsmallest(16, offending)
+            names.extend(nsmallest(16 - len(names), overflow))
+            count = len(offending) + len(overflow)
+    except (KeyError, RuntimeError):
+        return None
+    if not names:
+        return None
+    # Only exact reviewed names and the fixed placeholder reach the display.
+    # These literals need no heuristic redaction, which masks valid six-digit
+    # numbered names. The reference Git classifier keeps its shared formatter.
+    # Repeated placeholders consume one display slot, but every hidden variable
+    # still contributes to the remaining count.
+    bounded = list(dict.fromkeys(_display_name(key) for key in names))
+    label = ", ".join(bounded)
+    remaining = count - len(bounded)
+    return label + (" (+%d more)" % remaining if remaining > 0 else "")
+
+
+def _ambient_advice(label):
+    return ("Stabilize the Git environment, then retry." if label is None else
+            "Unset " + label + " in the environment, then retry.")
+
+
 def _refuse(reason="liveness_unknown"):
-    raise gitsafe.GitError(reason, code="ambient_git_environment" if reason == "ambient_git_environment"
-                          else "git_failed", next_action=next_action(reason)) from None
+    if reason == "ambient_git_environment":
+        label = _ambient_label()
+        detail = label if label is not None else "variable names unavailable during inspection"
+        raise gitsafe.GitError("Ambient Git environment refused: " + detail + ".", code=reason,
+                              next_action=_ambient_advice(label)) from None
+    raise gitsafe.GitError(reason, code="git_failed", next_action=next_action(reason)) from None
 
 
 def _ambient():
@@ -294,7 +358,9 @@ def custody(root, limit=2 * _LIMIT):
             elif root != binding["root"]:
                 _refuse()
         except gitsafe.GitError as exc:
-            _refuse("ambient_git_environment" if exc.code == "ambient_git_environment" else "liveness_unknown")
+            if exc.code == "ambient_git_environment":
+                raise
+            _refuse()
         except (OSError, ValueError, RuntimeError):
             _refuse()
         try:
@@ -324,6 +390,8 @@ def verify(root):
         if identity != binding["facts"]["identity"] or workspace_identity != binding["workspace_identity"]:
             _refuse()
     except gitsafe.GitError as exc:
-        _refuse("ambient_git_environment" if exc.code == "ambient_git_environment" else "liveness_unknown")
+        if exc.code == "ambient_git_environment":
+            raise
+        _refuse()
     except (OSError, ValueError, RuntimeError):
         _refuse()

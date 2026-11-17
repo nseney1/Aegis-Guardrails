@@ -600,6 +600,19 @@ class GitOpsJournal:
                         read = _parse(data, capture=write)
                         yield fd, data, read, directory
 
+    @contextmanager
+    def admission(self):
+        """Serialize read/deduplicate/record_intent with the existing journal lock.
+
+        Nested public reads and writes re-enter that same inode lock per thread,
+        including through another journal instance. Exit before running effects
+        or waiting for another owner: receipts retain their separate effect lock.
+        This context grants no effect attempt; only a newly created receipt does.
+        """
+        with _refusals(self.common_dir), _directory(self.common_dir, create=True) as directory:
+            with storage.file_lock(Path("gitops.lock"), timeout=5.0, dir_fd=directory):
+                yield self
+
     def read(self):
         """Bounded public history; compacted terminal rows retain result semantics."""
         with self._transaction() as (_, _, read, _):

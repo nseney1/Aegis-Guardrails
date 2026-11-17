@@ -27,6 +27,7 @@ __all__ = [
     "IDENTITY_ENV",
     "ENVIRON_TYPE",
     "classify_ambient",
+    "format_ambient_names",
     "AMBIENT_ENV",
     "LOCATION_ENV",
     "Environment",
@@ -138,6 +139,14 @@ def read_shape(args):
 IDENTITY_ENV = frozenset("GIT_" + role + "_" + field for role in ("AUTHOR", "COMMITTER")
                           for field in ("NAME", "EMAIL", "DATE"))
 _AMBIENT_REDIRECTS = LOCAL_ENV - {"GIT_NO_REPLACE_OBJECTS", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"}
+def format_ambient_names(names):
+    """Format caller-bounded names, never values, in the shared diagnostic order."""
+    displayed = []
+    for key in names:
+        canonical = sanitize_display(key, max_len=None)
+        shown = sanitize_display(redact_insight_text(canonical, max_len=max(1, len(canonical))), max_len=256)
+        displayed.append("GIT_TRACE* (" + shown + ")" if key.upper().startswith("GIT_TRACE") and key.upper() not in ("GIT_TRACE", "GIT_TRACE2", "GIT_TRACE2_EVENT", "GIT_TRACE2_PERF") else shown)
+    return ", ".join(displayed)
 def classify_ambient(env, *, limit=512, refuse_keys=True, environ_type=ENVIRON_TYPE):
     """Pure bounded snapshot and deterministic refusal; values never enter diagnostics."""
     from itertools import islice
@@ -154,12 +163,7 @@ def classify_ambient(env, *, limit=512, refuse_keys=True, environ_type=ENVIRON_T
     if any("\0" in key or "\0" in value for key, value in frozen.items()): return {}, ("git_custody_refused", "Strict lane Git command refused.", "Use the lane Git APIs or the CAS fast-forward writer.")
     names = sorted(key for key in frozen if refuse_keys and (key.upper().startswith("GIT_TRACE") or key.upper() in _AMBIENT_REDIRECTS))
     if not names: return frozen, None
-    displayed = []
-    for key in names:
-        canonical = sanitize_display(key, max_len=None)
-        shown = sanitize_display(redact_insight_text(canonical, max_len=max(1, len(canonical))), max_len=256)
-        displayed.append("GIT_TRACE* (" + shown + ")" if key.upper().startswith("GIT_TRACE") and key.upper() not in ("GIT_TRACE", "GIT_TRACE2", "GIT_TRACE2_EVENT", "GIT_TRACE2_PERF") else shown)
-    label = ", ".join(displayed)
+    label = format_ambient_names(names)
     return {}, ("ambient_git_environment", "Ambient Git environment refused: " + label + ".", "Unset " + label + " in the environment, then retry.")
 AMBIENT_ENV = frozenset(("HOME", "PATH", "SSH_AUTH_SOCK", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TZ", "TMPDIR"))
 _PROGRAM_ENV = frozenset(("GIT_CONFIG", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_SSH_VARIANT", "GIT_EXEC_PATH", "GIT_ASKPASS", "GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS", "GIT_PAGER", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "GIT_PROXY_COMMAND", "PAGER", "EDITOR", "VISUAL", "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "GH_PAGER", "GH_BROWSER", "GH_EDITOR", "GH_CONFIG_DIR", "BROWSER", "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONINSPECT", "PYTHONBREAKPOINT", "PYTHONWARNINGS", "BASH_ENV", "ENV", "PERL5OPT", "PERL5LIB", "RUBYOPT", "RUBYLIB", "NODE_OPTIONS", "NODE_PATH", "JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS", "GCONV_PATH", "LOCPATH", "OPENSSL_CONF", "OPENSSL_MODULES", "MALLOC_TRACE"))

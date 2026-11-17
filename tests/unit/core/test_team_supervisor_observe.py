@@ -12,6 +12,8 @@ import pytest
 from aegis_core import gitsafe, storage_confined, team, team_hosts, team_profile, team_queue
 from aegis_core import team_supervisor_observe as module
 from aegis_core import team_writer_binding
+from tests.conftest import symlink_or_skip
+from tests.helpers_writer_binding import lease as _lane_lease, make_home as _binding_home
 
 
 def make_store(tmp_path):
@@ -20,13 +22,6 @@ def make_store(tmp_path):
     root = tmp_path.resolve() / "workspace"
     (root / ".aegis").mkdir(parents=True)
     return root
-
-
-def symlink_or_skip(link, target, directory=False):
-    try:
-        link.symlink_to(target, target_is_directory=directory)
-    except (OSError, NotImplementedError):
-        pytest.skip("symlinks unavailable")
 
 
 def profile(source="subscription-window", pair=False):
@@ -112,7 +107,7 @@ def test_root_swapped_during_service_does_not_publish_redirected_facts(
     def swapped(path):
         root.rename(parked)
         if symlink:
-            symlink_or_skip(root, other, directory=True)
+            symlink_or_skip(other, root, target_is_directory=True)
         else:
             root.mkdir()
         return team.LeaseSet((lease(),))
@@ -126,7 +121,7 @@ def test_root_swapped_during_service_does_not_publish_redirected_facts(
 def test_linked_workspace_never_reaches_repository_services(tmp_path, monkeypatch, services):
     root = make_store(tmp_path)
     link = root.with_name("link")
-    symlink_or_skip(link, root, directory=True)
+    symlink_or_skip(root, link, target_is_directory=True)
     def unexpected(root):
         pytest.fail("linked workspace reached lease reads")
     monkeypatch.setattr(team, "read_leases", unexpected)
@@ -415,7 +410,7 @@ def test_real_lease_records_never_prove_liveness(tmp_path, case):
     if case == "symlink":
         outside = tmp_path / "ref-target"
         outside.write_bytes(result.stdout)
-        symlink_or_skip(ref, outside)
+        symlink_or_skip(outside, ref)
     else:
         ref.write_bytes(result.stdout)
     for _ in range(2):
@@ -497,17 +492,6 @@ def test_bad_bounded_preflight_never_reaches_services(tmp_path, monkeypatch, ser
     assert calls == ["count", "count"]
 
 
-def _binding_home(tmp_path):
-    if not storage_confined.descriptor_supported():
-        pytest.skip("requires descriptor-relative no-follow storage")
-    home = tmp_path.resolve() / "zzmarker-home"
-    config = home / ".config" / "aegis"
-    config.mkdir(parents=True)
-    for path in (home, home / ".config", config):
-        os.chmod(path, 0o700)
-    return home
-
-
 def _run_bound(root, home, now=100):
     return module.observe(profile(), workspace_root=root, now=now, usage_adapter=adapter(),
                           user_root=str(home))
@@ -519,14 +503,6 @@ def _with_lane(lease, lane):
         branch=lease.branch, paths=lease.paths, ts=lease.ts, ttl_s=lease.ttl_s, oid=lease.oid,
         parsed=lease.path_set,
     )
-
-
-def _lane_lease(lane="writer", gen=1, claim=None, ts=50, ttl=100):
-    claim_id = "a" * 16 if claim is None else claim
-    raw = json.dumps({"v": 1, "lane": lane, "role": "implementer", "owner": "owner",
-                      "claim_id": claim_id, "gen": gen, "branch": "lane/writer",
-                      "paths": ["docs/**"], "ts": ts, "ttl_s": ttl}).encode()
-    return team.parse_lease(raw, lane, "b" * 40)
 
 
 def _write_bindings(home, records):

@@ -11,12 +11,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from threading import Barrier, Event, Thread
+from threading import Barrier, Event, Lock, Thread
 from types import SimpleNamespace
 
 import pytest
 
 from aegis_core import gitsafe, gitsafe_run, gitops_fds, team_git as tg, team_git_snapshot
+from aegis_core import team, team_lease_custody
 from tests.unit.core.test_gitsafe import LANE_MODULES, strict_program, strict_program_guard
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
@@ -25,6 +26,250 @@ IDENTITY = tg.CommitIdentity("Lane", "lane@example.com", "1700000000 +0000")
 
 ENV_REDIRECTS = ("GIT_TRACE", "GIT_TRACE2", "GIT_TRACE2_EVENT", "GIT_TRACE2_PERF",
                  "GIT_CONFIG", "GIT_DIR", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY")
+
+
+@pytest.mark.parametrize("phase", ["custody", "verify"])
+@pytest.mark.parametrize("case", ["selector", "config", "several", "many", "count", "value", "name", "retained"])
+def test_lease_ambient_names_are_bounded_without_values_and_retry(repo, monkeypatch, phase, case):
+    secret = "ghp_" + "a" * 36
+    keys = {"selector": ["GIT_DIR"], "config": ["GIT_CONFIG_KEY_0"],
+            "several": ["GIT_WORK_TREE", "GIT_DIR", "GIT_CONFIG_KEY_0"],
+            "many": ["GIT_CONFIG_KEY_%02d" % index for index in reversed(range(20))],
+            "count": ["VARIABLE_%03d" % index for index in reversed(range(600))],
+            "value": ["LARGE_VALUE"], "name": ["N" * 129],
+            "retained": ["GIT_CUSTOM_%02d" % index for index in reversed(range(57))]}[case]
+    environment = dict.fromkeys(keys, secret)
+    if case == "value":
+        environment[keys[0]] = secret + "x" * (70 * 1024)
+    before = shared_bytes(repo)
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    try:
+        def refused(_slot):
+            with pytest.raises(gitsafe.GitError) as caught:
+                if phase == "custody":
+                    with team.lease_custody(repo):
+                        pytest.fail("ambient environment reached the effect body")
+                else:
+                    team.verify_lease_repository(repo)
+            exc = caught.value
+            assert exc.code == "ambient_git_environment"
+            if case in ("count", "value", "name", "retained"):
+                label = "<non-standard Git variable name>"
+                remaining = len(keys) - 1
+            else:
+                label = ", ".join(sorted(keys)[:16])
+                remaining = max(0, len(keys) - 16)
+            if remaining:
+                label += " (+%d more)" % remaining
+            assert str(exc) == "Ambient Git environment refused: " + label + "."
+            assert exc.next_action == "Unset " + label + " in the environment, then retry."
+            assert team.lease_next_action(exc.code) == exc.next_action
+            assert secret not in str(exc) + exc.next_action
+            return str(exc), exc.next_action
+        expected = refused(0)
+        assert refused(1) == expected
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert list(pool.map(refused, range(2))) == [expected, expected]
+    finally:
+        monkeypatch.setattr(team_lease_custody, "os", os)
+    assert shared_bytes(repo) == before
+    with team.lease_custody(repo):
+        team.verify_lease_repository(repo)
+
+
+def test_lease_ambient_name_diagnostics_mask_nonstandard_names(repo, monkeypatch):
+    secret = "ghp_" + "b" * 36
+    key = "GIT_CONFIG_KEY_\x1b[31m" + secret + "_" + "z" * 300
+    environment = {key: "never-display-this-value"}
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        with team.lease_custody(repo):
+            pytest.fail("unsafe environment accepted")
+    label = "<non-standard Git variable name>"
+    for field in (str(caught.value), caught.value.next_action, team.lease_next_action(caught.value.code)):
+        assert label in field
+        assert secret not in field and "\x1b" not in field and "never-display-this-value" not in field
+
+
+@pytest.mark.parametrize("phase", ["custody", "verify"])
+@pytest.mark.parametrize("prefix", ["GIT_CONFIG_KEY_REDACTEDx", "GIT_CONFIG_VALUE_REDACTEDx", "GIT_CUSTOM_REDACTEDx"])
+@pytest.mark.parametrize("kind", ["github", "aws", "pem", "entropy"])
+def test_lease_ambient_embedded_credentials_are_never_displayed(repo, monkeypatch, phase, prefix, kind):
+    samples = {"github": "".join(("gh", "p_", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8")),
+               "aws": "".join(("AK", "IA", "9F8E7D6C5B4A3210")),
+               "pem": "".join(("-----BEGIN ", "RSA ", "PRIVATE KEY-----")),
+               "entropy": "".join(("aB9zQ2mL7xK4", "pR6vT1nH8jF3", "sW5cD0yG9uE2"))}
+    secret = samples[kind]
+    key = prefix + secret
+    environment = {key: "private-value"}
+    retained = prefix.startswith("GIT_CUSTOM_")
+    if retained:
+        environment.update({"GIT_PADDING_%02d" % index: "private-value" for index in range(56)})
+    label = "<non-standard Git variable name>" + (" (+56 more)" if retained else "")
+    before = shared_bytes(repo)
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    try:
+        def refused(_slot):
+            with pytest.raises(gitsafe.GitError) as caught:
+                if phase == "custody":
+                    with team.lease_custody(repo):
+                        pytest.fail("unsafe environment accepted")
+                else:
+                    team.verify_lease_repository(repo)
+            assert caught.value.code == "ambient_git_environment"
+            fields = str(caught.value), caught.value.next_action, team.lease_next_action(caught.value.code)
+            assert fields == ("Ambient Git environment refused: " + label + ".",
+                              "Unset " + label + " in the environment, then retry.",
+                              "Unset " + label + " in the environment, then retry.")
+            assert all(secret not in field and key not in field and "private-value" not in field for field in fields)
+            return fields
+        expected = refused(0)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert list(pool.map(refused, range(2))) == [expected, expected]
+        assert refused(1) == expected
+    finally:
+        monkeypatch.setattr(team_lease_custody, "os", os)
+    assert shared_bytes(repo) == before
+    with team.lease_custody(repo):
+        team.verify_lease_repository(repo)
+
+
+@pytest.mark.parametrize("key,shown", [
+    ("GIT_DIR", True), ("GIT_NAMESPACE", True), ("GIT_CONFIG_PARAMETERS", True),
+    ("GIT_NO_REPLACE_OBJECTS", True), ("PATH", True), ("HOME", True),
+    ("USERPROFILE", True), ("XDG_CONFIG_HOME", True), ("GIT_CONFIG_KEY_0", True),
+    ("GIT_CONFIG_VALUE_000001", True), ("GIT_CONFIG_KEY_123456", True),
+    ("GIT_CONFIG_KEY_1234567", False), ("GIT_CONFIG_VALUE_", False),
+    ("GIT_CONFIG_KEY_12extra", False), ("GIT_CONFIG_KEY_0\n", False),
+    ("GIT_CONFIG_VALUE_\u0661", False), ("git_dir", False),
+])
+def test_lease_ambient_only_exact_reviewed_names_are_disclosed(tmp_path, monkeypatch, key, shown):
+    environment = {key: "x" * 65537}
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        team.verify_lease_repository(tmp_path)
+    label = key if shown else "<non-standard Git variable name>"
+    assert caught.value.code == "ambient_git_environment"
+    assert str(caught.value) == "Ambient Git environment refused: " + label + "."
+    assert caught.value.next_action == "Unset " + label + " in the environment, then retry."
+
+
+def test_lease_ambient_masked_names_are_deduplicated_and_counted(repo, monkeypatch):
+    keys = ["GIT_CONFIG_KEY_bad-b", "GIT_DIR", "GIT_CONFIG_VALUE_123456", "GIT_CONFIG_KEY_bad-a"]
+    environment = dict.fromkeys(keys, "private-value")
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        with team.lease_custody(repo):
+            pytest.fail("unsafe environment accepted")
+    label = "<non-standard Git variable name>, GIT_CONFIG_VALUE_123456, GIT_DIR (+1 more)"
+    assert caught.value.code == "ambient_git_environment"
+    assert str(caught.value) == "Ambient Git environment refused: " + label + "."
+    assert caught.value.next_action == "Unset " + label + " in the environment, then retry."
+
+
+@pytest.mark.parametrize("selector", ["GIT_DIR", "GIT_CONFIG_KEY_0", "PATH"])
+def test_lease_ambient_primary_offenders_precede_retained_overflow(repo, monkeypatch, selector):
+    environment = {"GIT_A%02d" % index: "1" for index in range(56)}
+    environment[selector] = "x" * 70000 if selector == "PATH" else "private-value"
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    try:
+        def refused(_slot):
+            with pytest.raises(gitsafe.GitError) as caught:
+                team.verify_lease_repository(repo)
+            label = selector + ", <non-standard Git variable name> (+55 more)"
+            assert caught.value.code == "ambient_git_environment"
+            assert str(caught.value) == "Ambient Git environment refused: " + label + "."
+            assert caught.value.next_action == "Unset " + label + " in the environment, then retry."
+            assert team.lease_next_action(caught.value.code) == caught.value.next_action
+            return str(caught.value), caught.value.next_action
+        expected = refused(0)
+        assert refused(1) == expected
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert list(pool.map(refused, range(2))) == [expected, expected]
+    finally:
+        monkeypatch.setattr(team_lease_custody, "os", os)
+    with team.lease_custody(repo):
+        team.verify_lease_repository(repo)
+
+
+@pytest.mark.parametrize("key,selector", [("\x07", True), ("   ", False)])
+def test_lease_ambient_empty_canonical_names_are_fixed_placeholders(repo, monkeypatch, key, selector):
+    environment = {key: "x" * 70000}
+    if selector:
+        environment["GIT_DIR"] = "private-value"
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        team.verify_lease_repository(repo)
+    label = "<non-standard Git variable name>" + (", GIT_DIR" if selector else "")
+    assert caught.value.code == "ambient_git_environment"
+    assert str(caught.value) == "Ambient Git environment refused: " + label + "."
+    assert caught.value.next_action == "Unset " + label + " in the environment, then retry."
+
+
+def test_lease_ambient_environment_emptied_during_diagnostics_is_unavailable_and_retries(repo, monkeypatch):
+    class EmptyingEnvironment(dict):
+        inspections = 0
+        def items(self):
+            self.inspections += 1
+            if self.inspections > 1:
+                self.clear()
+            return super().items()
+    environment = EmptyingEnvironment(GIT_DIR="private-value")
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    try:
+        with pytest.raises(gitsafe.GitError) as caught:
+            with team.lease_custody(repo):
+                pytest.fail("changing environment accepted")
+        assert caught.value.code == "ambient_git_environment"
+        assert str(caught.value) == "Ambient Git environment refused: variable names unavailable during inspection."
+        assert caught.value.next_action == "Stabilize the Git environment, then retry."
+        assert team.lease_next_action(caught.value.code) == caught.value.next_action
+    finally:
+        monkeypatch.setattr(team_lease_custody, "os", os)
+    with team.lease_custody(repo):
+        team.verify_lease_repository(repo)
+
+
+@pytest.mark.parametrize("failure", [KeyError, RuntimeError])
+def test_lease_ambient_diagnostic_snapshot_failure_keeps_refusal_and_retry(repo, monkeypatch, failure):
+    class ChangingEnvironment(dict):
+        inspections = 0
+        def items(self):
+            self.inspections += 1
+            if self.inspections > 1:
+                raise failure("private-environment-input")
+            return super().items()
+    environment = ChangingEnvironment(GIT_DIR="private-value")
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    try:
+        with pytest.raises(gitsafe.GitError) as caught:
+            with team.lease_custody(repo):
+                pytest.fail("changing environment accepted")
+        assert caught.value.code == "ambient_git_environment"
+        assert str(caught.value) == "Ambient Git environment refused: variable names unavailable during inspection."
+        assert caught.value.next_action == "Stabilize the Git environment, then retry."
+        assert team.lease_next_action(caught.value.code) == caught.value.next_action
+    finally:
+        monkeypatch.setattr(team_lease_custody, "os", os)
+    with team.lease_custody(repo):
+        team.verify_lease_repository(repo)
+
+
+def test_lease_ambient_unbounded_key_is_not_parsed(repo, monkeypatch):
+    key = "GIT_CONFIG_KEY_" + "x" * 65537
+    calls = []
+    def forbidden_formatter(names):
+        calls.append(tuple(names))
+        pytest.fail("lease diagnostics reached the shared redacting formatter")
+    monkeypatch.setattr(team_lease_custody, "gitsafe_policy", SimpleNamespace(format_ambient_names=forbidden_formatter))
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": {key: "private-value"}}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        with team.lease_custody(repo):
+            pytest.fail("oversized name accepted")
+    assert caught.value.code == "ambient_git_environment"
+    assert str(caught.value) == "Ambient Git environment refused: <non-standard Git variable name>."
+    assert caught.value.next_action == "Unset <non-standard Git variable name> in the environment, then retry."
+    assert calls == []
 
 
 @pytest.mark.parametrize("key", ENV_REDIRECTS)
@@ -5548,3 +5793,133 @@ def test_public_caller_refusal_matrix_golden_bytes(repo, monkeypatch, entry):
         monkeypatch.setattr(gitsafe_run.LaneRunner, "run", run)
         monkeypatch.setattr(gitsafe_run.LaneRunner, "read_private_object", read)
         assert store.object(head, "commit").startswith(b"tree ")
+
+
+def _attribute_oid_calls(monkeypatch):
+    """Count attribute OID hashing through the snapshot module's own reference."""
+    calls, lock = [], Lock()
+    real = team_git_snapshot.object_id
+
+    def counted(data, oid_length=40, kind="blob"):
+        with lock:
+            calls.append((id(data), oid_length))
+        return real(data, oid_length, kind)
+
+    monkeypatch.setattr(team_git_snapshot, "object_id", counted)
+    return calls, real
+
+
+def _attribute_body_calls(sources, oid_length):
+    """Count body refusals without patching the helper."""
+    seen, previous = [], sys.getprofile()
+    code = team_git_snapshot._attribute_body.__code__
+
+    def observed(frame, event, _arg):
+        if event == "call" and frame.f_code is code:
+            seen.append(id(frame.f_locals["data"]))
+        if previous is not None:
+            previous(frame, event, _arg)
+
+    sys.setprofile(observed)
+    try:
+        produced = team_git_snapshot.attribute_entries(sources, oid_length)
+    finally:
+        sys.setprofile(previous)
+    return produced, seen
+
+
+def test_attribute_entries_memoizes_validated_body_and_oid_by_identity(monkeypatch):
+    """One call validates and hashes each retained bytes object once and emits every path."""
+    calls, real = _attribute_oid_calls(monkeypatch)
+    assert team_git_snapshot.attribute_entries({}, 40) == []
+    assert calls == []
+    mutable = bytearray(b"*.c text\n")
+    mutable_sources = {b"b/.gitattributes": mutable, b"a/.gitattributes": mutable}
+    mutable_entries = team_git_snapshot.attribute_entries(mutable_sources, 40)
+    assert [path for path, mode, oid, data in mutable_entries] == [
+        b"a/.gitattributes", b"b/.gitattributes"]
+    assert all(mode == "100644" and data is mutable and oid == real(bytes(mutable), 40)
+               for _, mode, oid, data in mutable_entries)
+    assert calls == [(id(mutable), 40), (id(mutable), 40)]
+    body = b"*.bin text\r\n" + (b"z" * (team_git_snapshot.MAX_ATTRIBUTE_LINE_BYTES - 1)) + b"\n"
+    alias = bytes(bytearray(body))
+    assert alias == body and alias is not body
+    sources = {b"z/.gitattributes": body, b"a/.gitattributes": body, b"m/.gitattributes": alias}
+    calls.clear()
+    entries = team_git_snapshot.attribute_entries(sources, 40)
+    assert [path for path, mode, oid, data in entries] == [
+        b"a/.gitattributes", b"m/.gitattributes", b"z/.gitattributes"]
+    assert [mode for _, mode, _, _ in entries] == ["100644", "100644", "100644"]
+    assert entries[0][3] is body and entries[2][3] is body and entries[1][3] is alias
+    assert entries[0][2] == entries[2][2] == real(body, 40)
+    assert entries[1][2] == real(alias, 40)
+    assert calls == [(id(body), 40), (id(alias), 40)]
+    wide = {b"d%03d/.gitattributes" % index: body for index in range(64)}
+    calls.clear()
+    wide_entries = team_git_snapshot.attribute_entries(wide, 64)
+    assert len(wide_entries) == 64
+    assert [path for path, _, _, _ in wide_entries] == sorted(wide)
+    assert {oid for _, _, oid, _ in wide_entries} == {real(body, 64)}
+    assert all(data is body and len(oid) == 64 for _, _, oid, data in wide_entries)
+    assert calls == [(id(body), 64)]
+    calls.clear()
+    retried, validated = _attribute_body_calls(sources, 40)
+    assert retried == entries
+    assert calls == [(id(body), 40), (id(alias), 40)]
+    assert validated == [id(body), id(alias)]
+    calls.clear()
+    barrier = Barrier(2)
+    shared = {b"p%02d/.gitattributes" % index: body for index in range(8)}
+
+    def once(_slot):
+        barrier.wait(5)
+        return team_git_snapshot.attribute_entries(shared, 40)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        concurrent = list(pool.map(once, (0, 1)))
+    assert concurrent[0] == concurrent[1]
+    assert len(concurrent[0]) == 8
+    assert {oid for _, _, oid, _ in concurrent[0]} == {real(body, 40)}
+    assert calls == [(id(body), 40), (id(body), 40)]
+    _, validated_again = _attribute_body_calls({b"a/.gitattributes": mutable, b"b/.gitattributes": mutable}, 40)
+    assert validated_again == [id(mutable), id(mutable)]
+
+
+@pytest.mark.parametrize("fault", ["nul", "bom", "long-line", "later-line", "exact-line", "file-cap"])
+def test_attribute_entries_malformed_body_refuses_before_hash_and_retries(monkeypatch, fault):
+    calls, real = _attribute_oid_calls(monkeypatch)
+    limit = team_git_snapshot.MAX_ATTRIBUTE_LINE_BYTES
+    original_cap = team_git_snapshot.MAX_ATTRIBUTE_FILE_BYTES
+    if fault == "nul":
+        body = b"*.bin text\n\0marker-value"
+    elif fault == "bom":
+        body = b"\xef\xbb\xbf*.bin text\n"
+    elif fault == "long-line":
+        body = b"x" * limit
+    elif fault == "later-line":
+        body = b"ok\n" + (b"y" * limit)
+    elif fault == "exact-line":
+        body = (b"z" * limit) + b"\n"
+    else:
+        body = b"*.bin text\n"
+        monkeypatch.setattr(team_git_snapshot, "MAX_ATTRIBUTE_FILE_BYTES", len(body))
+    good = b"*.ok text\r\n" + (b"q" * (limit - 1)) + b"\n"
+    sources = {b"a/.gitattributes": good, b"m/.gitattributes": body, b"z/.gitattributes": body}
+    with pytest.raises(tg.GitRefusal) as caught:
+        team_git_snapshot.attribute_entries(sources, 40)
+    assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+        "conversion_unavailable", "Lane Git operation refused: conversion_unavailable", None)
+    assert type(caught.value).__module__ == "aegis_core.team_git"
+    rendered = str(caught.value)
+    assert "marker-value" not in rendered and "gitattributes" not in rendered
+    assert body.decode("latin-1") not in rendered
+    assert calls == []
+    if fault == "file-cap":
+        monkeypatch.setattr(team_git_snapshot, "MAX_ATTRIBUTE_FILE_BYTES", original_cap)
+    calls.clear()
+    retried = team_git_snapshot.attribute_entries(
+        {b"b/.gitattributes": good, b"a/.gitattributes": good}, 40)
+    assert [(path, mode, oid, data is good) for path, mode, oid, data in retried] == [
+        (b"a/.gitattributes", "100644", real(good, 40), True),
+        (b"b/.gitattributes", "100644", real(good, 40), True)]
+    assert calls == [(id(good), 40)]
