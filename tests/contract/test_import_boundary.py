@@ -117,6 +117,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_isolation_verify": 0,
     "aegis_core.team_lease_custody": 0,
     "aegis_core.team_mailbox": 1,
+    "aegis_core.team_mailbox_delivery": 1,
     "aegis_core.team_mailbox_index": 1,
     "aegis_core.team_mailbox_index_scan": 0,
     "aegis_core.team_mailbox_pager": 0,
@@ -196,6 +197,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_publish": 2,
     "aegis_core.team_qualify": 0,
     "aegis_core.team_queue": 2,
+    "aegis_core.team_roles": 0,
     # Read-only lane status report over lease declarations and the existing tip gate.
     "aegis_core.team_status": 3,
     # Rule packs (rule export/import): the loader, migrate's stripper, the lifecycle's id checks and events.
