@@ -93,6 +93,24 @@ def test_simulation_names_only_omitted_builtin_profiles_on_retry_and_concurrentl
             omitted = sorted(
                 profile for profile, result in scanned.items() if "sample" not in result.exposure_rule_ids())
             sweep[budget] = omitted
+
+        classes = {}
+        for budget, omitted in sweep.items():
+            classes.setdefault(tuple(omitted), []).append(budget)
+        budgets = list(sweep)
+        transitions = [
+            (before, after) for before, after in zip(budgets, budgets[1:])
+            if sweep[before] != sweep[after]]
+        sampled = {
+            budget for members in classes.values() for budget in (members[0], members[-1])}
+        sampled.update(budget for transition in transitions for budget in transition)
+        assert {tuple(sweep[budget]) for budget in sampled} == set(classes), sweep
+        assert all(members[0] in sampled and members[-1] in sampled for members in classes.values()), sweep
+        assert all(before in sampled and after in sampled for before, after in transitions), sweep
+
+        for budget in sorted(sampled):
+            (tmp_path / ".aegis/config.json").write_text(json.dumps({"jit": {"max_tokens": budget}}), encoding="utf-8")
+            omitted = sweep[budget]
             message = ("scan simulation: not selected in profiles: " + ", ".join(omitted)
                        if omitted else "scan simulation: selected in all profiles")
             for _ in range(2):
@@ -320,6 +338,225 @@ def _simulate(root):
     return scan_service.simulate_rule_selection(root, inventory, ruleset)
 
 
+@pytest.mark.parametrize("reviewed_target,candidate_target", [
+    ("legacy/**", "src/**"), ("src/**", "src/**"), ("src/**", "legacy/**")],
+                         ids=["reviewed_unmatched", "reviewed_matched", "candidate_unmatched"])
+@pytest.mark.parametrize("changed", [False, True])
+@pytest.mark.parametrize("companion", [False, True])
+@pytest.mark.parametrize("failure", ["none", "listing", "budget"])
+def test_snapshot_mismatch_precedes_cold_selection_and_refusals(
+        tmp_path, monkeypatch, reviewed_target, candidate_target, changed, companion, failure):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.skills.slots import PLATFORM_SLOT_PROFILES
+
+    repo = _git_repo(tmp_path)
+    path = _write_rule(repo, "edited", "invariant", targets=(reviewed_target,), do="Read reviewed.")
+    reviewed = (repo.root / path).read_bytes()
+    repo.write("src/a.py", "value = 1\n")
+    repo.commit("base")
+    repo.branch("work")
+    _write_rule(repo, "edited", "invariant", targets=(candidate_target,), do="UNTRUSTED candidate.")
+    candidate = (repo.root / path).read_bytes()
+    if companion:
+        _write_rule(repo, "cold", "invariant")
+    real_changed = scan_service.gitsafe.changed_files
+    if changed:
+        repo.write("src/a.py", "value = 2\n")
+    else:
+        monkeypatch.setattr(scan_service.gitsafe, "changed_files", lambda *_a, **_k: [])
+    listed, seen = [], []
+    state = {"failure": failure}
+    real_list, real_select = scan_service.gitsafe.list_files, scan_service.select_guidance
+
+    def list_files(*args, **kwargs):
+        listed.append(True)
+        if state["failure"] == "listing":
+            raise OSError("UNTRUSTED\nsecret")
+        return real_list(*args, **kwargs)
+
+    def select(rules, *args, **kwargs):
+        seen.extend(rule.raw for rule in rules.rules if rule.id == "edited")
+        return real_select(rules, *args, **kwargs)
+
+    monkeypatch.setattr(scan_service.gitsafe, "list_files", list_files)
+    monkeypatch.setattr(scan_service, "select_guidance", select)
+    if failure == "budget":
+        monkeypatch.setattr(scan_service, "_COLD_MATCH_BUDGET", 1)
+    expected = {"edited": "not evaluated: candidate differs from scan snapshot"}
+    if companion:
+        expected["cold"] = {"none": "scan simulation: selected in all profiles",
+                            "listing": "not evaluated: scan inputs unavailable",
+                            "budget": "not evaluated: simulation budget exceeded"}[failure]
+    assert _simulate(repo.root) == expected
+    assert bool(listed) is companion
+    assert _simulate(repo.root) == expected
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(lambda _: _simulate(repo.root), range(3), timeout=30)) == [expected] * 3
+    assert candidate not in seen
+    state["failure"] = "none"
+    monkeypatch.setattr(scan_service, "_COLD_MATCH_BUDGET", 16384)
+    recovered = dict(expected)
+    if companion:
+        recovered["cold"] = "scan simulation: selected in all profiles"
+    assert _simulate(repo.root) == recovered
+    repo.write(path, reviewed.decode("utf-8"))
+    recovered["edited"] = (
+        "not evaluated: no changed files" if not changed else
+        "scan simulation: selected in all profiles" if reviewed_target == "src/**" else
+        "scan simulation: not selected in profiles: " + ", ".join(sorted(PLATFORM_SLOT_PROFILES)))
+    assert _simulate(repo.root) == recovered
+    assert _simulate(repo.root) == recovered
+    repo.write(path, candidate.decode("utf-8"))
+    repo.commit("accept exact candidate bytes")
+    repo.write("src/a.py", "value = 3\n")
+    monkeypatch.setattr(scan_service.gitsafe, "changed_files", real_changed)
+    accepted = {"edited": (
+        "scan simulation: selected in all profiles" if candidate_target == "src/**" else
+        "scan simulation: not selected in profiles: " + ", ".join(sorted(PLATFORM_SLOT_PROFILES)))}
+    if companion:
+        accepted["cold"] = "scan simulation: selected in all profiles"
+    assert _simulate(repo.root) == accepted
+    assert _simulate(repo.root) == accepted
+
+
+@pytest.mark.parametrize("shape", ["pooled_only", "every_file_crowded", "amendment", "budget"])
+@pytest.mark.parametrize("file_count", [2, 10, 12])
+@pytest.mark.parametrize("target_kind", ["exact", "glob"])
+def test_cold_selection_fidelity_matrix(tmp_path, monkeypatch, shape, file_count, target_kind):
+    """Independent temporary rules exercise file selection, replacement and limits."""
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.fitness import Fitness
+    from aegis_core.rules import load_rules
+    from aegis_core.skills.slots import PLATFORM_SLOT_PROFILES, scan_registry
+
+    repo = _git_repo(tmp_path)
+    files = [f"src/group{index:02d}/a.py" for index in range(file_count)]
+    blockers = 2 if shape == "every_file_crowded" else 1
+    for index, path in enumerate(files):
+        repo.write(path, "value = 1\n")
+        target = path if target_kind == "exact" else f"src/group{index:02d}/**"
+        for slot in range(blockers):
+            _write_rule(repo, f"gate{index:02d}-{slot}", "gate", targets=(target,))
+    if shape == "amendment":
+        _write_rule(repo, "candidate", "invariant", targets=("vendor/**",), do="Reviewed source.")
+    repo.commit("base")
+    repo.branch("work")
+    _write_rule(repo, "candidate", "invariant", do="Replacement source.")
+    repo.write(files[0], "value = 2\n")
+    ruleset = load_rules(repo.root)
+    assert not ruleset.errors
+    assert {rule.id for rule in ruleset.rules} == {
+        "candidate", *(f"gate{index:02d}-{slot}" for index in range(file_count) for slot in range(blockers))}
+    fits = {rule.id: Fitness(rule=rule.id, score=0.0) for rule in ruleset.rules}
+    sample = files[:10]
+    for profile in PLATFORM_SLOT_PROFILES:
+        def oracle(paths):
+            return scan_service.select_guidance(
+                ruleset, paths, 3, 2000, [], lambda served: {r.id: fits[r.id] for r in served},
+                registry=scan_registry(profile, repo.root)).exposure_rule_ids()
+        assert "candidate" not in oracle(sample)
+        assert all(("candidate" in oracle([path])) == (blockers == 1) for path in sample)
+
+    calls = []
+    real_select = scan_service.select_guidance
+
+    def record(rules, paths, *args, **kwargs):
+        candidates = [rule for rule in rules.rules if rule.id == "candidate"]
+        if candidates and b"Replacement source." in candidates[0].raw:
+            assert len(candidates) == 1
+            calls.append(tuple(paths))
+        return real_select(rules, paths, *args, **kwargs)
+
+    monkeypatch.setattr(scan_service, "select_guidance", record)
+    if shape == "amendment":
+        expected = "not evaluated: candidate differs from scan snapshot"
+    elif shape == "budget":
+        monkeypatch.setattr(scan_service, "_COLD_MATCH_BUDGET", 1)
+        expected = "not evaluated: simulation budget exceeded"
+    elif blockers == 2:
+        expected = f"scan simulation: never served at cold start (0/{len(sample)})"
+    else:
+        expected = "scan simulation: selected in all profiles"
+    first = _simulate(repo.root)
+    assert first["candidate"] == expected
+    if shape == "amendment":
+        assert calls == []
+    elif shape != "budget":
+        assert calls == [(path,) for _ in PLATFORM_SLOT_PROFILES for path in sample]
+    assert _simulate(repo.root) == first
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(lambda _: _simulate(repo.root), range(3), timeout=30)) == [first] * 3
+    if shape == "budget":
+        monkeypatch.setattr(scan_service, "_COLD_MATCH_BUDGET", 16384)
+        assert _simulate(repo.root)["candidate"] == "scan simulation: selected in all profiles"
+
+
+@pytest.mark.parametrize("failure", ["projection", "raised", "budget"])
+@pytest.mark.parametrize("amended", [False, True])
+def test_cold_later_file_failure_refuses_partial_verdict_and_recovers(tmp_path, monkeypatch, failure, amended):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.scan_simulation import SimulationBudget
+
+    repo = _git_repo(tmp_path)
+    repo.write("src/a.py", "value = 1\n")
+    repo.write("src/b.py", "value = 1\n")
+    if amended:
+        _write_rule(repo, "candidate", "invariant", targets=("vendor/**",))
+    repo.commit("base")
+    repo.branch("work")
+    _write_rule(repo, "candidate", "invariant")
+    real_select = scan_service.select_guidance
+
+    def refuse(rules, paths, *args, **kwargs):
+        if paths == ["src/b.py"]:
+            if failure == "projection":
+                return {"status": "FAIL", "error": "UNTRUSTED\nsecret"}
+            if failure == "budget":
+                raise SimulationBudget
+            raise RuntimeError("UNTRUSTED\nsecret")
+        return real_select(rules, paths, *args, **kwargs)
+
+    monkeypatch.setattr(scan_service, "select_guidance", refuse)
+    reason = {"projection": "scan projection failed", "raised": "scan inputs unavailable",
+              "budget": "simulation budget exceeded"}[failure]
+    expected = {"candidate": ("not evaluated: candidate differs from scan snapshot" if amended else
+                              "not evaluated: " + reason)}
+    assert _simulate(repo.root) == expected
+    assert _simulate(repo.root) == expected
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(lambda _: _simulate(repo.root), range(3), timeout=30)) == [expected] * 3
+    monkeypatch.setattr(scan_service, "select_guidance", real_select)
+    assert _simulate(repo.root) == {"candidate": (
+        "not evaluated: candidate differs from scan snapshot" if amended else
+        "scan simulation: selected in all profiles")}
+
+
+def test_cold_amendments_keep_other_reviewed_matchers_and_replace_only_themselves(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    repo = _git_repo(tmp_path)
+    _write_rule(repo, "kept", "gate")
+    _write_rule(repo, "amended-gate", "gate", targets=("vendor/**",))
+    _write_rule(repo, "amended-invariant", "invariant", targets=("vendor/**",))
+    repo.write("src/a.py", "value = 1\n")
+    repo.commit("base")
+    repo.branch("work")
+    _write_rule(repo, "amended-gate", "gate")
+    _write_rule(repo, "amended-invariant", "invariant")
+    _write_rule(repo, "cold", "invariant")
+    repo.write("src/a.py", "value = 2\n")
+    expected = {
+        "kept": "scan simulation: selected in all profiles",
+        "amended-gate": "not evaluated: candidate differs from scan snapshot",
+        "amended-invariant": "not evaluated: candidate differs from scan snapshot",
+        "cold": "scan simulation: selected in all profiles",
+    }
+    assert _simulate(repo.root) == expected
+    assert _simulate(repo.root) == expected
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(lambda _: _simulate(repo.root), range(3), timeout=30)) == [expected] * 3
+
+
 def test_unanchored_binding_rule_stays_on_installed_selection(tmp_path, monkeypatch):
     """A working rule with no anchor is installed; cold sampling must not run."""
     _rule(tmp_path, "cold", "invariant")
@@ -423,10 +660,10 @@ def test_broad_cold_draft_gets_its_own_sample_after_ten_narrow_drafts(tmp_path, 
     first = _simulate(repo.root)
     assert set(first.values()) == {"scan simulation: selected in all profiles"}
     calls = [(ids, files) for ids, files in seen if files]
-    assert len(calls) == 11 * len(PLATFORM_SLOT_PROFILES)
-    assert all(len(ids) == 1 and 0 < len(files) <= 10 for ids, files in calls)
+    assert len(calls) == 20 * len(PLATFORM_SLOT_PROFILES)
+    assert all(len(ids) == 1 and len(files) == 1 for ids, files in calls)
     assert [files for ids, files in calls if ids == ("z-broad",)] == [
-        tuple(f"src/aaa{index:02d}.py" for index in range(10))] * len(PLATFORM_SLOT_PROFILES)
+        (f"src/aaa{index:02d}.py",) for _ in PLATFORM_SLOT_PROFILES for index in range(10)]
     assert _simulate(repo.root) == first
     with ThreadPoolExecutor(max_workers=3) as pool:
         results = list(pool.map(lambda _: _simulate(repo.root), range(3), timeout=30))
@@ -464,7 +701,7 @@ def test_cold_matching_budget_bounds_every_stage_and_recovers(tmp_path, monkeypa
         attempts.count = 0
         result = _simulate(repo.root)
         assert result["cold"] == "not evaluated: simulation budget exceeded"
-        assert attempts.count == 16384
+        assert attempts.count == (16384 if stage == "sampling" else 16378)
         if stage == "selection":
             assert result["installed"] == "not evaluated: no changed files"
         return result
@@ -532,7 +769,7 @@ def test_cold_global_budget_counts_cached_steps_and_exact_ranking(tmp_path, monk
     # One denied step is observed, and no later draft/profile starts selection.
     assert steps == 16385
     assert len(matches) < 16384, "cache misses were confused with total evaluation steps"
-    assert calls == [("cold0",)] * (1 if pressure == "shared_rules" else 2)
+    assert calls == [("cold0",)] * (9 if pressure == "shared_rules" else 17)
     assert {result[f"installed{index:02d}"] for index in range(count)} == {
         "not evaluated: no changed files"}
 
@@ -680,7 +917,7 @@ def test_cold_draft_at_fitness_zero_loses_to_higher_ranked_rules(tmp_path, monke
 
     monkeypatch.setattr(scan_service, "select_guidance", record_select)
     monkeypatch.setattr(scan_service, "for_rules", record_fits)
-    expected = "scan simulation: not selected in profiles: " + ", ".join(sorted(PLATFORM_SLOT_PROFILES))
+    expected = "scan simulation: never served at cold start (0/1)"
     assert _simulate(repo.root)["m-cold"] == expected
     assert _simulate(repo.root)["m-cold"] == expected
     cold_calls = [files for ids, files in seen if "m-cold" in ids]
@@ -711,13 +948,13 @@ def test_cold_draft_names_omitted_profiles(tmp_path):
         if message == "scan simulation: selected in all profiles":
             found["selected"] = True
         else:
-            prefix = "scan simulation: not selected in profiles: "
-            assert message.startswith(prefix), message
-            names = message[len(prefix):].split(", ")
-            assert names == sorted(names) and set(names) <= profiles
-            if set(names) == profiles:
+            prefix = "scan simulation: never served at cold start (0/1)"
+            if message == prefix:
                 found["never"] = True
             else:
+                assert message.startswith(prefix + " in profiles: "), message
+                names = message[len(prefix + " in profiles: "):].split(", ")
+                assert names == sorted(names) and set(names) < profiles
                 found["partial"] = message
             assert _simulate(repo.root)["cold"] == message
 
@@ -855,9 +1092,8 @@ def test_cold_sample_is_capped_and_drops_unsafe_paths(tmp_path, monkeypatch):
     result = _simulate(repo.root)
     assert result["cold"] == "scan simulation: selected in all profiles"
     assert "secret" not in repr(result).lower()
-    expected = tuple(good[:10])
     cold_files = [files for ids, files in seen if "cold" in ids]
-    assert cold_files == [expected] * len(PLATFORM_SLOT_PROFILES)
+    assert cold_files == [(path,) for _ in PLATFORM_SLOT_PROFILES for path in good[:10]]
 
 
 def test_cold_sample_does_not_read_symlink_targets(tmp_path):

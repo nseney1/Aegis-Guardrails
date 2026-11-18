@@ -12,13 +12,12 @@ import pytest
 from aegis_core import storage, team_custody as custody, team_git, team_gitops, team_qualify
 from aegis_core.errors import LockTimeoutError
 from tests.conftest import symlink_or_skip
-from tests.unit.core.test_team_custody_checks import copied_rig, rig_template, state
-from tests.unit.core.test_team_git import IDENTITY, git, make_store
+from tests.helpers_team_git import IDENTITY, copied_rig, git, make_store, rig_template, state
 
 
 @pytest.fixture
 def rig(tmp_path, rig_template):
-    # The imported module-scoped template is copied, never rebuilt per test.
+    # The shared module-scoped template is copied, never rebuilt per test.
     with copied_rig(rig_template, tmp_path) as candidate:
         candidate.journal = team_gitops.GitOpsJournal(candidate.repo / ".git")
         yield candidate
@@ -189,19 +188,23 @@ def test_crash_after_cas_recovers_without_second_effect(rig, monkeypatch):
     assert calls == [1] and len(results(rig)) == 1
 
 
+@pytest.mark.parametrize("code", (
+    "ref_update_unknown", "git_cleanup_failed", "git_timeout", "git_output_limit"))
 @pytest.mark.parametrize("applied", [False, True])
-def test_unknown_transport_is_observed_never_repeated(rig, monkeypatch, applied):
+def test_unknown_transport_is_observed_never_repeated(rig, monkeypatch, applied, code):
     real = team_git.cas_fast_forward
     calls = []
     def unknown(*args, **kwargs):
         calls.append(1)
         if applied:
             real(*args, **kwargs)
-        raise team_git.GitRefusal("ref_update_unknown")
+        raise team_git.GitRefusal(code)
     monkeypatch.setattr(custody, "team_git", SimpleNamespace(**{**vars(team_git), "cas_fast_forward": unknown}))
     with pytest.raises(custody.CommitRefused) as caught:
         run(rig)
     assert caught.value.code == "ref_update_unknown"
+    assert str(caught.value) == custody.REFUSALS["ref_update_unknown"]
+    assert code not in str(caught.value)
     assert caught.value.next_action == {
         "actor": "custodian",
         "command": "inspect the commit intent and reconcile by observation; never repeat its effect",
@@ -212,6 +215,8 @@ def test_unknown_transport_is_observed_never_repeated(rig, monkeypatch, applied)
         with pytest.raises(custody.CommitRefused) as caught:
             run(rig)
         assert caught.value.code == "request_closed"
+        assert str(caught.value) == custody.REFUSALS["request_closed"]
+        assert code not in str(caught.value)
     assert calls == [1] and len(results(rig)) == 1
 
 
@@ -1037,3 +1042,31 @@ def test_distinct_input_fingerprints_still_share_identical_commit_binding(rig):
     assert sorted(item.status for item in outcomes) == ["committed", "committed_recovered"]
     rows = [row for row in rig.journal.read().rows if row["op"] == "commit"]
     assert [row["kind"] for row in rows] == ["intent", "result"]
+
+
+def test_unknown_outcome_codes_are_one_shared_object():
+    """Custody and lane Git classify indeterminate outcomes with one frozenset."""
+    assert "UNKNOWN_OUTCOME_CODES" in team_git.__all__
+    shared = getattr(team_git, "UNKNOWN_OUTCOME_CODES", None)
+    assert shared is custody._UNKNOWN
+    assert isinstance(shared, frozenset)
+    assert shared == frozenset((
+        "ref_update_unknown", "git_cleanup_failed", "git_timeout", "git_output_limit"))
+    for determinate in ("git_failed", "ref_update_failed", "cas_mismatch", "git_missing"):
+        assert determinate not in shared
+
+
+def test_shared_unknown_codes_are_one_object_under_concurrent_reads():
+    assert hasattr(team_git, "UNKNOWN_OUTCOME_CODES")
+    shared = team_git.UNKNOWN_OUTCOME_CODES
+    barrier = Barrier(4)
+
+    def read():
+        barrier.wait(5)
+        return custody._UNKNOWN, team_git.UNKNOWN_OUTCOME_CODES
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(read) for _ in range(4)]
+        seen = [future.result(timeout=5) for future in futures]
+    assert seen == [(shared, shared)] * 4
+    assert all(item is custody._UNKNOWN for pair in seen for item in pair)

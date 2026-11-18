@@ -213,6 +213,8 @@ SELECTOR_SITE_TABLE = (
      "Review the subprocess.run default forwarded positionally only to the reviewed hook benchmark."),
     ("aegis_core/team_supervisor_start.py", "_spawn", "reviewed-dynamic",
      "Launch the configured supervisor process and perform startup identity and timeout checks."),
+    ("aegis_core/team_host_qualify_evidence.py", "_command_matches", "lexer-or-message",
+     "Recognize planned shell command wrappers in offline evidence analysis; no process is launched."),
     ("aegis_core/testexec.py", "kill_group", "reviewed-dynamic",
      "Run Windows taskkill directly; positional process-group termination shares the scope."),
     ("aegis_core/verification/test_runner.py", "discover_test_evidence", "reviewed-dynamic",
@@ -1040,7 +1042,6 @@ _Quoted = namedtuple("_Quoted", "value")
 _Launch = namedtuple("_Launch", "executable argv shell")
 _LaunchResolution = namedtuple("_LaunchResolution", "programs reason module")
 _SpawnVerdict = namedtuple("_SpawnVerdict", "rel node scope verdict reason programs module")
-_ARGV_ORIGINS = object()
 
 
 class _CommandEvidence(namedtuple("_CommandEvidence", "unresolved interpreter selector content module",
@@ -1052,7 +1053,7 @@ class _CommandEvidence(namedtuple("_CommandEvidence", "unresolved interpreter se
         return self.unresolved and (self.interpreter or self.selector or self.content)
 
 
-_SPLICE, _PYTHON, _OPTION_PREFIX, _USE_HEAD = object(), object(), object(), object()
+_SPLICE, _PYTHON, _OPTION_PREFIX, _USE_HEAD, _NONE = object(), object(), object(), object(), object()
 _UNRESOLVED_IMPORT = object()
 _UNRESOLVED_MODULE = object()
 _CONTENT_METHODS = frozenset({"read_text", "read_bytes", "open", "read", "readline", "readlines"})
@@ -1652,6 +1653,7 @@ class CommandResolver:
         pins = OPTION_PREFIX_PINS if option_pins is None else option_pins
         self.option_functions = ({key: checked_prefix_function(modules, key, pins) for key in pins}
                                  if OPTION_PREFIX_CALLER[0] in modules else {})
+        self._proven_cache = {}
 
     def export_changed(self, qualified, *, descendants=True):
         return any(qualified == name or qualified.startswith(name + ".")
@@ -1848,11 +1850,25 @@ class CommandResolver:
             return {None}
         result = {v for node in choices for v in self.values(node, origin, seen)}
         result |= {v for name in sources for v in self.imported(name, seen)}
-        if not result or any(not (isinstance(value, str) or value is _PYTHON
-                or isinstance(value, _Argv) and value.kind == "tuple"
-                and all(isinstance(word, str) or word is _PYTHON for word in value.items)) for value in result):
-            return {None}  # Mutable containers and call results do not cross modules as known values.
-        return result
+        if len(result) > _MAX_CHOICES:
+            return {None}
+        retained = set()
+        for value in result:
+            if isinstance(value, _Argv) and value.kind == "tuple":
+                if len(value.items) > _MAX_WORDS:
+                    return {None}
+                # An opaque operand cannot erase the immutable words around it.
+                # Nested mutable containers cross only as unknown individual words.
+                words = tuple(word if word is None or word is _UNRESOLVED_IMPORT or word is _SPLICE
+                              or isinstance(word, str) or word is _PYTHON
+                              or isinstance(word, _Quoted) and isinstance(word.value, str)
+                              else None for word in value.items)
+                retained.add(_Argv("tuple", words))
+            elif value is None or value is _UNRESOLVED_IMPORT or isinstance(value, str) or value is _PYTHON or value is _NONE:
+                retained.add(value)
+            else:
+                retained.add(None)  # Mutable containers and call results stay opaque.
+        return retained or {None}
 
     def named(self, node, origin, seen):
         names, bindings, _ = self.contexts[origin]
@@ -2061,6 +2077,9 @@ class CommandResolver:
         left, right = self.values(node.left, origin, seen), self.values(node.right, origin, seen)
         if len(left) * len(right) > _MAX_CHOICES:
             return {None}
+        opaque = any(isinstance(a, _Argv) != isinstance(b, _Argv) for a in left for b in right)
+        if opaque and len(left) * len(right) == _MAX_CHOICES:
+            return {None}  # Reserve the uncertainty alternative before allocating results.
         result = set()
         for a in left:
             for b in right:
@@ -2085,6 +2104,12 @@ class CommandResolver:
                     else:
                         result.add(_Shell(parts[0].text + parts[1].text, parts[0].holes | parts[1].holes,
                                           parts[0].hidden or parts[1].hidden))
+                elif isinstance(a, _Argv) and not isinstance(b, _Argv) and len(a.items) < _MAX_WORDS:
+                    result.add(_Argv(a.kind, a.items + (_SPLICE,)))  # Preserve the known prefix around an opaque suffix.
+                    result.add(None)  # Retain unresolved construction evidence as well as known words.
+                elif isinstance(b, _Argv) and not isinstance(a, _Argv) and len(b.items) < _MAX_WORDS:
+                    result.add(_Argv(b.kind, (_SPLICE,) + b.items))  # Preserve the known suffix around an opaque prefix.
+                    result.add(None)
                 else:
                     result.add(None)
         return result
@@ -2155,6 +2180,8 @@ class CommandResolver:
             return {v for sequence in self.values(node.iter, origin, seen)
                     for v in (sequence.items if isinstance(sequence, _Argv) else (None,))} or {None}
         names, _, _ = self.contexts[origin]
+        if isinstance(node, ast.Constant) and node.value is None:
+            return {_NONE}  # Explicit None selects the argv head; it is not an unresolved value.
         if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
             if len(node.value) > _MAX_TEXT:
                 return {None}
@@ -2201,6 +2228,8 @@ class CommandResolver:
         if executable is None or isinstance(executable, ast.Constant) and executable.value is None:
             return {_USE_HEAD}
         values = self.values(executable, origin)
+        if _NONE in values:
+            values = {_USE_HEAD if item is _NONE else item for item in values}
         if None in values or _UNRESOLVED_IMPORT in values:
             constants = self.constant_strings(executable, origin)
             if constants is not None:
@@ -3381,15 +3410,13 @@ class CommandResolver:
 
     def argv_programs(self, value, *, fragment=True, executable=_USE_HEAD, depth=0,
                       source_positions=None):
+        """Extract this argv's own program; the AST census visits nested containers separately."""
         items = value.items
         if not items:
             return
         if depth >= _MAX_DEPTH or len(items) > _MAX_WORDS:
             yield None
             return
-        for nested in items:
-            if isinstance(nested, _Argv):
-                yield from self.argv_programs(nested, depth=depth + 1)
         if isinstance(items[0], _Argv):
             return
         prefixes = [index for index, word in enumerate(items) if word is _OPTION_PREFIX]
@@ -3958,6 +3985,141 @@ class CommandResolver:
             return tuple(node.args[offset + 1:end])
         return node.args[offset + 1] if len(node.args) > offset + 1 else keywords.get("argv", keywords.get("args"))
 
+    def _direct_command_launch(self, node, parents, names):
+        """The raw call whose command expression is this node, with no intervening call."""
+        parent = parents.get(id(node))
+        keyword = None
+        if isinstance(parent, ast.keyword):
+            keyword = parent
+            parent = parents.get(id(parent))
+        if not (isinstance(parent, ast.Call) and names.resolve(parent.func) & RAW):
+            return None
+        for api in names.resolve(parent.func) & RAW:
+            command = self.construction_command(parent, api)
+            target = keyword.value if keyword is not None else node
+            if command is target:
+                return parent
+        return None
+
+    def proven_consumed_ids(self, rel):
+        """Node ids whose construction is the same event as a proven raw spawn.
+
+        A binding qualifies only when it is one simple ``name = <literal>``
+        inside a function, every load of that name in the function is the
+        direct first positional of one raw spawn, and that spawn's argv is
+        closed and yields exactly the literal's programs. Module bindings and
+        every unlisted shape stay counted at the construction.
+        """
+        cached = self._proven_cache.get(rel)
+        if cached is not None:
+            return cached
+        proven = self._prove_consumed(rel)
+        self._proven_cache[rel] = proven
+        return proven
+
+    def _prove_consumed(self, rel):
+        tree = self.modules.get(rel)
+        names = self.imports.names.get(rel) if tree is not None else None
+        if tree is None or names is None:
+            return frozenset()
+        parents = {id(child): parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+        proven = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                proven.update(self._proven_binding_ids(node, rel, names, parents))
+        return frozenset(proven)
+
+    def _direct_function_nodes(self, function):
+        """Nodes in one function, excluding nested function, class, and lambda bodies."""
+        nodes, stack = [], list(function.body)
+        nested = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+        while stack:
+            node = stack.pop()
+            if isinstance(node, nested):
+                continue
+            nodes.append(node)
+            stack.extend(ast.iter_child_nodes(node))
+        return nodes
+
+    def _closed_program(self, vectors):
+        """One fully resolved argv must yield exactly one literal program."""
+        if len(vectors) != 1:
+            return None
+        vector = next(iter(vectors))
+        if (not isinstance(vector, _Argv) or not vector.items
+                or any(not (isinstance(word, str) or word is _PYTHON) for word in vector.items)):
+            return None
+        program = None
+        for source in self.argv_programs(vector, executable=_USE_HEAD, fragment=False):
+            if program is not None or not isinstance(source, str) or not source or len(source) > _MAX_TEXT:
+                return None
+            program = source
+        return program
+
+    def _raw_command_load(self, load, parents, names):
+        """True when this name is the direct argv of one raw spawn and nothing else."""
+        parent = parents.get(id(load))
+        if not isinstance(parent, ast.Call) or len(parent.args) != 1 or parent.args[0] is not load:
+            return False
+        if any(keyword.arg is None or keyword.arg in {"executable", "shell", "args", "argv", "cmd", "command"}
+               for keyword in parent.keywords):
+            return False
+        apis = names.resolve(parent.func)
+        if len(apis) != 1 or not apis <= RAW:
+            return False
+        extracted = api_arguments(parent, next(iter(apis)))
+        if extracted is None:
+            return False
+        executable, command, shell = extracted
+        return executable is None and not shell and command is load
+
+    def _proven_binding_ids(self, function, rel, names, parents):
+        direct = self._direct_function_nodes(function)
+        direct_ids = {id(node) for node in direct}
+        assignments, rejected = {}, set()
+        for node in direct:
+            if isinstance(node, (ast.Global, ast.Nonlocal)):
+                rejected.update(node.names)
+            elif isinstance(node, ast.Delete):
+                rejected.update(target.id for target in node.targets if isinstance(target, ast.Name))
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                parent = parents.get(id(node))
+                simple = (isinstance(parent, ast.Assign) and len(parent.targets) == 1
+                          and parent.targets[0] is node)
+                if not simple:
+                    rejected.add(node.id)
+            elif (isinstance(node, ast.Assign) and len(node.targets) == 1
+                  and isinstance(node.targets[0], ast.Name)):
+                name = node.targets[0].id
+                if name in assignments:
+                    rejected.add(name)
+                else:
+                    assignments[name] = node
+        for node in ast.walk(function):
+            if node is function or id(node) in direct_ids:
+                continue
+            if isinstance(node, ast.Name) and node.id in assignments:
+                rejected.add(node.id)  # A nested scope can observe or rebind the name.
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                rejected.update(name for name in node.names if name in assignments)
+        proven = set()
+        for name, assign in assignments.items():
+            if (name in rejected or not isinstance(assign.value, (ast.List, ast.Tuple))
+                    or any(not isinstance(item, (ast.Constant, ast.Name, ast.Attribute))
+                           for item in assign.value.elts)):
+                continue
+            loads = [node for node in direct
+                     if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id == name]
+            if not loads or any(not self._raw_command_load(load, parents, names) for load in loads):
+                continue
+            literal = self._closed_program(self.values(assign.value, rel))
+            if literal is None:
+                continue
+            if any(self._closed_program(self.values(load, rel)) != literal for load in loads):
+                continue
+            proven.update(id(node) for node in ast.walk(assign.value))
+        return proven
+
     def construction_programs(self, value, node, api, origin):
         """A normalized call's execution context also governs its constructions."""
         extracted = api_arguments(node, api)
@@ -3972,31 +4134,29 @@ class CommandResolver:
 
     def programs(self, rel, *, with_locations=False, with_nodes=False, construction_refusals=False):
         # Located events distinguish launch occurrences from argv source data.
-        # Consumers remove construction subtrees used by a normalized launch;
-        # separate calls remain separate even when they share one argv value.
-        # Node-bearing refusal events retain the legacy eligibility rules,
-        # without the located inventory's additional consumption-only events.
+        # Constructions stay in the census. proven_consumed_ids drops only a
+        # function literal whose every load is a raw spawn of that same program.
+        # Every container is visited independently, with source-position
+        # deduplication instead of parent-shape or nested-container exclusions.
         tree = self.modules[rel]
         names = self.imports.names[rel]  # The graph resolves spawn callees only.
         parents = {id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
         emitted = set()
         events = {}
-        event_counts = [0, 0, 0]
+        event_counts = [0, 0]
 
         def record(node, program, sources, launch):
             key = node.lineno, node.col_offset, program, launch
             if key in events:
                 events[key][2].update(sources)
             else:
-                category = (2 if program is _ARGV_ORIGINS else
-                            int(program is None or program is _UNRESOLVED_MODULE))
+                category = int(program is None or program is _UNRESOLVED_MODULE)
                 if event_counts[category] >= _MAX_WORDS:
                     raise ValueError(rel + ": literal occurrence limit")
                 event_counts[category] += 1
                 events[key] = (node, program, set(sources), launch)
 
         for node in ast.walk(tree):
-            parent = parents.get(id(node))
             if isinstance(node, ast.Call) and names.resolve(node.func) & RAW:
                 for api in sorted(names.resolve(node.func) & RAW):
                     command = self.construction_command(node, api)
@@ -4033,18 +4193,6 @@ class CommandResolver:
                         command = self.construction_command(node, api)
                         vectors = (self.sequence(ast.Tuple(elts=list(command)), rel, frozenset())
                                    if isinstance(command, tuple) else self.values(command, rel))
-                        if extracted is not None:
-                            executable, _, _ = extracted
-                            executables = self.effective_executables(executable, rel)
-                            complete = bool(vectors) and all(isinstance(vector, _Argv) and vector.items and all(
-                                isinstance(word, str) or word is _PYTHON or word is _OPTION_PREFIX
-                                or isinstance(word, tuple) and len(word) == 2 and word[0] == "captured-module"
-                                for word in vector.items) for vector in vectors)
-                            if complete and all(value is _USE_HEAD or value is _PYTHON or isinstance(value, str)
-                                                for value in executables):
-                                origins = {word for words in self.argv_source_words(command, rel) for word in words}
-                                if origins:
-                                    record(node, _ARGV_ORIGINS, origins, True)
                         for vector in vectors:
                             if not isinstance(vector, _Argv):
                                 continue
@@ -4056,22 +4204,15 @@ class CommandResolver:
                 continue
             candidate = isinstance(node, (ast.List, ast.Tuple)) or (
                 isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add))
-            if isinstance(parent, ast.Assign) and all(isinstance(target, (ast.Tuple, ast.List)) for target in parent.targets):
-                continue  # Unpacking data is not an argv; its bindings remain unknown.
-            elif (isinstance(parent, ast.Compare)
-                  or not with_locations and isinstance(parent, (ast.Starred, ast.List, ast.Tuple))
-                  or not with_locations and isinstance(parent, ast.BinOp) and isinstance(parent.op, ast.Add)):
-                continue
             if not candidate:
                 continue
-            launch = parent if with_locations else None
-            while launch is not None and not (isinstance(launch, ast.Call) and names.resolve(launch.func) & RAW):
-                launch = parents.get(id(launch))
+            # Only the call's own command expression inherits its executable.
+            # A nested list, slice or helper call is a separate construction:
+            # re-reading it under the outer executable invents argv fragments.
+            launch = self._direct_command_launch(node, parents, names) if with_locations else None
             values = self.values(node, rel)
             for value in values:
                 if isinstance(value, _Argv):
-                    if with_locations and any(isinstance(item, _Argv) for item in value.items):
-                        continue  # Nested argv values have distinct source occurrences below this wrapper.
                     programs = (program for api in sorted(names.resolve(launch.func) & RAW)
                                 for program in self.construction_programs(value, launch, api, rel)) if launch is not None else self.argv_programs(value)
                 elif (value is None or value is _UNRESOLVED_IMPORT) and self.bearing(node, rel):
@@ -4259,11 +4400,10 @@ def literal_fixture_sites(root, *, option_pins=None):
 
 
 def literal_process_sites(rel, tree, resolver, *, owner=None, origin_line=None, depth=0, context_rel=None,
-                          consumed=None, constructors=None, dependencies=frozenset(),
+                          constructors=None,
                           literal_exceptions=None, used_reviews=None, selector_table=()):
     """Count resolvable program occurrences, retaining their reviewed source owner."""
     found, parsed = [], set()
-    consumed = set() if consumed is None else consumed
     constructors = set() if constructors is None else constructors
     exceptions = checked_literal_exceptions({} if literal_exceptions is None else literal_exceptions)
     used_reviews = set() if used_reviews is None else used_reviews
@@ -4271,33 +4411,26 @@ def literal_process_sites(rel, tree, resolver, *, owner=None, origin_line=None, 
     context_rel = rel if context_rel is None else context_rel
     rows = selector_table if not depth else ()
     reviewed = {row[:2] for row in rows}
+    proven = resolver.proven_consumed_ids(context_rel)
     for verdict in spawn_totality({context_rel: tree}, rows, resolver=resolver):
         scopes[id(verdict.node)] = verdict.scope
         if verdict.verdict == "refused":
             raise ValueError(rel + (": unresolved Python module" if verdict.module
                                     else ": unresolved Python -c program"))
     for node, source, origins, launch in resolver.programs(context_rel, with_locations=True):
-        if source is _ARGV_ORIGINS:
-            consumed.update((source_rel, id(source_node)) for source_rel, source_node in origins)
-            continue  # This is argv consumption metadata, not a resolver outcome.
         if source is None or source is _UNRESOLVED_MODULE:
             if (context_rel, scopes[id(node)]) not in reviewed:
                 raise ValueError(rel + (": unresolved Python module" if source is _UNRESOLVED_MODULE
                                         else ": unresolved Python -c program"))
-            if launch:
-                consumed.update((source_rel, id(source_node)) for source_rel, source_node in origins)
             continue  # Explicitly reviewed uncertainty; never an implicit source=None omission.
         if not isinstance(source, str):
             continue  # Reviewed uncertainty or an already-censused captured module.
-        required = dependencies
-        if launch:
-            consumed.update((source_rel, id(source_node), source) for source_rel, source_node in origins)
-        else:
+        if not launch:
             construction = context_rel, id(node), source
-            if construction in constructors or construction in consumed or construction[:2] in consumed:
+            # Only a proven direct binding is the same event as its launch.
+            if id(node) in proven or construction in constructors:
                 continue
             constructors.add(construction)
-            required = dependencies | {construction}
         scope = scopes[id(node)] if owner is None else owner + "." + scopes[id(node)]
         location = node.lineno, node.col_offset
         key = scope, location, source
@@ -4321,10 +4454,10 @@ def literal_process_sites(rel, tree, resolver, *, owner=None, origin_line=None, 
         for child_key, lines in module_process_sites({nested_rel: program}, imports=nested.imports).items():
             category, _, child_scope, api = child_key.split(":", 3)
             if category == "process":
-                found.extend((f"process:{rel}:{prefix}.{child_scope}:{api}", line, required) for _ in lines)
+                found.extend((f"process:{rel}:{prefix}.{child_scope}:{api}", line) for _ in lines)
         found.extend(literal_process_sites(
             rel, program, nested, owner=prefix, origin_line=line, depth=depth + 1, context_rel=nested_rel,
-            consumed=consumed, constructors=constructors, dependencies=required,
+            constructors=constructors,
             literal_exceptions=exceptions, used_reviews=used_reviews))
     return found
 
@@ -4347,16 +4480,15 @@ def process_sites(root, *, option_pins=None, selector_table=None, literal_except
         raise ValueError(errors[0])
     resolver = CommandResolver(modules, option_pins=option_pins)
     found = module_process_sites(modules, imports=resolver.imports)
-    literals, consumed, constructors, used_reviews = [], set(), set(), set()
+    literals, constructors, used_reviews = [], set(), set()
     for rel, tree in modules.items():
-        literals.extend(literal_process_sites(rel, tree, resolver, consumed=consumed, constructors=constructors,
+        literals.extend(literal_process_sites(rel, tree, resolver, constructors=constructors,
                                              literal_exceptions=literal_exceptions, used_reviews=used_reviews,
                                              selector_table=selector_table))
     if literal_exceptions.keys() - used_reviews:
         raise ValueError("process census: stale literal program exception")
-    for key, line, dependencies in literals:
-        if all(dependency not in consumed and dependency[:2] not in consumed for dependency in dependencies):
-            found.setdefault(key, []).append(line)
+    for key, line in literals:
+        found.setdefault(key, []).append(line)
     return dict(sorted(found.items()))
 
 
@@ -5975,16 +6107,17 @@ def test_literal_spawn_nested_import_keeps_package_context(tmp_path, provider, c
                for error in census_errors(after, record))
 
 
-@pytest.mark.parametrize("body", [
-    "subprocess.run([sys.executable, *['-c',P]])",
-    "subprocess.run((sys.executable, *('-c',P)))",
-    "FRAGMENT=['-c',P]\nsubprocess.run([sys.executable, *FRAGMENT])",
-    "FRAGMENT=('-c',P)\nsubprocess.run((sys.executable,) + FRAGMENT)",
-    "PREFIX=[sys.executable]\nFRAGMENT=['-c',P]\nsubprocess.run(PREFIX + FRAGMENT)",
-    "ARGV=[sys.executable,'-c',P]\nsubprocess.run(ARGV)",
-    "ARGV=[sys.executable,'-c',P]\nALIAS=ARGV\nsubprocess.run(ALIAS)",
+@pytest.mark.parametrize("body,count", [
+    ("subprocess.run([sys.executable, *['-c',P]])", 2),
+    ("subprocess.run((sys.executable, *('-c',P)))", 2),
+    ("FRAGMENT=['-c',P]\nsubprocess.run([sys.executable, *FRAGMENT])", 2),
+    ("FRAGMENT=('-c',P)\nsubprocess.run((sys.executable,) + FRAGMENT)", 2),
+    ("PREFIX=[sys.executable]\nFRAGMENT=['-c',P]\nsubprocess.run(PREFIX + FRAGMENT)", 2),
+    ("ARGV=[sys.executable,'-c',P]\nsubprocess.run(ARGV)", 1),
+    ("ARGV=[sys.executable,'-c',P]\nALIAS=ARGV\nsubprocess.run(ALIAS)", 2),
 ])
-def test_literal_spawn_flattened_fragments_count_once(tmp_path, body):
+def test_literal_spawn_flattened_fragments_count_once(tmp_path, body, count):
+    """A direct function binding counts once; a fragment or alias also keeps its construction."""
     package = tmp_path / "aegis_core"
     package.mkdir()
     (package / "probe.py").write_text(
@@ -5992,7 +6125,7 @@ def test_literal_spawn_flattened_fragments_count_once(tmp_path, body):
         + "".join("    " + line + "\n" for line in body.splitlines()), encoding="utf-8")
     table = (("aegis_core/probe.py", "launch", "resolved-python-program", "Test-owned flattened occurrence."),)
     sites = process_sites(tmp_path, selector_table=table)
-    assert sum(len(lines) for key, lines in sites.items() if key.endswith(":os.system")) == 1
+    assert sum(len(lines) for key, lines in sites.items() if key.endswith(":os.system")) == count
 
 
 @pytest.mark.parametrize("imported", [False, True], ids=["local", "imported"])
@@ -6013,11 +6146,11 @@ def test_literal_spawn_shared_argv_keeps_each_launch(tmp_path, imported, same_ow
         path.write_text(source + "subprocess.run(" + second + ")\n", encoding="utf-8")
     write("['true']")
     before = process_sites(tmp_path, selector_table=table)
-    assert sum(len(lines) for key, lines in before.items() if key.endswith(":os.system")) == 1
+    assert sum(len(lines) for key, lines in before.items() if key.endswith(":os.system")) == 2
     record = {key:{"count":len(lines),"reason":"Test-owned process rows."} for key,lines in before.items()}
     write("ARGV")
     after = process_sites(tmp_path, selector_table=table)
-    assert sum(len(lines) for key, lines in after.items() if key.endswith(":os.system")) == 2
+    assert sum(len(lines) for key, lines in after.items() if key.endswith(":os.system")) == 3
     assert any("unreviewed process:" in error and ":os.system" in error for error in census_errors(after, record))
 
 
@@ -6030,7 +6163,7 @@ def test_literal_spawn_constant_prefix_survives_concatenation(tmp_path, tail):
         + "    subprocess.run([sys.executable,'-I','-c',P] + " + tail + ")\n", encoding="utf-8")
     table = (("aegis_core/probe.py", "launch", "resolved-python-program", "Test-owned constant program prefix."),)
     sites = process_sites(tmp_path, selector_table=table)
-    assert sum(len(lines) for key, lines in sites.items() if key.endswith(":os.system")) == 1
+    assert sum(len(lines) for key, lines in sites.items() if key.endswith(":os.system")) == 2
 
 
 def test_literal_spawn_argon_native_head_shell_override(tmp_path):
@@ -6136,7 +6269,12 @@ def test_selector_site_formal_0728_bytes_argv_and_programs(tmp_path, call, bytes
     assert str(error.value) == "unreviewed selector site aegis_core/probe.py:launch"
     table = (("aegis_core/probe.py", "launch", "resolved-python-program", "Test-owned byte argv program."),)
     sites = process_sites(tmp_path, selector_table=table)
-    assert sum(len(lines) for key, lines in sites.items() if key.endswith(":os.system")) == 1
+    # A starred fragment or tuple concatenation is its own construction.
+    nested = call in {
+        "subprocess.run([sys.executable,*[b'-c',P]])",
+        "subprocess.run((sys.executable,) + (b'-c',P))",
+    }
+    assert sum(len(lines) for key, lines in sites.items() if key.endswith(":os.system")) == (2 if nested else 1)
 
 
 @pytest.mark.parametrize("call", ["os.system(CMD)", "subprocess.getoutput(CMD)", "subprocess.getstatusoutput(CMD)",
@@ -6197,7 +6335,9 @@ def test_literal_spawn_formal_0728_launch_site_dedup(tmp_path, call, shape, nest
     (package / "probe.py").write_text(source, encoding="utf-8")
     table = tuple((rel,owner,"resolved-python-program","Test-owned launch-site deduplication.") for rel,owner in owners)
     sites = process_sites(tmp_path, selector_table=table)
-    assert sum(len(lines) for key,lines in sites.items() if key.endswith(":os.system")) == 1
+    # Fragments, loops and the shell expression using shlex.quote are not a
+    # simple closed literal binding, so the construction stays counted.
+    assert sum(len(lines) for key,lines in sites.items() if key.endswith(":os.system")) == 2
 
 
 @pytest.mark.parametrize("selector,script", [
@@ -6316,9 +6456,12 @@ def test_literal_spawn_argon_0728_nested_dynamic_argv_is_site(tmp_path, argument
                                      encoding="utf-8")
     table = (("aegis_core/probe.py", "launch", "reviewed-dynamic", "Test-owned nested program with dynamic child argv."),)
     sites = process_sites(tmp_path, selector_table=table)
-    assert sum(len(lines) for key,lines in sites.items() if key.endswith(":subprocess.run")) == 2
+    # A preserved prefix keeps the launch as well as the list construction.
+    concat = "+ args" in argument
+    assert sum(len(lines) for key,lines in sites.items() if key.endswith(":subprocess.run")) == (3 if concat else 2)
     child = [(key,lines) for key,lines in sites.items() if ":launch.<literal-c-" in key]
-    assert len(child) == 1 and child[0][1] == [3]
+    assert len(child) == (2 if concat else 1)
+    assert all(lines == [3] for _, lines in child)
 
 
 @pytest.mark.parametrize("api", ["run", "Popen", "call", "check_call", "check_output"])
@@ -6341,8 +6484,10 @@ def test_literal_spawn_formal_0821_none_executable_counts_once(tmp_path, api, po
     table = tuple(("aegis_core/probe.py", owner, "resolved-python-program", "Test-owned explicit default executable.")
                   for owner in ("<module>","launch"))
     sites = process_sites(tmp_path, selector_table=table)
-    assert sum(len(lines) for key,lines in sites.items() if key.endswith(":os.system")) == copies
-    assert all(":launch." in key for key in sites if key.endswith(":os.system"))
+    system = {key: lines for key, lines in sites.items() if key.endswith(":os.system")}
+    owner = lambda key: key.split(":")[2].split(".<literal", 1)[0]
+    assert sum(len(lines) for key, lines in system.items() if owner(key) == "launch") == copies
+    assert sum(len(lines) for key, lines in system.items() if owner(key) == "<module>") == 1
 
 
 @pytest.mark.parametrize("copies", [1, 2])
@@ -6356,8 +6501,10 @@ def test_literal_spawn_formal_0821_late_origins_are_merged(tmp_path, copies):
     table = tuple(("aegis_core/probe.py", owner, "resolved-python-program", "Test-owned late construction origins.")
                   for owner in ("<module>","launch"))
     sites = process_sites(tmp_path, selector_table=table)
-    assert sum(len(lines) for key,lines in sites.items() if key.endswith(":os.system")) == copies
-    assert all(":launch." in key for key in sites if key.endswith(":os.system"))
+    system = {key: lines for key, lines in sites.items() if key.endswith(":os.system")}
+    owner = lambda key: key.split(":")[2].split(".<literal", 1)[0]
+    assert sum(len(lines) for key, lines in system.items() if owner(key) == "launch") == copies
+    assert sum(len(lines) for key, lines in system.items() if owner(key) == "<module>") == 1
 
 
 @pytest.mark.parametrize("copies", [4, 5])
@@ -6405,7 +6552,7 @@ def test_literal_spawn_argon_0821_argv_zero_is_not_option(tmp_path, display, cop
     table = tuple(("aegis_core/probe.py",owner,"resolved-python-program","Test-owned argv display name.")
                   for owner in ("<module>","launch"))
     sites = process_sites(tmp_path,selector_table=table)
-    assert sum(len(lines) for key,lines in sites.items() if key.endswith(":os.system")) == copies
+    assert sum(len(lines) for key,lines in sites.items() if key.endswith(":os.system")) == copies + 1
 
 
 @pytest.mark.parametrize("staged", [False, True], ids=["inline", "named"])
@@ -6428,7 +6575,8 @@ def test_literal_spawn_correctness_0821_effective_context_has_no_false_spawn(tmp
     owners = (("<module>",) if case == "shell-mode" else ("<module>","launch")) if staged else ("launch",)
     table = tuple(("aegis_core/probe.py",owner,"resolved-python-program","Test-owned effective execution context.") for owner in owners)
     sites = process_sites(tmp_path,selector_table=table)
-    assert sum(len(lines) for key,lines in sites.items() if key.endswith(":os.system")) == 0
+    # A named module argv stays counted. The shell or executable override adds no second program.
+    assert sum(len(lines) for key,lines in sites.items() if key.endswith(":os.system")) == (1 if staged else 0)
 
 
 @pytest.mark.parametrize("kind", ["default", "decorator"])
@@ -6986,9 +7134,20 @@ def test_imported_command_values_visit_intermediate_rebindings(tmp_path, form):
     for _ in range(2):
         sites = process_sites(tmp_path, selector_table=table)
         children = {key: lines for key, lines in sites.items() if key.endswith(":os.system")}
-        assert len(children) == 1
-        assert next(iter(children)).startswith("process:aegis_core/consumer.py:launch.")
-        assert next(iter(children.values())) == [4]
+        if vector:
+            # The provider tuple is a module construction and is never consumed.
+            provider_rel = provider.relative_to(tmp_path).as_posix()
+            launch = {key: lines for key, lines in children.items()
+                      if key.startswith("process:aegis_core/consumer.py:launch.")}
+            module = {key: lines for key, lines in children.items()
+                      if key.startswith("process:" + provider_rel + ":<module>.")}
+            assert set(launch) | set(module) == set(children)
+            assert list(launch.values()) == [[4]]
+            assert list(module.values()) == [[3]]
+        else:
+            assert len(children) == 1
+            assert next(iter(children)).startswith("process:aegis_core/consumer.py:launch.")
+            assert next(iter(children.values())) == [4]
         with pytest.raises(ValueError) as error:
             literal_fixture_sites(tmp_path)
         assert str(error.value) == "aegis_core/consumer.py: process spawn inside a literal -c program"
@@ -9126,7 +9285,11 @@ def test_argon_0748_constant_program_wrappers_resolve_and_count_once(tmp_path, b
                 refuse_literal_spawns(modules[rel], rel, modules)
             assert str(error.value) == rel + ": process spawn inside a literal -c program"
             return
-    assert sum(len(lines) for key, lines in sites.items() if key.endswith(":os.system")) == 1
+    stored_argv = body == ("ARGV = [sys.executable, '-c', '' + ('%s' % P)]\n"
+                           "subprocess.run(ARGV)")
+    # ROUND-3 default-deny retains the stored argv construction and launch.
+    expected_count = 2 if stored_argv else 1
+    assert sum(len(lines) for key, lines in sites.items() if key.endswith(":os.system")) == expected_count
 
 
 TOTALITY_REFUSAL_CASES = {
@@ -9628,7 +9791,8 @@ def test_round22_resolved_nested_keywords_inventory_the_program(tmp_path, mappin
         refuse_literal_spawns(modules[rel], rel, modules)
     assert str(error.value) == rel + ": process spawn inside a literal -c program"
     sites = process_sites(tmp_path, selector_table=table)
-    assert sum(len(lines) for key, lines in sites.items() if key.endswith(":os.system")) == 1
+    # The nested args list is a module construction as well as the launch.
+    assert sum(len(lines) for key, lines in sites.items() if key.endswith(":os.system")) == 2
 
 
 @pytest.mark.parametrize("mapping", [
@@ -11338,3 +11502,597 @@ def test_round31_hook_write_through_unproven_class_alias_is_unknown(tmp_path, en
               "Holder.Factory.__new__ = factory_new\nobj = Runner()\nobj.build = python_argv\n"
               "obj.launch(sys.argv[1])\n")
     round30_launch_outcome(tmp_path, source, entry, review=True)
+
+
+# Exact nested-spawn counts. One normalized argv is the only command reading.
+# A construction is omitted only for one simple function binding whose every
+# load is a raw spawn of that same closed program. Every other shape stays
+# counted, so module bindings and fragments can add an occurrence.
+# Explicit None selects the argv head and is distinct from an unresolved name.
+_EXACT_PROGRAM = "import os; os.system('id')"
+_EXACT_SHELL = "python3 -c " + repr(_EXACT_PROGRAM)
+
+
+def _exact_source(template):
+    return template.replace("__PROGRAM__", repr(_EXACT_PROGRAM)).replace("__SHELL__", repr(_EXACT_SHELL))
+
+
+def _exact_sites(tmp_path, files, rows):
+    """Retry the census; a second read of the same tree must match the first."""
+    package = tmp_path / "aegis_core"
+    package.mkdir(exist_ok=True)
+    for name, template in files.items():
+        (package / name).write_text(_exact_source(template), encoding="utf-8")
+    table = tuple((rel, owner, "resolved-python-program", "Test-owned exact nested spawn count.")
+                  for rel, owner in rows)
+    first = process_sites(tmp_path, selector_table=table)
+    second = process_sites(tmp_path, selector_table=table)
+    assert first == second
+    return first
+
+
+def _exact_system(sites):
+    return {key: lines for key, lines in sites.items() if key.endswith(":os.system")}
+
+
+def _exact_owners(sites):
+    return {key.split(":")[1] + ":" + key.split(":")[2].split(".<literal", 1)[0]
+            for key in _exact_system(sites)}
+
+
+_FRAGMENT_CALLS = (
+    ("run", "subprocess.run", "subprocess.run(__FRAG__, executable=sys.executable)"),
+    ("popen", "subprocess.Popen", "subprocess.Popen(__FRAG__, executable=sys.executable)"),
+    ("call", "subprocess.call", "subprocess.call(__FRAG__, executable=sys.executable)"),
+    ("check-call", "subprocess.check_call", "subprocess.check_call(__FRAG__, executable=sys.executable)"),
+    ("check-output", "subprocess.check_output", "subprocess.check_output(__FRAG__, executable=sys.executable)"),
+    ("execv", "os.execv", "os.execv(sys.executable, __FRAG__)"),
+    ("execve", "os.execve", "os.execve(sys.executable, __FRAG__, {})"),
+    ("spawnv", "os.spawnv", "os.spawnv(os.P_WAIT, sys.executable, __FRAG__)"),
+    ("spawnve", "os.spawnve", "os.spawnve(os.P_WAIT, sys.executable, __FRAG__, {})"),
+    ("spawnvp", "os.spawnvp", "os.spawnvp(os.P_WAIT, sys.executable, __FRAG__)"),
+    ("spawnvpe", "os.spawnvpe", "os.spawnvpe(os.P_WAIT, sys.executable, __FRAG__, {})"),
+    ("posix-spawn", "os.posix_spawn", "os.posix_spawn(sys.executable, __FRAG__, None, None)"),
+    ("posix-spawnp", "os.posix_spawnp", "os.posix_spawnp(sys.executable, __FRAG__, None, None)"),
+    ("execv-path", "os.execv", "os.execv(path=sys.executable, argv=__FRAG__)"),
+    ("spawnv-path", "os.spawnv", "os.spawnv(mode=os.P_WAIT, path=sys.executable, argv=__FRAG__)"),
+    ("posix-path", "os.posix_spawn", "os.posix_spawn(path=sys.executable, argv=__FRAG__, file_actions=None, attr=None)"),
+    ("run-args", "subprocess.run", "subprocess.run(args=__FRAG__, executable=sys.executable)"),
+)
+
+
+@pytest.mark.parametrize("label,api,call", _FRAGMENT_CALLS, ids=[item[0] for item in _FRAGMENT_CALLS])
+def test_literal_spawn_fragment_after_program_is_not_counted(tmp_path, label, api, call):
+    """A normalized argv is the only command; words after the program are not a new spawn."""
+    fragment = "[sys.executable, '-c', 'pass'] + ['sh', '-c', __PROGRAM__]"
+    source = "import os, sys, subprocess\ndef launch():\n    " + call.replace("__FRAG__", fragment) + "\n"
+    sites = _exact_sites(tmp_path, {"probe.py": source}, (("aegis_core/probe.py", "launch"),))
+    assert _exact_system(sites) == {}, label
+    assert sites["process:aegis_core/probe.py:launch:" + api] == [3]
+
+
+_PRECISION_SHAPES = {
+    "shlex-shell": {
+        "files": {"probe.py": "import subprocess, sys, shlex\ndef launch():\n    subprocess.run(shlex.join([sys.executable, '-c', __PROGRAM__]), shell=True)\n"},
+        "rows": (("aegis_core/probe.py", "launch"),),
+        "count": 1,
+        "owners": {"aegis_core/probe.py:launch"},
+    },
+    "execv-shlex": {
+        "files": {"probe.py": "import os, sys, shlex\ndef launch():\n    os.execv('/bin/sh', ['sh', '-c', shlex.join([sys.executable, '-c', __PROGRAM__])])\n"},
+        "rows": (("aegis_core/probe.py", "launch"),),
+        "count": 1,
+        "owners": {"aegis_core/probe.py:launch"},
+    },
+    "rhs-sublist": {
+        "files": {"probe.py": "import subprocess, sys\ndef launch():\n    subprocess.run(['worker', 'script.py'] + ['arg1', '-c', __PROGRAM__], executable=sys.executable)\n"},
+        "rows": (("aegis_core/probe.py", "launch"),),
+        "count": 1,
+        "owners": {"aegis_core/probe.py:launch"},
+        "outer": ("aegis_core/probe.py", "launch", "subprocess.run"),
+    },
+    "quoted-executable": {
+        "files": {"probe.py": "import subprocess, sys, shlex\nargv = [sys.executable, '-c', __PROGRAM__, shlex.quote('x')]\ndef launch():\n    subprocess.run(argv, executable='/bin/sh')\n"},
+        "rows": (("aegis_core/probe.py", "<module>"), ("aegis_core/probe.py", "launch")),
+        "count": 1,
+        "owners": {"aegis_core/probe.py:<module>"},
+    },
+    "quoted-shell": {
+        "files": {"probe.py": "import subprocess, sys, shlex\nargv = [sys.executable, '-c', __PROGRAM__, shlex.quote('x')]\ndef launch():\n    subprocess.run(argv, shell=True)\n"},
+        "rows": (("aegis_core/probe.py", "<module>"),),
+        "count": 1,
+        "owners": {"aegis_core/probe.py:<module>"},
+    },
+    "escape-list": {
+        "files": {"probe.py": "import subprocess, sys\nargv = [sys.executable, '-c', __PROGRAM__]\ndef launch():\n    subprocess.run(argv, executable='/bin/sh')\n    subprocess.run(list(argv))\n"},
+        "rows": (("aegis_core/probe.py", "<module>"), ("aegis_core/probe.py", "launch")),
+        "count": 1,
+        "owners": {"aegis_core/probe.py:<module>"},
+    },
+    "builder-return": {
+        "files": {"probe.py": "import subprocess, sys\nARGV = [sys.executable, '-c', __PROGRAM__]\ndef probe():\n    subprocess.run(ARGV, executable='/bin/sh')\ndef build():\n    return ARGV\n"},
+        "rows": (("aegis_core/probe.py", "<module>"), ("aegis_core/probe.py", "probe")),
+        "count": 1,
+        "owners": {"aegis_core/probe.py:<module>"},
+    },
+    "builder-annotation": {
+        "files": {"probe.py": "import subprocess, sys\nARGV: list = [sys.executable, '-c', __PROGRAM__]\ndef probe():\n    subprocess.run(ARGV, executable='/bin/sh')\ndef build():\n    return ARGV\n"},
+        "rows": (("aegis_core/probe.py", "<module>"), ("aegis_core/probe.py", "probe")),
+        "count": 1,
+        "owners": {"aegis_core/probe.py:<module>"},
+    },
+    "return-and-run": {
+        "files": {"probe.py": "import subprocess, sys\nARGV = [sys.executable, '-c', __PROGRAM__]\ndef build():\n    return ARGV\ndef launch():\n    subprocess.run(ARGV)\n"},
+        "rows": (("aegis_core/probe.py", "<module>"),),
+        "count": 2,
+        "owners": {"aegis_core/probe.py:<module>", "aegis_core/probe.py:launch"},
+    },
+    "none-name": {
+        "files": {"probe.py": "import subprocess\nEXEC = None\ndef launch():\n    subprocess.run(['sh', '-ec', __SHELL__], executable=EXEC)\n"},
+        "rows": (("aegis_core/probe.py", "launch"),),
+        "count": 1,
+        "owners": {"aegis_core/probe.py:launch"},
+    },
+    "none-conditional": {
+        "files": {"probe.py": "import subprocess\ndef launch(cond):\n    EXEC = None if cond else 'sh'\n    subprocess.run(['sh', '-c', __SHELL__], executable=EXEC)\n"},
+        "rows": (("aegis_core/probe.py", "launch"),),
+        "count": 1,
+        "owners": {"aegis_core/probe.py:launch"},
+    },
+    "none-staged": {
+        "files": {"probe.py": "import subprocess\nEXEC = None\nARGV = ['sh', '-ec', __SHELL__]\ndef a():\n    subprocess.run(ARGV, executable=EXEC)\ndef b():\n    subprocess.run(ARGV, executable=EXEC)\n"},
+        "rows": (("aegis_core/probe.py", "<module>"), ("aegis_core/probe.py", "a"), ("aegis_core/probe.py", "b")),
+        "count": 3,
+        "owners": {"aegis_core/probe.py:<module>", "aegis_core/probe.py:a", "aegis_core/probe.py:b"},
+    },
+    "star-under-shell": {
+        "files": {"probe.py": "import subprocess, sys\ndef launch():\n    subprocess.run([sys.executable, *['-I', '-c', __SHELL__]], executable='/bin/sh')\n"},
+        "rows": (("aegis_core/probe.py", "launch"),),
+        "count": 0,
+        "owners": set(),
+    },
+    "plus-under-shell": {
+        "files": {"probe.py": "import subprocess, sys\ndef launch():\n    subprocess.run([sys.executable] + ['-I', '-c', __SHELL__], executable='/bin/sh')\n"},
+        "rows": (("aegis_core/probe.py", "launch"),),
+        "count": 0,
+        "owners": set(),
+    },
+    "star-under-python": {
+        "files": {"probe.py": "import subprocess, sys\ndef launch():\n    subprocess.run(['/bin/sh', '-e', *['-I', '-c', __PROGRAM__]], executable=sys.executable)\n"},
+        "rows": (("aegis_core/probe.py", "launch"),),
+        "count": 1,
+        "owners": {"aegis_core/probe.py:launch"},
+    },
+    "tail-under-shell": {
+        "files": {"probe.py": "import subprocess, sys\nARGV = [sys.executable, '-c', __PROGRAM__]\ndef launch(extra):\n    subprocess.run([*ARGV, extra], executable='/bin/sh')\n"},
+        "rows": (("aegis_core/probe.py", "<module>"), ("aegis_core/probe.py", "launch")),
+        "count": 1,
+        "owners": {"aegis_core/probe.py:<module>"},
+    },
+    "tail-plus-under-shell": {
+        "files": {"probe.py": "import subprocess, sys\nARGV = [sys.executable, '-c', __PROGRAM__]\ndef launch(extra):\n    subprocess.run(ARGV + [extra], executable='/bin/sh')\n"},
+        "rows": (("aegis_core/probe.py", "<module>"), ("aegis_core/probe.py", "launch")),
+        "count": 1,
+        "owners": {"aegis_core/probe.py:<module>"},
+    },
+    "tail-shell-mode": {
+        "files": {"probe.py": "import subprocess, sys\nARGV = [sys.executable, '-c', __PROGRAM__]\ndef launch(extra):\n    subprocess.run([*ARGV, extra], shell=True)\n"},
+        "rows": (("aegis_core/probe.py", "<module>"),),
+        "count": 1,
+        "owners": {"aegis_core/probe.py:<module>"},
+    },
+    "tail-under-python": {
+        "files": {"probe.py": "import subprocess, sys\nARGV = [sys.executable, '-c', __PROGRAM__]\ndef launch(extra):\n    subprocess.run([*ARGV, extra], executable=sys.executable)\n"},
+        "rows": (("aegis_core/probe.py", "<module>"), ("aegis_core/probe.py", "launch")),
+        "count": 2,
+        "owners": {"aegis_core/probe.py:<module>", "aegis_core/probe.py:launch"},
+    },
+    "constant-prefix": {
+        "files": {"probe.py": "import subprocess, sys\ndef launch():\n    subprocess.run([sys.executable, '-c', __PROGRAM__] + ['extra'])\n"},
+        "rows": (("aegis_core/probe.py", "launch"),),
+        "count": 2,
+        "owners": {"aegis_core/probe.py:launch"},
+    },
+    "cross-return": {
+        "files": {
+            "shared.py": "import sys\nARGV = (sys.executable, '-c', __PROGRAM__)\ndef build():\n    return ARGV\n",
+            "probe.py": "import subprocess\nfrom aegis_core.shared import ARGV\ndef launch():\n    subprocess.run(ARGV, executable='/bin/sh')\n",
+        },
+        "rows": (("aegis_core/shared.py", "<module>"), ("aegis_core/probe.py", "launch")),
+        "count": 1,
+        "owners": {"aegis_core/shared.py:<module>"},
+    },
+    "cross-consumed": {
+        "files": {
+            "shared.py": "import sys\nARGV = (sys.executable, '-c', __PROGRAM__)\n",
+            "probe.py": "import subprocess\nfrom aegis_core.shared import ARGV\ndef launch():\n    subprocess.run(ARGV, executable='/bin/sh')\n",
+        },
+        "rows": (("aegis_core/shared.py", "<module>"), ("aegis_core/probe.py", "launch")),
+        "count": 1,
+        "owners": {"aegis_core/shared.py:<module>"},
+        "outer": ("aegis_core/probe.py", "launch", "subprocess.run"),
+    },
+}
+
+
+@pytest.mark.parametrize("label", sorted(_PRECISION_SHAPES))
+def test_literal_spawn_count_precision_shapes(tmp_path, label):
+    """Unproven constructions stay counted; a shell override does not erase them."""
+    case = _PRECISION_SHAPES[label]
+    sites = _exact_sites(tmp_path, case["files"], case["rows"])
+    found = _exact_system(sites)
+    assert sum(len(lines) for lines in found.values()) == case["count"]
+    assert _exact_owners(sites) == case["owners"]
+    outer = case.get("outer")
+    if outer is not None:
+        rel, scope, api = outer
+        assert sites["process:" + rel + ":" + scope + ":" + api]
+
+
+@pytest.mark.parametrize("body,reviewed_count", [
+    ("def launch(flag):\n    subprocess.run([sys.executable, flag, '-c', __PROGRAM__])\n", 0),
+    ("def launch(executable):\n    subprocess.run(['sh', '-ec', __SHELL__], executable=executable)\n    subprocess.run(['sh', '-ec', __SHELL__], executable=executable)\n", 0),
+])
+def test_literal_spawn_count_precision_unresolved_refuses(tmp_path, body, reviewed_count):
+    """An unresolved option or executable is refused and does not invent a nested spawn."""
+    source = "import subprocess, sys\n" + body
+    package = tmp_path / "aegis_core"
+    package.mkdir()
+    (package / "probe.py").write_text(_exact_source(source), encoding="utf-8")
+    expected = "unreviewed selector site aegis_core/probe.py:launch"
+    for _ in range(2):
+        with pytest.raises(ValueError) as error:
+            process_sites(tmp_path)
+        assert str(error.value) == expected
+        assert _EXACT_PROGRAM not in str(error.value)
+    sites = _exact_sites(tmp_path, {"probe.py": source}, (("aegis_core/probe.py", "launch"),))
+    assert sum(len(lines) for lines in _exact_system(sites).values()) == reviewed_count
+    assert len(sites["process:aegis_core/probe.py:launch:subprocess.run"]) == body.count("subprocess.run")
+
+
+def test_literal_spawn_count_precision_concurrent_resolvers_match(tmp_path):
+    """Each census builds its own resolver, so concurrent reads agree."""
+    import threading
+    case = _PRECISION_SHAPES["none-staged"]
+    package = tmp_path / "aegis_core"
+    package.mkdir()
+    for name, template in case["files"].items():
+        (package / name).write_text(_exact_source(template), encoding="utf-8")
+    table = tuple((rel, owner, "resolved-python-program", "Test-owned exact nested spawn count.")
+                  for rel, owner in case["rows"])
+    results, errors = [], []
+
+    def run():
+        try:
+            results.append(process_sites(tmp_path, selector_table=table))
+        except Exception as exc:  # The thread must return the census refusal, not drop it.
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run, daemon=True) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert not any(thread.is_alive() for thread in threads)
+    assert errors == []
+    assert len(results) == 2 and results[0] == results[1]
+    assert sum(len(lines) for lines in _exact_system(results[0]).values()) == 3
+    assert _exact_owners(results[0]) == case["owners"]
+
+
+# Formal 1121: a construction stays counted unless every load is a raw spawn
+# of that same closed program. These shapes were erased by escape recognition.
+def _deny_count(sites):
+    return sum(len(lines) for lines in _exact_system(sites).values())
+
+
+_DENY_CASES = {
+    "starred-call": {
+        "files": {"probe.py": "import subprocess, sys\ndef launch():\n    A = (sys.executable, '-c', __PROGRAM__)\n    subprocess.run(A, executable='/bin/sh')\n    subprocess.run(*[A])\n"},
+        "rows": (("aegis_core/probe.py", "launch"),),
+        "minimum": 1,
+    },
+    "list-forward": {
+        "files": {"probe.py": "import subprocess, sys\ndef launch():\n    A = (sys.executable, '-c', __PROGRAM__)\n    B = A\n    subprocess.run(A, executable='/bin/sh')\n    subprocess.run(list(B))\n"},
+        "rows": (("aegis_core/probe.py", "launch"),),
+        "minimum": 1,
+    },
+    "assign-forward": {
+        "files": {"probe.py": "import subprocess, sys\ndef launch():\n    A = (sys.executable, '-c', __PROGRAM__)\n    B = A\n    subprocess.run(B, executable='/bin/sh')\n"},
+        "rows": (("aegis_core/probe.py", "launch"),),
+        "minimum": 1,
+    },
+    "chained-assign": {
+        "files": {"probe.py": "import subprocess, sys\ndef launch():\n    A = B = (sys.executable, '-c', __PROGRAM__)\n    subprocess.run(A, executable='/bin/sh')\n"},
+        "rows": (("aegis_core/probe.py", "launch"),),
+        "minimum": 1,
+    },
+    "cross-module": {
+        "files": {
+            "shared.py": "import sys\nARGV = (sys.executable, '-c', __PROGRAM__)\n",
+            "probe.py": "import subprocess\nfrom aegis_core.shared import ARGV\ndef build():\n    return ARGV\ndef launch():\n    subprocess.run(ARGV, executable='/bin/sh')\n",
+        },
+        "rows": (("aegis_core/shared.py", "<module>"), ("aegis_core/probe.py", "launch")),
+        "minimum": 1,
+        "owners": ("aegis_core/shared.py:<module>",),
+    },
+    "slice-copy": {
+        "files": {"probe.py": "import subprocess, sys\ndef launch():\n    ARGV = [sys.executable, '-c', __PROGRAM__]\n    subprocess.run(ARGV, executable='/bin/sh')\n    subprocess.run(ARGV[:])\n"},
+        "rows": (("aegis_core/probe.py", "launch"),),
+        "minimum": 1,
+    },
+    "unpack-rebuild": {
+        "files": {"probe.py": "import subprocess, sys\ndef launch():\n    ARGV = [sys.executable, '-c', __PROGRAM__]\n    subprocess.run(ARGV, executable='/bin/sh')\n    head, flag, code = ARGV\n    subprocess.run([head, flag, code])\n"},
+        "rows": (("aegis_core/probe.py", "launch"),),
+        "minimum": 1,
+    },
+    "ifexp-return": {
+        "files": {"probe.py": "import subprocess, sys\ndef launch(cond):\n    ARGV = [sys.executable, '-c', __PROGRAM__]\n    subprocess.run(ARGV, executable='/bin/sh')\n    return ARGV if cond else []\n"},
+        "rows": (("aegis_core/probe.py", "launch"),),
+        "minimum": 1,
+    },
+    "lambda-load": {
+        "files": {"probe.py": "import subprocess, sys\ndef launch():\n    ARGV = [sys.executable, '-c', __PROGRAM__]\n    subprocess.run(ARGV, executable='/bin/sh')\n    fn = lambda: ARGV\n    return fn\n"},
+        "rows": (("aegis_core/probe.py", "launch"),),
+        "minimum": 1,
+    },
+    "default-argument": {
+        "files": {"probe.py": "import subprocess, sys\ndef launch():\n    ARGV = [sys.executable, '-c', __PROGRAM__]\n    subprocess.run(ARGV, executable='/bin/sh')\n    def inner(argv=ARGV):\n        return argv\n"},
+        "rows": (("aegis_core/probe.py", "launch"),),
+        "minimum": 1,
+    },
+    "executable-override": {
+        "files": {"probe.py": "import subprocess, sys\ndef launch():\n    A = [sys.executable, '-c', __PROGRAM__]\n    subprocess.run(A, executable='/bin/sh')\n"},
+        "rows": (("aegis_core/probe.py", "launch"),),
+        "minimum": 1,
+    },
+    "opaque-prefix": {
+        "files": {"probe.py": "import subprocess, sys\ndef launch(extra=()):\n    A = (sys.executable, '-c', __PROGRAM__)\n    subprocess.run(A + extra)\n    subprocess.run(A + extra)\n"},
+        "rows": (("aegis_core/probe.py", "launch"),),
+        "minimum": 2,
+    },
+    "opaque-suffix": {
+        "files": {"probe.py": "import subprocess, sys\ndef launch(extra=()):\n    A = (sys.executable, '-c', __PROGRAM__)\n    subprocess.run(extra + A)\n    subprocess.run(extra + A)\n"},
+        "rows": (("aegis_core/probe.py", "launch"),),
+        "minimum": 2,
+    },
+    "module-binding": {
+        "files": {"probe.py": "import subprocess, sys\nA = (sys.executable, '-c', __PROGRAM__)\ndef launch():\n    subprocess.run(A, executable='/bin/sh')\n"},
+        "rows": (("aegis_core/probe.py", "<module>"), ("aegis_core/probe.py", "launch")),
+        "minimum": 1,
+    },
+    "imported-none": {
+        "files": {
+            "shared.py": "EXEC = None\n",
+            "probe.py": "import subprocess\nfrom aegis_core.shared import EXEC\ndef launch():\n    subprocess.run(['sh', '-ec', __SHELL__], executable=EXEC)\n",
+        },
+        "rows": (("aegis_core/probe.py", "launch"),),
+        "minimum": 1,
+    },
+}
+
+
+@pytest.mark.parametrize("label", sorted(_DENY_CASES))
+def test_literal_spawn_unproven_construction_stays_counted(tmp_path, label):
+    """Shapes that are not a single direct raw spawn keep the nested program."""
+    case = _DENY_CASES[label]
+    sites = _exact_sites(tmp_path, case["files"], case["rows"])
+    assert _deny_count(sites) >= case["minimum"], label
+    for owner in case.get("owners", ()):
+        assert owner in _exact_owners(sites), label
+
+
+def test_literal_spawn_direct_function_binding_counts_once(tmp_path):
+    """One function assignment used only as a raw spawn counts at the launch."""
+    source = "import subprocess, sys\ndef launch():\n    argv = [sys.executable, '-c', __PROGRAM__]\n    subprocess.run(argv)\n"
+    sites = _exact_sites(tmp_path, {"probe.py": source}, (("aegis_core/probe.py", "launch"),))
+    assert _deny_count(sites) == 1
+    assert _exact_owners(sites) == {"aegis_core/probe.py:launch"}
+
+
+def test_literal_spawn_direct_function_binding_keeps_each_launch(tmp_path):
+    """Two raw launches of one proven binding stay two occurrences."""
+    source = "import subprocess, sys\ndef launch():\n    argv = [sys.executable, '-c', __PROGRAM__]\n    subprocess.run(argv)\n    subprocess.run(argv)\n"
+    sites = _exact_sites(tmp_path, {"probe.py": source}, (("aegis_core/probe.py", "launch"),))
+    assert _deny_count(sites) == 2
+    assert _exact_owners(sites) == {"aegis_core/probe.py:launch"}
+
+
+@pytest.mark.parametrize("assignment", [
+    "argv = [sys.executable, '-c', __PROGRAM__, extra]",
+    "argv = [sys.executable, '-c', __PROGRAM__] + []",
+    "argv = [sys.executable, *['-c', __PROGRAM__]]",
+    "argv: list = [sys.executable, '-c', __PROGRAM__]",
+    "argv = [sys.executable, '-c', __PROGRAM__]\n    argv += []",
+    "global argv\n    argv = [sys.executable, '-c', __PROGRAM__]",
+])
+def test_literal_spawn_consumption_requires_simple_closed_literal(tmp_path, assignment):
+    source = ("import subprocess, sys\ndef launch(extra):\n    " + assignment
+              + "\n    subprocess.run(argv)\n")
+    sites = _exact_sites(tmp_path, {"probe.py": source}, (("aegis_core/probe.py", "launch"),))
+    assert _deny_count(sites) >= 2  # The construction and the launch both remain.
+
+
+def test_literal_spawn_opaque_concat_keeps_partial_prefix(tmp_path):
+    source = ("import subprocess, sys\ndef launch(extra, tail):\n"
+              "    argv = [sys.executable, '-c', __PROGRAM__, extra]\n"
+              "    subprocess.run(argv + tail)\n    subprocess.run(argv + tail)\n")
+    sites = _exact_sites(tmp_path, {"probe.py": source}, (("aegis_core/probe.py", "launch"),))
+    assert _deny_count(sites) >= 3  # One construction and both launches.
+
+
+def test_literal_spawn_ambiguous_raw_callee_keeps_construction(tmp_path):
+    source = ("import sys\ndef launch(cond):\n"
+              "    if cond:\n        import subprocess as runner\n"
+              "    else:\n        import builtins as runner\n"
+              "    argv = [sys.executable, '-c', __PROGRAM__]\n"
+              "    runner.run(argv)\n")
+    sites = _exact_sites(tmp_path, {"probe.py": source}, (("aegis_core/probe.py", "launch"),))
+    assert _deny_count(sites) == 2
+
+
+@pytest.mark.parametrize("scope", ["module", "function"])
+@pytest.mark.parametrize("literal", ["tuple", "list"])
+@pytest.mark.parametrize("target,command", [
+    ("head, flag, code", "[head, flag, code]"),
+    ("[head, flag, code]", "[head, flag, code]"),
+    ("head, flag, *code", "[head, flag, *code]"),
+    ("[head, flag, *code]", "[head, flag, *code]"),
+    ("(head, flag, code) = [other_head, other_flag, other_code]", "[head, flag, code]"),
+    ("(head, flag, *code) = [other_head, other_flag, *other_code]", "[head, flag, *code]"),
+], ids=["tuple-target", "list-target", "starred-tuple", "starred-list", "chained-unpack", "chained-starred"])
+def test_literal_spawn_census_retains_direct_destructuring(tmp_path, scope, literal, target, command):
+    """ROUND-3d: target shape cannot remove a literal before the consumption proof."""
+    words = "sys.executable, '-c', __PROGRAM__"
+    value = "(" + words + ")" if literal == "tuple" else "[" + words + "]"
+    body = target + " = " + value + "\nsubprocess.run(" + command + ")\n"
+    owner = "<module>" if scope == "module" else "launch"
+    if scope == "function":
+        body = "def launch():\n" + "".join("    " + line + "\n" for line in body.splitlines())
+    source = "import subprocess, sys\n" + body
+    sites = _exact_sites(tmp_path, {"probe.py": source}, (("aegis_core/probe.py", owner),))
+    assert _deny_count(sites) == 1
+    assert _exact_owners(sites) == {"aegis_core/probe.py:" + owner}
+    assert len(sites["process:aegis_core/probe.py:" + owner + ":subprocess.run"]) == 1
+
+
+@pytest.mark.parametrize("scope", ["module", "function"])
+@pytest.mark.parametrize("literal", ["tuple", "list"])
+def test_literal_spawn_census_retains_comparison_construction(tmp_path, scope, literal):
+    """A comparison cannot bypass the only construction-removal gate either."""
+    words = "sys.executable, '-c', __PROGRAM__"
+    value = "(" + words + ")" if literal == "tuple" else "[" + words + "]"
+    body = "same = " + value + " == expected\n"
+    owner = "<module>" if scope == "module" else "launch"
+    if scope == "function":
+        body = "def launch(expected):\n    " + body
+    source = "import sys\n" + body
+    sites = _exact_sites(tmp_path, {"probe.py": source}, (("aegis_core/probe.py", owner),))
+    assert _deny_count(sites) == 1
+    assert _exact_owners(sites) == {"aegis_core/probe.py:" + owner}
+
+
+@pytest.mark.parametrize("launches", [1, 2])
+@pytest.mark.parametrize("route", ["direct", "reexport"])
+@pytest.mark.parametrize("expression", [
+    "(sys.executable, '-c', __PROGRAM__) + tuple(sys.argv[1:])",
+    "tuple(sys.argv[1:]) + (sys.executable, '-c', __PROGRAM__)",
+    "(sys.executable, '-c', __PROGRAM__) + tuple(sys.argv[1:]) + ('tail',)",
+    "(sys.executable, '-c', __PROGRAM__, sys.argv[1]) + tuple(sys.argv[1:])",
+], ids=["known-prefix", "known-suffix", "both-sides", "opaque-word"])
+def test_literal_spawn_census_imported_opaque_concat_keeps_each_launch(tmp_path, launches, route, expression):
+    """Partial immutable argv survives imports with its uncertainty and known words."""
+    files = {"shared.py": "import sys\nARGV = " + expression + "\n"}
+    provider = "shared"
+    if route == "reexport":
+        files["bridge.py"] = "from aegis_core.shared import ARGV\n"
+        provider = "bridge"
+    files["probe.py"] = ("import subprocess\nfrom aegis_core." + provider + " import ARGV\n"
+                         "def launch():\n" + "    subprocess.run(ARGV)\n" * launches)
+    rows = (("aegis_core/shared.py", "<module>"), ("aegis_core/probe.py", "launch"))
+    sites = _exact_sites(tmp_path, files, rows)
+    assert _deny_count(sites) == 1 + launches
+    assert _exact_owners(sites) == {"aegis_core/shared.py:<module>", "aegis_core/probe.py:launch"}
+    assert len(sites["process:aegis_core/probe.py:launch:subprocess.run"]) == launches
+
+
+@pytest.mark.parametrize("route", ["local", "imported"])
+@pytest.mark.parametrize("scope", ["module", "function"])
+@pytest.mark.parametrize("target", ["plain", "tuple", "list", "starred", "chained"])
+@pytest.mark.parametrize("rhs", ["tuple", "list"])
+@pytest.mark.parametrize("shape", ["flat", "nested-empty", "nested-populated", "quoted-tail"])
+def test_census_literal_construction_property(tmp_path, shape, rhs, target, scope, route):
+    """Every generated program operand has exactly one construction event before consumption."""
+    nested_program = _EXACT_PROGRAM + "; pass"
+    nested_words = "sys.executable, '-c', " + repr(nested_program)
+    tails = {"flat": ("'tail'",), "nested-empty": ("()", "[]"),
+             "nested-populated": ("(" + nested_words + ")", "[" + nested_words + "]"),
+             "quoted-tail": ("shlex.quote('tail')",)}[shape]
+    targets = {"plain": "ARGV", "tuple": "(head, flag, code, tail)",
+               "list": "[head, flag, code, tail]", "starred": "(head, flag, code, *tail)",
+               "chained": "(head, flag, code, tail) = [other_head, other_flag, other_code, other_tail]"}
+    command = "ARGV" if target == "plain" else "[head, flag, code]"
+    for index, tail in enumerate(tails):
+        root = tmp_path / ("variant_" + str(index))
+        root.mkdir()
+        words = "sys.executable, '-c', __PROGRAM__, " + tail
+        literal = "(" + words + ")" if rhs == "tuple" else "[" + words + "]"
+        assignment = targets[target] + " = " + literal + "\n"
+        imports = "import subprocess, sys, shlex\n"
+        provider = "probe.py" if route == "local" else "shared.py"
+        owner = "<module>"
+        if scope == "function":
+            owner = "launch" if route == "local" else "build"
+            body = assignment + ("subprocess.run(" + command + ")\n" if route == "local"
+                                 else "return " + command + "\n")
+            source = imports + "def " + owner + "():\n" + "".join("    " + line + "\n" for line in body.splitlines())
+        else:
+            source = imports + assignment
+            if route == "local":
+                source += "subprocess.run(" + command + ")\n"
+        files, rows = {provider: source}, [("aegis_core/" + provider, owner)]
+        if route == "imported":
+            exports = "build" if scope == "function" else "ARGV" if target == "plain" else "head, flag, code"
+            consumer = "build()" if scope == "function" else command
+            files["probe.py"] = ("import subprocess\nfrom aegis_core.shared import " + exports
+                                 + "\ndef launch():\n    subprocess.run(" + consumer + ")\n")
+            if not (scope == "module" and target == "plain" and rhs == "tuple"):
+                rows.append(("aegis_core/probe.py", "launch"))
+        package = root / "aegis_core"
+        package.mkdir()
+        for name, text in files.items():
+            (package / name).write_text(_exact_source(text), encoding="utf-8")
+        modules = dict(module_trees(root))
+        # The oracle comes from the generated syntax, independently of extraction:
+        # each literal argv has its own third operand, even when nested in another argv.
+        expected = Counter((rel, node.elts[2].lineno, node.elts[2].col_offset, node.elts[2].value)
+                           for rel, tree in modules.items() for node in ast.walk(tree)
+                           if isinstance(node, (ast.List, ast.Tuple)) and len(node.elts) >= 3
+                           and isinstance(node.elts[1], ast.Constant) and node.elts[1].value == "-c"
+                           and isinstance(node.elts[2], ast.Constant)
+                           and node.elts[2].value in {_EXACT_PROGRAM, nested_program})
+        assert sum(expected.values()) == (2 if shape == "nested-populated" else 1)
+        resolver = CommandResolver(modules)
+        actual = Counter((rel, node.lineno, node.col_offset, program)
+                         for rel in modules
+                         for node, program, origins, launch in resolver.programs(rel, with_locations=True)
+                         if not launch and isinstance(program, str))
+        assert actual == expected
+        sites = _exact_sites(root, files, rows)
+        launched = int(target == "plain" and (route == "local" or scope == "module" and rhs == "tuple"))
+        consumed = int(route == "local" and scope == "function" and target == "plain" and shape == "flat")
+        assert _deny_count(sites) == sum(expected.values()) + launched - consumed
+
+
+def test_census_formal_1531_destructured_empty_metadata(tmp_path):
+    source = ("import subprocess, sys\ndef launch():\n"
+              "    head, flag, code, unused = (sys.executable, '-c', __PROGRAM__, ())\n"
+              "    subprocess.run([head, flag, code])\n")
+    sites = _exact_sites(tmp_path, {"probe.py": source}, (("aegis_core/probe.py", "launch"),))
+    assert _deny_count(sites) == 1
+
+
+@pytest.mark.parametrize("route", ["direct", "reexport", "attribute"])
+@pytest.mark.parametrize("opaque", [False, True])
+@pytest.mark.parametrize("launches", [1, 2])
+def test_census_formal_1531_imported_quoted_tail(tmp_path, route, opaque, launches):
+    expression = "(sys.executable, '-c', __PROGRAM__, shlex.quote('x'))"
+    if opaque:
+        expression += " + tuple(sys.argv[1:])"
+    files = {"shared.py": "import sys, shlex\nARGV = " + expression + "\n"}
+    if route == "attribute":
+        declaration, command = "from aegis_core import shared", "shared.ARGV"
+    else:
+        provider = "shared"
+        if route == "reexport":
+            files["bridge.py"] = "from aegis_core.shared import ARGV\n"
+            provider = "bridge"
+        declaration, command = "from aegis_core." + provider + " import ARGV", "ARGV"
+    files["probe.py"] = ("import subprocess\n" + declaration + "\ndef launch():\n"
+                         + ("    subprocess.run(" + command + ")\n") * launches)
+    rows = [("aegis_core/shared.py", "<module>")]
+    if opaque:
+        rows.append(("aegis_core/probe.py", "launch"))
+    sites = _exact_sites(tmp_path, files, rows)
+    assert _deny_count(sites) == 1 + launches
+    assert _exact_owners(sites) == {"aegis_core/shared.py:<module>", "aegis_core/probe.py:launch"}
