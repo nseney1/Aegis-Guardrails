@@ -23,6 +23,24 @@ from aegis_core.workspace.layout import UserLayout
 from tests.conftest import symlink_or_skip
 
 
+@pytest.mark.parametrize("command", ["scan", "status"])
+@pytest.mark.parametrize("text", ["ordinary failure", "bad\x1btext\nretry"], ids=["plain", "controls"])
+def test_failure_envelope_golden_bytes(ws, monkeypatch, capsys, record_property, command, text):
+    def refuse(args):
+        raise OSError(text)
+
+    monkeypatch.setattr("aegis_cli.scan.run_scan", refuse)
+    monkeypatch.setattr("aegis_cli.status.run_status", refuse)
+    for attempt in range(2):
+        assert main([command] + (["src/app.py"] if command == "scan" else [])) == 1
+        captured = capsys.readouterr()
+        expected = "bad text retry" if command == "scan" and text != "ordinary failure" else text
+        assert captured.out == ""
+        assert captured.err.encode("utf-8") == ("Error: " + expected + "\n").encode("utf-8")
+        record_property("stdout_hex_" + str(attempt), captured.out.encode("utf-8").hex())
+        record_property("stderr_hex_" + str(attempt), captured.err.encode("utf-8").hex())
+
+
 @pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
 @pytest.mark.parametrize("secret_path", [False, True], ids=["plain", "redacted"])
 def test_long_refusal_path_never_clips_the_field_or_reason(ws, monkeypatch, capsys, json_mode, secret_path):

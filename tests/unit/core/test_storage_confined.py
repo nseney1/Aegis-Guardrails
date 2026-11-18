@@ -513,3 +513,133 @@ def test_profile_retry_flushes_reused_ancestor_containers(tmp_path, monkeypatch,
     assert_publication_flushes(proxy, directories, force, profile.REPO_PATH[-1])
     assert json.loads(root.joinpath(*profile.REPO_PATH).read_bytes()) == document
     assert sorted(path.name for path in root.joinpath(*profile.REPO_PATH[:-1]).iterdir()) == [profile.REPO_PATH[-1]]
+
+
+@pytest.mark.parametrize("kind", ["regular", "missing", "symlink", "fifo", "directory",
+                                  "parent-swapped", "concurrent-remover"])
+def test_confined_removal_cases_and_retry(tmp_path, monkeypatch, kind):
+    from conftest import symlink_or_skip
+    root = make_store(tmp_path)
+    parent = root / "parent"
+    parent.mkdir()
+    target = parent / "private-value"
+    outside = root / "outside"
+    outside.mkdir()
+    (outside / target.name).write_bytes(b"keep")
+    if kind == "symlink":
+        symlink_or_skip(outside / target.name, target)
+    elif kind == "fifo":
+        os.mkfifo(target)
+    elif kind == "directory":
+        target.mkdir()
+    elif kind != "missing":
+        target.write_bytes(b"receipt")
+    live = set()
+
+    def opened(*args, **kwargs):
+        fd = os.open(*args, **kwargs)
+        live.add(fd)
+        return fd
+
+    def closed(fd):
+        live.remove(fd)
+        os.close(fd)
+
+    def inspected(*args, **kwargs):
+        info = os.stat(*args, **kwargs)
+        if kind == "parent-swapped" and not (root / "moved").exists():
+            parent.rename(root / "moved")
+            symlink_or_skip(outside, parent, target_is_directory=True)
+        return info
+
+    def removed(*args, **kwargs):
+        if kind == "concurrent-remover":
+            os.unlink(*args, **kwargs)
+        return os.unlink(*args, **kwargs)
+
+    monkeypatch.setattr("aegis_core.storage_confined.os", ModuleOS(
+        open=opened, close=closed, stat=inspected, unlink=removed))
+    with storage.confined_file(root, ("parent", target.name)) as handle:
+        if kind in ("symlink", "fifo", "directory", "parent-swapped"):
+            for _ in range(2):
+                with pytest.raises(storage.ConfinedFileError) as refused:
+                    handle.remove()
+                assert refused.value.reason == "unsafe"
+                assert refused.value.code == "CONFINED_UNSAFE"
+                assert "private-value" not in str(refused.value)
+        else:
+            assert handle.remove() == ("removed" if kind == "regular" else "missing")
+            assert handle.remove() == "missing"
+    assert not live
+    assert (outside / target.name).read_bytes() == b"keep"
+    if kind == "parent-swapped":
+        assert (root / "moved" / target.name).read_bytes() == b"receipt"
+        parent.unlink()
+        (root / "moved").rename(parent)
+    elif kind in ("symlink", "fifo"):
+        target.unlink()
+    elif kind == "directory":
+        target.rmdir()
+    monkeypatch.setattr("aegis_core.storage_confined.os", os)
+    if kind in ("symlink", "fifo", "directory"):
+        target.write_bytes(b"receipt")
+    with storage.confined_file(root, ("parent", target.name)) as handle:
+        expected = "removed" if target.exists() else "missing"
+        assert handle.remove() == expected
+
+
+@pytest.mark.parametrize("failure", ["unlink", "fsync", "fstat"])
+def test_confined_removal_io_failure_closes_and_retries(tmp_path, monkeypatch, failure):
+    root = make_store(tmp_path)
+    target = root / "private-value"
+    target.write_bytes(b"receipt")
+    live = set()
+
+    def opened(*args, **kwargs):
+        fd = os.open(*args, **kwargs)
+        live.add(fd)
+        return fd
+
+    def closed(fd):
+        live.remove(fd)
+        os.close(fd)
+
+    def failed(*args, **kwargs):
+        raise OSError("token=private-value\nfailed")
+
+    methods = {"unlink": os.unlink, "fsync": os.fsync, "fstat": os.fstat, failure: failed}
+    monkeypatch.setattr("aegis_core.storage_confined.os", ModuleOS(open=opened, close=closed, **methods))
+    with storage.confined_file(root, (target.name,)) as handle:
+        with pytest.raises(storage.ConfinedFileError) as refused:
+            handle.remove()
+        assert refused.value.reason == "io" and refused.value.code == "CONFINED_IO"
+        assert str(refused.value) == "confined file I/O failed"
+    assert not live
+    assert target.exists() is (failure != "fsync")
+    monkeypatch.setattr("aegis_core.storage_confined.os", os)
+    with storage.confined_file(root, (target.name,)) as handle:
+        expected = "removed" if target.exists() else "missing"
+        assert handle.remove() == expected
+        assert handle.remove() == "missing"
+
+
+def test_concurrent_confined_removers_and_closed_handle(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    root = make_store(tmp_path)
+    (root / "file").write_bytes(b"receipt")
+    barrier = Barrier(2, timeout=5)
+
+    def remove():
+        with storage.confined_file(root, ("file",)) as handle:
+            barrier.wait()
+            return handle.remove()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(remove) for _ in range(2)]
+        assert sorted(future.result(timeout=10) for future in futures) == ["missing", "removed"]
+    with storage.confined_file(root, ("file",)) as handle:
+        assert handle.remove() == "missing"
+    with pytest.raises(storage.ConfinedFileError) as refused:
+        handle.remove()
+    assert refused.value.reason == "closed"
