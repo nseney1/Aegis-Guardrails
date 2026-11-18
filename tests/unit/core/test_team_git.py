@@ -1,7 +1,6 @@
 """Public lane plumbing contracts; all Git history is created by these tests."""
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from contextlib import contextmanager
 import ast
 import errno
 import json
@@ -18,14 +17,41 @@ import pytest
 
 from aegis_core import gitsafe, gitsafe_policy, gitsafe_run, gitops_fds, team_git as tg, team_git_snapshot
 from aegis_core import team, team_lease_custody
-from tests.unit.core.test_gitsafe import LANE_MODULES, strict_program, strict_program_guard
+from tests.helpers_team_git import (IDENTITY, LANE_MODULES, commit, filter_git_env, git,
+                                    make_store, new_store, shared_bytes, strict_program,
+                                    strict_program_guard)
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
-IDENTITY = tg.CommitIdentity("Lane", "lane@example.com", "1700000000 +0000")
 
 
 ENV_REDIRECTS = ("GIT_TRACE", "GIT_TRACE2", "GIT_TRACE2_EVENT", "GIT_TRACE2_PERF",
                  "GIT_CONFIG", "GIT_DIR", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY")
+
+
+@pytest.mark.parametrize("module", [
+    "tests.helpers_team_git",
+    "tests.unit.core.test_team_git",
+    "tests.unit.core.test_team_custody",
+    "tests.unit.core.test_team_custody_checks",
+])
+def test_team_helpers_import_without_collecting_other_test_modules(module):
+    script = """
+import importlib
+import sys
+sys.path.insert(0, sys.argv[1])
+importlib.import_module(sys.argv[2])
+coupled = {
+    "tests.unit.core.test_gitsafe",
+    "tests.unit.core.test_team_git",
+    "tests.unit.core.test_team_custody",
+    "tests.unit.core.test_team_custody_checks",
+} - {sys.argv[2]}
+assert not coupled.intersection(sys.modules), sorted(coupled.intersection(sys.modules))
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(Path(__file__).resolve().parents[3]), module],
+        capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize("phase", ["custody", "verify"])
@@ -1118,22 +1144,6 @@ def patch_lane_objects(monkeypatch, replacement):
 
 
 
-def git(repo, *args, data=None, env=None):
-    if env is None:
-        env = filter_git_env(Path(os.environ.get("HOME", os.path.expanduser("~"))))
-    return subprocess.run(
-        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
-         "-c", "commit.gpgsign=false", *args], cwd=str(repo), input=data,
-        capture_output=True, check=True, env=env).stdout
-
-
-def commit(repo, name, content, *, env=None):
-    (repo / name).write_bytes(content)
-    git(repo, "add", "--", name, env=env)
-    git(repo, "commit", "-qm", "change " + name, env=env)
-    return git(repo, "rev-parse", "HEAD", env=env).decode().strip()
-
-
 @pytest.fixture
 def repo(tmp_path):
     path = tmp_path / "repo"
@@ -1143,34 +1153,8 @@ def repo(tmp_path):
     return path
 
 
-def make_store(repo):
-    if not tg.descriptor_support():
-        pytest.skip("snapshot requires descriptor-relative no-follow opens and bound executables")
-    strict_program_guard()
-    return new_store(repo)
-
-
-@contextmanager
-def new_store(repo, *, require_program=True):
-    # Custody service provisions scratch; tests own its creation and cleanup.
-    # Refusal-only entries opt out so their checks still run before lookup.
-    if require_program:
-        strict_program_guard()
-    with tempfile.TemporaryDirectory(dir=repo.parent) as directory:
-        scratch = Path(directory)
-        (scratch / "objects").mkdir(mode=0o700)
-        with tg.GitStore(repo, scratch) as store:
-            yield store
-
-
 def refs(repo):
     return git(repo, "show-ref")
-
-
-def shared_bytes(repo):
-    root = repo / ".git"
-    return {str(p.relative_to(root)): p.read_bytes()
-            for p in root.rglob("*") if p.is_file()}
 
 
 def test_snapshot_preserves_first_dirty_path_and_all_shared_bytes(repo):
@@ -2105,10 +2089,6 @@ def filter_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
     return home
-
-
-def filter_git_env(home):
-    return {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "XDG_CONFIG_HOME": str(home / ".config"), "LC_ALL": "C"}
 
 
 def filter_git(home):
@@ -3432,7 +3412,7 @@ def test_snapshot_parity_ignores_host_system_and_custom_xdg_filters(repo, tmp_pa
     code = """from pathlib import Path
 import sys
 from aegis_core import team_git as tg
-from tests.unit.core.test_team_git import new_store
+from tests.helpers_team_git import new_store
 with new_store(Path(sys.argv[1])) as store:
     assert store.env['GIT_CONFIG_NOSYSTEM'] == '1'
     assert 'XDG_CONFIG_HOME' not in store.env
@@ -3464,7 +3444,7 @@ def test_snapshot_clean_lfs_tree_matches_git_without_git_lfs_on_path(repo, tmp_p
     code = """from pathlib import Path
 import shutil, sys
 from aegis_core import team_git as tg
-from tests.unit.core.test_team_git import new_store
+from tests.helpers_team_git import new_store
 assert shutil.which('git-lfs') is None
 with new_store(Path(sys.argv[1])) as store:
     tree = tg.snapshot_tree(store)

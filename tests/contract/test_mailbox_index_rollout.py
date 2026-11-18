@@ -626,16 +626,132 @@ def test_owner_admits_five_shadow_readers_and_refuses_unlisted_importer(shadow_s
 SHADOW_READERS = ("hierarchy_jobs", "hierarchy_sweep", "hierarchy_provision", "hierarchy_provider_recovery")
 
 
-@pytest.mark.parametrize("reader", SHADOW_READERS)
-def test_admitted_readers_route_all_explicit_history_reads_through_shadow(reader):
-    tree = ast.parse(_read_source(REPO, "tools/" + reader + ".py", MAX_SOURCE))
-    reads = [node for node in ast.walk(tree) if isinstance(node, ast.Attribute) and
+LOCKED_READER = '''class _MailboxReader:
+    """Keep binding and locking inside public read callables."""
+    def __init__(self, mailbox):
+        read_lock = Lock()
+        with read_lock:
+            index = MailboxIndex(mailbox, mode="shadow")
+
+        def read_messages():
+            with read_lock:
+                return index.messages()
+
+        def read_message(message_id):
+            with read_lock:
+                return index.get(message_id)
+
+        def read_mode():
+            with read_lock:
+                return index.mode
+
+        def read_divergence():
+            with read_lock:
+                return index.last_divergence
+
+        def read_reconciliation():
+            with read_lock:
+                return index.last_reconciliation
+
+        def read_changes():
+            with read_lock:
+                return index.content_changed
+
+        self.read_messages = read_messages
+        self.read_message = read_message
+        self.read_mode = read_mode
+        self.read_divergence = read_divergence
+        self.read_reconciliation = read_reconciliation
+        self.read_changes = read_changes
+
+    def messages(self):
+        return self.read_messages()
+
+    def get(self, message_id):
+        return self.read_message(message_id)
+
+    @property
+    def mode(self):
+        return self.read_mode()
+
+    @property
+    def last_divergence(self):
+        return self.read_divergence()
+
+    @property
+    def last_reconciliation(self):
+        return self.read_reconciliation()
+
+    @property
+    def content_changed(self):
+        return self.read_changes()
+'''
+
+
+def _assert_reader_history(tree, reader):
+    name = "tools/" + reader + ".py"
+    factories = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "mailbox_reader"]
+    assert len(factories) == 1
+    facades = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "_MailboxReader"]
+    _require(len(facades) == 1, name, "RF24_SIGNATURE")
+    facade = facades[0]
+    _require(ast.dump(facade) == ast.dump(ast.parse(LOCKED_READER).body[0]), name, "RF24_SIGNATURE")
+    owned = set(ast.walk(facade))
+    delegated = [node for node in owned if isinstance(node, ast.Attribute) and node.attr in {"messages", "get"}]
+    _require(sorted(node.attr for node in delegated) == ["get", "messages"], name, "RF24_SIGNATURE")
+    names = ScopedNames(tree, name)
+    lock_calls = [node for node in owned if isinstance(node, ast.Call) and _name(node.func, "Lock")]
+    _require(len(lock_calls) == 1 and names.resolve(lock_calls[0].func) == {"threading.Lock"},
+             name, "RF24_SIGNATURE")
+    constructors = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and _reference(node.func, names)]
+    _require(len(constructors) == 1 and constructors[0] in owned, name, "RF24_SIGNATURE")
+    _require(not any(isinstance(node, ast.Attribute) and node.attr.startswith("_")
+                     and not node.attr.startswith("__") for node in ast.walk(tree)), name, "RF24_SIGNATURE")
+    reads = [node for node in ast.walk(tree) if node not in owned and isinstance(node, ast.Attribute) and
              (node.attr == "messages" or (node.attr == "get" and isinstance(node.value, ast.Call) and
               isinstance(node.value.func, ast.Name) and node.value.func.id == "mailbox_reader"))]
     assert len(reads) == dict(zip(SHADOW_READERS, (5, 2, 3, 1)))[reader]
     for node in reads:
         assert isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
         assert node.value.func.id == "mailbox_reader"
+
+
+@pytest.mark.parametrize("reader", SHADOW_READERS)
+def test_admitted_readers_route_all_explicit_history_reads_through_shadow(reader):
+    tree = ast.parse(_read_source(REPO, "tools/" + reader + ".py", MAX_SOURCE))
+    _assert_reader_history(tree, reader)
+
+
+@pytest.mark.parametrize("mutation", [
+    "messages_unlocked", "get_unlocked", "bind_unlocked", "diagnostics_unlocked",
+    "extra_constructor", "raw_index_escape", "extra_outer_read", "wrong_lock", "private_attribute",
+])
+def test_reader_facade_guard_refuses_unlocked_or_bypassed_reads(mutation):
+    source = ("from threading import Lock\n" + LOCKED_READER
+              + "\ndef mailbox_reader(mailbox):\n    return _MailboxReader(mailbox)\n"
+              + "mailbox_reader(mb).messages()\n" * 5)
+    tree = ast.parse(source)
+    _assert_reader_history(tree, "hierarchy_jobs")
+    if mutation.endswith("_unlocked"):
+        method_name = {"messages_unlocked": "read_messages", "get_unlocked": "read_message",
+                       "bind_unlocked": "__init__", "diagnostics_unlocked": "read_divergence"}[mutation]
+        method = next(node for node in ast.walk(tree.body[1])
+                      if isinstance(node, ast.FunctionDef) and node.name == method_name)
+        position = 1 if method_name == "__init__" else 0
+        method.body[position:position + 1] = method.body[position].body
+    elif mutation == "wrong_lock":
+        tree = ast.parse(source.replace("from threading import Lock", "from contextlib import nullcontext as Lock"))
+    elif mutation == "raw_index_escape":
+        method = next(node for node in ast.walk(tree.body[1])
+                      if isinstance(node, ast.FunctionDef) and node.name == "read_messages")
+        method.body[0].body[0].value = ast.Name(id="index", ctx=ast.Load())
+    else:
+        extra = {"extra_constructor": 'raw = MailboxIndex(mb, mode="shadow")',
+                 "private_attribute": "facade._lock",
+                 "extra_outer_read": "mailbox_reader(mb).messages()"}[mutation]
+        tree.body.extend(ast.parse(extra).body)
+    with pytest.raises(AssertionError):
+        _assert_reader_history(tree, "hierarchy_jobs")
 
 
 @pytest.mark.parametrize("reader", SHADOW_READERS)
