@@ -1,11 +1,22 @@
 """Exercise runtime patch governance through isolated, real pytest sessions."""
+import ast
+import hashlib
+import inspect
+from itertools import islice
+import json
+import math
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
+import tempfile
 import textwrap
+import time
 
 import pytest
+
+from aegis_core import storage as _result_storage
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -6760,46 +6771,13 @@ sys.modules[owner.__name__] = owner
 
 def _session(tmp_path, body, *, extra="", options=(), limits=None, policy_suffix="", files=None,
              plugin_prefix="", env_overrides=None, child_timeout=120, selection=("tests/test_probe.py",)):
-    suite = tmp_path / "suite"
-    tests = suite / "tests"
-    contract = tests / "contract"
-    contract.mkdir(parents=True)
-    for name, source in (files or {}).items():
-        target = suite / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(source, encoding="utf-8")
-    (suite / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
-    policy = (ROOT / "tests/contract/test_monkeypatch_raising.py").read_text(encoding="utf-8")
-    if limits is not None:
-        policy += "\nPROCESS_PATCH_LIMITS = " + repr(limits) + "\n"
-    policy += policy_suffix
-    (contract / "test_monkeypatch_raising.py").write_text(policy, encoding="utf-8")
-    plugin = (ROOT / "tests/conftest.py").read_text(encoding="utf-8")
-    if plugin_prefix:
-        plugin = plugin.replace("import pytest\n", "import pytest\n" + textwrap.dedent(plugin_prefix) + "\n", 1)
-    plugin += '\n@pytest.fixture(autouse=True)\ndef _no_real_gh(): pass\n'
-    plugin += '\n@pytest.fixture(autouse=True)\ndef _no_real_gh_on_path(): pass\n'
-    plugin += textwrap.dedent(extra)
-    (tests / "conftest.py").write_text(plugin, encoding="utf-8")
-    (tests / "test_probe.py").write_text(textwrap.dedent(body), encoding="utf-8")
-    env = dict(os.environ)
-    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
-    env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
-    # Guard regressions request the guard explicitly, including after fallback B.
-    env["AEGIS_PATCH_GUARD"] = "on"
-    for name, value in (env_overrides or {}).items():
-        if value is None:
-            env.pop(name, None)
-        else:
-            env[name] = value
-    result = subprocess.run(
-        [sys.executable, "-B", "-m", "pytest", *selection, "-q",
-         "-p", "no:cacheprovider", "--basetemp", str(tmp_path / "run"),
-         "-o", "tmp_path_retention_policy=failed", *options],
-        cwd=str(suite), env=env, capture_output=True, text=True,
-        encoding="utf-8", errors="replace", timeout=child_timeout,
+    spec = _SessionSpec(
+        body=body, extra=extra, options=tuple(options), limits=limits,
+        policy_suffix=policy_suffix, files=dict(files or {}), plugin_prefix=plugin_prefix,
+        env_overrides=dict(env_overrides or {}), child_timeout=child_timeout,
+        selection=tuple(selection),
     )
-    return result.returncode, result.stdout + result.stderr
+    return _dispatch_session(tmp_path, spec)
 
 
 @pytest.mark.parametrize("operation", [
@@ -8007,3 +7985,1819 @@ def test_probe(monkeypatch):
 PLATFORM_ABSENT = {"rf11c_current_import_482adc.optional": "current-cache capability control"}
 ''')
     assert code == 0, output
+
+
+# Compile identical guard/framework setup once, then fork before any baseline or
+# probe collection. Each child creates its own real guard baseline and runs an
+# unchanged probe in a fresh copy of the same suite. Windows keeps _execute_solo.
+class _BatchState:
+    def __init__(self):
+        self.planning = False
+        self.current_nodeid = None
+        self.results = None
+        self.result_paths = None
+        self.exchange = None
+        self.child_seconds = {}
+        self.runtime = None
+
+    @staticmethod
+    def fork_supported():
+        return (os.name == "posix" and all(hasattr(os, name) for name in ("fork", "pread", "geteuid", "killpg"))
+                and _result_storage.confined_descriptor_supported())
+
+
+_BATCH_STATE = _BatchState()
+
+
+class _ResultExchange:
+    """Bounded results below a controller-created, owned, no-follow root."""
+    MAX_BYTES = 16 * 1024 * 1024
+    MAX_NODES = 100000
+    MAX_DEPTH = 32
+
+    def __init__(self, root, identity=None, *, file_factory=None):
+        self.root = root
+        self.identity = identity
+        self.file_factory = file_factory or _result_storage.confined_file
+        if not _BatchState.fork_supported():
+            raise RuntimeError("patch guard result exchange unavailable")
+        try:
+            with self.file_factory(self.root, ("anchor",)) as handle:
+                self._check_root(handle.parent_stat())
+        except _result_storage.ConfinedFileError:
+            raise RuntimeError("patch guard result exchange refused") from None
+
+    def _check_root(self, info):
+        identity = (info.st_dev, info.st_ino)
+        if (not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700
+                or info.st_uid != os.geteuid()
+                or self.identity is not None and self.identity != identity):
+            raise RuntimeError("patch guard result exchange refused")
+        self.identity = identity
+
+    def binding(self):
+        return {"root": str(self.root), "identity": self.identity}
+
+    @classmethod
+    def _budget(cls, payload):
+        remaining = [cls.MAX_BYTES, cls.MAX_NODES]
+
+        def visit(value, depth):
+            remaining[1] -= 1
+            if depth > cls.MAX_DEPTH or remaining[1] < 0:
+                raise RuntimeError("patch guard result data refused")
+            if type(value) is str:
+                remaining[0] -= 12 * len(value) + 2
+            elif type(value) in (dict, list, tuple):
+                if len(value) > remaining[1]:
+                    raise RuntimeError("patch guard result data refused")
+                remaining[0] -= 2 + 2 * len(value)
+                if type(value) is dict:
+                    for key, item in value.items():
+                        if type(key) is not str:
+                            raise RuntimeError("patch guard result data refused")
+                        visit(key, depth + 1)
+                        visit(item, depth + 1)
+                else:
+                    for item in value:
+                        visit(item, depth + 1)
+            elif value is None or type(value) is bool:
+                remaining[0] -= 5
+            elif type(value) is int and value.bit_length() <= 64:
+                remaining[0] -= 24
+            elif type(value) is float and math.isfinite(value):
+                remaining[0] -= 32
+            else:
+                raise RuntimeError("patch guard result data refused")
+            if remaining[0] < 0:
+                raise RuntimeError("patch guard result data refused")
+
+        visit(payload, 0)
+        return remaining[0]
+
+    @classmethod
+    def _preparse(cls, raw):
+        depth = tokens = digits = 0
+        quoted = escaped = False
+        for byte in raw:
+            if quoted:
+                if escaped:
+                    escaped = False
+                elif byte == 92:
+                    escaped = True
+                elif byte == 34:
+                    quoted = False
+                continue
+            if 48 <= byte <= 57:
+                digits += 1
+                if digits > 20:
+                    raise RuntimeError("patch guard result data refused")
+            else:
+                digits = 0
+            if byte == 34:
+                quoted = True
+            elif byte in (91, 123):
+                depth += 1
+                tokens += 1
+            elif byte in (93, 125):
+                depth -= 1
+            elif byte in (44, 58):
+                tokens += 1
+            if not 0 <= depth <= cls.MAX_DEPTH or tokens > cls.MAX_NODES:
+                raise RuntimeError("patch guard result data refused")
+
+    def publish(self, name, payload):
+        self._budget(payload)
+        raw = json.dumps(payload, allow_nan=False, separators=(",", ":")).encode("utf-8")
+        if len(raw) > self.MAX_BYTES:
+            raise RuntimeError("patch guard result data refused")
+        try:
+            with self.file_factory(self.root, (name,)) as handle:
+                self._check_root(handle.parent_stat())
+                handle.publish_bytes(raw, replace=False, mode=0o600)
+        except _result_storage.ConfinedFileError:
+            raise RuntimeError("patch guard result exchange refused") from None
+
+    def read(self, name):
+        try:
+            with self.file_factory(self.root, (name,)) as handle:
+                self._check_root(handle.parent_stat())
+                raw = handle.read_bytes(self.MAX_BYTES)
+        except _result_storage.ConfinedFileError:
+            raise RuntimeError("patch guard result exchange refused") from None
+        self._preparse(raw)
+        try:
+            payload = json.loads(raw)
+        except (ValueError, UnicodeError, RecursionError):
+            raise RuntimeError("patch guard result data refused") from None
+        self._budget(payload)
+        return payload
+
+
+class _ExchangeReader:
+    """A child capability: it can exchange data but never owns its directory."""
+    MAX_PACKET_CHARS = 400000
+
+    def __init__(self):
+        self.directory = None
+        self.exchange = None
+
+    def attach(self, packet):
+        if packet is None:
+            return
+        if (type(packet) is not dict or len(packet) != 2
+                or "root" not in packet or "identity" not in packet
+                or type(packet["root"]) is not str
+                or type(packet["identity"]) not in (tuple, list)
+                or len(packet["identity"]) != 2
+                or any(type(value) is not int or value < 0 or value.bit_length() > 64
+                       for value in packet["identity"])):
+            raise RuntimeError("patch guard result exchange refused")
+        self.exchange = _ResultExchange(packet["root"], tuple(packet["identity"]))
+
+    @classmethod
+    def decode(cls, text):
+        if (type(text) is not str or not 1 <= len(text) <= cls.MAX_PACKET_CHARS
+                or not text.isascii()):
+            raise RuntimeError("patch guard result exchange refused")
+        raw = text.encode("ascii")
+        try:
+            _ResultExchange._preparse(raw)
+            return json.loads(raw)
+        except (RuntimeError, ValueError, UnicodeError):
+            raise RuntimeError("patch guard result exchange refused") from None
+
+    def close(self):
+        self.exchange = None
+
+
+class _PlanCaptured(BaseException):
+    def __init__(self, spec):
+        self.spec = spec
+
+
+class _SessionSpec:
+    def __init__(self, body, extra, options, limits, policy_suffix, files,
+                 plugin_prefix, env_overrides, child_timeout, selection):
+        self.body = body
+        self.extra = extra
+        self.options = options
+        self.limits = limits
+        self.policy_suffix = policy_suffix
+        self.files = files
+        self.plugin_prefix = plugin_prefix
+        self.env_overrides = env_overrides
+        self.child_timeout = child_timeout
+        self.selection = selection
+
+
+def _child_env(spec):
+    env = dict(os.environ)
+    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    env["AEGIS_PATCH_GUARD"] = "on"
+    for name, value in spec.env_overrides.items():
+        if value is None:
+            env.pop(name, None)
+        else:
+            env[name] = value
+    return env
+
+
+def _write_suite(tmp_path, spec, *, fork_server=False):
+    suite = tmp_path / "suite"
+    tests = suite / "tests"
+    contract = tests / "contract"
+    contract.mkdir(parents=True)
+    for name, source in spec.files.items():
+        target = suite / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(source, encoding="utf-8")
+    (suite / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    policy = (ROOT / "tests/contract/test_monkeypatch_raising.py").read_text(encoding="utf-8")
+    if spec.limits is not None:
+        policy += "\nPROCESS_PATCH_LIMITS = " + repr(spec.limits) + "\n"
+    policy += spec.policy_suffix
+    (contract / "test_monkeypatch_raising.py").write_text(policy, encoding="utf-8")
+    plugin = (ROOT / "tests/conftest.py").read_text(encoding="utf-8")
+    if spec.plugin_prefix:
+        plugin = plugin.replace("import pytest\n",
+            "import pytest\n" + textwrap.dedent(spec.plugin_prefix) + "\n", 1)
+    plugin += "\n@pytest.fixture(autouse=True)\ndef _no_real_gh(): pass\n"
+    plugin += "\n@pytest.fixture(autouse=True)\ndef _no_real_gh_on_path(): pass\n"
+    plugin += textwrap.dedent(spec.extra)
+    if fork_server:
+        plugin += ("\nimport json, math, stat\nfrom aegis_core import storage as _result_storage\n"
+                   + inspect.getsource(_BatchState) + "\n" + inspect.getsource(_ResultExchange)
+                   + "\n" + inspect.getsource(_ExchangeReader)
+                   + _fork_server_source().replace("_PG_BATCH_LIMIT", str(_BatchController.MAX_BATCH)))
+    (tests / "conftest.py").write_text(plugin, encoding="utf-8")
+    (tests / "test_probe.py").write_text(textwrap.dedent(spec.body), encoding="utf-8")
+    return suite
+
+
+def _argv(tmp_path, spec):
+    return [sys.executable, "-B", "-m", "pytest", *spec.selection, "-q",
+            "-p", "no:cacheprovider", "--basetemp", str(tmp_path / "run"),
+            "-o", "tmp_path_retention_policy=failed", *spec.options]
+
+
+def _execute_solo(tmp_path, spec, *, run=subprocess.run):
+    suite = _write_suite(tmp_path, spec)
+    result = _run_fork_server(_argv(tmp_path, spec), run=run, cwd=str(suite), env=_child_env(spec),
+                              capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=spec.child_timeout, refusal="worker child")
+    return result.returncode, result.stdout + result.stderr
+
+
+def _fork_server_source():
+    return r'''
+import json as _fork_json
+import shutil as _fork_shutil
+import tempfile as _fork_tempfile
+import time as _fork_time
+from pathlib import Path as _ForkPath
+
+_fork_original_start = pytest_sessionstart
+
+@pytest.hookimpl(hookwrapper=True, tryfirst=True)
+def pytest_sessionstart(session):
+    yield
+    guard = getattr(session.config, "_patch_guard", None)
+    if guard is not None:
+        # This is the same idempotent compilation pass _start_baselines calls.
+        # No namespace baseline exists until each child calls the original hook.
+        guard._hook_index_modules()
+    manifest_path = _ForkPath(os.environ["AEGIS_FORK_MANIFEST"])
+    reader = _ExchangeReader()
+    reader.attach(reader.decode(os.environ.get("AEGIS_FORK_EXCHANGE")))
+    exchange = reader.exchange
+    if exchange is None or exchange.root != str(manifest_path.parent):
+        raise RuntimeError("patch guard result exchange refused")
+    manifest = exchange.read(manifest_path.name)
+    if type(manifest) is not list or not 1 <= len(manifest) <= _PG_BATCH_LIMIT:
+        raise RuntimeError("patch guard fork manifest refused")
+    for case in manifest:
+        if (type(case) is not dict or len(case) != 3
+                or type(case.get("nodeid")) is not str or not 1 <= len(case["nodeid"]) <= 4096
+                or type(case.get("body")) is not str
+                or type(case.get("timeout")) not in (int, float)
+                or not math.isfinite(case["timeout"]) or not 0 < case["timeout"] <= 120):
+            raise RuntimeError("patch guard fork manifest refused")
+    suite = _ForkPath.cwd()
+    template = suite.parent / "template"
+    _fork_shutil.copytree(suite, template)
+    records = []
+    batch_deadline = _fork_time.monotonic() + 90
+    for index, case in enumerate(manifest):
+        os.chdir(suite.parent)
+        _fork_shutil.rmtree(suite)
+        _fork_shutil.copytree(template, suite)
+        run = suite.parent / "run"
+        if run.exists():
+            _fork_shutil.rmtree(run)
+        os.chdir(suite)
+        (suite / "tests/test_probe.py").write_text(case["body"], encoding="utf-8")
+        output_path = suite.parent / ("output-%d.txt" % index)
+        error_path = suite.parent / ("error-%d.txt" % index)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        started = _fork_time.monotonic()
+        with output_path.open("wb") as output, error_path.open("wb") as error:
+            pid = os.fork()
+            if pid == 0:
+                capture = session.config.pluginmanager.getplugin("capturemanager")
+                active = capture._global_capturing
+                for target, stream, descriptor in ((active.out, output, 1), (active.err, error, 2)):
+                    saved = getattr(target, "targetfd_save", None)
+                    if saved is None:
+                        os.dup2(stream.fileno(), descriptor)
+                        continue
+                    # Keep capture object identities and pending startup output.
+                    # Its temporary file needs a private inode and file offset;
+                    # fork alone would share that open-file description.
+                    capture_fd = target.tmpfile.fileno()
+                    size = os.fstat(capture_fd).st_size
+                    position = os.lseek(capture_fd, 0, os.SEEK_CUR)
+                    with _fork_tempfile.TemporaryFile() as snapshot:
+                        offset = 0
+                        while offset < size:
+                            data = os.pread(capture_fd, min(65536, size - offset), offset)
+                            if not data:
+                                raise RuntimeError("patch guard capture snapshot was truncated")
+                            snapshot.write(data)
+                            offset += len(data)
+                        snapshot.seek(position)
+                        os.dup2(snapshot.fileno(), capture_fd,
+                                inheritable=os.get_inheritable(capture_fd))
+                    os.dup2(stream.fileno(), saved, inheritable=os.get_inheritable(saved))
+                    if target._state == "suspended":
+                        os.dup2(stream.fileno(), descriptor)
+                _fork_original_start(session)
+                return
+        reaped = False
+        try:
+            while True:
+                observed, status = os.waitpid(pid, os.WNOHANG)
+                if observed:
+                    reaped = True
+                    break
+                if (_fork_time.monotonic() - started >= case["timeout"]
+                        or _fork_time.monotonic() >= batch_deadline):
+                    os.kill(pid, 9)
+                    os.waitpid(pid, 0)
+                    reaped = True
+                    exchange.publish("results.json", {"error": "timeout"})
+                    pytest.exit("fork child timed out", returncode=1)
+                _fork_time.sleep(0.01)
+        finally:
+            if not reaped:
+                os.kill(pid, 9)
+                os.waitpid(pid, 0)
+        code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -os.WTERMSIG(status)
+        record = {"nodeid": case["nodeid"], "code": code,
+                  "seconds": _fork_time.monotonic() - started, "output": ""}
+        records.append(record)
+        for path in (output_path, error_path):
+            remaining = _ResultExchange._budget({"cases": records}) // 12
+            with _result_storage.confined_file(str(suite.parent), (path.name,)) as handle:
+                text = handle.read_bytes(remaining).decode("utf-8", errors="replace")
+                record["output"] += text.replace("\r\n", "\n").replace("\r", "\n")
+    exchange.publish("results.json", {"cases": records})
+    pytest.exit("fork probes completed", returncode=0)
+'''
+
+
+def _run_fork_server(argv, *, run, process_factory=None, refusal="fork server",
+                     output_limit=16 * 1024 * 1024, **kwargs):
+    timeout = kwargs.get("timeout")
+    if (type(refusal) is not str or len(refusal) > 12
+            or refusal not in {"fork server", "worker child"}
+            or type(output_limit) is not int or not 0 <= output_limit <= 16 * 1024 * 1024
+            or type(timeout) not in (int, float) or not math.isfinite(timeout)
+            or not 0 < timeout <= 150 or kwargs.get("capture_output") is not True):
+        raise RuntimeError("patch guard process request refused")
+    prefix = "patch guard " + refusal
+    try:
+        if run is not None and run is not subprocess.run:
+            result = run(argv, **kwargs)
+            if (type(result.stdout) is not str or type(result.stderr) is not str
+                    or len(result.stdout) + len(result.stderr) > output_limit):
+                raise RuntimeError(prefix + " output refused")
+            return result
+        timeout = kwargs.pop("timeout")
+        kwargs.pop("capture_output")
+        factory = subprocess.Popen if process_factory is None else process_factory
+        grouped = os.name == "posix" and hasattr(os, "killpg")
+        with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as error:
+            with factory(argv, stdout=output, stderr=error,
+                         start_new_session=grouped, **kwargs) as process:
+                try:
+                    process.wait(timeout=timeout)
+                except BaseException:
+                    try:
+                        if grouped:
+                            os.killpg(process.pid, 9)
+                        else:
+                            process.kill()
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+                    raise
+                streams = []
+                remaining = output_limit
+                for stream in (output, error):
+                    if os.fstat(stream.fileno()).st_size > remaining:
+                        raise RuntimeError(prefix + " output refused")
+                    stream.seek(0)
+                    raw = stream.read(remaining + 1)
+                    if len(raw) > remaining:
+                        raise RuntimeError(prefix + " output refused")
+                    remaining -= len(raw)
+                    text = raw.decode("utf-8", errors="replace")
+                    streams.append(text.replace("\r\n", "\n").replace("\r", "\n"))
+                return subprocess.CompletedProcess(argv, process.returncode, *streams)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(prefix + " timed out") from None
+    except OSError:
+        raise RuntimeError(prefix + " launch refused") from None
+
+
+def _execute_group(entries, *, run=None, fork_probe=None):
+    if type(entries) not in (list, tuple) or not 1 <= len(entries) <= _BatchController.MAX_BATCH:
+        raise RuntimeError("patch guard fork batch refused")
+    supported = _BATCH_STATE.fork_supported if fork_probe is None else fork_probe
+    if not supported():
+        results = {}
+        for nodeid, spec in entries:
+            with tempfile.TemporaryDirectory(prefix="pg-solo-") as holder:
+                results[nodeid] = _execute_solo(Path(holder), spec,
+                                              run=subprocess.run if run is None else run)
+        return results
+    with tempfile.TemporaryDirectory(prefix="pg-fork-",
+                                     dir=os.path.realpath(tempfile.gettempdir())) as holder:
+        directory = Path(holder)
+        first = entries[0][1]
+        suite = _write_suite(directory, first, fork_server=True)
+        manifest = [
+            {"nodeid": nodeid, "body": textwrap.dedent(spec.body), "timeout": spec.child_timeout}
+            for nodeid, spec in entries
+        ]
+        manifest_path = directory / "manifest.json"
+        exchange = _ResultExchange(str(directory))
+        exchange.publish(manifest_path.name, manifest)
+        ready = directory / "results.json"
+        env = _child_env(first)
+        env["AEGIS_FORK_MANIFEST"] = str(manifest_path)
+        env["AEGIS_FORK_RESULTS"] = str(ready)
+        packet = exchange.binding()
+        _ResultExchange._budget(packet)
+        env["AEGIS_FORK_EXCHANGE"] = json.dumps(packet, separators=(",", ":"))
+        result = _run_fork_server(_argv(directory, first), run=run, cwd=str(suite), env=env,
+                     capture_output=True, text=True, encoding="utf-8", errors="replace",
+                     timeout=min(150, 120 + sum(spec.child_timeout for _nodeid, spec in entries)))
+        if result.returncode == 4 and not ready.exists():
+            # Identical startup inputs have the same real pytest usage refusal.
+            return {nodeid: (4, result.stdout + result.stderr) for nodeid, _spec in entries}
+        if not ready.exists():
+            raise RuntimeError("patch guard fork server produced no results")
+        payload = exchange.read(ready.name)
+        if type(payload) is not dict:
+            raise RuntimeError("patch guard fork server returned invalid results")
+        if payload.get("error") == "timeout":
+            raise RuntimeError("patch guard fork child timed out")
+        if result.returncode != 0:
+            raise RuntimeError("patch guard fork server failed")
+        records = payload.get("cases")
+        if type(records) is not list:
+            raise RuntimeError("patch guard fork server returned invalid results")
+        if len(records) != len(entries):
+            raise RuntimeError("patch guard fork server omitted or duplicated case results")
+        expected = {nodeid for nodeid, _spec in entries}
+        if any(type(record) is not dict or type(record.get("nodeid")) is not str
+               or not 1 <= len(record["nodeid"]) <= 4096
+               for record in records):
+            raise RuntimeError("patch guard fork server returned invalid results")
+        actual = [record["nodeid"] for record in records]
+        if len(actual) != len(expected) or set(actual) != expected:
+            raise RuntimeError("patch guard fork server omitted or duplicated case results")
+        for record in records:
+            if (type(record) is not dict or len(record) != 4
+                    or type(record.get("nodeid")) is not str
+                    or type(record.get("code")) is not int
+                    or type(record.get("output")) is not str
+                    or type(record.get("seconds")) not in (int, float)
+                    or not math.isfinite(record["seconds"]) or record["seconds"] < 0):
+                raise RuntimeError("patch guard fork server returned invalid results")
+        _BATCH_STATE.child_seconds.update((record["nodeid"], record["seconds"])
+                                          for record in records)
+        return {record["nodeid"]: (record["code"], record["output"]) for record in records}
+
+
+def _plan_item(item):
+    if not isinstance(item, pytest.Function):
+        return None
+    function = item.function
+    source = textwrap.dedent(inspect.getsource(function))
+    tree = ast.parse(source)
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+             and isinstance(node.func, ast.Name)
+             and node.func.id in {"_session", "_r37_legacy_case", "_r19_chain_session"}]
+    if (len(calls) != 1 or not calls[0].args or not isinstance(calls[0].args[0], ast.Name)
+            or calls[0].args[0].id != "tmp_path"
+            or sum(isinstance(node, ast.Name) and node.id == "tmp_path"
+                   for node in ast.walk(tree)) != 1):
+        return None
+    # These tests own multiple processes or observe whole-session setup metrics.
+    if "runtime patch guard metrics" in source or "whole_checks" in source:
+        return None
+    signature = inspect.signature(function)
+    callspec = getattr(item, "callspec", None)
+    params = dict(callspec.params) if callspec is not None else {}
+    kwargs = {}
+    for name, parameter in signature.parameters.items():
+        if name in params:
+            kwargs[name] = params[name]
+        elif name == "tmp_path":
+            kwargs[name] = Path(tempfile.gettempdir()) / "pg-plan-unused"
+        elif name == "record_property":
+            kwargs[name] = lambda *args, **mark: None
+        elif parameter.default is not inspect.Signature.empty:
+            continue
+        else:
+            return None
+    try:
+        function(**kwargs)
+    except _PlanCaptured as captured:
+        return captured.spec
+    except pytest.skip.Exception:
+        return None
+    return None
+
+
+def _group_key(spec):
+    blob = spec.body + "\n" + spec.extra + "\n" + spec.plugin_prefix + "\n" + "\n".join(spec.files.values())
+    if ("pytest.main" in blob or "pytest_sessionstart" in blob
+            or "_PatchGuard" in blob or "-n" in spec.options
+            or any("xdist" in option for option in spec.options)):
+        return None
+    # Every startup input is identical. Only the as-yet-uncollected body varies.
+    return (spec.extra, spec.plugin_prefix, spec.options, spec.selection,
+            tuple(sorted(spec.env_overrides.items())), repr(spec.limits),
+            spec.policy_suffix, tuple(sorted(spec.files.items())))
+
+
+class _BatchController:
+    MAX_BATCH = 8
+    MAX_LOOKAHEAD = 512
+
+    def __init__(self, support_probe=None, directory_factory=None, file_factory=None,
+                 *, session=None, owned_items=None, run=None):
+        self.exchange = None
+        self.directory = None
+        self.configured = False
+        self.support_probe = support_probe or _BatchState.fork_supported
+        self.directory_factory = directory_factory or tempfile.mkdtemp
+        self.file_factory = file_factory
+        self.session = session
+        self.config = None
+        self.owned_items = owned_items
+        self.run = run
+        self.results = {}
+        self.plans = {}
+        self.refused = set()
+        self.timings = []
+        self.child_seconds = {}
+        self.serial = 0
+        self.adapter = None
+        self.inactive_reason = "setup did not complete"
+        self.positions = ({item.nodeid: index for index, item in enumerate(session.items)}
+                          if session is not None else {})
+
+    def open(self, config):
+        if self.configured:
+            return
+        self.configured = True
+        self.config = config
+        if config.option.collectonly:
+            self.inactive_reason = "collection only"
+            return
+        if not self.support_probe():
+            self.inactive_reason = "fork/descriptor unavailable"
+            return
+        if os.environ.get("AEGIS_PATCH_GUARD_BATCH") == "0":
+            self.inactive_reason = "disabled by environment"
+            return
+        self.adapter = "single-process" if not getattr(config, "workerinput", None) else None
+        # The session fixture in this process owns this directory. In particular,
+        # xdist workerinput never supplies an exchange path or inode identity.
+        try:
+            self.directory = self.directory_factory(prefix="aegis-patch-guard-run-",
+                dir=os.path.realpath(tempfile.gettempdir()))
+        except OSError:
+            raise RuntimeError("patch guard result exchange refused") from None
+        try:
+            self.exchange = _ResultExchange(self.directory, file_factory=self.file_factory)
+            self.inactive_reason = "no compatible assigned cohort"
+        except BaseException:
+            import shutil
+            failed_directory, self.directory = self.directory, None
+            try:
+                shutil.rmtree(failed_directory)
+            except OSError:
+                raise RuntimeError("patch guard result cleanup refused") from None
+            raise
+
+    def close(self, config=None):
+        if self.directory is not None:
+            import shutil
+            # Check ownership, mode, no-follow ancestry and identity again.
+            _ResultExchange(self.directory, self.exchange.identity, file_factory=self.file_factory)
+            try:
+                shutil.rmtree(self.directory)
+            except OSError:
+                raise RuntimeError("patch guard result cleanup refused") from None
+            self.directory = None
+
+    @classmethod
+    def validate_packet(cls, packet):
+        if (type(packet) is not dict or len(packet) != 1
+                or "results" not in packet or type(packet["results"]) is not dict
+                or not 1 <= len(packet["results"]) <= cls.MAX_BATCH):
+            raise RuntimeError("patch guard result exchange refused")
+        for nodeid, result in packet["results"].items():
+            if (type(nodeid) is not str or not 1 <= len(nodeid) <= 4096
+                    or type(result) is not list or len(result) != 2
+                    or type(result[0]) is not int or result[0].bit_length() > 64
+                    or type(result[1]) is not str):
+                raise RuntimeError("patch guard result exchange refused")
+        return packet["results"]
+
+    def _pending_items(self, item):
+        if self.owned_items is not None:
+            return tuple(islice(self.owned_items(item), self.MAX_LOOKAHEAD))
+        if self.session is None:
+            return ()
+        if not getattr(self.config, "workerinput", None):
+            start = self.positions[item.nodeid] + 1
+            return tuple(islice(self.session.items, start, start + self.MAX_LOOKAHEAD))
+        # Only the standard load scheduler has the stable queue ownership used
+        # here. Work-stealing and unknown adapters execute the current item only.
+        if not self._standard_load():
+            self.inactive_reason = "unsupported scheduler"
+            return ()
+        for plugin in self.config.pluginmanager.get_plugins():
+            if (type(plugin).__module__ in {"xdist.remote", "__channelexec__"}
+                    and type(plugin).__name__ == "WorkerInteractor"):
+                self.adapter = self._queue_interface(getattr(plugin, "torun", None))
+                if self.adapter is None:
+                    self.inactive_reason = "unsupported queue interface"
+                    return ()
+                indices = self._queued_indices(plugin)
+                return tuple(self.session.items[index] for index in indices
+                             if type(index) is int and 0 <= index < len(self.session.items))
+        self.inactive_reason = "worker queue unavailable"
+        return ()
+
+    @staticmethod
+    def _queue_interface(queue):
+        if callable(getattr(queue, "lock", None)):
+            return "TestQueue.lock"
+        if hasattr(queue, "mutex") and hasattr(queue, "queue"):
+            return "Queue.mutex"
+        return None
+
+    @classmethod
+    def _queued_indices(cls, worker):
+        queue = getattr(worker, "torun", None)
+        interface = cls._queue_interface(queue)
+        if interface == "TestQueue.lock":
+            with queue.lock() as items:
+                return (worker.nextitem_index, *islice(items, cls.MAX_LOOKAHEAD - 1))
+        if interface == "Queue.mutex":
+            with queue.mutex:
+                return (worker.nextitem_index, *islice(queue.queue, cls.MAX_LOOKAHEAD - 1))
+        return ()
+
+    def batching_status(self):
+        adapters = {"single-process", "TestQueue.lock", "Queue.mutex"}
+        if (self.exchange is not None and self.adapter in adapters
+                and any(len(group["nodeids"]) > 1 for group in self.timings)):
+            return "active (" + self.adapter + ")"
+        reasons = {"setup did not complete", "collection only", "fork/descriptor unavailable",
+                   "disabled by environment", "no compatible assigned cohort", "unsupported scheduler",
+                   "unsupported queue interface", "worker queue unavailable"}
+        reason = self.inactive_reason if self.inactive_reason in reasons else "unknown adapter"
+        return "inactive (" + reason + ")"
+
+    def _standard_load(self):
+        parsed_options = getattr(self.config, "known_args_namespace", None)
+        distribution = getattr(parsed_options, "dist", None)
+        if (getattr(parsed_options, "distload", False)
+                or distribution == "no" and getattr(parsed_options, "numprocesses", None)):
+            distribution = "load"
+        return distribution == "load"
+
+    def _plan(self, item):
+        if item.nodeid not in self.plans:
+            previous = _BATCH_STATE.planning
+            _BATCH_STATE.planning = True
+            try:
+                spec = _plan_item(item)
+            finally:
+                _BATCH_STATE.planning = previous
+            self.plans[item.nodeid] = (spec, _group_key(spec) if spec is not None else None)
+        return self.plans[item.nodeid]
+
+    def prepare(self, item):
+        if self.exchange is None or item.nodeid in self.results:
+            return
+        if item.nodeid in self.refused:
+            raise RuntimeError("patch guard worker batch previously refused")
+        spec, key = self._plan(item)
+        if spec is None:
+            return
+        entries = [(item.nodeid, spec)]
+        seen = {item.nodeid}
+        if key is not None:
+            for candidate in self._pending_items(item):
+                if (str(candidate.path) != str(Path(__file__))
+                        or candidate.nodeid in seen or candidate.nodeid in self.results
+                        or candidate.nodeid in self.refused):
+                    continue
+                other, other_key = self._plan(candidate)
+                if other is not None and other_key == key:
+                    entries.append((candidate.nodeid, other))
+                    seen.add(candidate.nodeid)
+                    if len(entries) == self.MAX_BATCH:
+                        break
+        started = time.perf_counter()
+        try:
+            if len(entries) == 1:
+                with tempfile.TemporaryDirectory(prefix="pg-solo-") as holder:
+                    results = {item.nodeid: _execute_solo(
+                        Path(holder), spec, run=subprocess.run if self.run is None else self.run)}
+                _BATCH_STATE.child_seconds[item.nodeid] = time.perf_counter() - started
+            else:
+                results = _execute_group(entries, run=self.run)
+            elapsed = time.perf_counter() - started
+            name = "batch-%d.json" % self.serial
+            self.serial += 1
+            self.exchange.publish(name, {"results": results})
+            decoded = self.validate_packet(self.exchange.read(name))
+            if set(decoded) != seen:
+                raise RuntimeError("patch guard worker batch omitted or duplicated results")
+        except subprocess.TimeoutExpired:
+            self.refused.update(seen)
+            raise RuntimeError("patch guard worker child timed out") from None
+        except OSError:
+            self.refused.update(seen)
+            raise RuntimeError("patch guard worker child launch refused") from None
+        except BaseException:
+            self.refused.update(seen)
+            raise
+        self.results.update(decoded)
+        self.child_seconds.update((nodeid, _BATCH_STATE.child_seconds.get(nodeid, elapsed / len(entries)))
+                                  for nodeid in seen)
+        self.timings.append({"nodeids": [nodeid for nodeid, _spec in entries], "seconds": elapsed})
+
+
+def _dispatch_session(tmp_path, spec):
+    if _BATCH_STATE.planning:
+        raise _PlanCaptured(spec)
+    if _BATCH_STATE.results is not None and _BATCH_STATE.current_nodeid in _BATCH_STATE.results:
+        code, output = _BATCH_STATE.results[_BATCH_STATE.current_nodeid]
+        return code, output
+    return _execute_solo(tmp_path, spec)
+
+
+@pytest.fixture(scope="session")
+def _worker_batches(request):
+    previous = (_BATCH_STATE.results, _BATCH_STATE.exchange, _BATCH_STATE.result_paths,
+                _BATCH_STATE.child_seconds, _BATCH_STATE.runtime)
+    runtime = _BatchController(session=request.session)
+    try:
+        runtime.open(request.config)
+        _BATCH_STATE.results = runtime.results
+        _BATCH_STATE.exchange = runtime.exchange
+        _BATCH_STATE.result_paths = None
+        _BATCH_STATE.child_seconds = {}
+        _BATCH_STATE.runtime = runtime
+        yield runtime
+    finally:
+        try:
+            print("patch guard batching: " + runtime.batching_status())
+            if runtime.timings:
+                # Hash node identifiers so telemetry never echoes a parameter.
+                digest = lambda nodeid: hashlib.sha256(nodeid.encode("utf-8", "surrogatepass")).hexdigest()
+                telemetry = {
+                    "groups": [{"ids": [digest(n) for n in group["nodeids"]],
+                                "seconds": group["seconds"]} for group in runtime.timings],
+                    "children": {digest(n): seconds for n, seconds in runtime.child_seconds.items()},
+                }
+                _ResultExchange._budget(telemetry)
+                print("patch guard batch telemetry: " + json.dumps(telemetry, separators=(",", ":")))
+        finally:
+            try:
+                runtime.close()
+            finally:
+                (_BATCH_STATE.results, _BATCH_STATE.exchange, _BATCH_STATE.result_paths,
+                 _BATCH_STATE.child_seconds, _BATCH_STATE.runtime) = previous
+
+
+@pytest.fixture(autouse=True)
+def _current_guard_case(request, _worker_batches):
+    previous = _BATCH_STATE.current_nodeid
+    _BATCH_STATE.current_nodeid = request.node.nodeid
+    try:
+        _worker_batches.prepare(request.node)
+        yield
+    finally:
+        _BATCH_STATE.current_nodeid = previous
+
+
+@pytest.mark.skipif(not _BatchState.fork_supported(), reason="requires fork and positional reads")
+def test_forked_probes_keep_memory_disk_refusals_and_retries_isolated():
+    from concurrent.futures import ThreadPoolExecutor
+
+    extra = """
+fork_control = ModuleType("fork_control")
+fork_control.flags = [True]
+sys.modules["fork_control"] = fork_control
+"""
+    body = """
+import os, sys
+from pathlib import Path
+from fork_control import flags
+def test_probe():
+    assert flags == [True]
+    assert "fresh_fork_target" not in sys.modules
+    assert not Path("case-leak.txt").exists()
+    assert not hasattr(os, "_fork_case_canary")
+    flags[0] = False
+    import fresh_fork_target
+    Path("case-leak.txt").write_text("owned fixture")
+    LEAK
+"""
+    def run_group(_index):
+        entries = [
+            (str(index), _SessionSpec(body.replace("LEAK", "os._fork_case_canary = object()" if index == 1 else "pass"),
+                extra, (), None, "", {"fresh_fork_target.py": "VALUE = 1\n"}, "", {}, 120,
+                ("tests/test_probe.py",)))
+            for index in range(3)
+        ]
+        return _execute_group(entries)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(run_group, range(2)))
+    for result in [*results, run_group(2)]:
+        assert [result[str(index)][0] for index in range(3)] == [0, 1, 0]
+        for index in range(3):
+            output = result[str(index)][1]
+            assert "1 passed" in output
+            assert ("unrestored namespace" in output) is (index == 1)
+            assert "INTERNALERROR" not in output
+
+
+def test_unsupported_fork_probe_keeps_original_subprocess_entrypoint():
+    from types import SimpleNamespace
+
+    probe = SimpleNamespace(supported=_BATCH_STATE.fork_supported)
+    probe.supported = lambda: False
+    calls = []
+    def run_child(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="owned output", stderr="")
+    spec = _SessionSpec("def test_probe(): pass\n", "", (), None, "", {}, "", {}, 120,
+                        ("tests/test_probe.py",))
+    result = _execute_group([("first", spec), ("second", spec)], run=run_child,
+                            fork_probe=probe.supported)
+    assert result == {"first": (0, "owned output"), "second": (0, "owned output")}
+    assert len(calls) == 2
+    assert all(argv[:4] == [sys.executable, "-B", "-m", "pytest"] for argv in calls)
+
+
+@pytest.mark.skipif(not _BatchState.fork_supported(), reason="requires fork and positional reads")
+@pytest.mark.parametrize("payload", [None, {"cases": []}, {"cases": [
+    {"nodeid": "first", "code": 0, "output": ""},
+    {"nodeid": "first", "code": 0, "output": ""},
+]}])
+def test_fork_server_cannot_omit_or_duplicate_cases_or_retry(payload):
+    calls = []
+    def run_child(argv, **kwargs):
+        calls.append(argv)
+        if payload is not None:
+            reader = _ExchangeReader()
+            reader.attach(reader.decode(kwargs["env"]["AEGIS_FORK_EXCHANGE"]))
+            reader.exchange.publish("results.json", payload)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+    spec = _SessionSpec("def test_probe(): pass\n", "", (), None, "", {}, "", {}, 120,
+                        ("tests/test_probe.py",))
+    message = ("patch guard fork server produced no results" if payload is None else
+               "patch guard fork server omitted or duplicated case results")
+    with pytest.raises(RuntimeError, match="^" + message + "$"):
+        _execute_group([("first", spec), ("second", spec)], run=run_child)
+    assert len(calls) == 1
+    assert not Path(calls[0][calls[0].index("--basetemp") + 1]).parent.exists()
+
+
+@pytest.mark.skipif(not _BatchState.fork_supported(), reason="requires fork and positional reads")
+def test_fork_child_timeout_refuses_and_cleans_its_suite():
+    spec = _SessionSpec("import time\ndef test_probe(): time.sleep(10)\n", "", (), None,
+                        "", {}, "", {}, 0.5, ("tests/test_probe.py",))
+    with pytest.raises(RuntimeError, match="^patch guard fork child timed out$"):
+        _execute_group([("first", spec), ("second", spec)])
+
+
+def test_probe_planner_does_not_run_external_session_helpers(request):
+    def external_case(tmp_path):
+        raise AssertionError("planner executed an external session helper")
+        _external_session(tmp_path, "def test_probe(): pass\n")
+
+    item = pytest.Function.from_parent(request.node.parent, name="external_case", callobj=external_case)
+    assert _plan_item(item) is None
+
+
+@pytest.mark.skipif(not _BatchState.fork_supported(), reason="requires fork and positional reads")
+def test_forked_probe_preserves_stdout_then_stderr_order():
+    extra = '''
+import atexit
+def emit_at_exit():
+    print("owned stderr marker", file=sys.stderr)
+    print("owned stdout marker", file=sys.stdout)
+atexit.register(emit_at_exit)
+'''
+    spec = _SessionSpec("def test_probe(): pass\n", extra, (), None, "", {}, "", {}, 120,
+                        ("tests/test_probe.py",))
+    results = _execute_group([("first", spec), ("second", spec)])
+    for code, output in results.values():
+        assert code == 0, output
+        assert output.index("owned stdout marker") < output.index("owned stderr marker"), output
+
+
+@pytest.mark.skipif(not _BatchState.fork_supported(), reason="requires fork and positional reads")
+@pytest.mark.parametrize("name", ["stdin", "stdout", "stderr"])
+def test_forked_probe_preserves_capture_bindings_seeded_during_setup(name):
+    extra = '''
+capture_control = ModuleType("capture_control")
+capture_control.original = sys.NAME
+sys.modules["capture_control"] = capture_control
+'''.replace("NAME", name)
+    body = '''
+import sys
+from capture_control import original
+def test_probe(): assert sys.NAME is original
+'''.replace("NAME", name)
+    spec = _SessionSpec(body, extra, (), None, "", {}, "", {}, 120, ("tests/test_probe.py",))
+    with tempfile.TemporaryDirectory(prefix="pg-capture-control-") as holder:
+        code, output = _execute_solo(Path(holder), spec)
+    assert code == 0, output
+    results = _execute_group([("first", spec), ("second", spec)])
+    assert all(code == 0 for code, _output in results.values()), results
+
+
+@pytest.mark.skipif(not _BatchState.fork_supported(), reason="requires confined POSIX operations")
+@pytest.mark.parametrize("kind", ["symlink", "directory", "foreign_owner"])
+def test_result_exchange_ignores_old_predictable_path(tmp_path, kind, path_factory=Path):
+    Path = path_factory
+    from contextlib import ExitStack, contextmanager
+    from types import SimpleNamespace
+    from tests.unit.core.test_storage_confined import make_store
+
+    if os.symlink not in os.supports_dir_fd:
+        pytest.skip("requires descriptor-relative symlinks")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+    def unlink(directory, name):
+        try:
+            os.unlink(name, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+
+    with ExitStack() as resources:
+        parent = make_store(tmp_path)
+        parent_fd = os.open(parent, flags)
+        resources.callback(os.close, parent_fd)
+        private = _private_result_root(parent)
+        resources.callback(os.rmdir, private.name, dir_fd=parent_fd)
+        private_fd = os.open(private.name, flags, dir_fd=parent_fd)
+        resources.callback(os.close, private_fd)
+        private_info = os.fstat(private_fd)
+        assert stat.S_IMODE(private_info.st_mode) == 0o700
+        assert private_info.st_uid == os.geteuid()
+
+        # Preserve the path-shaped assertions while making every read confined.
+        class ControlPath(type(Path())):
+            def read_text(self, encoding="utf-8"):
+                with _result_storage.confined_file(private, self.relative_to(private).parts) as handle:
+                    return handle.read_bytes(64).decode(encoding)
+
+        identity = hashlib.sha256(str(tmp_path).encode()).hexdigest()[:16]
+        nodeid = "tests/unit/core/test_patch_guard.py::test_result_control_" + identity
+        uid = os.environ.get("PYTEST_XDIST_TESTRUNUID") or ("pid%d" % os.getpid())
+        if (not 1 <= len(uid) <= 128 or not uid.isascii()
+                or any(not (c.isalnum() or c in "_-") for c in uid)):
+            pytest.fail("invalid private control identity")
+        digest = hashlib.sha256(nodeid.encode()).hexdigest()[:16]
+        parts = ("aegis-patch-guard-fork", uid, digest)
+        directory_fd = private_fd
+        for part in parts:
+            os.mkdir(part, 0o700, dir_fd=directory_fd)
+            resources.callback(os.rmdir, part, dir_fd=directory_fd)
+            child = os.open(part, flags, dir_fd=directory_fd)
+            resources.callback(os.close, child)
+            directory_fd = child
+        old = ControlPath(private).joinpath(*parts)
+        victim = ControlPath(private) / "sentinel"
+        resources.callback(unlink, private_fd, "sentinel")
+        with _result_storage.confined_file(private, ("sentinel",)) as handle:
+            handle.publish_bytes(b"sentinel")
+        resources.callback(unlink, directory_fd, "local.json")
+        if kind == "symlink":
+            os.symlink(str(victim), "local.json", dir_fd=directory_fd)
+        else:
+            with _result_storage.confined_file(private, (*parts, "local.json")) as handle:
+                handle.publish_bytes(b"sentinel")
+        info = os.fstat(directory_fd)
+        foreign = SimpleNamespace(st_uid=info.st_uid + 1, st_mode=info.st_mode,
+                                  st_dev=info.st_dev, st_ino=info.st_ino)
+        opened = []
+
+        @contextmanager
+        def file_at_os_boundary(directory, parts):
+            opened.append(Path(directory))
+            with _result_storage.confined_file(directory, parts) as handle:
+                if kind == "foreign_owner" and Path(directory) == old:
+                    yield SimpleNamespace(parent_stat=lambda: foreign,
+                                          publish_bytes=handle.publish_bytes,
+                                          read_bytes=handle.read_bytes)
+                else:
+                    yield handle
+
+        def private_directory(**kwargs):
+            return tempfile.mkdtemp(**dict(kwargs, dir=private))
+
+        config = SimpleNamespace(option=SimpleNamespace(collectonly=False), workerinput={})
+        controller = _BatchController(directory_factory=private_directory,
+                                      file_factory=file_at_os_boundary)
+        previous = _BATCH_STATE.exchange, _BATCH_STATE.result_paths
+        try:
+            controller.open(config)
+            assert Path(controller.directory).parent == private
+            controller.exchange.publish("local.json", {"results": {}})
+            assert victim.read_text(encoding="utf-8") == "sentinel"
+            assert old not in opened
+            if kind != "symlink":
+                assert (old / "local.json").read_text(encoding="utf-8") == "sentinel"
+        finally:
+            _BATCH_STATE.exchange, _BATCH_STATE.result_paths = previous
+            controller.close(config)
+
+
+def _private_result_root(tmp_path):
+    from tests.unit.core.test_storage_confined import make_store
+    return Path(tempfile.mkdtemp(prefix="result-control-", dir=make_store(tmp_path)))
+
+
+def test_private_result_exchange_concurrent_publish_refusal_and_retry(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    root = _private_result_root(tmp_path)
+    exchange = _ResultExchange(root)
+    payloads = {"gw0.json": {"results": {"first": [0, "passed"]}},
+                "gw1.json": {"results": {"second": [1, "refused"]}}}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda name: exchange.publish(name, payloads[name]), payloads))
+    assert {name: exchange.read(name) for name in payloads} == payloads
+    with pytest.raises(RuntimeError, match="^patch guard result exchange refused$"):
+        exchange.publish("gw0.json", {"results": {}})
+    with pytest.raises(RuntimeError, match="^patch guard result exchange refused$"):
+        exchange.read("missing.json")
+    exchange.publish("retry.json", {"results": {}})
+    assert exchange.read("retry.json") == {"results": {}}
+    assert exchange.read("gw0.json") == payloads["gw0.json"]
+
+
+def test_private_result_exchange_refuses_swapped_symlink(tmp_path):
+    from tests.conftest import symlink_or_skip
+
+    root = _private_result_root(tmp_path)
+    exchange = _ResultExchange(root)
+    exchange.publish("gw0.json", {"results": {}})
+    victim = tmp_path / "victim"
+    victim.write_text("sentinel", encoding="utf-8")
+    (root / "gw0.json").unlink()
+    symlink_or_skip(victim, root / "gw0.json")
+    with pytest.raises(RuntimeError, match="^patch guard result exchange refused$"):
+        exchange.read("gw0.json")
+    with pytest.raises(RuntimeError, match="^patch guard result exchange refused$"):
+        exchange.publish("gw0.json", {"results": {}})
+    assert victim.read_text(encoding="utf-8") == "sentinel"
+    (root / "gw0.json").unlink()
+    exchange.publish("gw0.json", {"results": {"retry": [0, "passed"]}})
+    assert exchange.read("gw0.json")["results"]["retry"] == [0, "passed"]
+
+
+@pytest.mark.parametrize("operation", ["read", "publish"])
+def test_private_result_exchange_keeps_held_root_during_rename(tmp_path, operation):
+    from contextlib import contextmanager
+    from tests.conftest import symlink_or_skip
+
+    root = _private_result_root(tmp_path)
+    moved = tmp_path / "moved"
+    victim = _private_result_root(tmp_path)
+    with _result_storage.confined_file(victim, ("gw0.json",)) as handle:
+        handle.publish_bytes(b"sentinel")
+    swap = []
+
+    @contextmanager
+    def racing_file(directory, parts):
+        with _result_storage.confined_file(directory, parts) as handle:
+            if swap and parts == ("gw0.json",):
+                swap.clear()
+                root.rename(moved)
+                symlink_or_skip(victim, root, target_is_directory=True)
+            yield handle
+
+    exchange = _ResultExchange(root, file_factory=racing_file)
+    if operation == "read":
+        exchange.publish("gw0.json", {"results": {"original": [0, "passed"]}})
+    swap.append(True)
+    if operation == "read":
+        assert exchange.read("gw0.json") == {"results": {"original": [0, "passed"]}}
+    else:
+        exchange.publish("gw0.json", {"results": {"original": [0, "passed"]}})
+        assert _ResultExchange(moved).read("gw0.json") == {"results": {"original": [0, "passed"]}}
+    with _result_storage.confined_file(victim, ("gw0.json",)) as handle:
+        assert handle.read_bytes(16) == b"sentinel"
+    with pytest.raises(RuntimeError, match="^patch guard result exchange refused$"):
+        exchange.read("gw0.json")
+
+
+def test_private_result_exchange_refuses_foreign_owner_and_closes_context(tmp_path):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    root = _private_result_root(tmp_path)
+    closed = []
+
+    @contextmanager
+    def foreign_owner(directory, parts):
+        try:
+            with _result_storage.confined_file(directory, parts) as handle:
+                info = handle.parent_stat()
+                foreign = SimpleNamespace(st_uid=info.st_uid + 1, st_mode=info.st_mode,
+                                          st_dev=info.st_dev, st_ino=info.st_ino)
+                yield SimpleNamespace(parent_stat=lambda: foreign)
+        finally:
+            closed.append(True)
+
+    with pytest.raises(RuntimeError, match="^patch guard result exchange refused$"):
+        _ResultExchange(root, file_factory=foreign_owner)
+    assert closed == [True]
+    assert list(root.iterdir()) == []
+    _ResultExchange(root).publish("retry.json", {"results": {}})
+
+
+@pytest.mark.parametrize("raw", [b"not-json", b"\xff", b"[" * 33 + b"]" * 33, b"1" * 100],
+                         ids=["syntax", "encoding", "depth", "integer"])
+def test_private_result_exchange_refuses_malformed_or_excessive_json(tmp_path, raw):
+    root = _private_result_root(tmp_path)
+    with _result_storage.confined_file(root, ("bad.json",)) as handle:
+        handle.publish_bytes(raw)
+    with pytest.raises(RuntimeError, match="^patch guard result data refused$"):
+        _ResultExchange(root).read("bad.json")
+
+
+def test_private_result_exchange_limits_before_publish_and_read(tmp_path):
+    class SmallExchange(_ResultExchange):
+        MAX_BYTES = 256
+
+    root = _private_result_root(tmp_path)
+    exchange = SmallExchange(root)
+    with pytest.raises(RuntimeError, match="^patch guard result data refused$"):
+        exchange.publish("large.json", "x" * (exchange.MAX_BYTES // 12 + 1))
+    assert not (root / "large.json").exists()
+    with _result_storage.confined_file(root, ("large.json",)) as handle:
+        handle.publish_bytes(b"x" * (exchange.MAX_BYTES + 1))
+    with pytest.raises(RuntimeError, match="^patch guard result exchange refused$"):
+        exchange.read("large.json")
+
+
+def test_private_result_controller_passes_parent_root_to_workers_and_cleans(tmp_path):
+    from types import SimpleNamespace
+    from tests.unit.core.test_storage_confined import make_store
+
+    make_store(tmp_path)
+    parent = _BatchController()
+    config = SimpleNamespace(option=SimpleNamespace(collectonly=False))
+    parent.open(config)
+    root = Path(parent.directory)
+    try:
+        node = SimpleNamespace(workerinput={"workerid": "gw0", "workercount": 1})
+        node.workerinput["_patch_guard_exchange"] = parent.exchange.binding()
+        assert node.workerinput["_patch_guard_exchange"] == {
+            "root": str(root), "identity": parent.exchange.identity}
+        assert stat.S_IMODE(root.stat().st_mode) == 0o700
+        assert root.stat().st_uid == os.geteuid()
+        worker = _ExchangeReader()
+        worker_config = SimpleNamespace(option=config.option, workerinput=node.workerinput)
+        worker.attach(worker_config.workerinput["_patch_guard_exchange"])
+        assert worker.directory is None
+        worker.exchange.publish("gw0.json", {"results": {"case": [0, "passed"]}})
+        assert parent.exchange.read("gw0.json") == {"results": {"case": [0, "passed"]}}
+        worker.close()
+        assert root.is_dir()
+    finally:
+        parent.close(config)
+    assert not root.exists()
+
+
+def test_private_result_controller_does_not_discover_paths_without_parent_packet():
+    from types import SimpleNamespace
+
+    controller = _ExchangeReader()
+    config = SimpleNamespace(option=SimpleNamespace(collectonly=False),
+                             workerinput={"workerid": "gw0", "workercount": 1})
+    controller.attach(config.workerinput.get("_patch_guard_exchange"))
+    assert controller.exchange is None
+    assert controller.directory is None
+
+
+def test_private_result_controller_unsupported_probe_avoids_allocation():
+    from types import SimpleNamespace
+
+    probe = SimpleNamespace(supported=_BatchState.fork_supported)
+    probe.supported = lambda: False
+    controller = _BatchController(support_probe=probe.supported)
+    config = SimpleNamespace(option=SimpleNamespace(collectonly=False))
+    controller.open(config)
+    assert controller.directory is None
+    assert controller.exchange is None
+    node = SimpleNamespace(workerinput={})
+    child = _ExchangeReader()
+    child.attach(node.workerinput.get("_patch_guard_exchange"))
+    assert node.workerinput == {}
+
+
+def test_private_result_exchange_refuses_replaced_owned_root(tmp_path):
+    root = _private_result_root(tmp_path)
+    exchange = _ResultExchange(root)
+    exchange.publish("gw0.json", {"results": {}})
+    saved = tmp_path / "saved"
+    root.rename(saved)
+    root.mkdir(mode=0o700)
+    with pytest.raises(RuntimeError, match="^patch guard result exchange refused$"):
+        exchange.read("gw0.json")
+    with pytest.raises(RuntimeError, match="^patch guard result exchange refused$"):
+        exchange.publish("gw0.json", {"results": {}})
+    assert list(root.iterdir()) == []
+    assert _ResultExchange(saved).read("gw0.json") == {"results": {}}
+
+
+def test_private_result_controller_refuses_creation_failure_without_echo():
+    from types import SimpleNamespace
+
+    def refused_directory(**kwargs):
+        raise PermissionError("untrusted supplied diagnostic")
+
+    controller = _BatchController(support_probe=lambda: True, directory_factory=refused_directory)
+    config = SimpleNamespace(option=SimpleNamespace(collectonly=False))
+    with pytest.raises(RuntimeError, match="^patch guard result exchange refused$"):
+        controller.open(config)
+    assert controller.directory is None
+    assert controller.exchange is None
+
+
+@pytest.mark.parametrize("packet", [
+    {}, [], {"root": "unused", "identity": [1]},
+    {"root": 1, "identity": [1, 2]},
+    {"root": "unused", "identity": [True, 2]},
+    {"root": "unused", "identity": [-1, 2]},
+    {"root": "unused", "identity": [1 << 65, 2]},
+    {"root": "unused", "identity": "12"},
+    {"root": "unused", "identity": [1, 2], "extra": "unused"},
+], ids=["empty", "list", "short", "root-type", "boolean", "negative",
+        "wide", "identity-type", "extra"])
+def test_private_result_controller_refuses_malformed_worker_packet(packet):
+    from types import SimpleNamespace
+
+    controller = _ExchangeReader()
+    config = SimpleNamespace(option=SimpleNamespace(collectonly=False),
+                             workerinput={"workerid": "gw0", "_patch_guard_exchange": packet})
+    with pytest.raises(RuntimeError, match="^patch guard result exchange refused$"):
+        controller.attach(config.workerinput["_patch_guard_exchange"])
+    assert controller.directory is None
+    assert controller.exchange is None
+
+
+def test_private_result_controller_cleanup_failure_keeps_teardown_safe(tmp_path):
+    from types import SimpleNamespace
+    from tests.unit.core.test_storage_confined import make_store
+
+    make_store(tmp_path)
+    if os.name != "posix" or os.geteuid() == 0:
+        pytest.skip("requires unprivileged POSIX directory permissions")
+    holder = tmp_path / "holder"
+    holder.mkdir(mode=0o700)
+    root = holder / "invalid"
+    root.mkdir(mode=0o750)
+    holder.chmod(0o500)
+    controller = _BatchController(directory_factory=lambda **kwargs: str(root))
+    config = SimpleNamespace(option=SimpleNamespace(collectonly=False))
+    try:
+        with pytest.raises(RuntimeError, match="^patch guard result cleanup refused$"):
+            controller.open(config)
+        controller.close(config)
+        assert controller.directory is None
+        assert controller.exchange is None
+        assert root.is_dir()
+    finally:
+        holder.chmod(0o700)
+    retry = _BatchController()
+    retry.open(config)
+    retry.close(config)
+    assert retry.directory is None
+
+
+def test_worker_local_session_fixture_needs_no_parent_plugin(request, _worker_batches):
+    from tests.unit.core.test_storage_confined import make_store
+
+    make_store(Path(tempfile.gettempdir()))
+    assert not request.config.pluginmanager.hasplugin("aegis-patch-guard-fork")
+    assert _worker_batches.directory is not None
+    assert _worker_batches.exchange.identity == (
+        Path(_worker_batches.directory).stat().st_dev,
+        Path(_worker_batches.directory).stat().st_ino)
+    assert stat.S_IMODE(Path(_worker_batches.directory).stat().st_mode) == 0o700
+    assert Path(_worker_batches.directory).stat().st_uid == os.geteuid()
+
+
+@pytest.mark.skipif(not _BatchState.fork_supported(), reason="requires confined POSIX fork operations")
+@pytest.mark.parametrize("failure", ["timeout", "launch"])
+def test_worker_local_fork_server_refuses_boundary_failures_without_echo(failure):
+    calls = []
+
+    def run_child(argv, **kwargs):
+        calls.append(argv)
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired("untrusted diagnostic", kwargs["timeout"])
+        raise PermissionError("untrusted diagnostic")
+
+    spec = _SessionSpec("def test_probe(): pass\n", "", (), None, "", {}, "", {}, 120,
+                        ("tests/test_probe.py",))
+    message = ("patch guard fork server timed out" if failure == "timeout"
+               else "patch guard fork server launch refused")
+    with pytest.raises(RuntimeError, match="^" + message + "$"):
+        _execute_group([("first", spec), ("second", spec)], run=run_child)
+    assert len(calls) == 1
+    assert not Path(calls[0][calls[0].index("--basetemp") + 1]).parent.exists()
+
+
+@pytest.mark.skipif(not _BatchState.fork_supported(), reason="requires confined POSIX fork operations")
+@pytest.mark.parametrize("variant", range(12))
+def test_worker_local_standard_scheduler_batches_assigned_children(tmp_path, variant):
+    code, output = _session(tmp_path, "def test_probe(): assert %d >= 0\n" % variant)
+    assert code == 0, output
+    runtime = _BATCH_STATE.runtime
+    assert _BATCH_STATE.current_nodeid in runtime.results
+    worker = getattr(runtime.config, "workerinput", {})
+    count = worker.get("workercount", 1)
+    # The dedicated cohort guarantees matching work on each worker. Unrelated
+    # selected contracts do not imply that this worker owns another guard case.
+    selected = runtime.session.items
+    cohort = all(str(item.path) == str(Path(__file__))
+                 and getattr(item, "originalname", None) ==
+                 "test_worker_local_standard_scheduler_batches_assigned_children"
+                 for item in selected)
+    if (len(selected) >= 2 * count and cohort
+            and (not worker or runtime._standard_load())):
+        assert any(len(group["nodeids"]) > 1 for group in _BATCH_STATE.runtime.timings)
+
+
+def _worker_local_control_items(request):
+    def first(tmp_path):
+        _session(tmp_path, "def test_first(): pass\n")
+
+    def second(tmp_path):
+        _session(tmp_path, "def test_second(): pass\n")
+
+    def foreign(tmp_path):
+        _session(tmp_path, "def test_foreign(): pass\n")
+
+    return [pytest.Function.from_parent(request.node.parent, name=fn.__name__, callobj=fn)
+            for fn in (first, second, foreign)]
+
+
+@pytest.mark.skipif(not _BatchState.fork_supported(), reason="requires confined POSIX fork operations")
+def test_worker_local_batches_never_execute_foreign_work_and_reuse_owned_results(request):
+    from types import SimpleNamespace
+
+    first, second, foreign = _worker_local_control_items(request)
+    calls = []
+
+    def child_process(argv, **kwargs):
+        reader = _ExchangeReader()
+        reader.attach(reader.decode(kwargs["env"]["AEGIS_FORK_EXCHANGE"]))
+        manifest = reader.exchange.read("manifest.json")
+        names = [entry["nodeid"] for entry in manifest]
+        calls.append(names)
+        assert foreign.nodeid not in names
+        reader.exchange.publish("results.json", {"cases": [
+            {"nodeid": name, "code": 0, "output": "owned output", "seconds": 0.01}
+            for name in names]})
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    runtime = _BatchController(session=SimpleNamespace(items=[first, second, foreign]),
+                               owned_items=lambda item: [second], run=child_process)
+    config = SimpleNamespace(option=SimpleNamespace(collectonly=False))
+    try:
+        runtime.open(config)
+        runtime.prepare(first)
+        runtime.prepare(second)
+        assert calls == [[first.nodeid, second.nodeid]]
+        assert set(runtime.results) == {first.nodeid, second.nodeid}
+        assert all(result == [0, "owned output"] for result in runtime.results.values())
+        assert len(runtime.timings) == 1
+    finally:
+        runtime.close()
+
+
+@pytest.mark.skipif(not _BatchState.fork_supported(), reason="requires confined POSIX fork operations")
+def test_worker_local_batch_failure_never_retries_its_assigned_children(request):
+    from types import SimpleNamespace
+
+    first, second, foreign = _worker_local_control_items(request)
+    calls = []
+
+    def child_process(argv, **kwargs):
+        calls.append(argv)
+        raise subprocess.TimeoutExpired("untrusted supplied diagnostic", kwargs["timeout"])
+
+    runtime = _BatchController(session=SimpleNamespace(items=[first, second, foreign]),
+                               owned_items=lambda item: [second], run=child_process)
+    config = SimpleNamespace(option=SimpleNamespace(collectonly=False))
+    try:
+        runtime.open(config)
+        with pytest.raises(RuntimeError, match="^patch guard fork server timed out$"):
+            runtime.prepare(first)
+        with pytest.raises(RuntimeError, match="^patch guard worker batch previously refused$"):
+            runtime.prepare(second)
+        assert len(calls) == 1
+        assert runtime.results == {}
+        assert runtime.refused == {first.nodeid, second.nodeid}
+        assert foreign.nodeid not in runtime.refused
+    finally:
+        runtime.close()
+
+
+@pytest.mark.skipif(not _BatchState.fork_supported(), reason="requires confined POSIX fork operations")
+def test_worker_local_server_budget_reaps_descendants_before_return(tmp_path):
+    from contextlib import contextmanager
+
+    ready = tmp_path / "ready"
+    escaped = tmp_path / "escaped"
+    opened = []
+    program = '''
+import os, sys, time
+from pathlib import Path
+if os.fork() == 0:
+    time.sleep(2)
+    Path(sys.argv[2]).write_text("escaped", encoding="utf-8")
+    os._exit(0)
+Path(sys.argv[1]).write_text("ready", encoding="utf-8")
+time.sleep(20)
+'''
+
+    @contextmanager
+    def started_server(argv, **kwargs):
+        opened.extend((kwargs["stdout"], kwargs["stderr"]))
+        with subprocess.Popen(argv, **kwargs) as process:
+            try:
+                deadline = time.monotonic() + 5
+                while not ready.exists():
+                    if process.poll() is not None or time.monotonic() >= deadline:
+                        pytest.fail("owned server did not become ready")
+                    time.sleep(0.01)
+                yield process
+            finally:
+                if process.poll() is None:
+                    try:
+                        os.killpg(process.pid, 9)
+                    except ProcessLookupError:
+                        pass
+                    process.communicate()
+
+    with pytest.raises(RuntimeError, match="^patch guard fork server timed out$"):
+        _run_fork_server([sys.executable, "-c", program, str(ready), str(escaped)],
+                         run=None, process_factory=started_server, capture_output=True,
+                         text=True, encoding="utf-8", errors="replace", timeout=0.1)
+    assert ready.exists()
+    assert len(opened) == 2
+    assert all(stream.closed for stream in opened)
+    deadline = time.monotonic() + 2.5
+    while not escaped.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not escaped.exists()
+
+
+@pytest.mark.parametrize("limit", [0, 32])
+def test_worker_local_process_output_limit_closes_every_stream(limit):
+    from contextlib import contextmanager
+
+    opened = []
+
+    @contextmanager
+    def process_factory(argv, **kwargs):
+        opened.extend((kwargs["stdout"], kwargs["stderr"]))
+        with subprocess.Popen(argv, **kwargs) as process:
+            yield process
+
+    with pytest.raises(RuntimeError, match="^patch guard fork server output refused$"):
+        _run_fork_server([sys.executable, "-c", "import sys; sys.stdout.write('x' * 33)"],
+                         run=None, process_factory=process_factory, capture_output=True,
+                         text=True, encoding="utf-8", errors="replace", timeout=5,
+                         output_limit=limit)
+    assert len(opened) == 2
+    assert all(stream.closed for stream in opened)
+
+
+def test_worker_local_owned_queue_snapshot_is_bounded_and_never_consumes_assignments():
+    from queue import Queue
+    from types import SimpleNamespace
+
+    queue = Queue()
+    for index in range(_BatchController.MAX_LOOKAHEAD + 20):
+        queue.put(index)
+    worker = SimpleNamespace(torun=queue, nextitem_index=-1)
+    snapshot = _BatchController._queued_indices(worker)
+    assert snapshot == (-1, *range(_BatchController.MAX_LOOKAHEAD - 1))
+    assert queue.qsize() == _BatchController.MAX_LOOKAHEAD + 20
+    assert queue.get_nowait() == 0
+    assert _BatchController._queued_indices(SimpleNamespace(torun=object())) == ()
+
+
+def test_worker_local_owned_queue_snapshot_is_locked_against_concurrent_delivery():
+    from concurrent.futures import ThreadPoolExecutor
+    from queue import Queue
+    from threading import Event
+    from types import SimpleNamespace
+
+    queue = Queue()
+    queue.put(2)
+    worker = SimpleNamespace(torun=queue, nextitem_index=1)
+    started = Event()
+
+    def snapshot():
+        started.set()
+        return _BatchController._queued_indices(worker)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with queue.mutex:
+            future = pool.submit(snapshot)
+            assert started.wait(2)
+            queue.queue.append(3)
+        assert future.result(timeout=2) == (1, 2, 3)
+    assert list(queue.queue) == [2, 3]
+
+
+@pytest.mark.parametrize("text", [None, "", "x" * 400001, "é", "not-json",
+                                 "[" * 33 + "]" * 33, "1" * 100],
+                         ids=["missing", "empty", "size", "encoding", "syntax", "depth", "integer"])
+def test_worker_local_reader_packet_bounds_and_parse_refusals(text):
+    with pytest.raises(RuntimeError, match="^patch guard result exchange refused$"):
+        _ExchangeReader.decode(text)
+
+
+def test_worker_local_process_construction_failure_closes_every_stream():
+    opened = []
+
+    def refused_process(argv, **kwargs):
+        opened.extend((kwargs["stdout"], kwargs["stderr"]))
+        raise PermissionError("untrusted supplied diagnostic")
+
+    with pytest.raises(RuntimeError, match="^patch guard fork server launch refused$"):
+        _run_fork_server([sys.executable, "-c", "pass"], run=None,
+                         process_factory=refused_process, capture_output=True,
+                         text=True, encoding="utf-8", errors="replace", timeout=5)
+    assert len(opened) == 2
+    assert all(stream.closed for stream in opened)
+
+
+@pytest.mark.parametrize("mode", ["worksteal", "loadscope", "each", "unknown"])
+def test_worker_local_other_schedulers_never_read_or_batch_unowned_queues(mode):
+    from types import SimpleNamespace
+
+    def forbidden_plugins():
+        pytest.fail("unsupported scheduler inspected an assignment queue")
+
+    runtime = _BatchController(support_probe=lambda: False,
+                               session=SimpleNamespace(items=[]))
+    config = SimpleNamespace(option=SimpleNamespace(collectonly=False),
+        workerinput={"workerid": "gw0", "workercount": 3},
+        known_args_namespace=SimpleNamespace(dist=mode, numprocesses=3),
+        pluginmanager=SimpleNamespace(get_plugins=forbidden_plugins))
+    runtime.open(config)
+    assert runtime._pending_items(SimpleNamespace(nodeid="owned")) == ()
+    assert runtime.directory is None
+
+
+def test_worker_local_process_capture_preserves_subprocess_text_newlines():
+    program = ("import sys; sys.stdout.buffer.write(bytes([97,13,10,98,13,99,10])); "
+               "sys.stderr.buffer.write(bytes([100,13,10,101,13,102,10]))")
+    argv = [sys.executable, "-c", program]
+    expected = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=5)
+    actual = _run_fork_server(argv, run=None, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=5)
+    assert actual.returncode == expected.returncode == 0
+    assert actual.stdout == expected.stdout
+    assert actual.stderr == expected.stderr
+
+
+@pytest.mark.skipif(not _BatchState.fork_supported(), reason="requires confined POSIX fork operations")
+@pytest.mark.parametrize("component", ["session", "fork"])
+def test_private_temp_roots_allow_a_symlinked_tmpdir(tmp_path, component):
+    from tests.conftest import symlink_or_skip
+    from tests.unit.core.test_storage_confined import make_store
+
+    root = make_store(tmp_path)
+    parent = root / "real-parent"
+    parent.mkdir(mode=0o700)
+    alias = root / "tmpdir-link"
+    symlink_or_skip(parent, alias, target_is_directory=True)
+    program = r'''
+import os, stat, sys, tempfile
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from threading import Barrier
+from types import SimpleNamespace
+import pytest
+from tests.conftest import symlink_or_skip
+from tests.unit.core import test_patch_guard as guard
+
+# A fresh interpreter must really use the symlink spelling, not a cached tempdir.
+assert tempfile.gettempdir() == os.environ["TMPDIR"]
+assert Path(tempfile.gettempdir()).is_symlink()
+parent = Path(os.path.realpath(tempfile.gettempdir()))
+if sys.argv[1] == "session":
+    config = SimpleNamespace(option=SimpleNamespace(collectonly=False))
+    barrier = Barrier(2, timeout=10)
+
+    def session_case(index, concurrent=False):
+        controller = guard._BatchController()
+        try:
+            controller.open(config)
+            directory = Path(controller.directory)
+            assert directory.parent == parent
+            info = directory.stat()
+            assert stat.S_IMODE(info.st_mode) == 0o700
+            assert info.st_uid == os.geteuid()
+            if concurrent:
+                barrier.wait()
+            exchange = controller.exchange
+            exchange.publish("result.json", {"index": index})
+            assert exchange.read("result.json") == {"index": index}
+            with pytest.raises(RuntimeError, match="^patch guard result exchange refused$"):
+                guard._ResultExchange(directory, (info.st_dev, info.st_ino + 1))
+            victim = parent / ("sentinel-%d" % index)
+            victim.write_bytes(b"sentinel")
+            result = directory / "result.json"
+            result.unlink()
+            symlink_or_skip(victim, result)
+            with pytest.raises(RuntimeError, match="^patch guard result exchange refused$"):
+                exchange.read("result.json")
+            with pytest.raises(RuntimeError, match="^patch guard result exchange refused$"):
+                exchange.publish("result.json", {"index": index})
+            assert victim.read_bytes() == b"sentinel"
+            result.unlink()
+            exchange.publish("result.json", {"retry": index})
+            assert exchange.read("result.json") == {"retry": index}
+        finally:
+            controller.close()
+        assert not directory.exists()
+        return directory
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(session_case, index, True) for index in range(2)]
+        directories = [future.result(timeout=30) for future in futures]
+    assert len(set(directories)) == 2
+    session_case(2)
+    assert not list(parent.glob("aegis-patch-guard-run-*"))
+else:
+    def fork_case(index):
+        spec = guard._SessionSpec("def test_probe(): pass\n", "", (), None,
+            "", {}, "", {}, 120, ("tests/test_probe.py",))
+        names = ["case-%d-first" % index, "case-%d-second" % index]
+        results = guard._execute_group([(name, spec) for name in names])
+        assert set(results) == set(names)
+        assert all(code == 0 and "1 passed" in output for code, output in results.values())
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(fork_case, range(2)))
+    slow = guard._SessionSpec("import time\ndef test_probe(): time.sleep(10)\n",
+        "", (), None, "", {}, "", {}, 0.5, ("tests/test_probe.py",))
+    with pytest.raises(RuntimeError, match="^patch guard fork child timed out$"):
+        guard._execute_group([("slow-first", slow), ("slow-second", slow)])
+    assert not list(parent.glob("pg-fork-*"))
+    fork_case(2)
+    assert not list(parent.glob("pg-fork-*"))
+'''
+    env = dict(os.environ, TMPDIR=str(alias), PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
+               AEGIS_PATCH_GUARD_BATCH="1")
+    env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    result = subprocess.run([sys.executable, "-B", "-c", program, component],
+        cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8",
+        errors="replace", timeout=120)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.skipif(not _BatchState.fork_supported(), reason="requires confined POSIX operations")
+@pytest.mark.parametrize("kind", ["symlink", "directory", "foreign_owner"])
+def test_private_old_location_control_uses_no_unconfined_path_io(tmp_path, kind):
+    class NoUnconfinedPath(type(Path())):
+        def denied(self, *args, **kwargs):
+            pytest.fail("old-location control used unconfined path I/O")
+
+        mkdir = write_text = read_text = chmod = stat = unlink = rmdir = denied
+
+    test_result_exchange_ignores_old_predictable_path(tmp_path, kind, path_factory=NoUnconfinedPath)
+
+
+def _test_lock_queue():
+    from collections import deque
+    from contextlib import contextmanager
+    from threading import Event, RLock
+    from types import SimpleNamespace
+    from xdist import remote
+
+    actual = getattr(remote, "TestQueue", None)
+    if actual is not None:
+        return actual(SimpleNamespace(RLock=RLock, Event=Event))
+
+    # The public lock contract used by TestQueue in xdist 3.8. The installed
+    # older xdist uses queue.Queue, which is covered independently above.
+    class LockQueue:
+        def __init__(self):
+            self._items = deque()
+            self._lock = RLock()
+
+        @contextmanager
+        def lock(self):
+            with self._lock:
+                yield self._items
+
+        def put(self, item):
+            with self.lock() as items:
+                items.append(item)
+
+    return LockQueue()
+
+
+def test_worker_local_testqueue_lock_snapshot_is_bounded_and_nonconsuming():
+    from types import SimpleNamespace
+
+    queue = _test_lock_queue()
+    for index in range(_BatchController.MAX_LOOKAHEAD + 20):
+        queue.put(index)
+    worker = SimpleNamespace(torun=queue, nextitem_index=-1)
+    assert _BatchController._queued_indices(worker) == (
+        -1, *range(_BatchController.MAX_LOOKAHEAD - 1))
+    with queue.lock() as items:
+        assert len(items) == _BatchController.MAX_LOOKAHEAD + 20
+        assert items[0] == 0
+
+
+def test_worker_local_testqueue_lock_snapshot_blocks_concurrent_delivery():
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from types import SimpleNamespace
+
+    queue = _test_lock_queue()
+    queue.put(2)
+    worker = SimpleNamespace(torun=queue, nextitem_index=1)
+    started = Event()
+
+    def snapshot():
+        started.set()
+        return _BatchController._queued_indices(worker)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with queue.lock() as items:
+            future = pool.submit(snapshot)
+            assert started.wait(2)
+            items.append(3)
+        assert future.result(timeout=2) == (1, 2, 3)
+    with queue.lock() as items:
+        assert list(items) == [2, 3]
+
+
+def test_worker_local_batching_status_explains_an_unsupported_probe():
+    from types import SimpleNamespace
+
+    def no_directory(**kwargs):
+        pytest.fail("unsupported batching allocated a directory")
+
+    runtime = _BatchController(support_probe=lambda: False, directory_factory=no_directory)
+    runtime.open(SimpleNamespace(option=SimpleNamespace(collectonly=False)))
+    assert runtime.batching_status() == "inactive (fork/descriptor unavailable)"
