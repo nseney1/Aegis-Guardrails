@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 from argparse import Namespace
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import pytest
@@ -720,8 +721,43 @@ def _wording_environment(pin):
     return env
 
 
-@pytest.mark.parametrize("case", _MCP_WORDING_REASONS)
-def test_mcp_binding_wording_equals_resolver(home, wording_paths, case):
+@contextmanager
+def _wording_mcp_server(inputs):
+    import aegis_mcp.server as server
+
+    saved = {name: getattr(server, name) for name in server.fresh_state()}
+    try:
+        server._start(_wording_environment(inputs.get("pin")))
+        server._server_cwd = str(inputs["cwd"])
+        yield server
+    finally:
+        for name, value in saved.items():
+            setattr(server, name, value)
+
+
+@pytest.mark.parametrize("fail", [False, True], ids=["success", "assertion-failure"])
+def test_mcp_wording_restores_every_connection_field(home, wording_paths, fail):
+    import aegis_mcp.server as server
+
+    saved = {name: getattr(server, name) for name in server.fresh_state()}
+    inputs = _mcp_wording_inputs("pin_denied_root", home, wording_paths)
+    for _ in range(2):
+        expected = pytest.raises(AssertionError, match="^wording assertion failed$") if fail else nullcontext()
+        with expected:
+            with _wording_mcp_server(inputs) as connection:
+                assert connection._workspace_error.reason == "pin_denied"
+                for name in server.fresh_state():
+                    setattr(server, name, object())
+                if fail:
+                    raise AssertionError("wording assertion failed")
+        for name, value in saved.items():
+            assert getattr(server, name) is value, name
+
+
+@pytest.mark.parametrize("case,stdio", [
+    pytest.param(case, False, id=case) for case in _MCP_WORDING_REASONS
+] + [pytest.param("pin_conflicts_with_host_root", True, id="stdio-pin_conflicts_with_host_root")])
+def test_mcp_binding_wording_equals_resolver(home, wording_paths, case, stdio):
     inputs = _mcp_wording_inputs(case, home, wording_paths)
     canonical = resolve_binding(**inputs)
     assert canonical.reason == _MCP_WORDING_REASONS[case]
@@ -734,13 +770,22 @@ def test_mcp_binding_wording_equals_resolver(home, wording_paths, case):
             "params": {"name": "aegis_list_rules", "arguments": {"files": inputs.get("files", [])},
                        "_meta": {"x-codex-turn-metadata": {"workspaces": roots}}},
         })
-    run = subprocess.run(
-        [sys.executable, "-m", "aegis_mcp"], cwd=inputs["cwd"], env=_wording_environment(inputs.get("pin")),
-        input="".join(json.dumps(frame) + "\n" for frame in frames),
-        text=True, capture_output=True, timeout=15,
-    )
-    assert run.returncode == 0, run.stderr
-    responses = {frame["id"]: frame for frame in map(json.loads, run.stdout.splitlines()) if "id" in frame}
+    if stdio:
+        # Keep the real entry point, framing and environment-read path covered.
+        run = subprocess.run(
+            [sys.executable, "-m", "aegis_mcp"], cwd=inputs["cwd"], env=_wording_environment(inputs.get("pin")),
+            input="".join(json.dumps(frame) + "\n" for frame in frames),
+            text=True, capture_output=True, timeout=15,
+        )
+        assert run.returncode == 0, run.stderr
+        responses = {frame["id"]: frame for frame in map(json.loads, run.stdout.splitlines()) if "id" in frame}
+    else:
+        with _wording_mcp_server(inputs) as server:
+            responses = {}
+            for frame in frames:
+                response = server.handle_request(frame)
+                if response is not None and "id" in response:
+                    responses[response["id"]] = response
     for req_id in (1, 2):
         response = responses[req_id]
         result = response["result"]
