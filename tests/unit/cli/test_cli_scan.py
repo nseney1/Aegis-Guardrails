@@ -988,6 +988,35 @@ def test_scan_warning_checks_full_size_before_control_refusal(ws, monkeypatch, c
     assert capsys.readouterr().err == "Warning: scan event not recorded: guidance_projection_limit\n"
 
 
+@pytest.mark.parametrize("message, expected", [
+    ("disk\nfull", "disk full"),
+    ("disk\x1bfull", "guidance withheld: control characters"),
+    ("disk\0full", "guidance withheld: control characters"),
+    ("x" * (1024 * 1024 + 1), "guidance_projection_limit"),
+    ("ghp_" + "a" * 30, "ghp_REDACTED"),
+    ("x" * 1100, "x" * 1021 + "..."),
+], ids=["newline", "esc", "nul", "oversized", "secret", "clipped"])
+def test_scan_telemetry_warning_retries_then_recovers(ws, monkeypatch, capsys, message, expected):
+    from aegis_core import scan_compliance
+
+    record = scan_compliance.record
+    attempts = []
+
+    def fail_twice(*args, **kwargs):
+        attempts.append(None)
+        if len(attempts) <= 2:
+            raise OSError(message)
+        return record(*args, **kwargs)
+
+    monkeypatch.setattr("aegis_core.scan_compliance.record", fail_twice)
+    for _ in range(2):
+        assert main(["scan", "src/app.py"]) == 0
+        assert capsys.readouterr().err == "Warning: scan event not recorded: " + expected + "\n"
+    assert main(["scan", "src/app.py"]) == 0
+    assert capsys.readouterr().err == ""
+    assert len(attempts) == 3
+
+
 @pytest.mark.parametrize("entry", ["file", "workspace_value"])
 @pytest.mark.parametrize("wrapped", [False, True], ids=["message_policy", "queue_wrapped"])
 @pytest.mark.parametrize("source", ["pin", "target"])
