@@ -21,21 +21,105 @@ Neither changes `quiet`, which stays about mail.
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
+from threading import Lock
 
 sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from hierarchy_mailbox_index import MailboxIndex  # noqa: E402
 from hierarchy_mailbox import (MAX_DELIVERY_IDS, Mailbox, endpoint_parts, parse_time, read_json, require,  # noqa: E402
                                safe_path)
 from hierarchy_meter import ROOT_LIMIT_SECONDS, measure  # noqa: E402
 from hierarchy_wake import wake  # noqa: E402
 from hierarchy_workspace import Store  # noqa: E402
 from hierarchy_lifecycle import Lifecycle  # noqa: E402
+
+
+class _MailboxReader:
+    """Keep binding and locking inside public read callables."""
+    def __init__(self, mailbox):
+        read_lock = Lock()
+        with read_lock:
+            index = MailboxIndex(mailbox, mode="shadow")
+
+        def read_messages():
+            with read_lock:
+                return index.messages()
+
+        def read_message(message_id):
+            with read_lock:
+                return index.get(message_id)
+
+        def read_mode():
+            with read_lock:
+                return index.mode
+
+        def read_divergence():
+            with read_lock:
+                return index.last_divergence
+
+        def read_reconciliation():
+            with read_lock:
+                return index.last_reconciliation
+
+        def read_changes():
+            with read_lock:
+                return index.content_changed
+
+        self.read_messages = read_messages
+        self.read_message = read_message
+        self.read_mode = read_mode
+        self.read_divergence = read_divergence
+        self.read_reconciliation = read_reconciliation
+        self.read_changes = read_changes
+
+    def messages(self):
+        return self.read_messages()
+
+    def get(self, message_id):
+        return self.read_message(message_id)
+
+    @property
+    def mode(self):
+        return self.read_mode()
+
+    @property
+    def last_divergence(self):
+        return self.read_divergence()
+
+    @property
+    def last_reconciliation(self):
+        return self.read_reconciliation()
+
+    @property
+    def content_changed(self):
+        return self.read_changes()
+
+
+_MAILBOX_READERS = OrderedDict()
+_MAILBOX_READERS_LOCK = Lock()
+
+
+def mailbox_reader(mailbox):
+    """Reuse locked shadow state only for this exact Mailbox authority."""
+    # The retained index owns mailbox, keeping its identity live until eviction.
+    key = (mailbox.root, os.getpid(), id(mailbox))
+    with _MAILBOX_READERS_LOCK:
+        reader = _MAILBOX_READERS.get(key)
+        if reader is None:
+            if len(_MAILBOX_READERS) >= 16:
+                _MAILBOX_READERS.popitem(last=False)
+            reader = _MailboxReader(mailbox)
+            _MAILBOX_READERS[key] = reader
+        _MAILBOX_READERS.move_to_end(key)
+        return reader
 
 
 MAX_ROUNDS = 100
@@ -51,7 +135,6 @@ OWED = {"orchestrator": {("router", "info"), ("front-door", "info"), ("lane", "r
         "lane": {("orchestrator", "dispatch")},
         "decider": {("orchestrator", "info")}}
 FINISHED = {"exited", "timed_out"}
-
 
 def profile_for(mailbox_root, endpoint, binding):
     stem = endpoint.replace("/", "%2F") + "-g%d.wake.json" % binding["generation"]
@@ -168,8 +251,10 @@ def wake_endpoint(initiative, name, summary, dry_run, durable=False):
 
 def endpoint_summary(mailbox, initiative, name, records, durable):
     summary = mailbox.endpoint_delivery(initiative["delivery_dir"], name, records)[1]
-    if not durable:
-        return summary
+    return durable_summary(mailbox, initiative, name, records, summary) if durable else summary
+
+
+def durable_summary(mailbox, initiative, name, records, summary):
     # The summary has no generation on woken_unread and caps its IDs, so durable mode reads the receipts it came
     # from and the full unread set, each unread ID with when it was published.
     directory = initiative["delivery_dir"]
@@ -181,9 +266,14 @@ def endpoint_summary(mailbox, initiative, name, records, durable):
             "wakes": mailbox.delivery_receipts(directory, "wakes", name, records)}
 
 
-def summaries(initiative, durable=False):
+def summary_records(initiative):
     mailbox = Mailbox(initiative["mailbox_root"])
-    records = mailbox.messages()
+    records = mailbox_reader(mailbox).messages()
+    return mailbox, records
+
+
+def summaries(initiative, durable=False):
+    mailbox, records = summary_records(initiative)
     found = {name: endpoint_summary(mailbox, initiative, name, records, durable)
              for name in sorted(mailbox.manifest["endpoints"])}
     return found, mailbox.open_job_requests(records), records
@@ -191,7 +281,7 @@ def summaries(initiative, durable=False):
 
 def fresh_summary(initiative, name):
     mailbox = Mailbox(initiative["mailbox_root"])
-    return endpoint_summary(mailbox, initiative, name, mailbox.messages(), True)
+    return endpoint_summary(mailbox, initiative, name, mailbox_reader(mailbox).messages(), True)
 
 
 def is_root(endpoint):
@@ -280,7 +370,7 @@ def sweep_round(initiatives, rows, tried, broken, dry_run, durable=False, skip=f
     woken = 0
     for initiative in initiatives:
         try:
-            found = summaries(initiative, durable)[0]
+            found, _, _ = summaries(initiative, durable)
         except ERRORS as exc:
             if initiative["id"] not in broken:
                 broken.add(initiative["id"])

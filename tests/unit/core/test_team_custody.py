@@ -12,13 +12,12 @@ import pytest
 from aegis_core import storage, team_custody as custody, team_git, team_gitops, team_qualify
 from aegis_core.errors import LockTimeoutError
 from tests.conftest import symlink_or_skip
-from tests.unit.core.test_team_custody_checks import copied_rig, rig_template, state
-from tests.unit.core.test_team_git import IDENTITY, git, make_store
+from tests.helpers_team_git import IDENTITY, copied_rig, git, make_store, rig_template, state
 
 
 @pytest.fixture
 def rig(tmp_path, rig_template):
-    # The imported module-scoped template is copied, never rebuilt per test.
+    # The shared module-scoped template is copied, never rebuilt per test.
     with copied_rig(rig_template, tmp_path) as candidate:
         candidate.journal = team_gitops.GitOpsJournal(candidate.repo / ".git")
         yield candidate
@@ -33,6 +32,38 @@ def run(rig, **changes):
 def results(rig):
     return [row for row in rig.journal.read().rows
             if row["op"] == "commit" and row["kind"] == "result"]
+
+
+class _ObservationClock:
+    """Monotonic seam: sleep advances this clock and does not call time.sleep."""
+
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, delay):
+        if delay < 0:
+            raise AssertionError("observation sleep must be non-negative")
+        self.sleeps.append(delay)
+        self.now += delay
+
+
+def _expected_observation_sleeps():
+    """Steps the named window must sleep: double from the initial poll, clip to the cap and deadline."""
+    now, delay = 0.0, custody.OBSERVATION_POLL_SECONDS
+    deadline = custody.OBSERVATION_SECONDS
+    steps = []
+    while now < deadline:
+        step = min(delay, custody.OBSERVATION_POLL_MAX_SECONDS, deadline - now)
+        if step <= 0:
+            break
+        steps.append(step)
+        now += step
+        delay = min(delay * 2.0, custody.OBSERVATION_POLL_MAX_SECONDS)
+    return steps
 
 
 def test_commit_exact_tested_bytes_and_retry_once(rig):
@@ -72,6 +103,10 @@ def test_governance_requires_explicit_true_and_failure_is_retryable(rig, decisio
         run(rig, governance_check=governance)
     assert caught.value.code == "governance_refused"
     assert str(caught.value) == custody.REFUSALS["governance_refused"]
+    assert caught.value.next_action == {
+        "actor": "custodian",
+        "command": "obtain governance approval for the tested bytes before retrying commit custody",
+    }
     assert state(rig) == before
     assert run(rig).status == "committed"
 
@@ -104,6 +139,10 @@ def test_unsupported_platform_refuses_without_git_or_journal(monkeypatch):
                        governance_check=None)
     assert caught.value.code == "unsupported_platform"
     assert str(caught.value) == custody.REFUSALS["unsupported_platform"]
+    assert caught.value.next_action == {
+        "actor": "custodian",
+        "command": "use a host with descriptor-relative commit custody support",
+    }
 
 
 def test_governance_race_cannot_overwrite_concurrent_ref(rig):
@@ -115,11 +154,19 @@ def test_governance_race_cannot_overwrite_concurrent_ref(rig):
     with pytest.raises(custody.CommitRefused) as caught:
         run(rig, governance_check=governance)
     assert caught.value.code == "cas_mismatch"
+    assert caught.value.next_action == {
+        "actor": "custodian",
+        "command": "inspect the lane ref and terminal commit result; never repeat this request's effect",
+    }
     assert git(rig.repo, "rev-parse", "HEAD").decode().strip() == winner
     assert len(results(rig)) == 1 and results(rig)[0]["status"] == "unknown"
     with pytest.raises(custody.CommitRefused) as caught:
         run(rig)
     assert caught.value.code == "request_closed"
+    assert caught.value.next_action == {
+        "actor": "custodian",
+        "command": "inspect the terminal commit result; never retry this request's effect",
+    }
     assert len(results(rig)) == 1
 
 
@@ -141,25 +188,35 @@ def test_crash_after_cas_recovers_without_second_effect(rig, monkeypatch):
     assert calls == [1] and len(results(rig)) == 1
 
 
+@pytest.mark.parametrize("code", (
+    "ref_update_unknown", "git_cleanup_failed", "git_timeout", "git_output_limit"))
 @pytest.mark.parametrize("applied", [False, True])
-def test_unknown_transport_is_observed_never_repeated(rig, monkeypatch, applied):
+def test_unknown_transport_is_observed_never_repeated(rig, monkeypatch, applied, code):
     real = team_git.cas_fast_forward
     calls = []
     def unknown(*args, **kwargs):
         calls.append(1)
         if applied:
             real(*args, **kwargs)
-        raise team_git.GitRefusal("ref_update_unknown")
+        raise team_git.GitRefusal(code)
     monkeypatch.setattr(custody, "team_git", SimpleNamespace(**{**vars(team_git), "cas_fast_forward": unknown}))
     with pytest.raises(custody.CommitRefused) as caught:
         run(rig)
     assert caught.value.code == "ref_update_unknown"
+    assert str(caught.value) == custody.REFUSALS["ref_update_unknown"]
+    assert code not in str(caught.value)
+    assert caught.value.next_action == {
+        "actor": "custodian",
+        "command": "inspect the commit intent and reconcile by observation; never repeat its effect",
+    }
     if applied:
         assert run(rig).status == "committed_recovered"
     else:
         with pytest.raises(custody.CommitRefused) as caught:
             run(rig)
         assert caught.value.code == "request_closed"
+        assert str(caught.value) == custody.REFUSALS["request_closed"]
+        assert code not in str(caught.value)
     assert calls == [1] and len(results(rig)) == 1
 
 
@@ -180,6 +237,10 @@ def test_two_callers_same_request_get_one_effect_and_one_result(rig, monkeypatch
             with pytest.raises(custody.CommitRefused) as caught:
                 pool.submit(run, rig).result(timeout=10)
             assert caught.value.code == "ref_update_unknown"
+            assert caught.value.next_action == {
+                "actor": "custodian",
+                "command": "inspect the commit intent and reconcile by observation; never repeat its effect",
+            }
             assert not results(rig)
         finally:
             release.set()
@@ -194,6 +255,10 @@ def test_retry_changed_binding_refuses_without_effect(rig):
     with pytest.raises(custody.CommitRefused) as caught:
         run(rig, message="different")
     assert caught.value.code == "request_conflict"
+    assert caught.value.next_action == {
+        "actor": "custodian",
+        "command": "inspect the recorded request binding and restore its original inputs; never repeat its effect",
+    }
     assert state(rig) == before and len(results(rig)) == 1
 
 
@@ -214,17 +279,46 @@ def test_other_commit_intent_shape_refuses_without_raw_exception(rig, new):
 
 @pytest.mark.parametrize("field,value", [("request_id", None), ("request_id", "x" * 129),
                                        ("request_id", "bad\nvalue"), ("actor", "bad\nvalue")])
-def test_invalid_request_fields_refuse_before_store_access(field, value):
+def test_invalid_request_fields_refuse_before_store_access(monkeypatch, field, value):
     options = dict(lane=None, owner=None, expected_head=None, tested_tree=None, required_legs=(),
                    message=None, identity=None, journal=None, request_id="commit-1", actor="custodian",
                    read_branch=None, read_head=None, read_paths=None, read_policy=None, governance_check=None)
     options[field] = value
-    # This input-only gate is portable; the capability seam is provided below.
-    if not team_qualify.descriptor_supported():
-        pytest.skip("commit request gate follows platform support")
-    with pytest.raises(custody.CommitRefused) as caught:
-        custody.commit(None, **options)
-    assert caught.value.code == "invalid_request"
+    monkeypatch.setattr(custody, "team_git", SimpleNamespace(descriptor_support=lambda: True))
+    monkeypatch.setattr(custody, "team_qualify", SimpleNamespace(descriptor_supported=lambda: True))
+    for _ in range(2):
+        with pytest.raises(custody.CommitRefused) as caught:
+            custody.commit(None, **options)
+        assert caught.value.code == "invalid_request"
+        assert str(caught.value) == custody.REFUSALS["invalid_request"]
+        assert caught.value.next_action == {
+            "actor": "custodian",
+            "command": "provide valid commit request and actor identifiers",
+        }
+
+
+@pytest.mark.parametrize("kind", ["wrong-type", "unreadable"])
+def test_journal_gate_advice_precedes_store_access_and_is_repeatable(monkeypatch, kind):
+    class UnreadableJournal:
+        def read(self):
+            raise team_gitops.GitOpsError("journal_io")
+    monkeypatch.setattr(custody, "team_git", SimpleNamespace(descriptor_support=lambda: True))
+    monkeypatch.setattr(custody, "team_qualify", SimpleNamespace(descriptor_supported=lambda: True))
+    monkeypatch.setattr(custody, "team_gitops", SimpleNamespace(
+        GitOpsJournal=UnreadableJournal, GitOpsError=team_gitops.GitOpsError))
+    journal = object() if kind == "wrong-type" else UnreadableJournal()
+    for _ in range(2):
+        with pytest.raises(custody.CommitRefused) as caught:
+            custody.commit(None, lane=None, owner=None, expected_head=None, tested_tree=None,
+                           required_legs=(), message=None, identity=None, journal=journal,
+                           request_id="commit-1", actor="custodian", read_branch=None, read_head=None,
+                           read_paths=None, read_policy=None, governance_check=None)
+        assert caught.value.code == "journal_failed"
+        assert str(caught.value) == custody.REFUSALS["journal_failed"]
+        assert caught.value.next_action == {
+            "actor": "custodian",
+            "command": "restore journal access and reconcile by observation; never repeat an existing intent's effect",
+        }
 
 
 def test_failed_result_append_is_recovered_without_repeating_cas(rig, monkeypatch):
@@ -244,6 +338,10 @@ def test_failed_result_append_is_recovered_without_repeating_cas(rig, monkeypatc
     with pytest.raises(custody.CommitRefused) as caught:
         run(rig, journal=facade)
     assert caught.value.code == "journal_failed"
+    assert caught.value.next_action == {
+        "actor": "custodian",
+        "command": "restore journal access and reconcile by observation; never repeat an existing intent's effect",
+    }
     assert not results(rig)
     monkeypatch.setattr(custody, "team_gitops", team_gitops)
     assert run(rig).status == "committed_recovered"
@@ -279,6 +377,11 @@ def test_returned_cas_with_live_holder_stays_unknown_until_holder_closes(rig, mo
         held.append(os.dup(kwargs["effect_fds"][0]))
         return result
     monkeypatch.setattr(custody, "team_git", SimpleNamespace(**{**vars(team_git), "cas_fast_forward": retained}))
+    ticks = iter((0.0, custody.OBSERVATION_SECONDS + 1.0))
+    def expired(delay):
+        pytest.fail("a live holder made the observation window sleep")
+    monkeypatch.setattr(custody, "time", SimpleNamespace(
+        monotonic=lambda: next(ticks), sleep=expired))
     try:
         for _ in range(2):
             with pytest.raises(custody.CommitRefused) as caught:
@@ -288,6 +391,7 @@ def test_returned_cas_with_live_holder_stays_unknown_until_holder_closes(rig, mo
     finally:
         for descriptor in held:
             os.close(descriptor)
+    monkeypatch.setattr(custody, "time", time)
     assert run(rig).status == "committed_recovered"
     assert calls == [1] and len(results(rig)) == 1
 
@@ -670,6 +774,53 @@ def test_admission_exit_failure_releases_receipt_without_running_effect(rig, mon
     assert len(results(rig)) == 1 and results(rig)[0]["status"] == "not_applied"
 
 
+def test_observation_window_backs_off_on_the_clock_seam(monkeypatch):
+    """Waiting observation is immediate, then doubles until the named window, without process sleep."""
+    clock = _ObservationClock()
+    monkeypatch.setattr(custody, "time", clock)
+
+    class Journal:
+        def __init__(self, ready_at=None):
+            self.ready_at = ready_at
+            self.reads = 0
+
+        def reconcile(self, lane, observe, request_id=None):
+            self.reads += 1
+            if self.ready_at is not None and clock.now >= self.ready_at:
+                return [{"kind": "result", "request_id": request_id, "status": "done"}]
+            return []
+
+        def read(self):
+            return SimpleNamespace(rows=[])
+
+    expired = Journal()
+    assert custody._terminal(None, expired, "work", "commit-1", "refs/heads/lane/work", wait=True) is None
+    expected = _expected_observation_sleeps()
+    assert clock.sleeps == expected
+    assert expected[0] == custody.OBSERVATION_POLL_SECONDS
+    assert expected[1] == custody.OBSERVATION_POLL_SECONDS * 2
+    assert expected[2] == custody.OBSERVATION_POLL_SECONDS * 4
+    assert expected[3] == custody.OBSERVATION_POLL_SECONDS * 8
+    assert expected[4] == custody.OBSERVATION_POLL_MAX_SECONDS
+    assert expected[-1] < custody.OBSERVATION_POLL_MAX_SECONDS
+    assert clock.now == custody.OBSERVATION_SECONDS
+    assert expired.reads == len(expected) + 1
+    assert len(expected) < custody.OBSERVATION_SECONDS / custody.OBSERVATION_POLL_SECONDS
+    slept = len(clock.sleeps)
+    found = custody._terminal(None, Journal(ready_at=0.0), "work", "commit-1",
+                              "refs/heads/lane/work", wait=True)
+    assert found["status"] == "done" and len(clock.sleeps) == slept
+    assert custody._terminal(None, Journal(), "work", "commit-1",
+                             "refs/heads/lane/work", wait=False) is None
+    assert len(clock.sleeps) == slept
+    clock.now, clock.sleeps = 0.0, []
+    raced = Journal(ready_at=custody.OBSERVATION_POLL_SECONDS)
+    found = custody._terminal(None, raced, "work", "commit-2", "refs/heads/lane/work", wait=True)
+    assert found == {"kind": "result", "request_id": "commit-2", "status": "done"}
+    assert clock.sleeps == [custody.OBSERVATION_POLL_SECONDS]
+    assert raced.reads == 2
+
+
 def test_distinct_attachment_timeout_preserves_unknown_until_holder_exits(rig, monkeypatch):
     real = team_git.cas_fast_forward
     held, calls = [], []
@@ -685,7 +836,7 @@ def test_distinct_attachment_timeout_preserves_unknown_until_holder_exits(rig, m
         with pytest.raises(custody.CommitRefused) as caught:
             run(rig)
         assert caught.value.code == "ref_update_unknown"
-        ticks = iter((0.0, 6.0))
+        ticks = iter((0.0, custody.OBSERVATION_SECONDS + 1.0))
         monkeypatch.setattr(custody, "time", SimpleNamespace(
             monotonic=lambda: next(ticks), sleep=forbidden_sleep))
         with pytest.raises(custody.CommitRefused) as caught:
@@ -793,8 +944,27 @@ def test_matching_bound_inputs_preserve_genuine_store_failure(rig):
         run(other)
     assert caught.value.code == "store_closed"
     assert str(caught.value) == custody.REFUSALS["store_closed"]
+    assert caught.value.next_action == {
+        "actor": "custodian",
+        "command": "open an active private Git store and reconcile any existing intent by observation; never repeat its effect",
+    }
     assert state(rig) == before and len(results(rig)) == 1
     assert run(rig).status == "committed_recovered"
+
+
+def test_invalid_commit_identity_advice_allows_corrected_retry(rig):
+    before = state(rig)
+    for _ in range(2):
+        with pytest.raises(custody.CommitRefused) as caught:
+            run(rig, identity=team_git.CommitIdentity("bad\nvalue", IDENTITY.email, IDENTITY.date))
+        assert caught.value.code == "invalid_identity"
+        assert str(caught.value) == custody.REFUSALS["invalid_identity"]
+        assert caught.value.next_action == {
+            "actor": "custodian",
+            "command": "provide a valid commit identity and reconcile any existing intent by observation; never repeat its effect",
+        }
+        assert state(rig) == before and not results(rig)
+    assert run(rig).status == "committed"
 
 
 @pytest.mark.parametrize("branch_state", ["unchanged", "switched", "detached", "reader-failed"])
@@ -872,3 +1042,31 @@ def test_distinct_input_fingerprints_still_share_identical_commit_binding(rig):
     assert sorted(item.status for item in outcomes) == ["committed", "committed_recovered"]
     rows = [row for row in rig.journal.read().rows if row["op"] == "commit"]
     assert [row["kind"] for row in rows] == ["intent", "result"]
+
+
+def test_unknown_outcome_codes_are_one_shared_object():
+    """Custody and lane Git classify indeterminate outcomes with one frozenset."""
+    assert "UNKNOWN_OUTCOME_CODES" in team_git.__all__
+    shared = getattr(team_git, "UNKNOWN_OUTCOME_CODES", None)
+    assert shared is custody._UNKNOWN
+    assert isinstance(shared, frozenset)
+    assert shared == frozenset((
+        "ref_update_unknown", "git_cleanup_failed", "git_timeout", "git_output_limit"))
+    for determinate in ("git_failed", "ref_update_failed", "cas_mismatch", "git_missing"):
+        assert determinate not in shared
+
+
+def test_shared_unknown_codes_are_one_object_under_concurrent_reads():
+    assert hasattr(team_git, "UNKNOWN_OUTCOME_CODES")
+    shared = team_git.UNKNOWN_OUTCOME_CODES
+    barrier = Barrier(4)
+
+    def read():
+        barrier.wait(5)
+        return custody._UNKNOWN, team_git.UNKNOWN_OUTCOME_CODES
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(read) for _ in range(4)]
+        seen = [future.result(timeout=5) for future in futures]
+    assert seen == [(shared, shared)] * 4
+    assert all(item is custody._UNKNOWN for pair in seen for item in pair)

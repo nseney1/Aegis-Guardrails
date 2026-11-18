@@ -122,6 +122,8 @@ AUDIT_WRITERS = {
     ("aegis_core/sync.py", "_commit"): "existing TemporaryDirectory; source lines 450",
     ("aegis_core/sync.py", "_restore"): "existing , rmdir; source lines 423, 426, 432",
     ("aegis_core/sync.py", "_write_examples"): "existing mkdir; source lines 265",
+    ("aegis_core/team_board.py", "Board.move_position"): "TA-1d: replace the validated endpoint/channel cursor by descriptor within the held positions directory; remove only this attempt's unpublished pending file on replacement failure.",
+    ("aegis_core/team_board.py", "Board.tombstone"): "TA-1d: descriptor-relative unlink of the selected tombstoned content file under board exclusion and a held content directory; missing content is an idempotent retry, other deletion failure rolls back this attempt's event.",
     ("aegis_core/team_gitops.py", "GitOpsJournal._transaction"): "GM-4: open the private no-follow journal under its descriptor-relative writer lock and enforce file mode 0600",
     ("aegis_core/team_gitops.py", "_acquire_effect"): "GM-4: create and chmod a private single-link per-request kernel flock below the anchored journal directory",
     ("aegis_core/gitops_checkpoint.py", "reset_retired"): "GM-4e: truncate and fsync a retired request checkpoint through a verified same-inode no-follow descriptor, only for a newly admitted intent",
@@ -514,6 +516,7 @@ CALLBACK_EXCEPTIONS = {
 # (file, scope, operation) -> (exact call sites, reason). No scope-wide bypass:
 # another call in an already reviewed function still requires explicit review.
 REVIEWED_DESCRIPTOR_OPERATIONS = {
+    ("aegis_core/team_board.py", "Board.move_position", "os.replace"): (1, "TA-1d: one atomic replacement with both names relative to the held positions descriptor; no pathname traversal or symlink following."),
     ("aegis_core/team_git.py", "_read_path", "os.open"): (2, "GM-5 O_RDONLY no-follow parent and regular-leaf opens from the held trusted root; every descriptor closed"),
     ("aegis_core/team_git.py", "_snapshot_attribute_candidates", "os.open"): (1, "GM-5-ATTR-CONTEXT r2 (coordinator-applied): one O_RDONLY|O_DIRECTORY|O_NOFOLLOW directory open relative to the held trusted root or the active chain parent while capturing attribute candidates; read-only, at most the active chain held, every descriptor closed in finally"),
     ("aegis_core/team_git.py", "snapshot_tree", "os.open"): (1, "GM-5 O_RDONLY no-follow trusted root descriptor for private snapshots; closed in finally"),

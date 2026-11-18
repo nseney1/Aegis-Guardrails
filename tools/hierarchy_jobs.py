@@ -59,7 +59,7 @@ from __future__ import annotations
 
 import argparse
 import errno
-from collections import namedtuple
+from collections import OrderedDict, namedtuple
 from contextlib import ExitStack, contextmanager
 from functools import lru_cache
 import hashlib
@@ -72,6 +72,7 @@ import signal
 import stat
 import subprocess
 import sys
+from threading import Lock
 import tempfile
 import threading
 import time
@@ -83,6 +84,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hierarchy_git import object_read_argv, object_read_env  # noqa: E402
 import hierarchy_hosts  # noqa: E402
+from hierarchy_mailbox_index import MailboxIndex  # noqa: E402
 from hierarchy_mailbox import (GIT_ID, GIT_STATUS_TIMEOUT_SECONDS, MAX_BYTES, SHA256, SLUG, Mailbox, encoded, fields, integer, matching,  # noqa: E402
                                parse_time, publish_file, read_bytes, read_json, require, safe_path, strict_json, strings, text, timestamp,
                                status_entries, writer_lock)
@@ -90,6 +92,86 @@ from hierarchy_wake import stop_group  # noqa: E402
 from hierarchy_workspace import (KINDS as LEDGER_KINDS, MAX_HEAVY, MAX_HEAVY_TESTS, Store, absolute, capacity_view,  # noqa: E402
                                  check_initiative_paths,
                                  check_paths, grant_next, initiative_view, verify_evidence)
+
+
+class _MailboxReader:
+    """Keep binding and locking inside public read callables."""
+    def __init__(self, mailbox):
+        read_lock = Lock()
+        with read_lock:
+            index = MailboxIndex(mailbox, mode="shadow")
+
+        def read_messages():
+            with read_lock:
+                return index.messages()
+
+        def read_message(message_id):
+            with read_lock:
+                return index.get(message_id)
+
+        def read_mode():
+            with read_lock:
+                return index.mode
+
+        def read_divergence():
+            with read_lock:
+                return index.last_divergence
+
+        def read_reconciliation():
+            with read_lock:
+                return index.last_reconciliation
+
+        def read_changes():
+            with read_lock:
+                return index.content_changed
+
+        self.read_messages = read_messages
+        self.read_message = read_message
+        self.read_mode = read_mode
+        self.read_divergence = read_divergence
+        self.read_reconciliation = read_reconciliation
+        self.read_changes = read_changes
+
+    def messages(self):
+        return self.read_messages()
+
+    def get(self, message_id):
+        return self.read_message(message_id)
+
+    @property
+    def mode(self):
+        return self.read_mode()
+
+    @property
+    def last_divergence(self):
+        return self.read_divergence()
+
+    @property
+    def last_reconciliation(self):
+        return self.read_reconciliation()
+
+    @property
+    def content_changed(self):
+        return self.read_changes()
+
+
+_MAILBOX_READERS = OrderedDict()
+_MAILBOX_READERS_LOCK = Lock()
+
+
+def mailbox_reader(mailbox):
+    """Reuse locked shadow state only for this exact Mailbox authority."""
+    # The retained index owns mailbox, keeping its identity live until eviction.
+    key = (mailbox.root, os.getpid(), id(mailbox))
+    with _MAILBOX_READERS_LOCK:
+        reader = _MAILBOX_READERS.get(key)
+        if reader is None:
+            if len(_MAILBOX_READERS) >= 16:
+                _MAILBOX_READERS.popitem(last=False)
+            reader = _MailboxReader(mailbox)
+            _MAILBOX_READERS[key] = reader
+        _MAILBOX_READERS.move_to_end(key)
+        return reader
 
 
 RECIPES_SCHEMA = "aegis.hierarchy-job-recipes/v1"
@@ -1157,7 +1239,7 @@ def check_dependency(store, initiative, message, packet, recipes):
         require(packet["recipes_sha256"] == recipes["recipes_sha256"], "dependent recipe file changed")
         mailbox = Mailbox(initiative["mailbox_root"])
         mailbox.fence(message)
-        records = mailbox.messages()
+        records = mailbox_reader(mailbox).messages()
         previous = records.get(packet["after"]["message_id"])
         if previous is None:
             raise DependencyPending("predecessor request is not present")
@@ -2357,7 +2439,7 @@ def publish_receipt(job, state, body, wait, *, exit_code=None, evidence=None, re
     def attempt():
         with writer_lock(root):
             mailbox = Mailbox(root)
-            existing = mailbox.messages().get(identifier)
+            existing = mailbox_reader(mailbox).get(identifier)
             if existing is not None:
                 prior = existing["message"]
                 require(receipt_matches(job, prior, receipt, body),
@@ -3344,7 +3426,7 @@ def admit_requests(store, ledger, initiatives, recipes, wait, rows, admission=No
     for initiative in initiatives:
         try:
             mailbox = Mailbox(initiative["mailbox_root"])
-            records = mailbox.messages()
+            records = mailbox_reader(mailbox).messages()
             requests = mailbox.open_job_requests(records)
         except ERRORS as exc:
             if admission is not None:
@@ -4369,7 +4451,7 @@ def resolve(store_path, identifier, reason, wait, process_stopped=False):
     store = Store(store_path)
     initiative = store.load().initiative(initiative_id)
     mailbox = Mailbox(initiative["mailbox_root"])
-    record = mailbox.messages().get(message_id)
+    record = mailbox_reader(mailbox).get(message_id)
     folder = safe_path(store.path / "jobs" / initiative_id / message_id)
     require(record is not None and folder.exists(), "no running job here: " + identifier)
     job_type = PlannedJob if has_host_plan(initiative) else Job
@@ -4672,7 +4754,7 @@ def recovery_status(store_path, chosen=(), recipes_path=None):
         if "mailbox_root" in initiative:
             try:
                 mailbox = Mailbox(initiative["mailbox_root"])
-                records = mailbox.messages()
+                records = mailbox_reader(mailbox).messages()
             except ERRORS as exc:
                 blockers.append({"initiative": initiative["id"], "owner": owner, "reason": "mailbox_unavailable",
                                  "error": str(exc)[:512], "next_action": "Restore visibility; retain all reservations."})

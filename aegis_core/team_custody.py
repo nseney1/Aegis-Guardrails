@@ -27,6 +27,7 @@ import hashlib
 import time
 
 from aegis_core import gitops_rows, team_git, team_gitops, team_qualify
+from aegis_core.team_git import UNKNOWN_OUTCOME_CODES as _UNKNOWN
 from aegis_core import team_custody_checks as checks
 from aegis_core.errors import AegisError
 from aegis_core.team_custody_checks import CustodyRefused
@@ -49,8 +50,25 @@ REFUSALS = {
     "invalid_parent": "commit parent is invalid",
     "store_closed": "commit requires an active private store",
 }
-_UNKNOWN = frozenset(("ref_update_unknown", "git_cleanup_failed", "git_timeout", "git_output_limit"))
 _ERRORS = (AegisError, OSError, ValueError, TypeError, RecursionError)
+# A code proves the refused gate, not the absence of a concurrent or saved intent.
+# Construction failures therefore retain observation-only advice for any intent.
+_ACTIONS = {
+    "unsupported_platform": "use a host with descriptor-relative commit custody support",
+    "governance_refused": "obtain governance approval for the tested bytes before retrying commit custody",
+    "invalid_request": "provide valid commit request and actor identifiers",
+    "request_conflict": "inspect the recorded request binding and restore its original inputs; never repeat its effect",
+    "request_closed": "inspect the terminal commit result; never retry this request's effect",
+    "journal_failed": "restore journal access and reconcile by observation; never repeat an existing intent's effect",
+    "git_failed": "inspect the Git failure and commit journal; reconcile any existing intent by observation; never repeat its effect",
+    "cas_mismatch": "inspect the lane ref and terminal commit result; never repeat this request's effect",
+    "ref_update_unknown": "inspect the commit intent and reconcile by observation; never repeat its effect",
+    "invalid_identity": "provide a valid commit identity and reconcile any existing intent by observation; never repeat its effect",
+    "invalid_message": "provide a bounded commit message without forbidden trailers and reconcile any existing intent by observation; never repeat its effect",
+    "invalid_oid": "provide valid commit object identities and reconcile any existing intent by observation; never repeat its effect",
+    "invalid_parent": "provide a valid commit parent and reconcile any existing intent by observation; never repeat its effect",
+    "store_closed": "open an active private Git store and reconcile any existing intent by observation; never repeat its effect",
+}
 
 
 class CommitRefused(ValueError):
@@ -59,7 +77,7 @@ class CommitRefused(ValueError):
     def __init__(self, code):
         super().__init__(REFUSALS[code])
         self.code = code
-        self.next_action = {"actor": "custodian", "command": "inspect the commit intent and reconcile by observation; never repeat its effect"}
+        self.next_action = {"actor": "custodian", "command": _ACTIONS[code]}
 
 
 @dataclass(frozen=True)
@@ -67,6 +85,13 @@ class CommitResult:
     status: str
     commit: str
     tree: str
+
+
+# Immediate first read. Later polls double until the cap and never run past the window.
+# Tests replace this module's time binding so the window does not call the process sleeper.
+OBSERVATION_SECONDS = 5.0
+OBSERVATION_POLL_SECONDS = 0.01
+OBSERVATION_POLL_MAX_SECONDS = 0.1
 
 
 def _terminal(store, journal, lane, request_id, ref, *, wait=False):
@@ -79,14 +104,23 @@ def _terminal(store, journal, lane, request_id, ref, *, wait=False):
         else:
             state = None if oid is None else {"ref": ref, "head": oid}
         return team_gitops.Observation(state)
-    deadline = time.monotonic() + 5.0 if wait else None
+    deadline = time.monotonic() + OBSERVATION_SECONDS if wait else None
+    delay = OBSERVATION_POLL_SECONDS
     while True:
         rows = journal.reconcile(lane, observe, request_id=request_id)
         terminal = next((row for row in (rows or journal.read().rows)
                          if row["kind"] in ("result", "tombstone") and row["request_id"] == request_id), None)
-        if terminal is not None or deadline is None or time.monotonic() >= deadline:
+        if terminal is not None or deadline is None:
             return terminal
-        time.sleep(0.01)
+        now = time.monotonic()
+        if now >= deadline:
+            return terminal
+        # Bound the wait before sleeping: poll cap and the time still inside the window.
+        step = min(delay, OBSERVATION_POLL_MAX_SECONDS, deadline - now)
+        if step <= 0:
+            return terminal
+        time.sleep(step)
+        delay = min(delay * 2.0, OBSERVATION_POLL_MAX_SECONDS)
 
 
 def _recover(store, journal, binding, tree, *, wait=False):

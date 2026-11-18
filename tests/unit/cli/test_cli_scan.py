@@ -439,7 +439,8 @@ def test_dispatcher_workspace_refusals_project_paths(tmp_path, monkeypatch, caps
             assert "guidance_projection_invalid_field" in captured.err
             assert "which is not a directory" in captured.err
         elif case == "long":
-            assert captured.err.rstrip().endswith("...")
+            assert captured.err.rstrip().endswith(", which is not a directory")
+            assert "... [display-only]" in captured.err
         else:
             assert "REDACTED" in captured.err
 
@@ -839,6 +840,37 @@ def test_hold_clips_each_bounded_component_once(monkeypatch, capsys):
     assert all(len(value) == 1024 and value.endswith("...") for value in payload["details"].values())
 
 
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("identity", ["p" * 5000, "Bearer\t" + "S" * 30 + "\n" + "p" * 5000,
+                                      "ghp_" + "S" * 30 + "/" + "p" * 5000],
+                         ids=["long", "controls", "secret"])
+@pytest.mark.parametrize("reason", ["pin_conflicts_with_target", "pin_conflicts_with_cwd"])
+def test_hold_keeps_recovery_after_long_identities(monkeypatch, capsys, json_mode, identity, reason):
+    from aegis_core.workspace.binding import WorkspaceBinding, WorkspaceHold
+
+    binding = WorkspaceBinding("hold", reason=reason,
+                               details=(("pin", identity), ("target", identity),
+                                        ("cwd", identity), ("cwd_root", identity)))
+
+    def refuse(args):
+        raise WorkspaceHold(binding)
+
+    monkeypatch.setattr("aegis_cli.cli._attach_workspace", refuse)
+    for _ in range(2):
+        assert main(["scan", "app.py"] + (["--json"] if json_mode else [])) == 2
+        captured = capsys.readouterr()
+        if json_mode:
+            payload = json.loads(captured.out)
+            assert captured.err == "" and payload["reason"] == reason
+            message = payload["message"]
+        else:
+            assert captured.out == ""
+            message = captured.err.removeprefix(f"Hold ({reason}): ").rstrip("\n")
+        assert "unset the pin" in message and len(message) <= 1024
+        assert "S" * 30 not in captured.out + captured.err
+        assert "\n" not in message and "\t" not in message
+
+
 @pytest.mark.parametrize("number", [errno.EACCES, errno.ENAMETOOLONG, errno.ELOOP, errno.ENOTDIR])
 def test_post_binding_scan_marker_error_retains_workspace_exit(ws, monkeypatch, capsys, number):
     from aegis_cli import scan
@@ -875,6 +907,49 @@ def test_hold_preserves_literal_windows_path_components(monkeypatch, capsys, jso
     assert pin in message and target in message
     if json_mode:
         assert json.loads(captured.out)["details"] == {"pin": pin, "target": target}
+
+
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("details", [None, (("candidates", "not a list"),), (("pin", 3),)])
+def test_hold_malformed_details_return_fixed_refusal(monkeypatch, capsys, details, json_mode):
+    from aegis_core.workspace.binding import WorkspaceBinding, WorkspaceHold
+
+    binding = WorkspaceBinding("hold", reason="pin_conflicts_with_target", details=details)
+
+    def refuse(args):
+        raise WorkspaceHold(binding)
+
+    monkeypatch.setattr("aegis_cli.cli._attach_workspace", refuse)
+    for _ in range(2):
+        assert main(["scan", "app.py"] + (["--json"] if json_mode else [])) == 2
+        captured = capsys.readouterr()
+        if json_mode:
+            payload = json.loads(captured.out)
+            assert payload["message"] == "guidance_projection_invalid_field"
+            assert payload["details"] == {}
+            assert list(payload) == ["status", "root", "source", "confidence", "reason", "message", "details",
+                                     "aegis_version", "checked_at", "scope"]
+        else:
+            assert captured.out == ""
+            assert captured.err == "Hold (pin_conflicts_with_target): guidance_projection_invalid_field\n"
+
+
+def test_text_hold_bounds_large_component_collection(monkeypatch, capsys):
+    from aegis_core.workspace.binding import WorkspaceBinding, WorkspaceHold
+
+    paths = ["x" * 5000 for _ in range(240)]
+    binding = WorkspaceBinding("hold", reason="pin_conflicts_with_target",
+                               details=(("pin", "pin"), ("target", "target"), ("candidates", paths)))
+
+    def refuse(args):
+        raise WorkspaceHold(binding)
+
+    monkeypatch.setattr("aegis_cli.cli._attach_workspace", refuse)
+    assert main(["scan", "app.py"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ("Hold (pin_conflicts_with_target): --workspace target resolves to target, "
+                            "but AEGIS_WORKSPACE pins pin; unset the pin or drop --workspace\n")
 
 
 @posix_names
@@ -956,7 +1031,11 @@ def test_workspace_refusals_bound_original_components_before_composition(ws, mon
     assert "guidance_projection_limit" not in captured.err
     assert "CANONICAL-PRIVATE-FILENAME" not in captured.err and "resolution denied" not in captured.err
     assert len(captured.err.rstrip("\n")) == len("Error: ") + 1024
-    assert captured.err.endswith("...\n")
+    suffix = {"plain": ", which has no .aegis/ (run aegis init there)",
+              "missing": ", which is not a directory", "root": ", which is the filesystem root",
+              "pin_resolution": " cannot be resolved", "target_resolution": " cannot be resolved"}[kind]
+    assert captured.err.endswith(suffix + "\n")
+    assert "... [display-only]" in captured.err
 
 
 @pytest.mark.parametrize("kind,target", [("nested", "~/../.."), ("root", "~")])

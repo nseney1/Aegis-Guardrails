@@ -8,17 +8,23 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import secrets
 import shlex
 
-from aegis_core import events, gitsafe, storage, team, team_paths
+try:
+    import pwd
+except ImportError:  # Windows has no passwd database.
+    pwd = None
+
+from aegis_core import events, gitsafe, storage, storage_confined, team, team_paths, team_writer_binding
 from aegis_core.primitives import sanitize_display
 from aegis_core.redaction import redact_command_secrets
 
 __all__ = ["ClaimRefusal", "validate_pending", "transition", "fingerprint",
-           "recovery_refusal", "observe_leases"]
+           "recovery_refusal", "observe_leases", "check_writer"]
 
 MAX_EVENT_BYTES = 16 * 1024 * 1024
 # Covers both event paths at the maximum workspace spelling, escaped labels,
@@ -31,6 +37,70 @@ _LEASE_OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}\Z")
 _NONBLANK_ROW = re.compile(rb"[^ \t\v\f]")
 _NON_LF = re.compile(rb"[^\n]")
 _CAUSE_REASONS = ("queue_size_limit", "unclaim_event_unavailable", "unclaim_lease_refused", "queue_io_unavailable")
+_WRITER_REASONS = frozenset(("writer_live", "writer_not_stopped", "identity_unavailable",
+    "binding_scope_mismatch", "bindings_unavailable", "writer_absent", "writer_replaced"))
+
+
+def _passwd_home():
+    """Use the owner account, never a model-supplied HOME override."""
+    return pwd.getpwuid(os.getuid()).pw_dir
+
+
+def _writer_verdict(root, lane, oid):
+    """Judge only the covering claim, even after its ref was released in recovery."""
+    if oid is None:
+        return "no_bound_liveness_source"
+    try:
+        lease = team.parse_lease(gitsafe.read_object(root, oid, team.MAX_LEASE_BYTES), lane, oid)
+        home = _passwd_home()
+        verdict = team_writer_binding.judge(home, team.LeaseSet((lease,), ()), {})
+        reason = verdict.get("reason") if type(verdict) is dict else None
+        if type(reason) is not str:
+            return "bindings_unavailable"
+        if reason == "bindings_unavailable":
+            # judge cannot distinguish a missing config directory from unsafe
+            # storage. Only descriptor-proven absence keeps the legacy path.
+            try:
+                with storage_confined.confined_file(home, (".config", "aegis", team_writer_binding.NAME)) as handle:
+                    handle.parent_stat()
+            except storage_confined.ConfinedFileError as error:
+                if error.reason == "missing":
+                    return "no_bound_liveness_source"
+        if reason in _WRITER_REASONS or reason in ("writer_bound", "no_bound_liveness_source"):
+            return reason
+    except (AttributeError, ImportError, KeyError, OSError, ValueError, RuntimeError, gitsafe.GitError):
+        pass
+    return "bindings_unavailable"
+
+
+def _check_writer(root, lane, oid, writer_stopped):
+    """A verified live writer defeats acknowledgement; uncertainty requires it."""
+    reason = _writer_verdict(root, lane, oid)
+    if reason == "writer_bound":
+        raise ClaimRefusal("writer_live")
+    if not writer_stopped:
+        raise ClaimRefusal("writer_not_stopped" if reason == "no_bound_liveness_source" else reason)
+
+
+def check_writer(root, state, identifier, lane, writer_stopped):
+    """Check the current claim before input/state refusals, under the workspace lock.
+
+    A stale requested revision must not hide the item's actual live writer.
+    Recovery retains the original immutable lease after its ref is released.
+    """
+    intent = state.get("unclaim")
+    oid = None
+    if intent is not None and intent["id"] == identifier:
+        lane, oid = intent["lane"], intent["lease_oid"]
+    else:
+        row = state["items"].get(identifier)
+        if row is not None and row["state"] == "claimed":
+            lane = row["lane"]
+            lease = team.read_leases(root).get(lane)
+            if lease is not None and team_paths.overlap(
+                    lease.path_set, team_paths.claim_paths(row["item"]["paths"])):
+                oid = lease.oid
+    _check_writer(root, lane, oid, writer_stopped)
 
 
 class ClaimRefusal(ValueError):
@@ -337,7 +407,7 @@ def _record(root, intent, shown):
         raise recovery_refusal(intent, root=root, cause="queue_io_unavailable")
 
 
-def _initial_intent(root, state, identifier, expect, lane, reason, caller, now, decode):
+def _initial_intent(root, state, identifier, expect, lane, reason, caller, now, decode, writer_stopped):
     if identifier in state["completed"]:
         raise ClaimRefusal("item_done")
     row = state["items"].get(identifier)
@@ -352,6 +422,7 @@ def _initial_intent(root, state, identifier, expect, lane, reason, caller, now, 
     if row["lane"] != lane:
         raise ClaimRefusal("lane_mismatch")
     oid = _preflight(root, row, lane, caller, now)
+    _check_writer(root, lane, oid, writer_stopped)
     _event_state(root, None, decode)
     return {"id": identifier, "revision": expect, "lane": lane, "caller": caller,
             "reason": reason, "lease_oid": oid, "to_revision": secrets.token_hex(32),
@@ -360,6 +431,7 @@ def _initial_intent(root, state, identifier, expect, lane, reason, caller, now, 
 
 def _check_leases(root, state, intent, now, *, released=False):
     oid = intent["lease_oid"]
+    _check_writer(root, intent["lane"], oid, intent["writer_stopped"])
     selected = _preflight(root, state["items"][intent["id"]], intent["lane"], intent["caller"], now)
     if oid is None:
         if selected is not None:
@@ -440,6 +512,7 @@ def transition(root, state, *, identifier, expect, lane, reason, caller, writer_
             if ((intent["id"], intent["revision"], intent["lane"], intent["caller"]) != (
                     identifier, expect, lane, caller) or (reason and reason != intent["reason"])):
                 raise recovery_refusal(intent, root=root)
+            _check_writer(root, lane, intent["lease_oid"], writer_stopped)
             receipt = _event_state(root, intent["to_revision"], decode)
             if receipt is not None:
                 if (receipt.get("writer_stopped") is not True or
@@ -448,7 +521,7 @@ def transition(root, state, *, identifier, expect, lane, reason, caller, writer_
                 progress["receipt"] = True
             intent["writer_stopped"] = writer_stopped
         else:
-            intent = _initial_intent(root, state, identifier, expect, lane, reason, caller, now, decode)
+            intent = _initial_intent(root, state, identifier, expect, lane, reason, caller, now, decode, writer_stopped)
             state["unclaim"] = intent
             receipt = None
             # Failure here is ambiguous: publication may have landed.
@@ -472,6 +545,10 @@ def transition(root, state, *, identifier, expect, lane, reason, caller, writer_
         return {"row": row, "released_lease_ids": intent.get("released_lease_ids", []), "state": final}
     except (ClaimRefusal, team.LeaseRefused) as error:
         if intent is None or (not recovering and "unclaim" not in state):
+            raise
+        if isinstance(error, ClaimRefusal) and error.reason in _WRITER_REASONS:
+            if not recovering and not progress["release_attempted"] and not progress["receipt"]:
+                restore()
             raise
         if recovering or progress["release_attempted"] or progress["receipt"] or (
                 isinstance(error, ClaimRefusal) and error.reason == "unclaim_recovery_required"):

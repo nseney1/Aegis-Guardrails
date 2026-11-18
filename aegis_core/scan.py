@@ -44,12 +44,17 @@ from aegis_core.guidance_projection import (
     project_error_name, project_field, project_identifier,
 )
 from aegis_core.match import normalize_path, workspace_files
-from aegis_core.packs import MAX_RULE_BYTES
-from aegis_core import gitsafe, rule_integrity
+from aegis_core import gitsafe, match as rule_match, rule_integrity
 from aegis_core.rule_integrity import MANDATORY_SLOT_CAP
 from aegis_core.rule_inventory import RuleInventory, RuleInventoryError
 from aegis_core.rules import Rule, RuleCache, RuleSet, workspace_root
 from aegis_core.skills.slots import SlotRegistry
+from aegis_core.scan_simulation import (
+    COLD_LIST_LIMIT as _COLD_LIST_LIMIT, COLD_SAMPLE_LIMIT as _COLD_SAMPLE_LIMIT,
+    ColdRule as _ColdRule, SimulationBudget as _SimulationBudget,
+    SimulationCache as _SimulationCache, SimulationHooks,
+    simulate_rule_selection as simulate_selection,
+)
 from aegis_core.taxonomy import (
     JIT_DEFAULT_MAX_TOKENS,
     JIT_DEFAULT_RULE_COUNT_BUDGET,
@@ -86,6 +91,8 @@ RULE_CACHE = RuleCache()
 NO_CHANGES_TEXT = "No changed files detected. Governance guidance will be provided when files are modified."
 NO_MATCH_TEXT = "No governance rules match your current changes."
 _STATUS_FAIL = "FAIL"
+_COLD_OUTPUT_LIMIT = 1024 * 1024
+_COLD_MATCH_BUDGET = 16384
 
 
 def resolve_token_budget(workspace: Any, max_tokens: Optional[int] = None) -> int:
@@ -176,7 +183,8 @@ class _ScanResult(GuidanceResult):
 
 
 def _match(rule: Rule, matched: Tuple[str, ...], fitness: Fitness) -> _Match:
-    exact = any(normalize_path(p) == normalize_path(f) for p in rule.target_paths for f in matched)
+    exact = (any(rule.applies_to(f, exact=True) for f in matched) if isinstance(rule, _ColdRule)
+             else any(normalize_path(p) == normalize_path(f) for p in rule.target_paths for f in matched))
     return _Match(rule, matched, exact, fitness)
 
 
@@ -519,95 +527,28 @@ def _scan(workspace: Any, changed_files: Optional[List[str]], budget: Optional[i
                    _integrity_extras(view), registry)
 
 
-class _SimulationLimit(ValueError):
-    pass
-
-
-def _check_simulation_inventory(inventory: RuleInventory) -> None:
-    """Refuse a source before parsing; never reread lint's captured paths."""
-    if len(inventory.entries) > 2048:
-        raise _SimulationLimit
-    total = 0
-    for entry in inventory.entries:
-        size = max(entry.size, len(entry.content))
-        total += size
-        if size > MAX_RULE_BYTES or total > 8 * 1024 * 1024:
-            raise _SimulationLimit
-
-
-class _SimulationCache(RuleCache):
-    """Reuse lint's checked working bytes; bound any differing reviewed source."""
-
-    def __init__(self, inventory: RuleInventory, ruleset: RuleSet) -> None:
-        super().__init__()
-        self.captured = inventory, ruleset
-        self.different_candidates: frozenset[str] = frozenset()
-
-    def compare_candidates(self, effective: RuleSet) -> None:
-        """Compare the full effective snapshot before any file matching occurs."""
-        source = {rule.id: rule for rule in effective.rules}
-        self.different_candidates = frozenset(
-            rule.id for rule in self.captured[1].rules
-            if rule.id not in source or source[rule.id].path != rule.path or source[rule.id].raw != rule.raw)
-
-    def snapshot(self, workspace: Any) -> Tuple[RuleInventory, RuleSet]:
-        return self.captured
-
-    def base_rules(self, root: str, inventory: RuleInventory, load: Callable[[], RuleSet]) -> RuleSet:
-        _check_simulation_inventory(inventory)
-        return super().base_rules(root, inventory, load)
-
-
 def simulate_rule_selection(workspace: Any, inventory: RuleInventory, ruleset: RuleSet) -> Dict[str, str]:
-    """Lint current changed files through real scan selection, without writes.
+    """Simulate lint selection with the current scan seams and request-local limits."""
+    hooks = SimulationHooks(_scan, _ScanResult, select_guidance, for_rules, _cold_rules,
+                            _COLD_OUTPUT_LIMIT, _COLD_MATCH_BUDGET)
+    return simulate_selection(workspace, inventory, ruleset, hooks)
 
-    Use lint's bounded working snapshot to capture scan's effective rules,
-    fitness, defaults and envelope once, then replay each built-in host registry.
-    Matching candidate bytes must
-    match the captured effective rule; a concurrent edit or reviewed-base
-    substitution never supplies a verdict about different candidate bytes.
-    Every refusal is fixed text, independent of rule input or exception text.
-    """
-    candidates = ruleset.rules
-    def refusal(reason: str) -> Dict[str, str]:
-        return dict.fromkeys((rule.id for rule in candidates), "not evaluated: " + reason)
 
-    if not callable(globals().get("select_guidance")):
-        return refusal("scan API unavailable")
-    from aegis_core.skills.slots import PLATFORM_SLOT_PROFILES, scan_registry
-
-    try:
-        _check_simulation_inventory(inventory)
-        cache = _SimulationCache(inventory, ruleset)
-        with gitsafe.memo():
-            captured = _scan(workspace, None, None, None, None, cache)
-        if not isinstance(captured, _ScanResult):
-            return refusal("scan projection failed")
-        if not captured._projection.changed_files:
-            return refusal("no changed files")
-        selected = []
-        for profile in PLATFORM_SLOT_PROFILES:
-            result = captured.with_registry(scan_registry(profile, workspace))
-            if result.get("status") == _STATUS_FAIL or not isinstance(result, GuidanceResult):
-                return refusal("scan projection failed")
-            selected.append(set(result.exposure_rule_ids()))
-    except _SimulationLimit:
-        return refusal("scan inputs over limit")
-    except GuidanceProjectionError:
-        return refusal("scan projection failed")
-    except gitsafe.GitError:
-        return refusal("scan inputs unavailable")
-    except (OSError, ValueError, RuntimeError):
-        return refusal("scan inputs unavailable")
-    messages = {}
-    for rule in candidates:
-        if rule.id in cache.different_candidates:
-            messages[rule.id] = "not evaluated: candidate differs from scan snapshot"
-        elif all(rule.id in identities for identities in selected):
-            messages[rule.id] = "scan simulation: selected in all profiles"
-        else:
-            messages[rule.id] = "scan simulation: not selected in one or more profiles"
-    return messages
+def _cold_rules(rules: Tuple[Rule, ...], remaining: List[int]) -> Tuple[Rule, ...]:
+    outcomes, targets = {}, {r.id: (r.skips_tests, tuple(dict.fromkeys(r.target_paths))) for r in rules}
+    def evaluate(pattern: str, path: str, exact: bool) -> bool:
+        if remaining[0] <= 0:
+            raise _SimulationBudget
+        remaining[0] -= 1  # Every step costs one, including cached negatives and ranking.
+        key = pattern, path, exact
+        if key not in outcomes:
+            outcomes[key] = normalize_path(pattern) == normalize_path(path) if exact else rule_match.matches(pattern, path)
+        return outcomes[key]
+    def applies(rule: Rule, path: str, exact: bool) -> bool:
+        if not exact and targets[rule.id][0] and rule_match.is_test_path(path):
+            return False
+        return any(evaluate(pattern, path, exact) for pattern in targets[rule.id][1])
+    return tuple(_ColdRule(**vars(replace(rule, meta={**rule.meta, "target_paths": targets[rule.id][1]})), _match_path=applies) for rule in rules)
 
 
 # Titles are branch-local text that reaches an agent: only the first few are listed.

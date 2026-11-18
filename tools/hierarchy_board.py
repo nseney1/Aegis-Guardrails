@@ -289,8 +289,11 @@ class Board:
                     raise ValueError("board is busy; inspect an abandoned lock before retrying") from exc
                 time.sleep(0.01)
         try:
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(encoded({"pid": os.getpid(), "created_at": timestamp()}))
+            try:
+                with os.fdopen(fd, "wb", closefd=False) as stream:
+                    stream.write(encoded({"pid": os.getpid(), "created_at": timestamp()}))
+            finally:
+                os.close(fd)
             with self.writer_guard():
                 yield
         finally:

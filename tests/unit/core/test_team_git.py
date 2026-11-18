@@ -1,7 +1,6 @@
 """Public lane plumbing contracts; all Git history is created by these tests."""
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from contextlib import contextmanager
 import ast
 import errno
 import json
@@ -16,16 +15,43 @@ from types import SimpleNamespace
 
 import pytest
 
-from aegis_core import gitsafe, gitsafe_run, gitops_fds, team_git as tg, team_git_snapshot
+from aegis_core import gitsafe, gitsafe_policy, gitsafe_run, gitops_fds, team_git as tg, team_git_snapshot
 from aegis_core import team, team_lease_custody
-from tests.unit.core.test_gitsafe import LANE_MODULES, strict_program, strict_program_guard
+from tests.helpers_team_git import (IDENTITY, LANE_MODULES, commit, filter_git_env, git,
+                                    make_store, new_store, shared_bytes, strict_program,
+                                    strict_program_guard)
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
-IDENTITY = tg.CommitIdentity("Lane", "lane@example.com", "1700000000 +0000")
 
 
 ENV_REDIRECTS = ("GIT_TRACE", "GIT_TRACE2", "GIT_TRACE2_EVENT", "GIT_TRACE2_PERF",
                  "GIT_CONFIG", "GIT_DIR", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY")
+
+
+@pytest.mark.parametrize("module", [
+    "tests.helpers_team_git",
+    "tests.unit.core.test_team_git",
+    "tests.unit.core.test_team_custody",
+    "tests.unit.core.test_team_custody_checks",
+])
+def test_team_helpers_import_without_collecting_other_test_modules(module):
+    script = """
+import importlib
+import sys
+sys.path.insert(0, sys.argv[1])
+importlib.import_module(sys.argv[2])
+coupled = {
+    "tests.unit.core.test_gitsafe",
+    "tests.unit.core.test_team_git",
+    "tests.unit.core.test_team_custody",
+    "tests.unit.core.test_team_custody_checks",
+} - {sys.argv[2]}
+assert not coupled.intersection(sys.modules), sorted(coupled.intersection(sys.modules))
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(Path(__file__).resolve().parents[3]), module],
+        capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize("phase", ["custody", "verify"])
@@ -1118,22 +1144,6 @@ def patch_lane_objects(monkeypatch, replacement):
 
 
 
-def git(repo, *args, data=None, env=None):
-    if env is None:
-        env = filter_git_env(Path(os.environ.get("HOME", os.path.expanduser("~"))))
-    return subprocess.run(
-        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
-         "-c", "commit.gpgsign=false", *args], cwd=str(repo), input=data,
-        capture_output=True, check=True, env=env).stdout
-
-
-def commit(repo, name, content, *, env=None):
-    (repo / name).write_bytes(content)
-    git(repo, "add", "--", name, env=env)
-    git(repo, "commit", "-qm", "change " + name, env=env)
-    return git(repo, "rev-parse", "HEAD", env=env).decode().strip()
-
-
 @pytest.fixture
 def repo(tmp_path):
     path = tmp_path / "repo"
@@ -1143,34 +1153,8 @@ def repo(tmp_path):
     return path
 
 
-def make_store(repo):
-    if not tg.descriptor_support():
-        pytest.skip("snapshot requires descriptor-relative no-follow opens and bound executables")
-    strict_program_guard()
-    return new_store(repo)
-
-
-@contextmanager
-def new_store(repo, *, require_program=True):
-    # Custody service provisions scratch; tests own its creation and cleanup.
-    # Refusal-only entries opt out so their checks still run before lookup.
-    if require_program:
-        strict_program_guard()
-    with tempfile.TemporaryDirectory(dir=repo.parent) as directory:
-        scratch = Path(directory)
-        (scratch / "objects").mkdir(mode=0o700)
-        with tg.GitStore(repo, scratch) as store:
-            yield store
-
-
 def refs(repo):
     return git(repo, "show-ref")
-
-
-def shared_bytes(repo):
-    root = repo / ".git"
-    return {str(p.relative_to(root)): p.read_bytes()
-            for p in root.rglob("*") if p.is_file()}
 
 
 def test_snapshot_preserves_first_dirty_path_and_all_shared_bytes(repo):
@@ -2105,10 +2089,6 @@ def filter_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
     return home
-
-
-def filter_git_env(home):
-    return {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "XDG_CONFIG_HOME": str(home / ".config"), "LC_ALL": "C"}
 
 
 def filter_git(home):
@@ -3432,7 +3412,7 @@ def test_snapshot_parity_ignores_host_system_and_custom_xdg_filters(repo, tmp_pa
     code = """from pathlib import Path
 import sys
 from aegis_core import team_git as tg
-from tests.unit.core.test_team_git import new_store
+from tests.helpers_team_git import new_store
 with new_store(Path(sys.argv[1])) as store:
     assert store.env['GIT_CONFIG_NOSYSTEM'] == '1'
     assert 'XDG_CONFIG_HOME' not in store.env
@@ -3464,7 +3444,7 @@ def test_snapshot_clean_lfs_tree_matches_git_without_git_lfs_on_path(repo, tmp_p
     code = """from pathlib import Path
 import shutil, sys
 from aegis_core import team_git as tg
-from tests.unit.core.test_team_git import new_store
+from tests.helpers_team_git import new_store
 assert shutil.which('git-lfs') is None
 with new_store(Path(sys.argv[1])) as store:
     tree = tg.snapshot_tree(store)
@@ -4963,7 +4943,8 @@ def test_snapshot_source_version_refuses_before_capture_and_retries(repo, monkey
             with pytest.raises(tg.GitRefusal) as caught:
                 tg.snapshot_tree(store)
             assert (caught.value.code, str(caught.value), caught.value.next_action) == (
-                "conversion_unavailable", "Lane Git operation refused: conversion_unavailable", None)
+                "conversion_unavailable", "Lane Git operation refused: conversion_unavailable",
+                "Install Git 2.40 or newer, then retry the snapshot.")
         assert queries == []
         restore()
         assert store.read_blob(tg.snapshot_tree(store), "x") == b"base\n"
@@ -5009,12 +4990,18 @@ def test_snapshot_source_query_closed_grammar_and_environment(repo, monkeypatch,
         assert env["GIT_INDEX_FILE"] == str(store.scratch / "index")
 
 
-@pytest.mark.parametrize("phase", ["version", "check-attr"])
+def test_snapshot_attribute_policy_requires_source_tree():
+    names = ("filter", "text", "eol", "ident", "working-tree-encoding", "crlf")
+    assert not gitsafe_policy.read_shape(("check-attr", "-z", "--stdin", *names))
+    assert gitsafe_policy.read_shape(("check-attr", "-z", "--stdin", "--source", "a" * 40, *names))
+
+
+@pytest.mark.parametrize("phase", ["version", "check-attr", "filters"])
 @pytest.mark.parametrize("failure", ["os-error", "git_failed", "git_timeout", "git_output_limit", "git_cleanup_failed"])
 def test_snapshot_attribute_observation_failure_refuses_and_retries(repo, monkeypatch, phase, failure):
     context = make_store(repo)
     def failed(real, args, *rest, **kwargs):
-        if args[:1] == [phase]:
+        if args[:1] == [phase] or phase == "filters" and args[-1:] == [r"^filter\."]:
             if failure == "os-error":
                 raise OSError(errno.EACCES, "private token=never-echo")
             raise gitsafe.GitError("private token=never-echo", code=failure)
@@ -5534,6 +5521,45 @@ def test_snapshot_stat_shortcut_payload_counts_and_retry(repo, monkeypatch, stat
             assert (len(reads) == 0) == (state == "clean")
         assert trees[0] == trees[1]
         assert store.read_blob(trees[0], "x") == (b"dirty payload\n" if state == "dirty" else b"base\n")
+
+
+@pytest.mark.parametrize("confirmation", [False, None], ids=["dirty", "indeterminate"])
+def test_snapshot_stat_skip_disagreement_refuses_and_retries(repo, monkeypatch, confirmation):
+    context = make_store(repo)
+    os.utime(repo / "x", ns=(1000000000000000000, 1000000000000000000))
+    git(repo, "update-index", "--refresh")
+    expected = git(repo, "rev-parse", "HEAD^{tree}").decode().strip()
+    before = shared_bytes(repo)
+    reached, resume, observations = Event(), Event(), []
+    real = team_git_snapshot.index_clean
+    def disagree(*args):
+        observations.append(args[1])
+        reached.set()
+        assert resume.wait(5), "stat-clean confirmation was never released"
+        return confirmation
+    with context as store:
+        monkeypatch.setattr(team_git_snapshot, "index_clean", disagree)
+        for _ in range(2):
+            reached.clear()
+            resume.clear()
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(tg.snapshot_tree, store)
+                try:
+                    assert reached.wait(5), "snapshot never reached stat-clean confirmation"
+                    with pytest.raises(tg.GitRefusal) as busy:
+                        tg.snapshot_tree(store)
+                    assert busy.value.code == "store_busy"
+                finally:
+                    resume.set()
+                with pytest.raises(tg.GitRefusal) as caught:
+                    future.result(timeout=5)
+                assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+                    "worktree_changed", "Lane Git operation refused: worktree_changed", None)
+        assert len(observations) == 2
+        monkeypatch.setattr(team_git_snapshot, "index_clean", real)
+        assert tg.snapshot_tree(store) == expected
+        assert tg.snapshot_tree(store) == expected
+    assert shared_bytes(repo) == before
 
 
 @pytest.mark.parametrize("over_wire", [False, True], ids=["under-wire-budget", "over-wire-budget"])

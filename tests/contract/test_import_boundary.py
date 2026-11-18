@@ -41,6 +41,7 @@ PACKAGES = ("aegis_core", "aegis_cli", "aegis_mcp", "aegis_sdk")
 CORE_LAYERS: Dict[str, int] = {
     "aegis_core._version": 0,
     "aegis_core.diagnostic_messages": 0,
+    "aegis_core.display_attribution": 0,
     "aegis_core.errors": 0,
     "aegis_core.taxonomy": 0,
     # Canonical message records and untrusted views (stdlib only).
@@ -64,6 +65,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.gitsafe": 0,
     "aegis_core.gitsafe_policy": 0,
     "aegis_core.gitsafe_run": 0,
+    "aegis_core.team_board": 1,
     "aegis_core.team_claims": 2,
     "aegis_core.team_custody": 1,
     "aegis_core.team_custody_checks": 1,
@@ -78,6 +80,7 @@ CORE_LAYERS: Dict[str, int] = {
     # GitHub CLI transport over gitsafe and pathlookup, with no trust-policy dependency.
     "aegis_core.ghcli": 0,
     "aegis_core.pathlookup_fence": 0,
+    "aegis_core.pathlookup_gitcache": 0,
     # Path containment, strict JSON and UTC timestamps (stdlib only).
     "aegis_core.primitives": 0,
     "aegis_core.proposals": 2,
@@ -102,6 +105,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.telemetry_engine": 1,
     "aegis_core.fitness": 1,
     "aegis_core.ast": 1,
+    "aegis_core.scan_simulation": 2,
     "aegis_core.skills": 1,
     "aegis_core.command_safety": 1,
     # Team leases and team.json: gitsafe, config, events and the matcher.
@@ -113,7 +117,11 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_isolation_verify": 0,
     "aegis_core.team_lease_custody": 0,
     "aegis_core.team_mailbox": 1,
+    "aegis_core.team_mailbox_delivery": 1,
     "aegis_core.team_mailbox_guidance": 1,
+    "aegis_core.team_mailbox_index": 1,
+    "aegis_core.team_mailbox_index_scan": 0,
+    "aegis_core.team_mailbox_pager": 0,
     "aegis_core.team_mailbox_primitives": 0,
     "aegis_core.team_mailbox_records": 1,
     "aegis_core.team_mailbox_store": 0,

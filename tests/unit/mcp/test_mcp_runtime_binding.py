@@ -775,10 +775,12 @@ def test_oversized_startup_pin_is_refused_before_resolution(home, monkeypatch, c
 
 @pytest.mark.parametrize("root_count", [8, 32, 128, 2048])
 def test_real_conflicting_roots_have_bounded_projection_work(home, tmp_path, monkeypatch, capsys, root_count):
+    from aegis_core.workspace import diagnostics
+
     pin = _governed(tmp_path / "pin", "rule-pin")
     roots = [tmp_path / ("foreign-" + str(i)) for i in range(root_count)]
     resolve = server.resolve_binding
-    project_name, project_text = server.project_error_name, server.project_diagnostic
+    project_name, project_text = diagnostics.project_error_name, diagnostics.project_diagnostic
     visits = []
     searches = []
 
@@ -806,12 +808,13 @@ def test_real_conflicting_roots_have_bounded_projection_work(home, tmp_path, mon
         return project_text(value, **kwargs)
 
     monkeypatch.setattr(server, "resolve_binding", observed_resolve)
-    monkeypatch.setattr(server, "project_error_name", observed_name)
-    monkeypatch.setattr(server, "project_diagnostic", observed_text)
+    monkeypatch.setattr("aegis_core.workspace.diagnostics.project_error_name", observed_name)
+    monkeypatch.setattr("aegis_core.workspace.diagnostics.project_diagnostic", observed_text)
     monkeypatch.setattr(server, "env_workspace", lambda environ=None: str(pin))
     frames = _serve(monkeypatch, capsys, [_init(), _call(1, "aegis_scan", {}, _codex_meta(*roots))])
     is_error, payload = _payload(frames[1])
     assert is_error and payload["reason"] == "pin_conflicts_with_host_root"
+    assert visits
     assert searches == []  # composition never rescans a finished diagnostic
     if root_count > 256:
         assert payload["error"] == "guidance_projection_limit"
@@ -826,19 +829,20 @@ def test_real_conflicting_roots_have_bounded_projection_work(home, tmp_path, mon
 
 def test_binding_component_limit_precedes_detail_projection(home, monkeypatch, capsys):
     from aegis_core.workspace.binding import WorkspaceBinding
+    from aegis_core.workspace import diagnostics
 
     paths = ["x" * (1024 * 1024 + 1)]
     binding = WorkspaceBinding("hold", reason="ambiguous_host_roots", message="host roots conflict",
                                details=(("candidates", paths),))
     projected = []
-    project_name = server.project_error_name
+    project_name = diagnostics.project_error_name
 
     def observed(value):
         projected.append(value)
         return project_name(value)
 
     monkeypatch.setattr(server, "_bind", lambda params, args: binding)
-    monkeypatch.setattr(server, "project_error_name", observed)
+    monkeypatch.setattr("aegis_core.workspace.diagnostics.project_error_name", observed)
     frames = _serve(monkeypatch, capsys, [_init(), _call(1, "aegis_scan", {})])
     is_error, payload = _payload(frames[1])
     assert is_error and payload["reason"] == "ambiguous_host_roots"
@@ -1063,7 +1067,30 @@ def test_large_normalized_startup_pin_is_clipped_without_double_counting(home, t
     is_error, payload = _payload(frames[1])
     assert is_error and payload["binding"]["reason"] == "pin_not_a_workspace"
     assert "guidance_projection_limit" not in captured.err + json.dumps(payload)
-    assert len(payload["error"]) == 1024 and payload["error"].endswith("...")
+    assert len(payload["error"]) == 1024
+    assert payload["error"].endswith(", which has no .aegis/ (run aegis init there)")
+    assert "... [display-only]" in payload["error"]
+
+
+@pytest.mark.parametrize("identity", ["h" * 5000, "Bearer\t" + "S" * 30 + "\n" + "h" * 5000,
+                                      "ghp_" + "S" * 30 + "/" + "h" * 5000],
+                         ids=["long", "controls", "secret"])
+def test_scan_binding_keeps_recovery_after_long_host_roots(home, monkeypatch, capsys, identity):
+    from aegis_core.workspace.binding import WorkspaceBinding
+
+    binding = WorkspaceBinding("hold", reason="pin_conflicts_with_host_root",
+                               details=(("pin", "pinned"), ("host_roots", [identity, "h" * 5000])))
+    monkeypatch.setattr(server, "_bind", lambda params, args: binding)
+    frames = _serve(monkeypatch, capsys, [_init(), _call(1, "aegis_scan", {}), _call(2, "aegis_scan", {})])
+    for req_id in (1, 2):
+        is_error, payload = _payload(frames[req_id])
+        assert is_error and payload["status"] == "hold"
+        assert payload["reason"] == "pin_conflicts_with_host_root"
+        assert payload["error"] == payload["binding"]["message"]
+        assert "fix the pin or open the pinned project" in payload["error"]
+        assert len(payload["error"]) <= 1024 and "... [display-only]" in payload["error"]
+        assert "S" * 30 not in json.dumps(payload)
+        assert "\n" not in payload["error"] and "\t" not in payload["error"]
 
 
 def test_valid_component_collection_is_clipped_independently(home, monkeypatch, capsys):
@@ -1180,6 +1207,39 @@ def test_binding_preserves_literal_windows_path_components(home, monkeypatch, ca
     assert is_error and payload["reason"] == "pin_conflicts_with_host_root"
     assert payload["binding"]["details"] == {"pin": pin, "host_roots": [other]}
     assert pin in payload["error"] and other in payload["error"]
+
+
+@pytest.mark.parametrize("kind,reason,suffix", [
+    ("not_a_directory", "pin_missing", "which is not a directory"),
+    ("filesystem_root", "pin_denied", "which is the filesystem root"),
+])
+def test_scan_binding_variant_ignores_message(home, monkeypatch, capsys, kind, reason, suffix):
+    from aegis_core.workspace.binding import WorkspaceBinding
+
+    binding = WorkspaceBinding("error", reason=reason, kind=kind, message="unrelated OS-error suffix",
+                               details=(("pin", r"C:\new\repo"),))
+    monkeypatch.setattr(server, "_bind", lambda params, args: binding)
+    frames = _serve(monkeypatch, capsys, [_init(), _call(1, "aegis_scan", {}), _call(2, "aegis_scan", {})])
+    for req_id in (1, 2):
+        is_error, payload = _payload(frames[req_id])
+        assert is_error and payload["status"] == "FAIL"
+        assert payload["error"] == "AEGIS_WORKSPACE is set to C:\\new\\repo, " + suffix
+        assert payload["binding"]["reason"] == reason
+        assert list(payload["binding"]) == ["status", "root", "source", "confidence", "reason", "details", "message"]
+
+
+@pytest.mark.parametrize("details", [None, (("candidates", "not a list"),), (("pin", 3),)])
+def test_scan_malformed_binding_details_return_fixed_refusal(home, monkeypatch, capsys, details):
+    from aegis_core.workspace.binding import WorkspaceBinding
+
+    binding = WorkspaceBinding("hold", reason="pin_conflicts_with_host_root", details=details)
+    monkeypatch.setattr(server, "_bind", lambda params, args: binding)
+    frames = _serve(monkeypatch, capsys, [_init(), _call(1, "aegis_scan", {}), _call(2, "aegis_scan", {})])
+    for req_id in (1, 2):
+        is_error, payload = _payload(frames[req_id])
+        assert is_error and payload["status"] == "hold"
+        assert payload["error"] == "guidance_projection_invalid_field"
+        assert payload["binding"]["details"] == {}
 
 
 @pytest.mark.parametrize("closed", [False, True], ids=["open", "closed"])

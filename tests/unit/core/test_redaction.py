@@ -46,7 +46,10 @@ REPO = Path(real_path(__file__)).parents[3]
 # aegis_core/pathlookup.py, tests/unit/core/test_gitsafe.py.
 # Coordinator CEILING RULING TA-1a 2026-11-16T22:57:17Z also reviewed:
 # aegis_core/team_mailbox_primitives.py (TA-1a).
-REDACTION_PARSE_CEILING = 78
+# 78 -> 82 (2026-11-17 coordinator, shared reviewed raise after #617; tip measured 78): aegis_core/workspace/diagnostics.py and
+# tests/unit/core/test_workspace_diagnostics.py (WORKSPACE-RECOVERY-FRAME, public clip_atomic_text), aegis_core/team_board.py (TA-1d),
+# aegis_core/merge_queue.py (GM-9).
+REDACTION_PARSE_CEILING = 82
 
 
 def assignment_values(statement):
@@ -1581,7 +1584,8 @@ def test_named_cleaner_policies_preserve_url_and_whitespace_contracts(policy):
     from aegis_core.redaction import clip_atomic_text, remove_url_credentials
 
     masked = "ftp://u:[REDACTED]@ci.example/p?q=hidden#private"
-    expected = "ftp://ci.example/p" if policy == "proposal" else masked
+    expected = ("ftp://ci.example/p" if policy == "proposal" else
+                "ftp://u:[REDACTED]@ci.example/p#private")
     assert remove_url_credentials(masked, limit=300, policy=policy) == expected
     assert remove_url_credentials(expected, limit=300, policy=policy) == expected
     expected = "plain" if policy == "proposal" else "plain "
@@ -1632,7 +1636,7 @@ def test_guidance_wrappers_use_the_shared_named_policy():
     assert grammar.clip_redacted("plain tail", 6) == "plain "
     assert grammar.redact_labeled("plain", [0] * 5, 32) == ("plain", [0] * 5)
     text = "ftp://u:pass@ci.example/p?q=hidden#private"
-    expected = "ftp://u:[REDACTED]@ci.example/p?q=hidden#private"
+    expected = "ftp://u:[REDACTED]@ci.example/p#private"
     assert grammar.redact_labeled(text, [0] * len(text), 300) == (expected, [0] * len(expected))
     assert grammar.clip_redacted("xxghp_REDACTED tail", 6) == "xx"
     with pytest.raises(ValueError, match="^guidance_projection_limit$"):
@@ -1640,3 +1644,788 @@ def test_guidance_wrappers_use_the_shared_named_policy():
     with pytest.raises(ValueError, match="^guidance_projection_limit$"):
         grammar.redact_labeled("plain", None, 3)
     assert grammar.clip_redacted("retry", 32) == "retry"
+
+
+def test_guidance_query_removal_preserves_list_item_attribution():
+    from aegis_core.guidance_projection import project_field
+
+    source = ["https://h/p?sig=hidden#anchor", "SECOND"]
+    assert project_field(source) == ["https://h/p#anchor", "SECOND"]
+    assert source == ["https://h/p?sig=hidden#anchor", "SECOND"]
+    masked = ["https://user:pass@h/p?sig=hidden#anchor", "token=secret", "SECOND"]
+    assert project_field(masked) == ["https://user:[REDACTED]@h/p#anchor", "token=REDACTED", "SECOND"]
+
+
+def test_guidance_query_removal_keeps_each_retained_character_label():
+    from aegis_core.guidance_grammar import redact_labeled
+
+    text = "https://h/p?sig=hidden#anchor\nSECOND https://h/next?q=other#last"
+    source_labels = list(range(len(text)))
+    shown, labels = redact_labeled(text, source_labels, 300)
+    assert shown == "https://h/p#anchor\nSECOND https://h/next#last"
+    assert len(labels) == len(shown)
+    assert labels == (list(range(text.index("?")))
+                      + list(range(text.index("#"), text.index("?q=")))
+                      + list(range(text.index("#last"), len(text))))
+    assert all(char == text[label] for char, label in zip(shown, labels))
+    assert source_labels == list(range(len(text)))
+
+
+def test_guidance_query_removal_keeps_detail_line_boundary():
+    from aegis_core.guidance_projection import project_detail
+
+    body = "\n".join(["https://h/p?sig=hidden#anchor"] + [f"line{n}" for n in range(1, 9)])
+    assert project_detail(body) == "https://h/p#anchor " + " ".join(f"line{n}" for n in range(1, 8))
+
+
+def test_guidance_query_removal_preserves_masks_and_proposal_policy():
+    from aegis_core.guidance_projection import redact_clean_text
+    from aegis_core.redaction import remove_url_credentials
+
+    text = "  HTTPS://user:pass@h/p?sig=hidden#anchor\nNEXT\t"
+    expected = "  HTTPS://user:[REDACTED]@h/p#anchor\nNEXT\t"
+    assert redact_clean_text(text) == expected
+    assert redact_clean_text(expected) == expected
+    assert remove_url_credentials(text, limit=300, policy="proposal") == "HTTPS://h/p NEXT"
+    unchanged = "  file:///home/...\nhttps://h/p#anchor?fragment\tNEXT"
+    assert redact_clean_text(unchanged) == unchanged
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("https://h/p?sig=hidden#anchor", "https://h/p#anchor"),
+    ("https://h/p#anchor?fragment", "https://h/p#anchor?fragment"),
+    ("https://h/p?sig=(hidden)", "https://h/p)"),
+    ("`https://h/p?sig=hidden`", "`https://h/p`"),
+    ("https://h/p?token=[REDACTED]", "https://h/p"),
+    ("https://h/p?sig=hidden?)", "https://h/p)"),
+    ("https://h/p?#anchor", "https://h/p#anchor"),
+    ("why?  file:///home/...\nNEXT", "why?  file:///home/...\nNEXT"),
+], ids=["anchor", "fragment-question", "closer", "code", "mask", "query-edge", "empty", "non-query"])
+def test_guidance_query_spans_preserve_other_url_components(text, expected):
+    from aegis_core.redaction import remove_guidance_url_queries, remove_url_credentials
+
+    shown, spans = remove_guidance_url_queries(text, limit=300)
+    assert shown == expected
+    assert remove_url_credentials(text, limit=300, policy="guidance") == expected
+    assert isinstance(spans, tuple)
+    assert all(type(start) is int and type(end) is int and 0 <= start < end <= len(text)
+               for start, end in spans)
+    assert all(left[1] <= right[0] for left, right in zip(spans, spans[1:]))
+    assert remove_guidance_url_queries(shown, limit=300) == (expected, ())
+
+
+def test_guidance_query_spans_are_offsets_in_the_original_input():
+    from aegis_core.redaction import remove_guidance_url_queries
+
+    text = "one https://h/p?sig=hidden#anchor\nhttps://h/next?q=other#last END"
+    shown, spans = remove_guidance_url_queries(text, limit=300)
+    assert shown == "one https://h/p#anchor\nhttps://h/next#last END"
+    assert spans == ((text.index("?sig="), text.index("#anchor")),
+                     (text.index("?q="), text.index("#last")))
+
+
+def test_guidance_query_removal_preserves_refusals_and_retry():
+    from aegis_core.guidance_grammar import redact_labeled
+    from aegis_core.guidance_projection import GuidanceProjectionError, redact_clean_text
+    from aegis_core.redaction import RedactionRefusal, remove_guidance_url_queries, remove_url_credentials
+
+    ceiling = 1024 * 1024
+    assert remove_guidance_url_queries("z" * ceiling, limit=ceiling) == ("z" * ceiling, ())
+    for text, limit in (("z" * (ceiling + 1), ceiling + 1), ("https://h/p?sig=hidden", 12)):
+        for cleaner in (remove_guidance_url_queries,
+                        lambda value, *, limit: remove_url_credentials(value, limit=limit, policy="guidance")):
+            with pytest.raises(RedactionRefusal, match="^too_large$") as caught:
+                cleaner(text, limit=limit)
+            assert caught.value.code == "too_large"
+        with pytest.raises(ValueError, match="^guidance_projection_limit$"):
+            redact_labeled(text, None, limit)
+    with pytest.raises(GuidanceProjectionError, match="^guidance_projection_limit$"):
+        redact_clean_text("z" * (ceiling + 1))
+    for value, limit in ((None, 32), (b"text", 32), ([], 32), ("plain", -1), ("plain", True)):
+        with pytest.raises(RedactionRefusal, match="^invalid$") as caught:
+            remove_guidance_url_queries(value, limit=limit)
+        assert caught.value.code == "invalid"
+    assert remove_guidance_url_queries("https://h/p?sig=hidden#anchor", limit=300) == (
+        "https://h/p#anchor", ((11, 22),))
+
+
+@pytest.mark.parametrize("text,expected,secret", [
+    ("https://u:secretPrefix?tail@h", "[REDACTED_URL]", "secretPrefix"),
+    ("https://h/?-----BEGIN " + "PRIVATE KEY-----\nsynthetic_private_body\n-----END " + "PRIVATE KEY-----",
+     "[REDACTED_URL]", "synthetic_private_body"),
+], ids=["userinfo-query", "pem-query"])
+def test_guidance_round4_masks_original_secrets_before_query_deletion(text, expected, secret):
+    from aegis_core.guidance_grammar import redact_labeled
+    from aegis_core.guidance_projection import project_field, redact_clean_text
+
+    assert redact_clean_text(text) == expected
+    assert project_field([text, "SECOND"]) == [expected, "SECOND"]
+    source = text + "\nSECOND"
+    source_labels = [0] * len(text) + [None] + [1] * len("SECOND")
+    shown, labels = redact_labeled(source, source_labels, 300)
+    assert shown == expected + "\nSECOND"
+    assert labels == [0] * len(expected) + [None] + [1] * len("SECOND")
+    assert len(labels) == len(shown) and secret not in shown
+    assert redact_clean_text(shown) == shown
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("[docs](https://h/p#anchor)[job](https://h/p?sig=hunter2)",
+     "[docs](https://h/p#anchor)[job](https://h/p)"),
+    ("[a](https://h/p#anchor),[b](https://ci.example/job?sig=hunter2)",
+     "[a](https://h/p#anchor),[b](https://ci.example/job)"),
+    ("[a](https://h/p?q=x#anchor),[b](https://ci.example/job?sig=hunter2)",
+     "[a](https://h/p#anchor),[b](https://ci.example/job)"),
+    ("[job](https://h/p?sig=hidden),NEXT", "[job](https://h/p),NEXT"),
+    ("https://h/p?q=x#anchor,https://ci.example/job?sig=hidden#last",
+     "https://h/p"),
+    ("[a](https://[2001:db8::1]:443/job(1)?sig=hidden#anchor),[b](https://h/?q=x#last)",
+     "[a](https://[2001:db8::1]:443/job(1)#anchor),[b](https://h/#last)"),
+    ("[job](https://h/p?sig=[REDACTED]),NEXT", "[job](https://h/p),NEXT"),
+    ("[a](CUSTOM+v1://h/p?q=x#anchor)[b](ftp://h/p?q=y#last)",
+     "[a](CUSTOM+v1://h/p#anchor)[b](ftp://h/p#last)"),
+], ids=["adjacent", "comma-later-query", "two-queries", "suffix", "later-fragment",
+        "ipv6-path-parentheses", "opaque-query-mask", "other-schemes"])
+def test_guidance_round4_each_url_has_its_own_query_and_boundaries(text, expected):
+    from aegis_core.guidance_grammar import redact_labeled
+    from aegis_core.guidance_projection import project_field, redact_clean_text
+    from aegis_core.redaction import remove_guidance_url_queries, remove_url_credentials
+
+    assert redact_clean_text(text) == expected
+    assert project_field([text, "SECOND"]) == [expected, "SECOND"]
+    assert remove_url_credentials(text, limit=300, policy="guidance") == expected
+    shown, spans = remove_guidance_url_queries(text, limit=300)
+    assert shown == expected
+    expected_labels = [index for index in range(len(text))
+                       if not any(start <= index < end for start, end in spans)]
+    labeled, labels = redact_labeled(text, list(range(len(text))), 300)
+    assert labeled == expected and labels == expected_labels
+    assert len(labels) == len(labeled)
+    assert all(char == text[label] for char, label in zip(labeled, labels))
+    assert remove_guidance_url_queries(expected, limit=300) == (expected, ())
+    assert redact_clean_text(expected) == expected
+
+
+def test_guidance_round4_original_input_is_bounded_before_masking():
+    from aegis_core.guidance_grammar import redact_labeled
+
+    pem = "https://h/?-----BEGIN " + "PRIVATE KEY-----\nbody\n-----END " + "PRIVATE KEY-----"
+    for text, limit in ((pem, len(pem) - 1),
+                        (pem + "x" * (1024 * 1024), 2 * 1024 * 1024)):
+        with pytest.raises(ValueError, match="^guidance_projection_limit$"):
+            redact_labeled(text, None, limit)
+    for value, limit in ((None, 300), (b"text", 300), ("text", True), ("text", -1)):
+        with pytest.raises(ValueError, match="^guidance_projection_limit$"):
+            redact_labeled(value, None, limit)
+
+
+@pytest.mark.parametrize("username,helper_expected,source_spans,head_expected,head_spans", [
+    ("u#ser", "https://u#ser:pass@ci.example/path?sig=hidden#anchor", (),
+     "https://u#ser:pass@ci.example/path#anchor", ()),
+    ("u?ser", "https://u#anchor", ((9, 45),), "https://u#anchor", ((9, 34),)),
+], ids=["fragment-in-user", "query-in-user"])
+def test_guidance_round4_userinfo_delimiters_are_not_url_delimiters(
+        username, helper_expected, source_spans, head_expected, head_spans):
+    from aegis_core.guidance_projection import project_field, redact_clean_text
+    from aegis_core.redaction import remove_guidance_url_queries
+
+    head = f"https://{username}:pass@ci.example/path"
+    source = head + "?sig=hidden#anchor"
+    expected = "[REDACTED_URL]"
+    assert redact_clean_text(source) == expected
+    assert project_field([source, "SECOND"]) == [expected, "SECOND"]
+    assert remove_guidance_url_queries(source, limit=300) == (
+        helper_expected, source_spans)
+    assert remove_guidance_url_queries(head + "#anchor", limit=300) == (head_expected, head_spans)
+    assert remove_guidance_url_queries(helper_expected, limit=300) == (helper_expected, ())
+    assert redact_clean_text(expected) == expected
+
+
+def test_guidance_round4_new_secret_joined_by_removal_is_masked():
+    from aegis_core.guidance_grammar import redact_labeled
+    from aegis_core.guidance_projection import project_field, redact_clean_text
+
+    secret = "AKIA" + "A" * 16
+    source = "https://h/AKIA?x=" + "A" * 16 + "://tail"
+    expected = "https://h/AKIA"
+    assert redact_clean_text(source) == expected
+    assert project_field([source, "SECOND"]) == [expected, "SECOND"]
+    assert redact_labeled(source, [0] * len(source), 300) == (expected, [0] * len(expected))
+    assert secret not in redact_clean_text(source)
+    assert redact_clean_text(expected) == expected
+
+
+@pytest.mark.parametrize("prefix", ["Bearer ", "Authorization: basic ", "password is ", "token= "],
+                         ids=["bearer", "authorization", "natural-password", "keyed"])
+def test_guidance_round4_mask_families_survive_query_header_removal(prefix):
+    from aegis_core.guidance_projection import project_field, redact_clean_text
+
+    secret = "synthetic_credential_value_1234"
+    source = "https://h/?" + prefix + secret
+    shown = redact_clean_text(source)
+    assert secret not in shown and "REDACTED" in shown
+    assert project_field([source, "SECOND"]) == [shown, "SECOND"]
+    assert redact_clean_text(shown) == shown
+
+
+@pytest.mark.parametrize("source,helper_expected,removed_span,expected", [
+    ("https://user:p#ss@ci.example/path?sig=SECRET", "https://user:p#ss@ci.example/path?sig=SECRET", None,
+     "[REDACTED_URL]"),
+    ("https://user:p?ss@ci.example/path?sig=SECRET", "https://user:p", (14, 44),
+     "[REDACTED_URL]"),
+    ("https://u#ser:[REDACTED]@ci.example/path?sig=SECRET",
+     "https://u#ser:[REDACTED]@ci.example/path?sig=SECRET", None, "[REDACTED_URL]"),
+    ("https://u?ser:[REDACTED]@ci.example/path", "https://u", (9, 40),
+     "[REDACTED_URL]"),
+], ids=["password-fragment", "password-query", "masked-username-fragment", "masked-username-query"])
+def test_guidance_round4_argon_authority_precedes_query_detection(source, helper_expected, removed_span, expected):
+    from aegis_core.guidance_grammar import redact_labeled
+    from aegis_core.guidance_projection import project_field, redact_clean_text
+    from aegis_core.redaction import remove_guidance_url_queries
+
+    assert redact_clean_text(source) == expected
+    assert project_field([source, "SECOND"]) == [expected, "SECOND"]
+    assert redact_labeled(source, [0] * len(source), 300) == (expected, [0] * len(expected))
+    shown, spans = remove_guidance_url_queries(source, limit=300)
+    assert shown == helper_expected
+    assert spans == (() if removed_span is None else (removed_span,))
+    assert remove_guidance_url_queries(shown, limit=300) == (shown, ())
+    assert redact_clean_text(expected) == expected
+
+
+@pytest.mark.parametrize("suffix", ["", "?sig=SECRET#anchor"], ids=["no-query", "query"])
+@pytest.mark.parametrize("userinfo,masked", [
+    (":pass", ":[REDACTED]"),
+    ("u:", "u:[REDACTED]"),
+    (":", ":[REDACTED]"),
+    ("u:p@ss", "u:[REDACTED]"),
+    ("u" * 129 + ":pass", "u" * 129 + ":[REDACTED]"),
+    ("u:" + "p" * 513, "u:[REDACTED]"),
+    ("u", "u"),
+    ("", ""),
+], ids=["empty-user", "empty-password", "empty-both", "last-at", "long-user", "long-password",
+        "username-only", "empty-userinfo"])
+def test_guidance_round5_structural_password_masking(userinfo, masked, suffix):
+    from aegis_core.guidance_grammar import redact_labeled
+    from aegis_core.guidance_projection import project_field, redact_clean_text
+    from aegis_core.redaction import remove_guidance_url_queries
+
+    head = "https://" + userinfo + "@ci.example/path"
+    source = head + suffix
+    fragment = "#anchor" if suffix else ""
+    expected = "https://" + masked + "@ci.example/path" + fragment
+    assert redact_clean_text(source) == expected
+    assert project_field([source, "SECOND"]) == [expected, "SECOND"]
+    joined, labels = redact_labeled(source + "\nSECOND", [0] * len(source) + [None] + [1] * 6, 2000)
+    assert joined == expected + "\nSECOND"
+    assert labels == [0] * len(expected) + [None] + [1] * 6
+    shown, spans = remove_guidance_url_queries(source, limit=2000)
+    assert shown == head + fragment
+    query = source.find("?sig=")
+    assert spans == (() if query < 0 else ((query, source.index("#anchor")),))
+    assert remove_guidance_url_queries(shown, limit=2000) == (shown, ())
+    assert redact_clean_text(expected) == expected
+
+
+@pytest.mark.parametrize("source,expected,query_expected", [
+    ("https://h/a;b?sig=SECRET", "https://h/a;b", "https://h/a;b"),
+    ("https://h/a,b?sig=SECRET", "https://h/a,b", "https://h/a,b"),
+    ("https://h/a'b?sig=SECRET", "https://h/a'b", "https://h/a'b"),
+    ('https://h/a"b?sig=SECRET', 'https://h/a"b', "https://h/a\"b"),
+    ("https://h/a)b?sig=SECRET", "https://h/a)b", "https://h/a)b"),
+    ("https://h/a]b?sig=SECRET", "https://h/a]b", "https://h/a]b"),
+    ("https://h/p?x=a,b&sig=SECRET", "https://h/p", "https://h/p"),
+    ("https://h/p?x=a;b&sig=SECRET", "https://h/p", "https://h/p"),
+    ("https://h/p?x=a'b&sig=SECRET", "https://h/p", "https://h/p"),
+    ('https://h/p?sig="hunter2"', 'https://h/p"', "https://h/p\""),
+    ("https://h/p?a=[]&sig=SECRET", "https://h/p", "https://h/p"),
+    ("https://h/p?a=(x)&sig=SECRET", "https://h/p", "https://h/p"),
+    ("https://h/p?a={x}&sig=SECRET", "https://h/p", "https://h/p"),
+    ("[job](https://h/p?x=(a,b)&sig=SECRET),NEXT", "[job](https://h/p),NEXT", "[job](https://h/p),NEXT"),
+    ("[job](https://h/a(b)c?sig=SECRET#anchor),NEXT", "[job](https://h/a(b)c#anchor),NEXT", "[job](https://h/a(b)c#anchor),NEXT"),
+    ("https://h/a;b?x=a,b&sig=SECRET#anchor", "https://h/a;b#anchor", "https://h/a;b#anchor"),
+    ("https://h/p?x=a,b&sig=SECRET),NEXT", "[REDACTED_URL]", "https://h/p"),
+    ("https://h/p?x=a,b&sig=SECRET https://h/next?sig=SECRET#last", "https://h/p https://h/next#last", "https://h/p https://h/next#last"),
+], ids=["semicolon-path", "comma-path", "apostrophe-path", "quote-path", "parenthesis-path",
+        "bracket-path", "comma-query", "semicolon-query", "apostrophe-query", "quote-query",
+        "bracket-query", "parenthesis-query", "brace-query", "markdown-query-parentheses",
+        "markdown-path-parentheses", "punctuation-and-anchor", "uncertain-prose-end", "whitespace-end"])
+def test_guidance_round5_url_internal_punctuation(source, expected, query_expected):
+    from aegis_core.guidance_grammar import redact_labeled
+    from aegis_core.guidance_projection import project_field, redact_clean_text
+    from aegis_core.redaction import remove_guidance_url_queries, remove_url_credentials
+
+    assert redact_clean_text(source) == expected
+    assert project_field([source, "SECOND"]) == [expected, "SECOND"]
+    assert remove_url_credentials(source, limit=2000, policy="guidance") == query_expected
+    shown, spans = remove_guidance_url_queries(source, limit=2000)
+    assert shown == query_expected
+    retained = [index for index in range(len(source))
+                if not any(start <= index < stop for start, stop in spans)]
+    expected_labels = retained if expected == query_expected else [0] * len(expected)
+    assert redact_labeled(source, list(range(len(source))), 2000) == (expected, expected_labels)
+    assert len(expected_labels) == len(expected)
+    assert len(retained) == len(query_expected)
+    assert all(char == source[index] for char, index in zip(query_expected, retained))
+    assert remove_guidance_url_queries(query_expected, limit=2000) == (query_expected, ())
+    assert redact_clean_text(expected) == expected
+
+
+@pytest.mark.parametrize("source,expected", [
+    ("[job](https://h/a\\)b?sig=SECRET),NEXT", "[job](https://h/a\\)b),NEXT"),
+    ("[job](https://h/a\\(b?sig=SECRET),NEXT", "[job](https://h/a\\(b),NEXT"),
+    ("[job](https://h/p?x=\\)&sig=SECRET),NEXT", "[job](https://h/p),NEXT"),
+    ("[job](https://h/p?x=\\(&sig=SECRET),NEXT", "[job](https://h/p),NEXT"),
+    ("[job](https://h/p?x=\\\\),NEXT", "[job](https://h/p),NEXT"),
+], ids=["escaped-path-close", "escaped-path-open", "escaped-query-close", "escaped-query-open",
+        "escaped-backslash-control"])
+def test_guidance_round5_markdown_escaped_parentheses(source, expected):
+    from aegis_core.guidance_grammar import redact_labeled
+    from aegis_core.guidance_projection import project_field, redact_clean_text
+    from aegis_core.redaction import remove_guidance_url_queries
+
+    assert redact_clean_text(source) == expected
+    assert project_field([source, "SECOND"]) == [expected, "SECOND"]
+    shown, spans = remove_guidance_url_queries(source, limit=300)
+    assert shown == expected
+    retained = [index for index in range(len(source))
+                if not any(start <= index < stop for start, stop in spans)]
+    assert redact_labeled(source, list(range(len(source))), 300) == (expected, retained)
+    assert len(retained) == len(expected)
+    assert redact_clean_text(expected) == expected
+    assert remove_guidance_url_queries(expected, limit=300) == (expected, ())
+
+
+def test_guidance_round5_structural_masker_refusals():
+    from aegis_core.guidance_grammar import redact_labeled
+    from aegis_core.redaction import RedactionRefusal, mask_guidance_url_authorities
+
+    source = "https://u:@h/p"
+    for labels in ([], [0], tuple(range(len(source))), 1):
+        with pytest.raises(RedactionRefusal, match="^invalid$") as caught:
+            mask_guidance_url_authorities(source, labels, limit=300)
+        assert caught.value.code == "invalid"
+    for value, limit in ((None, 300), (b"text", 300), ("text", True), ("text", -1)):
+        with pytest.raises(RedactionRefusal, match="^invalid$") as caught:
+            mask_guidance_url_authorities(value, None, limit=limit)
+        assert caught.value.code == "invalid"
+    for labels in (None, [0] * len(source)):
+        with pytest.raises(RedactionRefusal, match="^too_large$") as caught:
+            mask_guidance_url_authorities(source, labels, limit=len(source))
+        assert caught.value.code == "too_large"
+        with pytest.raises(ValueError, match="^guidance_projection_limit$"):
+            redact_labeled(source, labels, len(source))
+
+
+@pytest.mark.parametrize("source,helper_expected,removed_span", [
+    ("https://u#ser:@ci.example/path?sig=SECRET", "https://u#ser:@ci.example/path?sig=SECRET", None),
+    ("https://u?ser:@ci.example/path?sig=SECRET", "https://u", (9, 41)),
+    ("https://u#ser@ci.example/path?sig=SECRET", "https://u#ser@ci.example/path?sig=SECRET", None),
+    ("https://u:p@ss#rest@ci.example/path?sig=SECRET", "https://u:p@ss#rest@ci.example/path?sig=SECRET", None),
+    ("https://h?sig=SECRET@ci.example/path?sig=SECRET", "https://h", (9, 47)),
+], ids=["empty-password-fragment-user", "empty-password-query-user", "username-only-fragment",
+        "last-at-fragment", "query-as-userinfo"])
+def test_guidance_round5_ambiguous_authority_masks_the_whole_url(source, helper_expected, removed_span):
+    from aegis_core.guidance_grammar import redact_labeled
+    from aegis_core.guidance_projection import project_field, redact_clean_text
+    from aegis_core.redaction import remove_guidance_url_queries
+
+    # The offset-only primitive still performs query removal independently of
+    # masking; the serving projection must refuse ambiguous authority contents.
+    raw, spans = remove_guidance_url_queries(source, limit=300)
+    assert raw == helper_expected and spans == (() if removed_span is None else (removed_span,))
+    assert remove_guidance_url_queries(raw, limit=300) == (raw, ())
+    expected = "[REDACTED_URL]"
+    assert redact_clean_text(source) == expected
+    assert project_field([source, "SECOND"]) == [expected, "SECOND"]
+    assert redact_labeled(source + "\nSECOND", [0] * len(source) + [None] + [1] * 6, 300) == (
+        expected + "\nSECOND", [0] * len(expected) + [None] + [1] * 6)
+    assert redact_clean_text(expected) == expected
+
+
+@pytest.mark.parametrize("source,expected", [
+    ("https://u?ser@ci.example/path?sig=SECRET).", "[REDACTED_URL])."),
+    ("pre [job](https://u?ser@ci.example/path?sig=SECRET),NEXT", "pre [job]([REDACTED_URL]),NEXT"),
+    ("https://u?ser@[2001:db8::1]", "[REDACTED_URL]"),
+    ("https://u?ser@[2001:db8::1]).", "[REDACTED_URL])."),
+    ("https://u?ser@[REDACTED]).", "[REDACTED_URL])."),
+    ("https://u?ser@ci.example/path?sig=SECRET?#anchor", "[REDACTED_URL]"),
+], ids=["terminal-punctuation", "markdown-suffix", "ipv6-host", "ipv6-punctuation", "opaque-host",
+        "query-fragment"])
+def test_guidance_round5_whole_url_mask_keeps_attribution_and_closers(source, expected):
+    from aegis_core.guidance_grammar import redact_labeled
+    from aegis_core.guidance_projection import project_field, redact_clean_text
+    from aegis_core.redaction import mask_guidance_url_authorities
+
+    prefix, suffix = expected.split("[REDACTED_URL]")
+    first, last = len(prefix), len(source) - len(suffix)
+    labels = list(range(first)) + [first] * len("[REDACTED_URL]") + list(range(last, len(source)))
+    assert mask_guidance_url_authorities(source, list(range(len(source))), limit=300) == (expected, labels)
+    assert redact_labeled(source, list(range(len(source))), 300) == (expected, labels)
+    assert len(expected) == len(labels)
+    assert redact_clean_text(source) == expected
+    assert project_field([source, "SECOND"]) == [expected, "SECOND"]
+    assert redact_clean_text(expected) == expected
+    assert mask_guidance_url_authorities(expected, labels, limit=300) == (expected, labels)
+
+
+def test_guidance_round5_ambiguous_marker_respects_limit():
+    from aegis_core.guidance_grammar import redact_labeled
+    from aegis_core.redaction import RedactionRefusal, mask_guidance_url_authorities
+
+    source = "a://?@h"
+    for labels in (None, [0] * len(source)):
+        with pytest.raises(RedactionRefusal, match="^too_large$") as caught:
+            mask_guidance_url_authorities(source, labels, limit=len(source))
+        assert caught.value.code == "too_large"
+        with pytest.raises(ValueError, match="^guidance_projection_limit$"):
+            redact_labeled(source, labels, len(source))
+
+
+def test_guidance_round5_ambiguous_url_never_breaks_original_pem_masking():
+    from aegis_core.guidance_grammar import redact_labeled
+    from aegis_core.guidance_projection import project_field, redact_clean_text
+
+    source = "https://u?ser@h/-----BEGIN " + "PRIVATE KEY-----\nsynthetic_private_body\n-----END " + "PRIVATE KEY-----"
+    expected = "[REDACTED_URL]"
+    assert redact_clean_text(source) == expected
+    assert project_field([source, "SECOND"]) == [expected, "SECOND"]
+    assert redact_labeled(source + "\nSECOND", [0] * len(source) + [None] + [1] * 6, 300) == (
+        expected + "\nSECOND", [0] * len(expected) + [None] + [1] * 6)
+    assert redact_clean_text(expected) == expected
+
+
+@pytest.mark.parametrize("source,expected,secrets", [
+    ("token=redis://:prefix,hunter2@localhost/0?sig=SECRET", "[REDACTED_URL]", ("prefix", "hunter2", "SECRET")),
+    ("password is redis://:prefix,hunter2@localhost/0?sig=SECRET", "[REDACTED_URL]", ("prefix", "hunter2", "SECRET")),
+    ("token=redis://" + "u" * 129 + ":prefix,hunter2@localhost/0?sig=SECRET", "[REDACTED_URL]",
+     ("prefix", "hunter2", "SECRET")),
+    ("[job](https://u:(pass@h/p)?sig=SECRET)", "[job]([REDACTED_URL])", ("pass", "SECRET")),
+    ("[job](https://:(pass@h/p)?sig=SECRET)", "[job]([REDACTED_URL])", ("pass", "SECRET")),
+    ("[job](https://h/p?token=(abcd,foo)&sig=SECRET)", "[job]([REDACTED_URL])", ("abcd", "foo", "SECRET")),
+], ids=["keyed-empty-user", "natural-label", "keyed-long-user", "password-parenthesis",
+        "empty-user-parenthesis", "query-parenthesis"])
+def test_guidance_round6_original_url_spans_are_atomic(source, expected, secrets):
+    from aegis_core.guidance_grammar import redact_labeled
+    from aegis_core.guidance_projection import project_field, redact_clean_text
+
+    assert redact_clean_text(source) == expected
+    assert all(secret not in redact_clean_text(source) for secret in secrets)
+    assert project_field([source, "SECOND"]) == [expected, "SECOND"]
+    shown, labels = redact_labeled(source + "\nSECOND", [0] * len(source) + [None] + [1] * 6, 2000)
+    assert shown == expected + "\nSECOND"
+    assert labels == [0] * len(expected) + [None] + [1] * 6
+    assert len(shown) == len(labels)
+    assert redact_clean_text(expected) == expected
+
+
+@pytest.mark.parametrize("prefix", [".", "9", "+", "-"], ids=["dot", "digit", "plus", "minus"])
+@pytest.mark.parametrize("userinfo,masked", [("", ""), (":hunter2@", ":[REDACTED]@")],
+                         ids=["query", "empty-user-password"])
+def test_guidance_round6_prefixed_schemes_are_detected(prefix, userinfo, masked):
+    from aegis_core.guidance_grammar import redact_labeled
+    from aegis_core.guidance_projection import project_field, redact_clean_text
+    from aegis_core.redaction import remove_guidance_url_queries
+
+    head = prefix + "https://" + userinfo + "ci.example/job"
+    source = head + "?sig=SECRET"
+    expected = prefix + "https://" + masked + "ci.example/job"
+    assert redact_clean_text(source) == expected
+    assert "hunter2" not in expected and "SECRET" not in redact_clean_text(source)
+    assert project_field([source, "SECOND"]) == [expected, "SECOND"]
+    shown, labels = redact_labeled(source, [0] * len(source), 300)
+    assert shown == expected and labels == [0] * len(expected)
+    assert len(shown) == len(labels)
+    assert remove_guidance_url_queries(source, limit=300) == (head, ((len(head), len(source)),))
+    assert remove_guidance_url_queries(head, limit=300) == (head, ())
+    assert redact_clean_text(expected) == expected
+
+
+def test_guidance_round6_no_scheme_letters_fail_closed():
+    from aegis_core.guidance_grammar import redact_labeled
+    from aegis_core.guidance_projection import project_field, redact_clean_text
+
+    source = "://:hunter2@localhost/0?sig=SECRET"
+    expected = "[REDACTED_URL]"
+    assert redact_clean_text(source) == expected
+    assert project_field([source, "SECOND"]) == [expected, "SECOND"]
+    assert redact_labeled(source, [0] * len(source), 300) == (expected, [0] * len(expected))
+    assert redact_clean_text(expected) == expected
+
+
+def test_guidance_round6_large_non_url_completes():
+    script = (
+        "from aegis_core.guidance_grammar import redact_labeled\n"
+        "source = 'a' * (1024 * 1024)\n"
+        "shown, labels = redact_labeled(source, None, len(source))\n"
+        "assert shown == source and labels is None\n"
+        "print(len(shown))\n"
+    )
+    # Bound a stuck child; this checks completion/output, not elapsed-time speed.
+    result = subprocess.run([sys.executable, "-c", script], cwd=REPO, capture_output=True,
+                            text=True, check=True, timeout=20)
+    assert result.stdout.strip() == str(1024 * 1024)
+
+
+@pytest.mark.parametrize("tail", ["9hunter2://x", ".hunter2://x", "+hunter2://x",
+                                  "-hunter2://x", "12345hunter2://x", "1https://b",
+                                  "9hunter2://x#last", "9hunter2://x?next=SECRET"],
+                         ids=["digit", "dot", "plus", "minus", "digits", "nested-https",
+                              "nested-anchor", "nested-query"])
+@pytest.mark.parametrize("markdown", [False, True], ids=["plain", "markdown"])
+def test_guidance_round6d_query_owns_later_scheme_markers(tail, markdown):
+    from aegis_core.guidance_grammar import redact_labeled
+    from aegis_core.guidance_projection import project_field, redact_clean_text
+    from aegis_core.redaction import remove_guidance_url_queries, remove_url_credentials
+
+    prefix, suffix = ("[job](", "),NEXT") if markdown else ("", "")
+    head = prefix + "https://h/p"
+    source = head + "?sig=" + tail + suffix
+    expected = head + suffix
+    spans = ((len(head), len(source) - len(suffix)),)
+    retained = list(range(len(head))) + list(range(spans[0][1], len(source)))
+    assert remove_guidance_url_queries(source, limit=1000) == (expected, spans)
+    assert remove_url_credentials(source, limit=1000, policy="guidance") == expected
+    assert redact_clean_text(source) == expected
+    assert project_field([source, "SECOND"]) == [expected, "SECOND"]
+    shown, labels = redact_labeled(source, list(range(len(source))), 1000)
+    assert shown == expected and labels == retained
+    assert len(labels) == len(shown)
+    assert all(char == source[label] for char, label in zip(shown, labels))
+    assert redact_labeled(source + "\nSECOND", [0] * len(source) + [None] + [1] * 6, 1000) == (
+        expected + "\nSECOND", [0] * len(expected) + [None] + [1] * 6)
+    assert "hunter2" not in shown and "SECRET" not in shown
+    assert remove_guidance_url_queries(expected, limit=1000) == (expected, ())
+    assert remove_url_credentials(expected, limit=1000, policy="guidance") == expected
+    assert redact_labeled(shown, labels, 1000) == (shown, labels)
+    assert redact_clean_text(expected) == expected
+
+
+@pytest.mark.parametrize("source,expected", [
+    ("https://a/x?q=1https://b", "https://a/x"),
+    ("https://h/p#anchor,https://ci.example/job?sig=hunter2#last", "https://h/p"),
+    ("https://h/path/https://inner/path?sig=hunter2#last", "https://h/path/https://inner/path"),
+    ("https://h/path/https://inner/path", "https://h/path/https://inner/path"),
+    ("https://h/p?sig=hidden#anchor", "https://h/p#anchor"),
+], ids=["exact-reproducer", "fragment-owns-marker", "path-owns-marker", "path-no-query", "ordinary-anchor"])
+def test_guidance_round6d_one_url_ends_before_next_whitespace(source, expected):
+    from aegis_core.guidance_grammar import redact_labeled
+    from aegis_core.guidance_projection import project_field, redact_clean_text
+    from aegis_core.redaction import remove_guidance_url_queries, remove_url_credentials
+
+    shown, spans = remove_guidance_url_queries(source, limit=1000)
+    assert shown == expected
+    retained = [i for i in range(len(source)) if not any(lo <= i < hi for lo, hi in spans)]
+    assert redact_labeled(source, list(range(len(source))), 1000) == (expected, retained)
+    assert len(retained) == len(expected)
+    assert all(char == source[label] for char, label in zip(expected, retained))
+    assert remove_url_credentials(source, limit=1000, policy="guidance") == expected
+    assert redact_clean_text(source) == expected
+    assert project_field([source, "SECOND"]) == [expected, "SECOND"]
+    assert remove_guidance_url_queries(expected, limit=1000) == (expected, ())
+    assert remove_url_credentials(expected, limit=1000, policy="guidance") == expected
+    assert redact_labeled(expected, retained, 1000) == (expected, retained)
+    assert redact_clean_text(expected) == expected
+
+
+def test_guidance_round6d_nested_path_userinfo_is_not_the_owning_authority():
+    from aegis_core.guidance_grammar import redact_labeled
+    from aegis_core.guidance_projection import project_field, redact_clean_text
+
+    source = "https://h/path/https://u:hunter2@inner/path"
+    expected = "[REDACTED_URL]"
+    assert redact_clean_text(source) == expected
+    assert project_field([source, "SECOND"]) == [expected, "SECOND"]
+    assert redact_labeled(source, [0] * len(source), 1000) == (expected, [0] * len(expected))
+    assert "hunter2" not in redact_clean_text(source)
+    assert redact_clean_text(expected) == expected
+
+
+@pytest.mark.parametrize("source,query_expected,serving_expected", [
+    ("https://ci.example?user=a@b&sig=SECRET", "https://ci.example", "[REDACTED_URL]"),
+    ("https://ci.example?sig=SECRET@x/y", "https://ci.example", "[REDACTED_URL]"),
+    ("https://ci.example?sig=SECRET@x/y#anchor", "https://ci.example#anchor", "[REDACTED_URL]"),
+    ("https://ci.example/job?next=https://app.example/done&sig=SECRET",
+     "https://ci.example/job", "https://ci.example/job"),
+    ("https://ci.example/job?sig=v1://SECRET", "https://ci.example/job", "https://ci.example/job"),
+    ("https://ci.example/job?sig=://SECRET", "https://ci.example/job", "https://ci.example/job"),
+], ids=["query-at", "query-at-before-slash", "query-at-anchor", "redirect", "version", "bare-marker"])
+def test_guidance_round6e_authority_stops_before_query_contents(source, query_expected, serving_expected):
+    from aegis_core.guidance_grammar import redact_labeled
+    from aegis_core.guidance_projection import project_field, redact_clean_text
+    from aegis_core.redaction import remove_guidance_url_queries, remove_url_credentials
+
+    query = source.index("?")
+    stop = source.index("#") if "#" in source else len(source)
+    spans = ((query, stop),)
+    assert remove_guidance_url_queries(source, limit=1000) == (query_expected, spans)
+    assert remove_url_credentials(source, limit=1000, policy="guidance") == query_expected
+    assert "SECRET" not in query_expected
+    assert redact_clean_text(source) == serving_expected
+    assert project_field([source, "SECOND"]) == [serving_expected, "SECOND"]
+    retained = list(range(query)) + list(range(stop, len(source)))
+    labels = retained if serving_expected == query_expected else [0] * len(serving_expected)
+    shown, attribution = redact_labeled(source, list(range(len(source))), 1000)
+    assert shown == serving_expected and attribution == labels
+    assert len(shown) == len(attribution)
+    assert redact_labeled(source + "\nSECOND", [0] * len(source) + [None] + [1] * 6, 1000) == (
+        serving_expected + "\nSECOND", [0] * len(serving_expected) + [None] + [1] * 6)
+    assert redact_labeled(shown, attribution, 1000) == (shown, attribution)
+    assert redact_clean_text(serving_expected) == serving_expected
+    assert remove_guidance_url_queries(query_expected, limit=1000) == (query_expected, ())
+    assert remove_url_credentials(query_expected, limit=1000, policy="guidance") == query_expected
+
+
+@pytest.mark.parametrize("url,secrets", [
+    ("https://user:pass://hunter2@ci.example/path?sig=SECRET", ("pass", "hunter2", "SECRET")),
+    ("redis://:prefix://hunter2@localhost/0", ("prefix", "hunter2")),
+    ("https://user:p#a://hunter2@ci.example/path?sig=SECRET", ("p#a", "hunter2", "SECRET")),
+], ids=["password-marker", "empty-user-marker", "password-fragment-marker"])
+@pytest.mark.parametrize("markdown", [False, True], ids=["plain", "markdown"])
+def test_guidance_round6e_embedded_userinfo_fails_closed(url, secrets, markdown):
+    from aegis_core.guidance_grammar import redact_labeled
+    from aegis_core.guidance_projection import project_field, redact_clean_text
+    from aegis_core.redaction import remove_guidance_url_queries, remove_url_credentials
+
+    prefix, suffix = ("[job](", "),NEXT") if markdown else ("", "")
+    source = prefix + url + suffix
+    query_expected = prefix + suffix
+    expected = prefix + "[REDACTED_URL]" + suffix
+    first, last = len(prefix), len(prefix) + len(url)
+    assert remove_guidance_url_queries(source, limit=1000) == (query_expected, ((first, last),))
+    assert remove_url_credentials(source, limit=1000, policy="guidance") == query_expected
+    assert redact_clean_text(source) == expected
+    assert project_field([source, "SECOND"]) == [expected, "SECOND"]
+    labels = list(range(first)) + [first] * len("[REDACTED_URL]") + list(range(last, len(source)))
+    shown, attribution = redact_labeled(source, list(range(len(source))), 1000)
+    assert shown == expected and attribution == labels
+    assert len(shown) == len(attribution)
+    assert all(secret not in shown and secret not in query_expected for secret in secrets)
+    assert redact_labeled(shown, attribution, 1000) == (shown, attribution)
+    assert redact_labeled(source + "\nSECOND", [0] * len(source) + [None] + [1] * 6, 1000) == (
+        expected + "\nSECOND", [0] * len(expected) + [None] + [1] * 6)
+    assert redact_clean_text(expected) == expected
+    assert remove_guidance_url_queries(query_expected, limit=1000) == (query_expected, ())
+    assert remove_url_credentials(query_expected, limit=1000, policy="guidance") == query_expected
+
+
+def test_guidance_round6e_query_only_helper_retains_literal_fragment():
+    from aegis_core.guidance_grammar import redact_labeled
+    from aegis_core.guidance_projection import project_field, redact_clean_text
+    from aegis_core.redaction import remove_guidance_url_queries, remove_url_credentials
+
+    source = "https://ci.example#anchor@v1?detail=visible"
+    assert remove_guidance_url_queries(source, limit=1000) == (source, ())
+    assert remove_url_credentials(source, limit=1000, policy="guidance") == source
+    expected = "[REDACTED_URL]"
+    assert redact_clean_text(source) == expected
+    assert project_field([source, "SECOND"]) == [expected, "SECOND"]
+    assert redact_labeled(source, [0] * len(source), 1000) == (expected, [0] * len(expected))
+    assert redact_clean_text(expected) == expected
+
+
+@pytest.mark.parametrize("nested,sensitive", [
+    ("redis://:hunter2@localhost/0", ("hunter2",)),
+    ("redis://:hunter2@inner/0", ("hunter2",)),
+    ("redis://" + "u" * 129 + ":hunter2@inner/0", ("u" * 129, "hunter2")),
+    ("redis://user:" + "p" * 513 + "@inner/0", ("user", "p" * 513)),
+    ("redis://us@er:hunter2@inner/0", ("us@er", "hunter2")),
+    ("redis://:@inner/0", ()),
+    ("redis://viewer@inner", ("viewer",)),
+], ids=["empty-user-localhost", "empty-user-inner", "long-user", "long-password", "at-in-user",
+        "empty-components", "username-only-terminal"])
+@pytest.mark.parametrize("location", ["/path/", "/p?next=", "/p#next="], ids=["path", "query", "fragment"])
+@pytest.mark.parametrize("query", ["", "?sig=SECRET"], ids=["no-query", "following-query"])
+@pytest.mark.parametrize("markdown", [False, True], ids=["plain", "markdown"])
+def test_guidance_round6f_embedded_userinfo_masks_owner(nested, sensitive, location, query, markdown):
+    from aegis_core.guidance_grammar import redact_labeled
+    from aegis_core.guidance_projection import project_field, redact_clean_text
+    from aegis_core.redaction import remove_guidance_url_queries, remove_url_credentials
+
+    prefix, suffix = ("[job](", "),NEXT") if markdown else ("", "")
+    url = "https://h" + location + nested + query
+    source = prefix + url + suffix
+    expected = prefix + "[REDACTED_URL]" + suffix
+    first, last = len(prefix), len(prefix) + len(url)
+    labels = list(range(first)) + [first] * len("[REDACTED_URL]") + list(range(last, len(source)))
+    assert redact_clean_text(source) == expected
+    assert project_field([source, "SECOND"]) == [expected, "SECOND"]
+    shown, attribution = redact_labeled(source, list(range(len(source))), 8192)
+    assert shown == expected and attribution == labels
+    assert len(shown) == len(attribution)
+    assert all(part not in shown for part in sensitive + ("SECRET",))
+    assert redact_labeled(source + "\nSECOND", [0] * len(source) + [None] + [1] * 6, 8192) == (
+        expected + "\nSECOND", [0] * len(expected) + [None] + [1] * 6)
+    assert redact_labeled(shown, attribution, 8192) == (shown, attribution)
+    assert redact_clean_text(expected) == expected
+    # Compatibility helpers represent fail-closed consumption as deletion.
+    helper_expected = prefix + suffix
+    assert remove_guidance_url_queries(source, limit=8192) == (helper_expected, ((first, last),))
+    assert remove_url_credentials(source, limit=8192, policy="guidance") == helper_expected
+    assert remove_guidance_url_queries(helper_expected, limit=8192) == (helper_expected, ())
+    assert remove_url_credentials(helper_expected, limit=8192, policy="guidance") == helper_expected
+
+
+@pytest.mark.parametrize("source,helper_expected,expected", [
+    ("https://h/path/redis://inner/0", "https://h/path/redis://inner/0", "https://h/path/redis://inner/0"),
+    ("https://h/path/redis://inner/path@revision", "https://h/path/redis://inner/path@revision",
+     "https://h/path/redis://inner/path@revision"),
+    ("https://h/path/redis://inner?contact=x@y", "https://h/path/redis://inner", "[REDACTED_URL]"),
+    ("https://h/path/redis://inner#anchor@revision", "https://h/path/redis://inner", "[REDACTED_URL]"),
+    ("https://h/p/a://inner/b://target/path", "https://h/p/a://inner/b://target/path",
+     "https://h/p/a://inner/b://target/path"),
+    ("https://h/p?next=redis://inner/path#anchor", "https://h/p", "https://h/p"),
+    ("https://h/p#next=redis://inner/path", "https://h/p", "https://h/p"),
+], ids=["no-userinfo", "path-at", "query-at", "fragment-at", "multiple-markers", "owning-query",
+        "owning-fragment"])
+def test_guidance_round6f_embedded_authority_boundaries(source, helper_expected, expected):
+    from aegis_core.guidance_grammar import redact_labeled
+    from aegis_core.guidance_projection import project_field, redact_clean_text
+    from aegis_core.redaction import remove_guidance_url_queries, remove_url_credentials
+
+    assert redact_clean_text(source) == expected
+    assert project_field([source, "SECOND"]) == [expected, "SECOND"]
+    shown, labels = redact_labeled(source, [0] * len(source), 8192)
+    assert shown == expected and labels == [0] * len(expected)
+    assert len(shown) == len(labels)
+    assert remove_guidance_url_queries(source, limit=8192)[0] == helper_expected
+    assert remove_url_credentials(source, limit=8192, policy="guidance") == helper_expected
+    assert redact_labeled(shown, labels, 8192) == (shown, labels)
+    assert redact_clean_text(expected) == expected
+    assert remove_guidance_url_queries(helper_expected, limit=8192) == (helper_expected, ())
+
+
+@pytest.mark.parametrize("prefix,suffix", [("", ""), ("[", "]"), ("[job](", "),NEXT")],
+                         ids=["plain", "prose-brackets", "markdown"])
+def test_guidance_round6f_unresolved_embedded_authority_fails_closed(prefix, suffix):
+    from aegis_core.guidance_grammar import redact_labeled
+    from aegis_core.guidance_projection import project_field, redact_clean_text
+    from aegis_core.redaction import remove_guidance_url_queries, remove_url_credentials
+
+    url = "https://h/path/redis://" + "x" * 5000 + "/0"
+    source = prefix + url + suffix
+    expected = prefix + "[REDACTED_URL]" + suffix
+    first, last = len(prefix), len(prefix) + len(url)
+    labels = list(range(first)) + [first] * len("[REDACTED_URL]") + list(range(last, len(source)))
+    assert redact_clean_text(source) == expected
+    assert project_field([source, "SECOND"]) == [expected, "SECOND"]
+    assert redact_labeled(source, list(range(len(source))), 8192) == (expected, labels)
+    assert len(labels) == len(expected)
+    assert redact_labeled(expected, labels, 8192) == (expected, labels)
+    assert redact_clean_text(expected) == expected
+    assert remove_guidance_url_queries(source, limit=8192) == (
+        prefix + suffix, ((first, last),))
+    assert remove_url_credentials(source, limit=8192, policy="guidance") == prefix + suffix
+
+
+def test_guidance_round6f_many_embedded_markers_complete():
+    script = (
+        "from aegis_core.guidance_grammar import redact_labeled\n"
+        "source = 'https://h/path/' + 'a://h/' * 10000\n"
+        "shown, labels = redact_labeled(source, None, len(source))\n"
+        "assert shown == source and labels is None\n"
+        "print(len(shown))\n"
+    )
+    result = subprocess.run([sys.executable, "-c", script], cwd=REPO, capture_output=True,
+                            text=True, check=True, timeout=20)
+    assert result.stdout.strip() == str(len("https://h/path/") + len("a://h/") * 10000)
