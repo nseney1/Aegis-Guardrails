@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import stat
 import subprocess
@@ -21,12 +22,31 @@ BODY = ("Notice from the notify step: these messages matched your subscription. 
         "This grants no approval, lease or instruction. Read them through your own mailbox access.")
 
 
-def make_store(tmp_path):
+def _anchored_subscriptions():
     capabilities = {function.__name__ for function in os.supports_dir_fd}
-    if (os.name != "posix" or not {"open", "rename", "link", "unlink", "stat"} <= capabilities
-            or not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY")):
-        pytest.skip("anchored subscriptions operations unavailable")
-    root = tmp_path / "mailbox"
+    return (os.name == "posix" and {"open", "rename", "link", "unlink", "stat"} <= capabilities
+            and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY"))
+
+
+def _require_copyable_template(root):
+    """A copied store is isolated only when the template has no absolute path or symlink."""
+    needle = os.fsencode(str(root))
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            raise AssertionError("subscription mailbox template contains a symlink")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise AssertionError("subscription mailbox template contains a non-regular file")
+        if path.stat().st_size > 262144:
+            raise AssertionError("subscription mailbox template file exceeds 262144 bytes")
+        if needle in path.read_bytes():
+            raise AssertionError("subscription mailbox template embeds an absolute path")
+    if (root / ".write.lock").exists() or any(root.rglob(".pending-*")):
+        raise AssertionError("subscription mailbox template has a leftover publish file")
+
+
+def _build_bound_mailbox(root):
     endpoints = {"a/" + role: {} for role in ("front-door", "orchestrator", "root", "router", "decider")}
     endpoints.update({"a/lane/" + lane: {"kind": "reviewer"} for lane in ("f2", "f6")})
     invoke(root, "init", {"schema": "aegis.hierarchy-pilot/v1", "endpoints": endpoints,
@@ -34,6 +54,24 @@ def make_store(tmp_path):
     for endpoint in endpoints:
         invoke(root, "bind", {"endpoint": endpoint, "host": "host-one", "session": endpoint,
                               "expected_generation": 0})
+    _require_copyable_template(root)
+    return root
+
+
+@pytest.fixture(scope="module")
+def bound_mailbox(tmp_path_factory):
+    """Init and the seven binds once; each test copies this tree."""
+    if not _anchored_subscriptions():
+        return None
+    root = tmp_path_factory.mktemp("subscription-mailbox-template") / "mailbox"
+    return _build_bound_mailbox(root)
+
+
+def make_store(tmp_path, template):
+    if template is None:
+        pytest.skip("anchored subscriptions operations unavailable")
+    root = tmp_path / "mailbox"
+    shutil.copytree(template, root)
     state = tmp_path / "state"
     state.mkdir(mode=0o700)
     config = tmp_path / "subscriptions.json"
@@ -61,14 +99,20 @@ def publish(root, identifier, *, sender="a/lane/f2", recipient="a/orchestrator",
     return invoke(root, "publish", message(sender, recipient, identifier=identifier, **extra))
 
 
+def publish_direct(root, identifier, *, sender="a/lane/f2", recipient="a/orchestrator", **extra):
+    """Same mailbox publish the CLI runs, without one process per seeded message."""
+    with api.hm.writer_lock(root):
+        return api.hm.Mailbox(root).publish(message(sender, recipient, identifier=identifier, **extra))
+
+
 def notices(root, endpoint="a/orchestrator"):
     return [row for row in invoke(root, "inbox", endpoint=endpoint, include_briefs=True, limit=100)["messages"]
             if row["message"]["message_id"].startswith("notice-")]
 
 
 @pytest.mark.parametrize("endpoint", ["a/orchestrator", "a/root"])
-def test_hm_accepts_fixed_body_router_notice_with_reference_attachment(tmp_path, endpoint):
-    root, state, _ = make_store(tmp_path)
+def test_hm_accepts_fixed_body_router_notice_with_reference_attachment(tmp_path, bound_mailbox, endpoint):
+    root, state, _ = make_store(tmp_path, bound_mailbox)
     packet = state / "references.md"
     packet.write_bytes(b'{"references":[],"held_count":0}\n')
     result = publish(root, "notice-" + "a" * 64, sender="a/router", recipient=endpoint, body=BODY,
@@ -84,15 +128,15 @@ def test_hm_accepts_fixed_body_router_notice_with_reference_attachment(tmp_path,
     ([{"from": "a/lane/*"}], "a/root"),
     ([{"type": []}], "a/orchestrator"),
 ])
-def test_validation_refuses_entry_without_echoing_input(tmp_path, filters, subscriber):
-    store = make_store(tmp_path)
+def test_validation_refuses_entry_without_echoing_input(tmp_path, bound_mailbox, filters, subscriber):
+    store = make_store(tmp_path, bound_mailbox)
     write_config(store[2], subscriber=subscriber, filters=filters)
     assert notify(store, ok=False) == {"error": "invalid subscription entry 0", "code": "SUBSCRIPTIONS_INVALID"}
     assert notices(store[0]) == []
 
 
-def test_cli_batches_and_never_copies_body(tmp_path):
-    store = make_store(tmp_path)
+def test_cli_batches_and_never_copies_body(tmp_path, bound_mailbox):
+    store = make_store(tmp_path, bound_mailbox)
     root = store[0]
     original = [publish(root, lane, sender="a/lane/" + lane, body="HOSTILE_BODY_DO_NOT_COPY") for lane in ("f2", "f6")]
     result = notify(store)
@@ -106,8 +150,8 @@ def test_cli_batches_and_never_copies_body(tmp_path):
     assert len(notices(root)) == 1
 
 
-def test_result_batch_and_original_brief_references(tmp_path):
-    store = make_store(tmp_path)
+def test_result_batch_and_original_brief_references(tmp_path, bound_mailbox):
+    store = make_store(tmp_path, bound_mailbox)
     root, state, config = store
     write_config(config, filters=[{"type": "result", "from": "a/lane/*"}])
     brief = state / "task.md"
@@ -129,10 +173,10 @@ def test_result_batch_and_original_brief_references(tmp_path):
     assert notify((root, other_state, config))["matched"] == 0
 
 
-def test_batch_limit_holds_unlisted_matches_for_next_pass(tmp_path):
-    store = make_store(tmp_path)
+def test_batch_limit_holds_unlisted_matches_for_next_pass(tmp_path, bound_mailbox):
+    store = make_store(tmp_path, bound_mailbox)
     for number in range(52):
-        publish(store[0], "m-" + str(number))
+        publish_direct(store[0], "m-" + str(number))
     assert notify(store)["held"] == 2
     first = json.loads(notices(store[0])[0]["brief_text"])
     assert len(first["references"]) == 50 and first["held_count"] == 2
@@ -141,8 +185,8 @@ def test_batch_limit_holds_unlisted_matches_for_next_pass(tmp_path):
     assert len({ref["message_id"] for packet in packets for ref in packet["references"]}) == 52
 
 
-def test_budget_held_and_released_with_count(tmp_path):
-    store = make_store(tmp_path)
+def test_budget_held_and_released_with_count(tmp_path, bound_mailbox):
+    store = make_store(tmp_path, bound_mailbox)
     write_config(store[2], budget=2)
     for number in range(5):
         publish(store[0], "m-" + str(number))
@@ -155,8 +199,8 @@ def test_budget_held_and_released_with_count(tmp_path):
     assert packet["previously_held"] == 3
 
 
-def test_crash_after_publish_recovers_same_notice_even_with_new_mail(tmp_path, monkeypatch):
-    store = make_store(tmp_path)
+def test_crash_after_publish_recovers_same_notice_even_with_new_mail(tmp_path, bound_mailbox, monkeypatch):
+    store = make_store(tmp_path, bound_mailbox)
     publish(store[0], "first")
     real_save = api.save_cursor
     def fail(*args, **kwargs):
@@ -173,8 +217,8 @@ def test_crash_after_publish_recovers_same_notice_even_with_new_mail(tmp_path, m
     assert len(notices(store[0])) == 2
 
 
-def test_publish_failure_retries_without_advancing_cursor(tmp_path, monkeypatch):
-    store = make_store(tmp_path)
+def test_publish_failure_retries_without_advancing_cursor(tmp_path, bound_mailbox, monkeypatch):
+    store = make_store(tmp_path, bound_mailbox)
     publish(store[0], "first")
     real_publish = api.publish_notice
     def fail(*args, **kwargs):
@@ -188,8 +232,8 @@ def test_publish_failure_retries_without_advancing_cursor(tmp_path, monkeypatch)
     assert api.notify(*store)["published"] == 0
 
 
-def test_loop_guards_and_explicit_ack(tmp_path):
-    store = make_store(tmp_path)
+def test_loop_guards_and_explicit_ack(tmp_path, bound_mailbox):
+    store = make_store(tmp_path, bound_mailbox)
     root = store[0]
     publish(root, "original", sender="a/orchestrator", recipient="a/lane/f2")
     publish(root, "ack", kind="ack", in_reply_to="original", acknowledgment="received")
@@ -201,8 +245,8 @@ def test_loop_guards_and_explicit_ack(tmp_path):
 
 
 @pytest.mark.parametrize("damage", ["missing", "malformed", "oversized", "symlink", "ancestor_symlink"])
-def test_config_refusals_are_fixed_and_leave_mail_unchanged(tmp_path, damage):
-    store = make_store(tmp_path)
+def test_config_refusals_are_fixed_and_leave_mail_unchanged(tmp_path, bound_mailbox, damage):
+    store = make_store(tmp_path, bound_mailbox)
     config = store[2]
     if damage == "missing":
         config.unlink()
@@ -232,9 +276,9 @@ def test_unsupported_platform_is_a_fixed_refusal(tmp_path, monkeypatch):
     assert error.value.code == "SUBSCRIPTIONS_UNSUPPORTED"
 
 
-def test_concurrent_cli_passes_do_not_duplicate_notices(tmp_path):
+def test_concurrent_cli_passes_do_not_duplicate_notices(tmp_path, bound_mailbox):
     from concurrent.futures import ThreadPoolExecutor
-    store = make_store(tmp_path)
+    store = make_store(tmp_path, bound_mailbox)
     publish(store[0], "first")
     def run(_):
         root, state, config = store
@@ -251,8 +295,8 @@ def test_concurrent_cli_passes_do_not_duplicate_notices(tmp_path):
     assert notify(store)["published"] == 0
 
 
-def test_budget_backlog_survives_original_deletion(tmp_path):
-    store = make_store(tmp_path)
+def test_budget_backlog_survives_original_deletion(tmp_path, bound_mailbox):
+    store = make_store(tmp_path, bound_mailbox)
     write_config(store[2], budget=1)
     publish(store[0], "first")
     assert api.notify(*store, now=10000)["published"] == 1
@@ -265,8 +309,8 @@ def test_budget_backlog_survives_original_deletion(tmp_path):
     assert packet["previously_held"] == 1
 
 
-def test_config_size_and_shape_preflight_precedes_json_parser(tmp_path, monkeypatch):
-    store = make_store(tmp_path)
+def test_config_size_and_shape_preflight_precedes_json_parser(tmp_path, bound_mailbox, monkeypatch):
+    store = make_store(tmp_path, bound_mailbox)
     seen = []
     def parse(raw):
         seen.append(True)
@@ -278,13 +322,13 @@ def test_config_size_and_shape_preflight_precedes_json_parser(tmp_path, monkeypa
     assert seen == []
 
 
-def test_configuration_sha_is_the_exact_file_hash(tmp_path):
-    store = make_store(tmp_path)
+def test_configuration_sha_is_the_exact_file_hash(tmp_path, bound_mailbox):
+    store = make_store(tmp_path, bound_mailbox)
     assert notify(store)["configuration_sha256"] == hashlib.sha256(store[2].read_bytes()).hexdigest()
 
 
-def test_optional_batch_size_can_lower_the_hard_fifty_limit(tmp_path):
-    store = make_store(tmp_path)
+def test_optional_batch_size_can_lower_the_hard_fifty_limit(tmp_path, bound_mailbox):
+    store = make_store(tmp_path, bound_mailbox)
     config = json.loads(store[2].read_text())
     config["subscriptions"][0]["batch_size"] = 2
     store[2].write_text(json.dumps(config), encoding="utf-8")
@@ -295,8 +339,8 @@ def test_optional_batch_size_can_lower_the_hard_fifty_limit(tmp_path):
     assert notify(store)["matched"] == 1
 
 
-def test_root_subscription_and_field_only_reply_filter(tmp_path):
-    store = make_store(tmp_path)
+def test_root_subscription_and_field_only_reply_filter(tmp_path, bound_mailbox):
+    store = make_store(tmp_path, bound_mailbox)
     write_config(store[2], subscriber="a/root", filters=[{"type": "info"}])
     publish(store[0], "visible", sender="a/decider")
     publish(store[0], "lane-hidden")
@@ -310,8 +354,8 @@ def test_root_subscription_and_field_only_reply_filter(tmp_path):
     assert notify(store)["matched"] == 1
 
 
-def test_original_brief_is_a_reference_and_never_expanded(tmp_path):
-    store = make_store(tmp_path)
+def test_original_brief_is_a_reference_and_never_expanded(tmp_path, bound_mailbox):
+    store = make_store(tmp_path, bound_mailbox)
     brief = store[1] / "source.md"
     brief.write_text("HOSTILE_ORIGINAL_BRIEF", encoding="utf-8")
     ref = {"path": str(brief), "sha256": hashlib.sha256(brief.read_bytes()).hexdigest()}
@@ -324,8 +368,8 @@ def test_original_brief_is_a_reference_and_never_expanded(tmp_path):
 
 
 @pytest.mark.parametrize("damage", ["invalid", "oversized", "symlink"])
-def test_cursor_refusal_preserves_mail_and_allows_safe_retry(tmp_path, damage):
-    store = make_store(tmp_path)
+def test_cursor_refusal_preserves_mail_and_allows_safe_retry(tmp_path, bound_mailbox, damage):
+    store = make_store(tmp_path, bound_mailbox)
     publish(store[0], "first")
     assert notify(store)["published"] == 1
     cursor = next(store[1].glob("*.json"))
@@ -348,8 +392,8 @@ def test_cursor_refusal_preserves_mail_and_allows_safe_retry(tmp_path, damage):
     assert notify(store)["published"] == 0
 
 
-def test_config_ancestor_rename_cannot_redirect_the_open(tmp_path, monkeypatch):
-    store = make_store(tmp_path)
+def test_config_ancestor_rename_cannot_redirect_the_open(tmp_path, bound_mailbox, monkeypatch):
+    store = make_store(tmp_path, bound_mailbox)
     parent = tmp_path / "inputs"
     parent.mkdir()
     config = parent / "subscriptions.json"
@@ -372,8 +416,8 @@ def test_config_ancestor_rename_cannot_redirect_the_open(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("failure", [False, True])
-def test_descriptor_reads_close_on_success_and_io_failure(tmp_path, monkeypatch, failure):
-    store = make_store(tmp_path)
+def test_descriptor_reads_close_on_success_and_io_failure(tmp_path, bound_mailbox, monkeypatch, failure):
+    store = make_store(tmp_path, bound_mailbox)
     publish(store[0], "first")
     active = set()
     real_os = api.os
@@ -398,8 +442,8 @@ def test_descriptor_reads_close_on_success_and_io_failure(tmp_path, monkeypatch,
     assert active == set()
 
 
-def test_oversized_packet_refuses_before_pending_and_can_retry_smaller_batch(tmp_path):
-    store = make_store(tmp_path)
+def test_oversized_packet_refuses_before_pending_and_can_retry_smaller_batch(tmp_path, bound_mailbox):
+    store = make_store(tmp_path, bound_mailbox)
     directory = tmp_path
     for _ in range(12):
         directory = directory / ("\u0100" * 80)
@@ -409,7 +453,7 @@ def test_oversized_packet_refuses_before_pending_and_can_retry_smaller_batch(tmp
     ref = {"path": str(brief), "sha256": hashlib.sha256(brief.read_bytes()).hexdigest()}
     write_config(store[2], filters=[{"type": "brief", "from": "a/lane/*"}])
     for number in range(50):
-        publish(store[0], "brief-" + str(number), kind="brief", brief=ref)
+        publish_direct(store[0], "brief-" + str(number), kind="brief", brief=ref)
     assert notify(store, ok=False)["code"] == "SUBSCRIPTIONS_LIMIT"
     assert list(store[1].glob("*.json")) == []
     assert notices(store[0]) == []
@@ -425,8 +469,8 @@ def notify_arguments(store):
     return ["notify", "--root", str(root), "--state-dir", str(state), "--subscriptions", str(config)]
 
 
-def test_routing_flush_failure_preserves_pending_on_publish_and_reconcile(tmp_path, monkeypatch, capsys):
-    store = make_store(tmp_path)
+def test_routing_flush_failure_preserves_pending_on_publish_and_reconcile(tmp_path, bound_mailbox, monkeypatch, capsys):
+    store = make_store(tmp_path, bound_mailbox)
     publish(store[0], "first")
     route = (store[0] / "a" / "orchestrator").stat()
     real_os = api.os
@@ -461,8 +505,8 @@ def test_routing_flush_failure_preserves_pending_on_publish_and_reconcile(tmp_pa
 
 
 @pytest.mark.parametrize("placement", ["routing", "binding_history", "root", "parent"])
-def test_state_directory_overlap_refuses_before_any_write(tmp_path, placement):
-    root, state, config = make_store(tmp_path)
+def test_state_directory_overlap_refuses_before_any_write(tmp_path, bound_mailbox, placement):
+    root, state, config = make_store(tmp_path, bound_mailbox)
     invalid = {"routing": root / "a" / "orchestrator",
                "binding_history": root / "bindings" / "a" / "orchestrator",
                "root": root, "parent": root.parent}[placement]
@@ -486,8 +530,8 @@ sys.exit(api.main(sys.argv[1:]))
 """
 
 
-def test_sigkill_requires_operator_lock_recovery_then_reconciles_once(tmp_path):
-    store = make_store(tmp_path)
+def test_sigkill_requires_operator_lock_recovery_then_reconciles_once(tmp_path, bound_mailbox):
+    store = make_store(tmp_path, bound_mailbox)
     publish(store[0], "first")
     child = subprocess.run([sys.executable, "-B", "-c", KILL_BEFORE_CURSOR_SAVE, *notify_arguments(store)],
                            cwd=ROOT, capture_output=True, text=True, timeout=20)
@@ -514,11 +558,11 @@ def test_sigkill_requires_operator_lock_recovery_then_reconciles_once(tmp_path):
     assert not lock.exists()
 
 
-def test_live_mailbox_lock_hold_redacts_path_and_preserves_lock(tmp_path):
+def test_live_mailbox_lock_hold_redacts_path_and_preserves_lock(tmp_path, bound_mailbox):
     secret = "ghp_" + "a" * 24
     directory = tmp_path / secret
     directory.mkdir()
-    store = make_store(directory)
+    store = make_store(directory, bound_mailbox)
     lock = store[0] / ".write.lock"
     with api.hm.writer_lock(store[0]):
         original = lock.read_bytes()
@@ -530,10 +574,10 @@ def test_live_mailbox_lock_hold_redacts_path_and_preserves_lock(tmp_path):
     assert not lock.exists()
 
 
-def test_concurrent_pass_during_failed_notice_flush_does_not_advance_cursor(tmp_path, monkeypatch):
+def test_concurrent_pass_during_failed_notice_flush_does_not_advance_cursor(tmp_path, bound_mailbox, monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event
-    store = make_store(tmp_path)
+    store = make_store(tmp_path, bound_mailbox)
     publish(store[0], "first")
     route = (store[0] / "a" / "orchestrator").stat()
     entered, release = Event(), Event()
