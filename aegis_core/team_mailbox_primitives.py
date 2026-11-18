@@ -5,7 +5,7 @@ Records retain the legacy wire format. No tools imports or process execution.
 """
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import wraps
@@ -77,6 +77,25 @@ _NEXT = {
     "invalid_record": "Reconcile the input and stored history against the mailbox schema.",
     "io": "Check storage availability and read current history before retrying.",
 }
+
+
+_MANIFEST_REPAIR_ACTIONS = {
+    "manifest": "Restore a bounded manifest with schema, writer_limit, endpoints and counterparts before retrying.",
+    "schema": "Repair the manifest schema field to use aegis.hierarchy-pilot/v1 before retrying.",
+    "writer_limit": "Repair the manifest writer_limit field to use an integer within the owner writer ceiling before retrying.",
+    "endpoints": "Repair the manifest endpoints field: check endpoint names, lane kinds and required hierarchy roles before retrying.",
+    "counterparts": "Repair the manifest counterparts field: check endpoint pairs, cross-hierarchy roles and unique membership before retrying.",
+}
+
+
+@contextmanager
+def _manifest_field(field):
+    """Attach only source-selected advice; legacy labels may contain input values."""
+    try:
+        yield
+    except MailboxRefusal as error:
+        error.next_action = _MANIFEST_REPAIR_ACTIONS[field]
+        raise error from None
 
 
 class MailboxRefusal(ValueError):
@@ -513,36 +532,41 @@ class RoleTables:
 
 
     def validate_manifest(self, manifest):
-        bounded_tree(manifest)
-        fields(manifest, {"schema", "endpoints", "counterparts", "writer_limit"})
-        require(manifest["schema"] == "aegis.hierarchy-pilot/v1", "unsupported manifest schema")
-        integer(manifest["writer_limit"], "writer_limit", maximum=MAX_WRITERS)
-        endpoints = manifest["endpoints"]
-        require(isinstance(endpoints, dict) and 0 < len(endpoints) <= 256, "invalid endpoints")
-        hierarchies = set()
-        for endpoint, definition in endpoints.items():
-            parts = self.endpoint_parts(endpoint)
-            hierarchies.add(parts[0])
-            if parts[1] == "lane":
-                fields(definition, {"kind"})
-                require(isinstance(definition["kind"], str) and definition["kind"] in self.lane_kinds, "invalid lane kind")
-            else:
-                fields(definition, set())
-        for hierarchy in hierarchies:
-            require(hierarchy + "/front-door" in endpoints and hierarchy + "/orchestrator" in endpoints,
-                    "each hierarchy requires a front door and orchestrator")
-        counterparts = manifest["counterparts"]
-        require(isinstance(counterparts, list) and len(counterparts) <= 256, "invalid counterparts")
-        paired = set()
-        for pair in counterparts:
-            require(isinstance(pair, list) and len(pair) == 2 and all(isinstance(p, str) and p in endpoints for p in pair),
-                    "counterparts must name two endpoints")
-            left, right = (self.endpoint_parts(p) for p in pair)
-            require("root" not in (left[1], right[1]), "root endpoints cannot be counterparts")
-            require(left[0] != right[0] and left[1] == right[1], "counterparts must have the same role across hierarchies")
-            require(left[1] in self.across_roles, "only front doors, orchestrators and lanes can be counterparts")
-            require(not any(p in paired for p in pair), "endpoint has more than one counterpart")
-            paired.update(pair)
+        with _manifest_field("manifest"):
+            bounded_tree(manifest)
+            fields(manifest, {"schema", "endpoints", "counterparts", "writer_limit"})
+        with _manifest_field("schema"):
+            require(manifest["schema"] == "aegis.hierarchy-pilot/v1", "unsupported manifest schema")
+        with _manifest_field("writer_limit"):
+            integer(manifest["writer_limit"], "writer_limit", maximum=MAX_WRITERS)
+        with _manifest_field("endpoints"):
+            endpoints = manifest["endpoints"]
+            require(isinstance(endpoints, dict) and 0 < len(endpoints) <= 256, "invalid endpoints")
+            hierarchies = set()
+            for endpoint, definition in endpoints.items():
+                parts = self.endpoint_parts(endpoint)
+                hierarchies.add(parts[0])
+                if parts[1] == "lane":
+                    fields(definition, {"kind"})
+                    require(isinstance(definition["kind"], str) and definition["kind"] in self.lane_kinds, "invalid lane kind")
+                else:
+                    fields(definition, set())
+            for hierarchy in hierarchies:
+                require(hierarchy + "/front-door" in endpoints and hierarchy + "/orchestrator" in endpoints,
+                        "each hierarchy requires a front door and orchestrator")
+        with _manifest_field("counterparts"):
+            counterparts = manifest["counterparts"]
+            require(isinstance(counterparts, list) and len(counterparts) <= 256, "invalid counterparts")
+            paired = set()
+            for pair in counterparts:
+                require(isinstance(pair, list) and len(pair) == 2 and all(isinstance(p, str) and p in endpoints for p in pair),
+                        "counterparts must name two endpoints")
+                left, right = (self.endpoint_parts(p) for p in pair)
+                require("root" not in (left[1], right[1]), "root endpoints cannot be counterparts")
+                require(left[0] != right[0] and left[1] == right[1], "counterparts must have the same role across hierarchies")
+                require(left[1] in self.across_roles, "only front doors, orchestrators and lanes can be counterparts")
+                require(not any(p in paired for p in pair), "endpoint has more than one counterpart")
+                paired.update(pair)
         return manifest
 
 
