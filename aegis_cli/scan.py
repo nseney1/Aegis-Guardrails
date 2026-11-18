@@ -29,8 +29,7 @@ from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_core.errors import WorkspaceError
 from aegis_core.guidance_grammar import clip_redacted
 from aegis_core.guidance_projection import (
-    CONTROL_GUIDANCE, MAX_GUIDANCE_CHARS, GuidanceProjectionError,
-    contains_control_characters, project_diagnostic,
+    CONTROL_GUIDANCE, contains_control_characters, project_diagnostic,
 )
 from aegis_core.hosts import GENERIC
 from aegis_core.workspace.layout import is_aegis_workspace
@@ -59,7 +58,7 @@ def run_scan(args: argparse.Namespace) -> int:
     try:
         # Discovery walks up from a missing path, so its error would name a parent.
         if raw_ws and not os.path.exists(raw_ws):
-            _error(f"workspace path does not exist: {_terminal_text(str(raw_ws), max_len=1024, escaped=False)}", projected=True)
+            _error(f"workspace path does not exist: {project_diagnostic(str(raw_ws), escaped=False, refuse_controls=True)}", projected=True)
             return EXIT_USAGE
         root = Workspace.resolve(raw_ws).root.resolve()
         try:
@@ -71,7 +70,7 @@ def run_scan(args: argparse.Namespace) -> int:
         _error(str(exc))
         return EXIT_USAGE
     if not governed:
-        displayed_root = _terminal_text(str(root), max_len=1024, escaped=False)
+        displayed_root = project_diagnostic(str(root), escaped=False, refuse_controls=True)
         _error(f"not an Aegis workspace (no .aegis/ in {displayed_root}); run aegis init", projected=True)
         return EXIT_USAGE
 
@@ -135,12 +134,12 @@ def _record_scan(root: Path, raw_files: List[str]) -> None:
         scan_compliance.record(root, "scan", host=scan_compliance.CLI_HOST, session=uuid.uuid4().hex,
                                files=inside, basis="files")
     except Exception as exc:  # telemetry only: never fail the scan
-        print("Warning: scan event not recorded: " + _terminal_text(str(exc), max_len=1024), file=sys.stderr)
+        print("Warning: scan event not recorded: " + project_diagnostic(str(exc), refuse_controls=True), file=sys.stderr)
 
 
 def _error(message: str, *, projected: bool = False) -> None:
     # Errors name rule files and directories, which a cloned repository chooses.
-    print("Error: " + (_served_text(message, max_len=1024) if projected else _terminal_text(message, max_len=1024)), file=sys.stderr)
+    print("Error: " + (_served_text(message, max_len=1024) if projected else project_diagnostic(message, refuse_controls=True)), file=sys.stderr)
 
 
 def _served_text(text: str, *, max_len: int | None = None) -> str:
@@ -150,16 +149,6 @@ def _served_text(text: str, *, max_len: int | None = None) -> str:
     if max_len is not None and len(text) > max_len:
         return clip_redacted(text, max_len - 3) + "..."
     return text
-
-
-def _terminal_text(text: str, *, max_len: int | None = None, escaped: bool = True) -> str:
-    """Project untrusted text, refusing whole values with non-layout controls."""
-    if len(text) > MAX_GUIDANCE_CHARS:
-        return GuidanceProjectionError.code
-    shown = project_diagnostic(CONTROL_GUIDANCE if contains_control_characters(text) else text, escaped=escaped)
-    if max_len is not None and (type(max_len) is not int or max_len < 3):
-        return "guidance_projection_invalid_field"
-    return shown if max_len is None or len(shown) <= max_len else clip_redacted(shown, max_len - 3) + "..."
 
 
 class ScanCommand(AegisCommand):
