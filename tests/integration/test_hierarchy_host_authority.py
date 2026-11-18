@@ -538,7 +538,8 @@ def _file_digest(path):
 @contextmanager
 def owned_runtime_boundary(api, tmp_path, monkeypatch, fault=None, *,
                            initialize_canonical=True, planned_successor=False,
-                           initial_control=False, control_fault=None, live_control=False, live_fault=None):
+                           initial_control=False, control_fault=None,
+                           live_control=False, live_fault=None, peer_finished=None):
     """Fake the external Rust/OS boundary, never an H authority or N1 loader.
 
     This fixture is authored during FULL-01, but must only execute in a later
@@ -614,7 +615,9 @@ def owned_runtime_boundary(api, tmp_path, monkeypatch, fault=None, *,
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client.connect(str(endpoint))
         peer, _ = listener.accept()
-        peer.settimeout(2)
+        # The test body owns idle time between requests. Teardown's shutdown
+        # interrupts the blocking read; its bounded join still detects a stuck peer.
+        peer.settimeout(None)
         peer_read, host_write = os.pipe()
         host_read, peer_write = os.pipe()
         reader, writer = os.fdopen(host_read, "rb", 0), os.fdopen(host_write, "wb", 0)
@@ -862,6 +865,9 @@ def owned_runtime_boundary(api, tmp_path, monkeypatch, fault=None, *,
                                           "epoch": 17, "nonce": nonce, "result": result}))
                 except Exception as error:
                     errors.append(error)
+                finally:
+                    if peer_finished is not None:
+                        peer_finished.set()
 
             thread = threading.Thread(target=rust_control, daemon=True)
             thread.start()
@@ -931,6 +937,73 @@ def owned_runtime_boundary(api, tmp_path, monkeypatch, fault=None, *,
         assert thread is None or not thread.is_alive(), "external Rust stand-in did not stop"
         assert app_thread is None or not app_thread.is_alive(), "external appserver stand-in did not stop"
         assert not errors, errors
+
+
+@pytest.mark.parametrize("malformed", [False, True])
+def test_owned_runtime_peer_survives_idle_gap_and_preserves_errors(
+        api, tmp_path, monkeypatch, malformed):
+    """The stand-in peer stays blocked across an idle gap and still records faults.
+
+    This peer accepts describe only as frame 1 and requires each id to equal the
+    frame count, so the frame after the gap is reserve_initial. The lifecycle
+    regression repeats describe because that stand-in allows it.
+    """
+
+    def describe(control, reply):
+        value = {"schema": "aegis.protected-initial-control/v1", "id": 1,
+                 "epoch": 0, "nonce": "a" * 64,
+                 "method": "describe", "params": {}}
+        control.sendall(frame(value))
+        response = json.loads(reply.readline())
+        channel = response["result"]["channel_witness"]
+        assert response == {"schema": value["schema"], "id": 1, "epoch": 17,
+                            "nonce": value["nonce"],
+                            "result": {"channel_witness": channel}}
+        return channel
+
+    def reserve(control, reply, plan_ref, identifier):
+        value = {"schema": "aegis.protected-initial-control/v1", "id": identifier,
+                 "epoch": 17, "nonce": "b" * 64,
+                 "method": "reserve_initial",
+                 "params": {"approved_plan": plan_ref}}
+        control.sendall(frame(value))
+        response = json.loads(reply.readline())
+        reservations = response["result"]["reservations"]
+        assert response == {"schema": value["schema"], "id": identifier, "epoch": 17,
+                            "nonce": value["nonce"],
+                            "result": {"reservations": reservations}}
+        assert [row["actor_cid"] for row in reservations] == [
+            "fixture-coordinator", "fixture-operator", "fixture-reviewer",
+            "fixture-root", "fixture-router"]
+        return reservations
+
+    def exercise():
+        peer_finished = threading.Event()
+        with owned_runtime_boundary(api, tmp_path, monkeypatch,
+                                    peer_finished=peer_finished) as inputs:
+            control, _, _, _, plan_ref, requests = inputs
+            control.settimeout(15)
+            with control.makefile("rb", buffering=0) as reply:
+                describe(control, reply)
+                # Deliberately leave the peer idle beyond its former two-second
+                # deadline. This is an input schedule, not a speed assertion.
+                threading.Event().wait(2.2)
+                assert not peer_finished.is_set(), "peer stopped during a test-controlled idle gap"
+                assert [row["method"] for row in requests] == ["describe"]
+                reservations = reserve(control, reply, plan_ref, 2)
+                assert reserve(control, reply, plan_ref, 3) == reservations
+                assert [row["method"] for row in requests] == [
+                    "describe", "reserve_initial", "reserve_initial"]
+                if malformed:
+                    control.sendall(b"{invalid-json}\n")
+                    assert peer_finished.wait(15), "peer did not report malformed input"
+        assert peer_finished.is_set(), "peer completion was not observed at teardown"
+
+    if malformed:
+        with pytest.raises(AssertionError, match="JSONDecodeError"):
+            exercise()
+    else:
+        exercise()
 
 
 def test_owned_constructor_and_reserve_use_authenticated_control(api, tmp_path, monkeypatch):
