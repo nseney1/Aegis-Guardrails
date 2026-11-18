@@ -76,8 +76,8 @@ _NEXT = {
     "bindings_unavailable": "Repair the owner-managed writer binding or verify the writer has stopped, then retry unclaim with --writer-stopped.",
     "writer_absent": "Verify the writer and queued jobs have stopped, then explicitly acknowledge this with --writer-stopped.",
     "writer_replaced": "Verify the original writer and queued jobs have stopped, then explicitly acknowledge this with --writer-stopped.",
-    "unclaim_event_unavailable": "Ask the coordinator to reconcile the unreadable or oversized events log from trusted evidence before retrying unclaim; its bounded reader accepts at most 16 MiB.",
-    "unclaim_recovery_required": "Use the concrete unclaim retry command and recorded caller in blockers after reconciling changed leases or unreadable events; pending intent remains reserved.",
+    "unclaim_event_unavailable": "Ask the coordinator to reconcile unreadable or inconsistent private unclaim receipts in .aegis/state/unclaim-receipts from trusted evidence, then retry the queue operation.",
+    "unclaim_recovery_required": "Use the concrete unclaim retry command and recorded caller in blockers after reconciling changed leases or private receipts in .aegis/state/unclaim-receipts; any pending intent remains reserved.",
 }
 
 
@@ -607,7 +607,7 @@ def _mutate(root, state, verb, moment, caller, lanes, found, queue_paths, argume
     previous = state["items"].get(arguments.get("identifier"))
     previous = dict(previous) if previous is not None else None
     row = _change(state, verb, moment, lanes=lanes, found=found, root=root, queue_paths=queue_paths, **arguments)
-    _publish(root, state)
+    _publish(root, state, before_publish=lambda: team_claims.reconcile_completed(root, previous, _json))
     holder = row["lane"] or (previous["lane"] if previous else None)
     detail = {"queue": True, "action": verb, "caller": caller,
               "item_id": row["item"]["id"], "lane": holder,
