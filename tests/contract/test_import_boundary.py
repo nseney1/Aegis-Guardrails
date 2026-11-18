@@ -116,6 +116,8 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_isolation_mounts": 0,
     "aegis_core.team_isolation_verify": 0,
     "aegis_core.team_lease_custody": 0,
+    "aegis_core.team_lifecycle": 1,
+    "aegis_core.team_lifecycle_writers": 1,
     "aegis_core.team_mailbox": 1,
     "aegis_core.team_mailbox_delivery": 1,
     "aegis_core.team_mailbox_index": 1,
