@@ -21,6 +21,47 @@ WITHHELD_TEXT = "guidance withheld: ambiguous structure"
 CONTROL_TEXT = "guidance withheld: control characters"
 
 
+@pytest.mark.parametrize("text, options, expected", [
+    ("disk\nfull", {}, "disk full"),
+    (r"disk\nfull", {}, "disk full"),
+    (r"disk\nfull", {"escaped": False}, r"disk\nfull"),
+    ("disk\x1bfull", {}, CONTROL_TEXT),
+    ("disk\0full", {}, CONTROL_TEXT),
+    ("disk\x1bfull", {"refuse_controls": False}, "disk full"),
+    ("\x1b" + "x" * (1024 * 1024), {}, "guidance_projection_limit"),
+    ("long message", {"max_len": 3}, "..."),
+    ("long message", {"max_len": 7}, "long..."),
+    ("x" * 1100, {"max_len": 1100}, "x" * 1100),
+    ("x" * 1100, {"max_len": None}, "x" * 1100),
+    ("ghp_" + "a" * 30 + " tail", {"max_len": 16}, "ghp_REDACTED ..."),
+    ("x", {"max_len": 2}, "guidance_projection_invalid_field"),
+    ("x", {"max_len": "8"}, "guidance_projection_invalid_field"),
+    ("x", {"max_len": True}, "guidance_projection_invalid_field"),
+    ("x", {"refuse_controls": 1}, "guidance_projection_invalid_field"),
+    ("x", {"escaped": 1}, "guidance_projection_invalid_field"),
+    (None, {}, "guidance_projection_invalid_field"),
+], ids=["newline", "escaped", "literal", "escape_control", "nul", "default_control_policy",
+        "oversized_control", "minimum", "short_cap", "large_cap", "uncapped", "secret",
+        "invalid_cap", "string_cap", "bool_cap", "invalid_policy", "invalid_escaped", "invalid_text"])
+def test_diagnostic_policy_is_stable_on_retry_and_concurrent_reads(text, options, expected):
+    from aegis_core.guidance_projection import project_diagnostic
+
+    def render(_):
+        return project_diagnostic(text, **dict({"refuse_controls": True}, **options))
+
+    assert [render(None), render(None)] == [expected, expected]
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(render, range(3))) == [expected] * 3
+
+
+def test_guidance_cleaner_accepts_the_full_projection_bound():
+    from aegis_core.guidance_grammar import clip_redacted
+    from aegis_core.guidance_projection import MAX_GUIDANCE_CHARS
+
+    text = "x" * MAX_GUIDANCE_CHARS
+    assert clip_redacted(text, MAX_GUIDANCE_CHARS) == text
+
+
 @pytest.mark.parametrize("surface", ["field_signature", "assembly"])
 def test_projection_public_api_omits_unused_surfaces(surface: str):
     from inspect import signature
