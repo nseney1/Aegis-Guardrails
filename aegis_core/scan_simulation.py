@@ -92,10 +92,9 @@ def simulate_rule_selection(workspace: Any, inventory: RuleInventory, ruleset: R
 
     Use lint's bounded working snapshot to capture scan's effective rules,
     fitness, defaults and envelope once, then replay each built-in host registry.
-    Matching candidate bytes must
-    match the captured effective rule; a concurrent edit or reviewed-base
-    substitution never supplies a verdict about different candidate bytes.
-    A served rule absent from that snapshot is judged as if accepted, at fitness 0.0. Refusals are fixed text.
+    Installed verdicts require identical captured candidate bytes, including for
+    amendments. New served rules absent from that snapshot are judged individually
+    as if accepted, at fitness 0.0. Refusals are fixed text.
     """
     candidates = ruleset.rules
     def refusal(reason: str) -> Dict[str, str]:
@@ -111,7 +110,7 @@ def simulate_rule_selection(workspace: Any, inventory: RuleInventory, ruleset: R
         if not isinstance(captured, hooks.result_type):
             return refusal("scan projection failed")
         if not captured._projection.changed_files:
-            messages = refusal("no changed files")
+            messages = _simulation_messages(cache, candidates, None)
         else:
             selected = _simulation_profiles(captured, workspace)
             if selected is None:
@@ -141,11 +140,13 @@ def _simulation_profiles(captured: Any, workspace: Any) -> Optional[Dict[str, se
     return selected
 
 
-def _simulation_messages(cache: SimulationCache, candidates: Tuple[Rule, ...], selected: Dict[str, set]) -> Dict[str, str]:
+def _simulation_messages(cache: SimulationCache, candidates: Tuple[Rule, ...], selected: Optional[Dict[str, set]]) -> Dict[str, str]:
     messages = {}
     for rule in candidates:
         if rule.id in cache.different_candidates:
             messages[rule.id] = "not evaluated: candidate differs from scan snapshot"
+        elif selected is None:
+            messages[rule.id] = "not evaluated: no changed files"
         elif all(rule.id in identities for identities in selected.values()):
             messages[rule.id] = _SIM_SELECTED
         else:
@@ -225,11 +226,22 @@ def _cold_select(workspace: Any, captured: Any, ruleset: RuleSet, files: List[st
     # Unaccepted sibling diagnostics are outside this as-if-accepted selection.
     extras = {key: value for key, value in projection.extras.items() if key not in ("unreviewed_rules", "unreviewed_total")}
     for profile in PLATFORM_SLOT_PROFILES:
-        result = select_guidance(ruleset, files, projection.budget, projection.token_budget, list(projection.stale), fitness_of, dict(extras), scan_registry(profile, workspace))
-        if not isinstance(result, GuidanceResult) or result.get("status") == _STATUS_FAIL:
-            return None
-        selected[profile] = set(result.exposure_rule_ids())
+        selected[profile] = set()
+        registry = scan_registry(profile, workspace)
+        for path in files:
+            result = select_guidance(ruleset, [path], projection.budget, projection.token_budget, list(projection.stale), fitness_of, dict(extras), registry)
+            if not isinstance(result, GuidanceResult) or result.get("status") == _STATUS_FAIL:
+                return None
+            selected[profile].update(result.exposure_rule_ids())
     return selected
+
+
+def _cold_message(rule_id: str, selected: Dict[str, set], sample_count: int) -> str:
+    omitted = sorted(name for name, identities in selected.items() if rule_id not in identities)
+    if not omitted:
+        return _SIM_SELECTED
+    message = f"scan simulation: never served at cold start (0/{sample_count})"
+    return message + " in profiles: " + ", ".join(omitted) if len(omitted) < len(selected) else message
 
 
 def _cold_verdicts(workspace: Any, cache: SimulationCache, captured: Any, drafts: Tuple[Rule, ...], hooks: SimulationHooks) -> Dict[str, str]:
@@ -246,7 +258,7 @@ def _cold_verdicts(workspace: Any, cache: SimulationCache, captured: Any, drafts
         try:
             if remaining[0] <= 0:
                 raise SimulationBudget
-            rules = bounded[:len(effective.rules)] + (rule,)
+            rules = tuple(installed for installed in bounded[:len(effective.rules)] if installed.id != rule.id) + (rule,)
             files = _cold_sample(rules[-1], listed)
             if not files:
                 messages[rule.id] = _COLD_NO_SAMPLE
@@ -257,8 +269,7 @@ def _cold_verdicts(workspace: Any, cache: SimulationCache, captured: Any, drafts
             if selected is None:
                 messages[rule.id] = "not evaluated: scan projection failed"
                 continue
-            omitted = sorted(name for name, identities in selected.items() if rule.id not in identities)
-            messages[rule.id] = _SIM_OMITTED + ", ".join(omitted) if omitted else _SIM_SELECTED
+            messages[rule.id] = _cold_message(rule.id, selected, len(files))
         except SimulationBudget:
             messages.update(_cold_refusal(drafts[index:], "simulation budget exceeded"))
             break
