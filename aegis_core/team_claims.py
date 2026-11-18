@@ -24,18 +24,10 @@ from aegis_core.primitives import sanitize_display
 from aegis_core.redaction import redact_command_secrets
 
 __all__ = ["ClaimRefusal", "validate_pending", "transition", "fingerprint",
-           "recovery_refusal", "observe_leases", "check_writer"]
+           "recovery_refusal", "observe_leases", "check_writer", "reconcile_completed"]
 
-MAX_EVENT_BYTES = 16 * 1024 * 1024
-# Covers both event paths at the maximum workspace spelling, escaped labels,
-# the 4096-character reason, and fixed event metadata.
-EVENT_MARGIN = 1024 * 1024
-# The queue document parser refuses a row above 1 MiB before it parses. Refuse
-# here, before copying that row out of the log.
-_EVENT_ROW_BYTES = 1024 * 1024
+MAX_RECEIPT_BYTES = 65536
 _LEASE_OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}\Z")
-_NONBLANK_ROW = re.compile(rb"[^ \t\v\f]")
-_NON_LF = re.compile(rb"[^\n]")
 _CAUSE_REASONS = ("queue_size_limit", "unclaim_event_unavailable", "unclaim_lease_refused", "queue_io_unavailable")
 _WRITER_REASONS = frozenset(("writer_live", "writer_not_stopped", "identity_unavailable",
     "binding_scope_mismatch", "bindings_unavailable", "writer_absent", "writer_replaced"))
@@ -229,7 +221,7 @@ def _cause_blocker(cause, lane, lease_oid, root):
             trailer=" before work needing more queue space.")}
     if cause == "unclaim_event_unavailable":
         return {"refused": True, "reason": cause,
-            "next_action": "Ask the coordinator to reconcile the unreadable or oversized events log from trusted evidence before retrying unclaim; its bounded reader accepts at most 16 MiB."}
+            "next_action": "Ask the coordinator to reconcile the unreadable or inconsistent private unclaim receipt from trusted evidence before retrying unclaim."}
     if cause == "queue_io_unavailable":
         return {"refused": True, "reason": cause,
             "next_action": "Check the trusted workspace and retry the recorded unclaim."}
@@ -317,97 +309,140 @@ def _preflight(root, row, lane, caller, now):
     return selected
 
 
-def _event_state(root, correlation, decode):
-    """Read once; initial admission reserves a margin, recovery allows slack."""
-    limit = MAX_EVENT_BYTES + EVENT_MARGIN if correlation is not None else MAX_EVENT_BYTES
+def _receipt_file(root, token, *, create=False):
+    """Only a validated transaction ID can select a queue-owned receipt."""
+    if type(token) is not str or len(token) != 64 or re.fullmatch(r"[0-9a-f]{64}", token) is None:
+        raise ClaimRefusal("unclaim_event_unavailable")
+    return storage.confined_file(storage.state_dir(root),
+                                ("unclaim-receipts", token + ".json"), create_parents=create)
+
+
+def _receipt_detail(intent):
+    return {"queue": True, "action": "unclaim", "unclaim_id": intent["to_revision"],
+            "item_id": intent["id"], "lane": intent["lane"], "caller": intent["caller"],
+            "reason": intent["reason"], "writer_stopped": True,
+            "from_revision": intent["revision"], "to_revision": intent["to_revision"],
+            "from_state": "claimed", "to_state": "queued",
+            "released_lease_ids": intent.get("released_lease_ids", [])}
+
+
+def _receipt_matches(detail, intent):
+    return (type(detail) is dict and detail.get("writer_stopped") is True
+            and detail.get("queue") is True and detail == _receipt_detail(intent))
+
+
+def _read_receipt(root, token, decode):
+    """Read only this ID, bounding the regular file before allocation/parsing."""
     try:
-        target = events.events_path(root)
-        with storage.confined_file(target.parent, (target.name,)) as handle:
-            raw = handle.read_bytes(limit)
+        with _receipt_file(root, token) as handle:
+            raw = handle.read_bytes(MAX_RECEIPT_BYTES)
+        detail = decode(raw, "invalid_queue_state")
+        if type(detail) is not dict:
+            raise ClaimRefusal("unclaim_event_unavailable")
+        return detail
     except storage.ConfinedFileError as error:
         if error.reason == "missing":
-            raw = b""
-        else:
-            raise ClaimRefusal("unclaim_event_unavailable") from None
+            return None
+        raise ClaimRefusal("unclaim_event_unavailable") from None
     except (OSError, ValueError, RuntimeError, gitsafe.GitError):
         raise ClaimRefusal("unclaim_event_unavailable") from None
-    return _scan_event_log(raw, correlation, decode)
 
 
-def _iter_event_rows(raw):
-    """Yield each non-blank row once, in file order, without a history-sized list.
-
-    Line breaks match bytes.splitlines (LF, CR, and CRLF). Each delimiter cursor
-    moves only forward, so every log byte is examined a constant number of times.
-    A non-blank row above the decoder cap is refused before that row is copied.
-    Blank padding is skipped without a copy.
-    """
-    length = len(raw)
-    start = 0
-    newline = raw.find(b"\n")
-    carriage = raw.find(b"\r")
-    while start < length:
-        if 0 <= newline < start:
-            newline = raw.find(b"\n", start)
-        if 0 <= carriage < start:
-            carriage = raw.find(b"\r", start)
-        # No CR remains, and the next byte is LF. One search skips the whole run.
-        if carriage < 0 and newline == start:
-            found = _NON_LF.search(raw, start)
-            start = found.start() if found is not None else length
-            continue
-        if newline < 0 and carriage < 0:
-            end = nxt = length
-        elif carriage < 0 or (newline >= 0 and newline < carriage):
-            end, nxt = newline, newline + 1
-        else:
-            end = carriage
-            nxt = carriage + 1
-            if nxt < length and raw[nxt:nxt + 1] == b"\n":
-                nxt += 1
-        if end > start and _NONBLANK_ROW.search(raw, start, end) is not None:
-            if end - start > _EVENT_ROW_BYTES:
-                raise ClaimRefusal("unclaim_event_unavailable")
-            yield raw[start:end]
-        start = nxt
-
-
-def _scan_event_log(raw, correlation, decode):
-    """Validate receipt bytes in one forward pass. Limits apply before a row is parsed."""
-    if correlation is None and len(raw) > MAX_EVENT_BYTES - EVENT_MARGIN:
+def _receipt_state(root, intent, decode):
+    detail = _read_receipt(root, intent["to_revision"], decode)
+    if detail is not None and not _receipt_matches(detail, intent):
         raise ClaimRefusal("unclaim_event_unavailable")
-    if raw and not raw.endswith(b"\n"):
+    return detail
+
+
+def _write_receipt(root, intent):
+    """Exclusive publication under the caller's workspace lock; never overwrite."""
+    detail = _receipt_detail(intent)
+    # A conservative ASCII-JSON bound, before serialization or encoding. Queue
+    # validation already bounds each field; even all-astral reasons fit this cap.
+    strings = [value for value in detail.values() if type(value) is str]
+    strings.extend(detail["released_lease_ids"])
+    if 1024 + sum(12 * len(value) for value in strings) > MAX_RECEIPT_BYTES:
         raise ClaimRefusal("unclaim_event_unavailable")
-    receipt = None
-    for line in _iter_event_rows(raw):
-        try:
-            row = decode(line, "invalid_queue_state")
-        except ValueError:
-            raise ClaimRefusal("unclaim_event_unavailable") from None
-        if type(row) is not dict:
-            raise ClaimRefusal("unclaim_event_unavailable")
-        detail = row.get("detail")
-        if (correlation is not None and row.get("event") == "lease_claimed" and
-                row.get("result") == "queue_unclaim" and type(detail) is dict and
-                detail.get("unclaim_id") == correlation):
-            if receipt is not None:
-                raise ClaimRefusal("unclaim_event_unavailable")
-            receipt = detail
-    return receipt
+    data = json.dumps(detail, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    with _receipt_file(root, intent["to_revision"], create=True) as handle:
+        handle.publish_bytes(data, replace=False, mode=0o600)
+
+
+def _remove_receipt(root, token):
+    try:
+        with _receipt_file(root, token) as handle:
+            handle.remove()
+    except storage.ConfinedFileError as error:
+        if error.reason != "missing":
+            raise ClaimRefusal("queue_io_unavailable") from None
+    except (OSError, ValueError, RuntimeError, gitsafe.GitError):
+        raise ClaimRefusal("queue_io_unavailable") from None
 
 
 def _record(root, intent, shown):
-    detail = {"queue": True, "action": "unclaim", "unclaim_id": intent["to_revision"],
-              "item_id": intent["id"], "lane": intent["lane"], "caller": intent["caller"],
-              "reason": intent["reason"], "writer_stopped": True,
-              "from_revision": intent["revision"], "to_revision": intent["to_revision"],
-              "from_state": "claimed", "to_state": "queued",
-              "released_lease_ids": intent.get("released_lease_ids", [])}
-    if events.try_append(root, "lease_claimed", "queue_unclaim", shown(detail)) is not None:
-        raise recovery_refusal(intent, root=root, cause="queue_io_unavailable")
+    """Metrics are best-effort and never transaction evidence."""
+    try:
+        events.try_append(root, "lease_claimed", "queue_unclaim", shown(_receipt_detail(intent)))
+    except (OSError, ValueError, RuntimeError, gitsafe.GitError):
+        pass
 
 
-def _initial_intent(root, state, identifier, expect, lane, reason, caller, now, decode, writer_stopped):
+def _completed_intent(row, detail):
+    """Prove completion from the current queued revision and a strict receipt."""
+    caller, lane = detail.get("caller"), detail.get("lane")
+    revision = detail.get("from_revision")
+    reason, released = detail.get("reason"), detail.get("released_lease_ids")
+    # JSON escapes can decode to lone surrogates despite display stability.
+    if (row["state"] != "queued" or not _display_stable(caller, 200) or not caller or
+            type(lane) is not str or len(lane) > 64 or not team.valid_lane(lane) or
+            type(revision) is not str or len(revision) != 64 or
+            re.fullmatch(r"[0-9a-f]{64}", revision) is None or
+            not _display_stable(reason, RECOVERY_TEXT_LIMIT) or
+            any(0xD800 <= ord(char) <= 0xDFFF for text in (caller, reason) for char in text) or
+            type(released) is not list or len(released) > 1 or
+            any(type(oid) is not str or len(oid) > 64 or not _LEASE_OID.fullmatch(oid) for oid in released)):
+        raise ClaimRefusal("unclaim_event_unavailable")
+    intent = {"id": row["item"]["id"], "revision": revision, "to_revision": row["revision"],
+              "lane": lane, "caller": caller, "reason": reason,
+              "released_lease_ids": released}
+    if not _receipt_matches(detail, intent):
+        raise ClaimRefusal("unclaim_event_unavailable")
+    return intent
+
+
+def reconcile_completed(root, row, decode):
+    """Before replacing a revision, retire its completed receipt under the lock.
+
+    The caller validates the resulting queue first. Even an absent receipt is
+    removed idempotently so a prior unlink/fsync failure cannot resurface an
+    unreachable file after the revision changes. No metrics log is consulted.
+    """
+    if row is None:
+        return
+    detail = _read_receipt(root, row["revision"], decode)
+    if detail is not None:
+        _completed_intent(row, detail)
+    _remove_receipt(root, row["revision"])
+
+
+def _finished_unclaim(root, state, identifier, expect, lane, caller, reason, decode):
+    """Recover a crash between the final queue publication and receipt removal."""
+    row = state["items"].get(identifier)
+    if row is None or row["state"] != "queued" or row["revision"] == expect:
+        return None
+    detail = _read_receipt(root, row["revision"], decode)
+    if detail is None:
+        return None
+    intent = _completed_intent(row, detail)
+    if ((expect, lane, caller) != (intent["revision"], intent["lane"], intent["caller"]) or
+            (reason and reason != intent["reason"])):
+        raise ClaimRefusal("stale_revision")
+    _remove_receipt(root, row["revision"])
+    return {"row": row, "released_lease_ids": intent["released_lease_ids"], "state": state}
+
+
+def _initial_intent(root, state, identifier, expect, lane, reason, caller, now, writer_stopped):
     if identifier in state["completed"]:
         raise ClaimRefusal("item_done")
     row = state["items"].get(identifier)
@@ -423,7 +458,6 @@ def _initial_intent(root, state, identifier, expect, lane, reason, caller, now, 
         raise ClaimRefusal("lane_mismatch")
     oid = _preflight(root, row, lane, caller, now)
     _check_writer(root, lane, oid, writer_stopped)
-    _event_state(root, None, decode)
     return {"id": identifier, "revision": expect, "lane": lane, "caller": caller,
             "reason": reason, "lease_oid": oid, "to_revision": secrets.token_hex(32),
             "writer_stopped": True, "released_lease_ids": []}
@@ -506,22 +540,25 @@ def transition(root, state, *, identifier, expect, lane, reason, caller, writer_
     """Separate rollback-capable initial execution from irreversible recovery."""
     recovering = "unclaim" in state
     intent = state.get("unclaim")
-    progress = {"release_attempted": False, "receipt": False, "shown": shown}
+    progress = {"release_attempted": False, "receipt": False, "finalized": False, "shown": shown}
     try:
+        if not recovering:
+            finished = _finished_unclaim(root, state, identifier, expect, lane, caller, reason, decode)
+            if finished is not None:
+                return finished
         if recovering:
             if ((intent["id"], intent["revision"], intent["lane"], intent["caller"]) != (
                     identifier, expect, lane, caller) or (reason and reason != intent["reason"])):
                 raise recovery_refusal(intent, root=root)
             _check_writer(root, lane, intent["lease_oid"], writer_stopped)
-            receipt = _event_state(root, intent["to_revision"], decode)
+            receipt = _receipt_state(root, intent, decode)
             if receipt is not None:
-                if (receipt.get("writer_stopped") is not True or
-                        receipt.get("released_lease_ids") != intent.get("released_lease_ids", [])):
-                    raise recovery_refusal(intent, root=root, cause="unclaim_event_unavailable")
                 progress["receipt"] = True
             intent["writer_stopped"] = writer_stopped
         else:
-            intent = _initial_intent(root, state, identifier, expect, lane, reason, caller, now, decode, writer_stopped)
+            intent = _initial_intent(root, state, identifier, expect, lane, reason, caller, now, writer_stopped)
+            if _receipt_state(root, intent, decode) is not None:
+                raise ClaimRefusal("unclaim_event_unavailable")
             state["unclaim"] = intent
             receipt = None
             # Failure here is ambiguous: publication may have landed.
@@ -532,8 +569,10 @@ def transition(root, state, *, identifier, expect, lane, reason, caller, writer_
         _release(root, state, intent, now, recovering, receipt, publish, progress)
         _check_leases(root, state, intent, now, released=intent["lease_oid"] is not None)
         if receipt is None:
-            _record(root, intent, shown)
+            # Publication/fsync can fail after the exclusive link landed.
             progress["receipt"] = True
+            _write_receipt(root, intent)
+            _record(root, intent, shown)
         _check_leases(root, state, intent, now, released=intent["lease_oid"] is not None)
         row = dict(state["items"][identifier])
         row.update(state="queued", lane=None, expires_at=None, revision=intent["to_revision"])
@@ -542,9 +581,15 @@ def transition(root, state, *, identifier, expect, lane, reason, caller, writer_
         final["items"] = {**state["items"], identifier: row}
         publish(root, final, before_publish=lambda: _check_leases(
             root, state, intent, now, released=intent["lease_oid"] is not None))
+        progress["finalized"] = True
+        # The queue is committed even if cleanup fails. A retry authenticates
+        # this completed transaction from its remaining private receipt.
+        _remove_receipt(root, intent["to_revision"])
         return {"row": row, "released_lease_ids": intent.get("released_lease_ids", []), "state": final}
     except (ClaimRefusal, team.LeaseRefused) as error:
         if intent is None or (not recovering and "unclaim" not in state):
+            raise
+        if isinstance(error, ClaimRefusal) and error.reason == "queue_io_unavailable" and progress["finalized"]:
             raise
         if isinstance(error, ClaimRefusal) and error.reason in _WRITER_REASONS:
             if not recovering and not progress["release_attempted"] and not progress["receipt"]:
