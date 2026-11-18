@@ -535,7 +535,7 @@ def simulate_rule_selection(workspace: Any, inventory: RuleInventory, ruleset: R
 
 
 def _cold_rules(rules: Tuple[Rule, ...], remaining: List[int]) -> Tuple[Rule, ...]:
-    outcomes, targets = {}, {r.id: (r.skips_tests, tuple(dict.fromkeys(r.target_paths))) for r in rules}
+    outcomes, targets = {}, {(r.id, r.path, r.digest): (r.skips_tests, tuple(dict.fromkeys(r.target_paths))) for r in rules}
     def evaluate(pattern: str, path: str, exact: bool) -> bool:
         if remaining[0] <= 0:
             raise _SimulationBudget
@@ -545,10 +545,11 @@ def _cold_rules(rules: Tuple[Rule, ...], remaining: List[int]) -> Tuple[Rule, ..
             outcomes[key] = normalize_path(pattern) == normalize_path(path) if exact else rule_match.matches(pattern, path)
         return outcomes[key]
     def applies(rule: Rule, path: str, exact: bool) -> bool:
-        if not exact and targets[rule.id][0] and rule_match.is_test_path(path):
+        skip_tests, patterns = targets[(rule.id, rule.path, rule.digest)]
+        if not exact and skip_tests and rule_match.is_test_path(path):
             return False
-        return any(evaluate(pattern, path, exact) for pattern in targets[rule.id][1])
-    return tuple(_ColdRule(**vars(replace(rule, meta={**rule.meta, "target_paths": targets[rule.id][1]})), _match_path=applies) for rule in rules)
+        return any(evaluate(pattern, path, exact) for pattern in patterns)
+    return tuple(_ColdRule(**vars(replace(rule, meta={**rule.meta, "target_paths": targets[(rule.id, rule.path, rule.digest)][1]})), _match_path=applies) for rule in rules)
 
 
 # Titles are branch-local text that reaches an agent: only the first few are listed.
