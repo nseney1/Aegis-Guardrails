@@ -31,6 +31,27 @@ STUB = re.compile(r"aegis-record/1 sha256=([0-9a-f]{64}) kind=([a-z][a-z0-9.]*)"
 ROOT_MARKER = b"aegis.record-root/1\n"
 
 
+class _RecordCodec:
+    """Fixed codec interface; no imported namespace crosses request dispatch."""
+    CodecError = codec_module.CodecError
+    KIND_SCHEMAS = codec_module.KIND_SCHEMAS
+    MAX_BYTES = codec_module.MAX_BYTES
+    MAX_REFS = codec_module.MAX_REFS
+    ReadContext = codec_module.ReadContext
+    canonical = codec_module.canonical
+    compose = codec_module.compose
+    parse = codec_module.parse
+    preflight_read = codec_module.preflight_read
+    prepare_read = codec_module.prepare_read
+    read_view = codec_module.read_view
+    record_id = codec_module.record_id
+    require = codec_module.require
+
+    @staticmethod
+    def Store(path):
+        return codec_module.Store(path)
+
+
 class RecordRefusal(MailboxRefusal):
     """Typed operational refusal retaining the codec's fixed wire envelope."""
     def __init__(self, error, tool):
@@ -75,28 +96,14 @@ class Records:
         require(type(name) is str and name in (
             "mailbox_publish_record", "mailbox_read_record", "mailbox_digest"))
         require(isinstance(self.mailbox, Mailbox))
-        codec, mailbox = codec_module, self.mailbox
+        handlers = {"mailbox_publish_record": self._publish_record,
+                    "mailbox_read_record": self._read_record, "mailbox_digest": self._digest}
+        codec = _RecordCodec
         try:
             _arguments(codec, arguments, (), {"message_id", "to", "type", "kind", "content", "brief",
                 "in_reply_to", "acknowledgment", "readiness", "result", "receipt", "ref", "refs", "fields",
                 "outline", "expand", "max_chars", "after_message_id", "limit"})
-            if name == "mailbox_publish_record":
-                mailbox.roles.authorize(mailbox.caller_role, "publish")
-                with mailbox.store.lock(mailbox.root):
-                    mailbox.refresh()
-                    mailbox.fence(self.sender)
-                    result = publish(codec, mailbox, self.sender, arguments)
-                warnings = mailbox.store.drain_warnings()
-                if warnings:
-                    result["warnings"] = result.get("warnings", []) + warnings
-                return result
-            mailbox.refresh()
-            mailbox.fence(self.sender, ready=False)
-            if name == "mailbox_read_record":
-                result, _returned = read(codec, mailbox, self.sender, arguments)
-            else:
-                result, _returned = digest(codec, mailbox, self.sender, arguments, inbox=self.inbox)
-            return result
+            return handlers[name](arguments)
         except codec.CodecError as error:
             raise RecordRefusal(error, name) from None
         except MailboxRefusal:
@@ -107,6 +114,30 @@ class Records:
             raise RecordRefusal(codec.CodecError("E_AUTH"), name) from None
         except (ValueError, KeyError):
             raise RecordRefusal(codec.CodecError("E_FORMAT"), name) from None
+
+    def _publish_record(self, arguments):
+        mailbox = self.mailbox
+        mailbox.roles.authorize(mailbox.caller_role, "publish")
+        with mailbox.store.lock(mailbox.root):
+            mailbox.refresh()
+            mailbox.fence(self.sender)
+            result = publish(_RecordCodec, mailbox, self.sender, arguments)
+        warnings = mailbox.store.drain_warnings()
+        if warnings:
+            result["warnings"] = result.get("warnings", []) + warnings
+        return result
+
+    def _read_record(self, arguments):
+        self.mailbox.refresh()
+        self.mailbox.fence(self.sender, ready=False)
+        result, _returned = read(_RecordCodec, self.mailbox, self.sender, arguments)
+        return result
+
+    def _digest(self, arguments):
+        self.mailbox.refresh()
+        self.mailbox.fence(self.sender, ready=False)
+        result, _returned = digest(_RecordCodec, self.mailbox, self.sender, arguments, inbox=self.inbox)
+        return result
 
 
 def supported():
