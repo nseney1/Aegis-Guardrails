@@ -83,7 +83,8 @@ PYTHON_RUNS = 0
 
 def run_python(*arguments, input=None, expected_returncode=0):
     global PYTHON_RUNS
-    PYTHON_RUNS += 1
+    if __name__ == "__main__":
+        PYTHON_RUNS += 1
     process = subprocess.run(
         [sys.executable, "-I", "-B", *map(str, arguments)],
         cwd=REPO, input=input, capture_output=True, text=True, encoding="utf-8", timeout=30,
