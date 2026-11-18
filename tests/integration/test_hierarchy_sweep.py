@@ -16,6 +16,7 @@ import signal
 import stat
 import subprocess
 import sys
+from types import SimpleNamespace
 import uuid
 
 import pytest
@@ -23,6 +24,7 @@ import pytest
 from tests.integration.test_hierarchy_background import STUB
 from tests.integration.test_hierarchy_delivery import HELPER
 from tests.integration.test_hierarchy_mailbox import ROOT, git, invoke
+from tests.integration.test_hierarchy_mailbox_index_reuse import make_mailbox, publish
 from tests.integration.test_hierarchy_provision import INITIATIVE, LANES, Setup, provision
 from tests.conftest import symlink_or_skip
 
@@ -137,7 +139,7 @@ def test_sweep_shares_each_pass_summary_and_refreshes_after_wakes(fleet, monkeyp
     if action in ("publish", "cross_publish"):
         fleet.send("pilot/front-door", "pilot/orchestrator", "wake-trigger")
     code, result = candidate.run(fleet.workspace.store, 1, (), False)
-    assert len(calls) == (1 if action == "quiet" else 4 if action == "cross_publish" else 2)
+    assert len(calls) == (2 if action == "quiet" else 4 if action == "cross_publish" else 2)
     if action in ("publish", "cross_publish"):
         assert code == 3
         assert {row["endpoint"] for row in result["still_unread"]} == {
@@ -304,7 +306,7 @@ def test_sweep_without_descriptor_capabilities_refreshes_through_pin(fleet, monk
         calls.append(durable)
         return original(initiative, durable, **kwargs)
 
-    monkeypatch.setattr("hierarchy_sweep.summary_cache_supported", lambda: False)
+    monkeypatch.setattr("hierarchy_mailbox_index._checked_reads_supported", lambda: False)
     monkeypatch.setattr("hierarchy_sweep.summaries", observed)
     code, report = candidate.run(fleet.workspace.store, 1, (), True)
     assert code == 0 and report["quiet"] is True and report["rows"] == []
@@ -325,88 +327,46 @@ def test_durable_admission_preserves_the_first_endpoints_refusal(fleet):
     assert report["rows"] == [{"initiative": "pilot", "state": "mailbox_error", "error": str(expected.value)[:512]}]
 
 
-@pytest.mark.parametrize("limit", ["entries", "bytes", "names", "depth", "path"])
-def test_sweep_cache_budget_misses_close_every_descriptor(fleet, monkeypatch, limit):
+def quiet_sweep_store(tmp_path, message_count):
+    import hierarchy_workspace as workspace
+
+    mailbox = make_mailbox(tmp_path / "mailbox")
+    for number in range(message_count):
+        publish(mailbox, "seed-%d" % number)
+    if message_count:
+        mailbox.record_read(str(tmp_path / "delivery"), {
+            "from": "a/lane/review", "host": "test-host", "session": "a/lane/review", "binding_generation": 1},
+            ["seed-%d" % number for number in range(message_count)])
+    store = tmp_path / "store"
+    for command, request in (
+        ("init", {"writer_limit": 3, "heavy_limit": 1}),
+        ("register", {"id": "quiet", "project": "aegis", "repository": "aegis", "priority": 1,
+                      "target_branch": "develop", "mailbox_root": str(mailbox.root),
+                      "delivery_dir": str(tmp_path / "delivery")}),
+    ):
+        path = tmp_path / "request.json"
+        path.write_text(json.dumps(request), encoding="utf-8")
+        code, result = workspace.run(SimpleNamespace(store=str(store), command=command, request=str(path)))
+        assert code == 0, result
+    return store
+
+
+@pytest.mark.parametrize("message_count", [0, 20])
+def test_quiet_sweep_matches_round1_cached_report(tmp_path, message_count):
     import hierarchy_sweep as candidate
+    from hierarchy_mailbox import encoded
 
-    if not candidate.summary_cache_supported() or not Path("/proc/self/fd").is_dir():
-        pytest.skip("requires descriptor cache support and the Linux descriptor census")
-    mailbox = candidate.Mailbox(fleet.root)
-    initiative = {"delivery_dir": str(fleet.base / "delivery")}
-    assert candidate.summary_fingerprint(mailbox, initiative) is not None
-    if limit == "entries":
-        monkeypatch.setattr("hierarchy_sweep.CACHE_ENTRIES", 1)
-    elif limit == "bytes":
-        monkeypatch.setattr("hierarchy_sweep.CACHE_BYTES", 1)
-    elif limit == "names":
-        monkeypatch.setattr("hierarchy_sweep.CACHE_NAMES", 1)
-    elif limit == "depth":
-        monkeypatch.setattr("hierarchy_sweep.CACHE_DEPTH", 1)
-    else:
-        monkeypatch.setattr("hierarchy_sweep.CACHE_PATH", 1)
-    before = len(os.listdir("/proc/self/fd"))
-    for _ in range(3):
-        assert candidate.summary_fingerprint(mailbox, initiative) is None
-    assert len(os.listdir("/proc/self/fd")) == before
-
-
-@pytest.mark.parametrize("failure", ["ancestor_symlink", "read_error", "scandir_error"])
-def test_sweep_descriptor_observation_refuses_races_and_closes_on_os_failures(fleet, monkeypatch, failure):
-    import hierarchy_sweep as candidate
-
-    if not candidate.summary_cache_supported() or not Path("/proc/self/fd").is_dir():
-        pytest.skip("requires descriptor cache support and the Linux descriptor census")
-    mailbox = candidate.Mailbox(fleet.root)
-    initiative = {"delivery_dir": str(fleet.base / "delivery")}
-    outside, retained = fleet.tmp / "outside-cache-root", fleet.tmp / "retained-pilot"
-    (outside / "mailbox").mkdir(parents=True)
-    (outside / "mailbox/canary").write_bytes(b"must not read outside the held root")
-    observed = []
-
-    class CacheOS:
-        name = os.name
-        O_RDONLY, O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK = os.O_RDONLY, os.O_DIRECTORY, os.O_NOFOLLOW, os.O_NONBLOCK
-        supports_dir_fd, supports_fd = os.supports_dir_fd, os.supports_fd
-        supports_follow_symlinks = os.supports_follow_symlinks
-        fstat, stat, close = staticmethod(os.fstat), staticmethod(os.stat), staticmethod(os.close)
-        fspath, fsencode = staticmethod(os.fspath), staticmethod(os.fsencode)
-        geteuid, getegid, getgroups = staticmethod(os.geteuid), staticmethod(os.getegid), staticmethod(os.getgroups)
-
-        @staticmethod
-        def open(name, flags, *, dir_fd=None):
-            if (failure == "ancestor_symlink" and not observed and name == fleet.base.name and
-                    dir_fd is not None and os.readlink("/proc/self/fd/%d" % dir_fd) == str(fleet.base.parent)):
-                observed.append("swapped")
-                fleet.base.rename(retained)
-                symlink_or_skip(outside, fleet.base, target_is_directory=True)
-            return os.open(name, flags, dir_fd=dir_fd)
-
-        @staticmethod
-        def read(descriptor, size):
-            assert not os.readlink("/proc/self/fd/%d" % descriptor).startswith(str(outside))
-            if failure == "read_error":
-                observed.append("read refused")
-                raise OSError(errno.EIO, "fixture cache read refused")
-            return os.read(descriptor, size)
-
-        @staticmethod
-        def scandir(descriptor):
-            if failure == "scandir_error":
-                observed.append("listing refused")
-                raise OSError(errno.EIO, "fixture cache listing refused")
-            return os.scandir(descriptor)
-
-    monkeypatch.setattr("hierarchy_sweep.os", CacheOS)
-    assert candidate.summary_cache_supported()
-    before = len(os.listdir("/proc/self/fd"))
-    try:
-        assert candidate.summary_fingerprint(mailbox, initiative) is None
-        assert observed
-        assert len(os.listdir("/proc/self/fd")) == before
-    finally:
-        if retained.exists():
-            fleet.base.unlink()
-            retained.rename(fleet.base)
+    # Captured before O132 from the round-1 cached implementation, source SHA256
+    # 3eead7b644f1dbfb58700a3f3bf65b3690a7b4bd9cf28096fa0ca037790f663f.
+    # Keep the actual return-code/report bytes here: history-less snapshots need
+    # neither Git history nor a second implementation of the deleted cache.
+    expected = (
+        b'[0,{"lifecycle":{"coverage":"untracked","execution_enabled":false,"state":"untracked",'
+        b'"work_complete":false},"mail_quiet":true,"quiet":true,"root_queue":[],"root_time":[],"rotate_needed":[],'
+        b'"rounds":0,"rows":[],"silent_roles":[],"stalled_dispatches":[],"still_unread":[],"work_complete":false}]'
+    )
+    store = quiet_sweep_store(tmp_path, message_count)
+    assert encoded(candidate.run(store, 1, (), True)) == expected
 
 
 def test_mail_quiet_does_not_claim_that_untracked_work_is_complete(fleet):
