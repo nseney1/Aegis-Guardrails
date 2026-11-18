@@ -44,6 +44,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.display_attribution": 0,
     "aegis_core.errors": 0,
     "aegis_core.taxonomy": 0,
+    "aegis_core.merge_queue": 2,
     # Canonical message records and untrusted views (stdlib only).
     "aegis_core.message_codec": 0,
     # Shared format primitives and anchored content-addressed storage.
