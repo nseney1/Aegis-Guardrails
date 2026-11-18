@@ -12,13 +12,12 @@ import pytest
 from aegis_core import storage, team_custody as custody, team_git, team_gitops, team_qualify
 from aegis_core.errors import LockTimeoutError
 from tests.conftest import symlink_or_skip
-from tests.unit.core.test_team_custody_checks import copied_rig, rig_template, state
-from tests.unit.core.test_team_git import IDENTITY, git, make_store
+from tests.helpers_team_git import IDENTITY, copied_rig, git, make_store, rig_template, state
 
 
 @pytest.fixture
 def rig(tmp_path, rig_template):
-    # The imported module-scoped template is copied, never rebuilt per test.
+    # The shared module-scoped template is copied, never rebuilt per test.
     with copied_rig(rig_template, tmp_path) as candidate:
         candidate.journal = team_gitops.GitOpsJournal(candidate.repo / ".git")
         yield candidate
