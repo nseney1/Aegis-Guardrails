@@ -585,3 +585,20 @@ def test_switching_a_bound_claude_role_to_background_keeps_its_binding(setup):  
     assert second["generation"] == first["generation"] == 1 and second["session"] == first["session"]
     assert second["wake_profile"] == first["wake_profile"]
     assert json.loads(Path(second["wake_profile"]).read_text())["mode"] == "background"
+
+
+def test_cutover_mapping_distinguishes_the_live_initiative_from_history():
+    document = (Path(__file__).resolve().parents[2] / "docs" / "hierarchy-six-team-cutover.md").read_text(encoding="utf-8")
+    runtime_row = next(line for line in document.splitlines() if line.startswith("| Aegis Runtime |"))
+    assert "`aegis-live` (live initiative)" in runtime_row
+    assert "`aegis47-live` (read-only history)" in runtime_row
+
+
+@pytest.mark.parametrize("guidance", [
+    "version-free initiative names",
+    "fresh provision",
+    "read-only history marker",
+])
+def test_cutover_documents_initiative_naming_and_retirement(guidance):
+    document = (Path(__file__).resolve().parents[2] / "docs" / "hierarchy-six-team-cutover.md").read_text(encoding="utf-8")
+    assert guidance in document
