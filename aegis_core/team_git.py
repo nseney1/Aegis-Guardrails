@@ -36,7 +36,8 @@ from aegis_core.team_git_snapshot import (
 from aegis_core.primitives import sanitize_display
 from aegis_core.redaction import redact_insight_text
 
-__all__ = ["CommitIdentity", "GitRefusal", "GitStore", "Plan", "cas_fast_forward", "commit_tested",
+__all__ = ["CommitIdentity", "GitRefusal", "GitStore", "Plan", "UNKNOWN_OUTCOME_CODES",
+           "cas_fast_forward", "commit_tested",
            "descriptor_support", "ref_oid", "plan_merge", "plan_pick", "plan_revert", "snapshot_tree",
            "validate_oid", "validate_message",
            # Export the internal runner-transfer surface for the lane guard's accounting.
@@ -51,6 +52,8 @@ MAX_PICKS = 256
 MAX_OBJECT_BYTES = 16 * 1024 * 1024
 MAX_OBJECTS = 20000
 MAX_RESPONSE_BYTES = MAX_PATHS * (MAX_PATH_BYTES + 1)
+# One indeterminate-outcome set. Custody imports this object and never retries these codes.
+UNKNOWN_OUTCOME_CODES = frozenset(("ref_update_unknown", "git_cleanup_failed", "git_timeout", "git_output_limit"))
 _OID = team_git_snapshot.OID_PATTERN
 _DATE = re.compile(r"[0-9]{1,12} [+-](?:[01][0-9]|2[0-3])[0-5][0-9]\Z")
 _FORBIDDEN = re.compile(r"^\s*Aegis-(?:Approve(?:-Insight)?|Exempt-Test)\s*:", re.I | re.M)
@@ -786,11 +789,10 @@ def cas_fast_forward(store: GitStore, ref: str, expected: Optional[str], new: st
             return "already"
     except AegisError as exc:
         code = _error_code(exc)
-        if code not in ("git_failed", "git_timeout", "ref_update_unknown", "ref_update_failed",
-                        "git_cleanup_failed", "git_output_limit"):
+        if code not in UNKNOWN_OUTCOME_CODES and code not in ("git_failed", "ref_update_failed"):
             raise GitRefusal(_error_code(exc), next_action=getattr(exc, "next_action", None)) from None
         if (effect_fds is not None
-                and (code in ("git_timeout", "ref_update_unknown", "git_cleanup_failed", "git_output_limit")
+                and (code in UNKNOWN_OUTCOME_CODES
                      or code == "git_failed" and getattr(exc, "process_started", None) is True)):
             raise GitRefusal("ref_update_unknown") from None
         observed = _current(store, ref, _runner)
