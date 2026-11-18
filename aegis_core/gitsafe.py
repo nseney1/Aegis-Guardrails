@@ -161,7 +161,7 @@ def _reset_for_tests() -> None:
 
 
 def git_executable(*, environ=None, cwd=None) -> str:
-    """Resolve Git centrally; ordinary reads fence the outermost enclosing checkout."""
+    """Resolve Git centrally; ordinary reads fence the bound root, else the outermost checkout."""
     return gitsafe_run.find_executable((cache := _GIT_FOUND.for_cwd(cwd)) if environ is None else {}, environ,
         lambda effective: pathlookup.which("git",
             **({"path": effective.get("PATH", os.defpath), "outside": getattr(effective, "root", cwd)} if environ is not None else {"outside": cache.fence, "fence_program": True, "descriptors": False})),

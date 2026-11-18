@@ -23,6 +23,7 @@ Binding grants no authority, and a generated profile is not proof that a host wi
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
 import hashlib
 import json
 import math
@@ -32,6 +33,7 @@ import re
 import shutil
 import subprocess
 import sys
+from threading import Lock
 import uuid
 
 JSON_LIMIT_BYTES = 262144
@@ -172,6 +174,7 @@ if __name__ == "__main__" and getattr(sys, "_aegis_verified_runtime_entry", None
 sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from hierarchy_mailbox_index import MailboxIndex  # noqa: E402
 from hierarchy_mailbox import (MAX_RECORDS, SLUG, Mailbox, digest, encoded, endpoint_parts, initialize, integer,  # noqa: E402
                                matching, publish_file, read_bytes, require, safe_path, strings, text,
                                timestamp, writer_lock)
@@ -1517,6 +1520,86 @@ def claude_start(request):
     return {**answer, "team": team} if team is not None else answer
 
 
+class _MailboxReader:
+    """Keep binding and locking inside public read callables."""
+    def __init__(self, mailbox):
+        read_lock = Lock()
+        with read_lock:
+            index = MailboxIndex(mailbox, mode="shadow")
+
+        def read_messages():
+            with read_lock:
+                return index.messages()
+
+        def read_message(message_id):
+            with read_lock:
+                return index.get(message_id)
+
+        def read_mode():
+            with read_lock:
+                return index.mode
+
+        def read_divergence():
+            with read_lock:
+                return index.last_divergence
+
+        def read_reconciliation():
+            with read_lock:
+                return index.last_reconciliation
+
+        def read_changes():
+            with read_lock:
+                return index.content_changed
+
+        self.read_messages = read_messages
+        self.read_message = read_message
+        self.read_mode = read_mode
+        self.read_divergence = read_divergence
+        self.read_reconciliation = read_reconciliation
+        self.read_changes = read_changes
+
+    def messages(self):
+        return self.read_messages()
+
+    def get(self, message_id):
+        return self.read_message(message_id)
+
+    @property
+    def mode(self):
+        return self.read_mode()
+
+    @property
+    def last_divergence(self):
+        return self.read_divergence()
+
+    @property
+    def last_reconciliation(self):
+        return self.read_reconciliation()
+
+    @property
+    def content_changed(self):
+        return self.read_changes()
+
+
+_MAILBOX_READERS = OrderedDict()
+_MAILBOX_READERS_LOCK = Lock()
+
+
+def mailbox_reader(mailbox):
+    """Reuse locked shadow state only for this exact Mailbox authority."""
+    # The retained index owns mailbox, keeping its identity live until eviction.
+    key = (mailbox.root, os.getpid(), id(mailbox))
+    with _MAILBOX_READERS_LOCK:
+        reader = _MAILBOX_READERS.get(key)
+        if reader is None:
+            if len(_MAILBOX_READERS) >= 16:
+                _MAILBOX_READERS.popitem(last=False)
+            reader = _MailboxReader(mailbox)
+            _MAILBOX_READERS[key] = reader
+        _MAILBOX_READERS.move_to_end(key)
+        return reader
+
+
 def old_root_state(old_root, hierarchy):
     """Everything read from a live root, which this never writes to. A held lock means unsure, so it refuses."""
     old = delegated_read("mailbox manifest", Mailbox, safe_path(text(old_root, "old_root")))
@@ -1525,7 +1608,7 @@ def old_root_state(old_root, hierarchy):
     locks = [old.root / ".write.lock", *old.root.glob(".wake-" + hierarchy + "%2F*.lock")]
     busy = [path.name for path in locks if path.exists()]
     require(not busy, "the old root is busy (%s); try again once that finishes" % ", ".join(busy))
-    records = delegated_read("mailbox records", old.messages)
+    records = delegated_read("mailbox records", mailbox_reader(old).messages)
     closed, accepted = old.dispatch_history(records)
     acceptances = {message["in_reply_to"]: message for message in accepted}
     in_order = sorted((row for row in records.values() if row["message"]["from"] in names or row["message"]["to"] in names),
@@ -1687,7 +1770,7 @@ def carry(request):
     message_id = "carried-work-" + record["brief"]["sha256"][:32]
     with writer_lock(new.root):
         current = delegated_read("mailbox manifest", Mailbox, new.root)
-        if message_id not in delegated_read("mailbox records", current.messages):
+        if message_id not in delegated_read("mailbox records", mailbox_reader(current).messages):
             binding = delegated_read("mailbox records", current.current_binding, root_endpoint)
             delegated_read("mailbox records", current.publish,
                            {"message_id": message_id, "from": root_endpoint, "to": orchestrator,
@@ -1789,7 +1872,7 @@ def carry_check(request):
     names, seen = set(record["endpoints"]), set(record["message_ids"])
     late = sorted(({"message_id": identifier, "type": row["message"]["type"], "from": row["message"]["from"], "to": row["message"]["to"],
                     "created_at": row["message"]["created_at"], "path": row["path"]}
-                   for identifier, row in delegated_read("mailbox records", old.messages).items()
+                   for identifier, row in delegated_read("mailbox records", mailbox_reader(old).messages).items()
                    if identifier not in seen and (row["message"]["from"] in names or row["message"]["to"] in names)),
                   key=lambda row: row["created_at"])
     changed = sorted(name for name in record["endpoints"]

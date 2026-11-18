@@ -24,6 +24,7 @@ or exception text. RF24_GIT includes Git's bounded failure line when available;
 only missing Git skips, with a reason. Git runs inside tests, never at collection.
 """
 import ast
+import importlib
 import os
 from pathlib import Path
 import shutil
@@ -39,8 +40,10 @@ from tests.contract.test_process_ratchets import ScopedNames
 
 REPO = Path(__file__).resolve().parents[2]
 INDEX = "tools/hierarchy_mailbox_index.py"
-# Owner approved Phase 1 for the read-only doctor (MB-5 round 1b, Addendum A).
-ADMITTED_IMPORTERS = frozenset({"tools/hierarchy_mailbox_doctor.py"})
+# Owner approved the doctor and these four shadow readers (MB-2 release ruling).
+ADMITTED_IMPORTERS = frozenset({"tools/hierarchy_mailbox_doctor.py", "tools/hierarchy_jobs.py",
+                                "tools/hierarchy_sweep.py", "tools/hierarchy_provision.py",
+                                "tools/hierarchy_provider_recovery.py"})
 RECEIVER_ATTR_ALLOW = frozenset({"_path_key"})
 RECEIVER_ATTR_DENY = frozenset({"mode", "__init__", "__new__", "__dict__", "__class__"})
 NEEDLES = (b"MailboxIndex", b"hierarchy_mailbox_index")
@@ -603,16 +606,229 @@ def test_tip_prefilters_once_with_clean_git_environment(monkeypatch):
     assert parsed == [INDEX] + sorted(ADMITTED_IMPORTERS.intersection(tracked))
 
 
-def test_owner_admits_only_doctor_and_refuses_a_second_importer(shadow_signature):
+def test_owner_admits_five_shadow_readers_and_refuses_unlisted_importer(shadow_signature):
     doctor = "tools/hierarchy_mailbox_doctor.py"
-    assert ADMITTED_IMPORTERS == frozenset({doctor})
+    assert ADMITTED_IMPORTERS == frozenset({doctor, *("tools/" + name + ".py" for name in SHADOW_READERS)})
     raw = b'from tools.hierarchy_mailbox_index import MailboxIndex\nMailboxIndex(mailbox, mode="shadow")\n'
-    assert _importer_violations(raw, doctor, shadow_signature) == []
+    for path in sorted(ADMITTED_IMPORTERS):
+        assert _importer_violations(raw, path, shadow_signature) == []
+        assert _importer_violations(_read_source(REPO, path, MAX_SOURCE), path, shadow_signature) == []
+        for mode in (b"indexed", b"other"):
+            assert _importer_violations(raw.replace(b"shadow", mode), path, shadow_signature) == [
+                _message(path, 2, "RF24_MODE")]
     second = "tools/second_reader.py"
     assert _importer_violations(raw, second, shadow_signature) == [_message(second, 1, "RF24_MENTION")]
     # New files may be untracked in a writer handoff. Check the admitted source
     # directly too; this remains a plain bounded read of our own repository.
     assert _importer_violations(_read_source(REPO, doctor, MAX_SOURCE), doctor, shadow_signature) == []
+
+
+SHADOW_READERS = ("hierarchy_jobs", "hierarchy_sweep", "hierarchy_provision", "hierarchy_provider_recovery")
+
+
+LOCKED_READER = '''class _MailboxReader:
+    """Keep binding and locking inside public read callables."""
+    def __init__(self, mailbox):
+        read_lock = Lock()
+        with read_lock:
+            index = MailboxIndex(mailbox, mode="shadow")
+
+        def read_messages():
+            with read_lock:
+                return index.messages()
+
+        def read_message(message_id):
+            with read_lock:
+                return index.get(message_id)
+
+        def read_mode():
+            with read_lock:
+                return index.mode
+
+        def read_divergence():
+            with read_lock:
+                return index.last_divergence
+
+        def read_reconciliation():
+            with read_lock:
+                return index.last_reconciliation
+
+        def read_changes():
+            with read_lock:
+                return index.content_changed
+
+        self.read_messages = read_messages
+        self.read_message = read_message
+        self.read_mode = read_mode
+        self.read_divergence = read_divergence
+        self.read_reconciliation = read_reconciliation
+        self.read_changes = read_changes
+
+    def messages(self):
+        return self.read_messages()
+
+    def get(self, message_id):
+        return self.read_message(message_id)
+
+    @property
+    def mode(self):
+        return self.read_mode()
+
+    @property
+    def last_divergence(self):
+        return self.read_divergence()
+
+    @property
+    def last_reconciliation(self):
+        return self.read_reconciliation()
+
+    @property
+    def content_changed(self):
+        return self.read_changes()
+'''
+
+
+def _assert_reader_history(tree, reader):
+    name = "tools/" + reader + ".py"
+    factories = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "mailbox_reader"]
+    assert len(factories) == 1
+    facades = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "_MailboxReader"]
+    _require(len(facades) == 1, name, "RF24_SIGNATURE")
+    facade = facades[0]
+    _require(ast.dump(facade) == ast.dump(ast.parse(LOCKED_READER).body[0]), name, "RF24_SIGNATURE")
+    owned = set(ast.walk(facade))
+    delegated = [node for node in owned if isinstance(node, ast.Attribute) and node.attr in {"messages", "get"}]
+    _require(sorted(node.attr for node in delegated) == ["get", "messages"], name, "RF24_SIGNATURE")
+    names = ScopedNames(tree, name)
+    lock_calls = [node for node in owned if isinstance(node, ast.Call) and _name(node.func, "Lock")]
+    _require(len(lock_calls) == 1 and names.resolve(lock_calls[0].func) == {"threading.Lock"},
+             name, "RF24_SIGNATURE")
+    constructors = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and _reference(node.func, names)]
+    _require(len(constructors) == 1 and constructors[0] in owned, name, "RF24_SIGNATURE")
+    _require(not any(isinstance(node, ast.Attribute) and node.attr.startswith("_")
+                     and not node.attr.startswith("__") for node in ast.walk(tree)), name, "RF24_SIGNATURE")
+    reads = [node for node in ast.walk(tree) if node not in owned and isinstance(node, ast.Attribute) and
+             (node.attr == "messages" or (node.attr == "get" and isinstance(node.value, ast.Call) and
+              isinstance(node.value.func, ast.Name) and node.value.func.id == "mailbox_reader"))]
+    assert len(reads) == dict(zip(SHADOW_READERS, (5, 2, 3, 1)))[reader]
+    for node in reads:
+        assert isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
+        assert node.value.func.id == "mailbox_reader"
+
+
+@pytest.mark.parametrize("reader", SHADOW_READERS)
+def test_admitted_readers_route_all_explicit_history_reads_through_shadow(reader):
+    tree = ast.parse(_read_source(REPO, "tools/" + reader + ".py", MAX_SOURCE))
+    _assert_reader_history(tree, reader)
+
+
+@pytest.mark.parametrize("mutation", [
+    "messages_unlocked", "get_unlocked", "bind_unlocked", "diagnostics_unlocked",
+    "extra_constructor", "raw_index_escape", "extra_outer_read", "wrong_lock", "private_attribute",
+])
+def test_reader_facade_guard_refuses_unlocked_or_bypassed_reads(mutation):
+    source = ("from threading import Lock\n" + LOCKED_READER
+              + "\ndef mailbox_reader(mailbox):\n    return _MailboxReader(mailbox)\n"
+              + "mailbox_reader(mb).messages()\n" * 5)
+    tree = ast.parse(source)
+    _assert_reader_history(tree, "hierarchy_jobs")
+    if mutation.endswith("_unlocked"):
+        method_name = {"messages_unlocked": "read_messages", "get_unlocked": "read_message",
+                       "bind_unlocked": "__init__", "diagnostics_unlocked": "read_divergence"}[mutation]
+        method = next(node for node in ast.walk(tree.body[1])
+                      if isinstance(node, ast.FunctionDef) and node.name == method_name)
+        position = 1 if method_name == "__init__" else 0
+        method.body[position:position + 1] = method.body[position].body
+    elif mutation == "wrong_lock":
+        tree = ast.parse(source.replace("from threading import Lock", "from contextlib import nullcontext as Lock"))
+    elif mutation == "raw_index_escape":
+        method = next(node for node in ast.walk(tree.body[1])
+                      if isinstance(node, ast.FunctionDef) and node.name == "read_messages")
+        method.body[0].body[0].value = ast.Name(id="index", ctx=ast.Load())
+    else:
+        extra = {"extra_constructor": 'raw = MailboxIndex(mb, mode="shadow")',
+                 "private_attribute": "facade._lock",
+                 "extra_outer_read": "mailbox_reader(mb).messages()"}[mutation]
+        tree.body.extend(ast.parse(extra).body)
+    with pytest.raises(AssertionError):
+        _assert_reader_history(tree, "hierarchy_jobs")
+
+
+@pytest.mark.parametrize("reader", SHADOW_READERS)
+@pytest.mark.parametrize("api", ["messages", "get", "missing"])
+@pytest.mark.parametrize("scenario", ["healthy", "concurrent_publish", "concurrent_rewrite", "refusal_retry", "unsupported"])
+def test_admitted_shadow_readers_preserve_pinned_outcomes(tmp_path, monkeypatch, reader, api, scenario):
+    module = importlib.import_module("tools." + reader)
+    import hierarchy_mailbox as hm
+
+    class InterleavedMailbox(hm.Mailbox):
+        before_read = None
+
+        def messages(self):
+            if self.before_read is not None:
+                self.before_read()
+            return super().messages()
+
+    root = tmp_path / "mailbox"
+    endpoints = {"a/front-door": {}, "a/orchestrator": {}, "a/lane/review": {"kind": "reviewer"}}
+    hm.initialize(root, {"schema": "aegis.hierarchy-pilot/v1", "writer_limit": 3,
+                         "endpoints": endpoints, "counterparts": []})
+    mailbox = InterleavedMailbox(root)
+    for endpoint in endpoints:
+        mailbox.bind({"endpoint": endpoint, "host": "test-host", "session": endpoint, "expected_generation": 0})
+    message = {"message_id": "seed", "from": "a/orchestrator", "to": "a/lane/review", "host": "test-host",
+               "session": "a/orchestrator", "binding_generation": 1, "type": "info", "body": "pinned body"}
+    mailbox.publish(message)
+    pinned = super(InterleavedMailbox, mailbox).messages
+    index = module.mailbox_reader(mailbox)
+    assert index.mode == "shadow"
+    identifier = "absent" if api == "missing" else "seed"
+
+    def read():
+        return index.messages() if api == "messages" else index.get(identifier)
+
+    if scenario == "unsupported":
+        monkeypatch.setattr("hierarchy_mailbox_index._checked_reads_supported", lambda: False)
+    elif scenario == "concurrent_publish":
+        publications = []
+
+        def publish_before_pinned_read():
+            if not publications:
+                publications.append(True)
+                mailbox.publish({**message, "message_id": "late"})
+
+        mailbox.before_read = publish_before_pinned_read
+    elif scenario == "concurrent_rewrite":
+        path = Path(pinned()["seed"]["path"])
+        original = path.read_bytes()
+        rewrites = []
+
+        def rewrite_before_pinned_read():
+            rewrites.append(True)
+            path.write_bytes(original.replace(b"pinned body", ("concurrent body %d" % len(rewrites)).encode("ascii")))
+
+        mailbox.before_read = rewrite_before_pinned_read
+    elif scenario == "refusal_retry":
+        path = Path(pinned()["seed"]["path"])
+        original = path.read_bytes()
+        path.write_bytes(b"malformed mailbox record")
+        with pytest.raises(ValueError) as expected:
+            pinned()
+        with pytest.raises(type(expected.value)) as actual:
+            read()
+        assert str(actual.value) == str(expected.value)
+        path.write_bytes(original)
+    result = read()
+    expected = pinned()
+    assert result == (expected if api == "messages" else expected.get(identifier))
+    if scenario == "concurrent_rewrite" and api != "missing":
+        assert index.last_divergence
+    elif scenario == "concurrent_publish":
+        assert index.last_divergence == []
+    # Repeated reads also see the canonical result after refusal or divergence.
+    result = read()
+    expected = pinned()
+    assert result == (expected if api == "messages" else expected.get(identifier))
 
 
 def _symlink(target, link, directory=False):

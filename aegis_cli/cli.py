@@ -163,6 +163,24 @@ def _build_parser(prog: str = PROG, *, error_policy=None) -> argparse.ArgumentPa
     return parser
 
 
+def _resolve_cli_binding(explicit, pin, accept=is_aegis_workspace):
+    """Keep discovery provenance separate from resolve_cli_root's fallback path."""
+    from aegis_core.workspace.binding import resolve_cli_root
+
+    discovered = None
+
+    def record(candidate):
+        nonlocal discovered
+        accepted = accept(candidate)
+        if accepted:
+            discovered = candidate
+        return accepted
+
+    root = resolve_cli_root(explicit, Path.cwd(), pin, accept=record)
+    # A returned pin passed the resolver's pin checks; a walk must have accepted it.
+    return root, root if pin or root == discovered else None
+
+
 def _attach_workspace(args: argparse.Namespace) -> None:
     """Resolve the workspace the command acts on (``args.ws``, ``args._project_root``).
 
@@ -180,9 +198,10 @@ def _attach_workspace(args: argparse.Namespace) -> None:
     from aegis_core.config import env_workspace
     from aegis_core.errors import WorkspaceNotFoundError
     from aegis_core.workspace.base import Workspace
-    from aegis_core.workspace.binding import check_pin_agrees, resolve_cli_root
+    from aegis_core.workspace.binding import check_pin_agrees
     from aegis_core.workspace.discovery import refuse_unmigrated_v3, unconverted_rule_files
 
+    args._ordinary_binding_root = None
     raw_ws = getattr(args, "workspace", None)
     args._workspace_arg = raw_ws
     pin = env_workspace()
@@ -205,7 +224,7 @@ def _attach_workspace(args: argparse.Namespace) -> None:
         args.ws = Workspace.for_init(raw_ws or Path.cwd())
     elif args.command == "migrate":
         # A legacy .soma/ is a workspace to migrate too.
-        root = resolve_cli_root(raw_ws, Path.cwd(), pin, accept=_migratable)
+        root, args._ordinary_binding_root = _resolve_cli_binding(raw_ws, pin, accept=_migratable)
         args.ws = None
         args._project_root = root
         args.workspace = str(root)
@@ -213,9 +232,9 @@ def _attach_workspace(args: argparse.Namespace) -> None:
     else:
         try:
             if args.command in _LEGACY_TOLERANT_COMMANDS:
-                root = resolve_cli_root(raw_ws, Path.cwd(), pin)
+                root, args._ordinary_binding_root = _resolve_cli_binding(raw_ws, pin)
             else:
-                root = resolve_cli_root(raw_ws, Path.cwd(), pin, accept=_refuse_legacy)
+                root, args._ordinary_binding_root = _resolve_cli_binding(raw_ws, pin, accept=_refuse_legacy)
                 refuse_unmigrated_v3(root)  # a pin is not walked
                 _check_upgrade_state(args.command, root, args=args)
             args.ws = Workspace(root=root)
@@ -300,87 +319,10 @@ _WORKSPACE_ERROR_EXIT: Dict[str, int] = {"scan": 2}
 def _print_hold(args: argparse.Namespace, exc: Exception) -> None:
     """A workspace hold: machine-readable with --json, one stderr line otherwise."""
     import json
-    from aegis_core.guidance_projection import (
-        MAX_GUIDANCE_CHARS, GuidanceProjectionError, project_error_name, project_diagnostic,
-    )
+    from aegis_core.workspace.diagnostics import project_binding
 
-    canonical = exc.binding  # type: ignore[attr-defined]
-    raw = {"status": canonical.status, "root": str(canonical.root) if canonical.root is not None else None,
-           "source": canonical.source, "confidence": canonical.confidence, "reason": canonical.reason}
     supplied = getattr(args, "_workspace_arg", getattr(args, "workspace", None))
-    # Validate the complete collection before copying or projecting any detail.
-    refusal = None
-    items = len(canonical.details)
-    for value in (*raw.values(), supplied):
-        if value is not None:
-            if not isinstance(value, str):
-                refusal = "guidance_projection_invalid_field"
-                break
-            if len(value) > MAX_GUIDANCE_CHARS:
-                refusal = GuidanceProjectionError.code
-                break
-    if items > 256:
-        refusal = GuidanceProjectionError.code
-    allowed = {"pin", "target", "cwd", "cwd_root", "host_root", "registered_root", "host_roots", "candidates"}
-    if refusal is None:
-        for key, value in canonical.details:
-            if key not in allowed or not isinstance(value, list if key in {"host_roots", "candidates"} else str):
-                refusal = "guidance_projection_invalid_field"
-                break
-            items += len(value) if isinstance(value, list) else 1
-            if items > 256:
-                refusal = GuidanceProjectionError.code
-                break
-            for path in value if isinstance(value, list) else (value,):
-                if not isinstance(path, str):
-                    refusal = "guidance_projection_invalid_field"
-                    break
-                if len(path) > MAX_GUIDANCE_CHARS:
-                    refusal = GuidanceProjectionError.code
-                    break
-            if refusal is not None:
-                break
-    binding = {}
-    for key, value in raw.items():
-        if value is None:
-            binding[key] = None
-        else:
-            try:
-                name = project_error_name(value)
-            except GuidanceProjectionError as error:
-                name = error.code
-            binding[key] = project_diagnostic(name, escaped=False)
-    details = {}
-    if refusal is None:
-        for key, value in canonical.details:
-            shown = []
-            for path in value if isinstance(value, list) else (value,):
-                try:
-                    name = project_error_name(path)
-                except GuidanceProjectionError as error:
-                    name = error.code
-                shown.append(project_diagnostic(name, escaped=False))
-            details[key] = shown if isinstance(value, list) else shown[0]
-        if supplied is not None:
-            try:
-                supplied = project_diagnostic(project_error_name(supplied), escaped=False)
-            except GuidanceProjectionError as error:
-                supplied = error.code
-    templates = {
-        "pin_conflicts_with_target": (
-            "--workspace {workspace} resolves to {target}, but AEGIS_WORKSPACE pins {pin}; "
-            "unset the pin or drop --workspace", ("pin", "target")),
-        "pin_conflicts_with_cwd": (
-            "AEGIS_WORKSPACE pins {pin}, but the current directory {cwd} is in {cwd_root}; "
-            "unset the pin, or run aegis from the pinned project", ("pin", "cwd", "cwd_root")),
-    }
-    template, required = templates.get(canonical.reason, ("workspace binding refused", ()))
-    if refusal is None and not all(isinstance(details.get(key), str) for key in required):
-        refusal = "guidance_projection_invalid_field"
-    # Every interpolation is already projected; the raw message is never searched.
-    message = refusal or template.format(**details, workspace=supplied or details.get("target", "workspace"))
-    binding["message"] = project_diagnostic(message, escaped=False)
-    binding["details"] = details if refusal is None else {}
+    binding = project_binding(exc.binding, workspace=supplied, cli=True)  # type: ignore[attr-defined]
     if getattr(args, "json", False):
         print(json.dumps({
             **binding,
@@ -422,66 +364,30 @@ class _DefaultErrorPolicy:
         if args.command != "scan" or isinstance(error, WorkspaceHold):
             return None
         from aegis_core.guidance_projection import (
-            MAX_GUIDANCE_CHARS, GuidanceProjectionError, project_error_name, project_diagnostic,
+            MAX_GUIDANCE_CHARS, GuidanceProjectionError, project_diagnostic,
         )
+        from aegis_core.workspace.binding import WorkspaceBinding
+        from aegis_core.workspace.diagnostics import project_binding
 
-        if isinstance(error, OSError):
-            if getattr(args, "_workspace_pin", None):
-                message = "AEGIS_WORKSPACE "
-            elif getattr(args, "_workspace_arg", None) or getattr(args, "_workspace_cwd", None):
-                message = "--workspace "
-            else:
-                message = "workspace binding refused"
+        prepared = getattr(args, "_workspace_error_display", None)
+        binding = getattr(error, "binding", None)
+        if prepared is not None:
+            message = project_diagnostic(prepared, escaped=False)
+        elif binding is not None:
+            message = project_binding(binding, workspace=getattr(args, "_workspace_pin", None), cli=True)["message"]
+        elif isinstance(error, OSError):
+            pin = getattr(args, "_workspace_pin", None)
+            target = getattr(args, "_workspace_arg", None) or getattr(args, "_workspace_cwd", None)
+            kind = "pin_resolution" if pin else "target_resolution" if target else None
+            binding = WorkspaceBinding("error", reason="no_workspace", kind=kind,
+                                       details=(("pin", pin),) if pin else (("target", target),) if target else ())
+            message = project_binding(binding, cli=True)["message"]
         elif isinstance(error, WorkspaceError):
-            message = str(error)
+            # Unclassified exceptions never acquire authority from their wording.
+            message = GuidanceProjectionError.code if len(str(error)) > MAX_GUIDANCE_CHARS else "workspace binding refused"
         else:
             return None
-        prepared = getattr(args, "_workspace_error_display", None)
-        if prepared is not None:
-            message = prepared
-        else:
-            home = message.endswith("is the home directory; ~/.aegis is the user rule layer); "
-                                    "run aegis init in a project")
-            root = message.endswith("is the filesystem root); run aegis init in a project")
-            pin_set = message.startswith("AEGIS_WORKSPACE is set to ")
-            pin_resolution = message.startswith("AEGIS_WORKSPACE ")
-            target_resolution = message.startswith("--workspace ")
-            if not (pin_set or pin_resolution or target_resolution or home or root):
-                # Only genuine exception text is subject to a whole-message bound.
-                message = GuidanceProjectionError.code if len(message) > MAX_GUIDANCE_CHARS else "workspace binding refused"
-            else:
-                parts = {"pin": getattr(args, "_workspace_pin", None),
-                         "target": getattr(args, "_workspace_arg", None) or getattr(args, "_workspace_cwd", None)}
-                if any(isinstance(value, str) and len(value) > MAX_GUIDANCE_CHARS for value in parts.values()):
-                    message = GuidanceProjectionError.code
-                else:
-                    if home or root and isinstance(parts["target"], str):
-                        try:
-                            parts["target"] = str(Path.home().resolve() if home else Path(os.path.expanduser(parts["target"])).resolve())
-                        except (OSError, RuntimeError, ValueError):
-                            parts["target"] = None
-                    for key, value in parts.items():
-                        try:
-                            parts[key] = project_diagnostic(project_error_name(value), escaped=False)
-                        except GuidanceProjectionError as projection_error:
-                            parts[key] = projection_error.code
-                    # Compose fixed wording from independently bounded identities.
-                    if pin_set:
-                        suffixes = (", which is not a directory", ", which has no .aegis/ (run aegis init there)",
-                                    ", which is the home directory", ", which is the filesystem root")
-                        suffix = next((s for s in suffixes if message.endswith(s)), ", which cannot be resolved")
-                        message = "AEGIS_WORKSPACE is set to " + parts["pin"] + suffix
-                    elif pin_resolution:
-                        message = "AEGIS_WORKSPACE " + parts["pin"] + " cannot be resolved"
-                    elif target_resolution:
-                        message = "--workspace " + parts["target"] + " cannot be resolved"
-                    elif home:
-                        message = ("not an Aegis workspace (" + parts["target"]
-                                   + " is the home directory; ~/.aegis is the user rule layer); run aegis init in a project")
-                    else:
-                        message = ("not an Aegis workspace (" + parts["target"]
-                                   + " is the filesystem root); run aegis init in a project")
-        print("Error: " + project_diagnostic(message, escaped=False), file=sys.stderr)
+        print("Error: " + message, file=sys.stderr)
         return _WORKSPACE_ERROR_EXIT["scan"]
 
 
@@ -517,10 +423,22 @@ def _invocation_policy(argv):
     return policy
 
 
+def _ordinary_bound_root(args: argparse.Namespace):
+    """Only explicit successful resolution can mark an ordinary invocation."""
+    return getattr(args, "_ordinary_binding_root", None)
+
+
 def main(argv: Optional[List[str]] = None, prog: str = PROG) -> int:
+    from aegis_core.pathlookup import ordinary_root
+
     argv = list(sys.argv[1:] if argv is None else argv)
     policy = _invocation_policy(argv)
-    return policy.run(partial(_main, argv, prog, policy))
+    # A nested invocation must discover its own binding without the caller's fence.
+    token = ordinary_root.set(None)
+    try:
+        return policy.run(partial(_main, argv, prog, policy))
+    finally:
+        ordinary_root.reset(token)
 
 
 def _main(argv: List[str], prog: str, policy=None) -> int:
@@ -556,9 +474,11 @@ def _main(argv: List[str], prog: str, policy=None) -> int:
         return 0
 
     command = get_default_registry().get(args.command)
+    from aegis_core import pathlookup
     from aegis_core.errors import WorkspaceError
     from aegis_core.workspace.binding import WorkspaceHold
 
+    ordinary_token = None
     try:
         try:
             if args.command != "workspace":
@@ -583,6 +503,9 @@ def _main(argv: List[str], prog: str, policy=None) -> int:
             else:
                 print(f"Error: {exc}", file=sys.stderr)
             return _WORKSPACE_ERROR_EXIT.get(args.command, 1)
+        bound_root = _ordinary_bound_root(args)
+        if bound_root is not None:
+            ordinary_token = pathlookup.ordinary_root.set(os.path.normcase(os.fspath(bound_root)))
         return command.execute(args)
     except KeyboardInterrupt:
         return 130
@@ -597,6 +520,9 @@ def _main(argv: List[str], prog: str, policy=None) -> int:
             message = str(e)
         print(f"Error: {message}", file=sys.stderr)
         return 1
+    finally:
+        if ordinary_token is not None:
+            pathlookup.ordinary_root.reset(ordinary_token)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ import time
 import pytest
 
 from aegis_core import gitsafe, gitsafe_run, gitops_fds
+from tests.helpers_team_git import strict_program, strict_program_guard
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
 
@@ -328,23 +329,6 @@ def test_retained_capture_default_refusal_is_git_error(tmp_path):
         gitsafe_run.capture([], cwd=tmp_path, env={}, stdin=None, timeout=1)
     assert (caught.value.code, str(caught.value), caught.value.process_started) == (
         "invalid_custody", "invalid custody capture", False)
-
-
-def strict_program_guard(*, optional=False, native_fixture=False):
-    """One capability check, exposed as a fixture and for conditional helper setup."""
-    supported = gitsafe_run._program_supported()
-    reason = "strict runner requires descriptor-bound native executable support"
-    if supported and native_fixture and shutil.which("cc") is None:
-        supported = False
-        reason = "native strict-effect fixture needs an installed C compiler"
-    if not supported and not optional:
-        pytest.skip(reason)
-    return supported
-
-
-@pytest.fixture
-def strict_program():
-    return strict_program_guard()
 
 
 _NATIVE_STUB = {}
@@ -2623,7 +2607,7 @@ def test_cache_primed_before_workspace_symlink_retarget_is_skipped(tmp_path, fre
             found = gitsafe.git_executable(cwd=ws)
             assert found != str(alias)
             assert os.path.samefile(found, real_git)
-            assert pathlookup._inside(str(alias), pathlookup.git_fence(ws))
+            assert pathlookup._provenance_inside(str(alias), pathlookup.git_fence(ws))
             result = gitsafe.run(["--version"], ws)
     assert result.returncode == 0 and result.stdout.startswith(b"git version")
     assert not marker.exists()
@@ -3506,11 +3490,16 @@ def test_owner_readiness_stderr_is_bounded_canonicalized_and_redacted(tmp_path):
         assert stream.tell() == 65536 and os.get_blocking(stream.fileno())
 
 
-def test_owner_native_fixture_without_a_compiler_skips_before_child(tmp_path, monkeypatch):
+@pytest.mark.parametrize("cache_state", ["empty", "populated"])
+def test_owner_native_fixture_without_a_compiler_skips_before_child(tmp_path, monkeypatch, cache_state):
     from types import SimpleNamespace
+    monkeypatch.setattr("tests.unit.core.test_gitsafe._NATIVE_STUB", {})
+    if cache_state == "populated":
+        strict_program_guard(native_fixture=True)
+        _native_program(tmp_path / "cached-native", "#!/bin/sh\nexit 0\n")
     monkeypatch.setattr(gitsafe_run, "_program_supported", lambda: True)
     which = shutil.which
-    monkeypatch.setattr("tests.unit.core.test_gitsafe.shutil", SimpleNamespace(**{**vars(shutil),
+    monkeypatch.setattr("tests.helpers_team_git.shutil", SimpleNamespace(**{**vars(shutil),
         "which": lambda name: None if name == "cc" else which(name)}))
     def forbidden(*args, **kwargs):
         pytest.fail("missing fixture compiler started an owner child")
@@ -6461,25 +6450,33 @@ def test_ordinary_git_shims_preserve_script_identity(repo, tmp_path, monkeypatch
 
 # Exact AST proofs are reserved for refusals before lookup or mixed variants.
 # A changed body invalidates its proof; new construction sites need a guard.
+_STRICT_CENSUS_SOURCES = {
+    "test_gitsafe": "tests/unit/core/test_gitsafe.py",
+    "test_ghcli": "tests/unit/core/test_ghcli.py",
+    "test_team_git": "tests/unit/core/test_team_git.py",
+    "helpers_team_git": "tests/helpers_team_git.py",
+}
+
 _STRICT_SITE_PROOFS = {
+    ('test_gitsafe', 'test_bound_root_does_not_change_supplied_or_unsupported_strict_lookup'): ('489c9f1bb9b60e968c51f0bd9a741dadf130f2404e7f4fe9643fc01923e15cfb', 'The program probe is forced false; custody_program must refuse unsupported_effect_platform before spawn on every platform.'),
     ('test_gitsafe', 'test_effect_descriptor_refused_before_any_spawn'): ('f440d542ccf05a986720fb51cdadb1b5a38a54c0c776d783a4c8c4f2fa72e07b', 'Invalid receipt descriptors refuse in pass_through before executable lookup.'),
     ('test_gitsafe', 'test_effect_unsupported_platform_is_a_pre_spawn_refusal'): ('4480e3b2ef2f7c06b1c60a74288dd00df9da0584dae64c5a8a765ec7437174ba', 'The effect-platform probe is forced false; pass_through refuses before lookup.'),
     ('test_gitsafe', 'test_effect_write_roots_refuse_before_expansion'): ('f8042b05a19e1caa57c0370d7e57ff2c964a11d522499873180c6f8ad4bada44', 'Invalid or oversized root containers refuse before executable lookup.'),
     ('test_gitsafe', 'test_envelope_kind_cannot_cross_a_public_boundary'): ('dfba2f124365cffe5c6e988b6f86c1109e5f6d2c68c4f33778ef606bbb5d5373', 'Every source kind differs from the target boundary; constructor validation refuses before lookup.'),
     ('test_gitsafe', 'test_strict_executable_platform_probe_has_its_own_refusal'): ('c26c24a220cd30cb3b4c46b1965c9727842f2183fa2d6d84107dc9161da964cb', 'The program capability probe is forced false and its documented refusal is asserted.'),
-    ('test_gitsafe', 'test_strict_capture_own_bindings_do_not_admit_injected_locations'): ('ee30e9f8dd120b16ead59aa4265186837103d5bd6999614ce06ce23aa1e56055', 'Only capture issues a clean lane; it calls the shared guard. All other entries inject a forbidden selector before issuance.'),
-    ('test_gitsafe', 'test_selector_inputs_refuse_before_git_spawn'): ('68d522bde57ca81d421d5ad7c285e262b99f9c702564f2767cde4ccc5a8a9efb', 'Clean baseline and preissued variants call the shared guard; other variants supply forbidden selectors before lookup.'),
-    ('test_gitsafe', 'test_per_call_selectors_refuse_before_effect_spawn'): ('6f690fcf186fa9527f647be96f092e7cf810ccadbd89599ba90643b2ae2d8269', 'Lane and reused-source variants guard clean setup; raw, custody and strict calls reject the per-call selector before lookup.'),
-    ('test_team_git', 'test_ambient_environment_disappearing_during_snapshot_has_a_public_refusal'): ('86ad10f3db2ffc01d61d426217487c870ee1a36b4af7096b2e5229387b02b050', 'Input snapshot raises before lookup; successful recovery uses the shared optional guard.'),
-    ('test_team_git', 'test_ambient_key_diagnostics_canonicalize_and_redact_before_display'): ('2f58eb082d785f6760aa0d95374aca2202893d87af598e9d9f1cad8d570068f3', 'Forbidden ambient Git selector refuses before lookup.'),
-    ('test_team_git', 'test_ambient_lowercase_key_refuses_with_its_real_spelling'): ('6459fb273f706030d8118adecb9f59c3ed4eefa1c7aac758c1e61c93a055a008', 'Forbidden lowercase selector refuses before lookup; helper guard is deliberately bypassed.'),
-    ('test_team_git', 'test_ambient_refusal_is_deterministic_and_lists_every_exact_key'): ('54e6f3cb00831ad675cc9fd504e4e5854da4e7494fe09b04219a72f5fcea0c1b', 'Every subprocess environment contains forbidden Git location/trace selectors before lookup.'),
-    ('test_team_git', 'test_invalid_root_identity_precedes_git_or_metadata'): ('ac07c7dea4d2f129ea16e005df4c23822b062ca67033e6c0b90f888b9218d503', 'Every supplied root is relative, traversal-bearing or contains NUL; root validation precedes Git.'),
-    ('test_team_git', 'test_missing_fenced_git_refuses_before_discovery_and_retries'): ('131c624a9f1423f49752169fd0d0e9deaee99daa81baedea04b0d496f75b872d', 'The resolver callback lacks its required environ argument and refuses before lookup; successful recovery is guarded.'),
-    ('test_team_git', 'test_relative_cwd_public_routes_share_the_git_error_hierarchy'): ('7f61255ee0e682c76557f65299ce581e3a3bffe23590b0ee7d36fb0771ea781a', 'Capture guards its valid executable setup; every other route supplies a relative root and refuses before lookup.'),
-    ('test_team_git', 'test_runner_ambient_redirect_before_entry_refuses_and_retries'): ('e024521e0b976e766cc6dc6e3d4ec7c79d97c2db1d48274597b4b6a2b36b8f7c', 'Forbidden environment inputs refuse before lookup; only successful recovery is guarded.'),
-    ('test_team_git', 'test_store_entry_environment_bounds_have_public_refusal_and_retry'): ('0a8e1a01070e9502eea2409a90283a17323b1d05b99c30289cfbdd00c25fbc29', 'Oversized inputs refuse before lookup; only bounded successful recovery is guarded.'),
-    ('test_gitsafe', 'test_effect_capture_spawn_golden_and_exactly_one_extra_fd'): ('c9d7ef0dcb84da70108ec614400efd7926769e8db71079d92d74c6a732fbbd86', 'Only the ordinary capture variant avoids strict lookup; every other variant calls the shared guard first.'),
+    ('test_gitsafe', 'test_strict_capture_own_bindings_do_not_admit_injected_locations'): ('cf58eb60d2e79fd91503ae2c6a4dc7b76f17c4e1fce762d0e949f06d0f687232', 'Only capture issues a clean lane; it calls the shared guard. All other entries inject a forbidden selector before issuance.'),
+    ('test_gitsafe', 'test_selector_inputs_refuse_before_git_spawn'): ('f9ea34d0d1728251da300947a5857d412d390fae06aabd82ec2615a34ee8b691', 'Clean baseline and preissued variants call the shared guard; other variants supply forbidden selectors before lookup.'),
+    ('test_gitsafe', 'test_per_call_selectors_refuse_before_effect_spawn'): ('91b3f072baf6dcaf111c58c71e13e6b59f953f671a966e73a4024352c484ec89', 'Lane and reused-source variants guard clean setup; raw, custody and strict calls reject the per-call selector before lookup.'),
+    ('test_team_git', 'test_ambient_environment_disappearing_during_snapshot_has_a_public_refusal'): ('153ae9da3fbf92ca0a2817d999b8d7c5646dcf41f8d74e1cdb24ee518b364e5d', 'Input snapshot raises before lookup; successful recovery uses the shared optional guard.'),
+    ('test_team_git', 'test_ambient_key_diagnostics_canonicalize_and_redact_before_display'): ('5acdfc974780a818fc6a19f5bbfe86fbe4eb13479f80aced9fd03804cae87800', 'Forbidden ambient Git selector refuses before lookup.'),
+    ('test_team_git', 'test_ambient_lowercase_key_refuses_with_its_real_spelling'): ('3d4c462a8dc08273121ce4e084b3abc7ea23c57faa7e8916e07e2f05ccb2fe4f', 'Forbidden lowercase selector refuses before lookup; helper guard is deliberately bypassed.'),
+    ('test_team_git', 'test_ambient_refusal_is_deterministic_and_lists_every_exact_key'): ('29fe6bc8d5274beee29e0a77e957175e6e27f2bd522a652202821708e28fd954', 'Every subprocess environment contains forbidden Git location/trace selectors before lookup.'),
+    ('test_team_git', 'test_invalid_root_identity_precedes_git_or_metadata'): ('d08cd9c5fbb33bb31b87cf9f13d652da43a28a55330d36bb4405423630fb1b1c', 'Every supplied root is relative, traversal-bearing or contains NUL; root validation precedes Git.'),
+    ('test_team_git', 'test_missing_fenced_git_refuses_before_discovery_and_retries'): ('34311605be3cd567e7f19bb97d81fd2f5658d60fb3bdd3b9b3354b25e49d5d65', 'The resolver callback lacks its required environ argument and refuses before lookup; successful recovery is guarded.'),
+    ('test_team_git', 'test_relative_cwd_public_routes_share_the_git_error_hierarchy'): ('94b2cfc21ce24401758b5f55cc874b79a6f8a935d4370a76d3a4d110beac713b', 'Capture guards its valid executable setup; every other route supplies a relative root and refuses before lookup.'),
+    ('test_team_git', 'test_runner_ambient_redirect_before_entry_refuses_and_retries'): ('f6d22cbb652d556adfaee52f04a1215b43dd13f29595bd396879cd2cd3e240b1', 'Forbidden environment inputs refuse before lookup; only successful recovery is guarded.'),
+    ('test_team_git', 'test_store_entry_environment_bounds_have_public_refusal_and_retry'): ('1383f0c2e836cf9413f249a9919be2876f073813b22ffaac18c5abcede4a136b', 'Oversized inputs refuse before lookup; only bounded successful recovery is guarded.'),
+    ('test_gitsafe', 'test_effect_capture_spawn_golden_and_exactly_one_extra_fd'): ('6199733cdfe02e771bf3632262acffb7d1f3dd51598b1ae2de221f71fc7fa23d', 'Only the ordinary capture variant avoids strict lookup; every other variant calls the shared guard first.'),
 }
 
 
@@ -6628,8 +6625,8 @@ def _strict_runner_census(sources, *, parse=ast.parse):
 
 
 def test_every_strict_runner_construction_has_a_shared_capability_guard():
-    names = ("test_gitsafe", "test_ghcli", "test_team_git")
-    sources = {name: (ROOT / "tests/unit/core" / (name + ".py")).read_text(encoding="utf-8") for name in names}
+    sources = {name: (ROOT / _STRICT_CENSUS_SOURCES[name]).read_text(encoding="utf-8")
+               for name in _STRICT_CENSUS_SOURCES}
     rows = _strict_runner_census(sources)
     missing = [row for row in rows if not row["guarded"]]
     assert missing == []
@@ -6695,8 +6692,8 @@ def test_late(repo, scratch):
 
 
 def test_strict_census_repository_set_is_schema_independent():
-    sources = {name: (ROOT / "tests/unit/core" / (name + ".py")).read_text(encoding="utf-8")
-               for name in ("test_gitsafe", "test_ghcli", "test_team_git")}
+    sources = {name: (ROOT / _STRICT_CENSUS_SOURCES[name]).read_text(encoding="utf-8")
+               for name in _STRICT_CENSUS_SOURCES}
     native = _strict_runner_census(sources)
     for schema in ("py39", "py312"):
         rows = _strict_runner_census(sources, parse=lambda text: _census_parse_schema(text, schema))
@@ -6715,13 +6712,19 @@ def test_strict_proof_normalizes_only_empty_type_parameters():
 
 
 def test_strict_program_guard_has_one_shared_capability_probe():
-    sources = {name: ast.parse((ROOT / "tests/unit/core" / (name + ".py")).read_text(encoding="utf-8"))
-               for name in ("test_gitsafe", "test_ghcli", "test_team_git")}
+    sources = {name: ast.parse((ROOT / _STRICT_CENSUS_SOURCES[name]).read_text(encoding="utf-8"))
+               for name in _STRICT_CENSUS_SOURCES}
     probes = [(name, node.lineno) for name, tree in sources.items() for node in ast.walk(tree)
               if isinstance(node, ast.Call) and ast.unparse(node.func).endswith("._program_supported")]
-    assert probes == [("test_gitsafe", strict_program_guard.__code__.co_firstlineno + 2)]
-    for name in ("test_ghcli", "test_team_git"):
-        assert any(isinstance(node, ast.ImportFrom) and node.module == "tests.unit.core.test_gitsafe"
+    assert probes == [("helpers_team_git", strict_program_guard.__code__.co_firstlineno + 2)]
+    guard = next(node for node in sources["helpers_team_git"].body
+                 if isinstance(node, ast.FunctionDef) and node.name == "strict_program_guard")
+    assert [node.lineno for node in ast.walk(guard) if isinstance(node, ast.Call)
+            and ast.unparse(node.func).endswith("._program_supported")] == [probes[0][1]]
+    for name, home in (("test_gitsafe", "tests.helpers_team_git"),
+                       ("test_ghcli", "tests.unit.core.test_gitsafe"),
+                       ("test_team_git", "tests.helpers_team_git")):
+        assert any(isinstance(node, ast.ImportFrom) and node.module == home
                    and {"strict_program", "strict_program_guard"} <= {alias.name for alias in node.names}
                    for node in sources[name].body)
 
@@ -6871,3 +6874,112 @@ def test_effect_cleanup_keeps_timeout_class_and_closes_every_stream(fault):
     finally:
         for stream in streams:
             stream.close()
+
+
+def _bound_fence(path):
+    from aegis_core.primitives import real_key
+    return real_key(os.fspath(path))
+
+
+@contextlib.contextmanager
+def _bound_ordinary_root(path):
+    from aegis_core import pathlookup
+    token = pathlookup.ordinary_root.set(_bound_fence(path))
+    try:
+        yield
+    finally:
+        pathlookup.ordinary_root.reset(token)
+
+
+def test_bound_root_runs_enclosing_git_skips_workspace_git_and_retries(tmp_path, fresh_git_lookup):
+    """Git in the enclosing checkout is outside the owner root; git inside it is still refused."""
+    from aegis_core import pathlookup
+    from aegis_core.primitives import sanitize_display
+    from aegis_core.redaction import redact_insight_text
+    enclosing = _worktree(tmp_path / "home-dotfiles")
+    secret = "AKIAIOSFODNN7EXAMPLE"
+    app = _worktree(enclosing / secret)
+    (app / "sub").mkdir()
+    inside = tmp_path / "INSIDE"
+    outside = tmp_path / "OUTSIDE"
+    _plant_git(app / "bin", inside)
+    _plant_git(enclosing / "bin", outside)
+    planted = os.pathsep.join((str(app / "bin"), str(enclosing / "bin")))
+    with _temporary_env({"PATH": planted}):
+        with pytest.raises(gitsafe.GitError) as unbound:
+            gitsafe.run(["--version"], app / "sub")
+    assert unbound.value.code == "ERR_AEGIS"
+    assert not inside.exists() and not outside.exists()
+    with _bound_ordinary_root(app):
+        with _temporary_env({"PATH": planted}):
+            allowed = gitsafe.run(["--version"], app / "sub")
+        assert allowed.returncode == 0
+        assert outside.exists() and not inside.exists()
+        outside.unlink()
+        with _temporary_env({"PATH": str(app / "bin")}):
+            with pytest.raises(gitsafe.GitError) as refused:
+                gitsafe.run(["--version"], app)
+        fence = pathlookup.GitCache().for_cwd(app).fence
+        canonical = sanitize_display(fence, max_len=None)
+        expected = sanitize_display(redact_insight_text(canonical, max_len=max(1, len(canonical))), max_len=256)
+        assert refused.value.code == "ERR_AEGIS"
+        assert str(refused.value).endswith(expected)
+        assert secret not in str(refused.value)
+        assert "[REDACTED_AWS]" in str(refused.value)
+        assert "\n" not in str(refused.value) and "\r" not in str(refused.value)
+        assert not inside.exists()
+        with _temporary_env({"PATH": _REAL_GIT_DIR}):
+            retried = gitsafe.run(["--version"], app)
+        assert retried.returncode == 0 and retried.stdout.startswith(b"git version")
+        assert not inside.exists()
+    assert pathlookup.ordinary_root.get() is None
+    with _temporary_env({"PATH": planted}):
+        with pytest.raises(gitsafe.GitError):
+            gitsafe.run(["--version"], app)
+    assert not outside.exists() and not inside.exists()
+
+
+def test_bound_root_holds_for_ordinary_lookup_when_descriptors_are_unavailable(tmp_path, fresh_git_lookup):
+    from aegis_core import pathlookup
+    enclosing = _worktree(tmp_path / "home-dotfiles")
+    app = _worktree(enclosing / "app")
+    marker = tmp_path / "PWNED"
+    _plant_git(enclosing / "bin", marker)
+    probe = pathlookup.descriptor_fence_supported
+    pathlookup.descriptor_fence_supported = lambda: False
+    try:
+        with _bound_ordinary_root(app):
+            with _temporary_env({"PATH": str(enclosing / "bin")}):
+                result = gitsafe.run(["--version"], app)
+            assert pathlookup.GitCache().for_cwd(app).fence == _bound_fence(app)
+    finally:
+        pathlookup.descriptor_fence_supported = probe
+    assert result.returncode == 0 and marker.exists()
+    assert pathlookup.ordinary_root.get() is None
+
+
+def test_bound_root_does_not_change_supplied_or_unsupported_strict_lookup(tmp_path, monkeypatch, fresh_git_lookup):
+    from types import SimpleNamespace
+    from aegis_core import pathlookup
+    enclosing = _worktree(tmp_path / "home-dotfiles")
+    app = _worktree(enclosing / "app")
+    seen = []
+    real = pathlookup.which
+
+    def which(name, *args, **kwargs):
+        seen.append(kwargs.get("outside"))
+        return real(name, *args, **kwargs)
+
+    monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(**{**vars(pathlookup), "which": which}))
+    with _bound_ordinary_root(app):
+        assert gitsafe.git_executable(cwd=enclosing) == real("git", path=os.environ.get("PATH", os.defpath),
+                                                              outside=_bound_fence(app), fence_program=True, descriptors=False)
+        seen.clear()
+        assert gitsafe.git_executable(environ={"PATH": _REAL_GIT_DIR}, cwd=enclosing)
+        assert seen and all(os.path.normcase(os.path.realpath(item)) != _bound_fence(app) for item in seen)
+        monkeypatch.setattr(gitsafe_run, "_program_supported", lambda: False)
+        with pytest.raises(gitsafe.GitError) as caught:
+            gitsafe.custody_program(enclosing, environ={"PATH": _REAL_GIT_DIR})
+    assert caught.value.code == "unsupported_effect_platform"
+    assert caught.value.process_started is False
+    assert pathlookup.ordinary_root.get() is None

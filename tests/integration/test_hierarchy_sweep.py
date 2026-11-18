@@ -16,6 +16,7 @@ import signal
 import stat
 import subprocess
 import sys
+from types import SimpleNamespace
 import uuid
 
 import pytest
@@ -23,7 +24,9 @@ import pytest
 from tests.integration.test_hierarchy_background import STUB
 from tests.integration.test_hierarchy_delivery import HELPER
 from tests.integration.test_hierarchy_mailbox import ROOT, git, invoke
+from tests.integration.test_hierarchy_mailbox_index_reuse import make_mailbox, publish
 from tests.integration.test_hierarchy_provision import INITIATIVE, LANES, Setup, provision
+from tests.conftest import symlink_or_skip
 
 
 SWEEP = ROOT / "tools" / "hierarchy_sweep.py"
@@ -108,6 +111,262 @@ def test_nothing_unread_means_nothing_is_launched(fleet):
     assert result["quiet"] is True and result["rows"] == []
     assert result["root_queue"] == [] and result["still_unread"] == []
     assert fleet.launches() == []
+
+
+@pytest.mark.parametrize("action", ["quiet", "publish", "cross_publish", "fail_once"])
+def test_sweep_shares_each_pass_summary_and_refreshes_after_wakes(fleet, monkeypatch, action):
+    import hierarchy_sweep as candidate
+
+    original = candidate.summaries
+    calls = []
+    other = second_initiative(fleet) if action == "cross_publish" else None
+
+    def observed(initiative, durable=False, **kwargs):
+        calls.append(initiative["id"])
+        if action == "fail_once" and len(calls) == 1:
+            raise ValueError("mailbox unavailable")
+        return original(initiative, durable, **kwargs)
+
+    def wake(initiative, name, summary, dry_run, durable=False):
+        if other is None:
+            fleet.send("pilot/orchestrator", "pilot/front-door", "published-during-wake")
+        else:
+            fleet.send("second/orchestrator", "second/front-door", "published-during-wake", root=other)
+        return {"initiative": initiative["id"], "endpoint": name, "state": "refused"}
+
+    monkeypatch.setattr("hierarchy_sweep.summaries", observed)
+    monkeypatch.setattr("hierarchy_sweep.wake_endpoint", wake)
+    if action in ("publish", "cross_publish"):
+        fleet.send("pilot/front-door", "pilot/orchestrator", "wake-trigger")
+    code, result = candidate.run(fleet.workspace.store, 1, (), False)
+    assert len(calls) == (2 if action == "quiet" else 4 if action == "cross_publish" else 2)
+    if action in ("publish", "cross_publish"):
+        assert code == 3
+        assert {row["endpoint"] for row in result["still_unread"]} == {
+            "pilot/orchestrator", "second/front-door" if other is not None else "pilot/front-door"}
+    elif action == "fail_once":
+        assert code == 3 and result["rows"][0]["error"] == "mailbox unavailable"
+    else:
+        assert code == 0 and result["quiet"] is True
+
+
+def test_sweep_failed_pass_does_not_reuse_a_previous_pass_summary(fleet, monkeypatch):
+    import hierarchy_sweep as candidate
+
+    other = second_initiative(fleet, priority=10)
+    fleet.send("pilot/front-door", "pilot/orchestrator", "wake-trigger")
+    original = candidate.summaries
+    second_reads = []
+
+    def observed(initiative, durable=False, **kwargs):
+        if initiative["id"] == "second":
+            second_reads.append(True)
+            if len(second_reads) == 2:
+                fleet.send("second/orchestrator", "second/front-door", "published-before-failure", root=other)
+                raise ValueError("later pass unavailable")
+        return original(initiative, durable, **kwargs)
+
+    def wake(initiative, name, summary, dry_run, durable=False):
+        return {"initiative": initiative["id"], "endpoint": name, "state": "started", "wake_exit": 0}
+
+    monkeypatch.setattr("hierarchy_sweep.summaries", observed)
+    monkeypatch.setattr("hierarchy_sweep.wake_endpoint", wake)
+    code, result = candidate.run(fleet.workspace.store, 2, (), False)
+    assert code == 3 and result["rounds"] == 1
+    assert len(second_reads) == 3
+    assert {row["endpoint"] for row in result["still_unread"]} == {"pilot/orchestrator", "second/front-door"}
+    assert result["rows"][-1]["error"] == "later pass unavailable"
+
+
+def test_sweep_revalidates_manifest_before_reusing_a_quiet_snapshot(fleet, monkeypatch):
+    import hierarchy_sweep as candidate
+
+    original = candidate.Mailbox
+    changed = []
+
+    class ChangedManifestMailbox(original):
+        def endpoint_delivery(self, directory, endpoint, records):
+            result = super().endpoint_delivery(directory, endpoint, records)
+            if not changed and endpoint == sorted(self.manifest["endpoints"])[-1]:
+                changed.append(True)
+                (self.root / "manifest.json").write_text(
+                    json.dumps({**self.manifest, "writer_limit": 2}), encoding="utf-8")
+                fleet.send("pilot/orchestrator", "pilot/front-door", "published-with-new-manifest")
+            return result
+
+    monkeypatch.setattr("hierarchy_sweep.Mailbox", ChangedManifestMailbox)
+    code, report = candidate.run(fleet.workspace.store, 1, (), True)
+    expected = [{"initiative": "pilot", "endpoint": "pilot/front-door", "unread_count": 1}]
+    assert code == 3 and report["still_unread"] == expected
+    assert report["rows"] == []
+    # A later run uses the current authority and does not retain the old pass.
+    code, report = candidate.run(fleet.workspace.store, 1, (), True, skip=("pilot/front-door",))
+    assert code == 3 and report["still_unread"] == expected
+    assert report["rows"][0]["state"] == "skipped"
+
+
+@pytest.mark.parametrize("change", [
+    "corrupt_message", "publish", "routing_symlink", "corrupt_binding", "corrupt_receipt", "remove_message",
+    "message_reformat", "binding_reformat", "receipt_reformat", "new_receipt",
+])
+def test_sweep_rechecks_all_summary_dependencies_after_an_external_change(fleet, monkeypatch, change):
+    import hierarchy_sweep as candidate
+
+    original_mailbox, original_summaries = candidate.Mailbox, candidate.summaries
+    fleet.send("pilot/orchestrator", "pilot/front-door", "seed")
+    box = original_mailbox(fleet.root)
+    binding = box.current_binding("pilot/front-door")
+    box.record_read(str(fleet.base / "delivery"), {
+        "from": "pilot/front-door", "host": binding["host"], "session": binding["session"],
+        "binding_generation": binding["generation"]}, ["seed"])
+    message_path = Path(box.messages()["seed"]["path"])
+    binding_path = fleet.root / "bindings/pilot/front-door/000001.json"
+    receipt_path = next((fleet.base / "delivery/reads/pilot/front-door").glob("*.json"))
+    later = second_initiative(fleet, identifier="later", priority=10)
+    before_manifest, mutated, builds = (fleet.root / "manifest.json").read_bytes(), [], []
+
+    class LaterMailbox(original_mailbox):
+        def __init__(self, root):
+            super().__init__(root)
+            if self.root != later or mutated:
+                return
+            mutated.append(True)
+            if change == "publish":
+                fleet.send("pilot/orchestrator", "pilot/front-door", "external-publication")
+            elif change == "routing_symlink":
+                directory = fleet.root / "pilot/orchestrator"
+                target = fleet.tmp / "old-orchestrator-routing"
+                directory.rename(target)
+                symlink_or_skip(target, directory, target_is_directory=True)
+            elif change == "remove_message":
+                message_path.unlink()
+            elif change == "message_reformat":
+                header, body = message_path.read_bytes()[4:].split(b"\n---\n\n", 1)
+                message_path.write_bytes(b"---\n" + json.dumps(json.loads(header), indent=2).encode() + b"\n---\n\n" + body)
+            elif change == "new_receipt":
+                (receipt_path.parent / "additional.json").write_bytes(receipt_path.read_bytes())
+            else:
+                path = {"corrupt_message": message_path, "corrupt_binding": binding_path,
+                        "corrupt_receipt": receipt_path, "binding_reformat": binding_path,
+                        "receipt_reformat": receipt_path}[change]
+                if change.endswith("reformat"):
+                    path.write_text(json.dumps(json.loads(path.read_bytes()), indent=2), encoding="utf-8")
+                else:
+                    path.write_bytes(b"garbage")
+
+    def observed(initiative, durable=False, **kwargs):
+        builds.append(initiative["id"])
+        return original_summaries(initiative, durable, **kwargs)
+
+    monkeypatch.setattr("hierarchy_sweep.Mailbox", LaterMailbox)
+    monkeypatch.setattr("hierarchy_sweep.summaries", observed)
+    code, report = candidate.run(fleet.workspace.store, 1, (), True)
+    assert mutated == [True] and fleet.launches() == []
+    assert (fleet.root / "manifest.json").read_bytes() == before_manifest
+    if change == "publish":
+        assert code == 3 and report["quiet"] is False
+        assert report["still_unread"] == [{"initiative": "pilot", "endpoint": "pilot/front-door", "unread_count": 1}]
+        assert report["rows"] == []
+    elif change.endswith("reformat") or change == "new_receipt":
+        assert code == 0 and report["quiet"] is True and report["rows"] == []
+        assert builds.count("pilot") == 2, "changed filesystem inputs require a fresh derived summary"
+    else:
+        with pytest.raises(ValueError) as expected:
+            pinned = original_mailbox(fleet.root)
+            pinned.endpoint_delivery(str(fleet.base / "delivery"), "pilot/front-door", pinned.messages())
+        assert code == 3 and report["quiet"] is False
+        assert report["rows"] == [{"initiative": "pilot", "state": "mailbox_error", "error": str(expected.value)[:512]}]
+
+
+@pytest.mark.parametrize("durable", [False, True])
+def test_non_durable_admission_defers_an_idle_marker_refusal_until_reporting(fleet, durable):
+    import hierarchy_sweep as candidate
+
+    fleet.send("pilot/front-door", "pilot/orchestrator", "healthy-unread")
+    target = fleet.tmp / "idle-marker-target"
+    target.write_text("fixture marker", encoding="utf-8")
+    symlink_or_skip(target, fleet.root / ".wake-pilot%2Ffront-door.lock")
+    report = fleet.sweep("--dry-run", *(("--durable",) if durable else ()), expect=3)
+    assert report["quiet"] is False
+    assert [row["state"] for row in report["rows"]] == (["mailbox_error"] if durable else ["would_wake", "mailbox_error"])
+    if not durable:
+        assert report["rows"][0]["endpoint"] == "pilot/orchestrator"
+    with pytest.raises(ValueError) as expected:
+        candidate.Mailbox(fleet.root).wake_marker("pilot/front-door")
+    assert report["rows"][-1]["error"] == str(expected.value)[:512]
+    assert fleet.launches() == []
+
+
+def test_sweep_without_descriptor_capabilities_refreshes_through_pin(fleet, monkeypatch):
+    import hierarchy_sweep as candidate
+
+    original, calls = candidate.summaries, []
+
+    def observed(initiative, durable=False, **kwargs):
+        calls.append(durable)
+        return original(initiative, durable, **kwargs)
+
+    monkeypatch.setattr("hierarchy_mailbox_index._checked_reads_supported", lambda: False)
+    monkeypatch.setattr("hierarchy_sweep.summaries", observed)
+    code, report = candidate.run(fleet.workspace.store, 1, (), True)
+    assert code == 0 and report["quiet"] is True and report["rows"] == []
+    assert calls == [False, True]
+
+
+def test_durable_admission_preserves_the_first_endpoints_refusal(fleet):
+    import hierarchy_sweep as candidate
+
+    target = fleet.tmp / "idle-marker-target"
+    target.write_text("fixture marker", encoding="utf-8")
+    symlink_or_skip(target, fleet.root / ".wake-pilot%2Ffront-door.lock")
+    (fleet.root / "bindings/pilot/orchestrator/000001.json").write_bytes(b"invalid binding")
+    with pytest.raises(ValueError) as expected:
+        candidate.Mailbox(fleet.root).wake_marker("pilot/front-door")
+    report = fleet.sweep("--dry-run", "--durable", expect=3)
+    assert report["quiet"] is False
+    assert report["rows"] == [{"initiative": "pilot", "state": "mailbox_error", "error": str(expected.value)[:512]}]
+
+
+def quiet_sweep_store(tmp_path, message_count):
+    import hierarchy_workspace as workspace
+
+    mailbox = make_mailbox(tmp_path / "mailbox")
+    for number in range(message_count):
+        publish(mailbox, "seed-%d" % number)
+    if message_count:
+        mailbox.record_read(str(tmp_path / "delivery"), {
+            "from": "a/lane/review", "host": "test-host", "session": "a/lane/review", "binding_generation": 1},
+            ["seed-%d" % number for number in range(message_count)])
+    store = tmp_path / "store"
+    for command, request in (
+        ("init", {"writer_limit": 3, "heavy_limit": 1}),
+        ("register", {"id": "quiet", "project": "aegis", "repository": "aegis", "priority": 1,
+                      "target_branch": "develop", "mailbox_root": str(mailbox.root),
+                      "delivery_dir": str(tmp_path / "delivery")}),
+    ):
+        path = tmp_path / "request.json"
+        path.write_text(json.dumps(request), encoding="utf-8")
+        code, result = workspace.run(SimpleNamespace(store=str(store), command=command, request=str(path)))
+        assert code == 0, result
+    return store
+
+
+@pytest.mark.parametrize("message_count", [0, 20])
+def test_quiet_sweep_matches_round1_cached_report(tmp_path, message_count):
+    import hierarchy_sweep as candidate
+    from hierarchy_mailbox import encoded
+
+    # Captured before O132 from the round-1 cached implementation, source SHA256
+    # 3eead7b644f1dbfb58700a3f3bf65b3690a7b4bd9cf28096fa0ca037790f663f.
+    # Keep the actual return-code/report bytes here: history-less snapshots need
+    # neither Git history nor a second implementation of the deleted cache.
+    expected = (
+        b'[0,{"lifecycle":{"coverage":"untracked","execution_enabled":false,"state":"untracked",'
+        b'"work_complete":false},"mail_quiet":true,"quiet":true,"root_queue":[],"root_time":[],"rotate_needed":[],'
+        b'"rounds":0,"rows":[],"silent_roles":[],"stalled_dispatches":[],"still_unread":[],"work_complete":false}]'
+    )
+    store = quiet_sweep_store(tmp_path, message_count)
+    assert encoded(candidate.run(store, 1, (), True)) == expected
 
 
 def test_mail_quiet_does_not_claim_that_untracked_work_is_complete(fleet):
