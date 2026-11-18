@@ -261,6 +261,88 @@ a second `down` rewrites `SHA256SUMS`, so files added after the first are covere
   governance path (the `aegis-human-gate` ruleset has no bypass).
 - Clearing a `start_failing` hold, by deleting `$RUN/loop/status.json` once the cause is fixed.
 
+## Optional subscription notices and inbox nudges
+
+Direct loop invocations can opt in with `--subscriptions /absolute/subscriptions.json`
+before `once` or `run`. The schema and permitted interests are described in
+[mailbox subscriptions](hierarchy-subscriptions.md). The loop validates the complete
+file against the subscribers' active, provisioned mailboxes before starting any pass.
+Each subscriber must exist in an active mailbox; duplicate subscribers and unknown
+endpoints are refused. Each mailbox receives only its subscriptions, so unrelated
+initiatives receive no notices or subscription state. Invalid
+configuration exits 2 with SUB-1's fixed `SUBSCRIPTIONS_*` code and diagnostic.
+The file is limited to 256 KiB before parsing. Configuration changes take effect
+on the next loop start; an existing process keeps its startup bytes.
+
+With subscriptions enabled, each pass runs `notify` after routing and optional
+dispatch, before the durable sweep. Notify calls SUB-1's public entry point;
+the existing sweep handles wakes. Notices grant no authority and contain references,
+never original message bodies. A notify refusal creates an owner hold, and sweep
+and jobs still run. Retry with the same state after resolving the reported cause;
+never clear the cursor or remove a live mailbox lock. The loop does not remove locks.
+
+`status.json` adds `subscriptions_sha256` (the exact startup file bytes),
+`subscription_suppressed` (initiative, subscriber, reason and held count), and a
+notify step row with published, recovered, matched and held totals. Budget-held
+matches remain queued by SUB-1. Heartbeats record the configuration hash as well.
+Notify rows include `complete`. If SUB-1 refuses after possible partial publication,
+all four totals are null and `complete` is false; zero would incorrectly imply no
+side effects. `subscription_suppressed_complete` is also false, so any listed
+suppression rows are only a known subset. A later successful pass restores complete
+reporting using the retained cursor state. Heartbeats mark suppression incomplete
+until notify finishes; sweep and jobs heartbeats then report its current suppression
+rows and completeness. Retry never assumes that an incomplete pass published nothing.
+Without `--subscriptions`, these fields and the notify step are absent, and the
+existing pass and mail behavior is preserved.
+
+State lives at `<mailbox-parent>/subscriptions`, outside the mailbox and within
+the parent allowed for HM brief references. The loop creates this directory with
+mode 0700 and refuses a directory owned by another UID or writable by group/others.
+The derived path is checked with HM's `outside_mailbox` against every registered
+mailbox before any directory or snapshot write, including paused mailboxes and
+mailboxes without selected subscriptions. Empty configurations get the same
+placement check. A mailbox named `subscriptions` is refused without adding a
+configuration file to its history, including when it belongs to another initiative.
+A content-addressed, durable configuration snapshot accompanies SUB-1's cursor
+and reference packets. Keep this directory across restarts for budgets and retry
+reconciliation. Configuration and snapshot I/O use bounded descriptor-confined
+reads/publication; symlink components are refused.
+
+For faster detection, append `--nudge-seconds 2` after `run`. This is independent
+of subscriptions, defaults off, and accepts positive ASCII decimal integers only
+(at most 32,768 characters, including leading zeroes). Values beyond the normal
+interval have no effect on pacing. Each pass
+captures inbox directory metadata before its steps. During the subsequent interval
+wait, stat-only polling starts the next pass early on change, including mail
+arriving during a step or a directory replacement. There are no filesystem watchers,
+message reads or host calls during the wait. The normal interval remains the upper
+bound; stop signals remain checked during short sleeps. An unavailable probe creates
+an owner hold and retains the normal interval until a later pass can recover.
+On POSIX, watchers share ancestor descriptors and retain at most 64, while reserving
+64 descriptors above current process use for pass execution. Capacity exhaustion
+produces `NUDGE_LIMIT`, as do EMFILE/ENFILE during capacity probing or watcher setup.
+Descriptor exhaustion during a child launch releases watchers,
+records a hold and continues later steps; that failed step is not retried in the same
+pass. Without descriptor operations, nudge uses bounded path metadata polling and
+opens no content during the wait. Unavailable polling produces `NUDGE_UNSUPPORTED`;
+metadata failures produce `NUDGE_IO`. These holds recover on later passes.
+Registry discovery lets the existing store select its descriptor or portable reader;
+it does not require O_PATH. An unavailable registry produces `NUDGE_IO`; portable
+polling itself has no descriptor requirement. Subscription
+publication still requires descriptor operations and fails closed with
+`SUBSCRIPTIONS_UNSUPPORTED` where unavailable. Option names must be exact;
+abbreviations are refused with fixed diagnostics for subscription/nudge options.
+The existing loop's process/lock support remains platform-dependent. Cross-platform
+native timing acceptance must be recorded separately from these fixture tests.
+
+Use the freshly provisioned `aegis-live` initiative for acceptance. The historical
+`aegis47-live` run stays read-only. For example, with the normal loop arguments in
+`LOOP_FLAGS` and an owner-selected configuration:
+
+```sh
+python tools/hierarchy_loop.py $LOOP_FLAGS --subscriptions /srv/aegis-live/subscriptions.json run --interval 30 --nudge-seconds 2
+```
+
 ## Known gaps
 
 - **:70, a session that dies after reading.** It now raises `silent_role` (read and published nothing) or

@@ -213,6 +213,8 @@ SELECTOR_SITE_TABLE = (
      "Review the subprocess.run default forwarded positionally only to the reviewed hook benchmark."),
     ("aegis_core/team_supervisor_start.py", "_spawn", "reviewed-dynamic",
      "Launch the configured supervisor process and perform startup identity and timeout checks."),
+    ("aegis_core/team_host_qualify_evidence.py", "_command_matches", "lexer-or-message",
+     "Recognize planned shell command wrappers in offline evidence analysis; no process is launched."),
     ("aegis_core/testexec.py", "kill_group", "reviewed-dynamic",
      "Run Windows taskkill directly; positional process-group termination shares the scope."),
     ("aegis_core/verification/test_runner.py", "discover_test_evidence", "reviewed-dynamic",
