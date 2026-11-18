@@ -1,11 +1,9 @@
 """Ordered custody refusals through the public precondition boundary."""
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
 import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,70 +15,13 @@ import pytest
 from aegis_core import gitsafe, gitsafe_run, team, team_git, team_gitops, team_qualify, team_queue
 from aegis_core import team_custody_checks as checks
 from tests.conftest import symlink_or_skip
-from tests.unit.core.test_team_git import IDENTITY, commit, git, make_store, shared_bytes
-
-
-@pytest.fixture(scope="module")
-def rig_template(tmp_path_factory):
-    """Build once per worker; tests only receive independent copies of these bytes."""
-    if shutil.which("git") is None:
-        pytest.skip("needs git")
-    repo = tmp_path_factory.mktemp("custody-template") / "repo"
-    repo.mkdir()
-    git(repo, "init", "-q", "-b", "lane/work")
-    context = make_store(repo)  # Capability guard before descriptor-only work.
-    if not team_qualify.descriptor_supported():
-        pytest.skip("qualification requires descriptor custody")
-    (repo / "src").mkdir()
-    head = commit(repo, "src/a.py", b"base\n")
-    lease = team.claim(repo, "work", ["/src/**", "/shared.txt"], owner="team-1",
-                       branch="lane/work", now=100, ttl_s=60)
-    (repo / "src/a.py").write_bytes(b"tested\n")
-    with context as store:
-        tree = team_git.snapshot_tree(store)
-        journal = team_gitops.GitOpsJournal(repo / ".git")
-        item = team_qualify.QualificationResult(tree, "unit", head, "run-1", True)
-        team_qualify.record_pass(store, item, expected=None, identity=IDENTITY,
-                                journal=journal, lane="work", request_id="pass-1", actor="custodian")
-    # PASS publication includes the snapshot objects; no builder scratch survives.
-    template = SimpleNamespace(repo=repo, head=head, tree=tree, lease=lease)
-    template.baseline = state(template)
-    yield template
-    assert state(template) == template.baseline
-
-
-@contextmanager
-def copied_rig(template, directory):
-    repo = directory / "repo"
-    shutil.copytree(template.repo, repo)
-    assert state(SimpleNamespace(repo=repo)) == template.baseline
-    policy = team.parse_team(json.dumps({"v": 1, "shared": ["shared.txt"],
-                                       "lanes": {"work": ["src/**"]}}).encode())
-    with make_store(repo) as store:
-        def paths(old, new):
-            # Trusted adapter sees the private object directory. No repository history needed.
-            return tuple(p.decode() for p in git(repo, "diff-tree", "-r", "--no-renames",
-                                                "--name-only", "-z", old, new,
-                                                env=store.env).split(b"\0") if p)
-        options = dict(lane="work", owner="team-1", expected_head=template.head, tested_tree=template.tree,
-                       required_legs=("unit",), message="Implement work\n\nDetails.\n", now=101,
-                       read_branch=lambda: git(repo, "symbolic-ref", "--short", "HEAD").decode().strip(),
-                       read_head=lambda: git(repo, "rev-parse", "HEAD").decode().strip(),
-                       read_paths=paths, read_policy=lambda: policy)
-        yield SimpleNamespace(repo=repo, store=store, options=options, lease=template.lease, policy=policy)
+from tests.helpers_team_git import IDENTITY, copied_rig, git, make_store, rig_template, state
 
 
 @pytest.fixture
 def rig(tmp_path, rig_template):
     with copied_rig(rig_template, tmp_path) as candidate:
         yield candidate
-
-
-def state(rig):
-    return (shared_bytes(rig.repo), {
-        p.relative_to(rig.repo).as_posix(): ("link", str(p.readlink())) if p.is_symlink() else
-        ("file", p.read_bytes()) if p.is_file() else ("directory",)
-        for p in rig.repo.rglob("*") if ".git" not in p.parts})
 
 
 def run(rig, **changes):
