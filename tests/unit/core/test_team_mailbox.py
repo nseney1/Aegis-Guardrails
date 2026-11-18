@@ -18,6 +18,7 @@ import pytest
 
 from conftest import symlink_or_skip
 from aegis_core import team_mailbox as mail
+from aegis_core import team_mailbox_delivery as delivery_module
 from aegis_core import team_mailbox_store as store_module
 from aegis_core import team_mailbox_primitives as primitives
 from aegis_core.team_mailbox_primitives import BusyError, MailboxRefusal, RoleTables
@@ -784,13 +785,13 @@ def test_receipt_append_byte_budget_refuses_without_publication_then_retries(tmp
         folder = directory / "reads" / "alpha" / "orchestrator"
         size = next(folder.glob("*.json")).stat().st_size
         assert size * 2 - 1 >= Path(sent["path"]).stat().st_size
-        monkeypatch.setattr(mail, "MAX_HISTORY_BYTES", size * 2 - 1)
+        monkeypatch.setattr(delivery_module, "MAX_HISTORY_BYTES", size * 2 - 1)
         before = snapshot(tmp_path)
         with refusal("too_large"):
             box.write_delivery_receipt(directory, "reads", receipt)
         assert snapshot(tmp_path) == before
         assert box.delivery(directory, message_id="message")["message"]["state"] == "read"
-        monkeypatch.setattr(mail, "MAX_HISTORY_BYTES", size * 2)
+        monkeypatch.setattr(delivery_module, "MAX_HISTORY_BYTES", size * 2)
         box.write_delivery_receipt(directory, "reads", receipt)
         assert len(box.delivery_receipts(directory, "reads", "alpha/orchestrator", box.messages())) == 2
 
@@ -3490,3 +3491,34 @@ def test_paged_inbox_warning_counts_against_transport_budget(tmp_path, monkeypat
         assert caught.value.code == 1 and inbox["warnings"] == pending
         monkeypatch.setattr(primitives, "MAX_INBOX_RESPONSE_BYTES", len(render(inbox)))
         assert primitives.bounded_inbox(inbox, render)["warnings"] == pending
+
+
+@pytest.mark.parametrize("kind,state", [("reads", "read"), ("wakes", "woken")])
+def test_delivery_receipt_wire_bytes_after_busy_refusal_and_retry(tmp_path, kind, state):
+    root, box = populated(tmp_path)
+    directory = tmp_path / "delivery"
+    folder = directory / kind / "alpha" / "orchestrator"
+    receipt = {"endpoint": "alpha/orchestrator", "host": "test-host", "session": "alpha/orchestrator",
+               "generation": 1, "message_ids": ["message"]}
+    if kind == "wakes":
+        receipt.update(wake_id="wake-1", state="started", exit_code=None, timed_out=False)
+    with box:
+        box.publish(request())
+        before = snapshot(tmp_path)
+        with refusal("invalid_record") as caught:
+            box.write_delivery_receipt(directory, kind, {**receipt, "message_ids": ["mes\nsage"]})
+        assert caught.value.code == 1 and snapshot(tmp_path) == before
+        folder.mkdir(parents=True)
+        with box.store.lock(folder, create=True), ThreadPoolExecutor(max_workers=1) as workers:
+            before = snapshot(tmp_path)
+            attempt = workers.submit(box.write_delivery_receipt, directory, kind, receipt)
+            with refusal("busy") as caught:
+                attempt.result(timeout=5)
+            assert caught.value.code == 1 and snapshot(tmp_path) == before
+        assert box.write_delivery_receipt(directory, kind, receipt) is None
+        paths = list(folder.glob("*.json"))
+        assert len(paths) == 1
+        expected = {"schema": "aegis.hierarchy-delivery-receipt/v1",
+                    "at": "2026-11-16T12:00:00.000000Z", **receipt}
+        assert paths[0].read_bytes() == json.dumps(expected, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        assert box.delivery(directory, message_id="message")["message"]["state"] == state
