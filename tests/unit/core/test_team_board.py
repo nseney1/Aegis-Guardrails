@@ -765,6 +765,137 @@ def test_initialize_reports_owner_release_warning(tmp_path, monkeypatch, owner_p
         assert board.verify()["ok"] is True
 
 
+def test_initialize_allows_foreign_grandparent(tmp_path, monkeypatch):
+    make_store(tmp_path)
+    parent = tmp_path / "selected-parent"
+    parent.mkdir(mode=0o700)
+    grandparent = tmp_path.stat()
+
+    def foreign_grandparent(fd):
+        info = os.fstat(fd)
+        if (info.st_dev, info.st_ino) == (grandparent.st_dev, grandparent.st_ino):
+            return os.stat_result((*info[:4], os.geteuid() + 1, *info[5:]))
+        return info
+
+    monkeypatch.setattr(storage, "os", SimpleNamespace(**{**vars(os), "fstat": foreign_grandparent}))
+    root = parent / "board"
+    assert set(core.initialize(root, **OPTIONS)) == {"board"}
+    with core.Board(root, **OPTIONS) as board:
+        assert board.verify() == {"ok": True, "events": 1, "posts": 0}
+
+
+@pytest.mark.parametrize("damage", ["foreign", "group_writable", "world_writable", "replaced"])
+def test_initialize_refuses_unsafe_parent_and_retries(tmp_path, monkeypatch, damage):
+    make_store(tmp_path)
+    parent = tmp_path / "selected-parent"
+    parent.mkdir(mode=0o700)
+    identity = parent.stat()
+    replaced = []
+
+    def parent_info(fd):
+        info = os.fstat(fd)
+        if (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino):
+            if damage == "foreign":
+                return os.stat_result((*info[:4], os.geteuid() + 1, *info[5:]))
+            if damage == "replaced" and not replaced:
+                replaced.append(True)
+                parent.rename(tmp_path / "saved-parent")
+                parent.mkdir(mode=0o700)
+        return info
+
+    if damage.endswith("writable"):
+        parent.chmod(0o720 if damage == "group_writable" else 0o702)
+    monkeypatch.setattr(storage, "os", SimpleNamespace(**{**vars(os), "fstat": parent_info}))
+    with refused("unsafe_path"):
+        core.initialize(parent / "board", **OPTIONS)
+    monkeypatch.setattr(storage, "os", os)
+    assert list(parent.iterdir()) == []
+    if replaced:
+        assert list((tmp_path / "saved-parent").iterdir()) == []
+    parent.chmod(0o700)
+    core.initialize(parent / "board", **OPTIONS)
+    with core.Board(parent / "board", **OPTIONS) as board:
+        assert board.verify()["events"] == 1
+
+
+@pytest.mark.parametrize("failure", ["mkdir", "open", "link"])
+def test_parent_initialization_failure_closes_and_rolls_back(tmp_path, monkeypatch, failure):
+    make_store(tmp_path)
+    root = tmp_path / "candidate"
+    opened = set()
+
+    def tracking_open(path, *args, **kwargs):
+        if failure == "open" and path == root.name:
+            raise OSError(errno.EIO, "private open failure")
+        fd = os.open(path, *args, **kwargs)
+        opened.add(fd)
+        return fd
+
+    def tracking_dup(fd):
+        result = os.dup(fd)
+        opened.add(result)
+        return result
+
+    def tracking_close(fd):
+        os.close(fd)
+        opened.remove(fd)
+
+    def mkdir(path, *args, **kwargs):
+        if failure == "mkdir" and path == root.name:
+            raise OSError(errno.EIO, "private mkdir failure")
+        return os.mkdir(path, *args, **kwargs)
+
+    def link(*args, **kwargs):
+        if failure == "link":
+            raise OSError(errno.EIO, "private publication failure")
+        return os.link(*args, **kwargs)
+
+    proxy = SimpleNamespace(**{**vars(os), "open": tracking_open, "dup": tracking_dup,
+                               "close": tracking_close, "mkdir": mkdir, "link": link})
+    monkeypatch.setattr(storage, "os", proxy)
+    with refused("io"):
+        core.initialize(root, **OPTIONS)
+    monkeypatch.setattr(storage, "os", os)
+    assert opened == set()
+    assert not root.exists()
+    core.initialize(root, **OPTIONS)
+    with core.Board(root, **OPTIONS) as board:
+        assert board.verify()["events"] == 1
+
+
+@pytest.mark.parametrize("same_root", [True, False])
+def test_concurrent_initialization_refuses_then_retries(tmp_path, monkeypatch, same_root):
+    make_store(tmp_path)
+    root = tmp_path / "candidate"
+    contender = root if same_root else tmp_path / "peer"
+    entered, release = Event(), Event()
+
+    def mkdir(path, *args, **kwargs):
+        if path == root.name:
+            entered.set()
+            assert release.wait(5)
+        return os.mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(storage, "os", SimpleNamespace(**{**vars(os), "mkdir": mkdir}))
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(core.initialize, root, **OPTIONS)
+        try:
+            assert entered.wait(5)
+            with pytest.raises(BusyError) as caught:
+                core.initialize(contender, **OPTIONS)
+            assert caught.value.reason == "busy"
+        finally:
+            release.set()
+        assert set(future.result(timeout=5)) == {"board"}
+    if same_root:
+        with refused("exists"):
+            core.initialize(contender, **OPTIONS)
+    else:
+        assert set(core.initialize(contender, **OPTIONS)) == {"board"}
+    with core.Board(contender, **OPTIONS) as board:
+        assert board.verify()["events"] == 1
+
+
 @pytest.mark.parametrize("operation", ["read", "acknowledge", "position"])
 def test_cursor_operations_replay_history_once(tmp_path, monkeypatch, operation):
     root = make_store(tmp_path)

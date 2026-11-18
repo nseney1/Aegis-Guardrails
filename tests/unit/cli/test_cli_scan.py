@@ -955,7 +955,7 @@ def test_hold_malformed_details_return_fixed_refusal(monkeypatch, capsys, detail
 def test_text_hold_bounds_large_component_collection(monkeypatch, capsys):
     from aegis_core.workspace.binding import WorkspaceBinding, WorkspaceHold
 
-    paths = ["x" * 5000 for _ in range(240)]
+    paths = ["x" * 1100 for _ in range(240)]
     binding = WorkspaceBinding("hold", reason="pin_conflicts_with_target",
                                details=(("pin", "pin"), ("target", "target"), ("candidates", paths)))
 
@@ -986,6 +986,35 @@ def test_scan_warning_checks_full_size_before_control_refusal(ws, monkeypatch, c
     monkeypatch.setattr("aegis_core.scan_compliance.record", fail)
     assert main(["scan", "src/app.py"]) == 0
     assert capsys.readouterr().err == "Warning: scan event not recorded: guidance_projection_limit\n"
+
+
+@pytest.mark.parametrize("message, expected", [
+    ("disk\nfull", "disk full"),
+    ("disk\x1bfull", "guidance withheld: control characters"),
+    ("disk\0full", "guidance withheld: control characters"),
+    ("x" * (1024 * 1024 + 1), "guidance_projection_limit"),
+    ("ghp_" + "a" * 30, "ghp_REDACTED"),
+    ("x" * 1100, "x" * 1021 + "..."),
+], ids=["newline", "esc", "nul", "oversized", "secret", "clipped"])
+def test_scan_telemetry_warning_retries_then_recovers(ws, monkeypatch, capsys, message, expected):
+    from aegis_core import scan_compliance
+
+    record = scan_compliance.record
+    attempts = []
+
+    def fail_twice(*args, **kwargs):
+        attempts.append(None)
+        if len(attempts) <= 2:
+            raise OSError(message)
+        return record(*args, **kwargs)
+
+    monkeypatch.setattr("aegis_core.scan_compliance.record", fail_twice)
+    for _ in range(2):
+        assert main(["scan", "src/app.py"]) == 0
+        assert capsys.readouterr().err == "Warning: scan event not recorded: " + expected + "\n"
+    assert main(["scan", "src/app.py"]) == 0
+    assert capsys.readouterr().err == ""
+    assert len(attempts) == 3
 
 
 @pytest.mark.parametrize("entry", ["file", "workspace_value"])

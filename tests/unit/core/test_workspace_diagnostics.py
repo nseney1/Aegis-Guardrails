@@ -45,7 +45,7 @@ def test_parallel_projection_bounds_components_without_mutating_binding():
     from aegis_core.workspace.diagnostics import project_binding
 
     prefix = "C:\\new\\"
-    paths = [prefix + "x" * 5000 + str(i) for i in range(240)]
+    paths = [prefix + "x" * 1100 + str(i) for i in range(240)]
     binding = WorkspaceBinding("hold", reason="ambiguous_host_roots", details=(("candidates", paths),))
     with ThreadPoolExecutor(max_workers=3) as pool:
         futures = [pool.submit(project_binding, binding, cli=cli) for cli in (False, True) * 3]
