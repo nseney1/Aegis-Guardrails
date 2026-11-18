@@ -127,8 +127,24 @@ class _WitnessStage(str):
 class Store:
     """Use as a context or close explicitly. Paths are lexical names under held roots."""
     def __init__(self, root, *, delivery_roots=()):
+        self._initialize(root, delivery_roots=delivery_roots, parent_anchor=False)
+
+    @classmethod
+    def from_parent(cls, parent):
+        """Bind an initializer's selected parent without trusting its grandparent.
+
+        The selected directory must be owner-held and non-writable by others.
+        Reopen through the shared no-follow walk to refuse replacement during
+        validation, then confine every operation to this held parent's subtree.
+        """
+        store = cls.__new__(cls)
+        store._initialize(parent, delivery_roots=(), parent_anchor=True)
+        return store
+
+    def _initialize(self, root, *, delivery_roots, parent_anchor):
         require(descriptor_supported(), reason="unsupported_platform")
         self.root = safe_path(root)
+        self._parent_anchor = parent_anchor
         require(type(delivery_roots) in (tuple, list) and len(delivery_roots) <= 256)
         self.delivery_roots = tuple(safe_path(path) for path in delivery_roots)
         self.fd = self.parent_fd = None
@@ -138,10 +154,16 @@ class Store:
         self._warning_reservations = 0
         try:
             with refusals():
-                self.parent_fd = _open_absolute(self.root.parent)
+                self.parent_fd = _open_absolute(self.root if parent_anchor else self.root.parent)
                 _private_directory(self.parent_fd)
-                self.fd = os.open(self.root.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                                  dir_fd=self.parent_fd)
+                if parent_anchor:
+                    before = os.fstat(self.parent_fd)
+                    self.fd = _open_absolute(self.root)
+                    after = os.fstat(self.fd)
+                    require((before.st_dev, before.st_ino) == (after.st_dev, after.st_ino), reason="unsafe_path")
+                else:
+                    self.fd = os.open(self.root.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                      dir_fd=self.parent_fd)
                 _private_directory(self.fd)
             self._finalizer = weakref.finalize(self, _close_all, (self.fd, self.parent_fd))
         except BaseException:
@@ -167,6 +189,7 @@ class Store:
         try:
             return self.fd, path.relative_to(self.root).parts
         except ValueError:
+            require(not self._parent_anchor, reason="unsafe_path")
             try:
                 return self.parent_fd, path.relative_to(self.root.parent).parts
             except ValueError:
