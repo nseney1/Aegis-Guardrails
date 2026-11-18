@@ -79,6 +79,13 @@ class LintFinding:
 
 
 @dataclass(frozen=True)
+class _WithheldGuidanceFinding(LintFinding):
+    """Only this new refusal extends the existing serialized finding shape."""
+
+    next_action: str = "Remove control, format and surrogate characters from served guidance."
+
+
+@dataclass(frozen=True)
 class LintResult:
     """Draft readiness, separate from the CLI's always-zero report-only status."""
 
@@ -162,6 +169,18 @@ def _guidance(body):
 
 def _content(rule, body, retained, prefix, commands):
     findings = []
+    for value in (*rule.meta.values(), body):
+        if type(value) is str:
+            items = [value]
+        elif type(value) is list and all(type(item) is str for item in value):
+            items = value
+        else:
+            continue
+        # Scan's grammar owns Evidence exclusion and its served control verdict.
+        if raw_evidence_span(items, heading_has_slot, contains_control_characters)[0] == -3:
+            findings.append(_WithheldGuidanceFinding(
+                2, "withheld_guidance", "error", "served guidance contains withheld control characters"))
+            break
     for field in ("hypothesis", "prediction"):
         value = rule.meta.get(field)
         if not isinstance(value, str) or not value.strip():
