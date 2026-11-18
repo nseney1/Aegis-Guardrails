@@ -357,12 +357,16 @@ def _diagnostic_escape(match) -> str:
     return literal + " " if any(_diagnostic_space(c) for c in char) else match[0]
 
 
-def project_diagnostic(text: str, *, escaped: bool = True) -> str:
-    """Bound, canonicalize, redact and clip diagnostics; literal parts use escaped=False."""
-    if type(text) is not str or type(escaped) is not bool:
+def project_diagnostic(text: str, *, escaped: bool = True, max_len: Optional[int] = 1024,
+                       refuse_controls: bool = False) -> str:
+    """Bound, canonicalize, redact and clip; optionally refuse non-layout controls."""
+    if (type(text) is not str or type(escaped) is not bool or type(refuse_controls) is not bool
+            or (max_len is not None and (type(max_len) is not int or max_len < 3))):
         return "guidance_projection_invalid_field"
     if len(text) > MAX_GUIDANCE_CHARS:
         return GuidanceProjectionError.code
+    if refuse_controls and contains_control_characters(text):
+        return CONTROL_GUIDANCE
     try:
         canonical = "".join(" " if _diagnostic_space(ch) else ch for ch in text)
         canonical = " ".join(canonical.split())
@@ -376,7 +380,7 @@ def project_diagnostic(text: str, *, escaped: bool = True) -> str:
         # Canonicalization and escape replacement only remove characters or
         # replace non-printables with spaces: size/control preflights still hold.
         shown = _redact_labeled(literal, None)[0]
-        return shown if len(shown) <= 1024 else clip_redacted(shown, 1021) + "..."
+        return shown if max_len is None or len(shown) <= max_len else clip_redacted(shown, max_len - 3) + "..."
     except GuidanceProjectionError as error:
         return error.code
 
