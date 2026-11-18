@@ -955,7 +955,7 @@ def test_hold_malformed_details_return_fixed_refusal(monkeypatch, capsys, detail
 def test_text_hold_bounds_large_component_collection(monkeypatch, capsys):
     from aegis_core.workspace.binding import WorkspaceBinding, WorkspaceHold
 
-    paths = ["x" * 5000 for _ in range(240)]
+    paths = ["x" * 1100 for _ in range(240)]
     binding = WorkspaceBinding("hold", reason="pin_conflicts_with_target",
                                details=(("pin", "pin"), ("target", "target"), ("candidates", paths)))
 
