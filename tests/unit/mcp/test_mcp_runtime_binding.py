@@ -14,6 +14,7 @@ import io
 import json
 import os
 import sys
+import traceback
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,6 +25,155 @@ from aegis_core.yaml_engine.serializer import dump_frontmatter
 from tests.conftest import symlink_or_skip
 
 NOT_GOVERNED = 'not an Aegis workspace: run "aegis init" in your repository'
+
+
+@pytest.mark.parametrize("name", ["aegis_scan", "aegis_list_rules", "unknown_tool"])
+@pytest.mark.parametrize("transport", ["direct", "concurrent", "stdio", "stdio_dispatch"])
+def test_failure_envelope_golden_bytes(home, monkeypatch, capsys, record_property, name, transport):
+    """Golden transport bytes, with a deterministic external traceback sink."""
+    from aegis_core.workspace.binding import WorkspaceBinding
+
+    text = "bad\x1btext\nretry"
+    projected = "bad text retry"
+
+    def refuse(*args, **kwargs):
+        raise OSError(text)
+
+    def print_traceback(*, file):
+        assert sys.exc_info()[0] is OSError
+        print("Traceback (most recent call last):\nOSError: " + text, file=file)
+
+    monkeypatch.setattr(server, "traceback", SimpleNamespace(print_exc=print_traceback))
+    monkeypatch.setattr(server, "_bind", lambda *args: WorkspaceBinding("unbound", reason="no_workspace")
+                        if name == "aegis_scan" else WorkspaceBinding("bound", root=str(home), source="test"))
+    monkeypatch.setattr(server, "_workspace_for", lambda binding: home)
+    monkeypatch.setattr(server, "execute_tool", refuse)
+    if transport == "stdio_dispatch":
+        monkeypatch.setattr(server, "_bind", refuse)
+    calls = [_call(1, name, {}), _call(2, name, {}), _frame(3, "ping")]
+    if transport in ("direct", "concurrent"):
+        server.handle_request(json.loads(_init()))
+        if transport == "concurrent":
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                responses = list(pool.map(server.handle_request, map(json.loads, calls)))
+        else:
+            responses = [server.handle_request(json.loads(line)) for line in calls]
+        captured = capsys.readouterr()
+        output = "".join(json.dumps(response) + "\n" for response in responses)
+        assert captured.out == ""
+    else:
+        monkeypatch.setattr(server, "sys", SimpleNamespace(stdin=io.StringIO(
+            "\n".join([_init()] + calls) + "\n"), stdout=sys.stdout, stderr=sys.stderr))
+        assert server.run_stdio_server() == 0
+        captured = capsys.readouterr()
+        output = "\n".join(captured.out.splitlines()[1:]) + "\n"
+    if name == "unknown_tool":
+        expected = [{"jsonrpc": "2.0", "id": req_id, "error": {
+            "code": -32602, "message": "Unknown tool: unknown_tool"}} for req_id in (1, 2)]
+        diagnostic = ""
+    elif transport == "stdio_dispatch":
+        expected = [{"jsonrpc": "2.0", "id": req_id, "error": {
+            "code": -32603, "message": "Internal error"}} for req_id in (1, 2)]
+        diagnostic = ("aegis-mcp: " + projected + "\n" if name == "aegis_scan" else
+                      "Traceback (most recent call last):\nOSError: " + text + "\n") * 2
+    else:
+        message = projected if name == "aegis_scan" else text
+        expected = [{"jsonrpc": "2.0", "id": req_id, "result": {
+            "content": [{"type": "text", "text": "Tool execution failed: " + message}], "isError": True}}
+                    for req_id in (1, 2)]
+        diagnostic = ("aegis-mcp: " + projected + "\n" if name == "aegis_scan" else
+                      "Traceback (most recent call last):\nOSError: " + text + "\n") * 2
+    expected.append({"jsonrpc": "2.0", "id": 3, "result": {}})
+    assert output.encode("utf-8") == ("".join(json.dumps(row) + "\n" for row in expected)).encode("utf-8")
+    assert captured.err.encode("utf-8") == diagnostic.encode("utf-8")
+    record_property("stdout_hex", output.encode("utf-8").hex())
+    record_property("stderr_hex", captured.err.encode("utf-8").hex())
+
+
+@pytest.mark.parametrize("transport", ["direct", "stdio", "stdio_dispatch"])
+@pytest.mark.parametrize("name", list(getattr(server, "_TOOL_FAILURE_ENVELOPES", {None: str, "aegis_scan": str})))
+def test_failure_envelope_table_controls_each_transport(home, monkeypatch, capsys, name, transport):
+    # Every declared row must drive both catches, including the default for other tools.
+    table = server._TOOL_FAILURE_ENVELOPES
+    monkeypatch.setattr(server, "_TOOL_FAILURE_ENVELOPES", {**table, name: lambda text: "table diagnostic"})
+    from aegis_core.workspace.binding import WorkspaceBinding
+
+    def refuse(*args, **kwargs):
+        raise OSError("original failure")
+
+    monkeypatch.setattr(server, "_bind", lambda *args: WorkspaceBinding("bound", root=home, source="test"))
+    monkeypatch.setattr(server, "_workspace_for", lambda binding: home)
+    monkeypatch.setattr(server, "execute_tool", refuse)
+    if transport == "stdio_dispatch":
+        monkeypatch.setattr(server, "_bind", refuse)
+    request = _call(1, name or "aegis_list_rules", {})
+    if transport == "direct":
+        server.handle_request(json.loads(_init()))
+        response = server.handle_request(json.loads(request))
+        assert response["result"]["content"][0]["text"] == "Tool execution failed: table diagnostic"
+    else:
+        monkeypatch.setattr(server, "sys", SimpleNamespace(stdin=io.StringIO(
+            _init() + "\n" + request + "\n"), stdout=sys.stdout, stderr=sys.stderr))
+        assert server.run_stdio_server() == 0
+    captured = capsys.readouterr()
+    assert captured.err == "aegis-mcp: table diagnostic\n"
+
+
+def test_non_scan_failure_keeps_real_traceback(home, monkeypatch, capsys):
+    from aegis_core.workspace.binding import WorkspaceBinding
+
+    def refuse(*args):
+        raise OSError("raw\x1bfailure\nretry")
+
+    monkeypatch.setattr(server, "_bind", lambda *args: WorkspaceBinding("bound", root=home, source="test"))
+    monkeypatch.setattr(server, "_workspace_for", lambda binding: home)
+    monkeypatch.setattr(server, "execute_tool", refuse)
+    server.handle_request(json.loads(_init()))
+    response = server.handle_request(json.loads(_call(1, "aegis_list_rules", {})))
+    assert response["result"]["content"][0]["text"] == "Tool execution failed: raw\x1bfailure\nretry"
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("Traceback (most recent call last):\n")
+    assert captured.err.endswith("OSError: raw\x1bfailure\nretry\n")
+    assert ", line 629, in _finish_repository_call\n" in captured.err
+
+
+@pytest.mark.parametrize("transport", ["direct", "stdio_dispatch"])
+def test_non_scan_failure_preserves_exception_formatting(home, monkeypatch, capsys, transport):
+    from aegis_core.workspace.binding import WorkspaceBinding
+
+    class DisplayError(OSError):
+        def __str__(self):
+            raise AssertionError("exception string unavailable")
+
+        def __format__(self, spec):
+            assert spec == ""
+            return "formatted failure"
+
+    def refuse(*args):
+        raise DisplayError()
+
+    monkeypatch.setattr(server, "_bind", lambda *args: WorkspaceBinding("bound", root=home, source="test"))
+    monkeypatch.setattr(server, "_workspace_for", lambda binding: home)
+    monkeypatch.setattr(server, "execute_tool", refuse)
+    request = _call(1, "aegis_list_rules", {})
+    if transport == "direct":
+        server.handle_request(json.loads(_init()))
+        response = server.handle_request(json.loads(request))
+        assert response["result"]["content"][0]["text"] == "Tool execution failed: formatted failure"
+    else:
+        monkeypatch.setattr(server, "_bind", refuse)
+        monkeypatch.setattr(server, "sys", SimpleNamespace(stdin=io.StringIO(
+            _init() + "\n" + request + "\n"), stdout=sys.stdout, stderr=sys.stderr))
+        assert server.run_stdio_server() == 0
+    captured = capsys.readouterr()
+    assert captured.err.startswith("Traceback (most recent call last):\n")
+    expected_exception = "".join(traceback.format_exception_only(DisplayError, DisplayError()))
+    assert captured.err.endswith(expected_exception)
+    if transport == "stdio_dispatch":
+        assert json.loads(captured.out.splitlines()[-1])["error"] == {"code": -32603, "message": "Internal error"}
 
 
 def _tree(root: Path) -> list:

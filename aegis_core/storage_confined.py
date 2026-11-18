@@ -8,6 +8,8 @@ mode 0700. With create_parents=True, every relative ancestor's containing
 directory is flushed, including entries found existing. Roots are limited to
 32768 characters, and relative paths to 128
 components of at most 255 UTF-8 bytes. Keep the context open while using its handle.
+Removal rechecks the named parent identity, unlinks only relative to the held
+descriptor and flushes that parent, even when a retry finds the child missing.
 
 ConfinedFileError.reason distinguishes missing, exists, unsafe, too_large,
 unsupported, invalid_path, invalid_limit, invalid_data, invalid_mode, closed and
@@ -126,6 +128,7 @@ class ConfinedFile:
     def __init__(self, parent, name):
         self._parent = parent
         self._name = name
+        self._location = None
 
     def _check_open(self):
         if self._parent is None:
@@ -136,6 +139,53 @@ class ConfinedFile:
         self._check_open()
         with _refusals():
             return os.fstat(self._parent)
+
+    def _check_parent(self):
+        """Refuse a moved/replaced parent; removal still uses only the held fd."""
+        if self._location is None:
+            raise ConfinedFileError("unsafe")
+        try:
+            current = _open_parent(*self._location, False)
+        except OSError as error:
+            if error.errno in (errno.ENOENT, errno.ELOOP, errno.ENOTDIR):
+                raise ConfinedFileError("unsafe") from None
+            raise
+        try:
+            held, named = os.fstat(self._parent), os.fstat(current)
+            if (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
+                raise ConfinedFileError("unsafe")
+        finally:
+            os.close(current)
+
+    def remove(self):
+        """Unlink a regular child and flush its held parent, including on retry.
+
+        Return 'removed' or 'missing'; refuse unsafe entries/changed parents
+        with CONFINED_UNSAFE, and OS/flush failure with CONFINED_IO. A flush
+        can fail after unlink landed. No path is followed by the unlink itself.
+        """
+        self._check_open()
+        with _refusals():
+            self._check_parent()
+            try:
+                info = os.stat(self._name, dir_fd=self._parent, follow_symlinks=False)
+            except FileNotFoundError:
+                info = None
+            if info is not None and not stat.S_ISREG(info.st_mode):
+                raise ConfinedFileError("unsafe")
+            self._check_parent()
+            outcome = "missing"
+            if info is not None:
+                try:
+                    os.unlink(self._name, dir_fd=self._parent)
+                    outcome = "removed"
+                except FileNotFoundError:
+                    pass
+                except IsADirectoryError:
+                    raise ConfinedFileError("unsafe") from None
+            # Missing may be a retry after unlink succeeded but fsync failed.
+            os.fsync(self._parent)
+            return outcome
 
     def read_bytes(self, max_bytes):
         """Read a regular file, refusing size before allocation and on growth."""
@@ -224,6 +274,7 @@ def confined_file(root, relative_parts, create_parents=False):
     handle = None
     try:
         handle = ConfinedFile(parent, parts[-1])
+        handle._location = (root, parts[:-1])
         yield handle
     finally:
         if handle is not None:
