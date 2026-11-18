@@ -698,3 +698,32 @@ def test_valid_typescript_forms_parse_without_inventing_imports(source, path):
     tree = parse(source, path)
     assert [node.target for node in tree.call_sites] == ['eval']
     assert tree.imports == ()
+
+
+# A `{` after `as`, `satisfies`, `extends`, `readonly` or `is` on the same line is a TypeScript type literal.
+@pytest.mark.parametrize('source,path', [
+    ('const a = b as { x: number }; eval(x);', 'fixture.ts'),
+    ('const a = b as {\n  x: number;\n}; eval(x);', 'fixture.tsx'),
+    ('const a = b satisfies { f: <T>(x: T) => T }; eval(x);', 'fixture.ts'),
+    ('function f<T extends { id: string }>(x: T) { eval(x); }', 'fixture.ts'),
+    ('const h = (t): t is { a: number } => eval(t);', 'fixture.tsx'),
+    ('const el = <A b={x as { c: number }} />; eval(x);', 'fixture.tsx'),
+])
+def test_type_literals_after_type_operators_keep_following_calls(source, path):
+    assert [node.target for node in parse(source, path).call_sites] == ['eval']
+
+
+# After a newline (ASI) each `{` opens a block that runs `eval`; `x.as {` is not valid TypeScript,
+# but its `{` must not open a type literal either.
+@pytest.mark.parametrize('source,path', [
+    ('x.as\n{ eval(code) }', 'fixture.ts'),
+    ('as\n{ eval(code) }', 'fixture.tsx'),
+    ('x = is /*\n*/ { eval(code) }', 'fixture.ts'),
+    ('x.as { eval(code) }', 'fixture.ts'),
+])
+def test_a_block_after_a_type_operator_word_cannot_hide_calls(source, path):
+    from aegis_core.ast.drivers.js.tokenizer import JSLexError
+
+    with pytest.raises(JSLexError) as error:
+        parse(source, path)
+    assert error.value.reason == 'unsupported_lexical_context:brace'
