@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aegis-guardrails"
 dynamic = ["version"]
-description = "Project rules for AI coding agents (Claude Code, Codex CLI, Antigravity): MCP server, AGENTS.md bootstrap, AST checks, pre-commit hook and CI gate"
+description = "Project rules and team lanes for AI coding agents (Claude Code, Codex CLI, Antigravity): MCP server, AGENTS.md bootstrap, AST checks, pre-commit hook and CI gate"
 
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -17,7 +17,8 @@ keywords = [
     "ai-coding-agents", "ai-guardrails", "coding-agents", "guardrails", "mcp", "mcp-server",
     "model-context-protocol", "agents-md", "claude-md", "claude-code", "claude-code-hooks",
     "codex-cli", "antigravity", "pre-commit", "git-hooks", "code-review", "static-analysis", "ast",
-    "secret-scanning", "llm-guardrails", "agentic-coding"
+    "secret-scanning", "llm-guardrails", "agentic-coding", "agent-teams", "team-lanes",
+    "work-queue"
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",

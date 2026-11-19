@@ -17,7 +17,7 @@ import runpy
 import shutil
 import subprocess
 import sys
-from types import SimpleNamespace
+from types import GeneratorType, SimpleNamespace
 from typing import Dict, Iterable, List, Tuple
 import unicodedata
 
@@ -548,7 +548,7 @@ def test_round4_correctness_requires_a_successful_checker(tmp_path, caller, bypa
     else:
         call = ("private_imports(fabricated)" if caller == "test_redaction.py" else
                 "_defined_names_referenced_outside(Path(core_insights.__file__), fabricated, set())")
-        prelude = ("    original = _python_sources()\n"
+        prelude = ("    original = tuple(_python_sources())\n"
                    "    fabricated = ((original[0][0], '# fabricated\\n'), *original[1:])\n"
                    "    try:\n        " + call + "\n    except AssertionError:\n        pass\n")
         source = census_source_variant(caller, "_python_sources() if sources is None else sources", prelude=prelude)
@@ -762,7 +762,7 @@ def test_live_census_argon_extra_paths_are_prechecked(caller, binding):
 @pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
 @pytest.mark.parametrize("fabrication", ["filter", "slice", "map", "parameter", "fake-text", "repeated"])
 def test_live_census_argon_rejects_fabricated_rows(tmp_path, caller, fabrication):
-    prelude = "    original_rows = _python_sources()\n    first = original_rows[0][0]\n"
+    prelude = "    original_rows = tuple(_python_sources())\n    first = original_rows[0][0]\n"
     fake = "(row[0], '# benign fixture\\n') if row[0] == first else row"
     replacement = {
         "filter": "tuple(row for row in original_rows if row[0] != first)",
@@ -782,7 +782,7 @@ def test_live_census_argon_rejects_fabricated_rows(tmp_path, caller, fabrication
 @pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
 @pytest.mark.parametrize("argument", ["fabricated", "*[fabricated]", "**{'sources': fabricated}"])
 def test_live_census_argon_rejects_nonempty_wrappers(tmp_path, caller, argument):
-    prelude = ("    original_rows = _python_sources()\n"
+    prelude = ("    original_rows = tuple(_python_sources())\n"
                "    fabricated = ((original_rows[0][0], '# benign fixture\\n'), *original_rows[1:])\n")
     source = census_source_variant(caller, "_python_sources() if sources is None else sources", prelude=prelude)
     entry_name = ("test_no_module_imports_a_private_name_of_redaction" if caller == "test_redaction.py"
@@ -815,12 +815,112 @@ def test_live_census_runtime_allows_external_globs_and_resets(tmp_path, caller):
 
 
 @pytest.mark.parametrize("caller", ["test_redaction.py", "test_insights.py"])
-def test_live_census_source_rows_are_immutable(caller):
+def test_live_census_membership_is_immutable_and_insights_rows_stream(caller):
     import importlib
 
     module = importlib.import_module("tests.unit.core." + caller[:-3])
     assert isinstance(module._REVIEWED_PYTHON_PATHS, tuple)
-    assert isinstance(module._python_sources(), tuple)
+    assert isinstance(module._python_sources(), GeneratorType if caller == "test_insights.py" else tuple)
+
+
+def test_live_census_stream_snapshot_does_not_retain_source_text(tmp_path, monkeypatch):
+    import weakref
+
+    rows = [(f"tests/source_{index}.py", "# reviewed\n") for index in range(6)]
+    paths = reviewed_helper.freeze_fixture_sources(tmp_path, rows)
+    retained = []
+
+    class SourceText(str):
+        pass
+
+    class ObservedPath(type(tmp_path)):
+        def read_text(self, *args, **kwargs):
+            assert sum(reference() is not None for reference in retained) <= 1, (
+                "census snapshot retained source text")
+            text = SourceText(super().read_text(*args, **kwargs))
+            retained.append(weakref.ref(text))
+            return text
+
+    monkeypatch.setattr(reviewed_helper, "Path", ObservedPath)
+    for _ in range(2):
+        with census_guard(tmp_path, module_file=tmp_path / "fixture.py"):
+            assert not any(reference() is not None for reference in retained)
+            actual = reviewed_helper.reviewed_source_rows(ObservedPath(tmp_path), paths)
+            labels = []
+            for label, text in check_census_rows(actual):
+                labels.append(label)
+                assert text == "# reviewed\n"
+            del text
+            assert labels == list(paths)
+        assert not any(reference() is not None for reference in retained)
+
+
+@pytest.mark.parametrize("mutation", ["omit", "duplicate", "reorder", "text", "malformed", "surrogate", "non-text"])
+def test_live_census_stream_checker_refuses_then_recovers(tmp_path, mutation):
+    rows = [("tests/first.py", "# first\n"), ("tests/last.py", "# last\n")]
+    reviewed_helper.freeze_fixture_sources(tmp_path, rows)
+    changed = {
+        "omit": rows[:-1], "duplicate": rows + rows[:1], "reorder": rows[::-1],
+        "text": [(rows[0][0], "# fabricated\n"), rows[1]], "malformed": [None],
+        "surrogate": [(rows[0][0], chr(0xD800)), rows[1]], "non-text": [(rows[0][0], 42), rows[1]],
+    }[mutation]
+    for _ in range(2):
+        with pytest.raises(AssertionError, match="^census rows must equal the frozen inventory$"):
+            with census_guard(tmp_path, module_file=tmp_path / "fixture.py"):
+                # A caught mismatch must still poison this attempt.
+                with pytest.raises(AssertionError, match="^census rows must equal the frozen inventory$"):
+                    list(check_census_rows(iter(changed)))
+                list(check_census_rows(iter(rows)))
+        with census_guard(tmp_path, module_file=tmp_path / "fixture.py"):
+            assert list(check_census_rows(iter(rows))) == rows
+
+
+def test_live_census_stream_checker_requires_exhaustion_and_unchanged_text(tmp_path):
+    rows = [("tests/first.py", "# first\n"), ("tests/last.py", "# last\n")]
+    reviewed_helper.freeze_fixture_sources(tmp_path, rows)
+    with pytest.raises(AssertionError, match=r"^census did not check its source rows(?:\nassert False)?$"):
+        with census_guard(tmp_path, module_file=tmp_path / "fixture.py"):
+            checked = check_census_rows(iter(rows))
+            assert next(checked) == rows[0]
+    with pytest.raises(AssertionError, match=r"^census did not check its source rows(?:\nassert False)?$"):
+        with census_guard(tmp_path, module_file=tmp_path / "fixture.py"):
+            assert list(check_census_rows(iter(rows))) == rows
+            check_census_rows(iter(rows))
+    with pytest.raises(AssertionError, match="^census rows must equal the frozen inventory$"):
+        with census_guard(tmp_path, module_file=tmp_path / "fixture.py"):
+            (tmp_path / rows[1][0]).write_text("# changed\n", encoding="utf-8")
+            actual = ((name, (tmp_path / name).read_text(encoding="utf-8")) for name, _ in rows)
+            list(check_census_rows(actual))
+    with census_guard(tmp_path, module_file=tmp_path / "fixture.py"):
+        current = [(name, (tmp_path / name).read_text(encoding="utf-8")) for name, _ in rows]
+        assert list(check_census_rows(iter(current))) == current
+
+
+def test_live_census_stream_checkers_keep_their_context_when_interleaved(tmp_path):
+    outer, inner = tmp_path / "outer", tmp_path / "inner"
+    outer_rows = [("tests/first.py", "# outer first\n"), ("tests/last.py", "# outer last\n")]
+    inner_rows = [("tests/first.py", "# inner first\n"), ("tests/last.py", "# inner last\n")]
+    reviewed_helper.freeze_fixture_sources(outer, outer_rows)
+    reviewed_helper.freeze_fixture_sources(inner, inner_rows)
+    for _ in range(2):
+        with census_guard(outer, module_file=outer / "fixture.py"):
+            outer_checked = check_census_rows(iter(outer_rows))
+            with census_guard(inner, module_file=inner / "fixture.py"):
+                inner_checked = check_census_rows(iter(inner_rows))
+                assert next(outer_checked) == outer_rows[0]
+                assert next(inner_checked) == inner_rows[0]
+                assert list(outer_checked) == outer_rows[1:]
+                assert list(inner_checked) == inner_rows[1:]
+        with pytest.raises(AssertionError, match=r"^census did not check its source rows(?:\nassert False)?$"):
+            with census_guard(outer, module_file=outer / "fixture.py"):
+                unfinished = check_census_rows(iter(outer_rows))
+                assert next(unfinished) == outer_rows[0]
+                assert list(check_census_rows(iter(outer_rows))) == outer_rows
+        with census_guard(outer, module_file=outer / "fixture.py"):
+            first = check_census_rows(iter(outer_rows))
+            second = check_census_rows(iter(outer_rows))
+            assert next(first) == next(second) == outer_rows[0]
+            assert list(second) == list(first) == outer_rows[1:]
 
 
 def test_live_census_runtime_flag_resets_after_refusal_and_other_errors():
@@ -1039,21 +1139,21 @@ def test_both_censuses_freeze_the_index_and_retry_missing_sources(reviewed_censu
     scope = runpy.run_path(str(module))
     assert scope["_REVIEWED_PYTHON_PATHS"] == expected
     scan = scope["_python_sources"]
-    initial = scan()
+    initial = tuple(scan())
     assert ".github/scripts/reviewed script.py" in scope["_REVIEWED_PYTHON_PATHS"]
     assert "tests/untracked.py" not in scope["_REVIEWED_PYTHON_PATHS"]
     # A parallel worker may even stage a new file after collection.
     subprocess.run(["git", "add", "."], cwd=checkout, env=env, check=True, capture_output=True, timeout=60)
     for _ in range(2):
-        assert scan() == initial
+        assert tuple(scan()) == initial
     reviewed = checkout / "aegis_core" / "reviewed.py"
     reviewed.unlink()
     for _ in range(2):
         with pytest.raises(FileNotFoundError) as failure:
-            scan()
+            tuple(scan())
         assert failure.value.filename == str(reviewed)
     reviewed.write_text("# restored\n", encoding="utf-8")
-    assert scan() != initial
+    assert tuple(scan()) != initial
 
 
 def test_both_censuses_ignore_all_inherited_git_controls(reviewed_census_checkout, redaction_import_path):
@@ -1307,10 +1407,8 @@ def test_scanners_defines_no_redaction_table_and_no_redactor():
 
 def private_imports(sources: Iterable[Tuple[str, str]]) -> List[str]:
     """``label:line: aegis_core.redaction._name`` for each import of an underscore name of the module."""
-    sources = tuple(sources)
-    check_census_rows(sources)
     found = []
-    for label, text in sources:
+    for label, text in check_census_rows(sources):
         # Python normalizes identifiers with NFKC before exposing them in the AST.
         if "redaction" not in text and (text.isascii() or "redaction" not in unicodedata.normalize("NFKC", text)):
             continue

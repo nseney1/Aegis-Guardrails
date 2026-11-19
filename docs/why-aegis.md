@@ -152,6 +152,14 @@ Each v4 change came with a prediction that could fail, and a failed one is somet
 | In 20 multi-lane sessions no cross-lane write conflict reaches a merge. Proposed maintainer decision: remove the lease feature after 30 days of multi-lane use with no denial; this is not automatic lease expiry | `aegis team metrics` | Not yet measured over 20 sessions |
 | The next major version ships without a clean-slate purge | Its CHANGELOG gives an `aegis migrate` path for every format it changes | Holds for 4.0.0; rule files have no schema version yet |
 
+## 8. Team coordination on this branch
+
+The sections above are about how v4 got its shape. This branch also contains team coordination. The package version is still 4.5.0 until the release cut.
+
+In the tree now: repository leases and `aegis check --lane`; the team work queue; model selection that refuses a binding that was not admitted; `aegis msg` for the message codec; the product mailbox library; source-checkout hierarchy tools that are not in the wheel; lane Git snapshot, plan and compare-and-swap publish; qualification records with no CLI; a publisher core whose activation is not wired; proposal records that can name source `mine`; and `aegis rule lint`, which reports findings, exits 0 and does not install a rule. [Agent teams](teams.md) is the entry. [How Aegis works](how-it-works.md#proposals-and-rule-lint) and [Architecture](architecture.md#git-delivery) name the libraries.
+
+Not in this tree: copying `tools/hierarchy_templates/` into the wheel, and a separate OS principal. `aegis_core.merge_queue.MergeQueue` is an in-tree library whose landing wiring is separate work. The wheel does include `aegis_core/team_templates/role-registry.json`. `team_git.descriptor_support` is true when `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `stat` and `readlink`. `storage.confined_descriptor_supported` is true when `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `mkdir`, `link`, `rename`, `unlink` and `stat`. That function does not use `readlink`. Both are false when `os.name` is not `posix`, so Windows fails them. Neither function tests for macOS. Qualification writes call `team_qualify.descriptor_supported` and otherwise refuse `unsupported_platform`. That function is true only when `team_git.descriptor_support` is true, `team_gitops.descriptor_supported` is true (`fcntl` is available and `storage.confined_descriptor_supported` is true), and `gitops_fds.descriptor_supported` is true (`sys.platform` is `linux`, `os.name` is `posix`, and `prctl(37)` returns 0). File modes do not isolate another process running as the owner. A local score is still a label, and promoting a rule is still a reviewed change.
+
 ## Appendix A: Trade-offs
 
 | Decision | What it costs | What you give up |
@@ -186,8 +194,8 @@ python3 -c "import aegis_mcp.registry as r; print(len(r.TOOL_DEFINITIONS))"   # 
 
 These are future directions, not capabilities of the current release.
 
-- **4.6.0 — lessons from repository history:** `aegis mine` would turn observed failures and corrections into candidates in one proposal queue for human review. It would not create active rules automatically.
-- **4.7.0 — parallel agents in one repository:** improve coordination and review for agents sharing a repository, building on the existing advisory lanes and leases without claiming isolation or autonomous approval.
+- **4.6.0 — history mining command:** a command that turns observed failures and corrections into proposal candidates for human review. It would not create active rules automatically. Section 8 names the proposal records that already exist; this item is the missing command.
+- **5.1.0 — separate OS principal:** isolate team authority from other processes that share the owner account. File modes do not do that, and this principal is not in the tree.
 - **4.8.0 — code-claim checks:** a proposed `aegis claims check FILE` would read `{id, anchor, probe, expect}` claims and report **holds**, **moved**, **no longer holds** or **contradicts** against the current code. It would be stateless, read-only and independent of any plan format.
 
 The 4.8.0 idea must first prove useful in a manual trial that records what its probes catch; if the trial misses most stale claims, drop the feature. It is not project management: no owners, assignees, dates, estimates, priorities, dependency ordering, stored progress or progress UI. Plans and responsibility stay outside Aegis.
