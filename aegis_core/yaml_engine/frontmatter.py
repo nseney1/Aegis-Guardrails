@@ -1,40 +1,17 @@
 """Frontmatter extraction helpers and primary AegisYAML gateway interface."""
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from aegis_core.rule_inventory import RuleInventoryError, read_rule_file, split_frontmatter
 from aegis_core.yaml_engine.document import AegisDocument
 from aegis_core.yaml_engine.parser import (
     AegisYAMLError,
-    ZERO_WIDTH_CHARS,
-    _CLOSING_DELIM_RE,
     parse_yaml_subset,
 )
-
-
-def split_frontmatter(content: str) -> Tuple[str, Optional[str], str]:
-    """The one frontmatter delimiter scanner: ``(status, frontmatter text, body)``.
-
-    ``status`` is ``"ok"``, ``"none"`` (the text does not start with ``---``; the body is
-    the whole text) or ``"unterminated"`` (no closing ``---`` line). Leading zero-width
-    characters (a BOM) are not part of the text. The façades below keep their own
-    failure contracts on top of it (defense #30).
-    """
-    for zw in ZERO_WIDTH_CHARS:
-        if content.startswith(zw):
-            content = content[len(zw):]
-    if not content.startswith("---"):
-        return "none", None, content
-    # Partitioned rather than offset: '^' matches where ``rest`` starts, no index to miscount.
-    _opening, newline, rest = content.partition("\n")
-    if not newline:
-        return "unterminated", None, content
-    m = _CLOSING_DELIM_RE.search(rest)
-    if not m:
-        return "unterminated", None, content
-    return "ok", rest[: m.start()], rest[m.end():]
 
 
 def _get_body(content: str) -> str:
@@ -61,14 +38,35 @@ def parse_frontmatter(content: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def parse_rule_frontmatter(content_or_path: str) -> Tuple[Dict[str, Any], str]:
-    """Parse a rule file or markdown string into (frontmatter_dict, body)."""
-    if os.path.exists(content_or_path) and os.path.isfile(content_or_path):
-        with open(content_or_path, "r", encoding="utf-8-sig") as f:
-            content = f.read()
-    else:
-        content = content_or_path
+class RuleReadError(AegisYAMLError):
+    """A path could not be read safely; diagnostics never contain supplied text."""
 
+    def __init__(self, message: str, *, code: str = "RULE_FILE_READ_REFUSED"):
+        self.code = code
+        super().__init__(message)
+
+
+class RuleFileNotFoundError(FileNotFoundError):
+    """A missing rule path, preserving the file parser's FileNotFoundError API."""
+
+    code = "RULE_FILE_NOT_FOUND"
+
+
+def _read_rule_text(filepath, *, root=None, encoding="utf-8-sig", source=None,
+                    canonicalize_parent=True) -> str:
+    try:
+        raw = read_rule_file(filepath, root=root, source=source, preserve_os_errors=True,
+                             canonicalize_parent=canonicalize_parent)
+    except RuleInventoryError as exc:
+        if exc.code == "RULE_FILE_NOT_FOUND":
+            raise RuleFileNotFoundError("Rule file not found") from None
+        raise RuleReadError("Rule file read refused") from None
+    # Preserve each entry point's original codec and decoding errors, while
+    # matching universal newlines only after the bounded byte capture.
+    return raw.decode(encoding).replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _parse_rule_text(content: str) -> Tuple[Dict[str, Any], str]:
     status, fm_text, body = split_frontmatter(content)
     if status == "none":
         raise ValueError("No frontmatter delimiter")
@@ -79,20 +77,50 @@ def parse_rule_frontmatter(content_or_path: str) -> Tuple[Dict[str, Any], str]:
     return data, body.lstrip("\r\n")
 
 
+def parse_rule_frontmatter(content_or_path: str) -> Tuple[Dict[str, Any], str]:
+    """Parse a rule file or markdown string into (frontmatter_dict, body)."""
+    content = content_or_path
+    if (isinstance(content_or_path, (str, Path)) and len(str(content_or_path)) <= 32768
+            and os.path.exists(content_or_path) and os.path.isfile(content_or_path)):
+        content = _read_rule_text(content_or_path)
+    return _parse_rule_text(content)
+
+
 def parse_rule_file(filepath: str) -> Tuple[Dict[str, Any], str]:
     """Parse the rule file at ``filepath`` into (frontmatter_dict, body).
 
-    Raises RuleNotFoundError if it is not a file and RuleParseError if its
-    frontmatter is missing or malformed. Public through ``aegis_sdk``.
+    Legacy missing/non-file and parse failures retain their exception types,
+    messages and ERR_AEGIS code. Newly refused unsafe reads use
+    RULE_FILE_READ_REFUSED. Public through ``aegis_sdk``.
     """
     from aegis_core.errors import RuleNotFoundError, RuleParseError
 
-    if not os.path.isfile(filepath):
+    if (isinstance(filepath, (str, Path)) and len(str(filepath)) <= 32768
+            and "\x00" not in str(filepath) and not os.path.isfile(filepath)):
         raise RuleNotFoundError(f"Rule file not found: {filepath}")
     try:
-        return parse_rule_frontmatter(filepath)
+        return _parse_rule_text(_read_rule_text(filepath))
+    except FileNotFoundError:
+        raise RuleNotFoundError(f"Rule file not found: {filepath}") from None
+    except RuleReadError:
+        raise RuleParseError("Rule file read refused", code="RULE_FILE_READ_REFUSED") from None
     except ValueError as exc:
         raise RuleParseError(f"Error parsing rule {filepath}: {exc}") from exc
+
+
+def _rule_workspace_root(workspace):
+    """Recover an exposed trusted root without resolving its current spelling."""
+    from aegis_core.workspace.base import Workspace
+
+    root = getattr(workspace, "root", None)
+    if root is None:
+        owner = getattr(workspace.confine_path, "__self__", None)
+        if isinstance(owner, Workspace):
+            root = owner.root
+    if root is not None and (not isinstance(root, (str, Path))
+            or not 1 <= len(str(root)) <= 32768 or "\x00" in str(root)):
+        raise RuleReadError("Rule file read refused")
+    return root
 
 
 class AegisYAML:
@@ -115,38 +143,69 @@ class AegisYAML:
 
     @staticmethod
     def parse_file(rel_path: str | Path, workspace: Any) -> AegisDocument:
-        """Parse file strictly confined within workspace boundaries, rejecting symlinks."""
+        """Parse a bounded rule, querying the confiner only for the original path.
+
+        An exposed root, including a bound Workspace.confine_path owner, uses
+        the anchored no-follow walk over the original descendant components.
+        An opaque adapter owns containment and any original symlink resolution:
+        read exactly its returned path (or tuple[0]) once, without rebuilding it.
+        Its returned final component is never followed. A resolver that provides
+        no containment is outside this opaque-adapter trust boundary.
+        """
         if not hasattr(workspace, "confine_path"):
             raise AegisYAMLError("Workspace with confine_path() required to parse file")
+        if not isinstance(rel_path, (str, Path)) or not 1 <= len(str(rel_path)) <= 32768:
+            raise RuleReadError("Rule file read refused")
 
-        ws_root = getattr(workspace, "root", None)
-        if ws_root:
+        ws_root = _rule_workspace_root(workspace)
+        if ws_root is not None:
             raw_target = Path(ws_root) / rel_path
             if raw_target.is_symlink():
                 raise AegisYAMLError(f"Symlink parsing prohibited for security: {raw_target}")
 
+        # Preserve the full result for legacy metadata checks and diagnostics.
         resolved = workspace.confine_path(rel_path)
         if isinstance(resolved, tuple):
             resolved_abs = resolved[0]
         else:
             resolved_abs = resolved
 
+        source_path = resolved_abs
+        if (not isinstance(resolved_abs, (str, Path)) or not 1 <= len(str(resolved_abs)) <= 32768
+                or "\x00" in str(resolved_abs)):
+            raise RuleReadError("Rule file read refused")
         path_obj = Path(resolved_abs)
         if not path_obj.exists():
             raise FileNotFoundError(f"File does not exist: {resolved_abs}")
         if path_obj.is_symlink():
             raise AegisYAMLError(f"Symlink parsing prohibited for security: {resolved_abs}")
+        if path_obj.is_dir():
+            if os.name == "nt":
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(path_obj))
+            raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), str(path_obj))
 
-        content = path_obj.read_text(encoding="utf-8")
+        target = Path(ws_root) / rel_path if ws_root is not None else source_path
+        try:
+            content = _read_rule_text(target, root=ws_root, encoding="utf-8", source=source_path,
+                                      canonicalize_parent=False)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"File does not exist: {resolved_abs}") from None
+        except OSError as exc:
+            if exc.filename is not None:
+                exc.filename = str(path_obj)
+            raise
         doc = AegisYAML.parse_text(content)
-        doc._source_path = str(resolved_abs)
+        doc._source_path = str(source_path)
         return doc
 
 __all__ = [
     "AegisYAML",
+    "RuleFileNotFoundError",
+    "RuleReadError",
     "_get_body",
     "parse_frontmatter",
     "parse_rule_file",
     "parse_rule_frontmatter",
+    "read_rule_file",
     "split_frontmatter",
 ]
