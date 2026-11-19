@@ -20,7 +20,7 @@ from aegis_core.insights.keys import (
     insights_path,
 )
 from aegis_core.primitives import parse_utc, utc_stamp
-from aegis_core.redaction import redact_insight_text
+from aegis_core.redaction import RedactionRefusal, redact_insight_text
 from aegis_core.storage import read_jsonl
 from aegis_core.workspace.binding import bounded_walk_up
 from aegis_core.workspace.layout import AEGIS_DIRNAME
@@ -39,6 +39,9 @@ __all__ = [
     "merge_insight_hook",
     "record_hook_prompt",
     "remove_insight_hook",
+    "INSIGHT_FIELD_POLICIES",
+    "clean_insight_row",
+    "MAX_INSIGHT_ITEMS",
 ]
 
 # How far apart (seconds) an insight and an exposure, or a capture and the hook prompt that
@@ -54,6 +57,93 @@ JOIN_WINDOW_S = 1800
 MAX_CAPTURES_PER_SESSION = 50
 MAX_CAPTURE_PATHS = 20
 MAX_CAPTURE_PATH_CHARS = 512
+MAX_INSIGHT_ITEMS = 4096
+
+# Every persisted field has one policy. Unknown fields refuse before append.
+INSIGHT_FIELD_POLICIES = {
+    "v": "identity", "ts": "identity", "event": "identity", "id": "identity",
+    "level": "identity", "text": "text", "paths": "path", "psrc": "identity",
+    "host": "text", "hs": "identity", "source": "identity", "kind": "text",
+    "approval_code": "identity", "revs": "identity", "corroborated_by": "identity",
+    "paths_dropped": "identity", "cue": "identity", "inv": "identity",
+    "decision": "identity", "insight_ids": "identity", "reason": "text", "rule_id": "identity",
+}
+_IDENTITY_ENUMS = {
+    "event": ("insight", "heartbeat", "inventory", "decision"),
+    "level": ("H", "cli", "W2", "suggestion"), "psrc": ("explicit", "dirty"),
+    "source": ("cli", "mcp", "hook"),
+    "decision": ("propose", "reject", "snooze", "merge-into-rule", "noise", "confirm"),
+}
+_IDENTITY_PATTERNS = {
+    "id": r"ins-[0-9a-f]{12}", "corroborated_by": r"ins-[0-9a-f]{12}",
+    "hs": r"[0-9a-f]{32}", "inv": r"[0-9a-f]{16}",
+    "approval_code": r"[a-z][a-z0-9_]{0,63}",
+    # Same bounded rule-id form as adjudication, without adding its import path.
+    "rule_id": r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}",
+}
+
+
+def _insight_identity(name, value):
+    if name == "v":
+        return type(value) is int and value == INSIGHT_SCHEMA_VERSION
+    if name == "cue":
+        return type(value) is bool
+    if name == "paths_dropped":
+        return type(value) is int and 0 <= value < 2 ** 63
+    if name == "ts":
+        parsed = parse_utc(value) if type(value) is str and len(value) == 20 else None
+        return parsed is not None and utc_stamp(parsed) == value
+    if name in _IDENTITY_ENUMS:
+        return type(value) is str and value in _IDENTITY_ENUMS[name]
+    if name in _IDENTITY_PATTERNS:
+        return (type(value) is str and len(value) <= 128 and
+                re.fullmatch(_IDENTITY_PATTERNS[name], value) is not None and
+                redact_insight_text(value, max_len=0) == value)
+    if name == "insight_ids":
+        return (type(value) in (tuple, list) and len(value) <= MAX_INSIGHT_ITEMS and
+                all(_insight_identity("id", item) for item in value))
+    if name == "revs":
+        return (type(value) is dict and len(value) <= MAX_INSIGHT_ITEMS and all(
+            _insight_identity("rule_id", key) and type(digest) is str and len(digest) == 16 and
+            re.fullmatch(r"[0-9a-f]{16}", digest) is not None for key, digest in value.items()))
+    return False
+
+
+def _insight_text(value):
+    if type(value) is not str:
+        raise RedactionRefusal("invalid")
+    shown = redact_insight_text(value)
+    try:
+        shown.encode("utf-8")
+    except UnicodeError:
+        raise RedactionRefusal("invalid") from None
+    return shown
+
+
+def clean_insight_row(row, *, workspace):
+    """Apply the closed field policy; refuse invalid/too_large without echoing data.
+
+    The workspace is the writer's trusted root. Paths use its existing
+    confinement flow; all string parsing/encoding follows bounded preflights.
+    """
+    if type(row) is not dict or len(row) > len(INSIGHT_FIELD_POLICIES):
+        raise RedactionRefusal("invalid")
+    cleaned = {}
+    for name, value in row.items():
+        if type(value) in (list, tuple, dict) and len(value) > MAX_INSIGHT_ITEMS:
+            raise RedactionRefusal("too_large")
+        policy = INSIGHT_FIELD_POLICIES.get(name)
+        if policy == "text":
+            cleaned[name] = _insight_text(value)
+        elif policy == "path":
+            if type(value) not in (tuple, list):
+                raise RedactionRefusal("invalid")
+            cleaned[name] = _confine_paths(workspace, value)
+        elif policy == "identity" and _insight_identity(name, value):
+            cleaned[name] = dict(value) if name == "revs" else list(value) if name == "insight_ids" else value
+        else:
+            raise RedactionRefusal("invalid")
+    return cleaned
 
 
 _CUE_RE = re.compile(
@@ -91,9 +181,12 @@ def _served_rule_revs(workspace: Any) -> Dict[str, str]:
     try:
         from aegis_core.rules import load_rules
 
-        return {r.id: r.digest[:16] for r in load_rules(root).served}
+        served = load_rules(root).served
     except Exception:
         return {}
+    if len(served) > MAX_INSIGHT_ITEMS:
+        raise RedactionRefusal("too_large")
+    return {r.id: r.digest[:16] for r in served}
 
 
 def _inventory_id(root: Path) -> Optional[str]:
@@ -109,6 +202,8 @@ def _known_inventory_revs(path: Path, inv: str) -> Optional[Dict[str, str]]:
     # Rows are compact JSON, so these bytes are exact and appear only in inventory rows.
     for row in read_jsonl(path, contains=b'"event":"inventory"').rows:
         if row.get("event") == "inventory" and row.get("inv") == inv and isinstance(row.get("revs"), dict):
+            if len(row["revs"]) > MAX_INSIGHT_ITEMS:
+                raise RedactionRefusal("too_large")
             return dict(row["revs"])
     return None
 
@@ -133,16 +228,29 @@ def _human_approval(workspace: Any, commit: Optional[str], base_ref: Optional[st
 
 def _confine_paths(root: Any, paths: Sequence[str]) -> List[str]:
     """Workspace-relative POSIX paths; PathTraversalError for one that resolves outside."""
+    if not paths:
+        return []
     from aegis_core.workspace.confinement import confine_path_internal
+    from aegis_core.errors import PathTraversalError
 
-    base = Path(os.fspath(root))
-    return sorted({PurePath(confine_path_internal(base, str(p))[1]).as_posix() for p in paths if str(p).strip()})
+    if len(paths) > MAX_INSIGHT_ITEMS:
+        raise RedactionRefusal("too_large")
+    if any(type(path) is not str or len(path) > MAX_CAPTURE_PATH_CHARS or any(
+            ord(char) < 32 or 127 <= ord(char) <= 159 for char in path) for path in paths):
+        raise PathTraversalError("invalid insight path")
+    try:
+        for path in paths:
+            path.encode("utf-8")
+        base = Path(os.fspath(root))
+        return sorted({PurePath(confine_path_internal(base, p)[1]).as_posix() for p in paths if p.strip()})
+    except (UnicodeError, PathTraversalError):
+        raise PathTraversalError("invalid insight path") from None
 
 
 def _resolve_paths(workspace: Any, paths: Optional[Sequence[str]]) -> Tuple[List[str], str]:
     if paths is not None and len(paths) > 0:
         return _confine_paths(workspace, paths), "explicit"
-    return dirty_paths(workspace), "dirty"
+    return _confine_paths(workspace, dirty_paths(workspace)), "dirty"
 
 
 class CaptureLimitReached(ValueError):
@@ -248,15 +356,16 @@ def add_insight(
     # never from a typed argument, so CLI rows cannot forge distinct recurrence episodes.
     if not isinstance(text, str) or not text.strip():
         raise ValueError("insight text must be a non-empty string")
-    clean = redact_insight_text(text)
     norm_paths, psrc = _resolve_paths(workspace, paths)
     # The human signs the hash of what they typed; only the redacted text is stored.
     approved, approval_code = _human_approval(workspace, commit, base_ref, text)
     level = "H" if approved else "cli"
     row = _build_insight_row(
-        workspace, level, clean, norm_paths, psrc, "cli", None, source="cli", kind=str(kind) if kind else None,
+        workspace, level, text, norm_paths, psrc, "cli", None, source="cli",
+        kind=str(kind) if kind else None,
         approval_code=approval_code,
     )
+    row = clean_insight_row(row, workspace=workspace)
     _append_user_insights(insights_path(workspace, home=home), [row])
     return row
 
@@ -272,6 +381,8 @@ def capture_suggestion(
 ) -> Dict[str, Any]:
     if not isinstance(quote, str) or not quote.strip():
         raise ValueError("quote must be a non-empty string")
+    raw_host = host or "mcp"
+    host = _insight_text(raw_host)
     redacted = redact_insight_text(quote)
     norm_paths, psrc, dropped = _capture_paths(workspace, paths)
     hs = _ensure_hs(host, session, home)
@@ -292,10 +403,10 @@ def capture_suggestion(
         row = _build_insight_row(
             workspace,
             "suggestion",
-            redacted,
+            quote,
             norm_paths,
             psrc,
-            host or "mcp",
+            raw_host,
             hs,
             now,
             revs=revs,
@@ -303,6 +414,7 @@ def capture_suggestion(
             corroborated_by=_corroborating_hook(hooks, host or "mcp", now, redacted),
             paths_dropped=dropped,
         )
+        row = clean_insight_row(row, workspace=workspace)
         _append_user_insights(path, [row])
     return row
 
@@ -331,7 +443,8 @@ def record_hook_prompt(
     excerpts: bool = True,
     home: Optional[Path] = None,
 ) -> Dict[str, Any]:
-    host = str(host)
+    raw_host = host
+    host = _insight_text(raw_host)
     prompt_text, payload_session, payload_cwd = _extract_hook_fields(payload)
     actual_ws = workspace
     if actual_ws is None:
@@ -366,18 +479,19 @@ def record_hook_prompt(
                 to_write.append({"v": INSIGHT_SCHEMA_VERSION, "ts": now, "event": "inventory", "inv": inv, "revs": revs})
     hb: Dict[str, Any] = {}
     if hs is not None:
-        hb = {"v": INSIGHT_SCHEMA_VERSION, "ts": now, "event": "heartbeat", "host": host, "hs": hs, "cue": cue}
+        hb = {"v": INSIGHT_SCHEMA_VERSION, "ts": now, "event": "heartbeat", "host": raw_host, "hs": hs, "cue": cue}
         if inv:
             hb["inv"] = inv
         to_write.append(hb)
     insight_row: Optional[Dict[str, Any]] = None
     if excerpt:
         insight_row = _build_insight_row(
-            actual_ws, "W2", excerpt, dirty_paths(actual_ws), "dirty", host, hs, now=now, revs=revs or {}, source="hook",
+            actual_ws, "W2", prompt_text, dirty_paths(actual_ws), "dirty", raw_host, hs, now=now, revs=revs or {}, source="hook",
         )
         to_write.append(insight_row)
+    to_write = [clean_insight_row(row, workspace=actual_ws) for row in to_write]
     _append_user_insights(path, to_write)
-    return insight_row if insight_row is not None else hb
+    return to_write[-1] if to_write else {}
 
 
 #: Marks Aegis's insight handler: in the exec form's args, the Codex string or 4.3's ``-m``.

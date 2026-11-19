@@ -24,6 +24,9 @@ import aegis_mcp.server as server
 from aegis_core.workspace.binding import Attested, read_registry, resolve_binding
 
 
+REAL_HARDEN_PROCESS = server.harden_process
+
+
 @pytest.fixture
 def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home = tmp_path / "home"
@@ -115,6 +118,11 @@ def test_in_process_stdio_preserves_worker_dumpability(home, monkeypatch, capsys
 
     assert frames[1]["result"] == {}
     assert libc.prctl(3, 0, 0, 0, 0) == before
+
+
+def test_hardening_policy_applies_in_another_module():
+    assert server.harden_process is not REAL_HARDEN_PROCESS
+    assert server.harden_process() is False
 
 
 def _list_rules(monkeypatch, capsys, client: str, roots_uri=None):

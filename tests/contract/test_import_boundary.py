@@ -97,6 +97,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.rule_lint": 2,
     "aegis_core.rule_lint_capture": 2,
     "aegis_core.rule_lint_grammar": 2,
+    "aegis_core.rule_lint_reasons": 0,
     "aegis_core.rules": 1,
     "aegis_core.rule_inventory": 1,
     "aegis_core.yaml_engine": 1,
@@ -126,6 +127,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_mailbox_pager": 0,
     "aegis_core.team_mailbox_primitives": 0,
     "aegis_core.team_mailbox_records": 1,
+    "aegis_core.team_mailbox_service": 1,
     "aegis_core.team_mailbox_store": 0,
     "aegis_core.team_metrics": 1,
     "aegis_core.team_paths": 1,
@@ -185,6 +187,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.release_verify": 1,
     # v4.3 T8: human insights closed loop, a package (user-scope JSONL, cue detector, TF-IDF review, recurrence).
     "aegis_core.insights": 2,
+    "aegis_core.redaction_patterns": 0,
     # v4.3 T5: fail-to-pass regression check (gitsafe, testexec's snapshot pytest runner, human_gate exemptions).
     "aegis_core.regression": 2,
     "aegis_core.scan": 2,

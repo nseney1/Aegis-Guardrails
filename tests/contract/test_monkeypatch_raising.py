@@ -8166,7 +8166,6 @@ PROCESS_PATCH_LIMITS = {
     'tests/unit/mcp/test_mcp_runtime_binding.py': 2,
     'tests/unit/mcp/test_mcp_session_close_side_effects.py': 1,
     'tests/unit/mcp/test_mcp_session_stdio_contract.py': 1,
-    'tests/unit/mcp/test_server_hardening.py': 2,
     'tests/unit/test_p6_noadmin.py': 1,
     'tests/unit/verification/test_call_graph_ast.py': 1,
     'tests/unit/verification/test_checkpoint_fail_closed.py': 1,
