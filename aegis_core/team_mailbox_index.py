@@ -11,9 +11,10 @@ from threading import RLock
 
 from aegis_core.team_mailbox import Mailbox
 from aegis_core.team_mailbox_primitives import (
-    SLUG, matching, operation, require,
+    SLUG, matching, require,
 )
 from aegis_core.team_mailbox_index_scan import Evidence, scan_history
+from aegis_core.team_mailbox_service import operation
 
 __all__ = ["Index", "compare"]
 

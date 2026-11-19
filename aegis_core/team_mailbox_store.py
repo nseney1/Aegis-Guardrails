@@ -26,7 +26,7 @@ from aegis_core.workspace.layout import UserLayout
 from aegis_core.team_mailbox_primitives import (
     render_mailbox_refusal,
     BusyError, MailboxRefusal, MAX_BYTES, MAX_RECORDS, MAX_STATUS_EVIDENCE_BYTES, MAX_RELEASE_WARNINGS,
-    SHA256, SLUG, LockReleaseWarning, bounded_tree, lock_path, matching, require, safe_path, strict_json, validate_warnings, witness_record,
+    SHA256, SLUG, LockReleaseWarning, lock_path, matching, require, safe_path, strict_json, validate_warnings,
 )
 
 __all__ = ["Store", "descriptor_supported", "initialize_store"]
@@ -516,58 +516,15 @@ class Store:
                 os.unlink(pending, dir_fd=parent)
             os.fsync(parent)
 
-    def witnesses(self, worktrees, directory, observe, *, expected=None, warnings=None):
-        """Stage an entire observation batch under one exclusion, then commit or undo."""
-        require(type(worktrees) is list and len(worktrees) <= 256)
-        validate_warnings(warnings, limit=MAX_RELEASE_WARNINGS)
-        if expected is not None:
-            require(type(expected) is list)
-            require(len(expected) <= 256, reason="too_large")
-            require(len(expected) == len(worktrees))
-            expected = [witness_record(source, worktree) for source, worktree in zip(expected, worktrees)]
-            bounded_tree(expected)
-        directory = safe_path(directory)
-        stage = self.root / (".pending-witness-" + uuid.uuid4().hex)
-        results, artifacts, undo, total = [], {}, [], 0
-        with self.creation("evidence-destination"), self.evidence_transaction(warnings) as transaction, self.publication_lock(self.root, transaction), self.witness_lock(directory, transaction) as anchor:
-            with self.directory(directory, create=True, undo=undo, parent=anchor) as parent:
-                with self.directory(stage, create=True, temporary=True) as stage_fd:
-                    for index, worktree in enumerate(worktrees):
-                        capability = _WitnessStage(stage, self, stage_fd)
-                        self._local.stage = capability
-                        try:
-                            result = witness_record(observe("source_witness", safe_path(worktree), capability), worktree)
-                        finally:
-                            self._local.stage = None
-                        if expected is not None:
-                            require(all(result[key] == expected[index][key] for key in
-                                        ("worktree", "source_revision", "source_tree", "dirty_state_sha256", "dirty_entries")))
-                        if "dirty_evidence" in result:
-                            sha = result["dirty_state_sha256"]
-                            artifact = stage / (sha + ".status")
-                            require(safe_path(result["dirty_evidence"]) == artifact)
-                            if sha not in artifacts:
-                                raw = self.read(artifact, limit=MAX_STATUS_EVIDENCE_BYTES - total, parent=stage_fd)
-                                require(hashlib.sha256(raw).hexdigest() == sha)
-                                artifacts[sha], total = raw, total + len(raw)
-                            result["dirty_evidence"] = str(directory / artifact.name)
-                        else:
-                            require(result["dirty_entries"] == 0)
-                        results.append(result)
-                    bounded_tree(results)
-                    require({path.name for path in self.entries(stage, parent=stage_fd)} == {sha + ".status" for sha in artifacts})
-                    pending = []
-                    for sha, raw in artifacts.items():
-                        path = directory / (sha + ".status")
-                        if self.exists(path, parent=parent):
-                            require(hashlib.sha256(self.read(path, limit=MAX_STATUS_EVIDENCE_BYTES, parent=parent)).hexdigest() == sha)
-                        else:
-                            pending.append((path, raw))
-                    for path, raw in pending:
-                        self.publish(path, raw, limit=MAX_STATUS_EVIDENCE_BYTES, parent=parent, undo=undo)
-                # All evidence is published and staging cleanup has completed.
-                transaction["committed"] = True
-        return results
+    @contextmanager
+    def witness_stage(self, path, parent):
+        """Lend the host a capability for an already-held staging descriptor."""
+        capability = _WitnessStage(path, self, parent)
+        self._local.stage = capability
+        try:
+            yield capability
+        finally:
+            self._local.stage = None
 
     @contextmanager
     def owner_lock(self, transaction):
