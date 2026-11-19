@@ -186,6 +186,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.release_verify": 1,
     # v4.3 T8: human insights closed loop, a package (user-scope JSONL, cue detector, TF-IDF review, recurrence).
     "aegis_core.insights": 2,
+    "aegis_core.redaction_patterns": 0,
     # v4.3 T5: fail-to-pass regression check (gitsafe, testexec's snapshot pytest runner, human_gate exemptions).
     "aegis_core.regression": 2,
     "aegis_core.scan": 2,
