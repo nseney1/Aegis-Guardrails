@@ -23,7 +23,7 @@ from pathlib import Path
 import re
 
 from aegis_core.storage import confined_descriptor_supported as storage_descriptor_supported
-from aegis_core.team_mailbox_primitives import MAX_BYTES, MAX_RECORDS, MailboxRefusal
+from aegis_core.team_mailbox_primitives import MAX_BYTES, MAX_RECORDS, MailboxRefusal, render_mailbox_refusal
 
 __all__ = [
     "MAX_BYTES", "MAX_RECORDS", "MAX_ARGV_ATOMS", "MAX_ARGV_ATOM_CHARS", "MAX_ARGV_CHARS",
@@ -98,13 +98,13 @@ def guarded(function):
         require(all(name in kwargs for name in names[len(args):required]))
         try:
             return function(*args, **kwargs)
+        except MailboxRefusal as error:
+            raise HostRefusal("too_large" if render_mailbox_refusal(error)["reason"] == "too_large" else "invalid_record") from None
         except HostRefusal:
             raise
         except OSError as error:
             reason = "unsafe_path" if error.errno in (errno.ELOOP, errno.ENOTDIR) else "io"
             raise HostRefusal(reason) from None
-        except MailboxRefusal as error:
-            raise HostRefusal("too_large" if error.reason == "too_large" else "invalid_record") from None
         except (ValueError, KeyError, IndexError, AttributeError, RecursionError, OverflowError):
             raise HostRefusal("invalid_record") from None
     return call

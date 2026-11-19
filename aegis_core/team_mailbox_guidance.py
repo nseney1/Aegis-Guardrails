@@ -3,6 +3,8 @@
 The adapter supplies its renderer; validation order and storage stay with it.
 """
 
+from aegis_core.team_mailbox_primitives import MailboxRefusal, render_mailbox_refusal
+
 __all__ = ["MAX_CHARS", "NEXT_ACTIONS", "error_result", "render_digest", "measured_refusal", "tool_specs"]
 
 MAX_CHARS = 60000
@@ -34,6 +36,8 @@ DIGEST_VIEW_MINIMUM_NEXT = ("pass max_chars large enough for the record view, as
 
 
 def error_result(error, *, tool, max_chars):
+    if isinstance(error, MailboxRefusal):
+        return render_mailbox_refusal(error, record=True)
     publishing = tool == "mailbox_publish_record"
     result = error.as_dict()
     if error.code == "E_AUTH" and error.detail in NEXT_ACTIONS:
