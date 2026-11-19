@@ -14,7 +14,7 @@ from aegis_core.team_mailbox_primitives import (
 )
 from aegis_core.diagnostic_messages import guidance_value
 
-__all__ = ["scan_history", "parse_message", "Evidence"]
+__all__ = ["scan_history", "parse_message", "pending_entry", "Evidence"]
 
 _MISSING = object()
 MAX_EVIDENCE_ENTRIES = 10000
@@ -23,6 +23,19 @@ EVIDENCE_SUMMARY_BYTES = 32768
 MAX_EVIDENCE_SAMPLE_PATHS = 8
 MAX_EVIDENCE_SAMPLE_PATH_BYTES = 1024
 MAX_EVIDENCE_COUNT = (1 << 63) - 1
+
+
+def pending_entry(path, root, *, message_folders=()):
+    """Recognize core stages and exact legacy stages in their writer's folder.
+
+    The mailbox root and sibling record store are not history scan folders;
+    their stages must never acquire an exemption in a binding/message folder.
+    Callers supply only validated message routing folders.
+    """
+    return (re.fullmatch(r"\.pending-[0-9a-f]{32}", path.name) is not None
+            or path.name == ".pending-root-id" and path.parent == root
+            or path.name == ".pending-grants" and path.parent == root.parent / "mailbox-records"
+            or path.name == ".pending-stub" and path.parent in message_folders)
 
 
 class Evidence:
@@ -191,7 +204,7 @@ def scan_history(mailbox, memo, evidence, *, force=False):
     folders |= {mailbox.root / "across" / role for role in mailbox.roles.across_roles}
     for folder in sorted(folders):
         for path in mailbox.store.entries(folder):
-            if re.fullmatch(r"\.pending-[0-9a-f]{32}", path.name):
+            if pending_entry(path, mailbox.root, message_folders=folders):
                 continue
             require(path.suffix == ".md")
             require(len(records) < MAX_RECORDS, reason="too_large")
