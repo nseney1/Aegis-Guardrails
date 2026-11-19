@@ -23,6 +23,226 @@ from aegis_core.workspace.layout import UserLayout
 from tests.conftest import symlink_or_skip
 
 
+_ROWLESS_REPAIR = ("Run `aegis status` to list unloadable and ignored files; once the rules load, "
+                   "fix field types or shorten fields and run `aegis rule lint <path>`, then retry `aegis scan`.")
+
+
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("first_reason", ["invalid_field", "limit"])
+def test_mixed_projection_refusal_prints_each_represented_repair_once(ws, capsys, first_reason, json_mode):
+    original = ws / ".aegis" / "rules" / "traps" / "trap-src-python.md"
+    source = original.read_text(encoding="utf-8")
+    second_reason = "limit" if first_reason == "invalid_field" else "invalid_field"
+    values = {"invalid_field": 3, "limit": ["x"] * 257}
+    for name, reason in zip(("a-first", "b-repeat", "c-other"), (first_reason, first_reason, second_reason)):
+        path = original.with_name(name + ".md")
+        path.write_text(source.replace("id: trap-src-python", "id: " + name).replace(
+            "hypothesis: Source modules must not read the clock directly", "hypothesis: " + json.dumps(values[reason])),
+            encoding="utf-8")
+    payload = core_scan.scan(ws, ["src/app.py"])
+    assert payload["error"] == "guidance_projection_" + first_reason
+    assert [row["error"] for row in payload["rule_errors"]] == [
+        "hypothesis: " + reason for reason in (first_reason, first_reason, second_reason)]
+    repairs = {
+        "invalid_field": "Fix the field type and run `aegis rule lint <path>`.",
+        "limit": "Shorten the instruction or slot expansion and run `aegis rule lint <path>`.",
+    }
+    for _ in range(2):
+        assert main(["scan", "src/app.py"] + (["--json"] if json_mode else [])) == 1
+        captured = capsys.readouterr()
+        if json_mode:
+            assert captured.err == ""
+            assert json.loads(captured.out) == payload
+        else:
+            assert captured.out == ""
+            rows = "".join("Error: " + row["path"] + ": " + row["error"] + "\n" for row in payload["rule_errors"])
+            assert captured.err == ("Error: " + payload["error"] + "\n" + rows
+                                    + repairs[first_reason] + "\n" + repairs[second_reason] + "\n")
+        assert not (ws / ".aegis" / "state" / "activity.jsonl").exists()
+
+
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("error,repair", [
+    ("guidance_projection_invalid_field", _ROWLESS_REPAIR),
+    ("guidance_projection_limit", _ROWLESS_REPAIR),
+    ("guidance_projection_budget", "Raise AEGIS_MAX_JIT_TOKENS and retry `aegis scan`."),
+    ("the rules directory cannot be read safely: unsafe entry",
+     "Remove unsafe links and restore read access to the rules directory, then run `aegis status`."),
+    ("the user rules directory cannot be read safely: unsafe entry",
+     "Remove unsafe links and restore read access to the rules directory, then run `aegis status`."),
+    ("the reviewed (base) version of the rules cannot be read, so none is served: missing object",
+     "Fetch the reviewed rules base and check rules.base_ref in the user config, then retry `aegis scan`."),
+    ("unknown refusal", "Run `aegis status` to diagnose the refusal, then retry `aegis scan`."),
+])
+@pytest.mark.parametrize("empty_rows", [False, True], ids=["no_rows", "empty_rows"])
+def test_every_rowless_scan_refusal_prints_fixed_repair(ws, monkeypatch, capsys,
+                                                       error, repair, json_mode, empty_rows):
+    payload = {"status": "FAIL", "error": error}
+    if empty_rows:
+        payload["rule_errors"] = []
+    before = json.dumps(payload)
+    monkeypatch.setattr(core_scan, "scan", lambda *args, **kwargs: payload)
+    for _ in range(2):
+        assert main(["scan", "src/app.py"] + (["--json"] if json_mode else [])) == 1
+        captured = capsys.readouterr()
+        if json_mode:
+            assert captured.err == ""
+            assert json.loads(captured.out) == payload
+        else:
+            assert captured.out == ""
+            assert captured.err == "Error: " + error + "\n" + repair + "\n"
+        assert json.dumps(payload) == before
+        assert not (ws / ".aegis" / "state" / "activity.jsonl").exists()
+
+
+def _rowless_failure_files(ws, kind):
+    rules = ws / ".aegis" / "rules"
+    if kind == "load_cap":
+        for index in range(682):
+            (rules / "traps" / f"b{index}.md").write_text("---\nid: [x\n---\n", encoding="utf-8")
+    else:
+        (rules / "bad\x1bname.md").write_text("Notes without frontmatter.\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("kind,code", [
+    ("load_cap", "guidance_projection_limit"),
+    pytest.param("ignored_control_name", "guidance_projection_invalid_field",
+                 marks=pytest.mark.skipif(os.name == "nt", reason="Windows filename controls")),
+])
+def test_real_rowless_producers_print_unattributed_status_repair(ws, capsys, kind, code, json_mode):
+    _rowless_failure_files(ws, kind)
+    expected = {"status": "FAIL", "error": code}
+    assert core_scan.scan(ws, ["src/app.py"]) == expected
+    for _ in range(2):
+        assert main(["scan", "src/app.py"] + (["--json"] if json_mode else [])) == 1
+        captured = capsys.readouterr()
+        if json_mode:
+            assert captured.err == ""
+            assert captured.out == json.dumps(expected, indent=2) + "\n"
+        else:
+            assert captured.out == ""
+            assert captured.err == "Error: " + code + "\n" + _ROWLESS_REPAIR + "\n"
+        assert not (ws / ".aegis" / "state" / "activity.jsonl").exists()
+
+
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("primary,reason,repair", [
+    ("invalid_field", "hypothesis: limit",
+     "Shorten the instruction or slot expansion and run `aegis rule lint <path>`."),
+    ("limit", "prediction: invalid_field", "Fix the field type and run `aegis rule lint <path>`."),
+    ("invalid_field", "unknown: limit", _ROWLESS_REPAIR),
+])
+def test_projection_repair_requires_confirmation_from_an_allowlisted_row(ws, monkeypatch, capsys,
+                                                                        primary, reason, repair, json_mode):
+    payload = {"status": "FAIL", "error": "guidance_projection_" + primary,
+               "rule_errors": [{"path": ".aegis/rules/traps/example.md", "error": reason}]}
+    before = json.dumps(payload)
+    monkeypatch.setattr(core_scan, "scan", lambda *args, **kwargs: payload)
+    for _ in range(2):
+        assert main(["scan", "src/app.py"] + (["--json"] if json_mode else [])) == 1
+        captured = capsys.readouterr()
+        if json_mode:
+            assert captured.err == ""
+            assert captured.out == json.dumps(payload, indent=2) + "\n"
+        else:
+            assert captured.out == ""
+            assert captured.err == ("Error: " + payload["error"] + "\n"
+                                    "Error: .aegis/rules/traps/example.md: " + reason + "\n" + repair + "\n")
+        assert json.dumps(payload) == before
+        assert not (ws / ".aegis" / "state" / "activity.jsonl").exists()
+
+
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("kind", ["inventory", "base", "load", "budget"])
+def test_real_scan_failures_keep_their_envelope_and_gain_repair(ws, monkeypatch, capsys, kind, json_mode):
+    if kind in {"inventory", "base"}:
+        message = "unavailable ghp_" + "S" * 36
+        error = (core_scan.RuleInventoryError("read", str(ws / ".aegis" / "rules"), message)
+                 if kind == "inventory" else core_scan.rule_integrity.IntegrityError(message))
+
+        def refuse(*args, **kwargs):
+            raise error
+
+        monkeypatch.setattr(core_scan, "rule_integrity", SimpleNamespace(
+            effective=refuse, IntegrityError=core_scan.rule_integrity.IntegrityError))
+    elif kind == "load":
+        (ws / ".aegis" / "rules" / "traps" / "broken.md").write_text("---\nid: [x\n---\n", encoding="utf-8")
+    else:
+        monkeypatch.setattr(core_config, "env_max_jit_tokens", lambda: 1)
+    payload = core_scan.scan(ws, ["src/app.py"])
+    assert payload["status"] == "FAIL"
+    repair = {
+        "inventory": "Remove unsafe links and restore read access to the rules directory, then run `aegis status`.",
+        "base": "Fetch the reviewed rules base and check rules.base_ref in the user config, then retry `aegis scan`.",
+        "load": "Fix or move the invalid rule files and run `aegis rule lint <path>`; `aegis status` lists them.",
+        "budget": "Raise AEGIS_MAX_JIT_TOKENS and retry `aegis scan`.",
+    }[kind]
+    for _ in range(2):
+        assert main(["scan", "src/app.py"] + (["--json"] if json_mode else [])) == 1
+        captured = capsys.readouterr()
+        assert "S" * 36 not in captured.out + captured.err
+        if json_mode:
+            assert captured.err == ""
+            assert json.loads(captured.out) == payload
+        else:
+            assert captured.out == ""
+            assert captured.err == "Error: " + payload["error"] + "\n" + repair + "\n"
+        assert not (ws / ".aegis" / "state" / "activity.jsonl").exists()
+
+
+@pytest.mark.parametrize("kind", ["load", "field", "budget", "mixed_field", "mixed_limit", "load_cap",
+                                  pytest.param("ignored_control_name", marks=pytest.mark.skipif(
+                                      os.name == "nt", reason="Windows filename controls"))])
+def test_concurrent_scan_refusals_print_the_same_repair_without_recording(ws, kind):
+    from concurrent.futures import ThreadPoolExecutor
+    import subprocess
+    import sys
+
+    path = ws / ".aegis" / "rules" / "traps" / "trap-src-python.md"
+    if kind in {"load_cap", "ignored_control_name"}:
+        _rowless_failure_files(ws, kind)
+    elif kind == "load":
+        path.write_text("---\nid: [x\n---\n", encoding="utf-8")
+    elif kind == "field":
+        path.write_text(path.read_text(encoding="utf-8").replace(
+            "hypothesis: Source modules must not read the clock directly", "hypothesis: 3"), encoding="utf-8")
+    elif kind.startswith("mixed_"):
+        source = path.read_text(encoding="utf-8")
+        values = (3, ["x"] * 257) if kind == "mixed_field" else (["x"] * 257, 3)
+        for name, value in zip(("a-first", "b-other"), values):
+            path.with_name(name + ".md").write_text(source.replace("id: trap-src-python", "id: " + name).replace(
+                "hypothesis: Source modules must not read the clock directly", "hypothesis: " + json.dumps(value)),
+                encoding="utf-8")
+    env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[3]))
+    if kind == "budget":
+        env["AEGIS_MAX_JIT_TOKENS"] = "1"
+    repair = {
+        "load": "Fix or move the invalid rule files and run `aegis rule lint <path>`; `aegis status` lists them.",
+        "field": "Fix the field type and run `aegis rule lint <path>`.",
+        "budget": "Raise AEGIS_MAX_JIT_TOKENS and retry `aegis scan`.",
+        "load_cap": _ROWLESS_REPAIR,
+        "ignored_control_name": _ROWLESS_REPAIR,
+        "mixed_field": ("Fix the field type and run `aegis rule lint <path>`.\n"
+                        "Shorten the instruction or slot expansion and run `aegis rule lint <path>`."),
+        "mixed_limit": ("Shorten the instruction or slot expansion and run `aegis rule lint <path>`.\n"
+                        "Fix the field type and run `aegis rule lint <path>`."),
+    }[kind]
+
+    def invoke(_):
+        result = subprocess.run([sys.executable, "-m", "aegis_cli", "scan", "src/app.py"],
+                                cwd=ws, env=env, capture_output=True, text=True, timeout=30)
+        return result.returncode, result.stdout, result.stderr
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(invoke, range(3)))
+    assert results == [results[0]] * 3
+    code, out, err = results[0]
+    assert code == 1 and out == ""
+    assert err.endswith("\n" + repair + "\n")
+    assert not (ws / ".aegis" / "state" / "activity.jsonl").exists()
+
+
 @pytest.mark.parametrize("command", ["scan", "status"])
 @pytest.mark.parametrize("text", ["ordinary failure", "bad\x1btext\nretry"], ids=["plain", "controls"])
 def test_failure_envelope_golden_bytes(ws, monkeypatch, capsys, record_property, command, text):
@@ -136,7 +356,8 @@ def test_projection_refusal_prints_locations_and_fixed_repair(ws, monkeypatch, c
         assert json.loads(captured.out) == expected
     elif case == "source":
         assert captured.out == ""
-        assert captured.err == "Error: " + expected["error"] + "\n"
+        assert captured.err == ("Error: " + expected["error"] + "\n"
+                                "Fix or move the invalid rule files and run `aegis rule lint <path>`; `aegis status` lists them.\n")
     else:
         assert captured.out == ""
         rows = "".join("Error: " + row["path"] + ": " + row["error"] + "\n" for row in expected["rule_errors"])
