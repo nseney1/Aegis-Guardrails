@@ -304,7 +304,7 @@ def test_file_parse_refusal_preserves_legacy_diagnostic(tmp_path, entry):
     path.write_text("---\nPRIVATE_KEY_NAME: 1\nPRIVATE_KEY_NAME: 2\n---\nbody\n", encoding="utf-8")
     error = RuleParseError if entry == "parse_rule_file" else AegisYAMLError
     diagnostic = "Duplicate key 'PRIVATE_KEY_NAME' detected at line 2"
-    message = f"Error parsing rule {path}: {diagnostic}" if entry == "parse_rule_file" else diagnostic
+    message = f"Error parsing rule {path}: Invalid YAML frontmatter" if entry == "parse_rule_file" else diagnostic
     with pytest.raises(error) as refused:
         read_rule(entry, path, tmp_path)
     assert type(refused.value) is error
