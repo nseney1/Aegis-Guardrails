@@ -289,7 +289,7 @@ def initialize(path, *, clock, roles, hosts, caller_role):
     event = {"schema": SCHEMA, "seq": 1, "at": moment.astimezone(timezone.utc).isoformat(
         timespec="microseconds").replace("+00:00", "Z"), "kind": "init", "data": {}, "prev": None}
     event["digest"] = event_digest(event)
-    with Store(path.parent) as store, store.creation("mailbox"), store.evidence_transaction():
+    with Store.from_parent(path.parent) as store, store.creation("mailbox"), store.evidence_transaction():
         require(not store.exists(path), reason="exists")
         with store.directory(path, create=True, undo=[]) as root, ExitStack() as stack:
             for name in ("content", "positions", "events"):

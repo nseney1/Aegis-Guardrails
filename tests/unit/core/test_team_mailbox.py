@@ -97,6 +97,107 @@ def refusal(reason):
     return pytest.raises(MailboxRefusal, match="^mailbox refused: " + reason + "$")
 
 
+MANIFEST_REPAIR_ACTIONS = {
+    "manifest": "Restore a bounded manifest with schema, writer_limit, endpoints and counterparts before retrying.",
+    "schema": "Repair the manifest schema field to use aegis.hierarchy-pilot/v1 before retrying.",
+    "writer_limit": "Repair the manifest writer_limit field to use an integer within the owner writer ceiling before retrying.",
+    "endpoints": "Repair the manifest endpoints field: check endpoint names, lane kinds and required hierarchy roles before retrying.",
+    "counterparts": "Repair the manifest counterparts field: check endpoint pairs, cross-hierarchy roles and unique membership before retrying.",
+}
+
+
+@pytest.mark.parametrize("field,patch,reason", [
+    ("manifest", None, "invalid_record"),
+    ("manifest", {"extra": "PRIVATE\nmanifest"}, "invalid_record"),
+    ("manifest", {"schema": "x" * 262145}, "too_large"),
+    ("schema", {"schema": "PRIVATE\nschema"}, "invalid_record"),
+    ("writer_limit", {"writer_limit": "PRIVATE\nwriter"}, "invalid_record"),
+    ("writer_limit", {"writer_limit": True}, "invalid_record"),
+    ("writer_limit", {"writer_limit": 6}, "invalid_record"),
+    ("endpoints", {"endpoints": []}, "invalid_record"),
+    ("endpoints", {"endpoints": {}}, "invalid_record"),
+    ("endpoints", {"endpoints": {"alpha/lane/worker" + str(i): {"kind": "reviewer"}
+                                for i in range(257)}}, "invalid_record"),
+    ("endpoints", {"endpoints": {"PRIVATE\nendpoint": {}}}, "invalid_record"),
+    ("endpoints", {"endpoints": {"alpha/front-door": {"PRIVATE": "definition"}}}, "invalid_record"),
+    ("endpoints", {"endpoints": {"alpha/lane/work": {"kind": "PRIVATE\nkind"}}}, "invalid_record"),
+    ("endpoints", {"endpoints": {"alpha/root": {}}}, "invalid_record"),
+    ("counterparts", {"counterparts": "PRIVATE\npairs"}, "invalid_record"),
+    ("counterparts", {"counterparts": [[]] * 257}, "invalid_record"),
+    ("counterparts", {"counterparts": [["PRIVATE\npair", "alpha/front-door"]]}, "invalid_record"),
+    ("counterparts", {"counterparts": [["alpha/root", "alpha/front-door"]]}, "invalid_record"),
+    ("counterparts", {"counterparts": [["alpha/front-door", "alpha/orchestrator"]]}, "invalid_record"),
+], ids=["shape", "extra", "budget", "schema", "writer-type", "writer-bool", "writer-ceiling",
+        "endpoints-type", "endpoints-empty", "endpoints-limit", "endpoint-name", "endpoint-definition", "lane-kind",
+        "hierarchy-roles", "counterparts-type", "counterparts-limit", "counterpart-name", "counterpart-root", "counterpart-role"])
+def test_initialize_manifest_repair_context_is_fixed_before_storage(tmp_path, monkeypatch, field, patch, reason):
+    def unexpected_storage(*args, **kwargs):
+        pytest.fail("invalid manifest reached storage")
+
+    monkeypatch.setattr(mail, "initialize_store", unexpected_storage)
+    candidate = None if patch is None else {**MANIFEST, **patch}
+    root = tmp_path / "candidate"
+    for _ in range(2):
+        with refusal(reason) as caught:
+            mail.initialize(root, candidate, roles=ROLES, caller_role="owner")
+        assert caught.value.as_dict() == {"status": "refused", "reason": reason, "code": 1,
+                                          "next_action": MANIFEST_REPAIR_ACTIONS[field]}
+        assert "PRIVATE" not in str(caught.value) + json.dumps(caught.value.as_dict())
+        assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("field", ["schema", "writer_limit", "endpoints", "counterparts"])
+def test_initialize_manifest_repair_then_retry_preserves_existing_store(tmp_path, field):
+    existing = make_store(tmp_path)
+    before = snapshot(existing)
+    root = tmp_path / "candidate"
+    with refusal("invalid_record") as caught:
+        mail.initialize(root, {**MANIFEST, field: None}, roles=ROLES, caller_role="owner")
+    assert caught.value.next_action == MANIFEST_REPAIR_ACTIONS[field]
+    assert snapshot(existing) == before and not root.exists()
+    mail.initialize(root, MANIFEST, roles=ROLES, caller_role="owner")
+    with mailbox(root) as box:
+        assert box.manifest == MANIFEST
+    assert snapshot(existing) == before
+
+
+def test_initialize_manifest_repair_context_is_local_to_concurrent_calls(tmp_path):
+    fields = ["schema", "writer_limit", "endpoints", "counterparts"] * 8
+
+    def rejected(field):
+        with refusal("invalid_record") as caught:
+            mail.initialize(tmp_path / "candidate", {**MANIFEST, field: None}, roles=ROLES, caller_role="owner")
+        return caught.value.as_dict()
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(rejected, fields))
+    assert [result["next_action"] for result in results] == [MANIFEST_REPAIR_ACTIONS[field] for field in fields]
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("pairs", [
+    [["alpha/front-door", "beta/orchestrator"]],
+    [["alpha/router", "beta/router"]],
+    [["alpha/front-door", "beta/front-door"]] * 2,
+], ids=["different-roles", "unsupported-role", "duplicate-membership"])
+def test_initialize_manifest_counterpart_constraints_have_fixed_repair(tmp_path, pairs):
+    endpoints = {**MANIFEST["endpoints"], "alpha/router": {}, "beta/router": {},
+                 "beta/front-door": {}, "beta/orchestrator": {}}
+    candidate = {**MANIFEST, "endpoints": endpoints, "counterparts": pairs}
+    with refusal("invalid_record") as caught:
+        mail.initialize(tmp_path / "candidate", candidate, roles=ROLES, caller_role="owner")
+    assert caught.value.next_action == MANIFEST_REPAIR_ACTIONS["counterparts"]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_initialize_storage_refusal_keeps_platform_repair_advice(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_module, "descriptor_supported", lambda: False)
+    with refusal("unsupported_platform") as caught:
+        mail.initialize(tmp_path / "candidate", MANIFEST, roles=ROLES, caller_role="owner")
+    assert caught.value.as_dict() == MailboxRefusal("unsupported_platform").as_dict()
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_publish_inbox_and_retry(tmp_path):
     root, box = populated(tmp_path)
     with box:
