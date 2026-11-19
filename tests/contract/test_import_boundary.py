@@ -126,6 +126,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_mailbox_pager": 0,
     "aegis_core.team_mailbox_primitives": 0,
     "aegis_core.team_mailbox_records": 1,
+    "aegis_core.team_mailbox_service": 1,
     "aegis_core.team_mailbox_store": 0,
     "aegis_core.team_metrics": 1,
     "aegis_core.team_paths": 1,
