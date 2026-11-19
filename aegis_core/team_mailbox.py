@@ -17,6 +17,7 @@ from threading import local
 from types import MappingProxyType
 
 from aegis_core.team_mailbox_primitives import (
+    render_mailbox_refusal,
     MAX_BYTES, MAX_RECORDS, MAX_HISTORY_BYTES, MAX_DIRTY_ENTRIES, MAX_DELIVERY_IDS,
     MAX_RECENT_ACKNOWLEDGMENTS, MESSAGE_TYPES, STAGES, TERMINAL_JOB_STATES,
     VERIFICATION, SHA256, GIT_ID, SLUG,
@@ -81,7 +82,7 @@ class Mailbox(MailboxDelivery):
         try:
             return port(*args)
         except MailboxRefusal as error:
-            raise error from None
+            render_mailbox_refusal(error, reraise=True)
         except (OSError, TimeoutError, ValueError):
             raise MailboxRefusal("host_unavailable") from None
 
@@ -354,8 +355,8 @@ class Mailbox(MailboxDelivery):
                     require(destination == folder, "message is in the wrong routing folder")
                     require(message["message_id"] not in records, "duplicate message_id in history")
                     records[message["message_id"]] = {"path": str(path), "message": message}
-                except MailboxRefusal:
-                    raise
+                except MailboxRefusal as error:
+                    render_mailbox_refusal(error, reraise=True)
                 except (ValueError, KeyError):
                     raise MailboxRefusal("invalid_record") from None
         for record in records.values():
