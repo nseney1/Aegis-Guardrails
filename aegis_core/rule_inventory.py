@@ -2,18 +2,47 @@
 from __future__ import annotations
 
 import codecs
+import errno
 from dataclasses import dataclass, field
 import hashlib
 import os
 from pathlib import Path
+import re
 import stat
 from typing import Collection, Dict, Iterable, List, Optional, Tuple
 
 from aegis_core.storage import file_generation
 from aegis_core.workspace.layout import WorkspaceLayout
 
+# The hook path must not load yaml_engine; a parity test guards the parser's literal.
+ZERO_WIDTH_CHARS = ("\ufeff", "\u200b", "\u200c", "\u200d")
+
 # A 64 KiB lifecycle body plus room for frontmatter.
 MAX_RULE_BYTES = 128 * 1024
+_CLOSING_DELIM_RE = re.compile(r"(?m)^---[ \t]*\r?$")
+
+
+def split_frontmatter(content: str) -> Tuple[str, Optional[str], str]:
+    """The one frontmatter delimiter scanner: ``(status, frontmatter text, body)``.
+
+    ``status`` is ``"ok"``, ``"none"`` (the text does not start with ``---``; the body is
+    the whole text) or ``"unterminated"`` (no closing ``---`` line). Leading zero-width
+    characters (a BOM) are not part of the text. The façades below keep their own
+    failure contracts on top of it (defense #30).
+    """
+    for zw in ZERO_WIDTH_CHARS:
+        if content.startswith(zw):
+            content = content[len(zw):]
+    if not content.startswith("---"):
+        return "none", None, content
+    # Partitioned rather than offset: '^' matches where ``rest`` starts, no index to miscount.
+    _opening, newline, rest = content.partition("\n")
+    if not newline:
+        return "unterminated", None, content
+    m = _CLOSING_DELIM_RE.search(rest)
+    if not m:
+        return "unterminated", None, content
+    return "ok", rest[: m.start()], rest[m.end():]
 
 
 def descriptor_supported() -> bool:
@@ -62,8 +91,6 @@ def classification_prefix(data: bytes, max_rule_bytes: int = MAX_RULE_BYTES) -> 
     An incomplete final codepoint is expected at the capture boundary. Invalid
     captured bytes still fail classification; bytes beyond capture are irrelevant.
     """
-    from aegis_core.yaml_engine.frontmatter import split_frontmatter
-
     data = data[:max_rule_bytes + 1]
     decoder = codecs.getincrementaldecoder("utf-8-sig")()
     try:
@@ -101,11 +128,13 @@ class RuleInventoryError(RuntimeError):
         path: str,
         message: str,
         cause: Optional[BaseException] = None,
+        *, code: Optional[str] = None,
     ) -> None:
         self.operation = operation
         self.path = os.path.abspath(path)
         self.cause = cause
-        super().__init__(f"rule inventory {operation} failed for {self.path}: {message}")
+        self.code = code or "RULE_INVENTORY_ERROR"
+        super().__init__(message if code else f"rule inventory {operation} failed for {self.path}: {message}")
 
 
 def _stat_signature(info: os.stat_result) -> Tuple[int, int, int, int, int, int]:
@@ -146,7 +175,8 @@ def _require_directory(path: str, info: os.stat_result) -> None:
 
 
 def _read_stable_file(path: str, before: os.stat_result,
-                      identities: Dict[str, Tuple[int, int, int]], root: str, listed: Collection[str]) -> bytes:
+                      identities: Dict[str, Tuple[int, int, int]], root: str, listed: Collection[str],
+                      *, relative_parts: Optional[Tuple[str, ...]] = None, direct: bool = False) -> bytes:
     if stat.S_ISLNK(before.st_mode):
         raise RuleInventoryError("validate", path, "symlinked .md rule is not allowed")
     if not stat.S_ISREG(before.st_mode):
@@ -162,7 +192,8 @@ def _read_stable_file(path: str, before: os.stat_result,
     # The owner-selected root is trusted. Only descendants belong to the hostile
     # rule tree; opening ancestors separately would reject trusted aliases and
     # require read permission on otherwise traversable, execute-only parents.
-    parts = (root, *Path(os.path.relpath(path, root)).parts) if descriptor_supported() else (path,)
+    descendants = Path(os.path.relpath(path, root)).parts if relative_parts is None else relative_parts
+    parts = (path,) if direct or not descriptor_supported() else (root, *descendants)
     # Traversal-only parents need search permission. Without O_PATH (including
     # macOS), these parents still require read permission; listed directories
     # always need it, so retain O_RDONLY there.
@@ -250,6 +281,111 @@ def fingerprint(entries: Iterable[RuleInventoryEntry]) -> str:
 
 def _empty_inventory() -> RuleInventory:
     return RuleInventory(entries=(), fingerprint=fingerprint(()))
+
+
+def _original_rule_parts(path: str, root: str) -> Tuple[str, ...]:
+    """Check the anchor lexically, preserving zero-depth dots in descendants."""
+    Path(path).relative_to(root)
+    _drive, tail = os.path.splitdrive(path)
+    parts = tuple(part for part in re.split(r"[\\/]" if os.path.altsep else "/", tail) if part)
+    remaining, index = len(Path(root).parts) - 1, 0
+    while remaining:
+        if parts[index] != ".":
+            remaining -= 1
+        index += 1
+    return parts[index:]
+
+
+def _rule_read_location(path, root, canonicalize_parent):
+    """Retain original rooted components or an opaque adapter's exact result."""
+    if root is None and not canonicalize_parent:
+        return str(path), None, (os.path.basename(path),)
+    absolute = os.path.join(os.path.abspath("."), path)
+    if root is None:
+        anchor = os.path.realpath(os.path.dirname(absolute))
+        absolute = os.path.join(anchor, os.path.basename(absolute))
+    else:
+        anchor = os.path.abspath(root)
+    return absolute, anchor, _original_rule_parts(absolute, anchor)
+
+
+def read_rule_file(path: str | Path, *, root: str | Path | None = None,
+                   missing_ok: bool = False, error_type=RuleInventoryError,
+                   preserve_os_errors: bool = False, source: str | Path | None = None,
+                   canonicalize_parent: bool = True) -> Optional[bytes]:
+    """Capture one regular rule using the inventory reader, refusing above its cap.
+
+    With ``root``, the workspace is trusted and original descendant components
+    are walked without following symlinks, including components before '..'.
+    Descendant directories must be readable, as for inventory listing; a refusal
+    keeps its legacy PermissionError when requested. Ancestors above the trusted
+    root are not opened separately and may need only search permission.
+    Without ``root``, the caller trusts the path up to its parent: canonicalize
+    that parent, then open the canonical file directly in one call, never opening
+    a directory. With ``canonicalize_parent=False``, an opaque adapter owns
+    containment and resolution: open exactly its returned path once, without
+    canonicalizing or rebuilding it, or separately inspecting its parent.
+    The final component is never resolved or followed; descriptor regular-file,
+    byte-cap and identity checks apply in both modes.
+    Refusals contain no supplied text; RULE_FILE_NOT_FOUND distinguishes absence
+    from RULE_FILE_READ_REFUSED.
+    OS failures remain available as ``cause``; legacy boundaries opt into raising
+    them with ``preserve_os_errors``. ``source`` must identify the captured file
+    both before and after reading, before a caller records it as provenance.
+    The inventory's non-descriptor fallback is retained on unsupported platforms.
+    """
+    try:
+        values = (path, *(value for value in (root, source) if value is not None))
+        for value in values:
+            if not isinstance(value, (str, Path)) or not 1 <= len(str(value)) <= 32768 or "\x00" in str(value):
+                raise ValueError("invalid rule path")
+        absolute, anchor, relative_parts = _rule_read_location(path, root, canonicalize_parent)
+        if not relative_parts:
+            raise ValueError("rule path is a directory")
+        identities = {}
+        spelling, depth = anchor, 0
+        for component in (None, *relative_parts[:-1]) if anchor is not None else ():
+            if component is not None:
+                depth += 0 if component == "." else -1 if component == ".." else 1
+                if depth < 0:
+                    raise ValueError("rule path escapes root")
+                spelling = os.path.join(spelling, component)
+            info = _stat_path(spelling)
+            _require_directory(spelling, info)
+            identities[spelling] = _identity_signature(info)
+        if relative_parts[-1] in (".", ".."):
+            raise ValueError("rule path is a directory")
+        before = _stat_path(absolute)
+        if before.st_size > MAX_RULE_BYTES:
+            raise ValueError("rule size limit exceeded")
+        if source is not None and _stat_signature(_stat_path(str(source))) != _stat_signature(before):
+            raise ValueError("rule source differs from captured file")
+        root_identity = identities.get(anchor)
+        listed = {name for name, identity in identities.items() if identity != root_identity}
+        data = _read_stable_file(absolute, before, identities, anchor or ".", listed,
+                                 relative_parts=relative_parts, direct=root is None)
+        if len(data) > MAX_RULE_BYTES:
+            raise ValueError("rule size limit exceeded")
+        for parent, expected in identities.items():
+            if _identity_signature(_stat_path(parent)) != expected:
+                raise ValueError("rule ancestor changed")
+        if source is not None and _stat_signature(_stat_path(str(source))) != _stat_signature(before):
+            raise ValueError("rule source changed during capture")
+        return data
+    except (RuleInventoryError, OSError, ValueError) as exc:
+        cause = exc.cause if isinstance(exc, RuleInventoryError) else exc
+        missing = isinstance(cause, FileNotFoundError)
+        if missing and missing_ok:
+            return None
+        code = "RULE_FILE_NOT_FOUND" if missing else "RULE_FILE_READ_REFUSED"
+        os_cause = cause if isinstance(cause, OSError) and cause.errno not in (errno.ELOOP, errno.ENOTDIR) else None
+        if preserve_os_errors and os_cause is not None and not missing:
+            if os_cause.filename is not None:
+                os_cause.filename = str(path)
+            raise os_cause from None
+        if error_type is RuleInventoryError:
+            raise RuleInventoryError("read", ".", "Rule file read refused", os_cause, code=code) from None
+        raise error_type("Rule file read refused", code=code) from None
 
 
 def inventory_rules(workspace: str) -> RuleInventory:
@@ -353,4 +489,6 @@ __all__ = [
     "classification_prefix",
     "fingerprint",
     "inventory_rules",
+    "read_rule_file",
+    "split_frontmatter",
 ]
