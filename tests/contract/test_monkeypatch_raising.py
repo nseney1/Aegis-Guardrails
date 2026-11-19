@@ -45,6 +45,10 @@ LEASED_SITES = {}
 # Exact computed calls: (file, scope, kind, syntax, occurrence) -> (shared, reason).
 # A newly permissive flag changes the key and requires its own explicit review.
 UNRESOLVED_TARGETS = {
+    ('tests/helpers_pathlookup.py', '_OwnedModulePatch.setattr', 'patch', 'self.patcher.setattr(module, name, value)', 0):
+        (False, 'The owned-context API validates module identity against the three governed import-baseline modules before this strict public MonkeyPatch call; it records the exact replacement and the live context owns undo. Shared process modules cannot be targets.'),
+    ('tests/helpers_pathlookup.py', '_OwnedModulePatch.delattr', 'patch', 'self.patcher.delattr(module, name)', 0):
+        (False, 'The owned-context API validates module identity against the three governed import-baseline modules before this strict public MonkeyPatch deletion; it records the exact absence and the live context owns undo. Shared process modules cannot be targets.'),
     ('tests/integration/test_hierarchy_mailbox_index.py', 'test_mode_guard_sentinel_is_local', 'patch', "monkeypatch.setattr(module, '_MISSING', mode)", 0):
         (False, 'MB-MODE-1 imports tools.hierarchy_mailbox_index as module and changes only its existing _MISSING binding to prove the guard uses its own sentinel; shared process modules and builtins stay untouched.'),
     ('tests/contract/test_mailbox_index_rollout.py', 'test_tip_prefilters_once_with_clean_git_environment', 'patch', "monkeypatch.setitem(globals(), '_tracked_names', observed_tracked_names)", 0):
@@ -975,6 +979,18 @@ AST_DIGEST_PREFIX = "ast-sha256:"
 # Namespace rows store canonical AST fingerprints, not copies of another file's
 # source syntax. Other ban rows retain the existing source-syntax representation.
 BAN_REGISTRATIONS = {
+    ('tests/helpers_pathlookup.py', '_ModuleSnapshot.__init__', 'namespace_vars', 'ast-sha256:2d9e05cb700ccabc6070835ca14fa0ec7233b76ff26e9e9961fc8af32ce492f5', 0):
+        'Read only namespace copy retains every original binding of pathlookup, gitsafe and primitives before a test; values are held by reference for identity comparison and no module dictionary is changed.',
+    ('tests/helpers_pathlookup.py', '_assert_module_state', 'namespace_vars', 'ast-sha256:58c50a673338f35b3d5d600b77b0ec6a718fbd4a4eb23813126ab4a95b007b58', 0):
+        'Read only namespace copy after test and MonkeyPatch context teardown compares added, removed and replaced bindings against retained originals; diagnostics contain names and change kinds without module values.',
+    ('tests/helpers_pathlookup.py', 'monkeypatch', 'constructor_reference', 'pytest.MonkeyPatch', 0):
+        'The module-local monkeypatch fixture creates its own public pytest MonkeyPatch context inside the governed_module_state lifetime, so native context exit undoes patches before the final identity comparison.',
+    ('tests/helpers_pathlookup.py', 'owned_module_patch', 'constructor_reference', 'pytest.MonkeyPatch', 0):
+        'The public context manager creates its own pytest MonkeyPatch context for a recorded broader-scope fixture request; context exit undoes every write before its ownership record is removed and before the dependent session-final comparison.',
+    ('tests/unit/core/test_pathlookup.py', 'test_clean_host_os_preserves_capability_names', 'namespace_getattr', 'ast-sha256:ac088cc128de8beeb4e22a4554a520447c0a0247468d7954e7983562206762fa', 0):
+        'Read-only capability-name comparison on the test-owned clean-host OS namespace for supports_dir_fd and supports_follow_symlinks; no namespace mutation.',
+    ('tests/unit/core/test_pathlookup.py', 'test_clean_host_os_preserves_capability_names', 'namespace_getattr', 'ast-sha256:ac088cc128de8beeb4e22a4554a520447c0a0247468d7954e7983562206762fa', 1):
+        'Read-only capability-name comparison on shared os for the same two fixed capability sets; no namespace mutation.',
     ('tests/integration/test_hierarchy_mailbox_index.py', '_attempt_mode_change', 'namespace___setattr__', 'ast-sha256:c14318d11a5f42a5304e3e4b5c6b0c94d67314fad49a3c7fd8e9d0a361ab91bc', 0):
         'MB-MODE-1 attempts a backing-slot write on the test-owned index to verify the captured descriptor cannot be reached by name.',
     ('tests/integration/test_hierarchy_mailbox_index.py', '_attempt_mode_change', 'namespace___delattr__', 'ast-sha256:0b91ff65a0ad33dd7b003bdbe2c1e0e77f608ca79e41d1cdd5bc8fb610ae3818', 0):
@@ -1832,7 +1848,7 @@ BAN_REGISTRATIONS = {
     ('tests/conftest.py', '_PatchGuard._callback_site', 'namespace___getattribute__', 'ast-sha256:88cfe19d49e4b5c80d7ce18b41d52eb09c6758213ee10ab1fd03a213dd503020', 0):
         'RF-11c round 35: authenticate bootstrap displacement and nested patch attribution.',
 }
-BAN_LIMITS = {'constructor': 0, 'constructor_reference': 13, 'declaration': 20, 'import': 3, 'module_write': 43, 'namespace___class__': 3, 'namespace___delattr__': 2, 'namespace___dict__': 27, 'namespace___getattribute__': 15, 'namespace___setattr__': 13, 'namespace_builtin_import': 14, 'namespace_delattr': 1, 'namespace_generated_builtin_import': 5, 'namespace_getattr': 121, 'namespace_globals': 6, 'namespace_importlib': 5, 'namespace_locals': 0, 'namespace_setattr': 13, 'namespace_sys_modules': 59, 'namespace_vars': 65}
+BAN_LIMITS = {'constructor': 0, 'constructor_reference': 15, 'declaration': 20, 'import': 3, 'module_write': 43, 'namespace___class__': 3, 'namespace___delattr__': 2, 'namespace___dict__': 27, 'namespace___getattribute__': 15, 'namespace___setattr__': 13, 'namespace_builtin_import': 14, 'namespace_delattr': 1, 'namespace_generated_builtin_import': 5, 'namespace_getattr': 123, 'namespace_globals': 6, 'namespace_importlib': 5, 'namespace_locals': 0, 'namespace_setattr': 13, 'namespace_sys_modules': 59, 'namespace_vars': 67}
 
 # Formal 0715 example disposition (dynamic examples intentionally unasserted):
 # security 1 / correctness 2: global/nonlocal import/from-import rebindings,
@@ -2175,6 +2191,18 @@ def _ban_identity(key):
 # Each group lists zero-based occurrences of identical syntax within its lexical scope.
 # Registrations certify today's otherwise unprovable uses, never a wildcard.
 PROOF_REGISTRATION_GROUPS = {
+    ('tests/helpers_pathlookup.py', '_OwnedModulePatch.setattr', 'callable', 'self.patcher.setattr', False):
+        ((0,), 'This direct method call uses the public MonkeyPatch object supplied by owned_module_patch; _check_target restricts the target to an import-baseline governed module and successful strict replacements are individually recorded for the live context.'),
+    ('tests/helpers_pathlookup.py', '_OwnedModulePatch.delattr', 'callable', 'self.patcher.delattr', False):
+        ((0,), 'This direct method call uses the public MonkeyPatch object supplied by owned_module_patch; _check_target restricts the target to an import-baseline governed module and successful strict deletions are individually recorded for the live context.'),
+    ('tests/helpers_pathlookup.py', 'owned_module_patch', 'fixture', '_OwnedModulePatch(patcher, request.scope)', False):
+        ((0,), 'The context manager wraps its own public MonkeyPatch object with a recorded class/module/package/session scope, registers the wrapper only while live, and yields that API; undo finishes before ownership removal. Function scope and non-governed targets are refused.'),
+    ('tests/helpers_pathlookup.py', 'monkeypatch', 'fixture', '(yield patcher)', False):
+        ((0,), 'Fixture yields its own context-managed MonkeyPatch object to normal consumers; governed_module_state is its prerequisite, and context exit performs undo before the final module-state check.'),
+    ('tests/unit/core/test_pathlookup.py', 'test_clean_host_os_patch_restores_after_failure_and_retry', 'fixture', 'monkeypatch.context', False):
+        ((0,), 'Scoped pytest monkeypatch context restores only the helper regression patch after a raised failure and on retry; autouse fixture patches stay installed.'),
+    ('tests/unit/core/test_pathlookup.py', 'test_clean_host_os_patch_restores_after_failure_and_retry', 'callable', 'patch.setattr', False):
+        ((0,), 'Context-owned pytest MonkeyPatch replaces only aegis_core.pathlookup.os and restores it on exception exit; no shared process module is patched.'),
     ('tests/unit/core/test_team_git.py', 'test_runner_environment_redirects_refuse_before_spawn', 'fixture', 'monkeypatch.context', False):
         ((0,), 'GM-5 r7 fixture context restores the real ambient environment after the redirect refusal; its body is independently censused.'),
     ('tests/unit/core/test_team_git.py', 'test_runner_environment_redirects_refuse_before_spawn', 'fixture', 'scoped.setenv', False):
