@@ -22,11 +22,12 @@ from aegis_core.team_mailbox_primitives import (
     MAX_RECENT_ACKNOWLEDGMENTS, MESSAGE_TYPES, STAGES, TERMINAL_JOB_STATES,
     VERIFICATION, SHA256, GIT_ID, SLUG,
     MailboxRefusal, RoleTables, bounded_tree, digest, encoded, fields, integer,
-    matching, message_types, operation, parse_time, record_types, reply_reference, require, safe_path,
+    matching, message_types, parse_time, record_types, reply_reference, require, safe_path,
     strict_json, strings, text, validation, validate_job_receipt, witness_record,
     binding_payload, binding_record, checkpoint_payload,
 )
 from aegis_core.team_mailbox_store import Store, initialize_store
+from aegis_core.team_mailbox_service import operation, witnesses
 from aegis_core.team_mailbox_delivery import MailboxDelivery
 
 __all__ = ["Mailbox", "MailboxRefusal", "initialize"]
@@ -579,8 +580,8 @@ class Mailbox(MailboxDelivery):
         self.checkpoint(checkpoint, records)
         self.checkpoint_assignments(endpoint, checkpoint, records)
         if "evidence_dir" in request:
-            sources[:] = self.store.witnesses([source["worktree"] for source in sources],
-                                              request["evidence_dir"], self.host_call, expected=sources)
+            sources[:] = witnesses(self.store, [source["worktree"] for source in sources],
+                                   request["evidence_dir"], self.host_call, expected=sources)
         result = {"endpoint": endpoint, "host": request["host"], "session": request["session"],
                   "expected_generation": len(history), "checkpoint": checkpoint}
         return result
@@ -788,7 +789,7 @@ class Mailbox(MailboxDelivery):
         if evidence_dir is not None:
             self.roles.authorize(self.caller_role, "source_witness")
             directory = self.evidence_directory(evidence_dir)
-            return self.store.witnesses([worktree], directory, self.host_call)[0]
+            return witnesses(self.store, [worktree], directory, self.host_call)[0]
         return witness_record(self.host_call("source_witness", safe_path(worktree), None), worktree)
 
 
