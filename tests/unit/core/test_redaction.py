@@ -52,7 +52,17 @@ REPO = Path(real_path(__file__)).parents[3]
 # Coordinator ROUND-5b RULING 2026-11-17T21:18:05Z: measured 83 parsed files; reviewed additions:
 # aegis_core/team_host_qualify_evidence.py, tests/unit/core/test_team_host_qualify_evidence.py.
 # Both were checked: neither imports a private redaction name.
-REDACTION_PARSE_CEILING = 83
+# PROPOSAL-CLEAN-DELETED-VIEW round 4 reviewed direct importers:
+# aegis_core/redaction_patterns.py (this item), aegis_core/team_jobs_recipes.py
+# (TA-5a) and aegis_core/merge_queue.py (GM-9); count <= ceiling in any landing order.
+# Coordinator ROUND-5: merged census N=84; reviewed ceiling N+4=88.
+# Pending: aegis_core/team_jobs_recipes.py (TA-5a), aegis_core/merge_queue.py (GM-9),
+# aegis_core/team_workspace_display.py (TA-4c),
+# tests/unit/core/test_display_attribution_dense.py (TEST-DISPLAY; text-only mention
+# until REDACTION-CENSUS-IMPORT-PREFILTER removes it), and
+# tests/unit/core/test_ruleyaml.py (RULE-PARSE-ERROR-ECHO; text-only mention
+# until REDACTION-CENSUS-IMPORT-PREFILTER removes it).
+REDACTION_PARSE_CEILING = 89
 
 
 def assignment_values(statement):
@@ -1191,6 +1201,7 @@ GOLDENS: Dict[str, Tuple[str, str, List[Tuple[str, str, str]]]] = {
     ),
     "url-basic-auth": (
         "deploy --opt https://svc_admin:[REDACTED]@api.internal.corp/v1 --next",
+        # ROUND-8c drops privacy matches that reinterpret credential context.
         "deploy --opt https://svc_admin:[REDACTED]@api.internal.corp/v1 --next",
         [("url-basic-auth", "gate", "deploy --opt https://s...rp/v1 --next")],
     ),
@@ -1252,16 +1263,34 @@ def test_a_line_with_two_secrets_loses_both():
 # ── One definition, at L0 ─────────────────────────────────────────────────────
 
 def test_redaction_is_one_definition_at_l0():
-    """Given the finished tree, When aegis_core/redaction.py is parsed, Then it imports only the
-    standard library; the hook adapter and the insights package hand out its objects, not copies."""
+    """Only stdlib, the pattern leaf and the named display helper enter the facade.
+
+    The hook adapter and insights package hand out its objects, not copies.
+    """
     from aegis_cli.hooks import redaction as hook_redaction
-    from aegis_core import insights, redaction
+    from aegis_core import insights, redaction, redaction_patterns
     from aegis_core.verification.import_guard import is_stdlib
 
     tree = ast.parse((REPO / "aegis_core" / "redaction.py").read_text(encoding="utf-8"))
-    imported = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
-    imported |= {n.module.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
-    assert imported and sorted(m for m in imported if not is_stdlib(m)) == []
+    imported = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+    assert all(is_stdlib(name) for name in imported)
+    imported |= {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
+    assert imported and sorted(m for m in imported if not is_stdlib(m)) == [
+        "aegis_core.primitives", "aegis_core.redaction_patterns"]
+    helper_names = {a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
+                    and n.module == "aegis_core.primitives" for a in n.names}
+    assert helper_names == {"redact_display_secrets"}
+    pattern_names = {a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
+                     and n.module == "aegis_core.redaction_patterns" for a in n.names}
+    assert pattern_names and pattern_names <= set(redaction_patterns.__all__)
+    leaf = ast.parse((REPO / "aegis_core" / "redaction_patterns.py").read_text(encoding="utf-8"))
+    leaf_imports = {a.name for n in ast.walk(leaf) if isinstance(n, ast.Import) for a in n.names}
+    leaf_imports |= {n.module for n in ast.walk(leaf) if isinstance(n, ast.ImportFrom) and n.module}
+    assert leaf_imports and all(is_stdlib(name) for name in leaf_imports)
+    assert all(hasattr(redaction_patterns, name) for name in redaction_patterns.__all__)
+    assert redaction.SECRET_REPLACEMENTS is redaction_patterns.SECRET_REPLACEMENTS
+    assert redaction.TOKEN_REDACTIONS is redaction_patterns.TOKEN_REDACTIONS
+    assert redaction.RedactionRefusal is redaction_patterns.RedactionRefusal
     assert all(hasattr(redaction, name) for name in redaction.__all__)
     assert hook_redaction.SECRET_REPLACEMENTS is redaction.SECRET_REPLACEMENTS
     assert insights.redact_insight_text is redaction.redact_insight_text
@@ -1493,7 +1522,8 @@ _HOOK_ADAPTER_IMPORTS = (
 
 def test_the_hook_adapter_loads_no_scanner_stack(tmp_path: Path):
     """Given a fresh interpreter, When aegis_cli.hooks.redaction is imported, Then neither the
-    scanner stack nor gitsafe loads, and at most 7 Aegis modules in all (14 on the w14 tree).
+    scanner stack nor gitsafe loads, and at most 7 other Aegis modules accompany the pattern leaf
+    (14 modules on the w14 tree).
 
     Seven, not the spec's derived 6: aegis_cli/__init__.py imports aegis_core.primitives, so any
     aegis_cli import first loads aegis_cli, aegis_core, aegis_core._version and primitives."""
@@ -1507,7 +1537,10 @@ def test_the_hook_adapter_loads_no_scanner_stack(tmp_path: Path):
                      "aegis_core.verification.test_runner", "aegis_core.gitsafe", "aegis_core.pathlookup",
                      "aegis_core.errors"}
     assert sorted(loaded & scanner_stack) == []
-    assert len(loaded) <= 7, sorted(loaded)
+    # Reviewed PROPOSAL-CLEAN-DELETED-VIEW round 3c: coordinator importtime measured
+    # 3.6-6.4 ms of regex compilation moved from redaction.py into this leaf.
+    reviewed_modules = {"aegis_core.redaction_patterns"}
+    assert len(loaded - reviewed_modules) <= 7, sorted(loaded)
 
 
 def test_url_credential_removal_and_atomic_clip_live_only_in_redaction():

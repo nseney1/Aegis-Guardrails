@@ -53,6 +53,643 @@ REPO = Path(real_path(__file__)).parents[3]
 INSIGHTS_PARSE_CEILING = 80
 
 
+_ROUND8_INSIGHT_FIELDS = {
+    "v": "identity", "ts": "identity", "event": "identity", "id": "identity",
+    "level": "identity", "text": "text", "paths": "path", "psrc": "identity",
+    "host": "text", "hs": "identity", "source": "identity", "kind": "text",
+    "approval_code": "identity", "revs": "identity", "corroborated_by": "identity",
+    "paths_dropped": "identity", "cue": "identity", "inv": "identity",
+    "decision": "identity", "insight_ids": "identity", "reason": "text", "rule_id": "identity",
+}
+
+
+def test_round8_writer_field_inventory_contract():
+    from dataclasses import field, fields, make_dataclass
+    import inspect
+
+    from aegis_core.insights import capture, review
+    from aegis_core.proposals import model, store
+
+    assert dict(capture.INSIGHT_FIELD_POLICIES) == _ROUND8_INSIGHT_FIELDS
+    assert set(model.PROPOSAL_FIELD_POLICIES) == {item.name for item in fields(model.Proposal)} | {"count"}
+    assert set(model.PROPOSAL_FIELD_POLICIES.values()) <= {"identity", "path", "text"}
+    source = ast.parse(inspect.getsource(store._validate_row))
+    required = next(node.value for node in source.body[0].body if isinstance(node, ast.Assign)
+                    and any(isinstance(target, ast.Name) and target.id == "required" for target in node.targets))
+    allowed = next(node.value for node in source.body[0].body if isinstance(node, ast.Assign)
+                   and any(isinstance(target, ast.Name) and target.id == "allowed" for target in node.targets))
+    assert set(model.PROPOSAL_DECISION_FIELD_POLICIES) == ast.literal_eval(required) | ast.literal_eval(allowed.right)
+    writers, literal_fields = set(), set()
+    for module in (capture, review):
+        tree = ast.parse(inspect.getsource(module))
+        for function in (node for node in tree.body if isinstance(node, ast.FunctionDef)):
+            nodes = list(ast.walk(function))
+            if any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                   and node.func.id == "_append_user_insights" for node in nodes):
+                writers.add(function.name)
+                assert any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                           and node.func.id == "clean_insight_row" for node in nodes), function.name
+            if function.name in {"_build_insight_row", "record_hook_prompt", "record_decision"}:
+                for node in nodes:
+                    if isinstance(node, ast.Dict):
+                        literal_fields.update(key.value for key in node.keys
+                                              if isinstance(key, ast.Constant) and isinstance(key.value, str))
+                    if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Store):
+                        if isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str):
+                            literal_fields.add(node.slice.value)
+    assert writers == {"add_insight", "capture_suggestion", "record_hook_prompt", "record_decision"}
+    assert literal_fields <= set(capture.INSIGHT_FIELD_POLICIES)
+    expanded = make_dataclass("UnclassifiedProposal", [("unclassified", str, field(default="opaque"))],
+                              bases=(model.Proposal,), frozen=True)
+    with pytest.raises(model.ProposalError) as refusal:
+        expanded(id="trap-safe", source="one", kind="correctness", candidate_key="one:safe")
+    assert refusal.value.code == "invalid"
+
+
+@pytest.mark.parametrize("name,policy", _ROUND8_INSIGHT_FIELDS.items())
+@pytest.mark.parametrize("control", ["\r", "\x85", "\x1b[31m"], ids=["cr", "nel", "csi"])
+def test_round8_each_insight_field_has_a_secret_safe_policy(tmp_path, name, policy, control):
+    from aegis_core.insights import capture
+    from aegis_core.redaction import RedactionRefusal
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    value = "AK" + "IA" + control + "B" * 16
+    supplied = ([value] if name in {"paths", "insight_ids"} else
+                {value: "0" * 16} if name == "revs" else value)
+    if policy == "text":
+        shown = capture.clean_insight_row({name: supplied}, workspace=workspace)
+        assert "BBBB" not in shown[name] and "[REDACTED" in shown[name]
+    elif policy == "path":
+        with pytest.raises(PathTraversalError, match="^invalid insight path$"):
+            capture.clean_insight_row({name: supplied}, workspace=workspace)
+    else:
+        with pytest.raises(RedactionRefusal, match="^invalid$") as refusal:
+            capture.clean_insight_row({name: supplied}, workspace=workspace)
+        assert refusal.value.code == "invalid"
+
+
+@pytest.mark.parametrize("control", ["\r", "\x85", "\x1b[31m"], ids=["cr", "nel", "csi"])
+def test_round8_public_writers_refuse_identities_paths_and_redact_hosts(tmp_path, control):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.redaction import RedactionRefusal
+
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("pass\n", encoding="utf-8")
+    (workspace / ".aegis/rules/traps").mkdir(parents=True)
+    _put_rule(workspace, "trap-safe")
+    secret = "AK" + "IA" + control + "B" * 16
+    for argument in ({"insight_ids": [secret]}, {"insight_ids": ["ins-" + "a" * 12], "rule_id": secret}):
+        with pytest.raises(RedactionRefusal, match="^invalid$"):
+            record_decision(workspace, decision="confirm", home=home, **argument)
+    for write in (add_insight, capture_suggestion):
+        with pytest.raises(PathTraversalError, match="^invalid insight path$"):
+            write(workspace, "Ordinary note.", paths=[secret], home=home)
+
+    def write(index):
+        captured = capture_suggestion(workspace, "Ordinary capture.", paths=["app.py"],
+                                      host=secret, home=home)
+        beat = record_hook_prompt(secret, {"prompt": "ordinary", "session_id": "session"},
+                                  workspace=workspace, home=home)
+        prompt = record_hook_prompt(secret, {"prompt": "Never repeat that mistake.", "session_id": "session"},
+                                    workspace=workspace, home=home)
+        assert all("BBBB" not in row["host"] for row in (captured, beat, prompt))
+        row = add_insight(workspace, "Ordinary correction.", paths=["app.py"], home=home)
+        decision = record_decision(workspace, decision="confirm", insight_ids=[row["id"]], home=home)
+        assert decision["insight_ids"] == [row["id"]]
+
+    write(0)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(write, range(3)))
+    stored = read_insight_rows(workspace, home=home)
+    assert {row["event"] for row in stored} >= {"insight", "heartbeat", "decision", "inventory"}
+    assert all("BBBB" not in json.dumps(row) for row in stored)
+
+
+def test_round8_unknown_writer_field_refuses_before_append_then_recovers(tmp_path, monkeypatch):
+    from aegis_core.insights import capture
+    from aegis_core.redaction import RedactionRefusal
+
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("pass\n", encoding="utf-8")
+    original = capture._build_insight_row
+
+    def extended(*args, **kwargs):
+        return dict(original(*args, **kwargs), unclassified="AK" + "IA" + "B" * 16)
+
+    monkeypatch.setattr("aegis_core.insights.capture._build_insight_row", extended)
+    for _ in range(2):
+        with pytest.raises(RedactionRefusal, match="^invalid$"):
+            add_insight(workspace, "Ordinary note.", paths=["app.py"], home=home)
+    assert read_insight_rows(workspace, home=home) == []
+    monkeypatch.setattr("aegis_core.insights.capture._build_insight_row", original)
+    row = add_insight(workspace, "Ordinary note.", paths=["app.py"], home=home)
+    assert read_insight_rows(workspace, home=home)[0]["id"] == row["id"]
+
+
+@pytest.mark.parametrize("control", ["\r", "\x85", "\x1b[31m"], ids=["cr", "nel", "csi"])
+def test_round8_each_proposal_field_refuses_or_masks_credentials(control):
+    from dataclasses import fields
+    from aegis_core.proposals import model
+
+    secret = "AK" + "IA" + control + "B" * 16
+    base = dict(id="trap-safe", source="one", kind="correctness", candidate_key="one:safe")
+    for item in fields(model.Proposal):
+        if not item.init:
+            continue  # Derived legacy flag, not an input field.
+        value = (secret,) if isinstance(item.default, tuple) else secret
+        try:
+            proposal = model.Proposal(**dict(base, **{item.name: value}))
+        except model.ProposalError as refusal:
+            assert refusal.code in {"invalid", "ancestry"}, item.name
+            assert "BBBB" not in str(refusal)
+        else:
+            assert "BBBB" not in proposal.to_bytes().decode("utf-8"), item.name
+
+
+def test_round8_field_policies_bound_input_before_copy_and_recover(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.insights import capture
+    from aegis_core.redaction import RedactionRefusal
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("pass\n", encoding="utf-8")
+    row = {"v": 1, "ts": "2026-11-18T18:00:00Z", "event": "insight", "id": "ins-" + "a" * 12,
+           "level": "cli", "text": "Ordinary note.", "paths": ["app.py"], "psrc": "explicit",
+           "host": "cli", "hs": "0" * 32, "source": "cli", "kind": "correctness",
+           "approval_code": "unverifiable", "revs": {"trap-safe": "0" * 16},
+           "corroborated_by": "ins-" + "b" * 12, "paths_dropped": 0, "cue": False,
+           "inv": "0" * 16, "decision": "confirm", "insight_ids": ["ins-" + "a" * 12],
+           "reason": "Ordinary reason.", "rule_id": "trap-safe"}
+    assert set(row) == set(capture.INSIGHT_FIELD_POLICIES)
+    for bad in (None, {"unclassified": "opaque"}, {"text": 3}, {"text": "bad\ud800"},
+                {"insight_ids": None}):
+        with pytest.raises(RedactionRefusal, match="^invalid$"):
+            capture.clean_insight_row(bad, workspace=workspace)
+    with pytest.raises(RedactionRefusal, match="^too_large$"):
+        capture.clean_insight_row({"paths": ["app.py"] * (capture.MAX_INSIGHT_ITEMS + 1)}, workspace=object())
+    with pytest.raises(RedactionRefusal, match="^too_large$"):
+        capture.clean_insight_row({"insight_ids": ["ins-" + "a" * 12] * (capture.MAX_INSIGHT_ITEMS + 1)}, workspace=object())
+    for bad_path in ("bad\ud800", "../AK" + "IA" + "B" * 16):
+        with pytest.raises(PathTraversalError, match="^invalid insight path$"):
+            capture.clean_insight_row({"paths": [bad_path]}, workspace=workspace)
+
+    def clean(_index):
+        assert capture.clean_insight_row(row, workspace=workspace) == row
+        return capture.clean_insight_row(row, workspace=workspace)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(clean, range(6))) == [row] * 6
+
+
+@pytest.mark.parametrize("control", ["\r", "\x85", "\x1b[31m"], ids=["cr", "nel", "csi"])
+def test_round8_each_proposal_decision_field_refuses_credentials_then_recovers(tmp_path, control):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.proposals import model
+    from tests.unit.core.test_proposals_store import make_store
+
+    store = make_store(tmp_path)
+    proposal = model.Proposal(id="trap-safe", source="one", kind="correctness", candidate_key="one:safe")
+    store.write(proposal)
+    row = store.decide([proposal.id], decision="noise", operation_id="op-safe")
+    path, = (store.root / ".aegis/proposals/decisions").glob("*.json")
+    original = path.read_bytes()
+    secret = "AK" + "IA" + control + "B" * 16
+    for name in model.PROPOSAL_DECISION_FIELD_POLICIES:
+        value = ([secret] if name in {"proposal_ids", "evidence_ids", "insight_ids"} else
+                 {secret: 1} if name == "revisions" else secret)
+        changed = dict(row, **{name: value})
+        path.write_text(json.dumps(changed), encoding="utf-8")
+        for _ in range(2):
+            with pytest.raises(model.ProposalError) as refusal:
+                store.state(proposal.id)
+            assert refusal.value.code == "decision", name
+            assert "BBBB" not in str(refusal.value)
+        path.write_bytes(original)
+        assert store.state(proposal.id) == "rejected"
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(lambda _index: store.state(proposal.id), range(6))) == ["rejected"] * 6
+
+
+def test_round8_inventory_bounds_refuse_before_copy_then_recover(tmp_path, monkeypatch):
+    from aegis_core.insights import capture
+    from aegis_core.redaction import RedactionRefusal
+
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    (workspace / ".aegis/rules/traps").mkdir(parents=True)
+    _put_rule(workspace, "trap-one")
+    _put_rule(workspace, "trap-two")
+    maximum = capture.MAX_INSIGHT_ITEMS
+    monkeypatch.setattr("aegis_core.insights.capture.MAX_INSIGHT_ITEMS", 1)
+    for _ in range(2):
+        with pytest.raises(RedactionRefusal, match="^too_large$"):
+            add_insight(workspace, "Ordinary note.", paths=["app.py"], home=home)
+    assert read_insight_rows(workspace, home=home) == []
+    monkeypatch.setattr("aegis_core.insights.capture.MAX_INSIGHT_ITEMS", maximum)
+    payload = {"prompt": "stop repeating this change", "session_id": "safe-session"}
+    record_hook_prompt("cli", payload, workspace=workspace, home=home)
+    before = read_insight_rows(workspace, home=home)
+    assert any(row.get("event") == "inventory" and len(row["revs"]) == 2 for row in before)
+    monkeypatch.setattr("aegis_core.insights.capture.MAX_INSIGHT_ITEMS", 1)
+    for _ in range(2):
+        with pytest.raises(RedactionRefusal, match="^too_large$"):
+            record_hook_prompt("cli", payload, workspace=workspace, home=home)
+    assert read_insight_rows(workspace, home=home) == before
+    monkeypatch.setattr("aegis_core.insights.capture.MAX_INSIGHT_ITEMS", maximum)
+    assert record_hook_prompt("cli", payload, workspace=workspace, home=home)
+
+
+def _round8h_control_source(split, tail, placement=None, preceding=""):
+    prefix = "abcdefghijklm" * 5
+    controls = {"cr": "\r", "nel": "\x85", "vt": "\v", "ff": "\f", "esc-parameters": "\x1b[1:2m",
+                "esc-intermediates": "\x1b[1:2 !p", "c1-parameters": "\x9b1:2m", "c1-intermediates": "\x9b1:2 !p",
+                "esc-spaced": "\x1b[ m", "c1-spaced": "\x9b m"}
+    if split.startswith("correctness-"):
+        prefix = "a" * 70
+        token = prefix + controls[split[len("correctness-"):]] + "z"
+        continuation = "K1M2N3P4" + "Q5R6S7T8U9abcd"
+        head = preceding + "Never repeat this: " + token
+        removed = controls[tail] * 5000
+        return head + removed + continuation, head + controls[tail] + continuation, prefix + "z" + continuation
+    if split == "mixed":
+        pieces = [prefix[index:index + 13] for index in range(0, len(prefix), 13)]
+        token = pieces[0] + "\r" + pieces[1] + "\x85" + pieces[2] + "\x1b[1:2 !p" + pieces[3] + "\x9b31m" + pieces[4] + "\rA"
+    elif split == "repeated":
+        cycle = ("\r", "\x85", "\v", "\f", "\x1b[31m", "\x9b1:2 !p")
+        token = "".join(char + cycle[index % len(cycle)] for index, char in enumerate(prefix)) + "A"
+    else:
+        token = prefix + controls[split] + "A"
+    continuation = "k7Qm9pL2xV4n" + "R8wY3tB6cD1fH0aZ"
+    if tail in ("vt", "ff"):
+        head = preceding + "Never repeat this: " + token
+        gap = 4097 if placement is None else 4097 + placement - len(head)
+        source, short = head + controls[tail] * gap + continuation, head + controls[tail] + continuation
+    else:
+        source, short, _raw = _round8g_control_source(tail, placement, preceding=preceding, token=token)
+    return source, short, prefix + "A" + continuation
+
+
+def _round8h_control_pairs():
+    splits = ("cr", "nel", "vt", "ff", "esc-parameters", "esc-intermediates", "c1-parameters", "c1-intermediates", "mixed", "repeated")
+    tails = ("cr", "nel", "vt", "ff", "esc-parameters", "esc-intermediates", "c1-parameters", "c1-intermediates")
+    edges = (None, -1, 0, 1)
+    return [pytest.param(split, tail, edges[(left + right) % len(edges)], id=split + "-" + tail)
+            for left, split in enumerate(splits) for right, tail in enumerate(tails)] + [
+                pytest.param("correctness-" + split, tail, None, id="correctness-" + split + "-" + tail)
+                for split in ("cr", "nel", "vt", "ff", "esc-spaced", "c1-spaced") for tail in ("cr", "nel", "esc-spaced")]
+
+
+@pytest.mark.parametrize("split,tail,placement", _round8h_control_pairs())
+def test_round8h_every_insight_writer_withholds_across_earlier_deleted_splits(tmp_path, split, tail, placement):
+    from concurrent.futures import ThreadPoolExecutor
+
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    workspace.mkdir()
+    source, short, secret = _round8h_control_source(split, tail, placement)
+    expected = "Never repeat this: ..."
+    member = add_insight(workspace, "Ordinary member.", paths=[], home=home)
+    fragments = {secret[index:index + 4] for index in range(len(secret) - 3)}
+
+    def persist(_index):
+        rows = [add_insight(workspace, source, kind=source, paths=[], home=home),
+                capture_suggestion(workspace, source, paths=[], host=source, home=home),
+                record_hook_prompt(source, {"prompt": source, "session_id": "safe-session"}, workspace=workspace, home=home),
+                record_hook_prompt(source, {"prompt": "Ordinary prompt.", "session_id": "heartbeat-session"}, workspace=workspace, home=home),
+                record_decision(workspace, decision="confirm", insight_ids=[member["id"]], kind=source, reason=source, home=home)]
+        assert rows[3]["event"] == "heartbeat" and "text" not in rows[3]
+        for row, fields in zip(rows, (("text", "kind"), ("text", "host"), ("text", "host"), ("host",), ("kind", "reason"))):
+            for field in fields:
+                assert row[field] == expected
+                assert not any(fragment in row[field] for fragment in fragments)
+
+    for _ in range(2):
+        persist(0)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(persist, range(3)))
+    for row in read_insight_rows(workspace, home=home):
+        for field in ("text", "kind", "reason", "host"):
+            assert not any(fragment in row.get(field, "") for fragment in fragments)
+    if not split.startswith("correctness-"):
+        from aegis_core.proposals.model import clean_text
+        cleaned = clean_text(short, 300)
+        assert "[REDACTED_HIENT]" in cleaned
+        assert not any(fragment in cleaned for fragment in fragments)
+
+
+def _round8g_control_source(control, placement=None, preceding="", token=None, case="security"):
+    prefix = {"security": "abcdefghijklm" * 5, "correctness-letters": "abcdefghij" * 6 + "abcde",
+              "correctness-symbols": "A=" * 8}[case] if token is None else token
+    continuation = ("K1M2N3P4" + "Q5R6S7T8U9" if case == "correctness-letters" else
+                    "k7Qm9pL2xV4n" + "R8wY3tB6cD1fH0aZ")
+    lead = "Never repeat this: " if case == "security" else "First safe note. "
+    head = preceding + lead + prefix
+    gap = 4097 if placement is None else 4097 + placement - len(head)
+    if control in ("cr", "nel", "nul", "ignored-c1"):
+        removed = {"cr": "\r", "nel": "\x85", "nul": "\x00", "ignored-c1": "\x86"}[control] * gap
+        short = removed[:1]
+    else:
+        intro = "\x1b[" if control.startswith("esc") else "\x9b"
+        parameter = "1" if control.endswith("parameters") else " "
+        if placement is None:
+            gap = len(intro) + 5001
+        removed = intro + parameter * (gap - len(intro) - 1) + "m"
+        short = intro + parameter + "m"
+    return head + removed + continuation, head + short + continuation, prefix + continuation
+
+
+@pytest.mark.parametrize("control", ["cr", "nel", "nul", "ignored-c1", "esc-parameters", "esc-intermediates",
+                                     "c1-parameters", "c1-intermediates"])
+@pytest.mark.parametrize("placement", [None, -1, 0, 1], ids=["review", "before", "at", "after"])
+@pytest.mark.parametrize("case", ["security", "correctness-letters", "correctness-symbols"])
+def test_round8g_all_insight_writers_withhold_raw_token_without_detector_threshold(tmp_path, control, placement, case):
+    from concurrent.futures import ThreadPoolExecutor
+
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    workspace.mkdir()
+    source, _short, secret = _round8g_control_source(control, placement, case=case)
+    expected = ("Never repeat this:" if case == "security" else "First safe note.") + " ..."
+    hook_source = source if case == "security" else "Never " + source
+    member = add_insight(workspace, "Ordinary member.", paths=[], home=home)
+    fragments = {secret[index:index + 4] for index in range(len(secret) - 3)}
+
+    def persist(_index):
+        rows = [add_insight(workspace, source, kind=source, paths=[], home=home),
+                capture_suggestion(workspace, source, paths=[], host=source, home=home),
+                record_hook_prompt(source, {"prompt": hook_source, "session_id": "safe-session"}, workspace=workspace, home=home),
+                record_decision(workspace, decision="confirm", insight_ids=[member["id"]], kind=source, reason=source, home=home)]
+        for index, (row, fields) in enumerate(zip(rows, (("text", "kind"), ("text", "host"), ("text", "host"), ("kind", "reason")))):
+            for field in fields:
+                wanted = "Never " + expected if case != "security" and index == 2 and field == "text" else expected
+                assert row[field] == wanted
+                assert not any(fragment in row[field] for fragment in fragments)
+
+    for _ in range(2):
+        persist(0)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(persist, range(3)))
+    for row in read_insight_rows(workspace, home=home):
+        for field in ("text", "kind", "reason", "host"):
+            assert not any(fragment in row.get(field, "") for fragment in fragments)
+
+
+@pytest.mark.parametrize("control", ["cr", "nel", "esc-parameters", "esc-intermediates", "c1-parameters", "c1-intermediates"])
+@pytest.mark.parametrize("field", ["kind", "hypothesis", "prediction", "do", "labels", "guidance"])
+@pytest.mark.parametrize("case", ["security", "correctness-letters", "correctness-symbols"])
+def test_round8g_proposal_text_writers_refuse_overbound_then_mask_and_retry(tmp_path, control, field, case):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.proposals import model
+    from tests.unit.core.test_proposals_store import make_store, snapshot
+
+    source, short, secret = _round8g_control_source(control, case=case)
+    base = dict(id="round8g-safe", source="one", kind="correctness", candidate_key="one:safe")
+    wrap = lambda text: (text,) if field in ("labels", "guidance") else text
+    code = "invalid" if field == "kind" and control == "cr" else "too_large"
+    for _ in range(2):
+        with pytest.raises(model.ProposalError) as caught:
+            model.Proposal(**dict(base, **{field: wrap(source)}))
+        assert caught.value.code == code
+        assert secret[:4] not in str(caught.value)
+    if field == "kind" and control == "cr":
+        with pytest.raises(model.ProposalError) as caught:
+            model.Proposal(**dict(base, **{field: wrap(short)}))
+        assert caught.value.code == "invalid"  # Single-line kind refuses CR before cleaning.
+        short = "Ordinary kind."
+    proposal = model.Proposal(**dict(base, **{field: wrap(short)}))
+    if not (field == "kind" and control == "cr"):
+        cleaned = {"kind": proposal.kind, "hypothesis": proposal.hypothesis,
+                   "prediction": proposal.prediction, "do": proposal.do,
+                   "labels": proposal.labels, "guidance": proposal.guidance}[field]
+        assert all("[REDACTED_HIENT]" in value for value in (cleaned if isinstance(cleaned, tuple) else (cleaned,)))
+    assert all(secret[index:index + 4] not in proposal.to_bytes().decode("utf-8") for index in range(len(secret) - 3))
+    store = make_store(tmp_path)
+    saved = store.write(proposal)
+    before = snapshot(store.root)
+    for _ in range(2):
+        assert store.write(proposal).digest == saved.digest
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(lambda _: store.write(proposal).digest, range(3))) == [saved.digest] * 3
+    assert snapshot(store.root) == before
+    assert store.read(proposal.id).digest == saved.digest
+
+
+@pytest.mark.parametrize("control", ["cr", "nel", "esc-parameters", "esc-intermediates", "c1-parameters", "c1-intermediates"])
+@pytest.mark.parametrize("case", ["security", "correctness-letters", "correctness-symbols"])
+def test_round8g_proposal_decision_reason_refuses_before_write_and_recovers(tmp_path, control, case):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.proposals import model
+    from tests.unit.core.test_proposals_store import make_store, snapshot
+
+    store = make_store(tmp_path)
+    proposal = model.Proposal(id="round8g-safe", source="one", kind="correctness", candidate_key="one:safe")
+    store.write(proposal)
+    source, short, secret = _round8g_control_source(control, case=case)
+    before = snapshot(store.root)
+    for _ in range(2):
+        with pytest.raises(model.ProposalError) as caught:
+            store.decide([proposal.id], decision="noise", operation_id="op-safe", reason=source)
+        assert caught.value.code == "too_large"
+        assert snapshot(store.root) == before
+
+    def decide(_index):
+        row = store.decide([proposal.id], decision="noise", operation_id="op-safe", reason=short)
+        assert "[REDACTED_HIENT]" in row["reason"]
+        assert all(secret[index:index + 4] not in row["reason"] for index in range(len(secret) - 3))
+        return row
+
+    expected = decide(0)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(decide, range(3))) == [expected] * 3
+    assert decide(0) == expected
+
+
+@pytest.mark.parametrize("control", ["cr", "nel", "esc-parameters", "esc-intermediates", "c1-parameters", "c1-intermediates"])
+@pytest.mark.parametrize("field", ["kind", "summary_bullets"])
+@pytest.mark.parametrize("case", ["security", "correctness-letters", "correctness-symbols"])
+def test_round8g_insight_proposal_writer_refuses_long_fields_and_recovers(tmp_path, control, field, case):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.proposals.model import ProposalError, parse_proposal
+
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("pass\n", encoding="utf-8")
+    member = add_insight(workspace, "Ordinary distinct correction.", kind="correctness", paths=["app.py"], home=home)
+    source, short, secret = _round8g_control_source(control, case=case)
+    wrap = lambda text: (text,) if field == "summary_bullets" else text
+    options = dict(proposal_id="round8g-safe", insight_ids=[member["id"]], home=home)
+    for _ in range(2):
+        with pytest.raises(ProposalError) as caught:
+            write_proposal(workspace, **options, **{field: wrap(source)})
+        assert caught.value.code == ("invalid" if field == "kind" and control == "cr" else "too_large")
+        assert not (workspace / ".aegis/proposals/round8g-safe.md").exists()
+    if field == "kind" and control == "cr":
+        short = "Ordinary kind."
+
+    def publish(_index):
+        target = write_proposal(workspace, **options, **{field: wrap(short)})
+        text = target.read_text(encoding="utf-8")
+        parsed = parse_proposal(target.read_bytes(), "round8g-safe")
+        free_text = (parsed.kind, parsed.hypothesis, parsed.prediction, parsed.do, *parsed.labels, *parsed.guidance)
+        assert all(secret[index:index + 4] not in value for value in free_text for index in range(len(secret) - 3))
+        if not (field == "kind" and control == "cr"):
+            assert "[REDACTED_HIENT]" in (parsed.kind if field == "kind" else parsed.guidance[-1])
+        return text
+
+    expected = publish(0)
+    assert publish(0) == expected
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(publish, range(3))) == [expected] * 3
+
+
+def _round8e_interrupted_text(value, secret, control, placement):
+    split = min(16, max(1, len(secret) // 2))
+    offset = value.index(secret) + split
+    head, tail = "Never repeat this: " + value[:offset], value[offset:]
+    gap = 4097 + placement - len(head)
+    removed = "\x1b[" + " " * (gap - 3) + "m" if control == "csi" else control * gap
+    return head + removed + tail
+
+
+def _round8e_detector_families():
+    from tests.unit.cli.test_check_ci_push import REDACTION_FAMILY_PROBES
+
+    return REDACTION_FAMILY_PROBES
+
+
+@pytest.mark.parametrize("family,value,secret,marker", _round8e_detector_families())
+@pytest.mark.parametrize("control", ["\r", "\x85", "csi"], ids=["cr", "nel", "csi"])
+@pytest.mark.parametrize("placement", [-1, 0, 1], ids=["before", "at", "after"])
+def test_round8e_public_writer_bounds_never_persist_credential_fragments(
+        tmp_path, family, value, secret, marker, control, placement):
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    (workspace / ".aegis/rules/traps").mkdir(parents=True)
+    (workspace / "app.py").write_text("pass\n", encoding="utf-8")
+    _put_rule(workspace, "trap-safe")
+    source = _round8e_interrupted_text(value, secret, control, placement)
+    member = add_insight(workspace, "Ordinary member.", paths=["app.py"], home=home)
+    fields = []
+    for _ in range(2):
+        fields.extend((
+            add_insight(workspace, source, paths=["app.py"], home=home)["text"],
+            capture_suggestion(workspace, source, paths=["app.py"], home=home)["text"],
+            record_hook_prompt("cli", {"prompt": source, "session_id": "safe-session"},
+                               workspace=workspace, home=home)["text"],
+            add_insight(workspace, "Ordinary member.", kind=source, paths=["app.py"], home=home)["kind"],
+            record_decision(workspace, decision="confirm", insight_ids=[member["id"]],
+                            reason=source, home=home)["reason"],
+            capture_suggestion(workspace, "Ordinary quote.", paths=["app.py"],
+                               host=source, home=home)["host"],
+        ))
+    fragments = {secret[index:index + 4] for index in range(len(secret) - 3)}
+    for shown in fields:
+        assert shown.startswith("Never repeat this:")
+        assert not any(fragment in shown for fragment in fragments), (family, control, placement)
+    for row in read_insight_rows(workspace, home=home):
+        for name in ("text", "kind", "reason", "host"):
+            assert not any(fragment in row.get(name, "") for fragment in fragments), (family, name)
+
+
+@pytest.mark.parametrize("control", ["\r", "\x85", "\x1b[" + " " * 30000 + "m"],
+                         ids=["cr", "nel", "csi"])
+def test_round8e_inconclusive_writer_fields_retry_and_parallel_calls(tmp_path, control):
+    from concurrent.futures import ThreadPoolExecutor
+
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    (workspace / ".aegis/rules/traps").mkdir(parents=True)
+    (workspace / "app.py").write_text("pass\n", encoding="utf-8")
+    _put_rule(workspace, "trap-safe")
+    secret = "k7Qm9pL2xV4nR8wY3tB6cD1fH0aZ"
+    removed = control if len(control) > 1 else control * 50000
+    source = "Never repeat this: " + secret[:16] + removed + secret[16:]
+    member = add_insight(workspace, "Ordinary member.", paths=["app.py"], home=home)
+
+    def persist(_index):
+        rows = [
+            add_insight(workspace, source, kind=source, paths=["app.py"], home=home),
+            capture_suggestion(workspace, source, paths=["app.py"], host=source, home=home),
+            record_hook_prompt(source, {"prompt": source, "session_id": "safe-session"},
+                               workspace=workspace, home=home),
+            record_decision(workspace, decision="confirm", insight_ids=[member["id"]],
+                            kind=source, reason=source, home=home),
+        ]
+        for row in rows:
+            for field in ("text", "kind", "reason", "host"):
+                assert all(secret[index:index + 4] not in row.get(field, "")
+                           for index in range(len(secret) - 3))
+
+    persist(0)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(persist, range(3)))
+    rows = read_insight_rows(workspace, home=home)
+    assert {row["event"] for row in rows} >= {"insight", "decision", "heartbeat", "inventory"}
+    assert all(secret[:4] not in json.dumps(row) for row in rows)
+
+
+@pytest.mark.parametrize("intro", ["\x1b[", "\x9b"], ids=["esc", "c1"])
+@pytest.mark.parametrize("control", ["\r", "\x85"], ids=["cr", "nel"])
+@pytest.mark.parametrize("secret", ["0123456789012345k7Qm9pL2xV4nR8wY3tB6", "0123456789012345@example.test"],
+                         ids=["entropy", "privacy"])
+def test_round8e_unfinished_header_payload_is_withheld_on_every_writer(tmp_path, intro, control, secret):
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    (workspace / ".aegis/rules/traps").mkdir(parents=True)
+    (workspace / "app.py").write_text("pass\n", encoding="utf-8")
+    _put_rule(workspace, "trap-safe")
+    source = "Never repeat this: " + intro + secret[:16] + control * 50000 + secret[16:]
+    member = add_insight(workspace, "Ordinary member.", paths=["app.py"], home=home)
+    fields = []
+    for _ in range(2):
+        fields.extend((
+            add_insight(workspace, source, paths=["app.py"], home=home)["text"],
+            capture_suggestion(workspace, source, paths=["app.py"], home=home)["text"],
+            record_hook_prompt("cli", {"prompt": source, "session_id": "safe-session"},
+                               workspace=workspace, home=home)["text"],
+            add_insight(workspace, "Ordinary member.", kind=source, paths=["app.py"], home=home)["kind"],
+            record_decision(workspace, decision="confirm", insight_ids=[member["id"]],
+                            reason=source, home=home)["reason"],
+            capture_suggestion(workspace, "Ordinary quote.", paths=["app.py"], host=source, home=home)["host"],
+        ))
+    # ROUND-8h: genuine whitespace before the header preserves this benign cue.
+    assert fields == ["Never repeat this: ..."] * 12
+    for row in read_insight_rows(workspace, home=home):
+        for field in ("text", "kind", "reason", "host"):
+            assert secret[:4] not in row.get(field, "")
+
+
+@pytest.mark.parametrize("control", ["\r", "\x85", "\x00", "\n", "\t", "\x1b[31m", "\x9b31m",
+                                     "\x1b[" + "1;" * 5000 + "m", "\x9b" + " " * 5000 + "m"],
+                         ids=["cr", "nel", "nul", "lf", "tab", "esc", "c1", "parameters", "intermediates"])
+def test_round8e_conservative_tail_rule_applies_to_every_public_writer(tmp_path, control):
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    (workspace / ".aegis/rules/traps").mkdir(parents=True)
+    (workspace / "app.py").write_text("pass\n", encoding="utf-8")
+    _put_rule(workspace, "trap-safe")
+    source = "Never repeat this: " + control + " ordinary" * 1000
+    member = add_insight(workspace, "Ordinary member.", paths=["app.py"], home=home)
+    fields = (
+        add_insight(workspace, source, paths=["app.py"], home=home)["text"],
+        capture_suggestion(workspace, source, paths=["app.py"], home=home)["text"],
+        record_hook_prompt("cli", {"prompt": source, "session_id": "safe-session"},
+                           workspace=workspace, home=home)["text"],
+        add_insight(workspace, "Ordinary member.", kind=source, paths=["app.py"], home=home)["kind"],
+        record_decision(workspace, decision="confirm", insight_ids=[member["id"]],
+                        reason=source, home=home)["reason"],
+        capture_suggestion(workspace, "Ordinary quote.", paths=["app.py"], host=source, home=home)["host"],
+    )
+    prefix = "Never repeat this:"
+    assert all(shown.startswith(prefix) for shown in fields)
+    if len(control) < 10:
+        assert all(" ordinary" in shown for shown in fields)
+    else:
+        # ROUND-8h: header intermediates are removed; preceding space remains.
+        assert fields == ("Never repeat this: ...",) * 6
+    for row in read_insight_rows(workspace, home=home):
+        for field in ("text", "kind", "reason", "host"):
+            if row.get(field, "").startswith("Never"):
+                assert row[field].startswith(prefix)
+
+
 def _make_repo(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     _git(path, "init", "-q")
@@ -1663,6 +2300,9 @@ S0 = {
 NEW_MODULES = frozenset({
     "aegis_core.pathlookup_gitcache",
     "aegis_core.redaction", "aegis_core.storage_shared",
+    # Reviewed PROPOSAL-CLEAN-DELETED-VIEW round 3c: coordinator importtime measured
+    # 3.6-6.4 ms of regex compilation moved from redaction.py into this leaf.
+    "aegis_core.redaction_patterns",
                          "aegis_core.gitsafe_run",
                          "aegis_core.gitsafe_policy",
                          *(f"aegis_core.insights.{m}" for m in INSIGHT_MODULES),
@@ -1722,6 +2362,62 @@ def test_the_hook_path_loads_no_module_it_did_not_load_before(tmp_path: Path, hb
 def test_a_heavy_module_on_the_hook_path_is_named():
     loaded = S0["prompt"] | {"aegis_core.insights.capture", "aegis_core.human_gate"}
     assert unexpected_modules(loaded, S0["prompt"]) == ["aegis_core.human_gate"]
+
+
+def test_round8b_empty_path_cues_keep_the_fresh_hook_import_set(tmp_path: Path, hb_home: Path):
+    workspace = tmp_path / "ws"
+    (workspace / ".aegis").mkdir(parents=True)
+    program = r"""
+import json
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from aegis_core import insights
+from aegis_core.errors import PathTraversalError
+from aegis_core.insights.capture import clean_insight_row
+
+workspace, home = Path(sys.argv[2]), Path(sys.argv[3])
+module = "aegis_core.workspace.confinement"
+def loaded():
+    return sorted(name for name in sys.modules if name.startswith("aegis_"))
+
+found = {"import": loaded()}
+insights.record_hook_prompt("claude-code", {"prompt": "Please run the tests.", "session_id": "safe"},
+                            workspace=workspace, home=home)
+found["prompt"] = loaded()
+def cue(_index):
+    row = insights.record_hook_prompt("claude-code", {"prompt": "No, stop repeating the same edit.", "session_id": "safe"},
+                                      workspace=workspace, home=home)
+    assert row["event"] == "insight" and row["paths"] == []
+for attempt in range(2):
+    cue(attempt)
+    found["cue" + str(attempt)] = loaded()
+with ThreadPoolExecutor(max_workers=3) as pool:
+    list(pool.map(cue, range(6)))
+found["parallel"] = loaded()
+assert clean_insight_row({}, workspace=object()) == {}
+assert clean_insight_row({"paths": []}, workspace=workspace) == {"paths": []}
+assert clean_insight_row({"paths": ()}, workspace=workspace) == {"paths": []}
+found["empty"] = loaded()
+for attempt in range(2):
+    try:
+        clean_insight_row({"paths": ["../outside"]}, workspace=workspace)
+    except PathTraversalError as refusal:
+        assert str(refusal) == "invalid insight path"
+    else:
+        raise AssertionError("nonempty paths bypassed confinement")
+assert clean_insight_row({"paths": ["app.py"]}, workspace=workspace) == {"paths": ["app.py"]}
+found["nonempty"] = loaded()
+sys.stdout.write(json.dumps(found))
+"""
+    result = _run_isolated(program, workspace, hb_home, env=_child_env(hb_home))
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    found = json.loads(result.stdout)
+    confinement = "aegis_core.workspace.confinement"
+    assert all(confinement not in found[step] for step in ("import", "prompt", "cue0", "cue1", "parallel", "empty"))
+    assert {step: sorted(set(found[step]) - set(found["prompt"]))
+            for step in ("cue0", "cue1", "parallel", "empty")} == {
+                step: [] for step in ("cue0", "cue1", "parallel", "empty")}
+    assert confinement in found["nonempty"]
 
 
 _APPEND = r"""
