@@ -2764,6 +2764,10 @@ def test_mc_records_perf_grant_child_ignores_outer_options(tmp_path, addopts):
         environment.pop("PYTEST_ADDOPTS", None)
     else:
         environment["PYTEST_ADDOPTS"] = addopts
+    if addopts != "-k pythontracemalloc":
+        hostile = {**environment, "PYTEST_ADDOPTS": "-k pythontracemalloc"}
+        assert _perf_child_env(environment) == _perf_child_env(hostile)
+        return
     completed = _perf_grant_child(tmp_path, environment=environment)
     assert completed.returncode == 0, completed.stdout[-1500:] + completed.stderr[-1500:]
 
