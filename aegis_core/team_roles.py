@@ -11,7 +11,7 @@ import json
 from types import MappingProxyType
 
 from aegis_core.primitives import json_preflight
-from aegis_core.team_mailbox_primitives import MailboxRefusal, RoleTables, bounded_tree
+from aegis_core.team_mailbox_primitives import MailboxRefusal, RoleTables, bounded_tree, render_mailbox_refusal
 
 __all__ = [
     "RoleRefusal", "SCHEMA", "VOCABULARY", "ENDPOINT_ROLES", "LANE_KINDS", "VERTICAL_ROUTES",
@@ -80,11 +80,11 @@ def _operation(reason="invalid_registry", *, budget=False):
                     bounded_tree(args)
                     bounded_tree(kwargs)
                 return function(*args, **kwargs)
+            except MailboxRefusal as error:
+                code = "too_large" if render_mailbox_refusal(error)["reason"] == "too_large" else reason
+                raise RoleRefusal(code) from None
             except RoleRefusal:
                 raise
-            except MailboxRefusal as error:
-                code = "too_large" if error.reason == "too_large" else reason
-                raise RoleRefusal(code) from None
             except OSError:
                 raise RoleRefusal("policy_io") from None
             except (ValueError, KeyError, IndexError, AttributeError,
@@ -220,7 +220,8 @@ def _thaw(value):
 def _endpoint_key(endpoint, kind):
     try:
         family = _GRAMMAR.endpoint_parts(endpoint)[1]
-    except MailboxRefusal:
+    except MailboxRefusal as error:
+        render_mailbox_refusal(error)
         raise RoleRefusal("unknown_endpoint") from None
     if family == "lane":
         require(type(kind) is str and len(kind) <= 64 and kind in LANE_KINDS,
