@@ -97,6 +97,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.rule_lint": 2,
     "aegis_core.rule_lint_capture": 2,
     "aegis_core.rule_lint_grammar": 2,
+    "aegis_core.rule_lint_reasons": 0,
     "aegis_core.rules": 1,
     "aegis_core.rule_inventory": 1,
     "aegis_core.yaml_engine": 1,
