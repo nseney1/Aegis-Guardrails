@@ -22,7 +22,7 @@ from aegis_core.telemetry_engine.ledger import pending_worktree_rows
 from aegis_core.workspace.confinement import finish_file_move, iter_confined_files, read_confined_bytes
 from aegis_core.workspace.discovery import UPGRADE_STATE_MSG, unmigrated_state
 from aegis_core.workspace.layout import WorkspaceLayout
-from aegis_core.yaml_engine.frontmatter import parse_frontmatter
+from aegis_core.yaml_engine.frontmatter import parse_frontmatter, read_rule_file
 
 _TOP_KEY = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*)\s*:")
 _TYPE_LINE = re.compile(r"^type[ \t]*:")
@@ -147,7 +147,7 @@ def _set_type(text: str, rule_type: str) -> str:
     return prefix + "".join(lines)
 
 
-_input = partial(read_confined_bytes, error_type=MigrationRefused)
+_input = partial(read_rule_file, error_type=MigrationRefused, missing_ok=True, preserve_os_errors=True)
 
 
 def _plan_rules(result: MigrationPlan, layout: WorkspaceLayout) -> None:
@@ -159,7 +159,7 @@ def _plan_rules(result: MigrationPlan, layout: WorkspaceLayout) -> None:
         if path in targets or path.name.lower() == "readme.md":
             continue
         try:
-            raw = _input(layout.root, path, missing_ok=False)
+            raw = _input(path, root=layout.root, missing_ok=False)
             text = raw.decode("utf-8")
         except (MigrationRefused, OSError, UnicodeError) as exc:
             if isinstance(exc, MigrationRefused):
@@ -181,7 +181,7 @@ def _plan_rules(result: MigrationPlan, layout: WorkspaceLayout) -> None:
         if moving:
             change.target = layout.rules_dir / RULE_TYPE_DIRS[kind] / path.name
             try:
-                current = _input(layout.root, change.target)
+                current = _input(change.target, root=layout.root)
             except (MigrationRefused, OSError) as exc:
                 result.skipped.append({"path": result._rel(path), "reason": str(exc)})
                 continue
@@ -237,14 +237,14 @@ def apply(migration: MigrationPlan) -> MigrationResult:
     try:
         state_dir(layout.root)
         ledger_site(layout.root, create=False)
-        _input(layout.root, layout.config_file, max_bytes=MAX_CONFIG_BYTES)
+        read_confined_bytes(layout.root, layout.config_file, error_type=MigrationRefused, max_bytes=MAX_CONFIG_BYTES)
     except (PathTraversalError, OSError) as exc:
         raise MigrationRefused(str(exc) if isinstance(exc, PathTraversalError) else "workspace inputs could not be read; no rule, config.json or .aegis/.gitignore was changed") from exc
     with locked(layout.root):
         retired = unmigrated_state(layout.root)
         if retired:
             raise MigrationRefused(UPGRADE_STATE_MSG.format(path=layout.root, found=", ".join(retired)))
-        changed = [rel for rel, original in migration.inputs.items() if _input(layout.root, layout.root / rel) != original]
+        changed = [rel for rel, original in migration.inputs.items() if _input(layout.root / rel, root=layout.root) != original]
         if changed:
             raise MigrationRefused(f"{', '.join(changed)} changed since the plan was made; no rule, config.json or .aegis/.gitignore was changed. Run aegis migrate again.")
         result.backup = Path(tempfile.mkdtemp(prefix=f"migrate-backup-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-", dir=layout.state_dir))
@@ -254,7 +254,7 @@ def apply(migration: MigrationPlan) -> MigrationResult:
         if ensure_runtime_gitignore(layout.aegis_dir, dry_run=True) == "dry-run" and ignore.is_file():
             touched.append(ignore)
         for path in touched:
-            atomic_write_bytes(result.backup / path.relative_to(layout.root), path.read_bytes(), mode=stat.S_IMODE(path.stat().st_mode))
+            atomic_write_bytes(result.backup / path.relative_to(layout.root), _input(path, root=layout.root, missing_ok=False) if path.relative_to(layout.root).as_posix() in migration.inputs else path.read_bytes(), mode=stat.S_IMODE(path.stat().st_mode))
         ensure_runtime_gitignore(layout.aegis_dir)
         if not layout.config_file.exists():
             update_repo_config(layout.root, lambda data: None)

@@ -21,11 +21,14 @@ import aegis_core.rule_lint as lint
 import aegis_core.scan as scan_service
 import aegis_core.rules as rule_schema
 import aegis_core.gitsafe as git_service
+import aegis_core.rule_inventory as inventory_module
+import aegis_core.workspace.confinement as confinement
 from tests import helpers_humangate as hg
+from tests.helpers_guidance_corpus import guidance_corpus, repository_guidance_corpus
 
 from aegis_cli.init import install_rules
 from aegis_core.lifecycle.constants import PROTECTED_RULES
-from aegis_core.yaml_engine.frontmatter import parse_rule_frontmatter
+from aegis_core.yaml_engine.frontmatter import AegisYAML, parse_frontmatter, parse_rule_frontmatter, split_frontmatter
 from aegis_core.match import matching_files
 
 try:
@@ -58,75 +61,94 @@ def _md(base: Path, pattern: str) -> list[Path]:
     return sorted(p for p in base.glob(pattern) if p.name not in SKIP)
 
 
-CORE = _md(ROOT / "rules", "*.md") + _md(ROOT / "rules" / ".oracles", "*.md")
-# Rules under a hidden directory (.archive) are out of service, as the loader treats them.
-WS = [p for p in _md(ROOT / ".aegis" / "rules", "**/*.md")
-      if not any(part.startswith(".") for part in p.relative_to(ROOT / ".aegis" / "rules").parts[:-1])]
-ALL = CORE + WS
 META = ROOT / "rules" / "META.md"
+
+
+@pytest.fixture(scope="module")
+def shipped_rule_sources():
+    paths = _md(ROOT / "rules", "*.md") + _md(ROOT / "rules" / ".oracles", "*.md")
+    return {p: p.read_text(encoding="utf-8-sig") for p in paths + [META]}
+
+
+@pytest.fixture(scope="module")
+def repository_guidance_snapshot():
+    return inventory_module.inventory_rules(ROOT)
+
+
+@pytest.fixture(scope="module")
+def workspace_rule_sources(repository_guidance_snapshot):
+    return {ROOT / path: raw.decode("utf-8-sig")
+            for path, raw, _body in repository_guidance_corpus(repository_guidance_snapshot)}
+
+
+@pytest.fixture(scope="module")
+def repository_rule_sources(shipped_rule_sources, workspace_rule_sources):
+    return {**{p: text for p, text in shipped_rule_sources.items() if p != META},
+            **workspace_rule_sources}
 
 
 def rel(p: Path) -> str:
     return p.relative_to(ROOT).as_posix()
 
 
-def _parse(p: Path) -> tuple[dict, str]:
+def _parse(p: Path, text: str) -> tuple[dict, str]:
     try:
-        fm, body = parse_rule_frontmatter(str(p))
+        status, _header, _body = split_frontmatter(text)
+        if status != "ok":
+            raise ValueError("No frontmatter delimiter" if status == "none" else "Unclosed frontmatter")
+        document = AegisYAML.parse_text(text)
+        fm, body = document.metadata, document.body
     except Exception as exc:  # missing, unclosed or malformed frontmatter
         pytest.fail(f"{rel(p)}: unparseable frontmatter: {exc}")
     assert fm, f"{rel(p)}: empty frontmatter"
     return fm, body
 
 
-def _fm_or_empty(p: Path) -> dict:
-    try:
-        return parse_rule_frontmatter(str(p))[0] or {}
-    except Exception:
-        return {}  # reported by the per-file tests, not as a collection error
+def _fm_or_empty(text: str) -> dict:
+    return parse_frontmatter(text) or {}  # reported by the schema tests if malformed
 
 
-@pytest.mark.parametrize("p", ALL, ids=rel)
-def test_rule_id_matches_filename_domain_is_known_and_body_is_real(p):
-    fm, body = _parse(p)
-    assert fm.get("id") == p.stem, f"{rel(p)}: id {fm.get('id')!r} != filename stem"
-    assert fm.get("domain") in DOMAINS, f"{rel(p)}: domain {fm.get('domain')!r} not allowed"
-    assert len(body.strip()) > 50, f"{rel(p)}: body too short to be actionable"
+def test_rule_id_matches_filename_domain_is_known_and_body_is_real(repository_rule_sources):
+    for p, text in repository_rule_sources.items():
+        fm, body = _parse(p, text)
+        assert fm.get("id") == p.stem, f"{rel(p)}: id {fm.get('id')!r} != filename stem"
+        assert fm.get("domain") in DOMAINS, f"{rel(p)}: domain {fm.get('domain')!r} not allowed"
+        assert len(body.strip()) > 50, f"{rel(p)}: body too short to be actionable"
 
 
-def test_rule_ids_are_unique_across_shipped_and_workspace_rules():
+def test_rule_ids_are_unique_across_shipped_and_workspace_rules(repository_rule_sources):
     seen: dict[str, Path] = {}
-    for p in ALL:
-        rid = _parse(p)[0].get("id")
+    for p, text in repository_rule_sources.items():
+        rid = _parse(p, text)[0].get("id")
         assert rid not in seen, f"duplicate id {rid!r}: {rel(seen[rid])} and {rel(p)}"
         seen[rid] = p
 
 
-@pytest.mark.parametrize("p", CORE + [META], ids=rel)
-def test_shipped_rule_host_contract(p):
-    fm, _ = _parse(p)
-    assert fm.get("trigger") in ("always_on", "model_decision"), f"{rel(p)}: bad trigger"
-    assert len(str(fm.get("description", "")).strip()) > 10, f"{rel(p)}: description too short"
-    if p.parent.name == "rules" and p != META:
-        assert "enforcement" in fm, f"{rel(p)}: missing enforcement"
+def test_shipped_rule_host_contract(shipped_rule_sources):
+    for p, text in shipped_rule_sources.items():
+        fm, _ = _parse(p, text)
+        assert fm.get("trigger") in ("always_on", "model_decision"), f"{rel(p)}: bad trigger"
+        assert len(str(fm.get("description", "")).strip()) > 10, f"{rel(p)}: description too short"
+        if p.parent.name == "rules" and p != META:
+            assert "enforcement" in fm, f"{rel(p)}: missing enforcement"
 
 
-def test_meta_bootstrap_stays_always_on():
-    assert _parse(META)[0].get("trigger") == "always_on"
+def test_meta_bootstrap_stays_always_on(shipped_rule_sources):
+    assert _parse(META, shipped_rule_sources[META])[0].get("trigger") == "always_on"
 
 
-@pytest.mark.parametrize("p", WS, ids=rel)
-def test_workspace_rule_type_schema(p):
-    assert p.parent.name in WORKSPACE, f"{rel(p)}: not under a canonical type dir {sorted(WORKSPACE)}"
-    rtype, required = WORKSPACE[p.parent.name]
-    fm, _ = _parse(p)
-    assert fm.get("type") == rtype, f"{rel(p)}: type {fm.get('type')!r}, expected {rtype!r}"
-    for field in required:
-        assert fm.get(field), f"{rel(p)}: missing or empty {field!r}"
-    if rtype == "trap":
-        assert "expiry_sessions" in fm or "expiry_days" in fm, f"{rel(p)}: trap has no expiry"
-    if rtype == "invariant":
-        assert fm.get("enforcement") == "gate", f"{rel(p)}: invariant must be gate"
+def test_workspace_rule_type_schema(workspace_rule_sources):
+    for p, text in workspace_rule_sources.items():
+        assert p.parent.name in WORKSPACE, f"{rel(p)}: not under a canonical type dir {sorted(WORKSPACE)}"
+        rtype, required = WORKSPACE[p.parent.name]
+        fm, _ = _parse(p, text)
+        assert fm.get("type") == rtype, f"{rel(p)}: type {fm.get('type')!r}, expected {rtype!r}"
+        for field in required:
+            assert fm.get(field), f"{rel(p)}: missing or empty {field!r}"
+        if rtype == "trap":
+            assert "expiry_sessions" in fm or "expiry_days" in fm, f"{rel(p)}: trap has no expiry"
+        if rtype == "invariant":
+            assert fm.get("enforcement") == "gate", f"{rel(p)}: invariant must be gate"
 
 
 # A served rule without target_paths applies to no file: scan and check never serve it.
@@ -134,14 +156,17 @@ def test_workspace_rule_type_schema(p):
 KNOWN_UNTARGETED: set = set()
 
 
-def test_every_served_workspace_rule_applies_to_some_file():
+def test_every_served_workspace_rule_applies_to_some_file(repository_guidance_snapshot):
     from aegis_core.rules import load_rules
 
-    untargeted = {r.id for r in load_rules(ROOT).served if not r.target_paths}
+    untargeted = {r.id for r in load_rules(ROOT, inventory=repository_guidance_snapshot).served if not r.target_paths}
     assert untargeted == KNOWN_UNTARGETED, "served rules without target_paths match no file; give them patterns"
 
 
-_PATHS = [(p, t) for p in WS for t in (_fm_or_empty(p).get("target_paths") or []) if isinstance(t, str)]
+@pytest.fixture(scope="module")
+def workspace_target_paths(workspace_rule_sources):
+    return [(p, t) for p, text in workspace_rule_sources.items()
+            for t in (_fm_or_empty(text).get("target_paths") or []) if isinstance(t, str)]
 
 
 @functools.lru_cache(maxsize=None)
@@ -157,26 +182,20 @@ def _repo_files() -> tuple[str, ...]:
 # rules owner: retargeting the rule turns the xfail into a failure that removes the entry.
 # The set must shrink, never grow.
 KNOWN_DEAD_TARGETS: set = set()
-_DEAD = pytest.mark.xfail(
-    strict=True, reason="the docs wave moved this target; the rule file is outside lane f2 (retarget it)"
-)
 
 
-@pytest.mark.parametrize(
-    "p,target",
-    [pytest.param(p, t, marks=[_DEAD] if (p.name, t) in KNOWN_DEAD_TARGETS else []) for p, t in _PATHS],
-    ids=[f"{p.name}:{t}" for p, t in _PATHS],
-)
-def test_target_paths_resolve(p, target):
+def test_target_paths_resolve(workspace_target_paths):
     """Resolve with the one matcher every rule site uses (aegis_core.match), not glob:
     a pattern that matches no file is dead, and one that relied on the removed
     substring glob (a bare `src`) matches nothing now."""
     files = _repo_files()
-    matched = set(matching_files([target], files))
-    assert matched, f"{rel(p)}: {target!r} matches no file through aegis_core.match"
-    named = {Path(x).relative_to(ROOT).as_posix() for x in glob.glob(str(ROOT / target), recursive=True)}
-    missed = sorted((named & set(files)) - matched)
-    assert not missed, f"{rel(p)}: {target!r} reads as a glob for {missed[:5]} but the scan matcher skips them"
+    assert not KNOWN_DEAD_TARGETS, "deferred rule targets need individual cases before adding an xfail"
+    for p, target in workspace_target_paths:
+        matched = set(matching_files([target], files))
+        assert matched, f"{rel(p)}: {target!r} matches no file through aegis_core.match"
+        named = {Path(x).relative_to(ROOT).as_posix() for x in glob.glob(str(ROOT / target), recursive=True)}
+        missed = sorted((named & set(files)) - matched)
+        assert not missed, f"{rel(p)}: {target!r} reads as a glob for {missed[:5]} but the scan matcher skips them"
 
 
 @pytest.mark.parametrize("preset", ["minimal", "standard", "full"])
@@ -196,13 +215,13 @@ def test_unshipped_ids_agree_with_wheel_smoke():
     assert set(ast.literal_eval(node.value)) == UNSHIPPED
 
 
-def test_protected_rules_are_shipped_rules():
-    assert PROTECTED_RULES <= {p.stem for p in CORE}
+def test_protected_rules_are_shipped_rules(shipped_rule_sources):
+    assert PROTECTED_RULES <= {p.stem for p in shipped_rule_sources if p != META}
 
 
-def test_dogfood_rules_are_workspace_rules_not_shipped():
-    assert {f"{rtype}-{name}" for name, rtype in DOGFOOD.items()} <= {p.stem for p in WS}
-    assert not set(DOGFOOD) & {p.stem for p in CORE}
+def test_dogfood_rules_are_workspace_rules_not_shipped(shipped_rule_sources, workspace_rule_sources):
+    assert {f"{rtype}-{name}" for name, rtype in DOGFOOD.items()} <= {p.stem for p in workspace_rule_sources}
+    assert not set(DOGFOOD) & {p.stem for p in shipped_rule_sources if p != META}
 
 
 def _table(text: str, header: str) -> set[str]:
@@ -213,10 +232,10 @@ def _table(text: str, header: str) -> set[str]:
     return {(re.search(r"\((\w+)\)", c) or re.match(r"`?([\w-]+)", c)).group(1).lower() for c in cells}
 
 
-def test_optional_import_guard_tables_match_pyproject():
-    found = [p for p in ALL if p.stem == "trap-optional-import-guard"]
+def test_optional_import_guard_tables_match_pyproject(repository_rule_sources):
+    found = [p for p in repository_rule_sources if p.stem == "trap-optional-import-guard"]
     assert len(found) == 1, f"expected one optional-import-guard rule, found {found}"
-    oracle = found[0].read_text(encoding="utf-8")
+    oracle = repository_rule_sources[found[0]]
     with open(ROOT / "pyproject.toml", "rb") as f:
         deps = {re.split(r"[><=!~\[ ;]", d)[0].lower() for d in tomllib.load(f)["project"]["dependencies"]}
     assert deps == set(), "Aegis has zero runtime dependencies"
@@ -239,6 +258,270 @@ LINT_PATH = ".aegis/rules/traps/sample.md"
 
 def lint_codes(result):
     return {finding.code for finding in result.findings}
+
+
+@pytest.mark.parametrize("case", guidance_corpus(), ids=lambda case: case.name)
+def test_lint_check2_matches_shared_guidance_control_corpus(case):
+    from concurrent.futures import ThreadPoolExecutor
+    import hashlib
+    from aegis_core.fitness import compute
+    from aegis_core.guidance_projection import CONTROL_GUIDANCE, WITHHELD_GUIDANCE, project_detail, project_display_data, project_field
+    from aegis_core.rule_inventory import RuleInventory, RuleInventoryEntry
+
+    value = case.value
+    if case.field == "body":
+        projected = project_detail(value)
+    elif case.field in {"hypothesis", "prediction"}:
+        projected = project_field(value)
+    else:
+        projected = project_display_data({case.field: value})[case.field]
+    refused = projected in (CONTROL_GUIDANCE, [CONTROL_GUIDANCE])
+    # Literal notices are data, not proof of a control refusal.
+    if case.name.endswith("literal_notice"):
+        refused = False
+    data = case.rule_bytes()
+    first = lint.lint_rule(data, LINT_PATH)
+    if case.field == "body" and "\ud800" in value:
+        assert lint_codes(first) == {"loader"}  # Invalid UTF-8 never reaches check 2.
+        return
+    entry = RuleInventoryEntry(LINT_PATH, LINT_PATH, data, hashlib.sha256(data).hexdigest(), len(data))
+    ruleset = rule_schema.load_rules("/", inventory=RuleInventory((entry,), "guidance-corpus"))
+    extras = {case.field: value} if case.field not in {"body", "hypothesis", "prediction"} else None
+    scanned = scan_service.select_guidance(ruleset, ["src/a.py"], 3, 2000, [],
+                                           lambda rules: {rule.id: compute({}) for rule in rules}, extras=extras)
+    assert scanned.exposure_rule_ids() == ("sample",)
+    if case.field == "body":
+        assert "   Detail: " + projected + "\n" in scanned["guidance"]
+    elif extras is not None:
+        assert scanned[case.field] == projected
+    else:
+        assert scanned["relevant_rules"][0][case.field] == projected
+    findings = [finding for finding in first.findings if finding.code == "withheld_guidance"]
+    assert bool(findings) is refused
+    if refused:
+        assert not first.ok
+        assert len(findings) == 1
+        assert findings[0].check == 2
+        assert findings[0].next_action == "Remove control, format and surrogate characters from served guidance."
+        assert findings[0].message == "served guidance contains withheld control characters"
+    elif projected not in (WITHHELD_GUIDANCE, [WITHHELD_GUIDANCE]):
+        assert first.ok
+    else:
+        assert not first.ok
+        assert "do_window" in lint_codes(first)
+    assert lint.lint_rule(data, LINT_PATH) == first
+
+    def retry(_):
+        result = lint.lint_rule(data, LINT_PATH)
+        assert lint.lint_rule(lint_bytes(), LINT_PATH).ok
+        return result
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(retry, range(3), timeout=15))
+    assert results == [first] * 3
+
+
+def test_lint_repository_corpus_matches_served_control_verdict(repository_guidance_snapshot):
+    from aegis_core.guidance_projection import CONTROL_GUIDANCE, project_detail, project_display_data
+
+    rules = {rule.path: rule for rule in rule_schema.load_rules(ROOT, inventory=repository_guidance_snapshot).rules}
+    assert rules
+    seen = set()
+    for path, data, body in repository_guidance_corpus(repository_guidance_snapshot):
+        rule = rules[path]
+        projected = project_display_data(rule.as_dict())
+        values = [project_detail(body), *projected.values()]
+        refused = any(value in (CONTROL_GUIDANCE, [CONTROL_GUIDANCE]) for value in values)
+        result = lint.lint_rule(data, path)
+        assert ("withheld_guidance" in lint_codes(result)) is refused
+        seen.add(path)
+    assert seen == set(rules)
+
+
+def test_lint_withheld_guidance_cli_reports_fixed_refusal_and_next_action(tmp_path, monkeypatch, capsys):
+    import argparse
+    import json
+    from aegis_cli.rule import RuleCommand, run_rule
+
+    root = lint_root(tmp_path)
+    path = root / LINT_PATH
+    path.write_bytes(lint_bytes(do="Read\u200c safely."))
+    monkeypatch.setattr(git_service, "changed_files", lambda *_a, **_k: [])
+    parser = argparse.ArgumentParser()
+    RuleCommand().configure_parser(parser)
+    args = parser.parse_args(["lint", LINT_PATH, "--json", "--workspace", str(root)])
+    assert run_rule(args) == 0
+    result = json.loads(capsys.readouterr().out)["results"][0]
+    assert result["ok"] is False
+    finding = next(f for f in result["findings"] if f["code"] == "withheld_guidance")
+    assert finding["check"] == 2
+    assert finding["next_action"] == "Remove control, format and surrogate characters from served guidance."
+    assert finding["message"] == "served guidance contains withheld control characters"
+    path.write_bytes(lint_bytes())
+    assert run_rule(args) == 0
+    assert json.loads(capsys.readouterr().out)["results"][0]["ok"] is True
+
+
+def test_lint_unaffected_findings_keep_their_public_shape():
+    from dataclasses import asdict
+
+    result = lint.lint_rule(lint_bytes(), LINT_PATH)
+    assert [asdict(finding) for finding in result.findings] == [{
+        "check": 7, "code": "scan_simulation", "severity": "warning",
+        "message": "not evaluated: no scan workspace", "suggestions": (),
+    }]
+
+
+def test_repository_guidance_corpus_is_not_captured_during_import():
+    from tests.helpers_reviewed_sources import run_isolated_test
+
+    # Only the owned child replaces shared openers; pytest teardown stays real.
+    program = r'''
+import builtins
+from concurrent.futures import ThreadPoolExecutor
+import importlib.util
+import os
+from pathlib import Path
+import sys
+import aegis_core.rule_inventory as inventory_module
+from tests import helpers_guidance_corpus as corpus_module
+
+def forbidden(*args, **kwargs):
+    raise AssertionError("repository corpus was captured during module import")
+
+def guarded(operation):
+    def call(path, *args, **kwargs):
+        if not isinstance(path, int):
+            parts = Path(os.fsdecode(path)).parts
+            if any(parts[i:i + 2] == (".aegis", "rules") for i in range(len(parts) - 1)):
+                raise AssertionError("workspace rule I/O during module import")
+        return operation(path, *args, **kwargs)
+    return call
+
+inventory_module.inventory_rules = forbidden
+corpus_module.repository_guidance_corpus = forbidden
+builtins.open = guarded(builtins.open)
+Path.open = guarded(Path.open)
+Path.read_text = guarded(Path.read_text)
+Path.read_bytes = guarded(Path.read_bytes)
+Path.glob = guarded(Path.glob)
+os.open = guarded(os.open)
+os.walk = guarded(os.walk)
+
+# Prove each read guard refuses before reaching a filesystem operation.
+path = Path(".aegis/rules/traps/import-probe.md")
+for operation in (builtins.open, Path.open, Path.read_text, Path.read_bytes, os.open):
+    try:
+        operation(path)
+    except AssertionError as exc:
+        assert str(exc) == "workspace rule I/O during module import"
+    else:
+        raise AssertionError("workspace rule guard did not refuse")
+
+def load(index):
+    spec = importlib.util.spec_from_file_location("lint_corpus_import_probe_" + str(index), sys.argv[2])
+    probe = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(probe)
+
+load(0)
+with ThreadPoolExecutor(max_workers=3) as pool:
+    list(pool.map(load, range(1, 4), timeout=15))
+load(4)
+'''
+    result = run_isolated_test(program, __file__)
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+
+
+@pytest.mark.parametrize("backend", ["native", "fallback"])
+def test_repository_guidance_corpus_reuses_snapshot_after_paths_change(tmp_path, monkeypatch, backend):
+    from concurrent.futures import ThreadPoolExecutor
+
+    if backend == "fallback":
+        monkeypatch.setattr(inventory_module, "descriptor_supported", lambda: False)
+
+    path = tmp_path / LINT_PATH
+    path.parent.mkdir(parents=True)
+    original = lint_bytes(do="Read captured guidance.")
+    path.write_bytes(original)
+    snapshot = inventory_module.inventory_rules(tmp_path)
+    path.write_bytes(lint_bytes(do="Read changed guidance."))
+    path.parent.rename(path.parent.with_name("moved"))
+    expected = [(LINT_PATH, original, "\n## Do\nRead captured guidance.\n")]
+
+    def read(_):
+        rows = list(repository_guidance_corpus(snapshot))
+        assert rows == expected
+        for relative, raw, _body in rows:
+            text = raw.decode("utf-8-sig")
+            meta, body = _parse(ROOT / relative, text)
+            assert meta["id"] == "sample"
+            assert body == "## Do\nRead captured guidance."
+            assert _fm_or_empty(text)["target_paths"] == ["src/**"]
+        loaded = rule_schema.load_rules(tmp_path, inventory=snapshot)
+        assert [(rule.path, rule.raw) for rule in loaded.rules] == [(LINT_PATH, original)]
+        return rows
+
+    assert read(None) == expected
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(read, range(3), timeout=15)) == [expected] * 3
+    assert read(None) == expected
+
+
+def test_workspace_parser_refuses_path_shaped_snapshot_text(tmp_path):
+    outside = tmp_path / "outside.md"
+    outside.write_bytes(lint_bytes())
+    text = str(outside)
+    with pytest.raises(pytest.fail.Exception, match=r"sample\.md: unparseable frontmatter: No frontmatter delimiter$"):
+        _parse(ROOT / LINT_PATH, text)
+    assert _fm_or_empty(text) == {}
+    meta, body = _parse(ROOT / LINT_PATH, lint_bytes().decode("utf-8"))
+    assert meta["id"] == "sample"
+    assert body.startswith("## Do\n")
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+def test_repository_guidance_inventory_refuses_special_files_before_open(tmp_path, monkeypatch, kind):
+    from concurrent.futures import ThreadPoolExecutor
+    from tests.conftest import symlink_or_skip
+
+    if kind == "fifo" and (os.name != "posix" or not hasattr(os, "mkfifo")):
+        pytest.skip("requires POSIX FIFOs")
+    root = tmp_path / "workspace"
+    path = root / LINT_PATH
+    path.parent.mkdir(parents=True)
+    if kind == "symlink":
+        outside = tmp_path / "outside.md"
+        outside.write_bytes(lint_bytes())
+        symlink_or_skip(outside, path)
+        reason = "symlinked .md rule is not allowed"
+    else:
+        os.mkfifo(path)
+        reason = ".md rule is not a regular file"
+
+    def no_leaf_open(*args, **kwargs):
+        if os.fspath(args[0]) in {str(path), path.name}:
+            pytest.fail("inventory opened a special rule file before refusal")
+        return os.open(*args, **kwargs)
+
+    def refuse(_):
+        with pytest.raises(inventory_module.RuleInventoryError) as caught:
+            snapshot = inventory_module.inventory_rules(root)
+            list(repository_guidance_corpus(snapshot))
+        assert caught.value.operation == "validate"
+        assert str(caught.value) == f"rule inventory validate failed for {path}: {reason}"
+
+    monkeypatch.setattr(inventory_module, "os", SimpleNamespace(**{**vars(os), "open": no_leaf_open}))
+    refuse(None)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(refuse, range(3), timeout=15))
+    refuse(None)
+    monkeypatch.setattr(inventory_module, "os", os)
+    path.unlink()
+    original = lint_bytes()
+    path.write_bytes(original)
+    snapshot = inventory_module.inventory_rules(root)
+    rows = list(repository_guidance_corpus(snapshot))
+    assert [(relative, raw) for relative, raw, _body in rows] == [(LINT_PATH, original)]
 
 
 @pytest.mark.parametrize("data", [b"", b"---\nid: sample\n", b"\xff", b"---\nid: other\n---\n"])
@@ -1040,19 +1323,102 @@ def test_lint_documentation_does_not_block_supported_source_hit_counts(tmp_path)
 
 
 def test_lint_git_storage_does_not_consume_the_source_entry_quota(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
     root = lint_root(tmp_path)
     (root / LINT_PATH).write_bytes(lint_bytes(extra="forbid_ast:\n  calls: [eval]\n"))
     (root / "src").mkdir()
     (root / "src/a.py").write_bytes(b"eval('1')\n")
     monkeypatch.setattr(lint, "MAX_ENTRIES", 2)
+    for index in range(4):
+        objects = root / ".git" / "objects" / str(index)
+        objects.mkdir(parents=True)
+        for item in range(8):
+            (objects / str(item)).write_bytes(b"not source")
+    walked = {}
 
-    def files(*args, **kwargs):
-        for index in range(3):
-            yield root / ".git" / str(index), None
-        yield root / "src/a.py", None
+    def counted_walk(*args, **kwargs):
+        for folder, dirs, files in os.walk(*args, **kwargs):
+            walked[Path(folder).relative_to(root).as_posix()] = len(files)
+            yield folder, dirs, files
 
-    monkeypatch.setattr(lint, "iter_confined_files", files)
+    monkeypatch.setattr(confinement, "os", SimpleNamespace(walk=counted_walk))
     assert lint.lint_workspace(root)[0].gate_hits == 1
+    assert lint.lint_workspace(root)[0].gate_hits == 1
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(lint.lint_workspace, [root] * 3, timeout=15))
+    assert all(result[0].gate_hits == 1 for result in results)
+    assert set(walked) == {".", ".aegis", ".aegis/rules", ".aegis/rules/traps", "src"}
+    assert sum(walked.values()) == 2
+
+
+@pytest.mark.parametrize("kind", ["directory", "file", "directory_symlink", "file_symlink", "broken_symlink"])
+def test_confined_walk_git_pruning_is_opt_in_and_root_only(tmp_path, kind):
+    from tests.conftest import symlink_or_skip
+
+    root = tmp_path / "workspace"
+    nested = root / "src" / ".git" / "keep.md"
+    nested.parent.mkdir(parents=True)
+    nested.write_bytes(b"nested source")
+    git = root / ".git"
+    if kind == "directory":
+        git.mkdir()
+        (git / "object.md").write_bytes(b"git object")
+    elif kind == "file":
+        git.write_bytes(b"gitdir: elsewhere")
+    else:
+        target = tmp_path / "outside"
+        if kind == "directory_symlink":
+            target.mkdir()
+        elif kind == "file_symlink":
+            target.write_bytes(b"outside")
+        symlink_or_skip(target, git, target_is_directory=kind == "directory_symlink")
+    default = list(confinement.iter_confined_files(root, root, suffix=""))
+    assert any(path == git or git in path.parents for path, _ in default)
+    assert list(confinement.iter_confined_files(root, root, suffix="", skip_root_git=False)) == default
+    for _ in range(2):
+        assert list(confinement.iter_confined_files(root, root, suffix="", skip_root_git=True)) == [(nested, None)]
+    assert list(confinement.iter_confined_files(root, root / "src", skip_root_git=True)) == [(nested, None)]
+
+
+def test_lint_git_pruning_keeps_listing_refusal_and_retry(tmp_path, monkeypatch):
+    root = lint_root(tmp_path)
+    (root / LINT_PATH).write_bytes(lint_bytes(extra="forbid_ast:\n  calls: [eval]\n"))
+    (root / ".git").mkdir()
+    failed = []
+
+    def failing_walk(*args, **kwargs):
+        yield from os.walk(*args, **kwargs)
+        if not failed:
+            failed.append(True)
+            kwargs["onerror"](PermissionError(13, "UNTRUSTED-DETAIL", str(root / "src")))
+
+    monkeypatch.setattr(confinement, "os", SimpleNamespace(walk=failing_walk))
+    result = lint.lint_workspace(root)[0]
+    assert result.ok and result.gate_hits is None
+    assert "source_unavailable" in lint_codes(result)
+    assert "UNTRUSTED" not in repr(result)
+    assert lint.lint_workspace(root)[0].gate_hits == 0
+
+
+def test_confined_walk_prunes_git_replaced_after_listing(tmp_path, monkeypatch):
+    root = tmp_path / "workspace"
+    (root / ".git").mkdir(parents=True)
+    (root / "source.md").write_bytes(b"source")
+    walked = []
+
+    def replacing_walk(*args, **kwargs):
+        for folder, dirs, files in os.walk(*args, **kwargs):
+            walked.append(Path(folder))
+            if Path(folder) == root:
+                (root / ".git").rename(tmp_path / "retired-git")
+                (root / ".git").mkdir()
+                (root / ".git" / "object.md").write_bytes(b"replacement object")
+            yield folder, dirs, files
+
+    monkeypatch.setattr(confinement, "os", SimpleNamespace(walk=replacing_walk))
+    assert list(confinement.iter_confined_files(root, root, skip_root_git=True)) == [(root / "source.md", None)]
+    assert walked == [root]
 
 
 def test_lint_source_capture_refusal_is_single_ordered_and_retains_limit_code(tmp_path, monkeypatch):
@@ -1091,11 +1457,12 @@ def test_lint_python_options_do_not_make_unrelated_scripts_match_a_role():
     assert "concrete_command" not in lint_codes(modes)
 
 
-def test_lint_real_inventory_matches_runtime_classified_record_paths():
+def test_lint_real_inventory_matches_runtime_classified_record_paths(repository_guidance_snapshot, monkeypatch):
     from aegis_core.rules import load_rules
     if not lint.descriptor_supported():
         pytest.skip("descriptor-relative no-follow reads unavailable")
-    records = load_rules(ROOT).rules
+    records = load_rules(ROOT, inventory=repository_guidance_snapshot).rules
+    monkeypatch.setattr(lint, "inventory_rules", lambda _root: repository_guidance_snapshot)
     results = lint.lint_workspace(ROOT)
     assert len(results) == len(records)
     assert {result.path for result in results} == {lint.display_text(rule.path) for rule in records}

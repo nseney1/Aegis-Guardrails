@@ -634,12 +634,12 @@ def _finish_repository_call(req_id, name, args, binding):
             return _tool_result(req_id, json.dumps({"error": "model_io_unavailable"}), True)
         if name in ("aegis_msg_read", "aegis_msg_write"):
             return _message_failure(req_id, exc)
-        if name == "aegis_scan":
-            message = project_diagnostic(str(exc))
-            print(f"aegis-mcp: {message}", file=sys.stderr)
-            return _tool_result(req_id, f"Tool execution failed: {message}", True)
-        traceback.print_exc(file=sys.stderr)
-        return _tool_result(req_id, f"Tool execution failed: {exc}", True)
+        # One table owns projection and logging at both exception boundaries.
+        # Dedicated tool refusals above remain independent.
+        # Keep throwing call sites at their existing source positions:
+        # their line numbers are part of the legacy traceback bytes.
+        message = _tool_failure_message(name, exc)
+        return _tool_result(req_id, f"Tool execution failed: {message}", True)
     if name in ("aegis_msg_read", "aegis_msg_write"):
         text, needs_json = message_result(result)
         return _tool_result(req_id, json.dumps(text, separators=(",", ":")) if needs_json else text,
@@ -806,12 +806,12 @@ def run_stdio_server(*, queue_registration=None):
                     send_response(response)
             except Exception as exc:
                 params = request.get("params")
-                if (request.get("method") == "tools/call" and isinstance(params, dict)
-                        and params.get("name") == "aegis_scan"):
-                    message = project_diagnostic(str(exc))
-                    print(f"aegis-mcp: {message}", file=sys.stderr)
-                else:
-                    traceback.print_exc(file=sys.stderr)
+                # Share the policy even when dispatch fails before execution.
+                # Non-tool and malformed names select the legacy fallback.
+                # Keep source positions stable for the traceback byte contract.
+                name = (params.get("name") if request.get("method") == "tools/call"
+                        and isinstance(params, dict) else None)
+                _tool_failure_message(name, exc)
                 if "id" in request:
                     send_error(_safe_id(request["id"]), -32603, "Internal error")
             for message in take_outbox():
@@ -830,3 +830,20 @@ def run_stdio_server(*, queue_registration=None):
 
 def main():
     sys.exit(run_stdio_server())
+
+
+# Defined below the transports to preserve legacy traceback source positions.
+# None is the fallback for every other tool and non-tool request.
+_TOOL_FAILURE_ENVELOPES = {None: str, "aegis_scan": project_diagnostic}
+
+
+def _tool_failure_message(name, exc):
+    key = name if isinstance(name, str) else None
+    project = _TOOL_FAILURE_ENVELOPES.get(key, _TOOL_FAILURE_ENVELOPES[None])
+    if project is str:
+        traceback.print_exc(file=sys.stderr)
+        # The caller retains the original f-string formatting; stdio needs no text.
+        return exc
+    message = project(str(exc))
+    print(f"aegis-mcp: {message}", file=sys.stderr)
+    return message

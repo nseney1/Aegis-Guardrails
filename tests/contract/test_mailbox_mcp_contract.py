@@ -83,7 +83,8 @@ PYTHON_RUNS = 0
 
 def run_python(*arguments, input=None, expected_returncode=0):
     global PYTHON_RUNS
-    PYTHON_RUNS += 1
+    if __name__ == "__main__":
+        PYTHON_RUNS += 1
     process = subprocess.run(
         [sys.executable, "-I", "-B", *map(str, arguments)],
         cwd=REPO, input=input, capture_output=True, text=True, encoding="utf-8", timeout=30,
@@ -389,24 +390,36 @@ def test_opt_in_records_preserve_legacy_definitions_and_have_closed_schemas():
         assert not {"root", "store", "from", "host", "session", "meta", "spans"} & schema["properties"].keys()
         assert tool["annotations"]["readOnlyHint"] is (name != "mailbox_publish_record")
         assert "untrusted" in tool["description"]
+        assert "configured provenance is not authentication" in tool["description"]
+        assert "findings.*.{id,severity,file,line}" not in tool["description"]
+        assert "E_SELECTOR" not in tool["description"]
+        if name in {"mailbox_read_record", "mailbox_digest"}:
+            selector = schema["properties"]["fields"]
+            assert selector == tools["mailbox_read_record"]["inputSchema"]["properties"]["fields"]
+            for capability in ("dotted paths", "indices", "one-level *", "row projection",
+                               "findings.*.{id,severity,file,line}", "16 selectors", "depth 8", "E_SELECTOR"):
+                assert selector["description"].count(capability) == 1, (name, capability)
+            assert selector["maxItems"] == 16
+            assert selector["items"] == {"type": "string", "maxLength": 1024}
+            assert "grant" in tool["description"]
         if name == "mailbox_read_record":
-            assert "findings.*.{id,severity,file,line}" in tool["description"]
             assert "narrow fields" in tool["description"]
-        else:
-            assert "findings.*.{id,severity,file,line}" not in tool["description"]
-            assert "E_SELECTOR" not in tool["description"]
-            if name == "mailbox_publish_record":
-                assert "narrow" not in tool["description"]
-            else:
-                assert "narrow fields" in tool["description"]
+            assert "Hashes grant no access" in tool["description"]
         if name == "mailbox_publish_record":
+            assert "fields" not in schema["properties"]
+            assert "narrow" not in tool["description"]
             assert "legacy-readable v1 stub" in tool["description"]
         if name == "mailbox_digest":
-            assert ("reduce limit, keep after_message_id, and read an individually oversized "
-                    "ordinary message through the inbox path") in tool["description"]
-            assert "request fewer refs, or narrow fields (for example body) or outline" in tool["description"]
-            assert "read the ordinary message through the inbox path" in tool["description"]
-            assert "restart mailbox_inbox from the start without after_message_id" in tool["description"]
+            assert len(tool["description"].encode("utf-8")) < 2325
+            assert "E_LIMIT" in tool["description"] and "error.next_action" in tool["description"]
+            assert "measured retry" in tool["description"]
+            assert "after_message_id is exclusive" in tool["description"]
+            assert "planned inbox" in tool["description"]
+            assert "ordering or generation" in tool["description"]
+            for recovery in ("reduce limit, keep after_message_id", "request fewer refs, or narrow fields",
+                             "read the ordinary message through the inbox path",
+                             "pass max_chars large enough for the record view"):
+                assert recovery not in tool["description"]
             assert "1 to 100" in tool["description"]
             assert "0 to 60000" in tool["description"]
         if name in {"mailbox_read_record", "mailbox_digest"}:
