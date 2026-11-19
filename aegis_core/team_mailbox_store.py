@@ -24,6 +24,7 @@ except ImportError:
 
 from aegis_core.workspace.layout import UserLayout
 from aegis_core.team_mailbox_primitives import (
+    render_mailbox_refusal,
     BusyError, MailboxRefusal, MAX_BYTES, MAX_RECORDS, MAX_STATUS_EVIDENCE_BYTES, MAX_RELEASE_WARNINGS,
     SHA256, SLUG, LockReleaseWarning, bounded_tree, lock_path, matching, require, safe_path, strict_json, validate_warnings, witness_record,
 )
@@ -92,7 +93,8 @@ def _account_home():
     require(type(home) is str and bool(home), reason="missing")
     try:
         return safe_path(home)
-    except MailboxRefusal:
+    except MailboxRefusal as error:
+        render_mailbox_refusal(error)
         raise MailboxRefusal("missing") from None
 
 
@@ -416,9 +418,9 @@ class Store:
                         _regular(info)
                     return True
         except MailboxRefusal as error:
-            if error.reason == "missing":
+            if render_mailbox_refusal(error)["reason"] == "missing":
                 return False
-            raise
+            render_mailbox_refusal(error, reraise=True)
 
     def entries(self, path, *, missing=False, parent=None):
         """Stream the census under a cap before allocating a sortable name list."""
@@ -434,9 +436,9 @@ class Store:
                         _regular(entry.stat(follow_symlinks=False))
                         result.append(Path(path) / entry.name)
         except MailboxRefusal as error:
-            if missing and error.reason == "missing" and not opened:
+            if missing and render_mailbox_refusal(error)["reason"] == "missing" and not opened:
                 return []
-            raise
+            render_mailbox_refusal(error, reraise=True)
         return sorted(result)
 
     def require_room(self, directory, needed=1):
@@ -605,10 +607,12 @@ class Store:
                 with self.lock(directory, destination=destination, parent=parent, owner=owner):
                     yield
                     completed = True
-            except (MailboxRefusal, OSError):
+            except (MailboxRefusal, OSError) as error:
                 if completed:
                     self._record_release_warning(slot)
-                if not completed or not transaction["committed"]:
+                if isinstance(error, MailboxRefusal):
+                    render_mailbox_refusal(error, reraise=not completed or not transaction["committed"])
+                elif not completed or not transaction["committed"]:
                     raise
 
     def publish_status_evidence(self, directory, raw, sha256, *, warnings=None):
@@ -670,9 +674,11 @@ class Store:
                     self._local.held = getattr(self._local, "held", set()) - {key}
                     try:
                         os.unlink(name, dir_fd=parent)
-                    except (MailboxRefusal, OSError):
+                    except (MailboxRefusal, OSError) as error:
                         self._record_release_warning(slot)
-                        if not completed:
+                        if isinstance(error, MailboxRefusal):
+                            render_mailbox_refusal(error, reraise=not completed)
+                        elif not completed:
                             raise
 
 

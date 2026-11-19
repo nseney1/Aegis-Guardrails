@@ -18,6 +18,7 @@ import re
 from aegis_core.storage import ConfinedFileError, confined_file
 from aegis_core.storage import confined_descriptor_supported as descriptor_supported
 from aegis_core.team_mailbox_primitives import (
+    render_mailbox_refusal,
     MAX_BYTES, MailboxRefusal, RoleTables, bounded_tree, integer, strict_json, text,
 )
 from aegis_core.team_host_registry import (
@@ -96,7 +97,7 @@ def _read_json(base, parts):
     try:
         return strict_json(raw)
     except MailboxRefusal as error:
-        raise HostRefusal("too_large" if error.reason == "too_large" else "invalid_json") from None
+        raise HostRefusal("too_large" if render_mailbox_refusal(error)["reason"] == "too_large" else "invalid_json") from None
 
 
 @guarded

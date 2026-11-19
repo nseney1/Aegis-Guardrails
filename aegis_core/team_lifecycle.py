@@ -15,7 +15,7 @@ import os
 from pathlib import Path, PurePath, PurePosixPath
 import uuid
 from aegis_core.primitives import json_preflight
-from aegis_core.team_mailbox_primitives import GIT_ID, SHA256, SLUG, MailboxRefusal, bounded_tree, fields, integer, matching, parse_time, text
+from aegis_core.team_mailbox_primitives import GIT_ID, SHA256, SLUG, MailboxRefusal, bounded_tree, fields, integer, matching, parse_time, text, render_mailbox_refusal
 
 __all__ = [
     'INITIAL_ENVELOPE', 'JOURNAL', 'LifecycleRefusal', 'MAX_BYTES', 'MAX_EVENTS', 'POLICY', 'SHA256', 'SLUG',
@@ -60,10 +60,10 @@ def boundary(function):
         try:
             _check_inputs(function, args, kwargs)
             return function(*args, **kwargs)
+        except MailboxRefusal as error:
+            raise LifecycleRefusal(render_mailbox_refusal(error)["reason"]) from None
         except LifecycleRefusal:
             raise
-        except MailboxRefusal as error:
-            raise LifecycleRefusal(error.reason) from None
         except OSError as error:
             code = {errno.ENOENT: 'missing', errno.EEXIST: 'exists', errno.ELOOP: 'unsafe_path', errno.ENOTDIR: 'unsafe_path'}.get(error.errno, 'io')
             raise LifecycleRefusal(code) from None
