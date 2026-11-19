@@ -469,7 +469,24 @@ The sender calls `mailbox_publish_record`. The peer named by `to` calls `mailbox
 {"limit": 20, "after_message_id": "guide-1"}
 ```
 
-If `mailbox_digest` returns E_LIMIT because an aggregate message page does not fit, reduce limit, keep after_message_id, and read an individually oversized ordinary message through the inbox path. The inbox path is `mailbox_inbox`. One ordinary message that does not fit: read the ordinary message through the inbox path. A record view or explicit refs that do not fit: request fewer refs, or narrow fields (for example body) or outline, or use mailbox_read_record with narrower fields. That selector recovery is valid on `mailbox_digest` itself. A max_chars below the minimum record view: pass max_chars large enough for the record view, as an integer from 0 to 60000. max_chars below the page envelope: pass max_chars large enough for the digest page, as an integer from 0 to 60000. An invalid limit is not an integer from 1 to 100. An invalid max_chars is not an integer from 0 to 60000. Either invalid option refuses E_LIMIT and names that range. A history-limit refusal keeps its owner guidance. A digest refusal does not join a multi-line cursor into one line and does not echo the message body.
+Both read tools accept `fields` with dotted paths, indices, one-level `*`, and row projection such as `findings.*.{id,severity,file,line}`; at most 16 selectors, depth 8. Their `fields` schemas carry the same grammar. Publish accepts no selector option. Unknown paths refuse E_SELECTOR with the advice below.
+
+For digest E_LIMIT, follow `error.next_action` and any measured `error.retry` rather than guessing a repair. These are the contextual advice forms; a verified retry takes precedence over general budget advice. The inbox path is `mailbox_inbox`.
+
+| Refusal context | Advice from the error |
+| --- | --- |
+| Aggregate message page | reduce limit, keep after_message_id, and read an individually oversized ordinary message through the inbox path |
+| One oversized ordinary message | read the ordinary message through the inbox path |
+| Ordinary message after a planned-inbox cursor | restart mailbox_inbox from the start without after_message_id; read oldest-first pages and follow their next_after cursors until the message is retrieved |
+| Record view or explicit refs | request fewer refs, or narrow fields (for example body) or outline, or use mailbox_read_record with narrower fields |
+| Below the minimum record view | pass max_chars large enough for the record view, as an integer from 0 to 60000 |
+| Below the page envelope | pass max_chars large enough for the digest page, as an integer from 0 to 60000 |
+| Invalid limit | pass limit as an integer from 1 to 100 |
+| Invalid max_chars | pass max_chars as an integer from 0 to 60000 |
+| History limit | ask the owner to resolve the mailbox history limit |
+| Invalid selector (E_SELECTOR) | invalid selector or cursor; check grammar or re-read without since |
+
+A digest refusal does not join a multi-line cursor into one line and does not echo the message body.
 
 For a record-view budget refusal, follow `error.retry.tool` and merge `error.retry.options` into the retry request. A digest retry keeps its existing cursor and references. A `mailbox_read_record` retry retains `retry.target.collection` and its zero-based `retry.target.index` to identify the failing row. For a received message, pass `retry.options` unchanged: it includes the already authorized, bounded `message_id` and the measured `max_chars`, so later publications cannot shift the read to another row. For an explicit reference, add `ref` from the original request's `refs[retry.target.index]` to `retry.options`. Privacy refusals disclose no message identity. The adapter renders the proposed complete retry before offering it, including attribution and digest row overhead. If no candidate fits the current budget, `error.minimum_max_chars` gives a measured budget and the advice says to increase `max_chars` to at least that number. Selector and outline advice is offered only when that retry fits the current budget. Ordinary-message failures verify inbox recovery before considering any record candidate; a later record or explicit reference never replaces that recovery. The earlier repair forms above describe possible actions; the refusal selects the verified one.
 
