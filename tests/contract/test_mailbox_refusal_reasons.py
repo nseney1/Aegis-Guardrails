@@ -161,7 +161,7 @@ BOUNDARY_HANDLERS = (('aegis_core/team_board.py', 'board_operation.decorate.call
  ('aegis_core/team_mailbox_delivery.py', 'MailboxDelivery.delivery_receipts'),
  ('aegis_core/team_mailbox_pager.py', '_boundary.call'),
  ('aegis_core/team_mailbox_primitives.py', '_manifest_field'),
- ('aegis_core/team_mailbox_primitives.py', 'operation.decorate.call'),
+ ('aegis_core/team_mailbox_service.py', 'operation.decorate.call'),
  ('aegis_core/team_mailbox_primitives.py', 'strict_json'),
  ('aegis_core/team_mailbox_primitives.py', 'validation.call'),
  ('aegis_core/team_mailbox_records.py', 'Records.call'),

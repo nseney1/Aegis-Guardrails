@@ -20,6 +20,7 @@ from conftest import symlink_or_skip
 from aegis_core import team_mailbox as mail
 from aegis_core import team_mailbox_delivery as delivery_module
 from aegis_core import team_mailbox_store as store_module
+from aegis_core import team_mailbox_service as service_module
 from aegis_core import team_mailbox_primitives as primitives
 from aegis_core import team_mailbox_records as records_module
 from aegis_core import message_codec as record_codec
@@ -3362,7 +3363,7 @@ def test_warning_accumulators_refuse_invalid_values_before_publication(tmp_path,
                     with box.store.evidence_transaction(invalid):
                         pytest.fail("invalid accumulator admitted")
                 elif surface == "witnesses":
-                    box.store.witnesses([worktree], tmp_path / "evidence", box.host_call, warnings=invalid)
+                    service_module.witnesses(box.store, [worktree], tmp_path / "evidence", box.host_call, warnings=invalid)
                 else:
                     box.store.publish_status_evidence(tmp_path / "evidence", raw, sha, warnings=invalid)
             assert caught.value.code == 1 and snapshot(tmp_path) == before
@@ -3380,7 +3381,7 @@ def test_nonempty_typed_warning_accumulators_are_reusable(tmp_path, surface):
             with box.store.evidence_transaction(accumulator):
                 pass
         elif surface == "witnesses":
-            result = box.store.witnesses([worktree], tmp_path / "evidence", box.host_call, warnings=accumulator)
+            result = service_module.witnesses(box.store, [worktree], tmp_path / "evidence", box.host_call, warnings=accumulator)
             assert Path(result[0]["dirty_evidence"]).is_file()
         elif surface == "status":
             result = box.store.publish_status_evidence(tmp_path / "evidence", raw, hashlib.sha256(raw).hexdigest(), warnings=accumulator)
@@ -3473,7 +3474,7 @@ def test_nonempty_store_sink_can_be_a_witness_accumulator(tmp_path, monkeypatch)
             return result
 
         monkeypatch.setattr(store_module, "os", SimpleNamespace(**{**vars(os), "unlink": fail_release}))
-        result = box.store.witnesses([worktree], tmp_path / "evidence", box.host_call, warnings=box.store.warnings)
+        result = service_module.witnesses(box.store, [worktree], tmp_path / "evidence", box.host_call, warnings=box.store.warnings)
         assert Path(result[0]["dirty_evidence"]).is_file() and failures
         assert box.store.warnings[0] == pending[0] and len(box.store.warnings) == 2
         expected = box.store.warnings[:]
@@ -3518,7 +3519,7 @@ def source_result_consumer(box, source, draft, worktree, directory, surface):
         binding = {**box.current_binding("alpha/orchestrator"), "checkpoint": checkpoint}
         return box.ready(binding)
     assert surface == "expected"
-    return box.store.witnesses([worktree], directory, box.host_call, expected=[source])
+    return service_module.witnesses(box.store, [worktree], directory, box.host_call, expected=[source])
 
 
 @pytest.mark.parametrize("surface", ["bind", "witness", "checkpoint", "assignments", "ready", "expected"])
@@ -3895,7 +3896,7 @@ def test_programming_reason_error_is_not_normalized_into_an_operational_refusal(
             primitives.require(False, reason="brand_new")
         call = reject
     else:
-        @primitives.operation()
+        @service_module.operation()
         def reject(box):
             primitives.require(False, reason="brand_new")
         root = make_store(tmp_path)
@@ -4854,3 +4855,25 @@ def test_generic_handler_normal_construction_propagates_concurrently(route, tmp_
         assert entered == [route] * 12
         if route == "read_plan":
             assert closed == entered
+
+
+def test_service_witness_batch_preserves_public_bytes_on_reuse_and_mismatch_retry(tmp_path):
+    from aegis_core.team_mailbox_service import witnesses
+
+    root, hosts, roles, _calls, worktree = active_handoff_store(tmp_path)
+    directory = tmp_path / "evidence"
+    with mailbox(root, hosts=hosts, roles=roles) as box:
+        source = box.source_witness(worktree, directory)
+        before = snapshot(tmp_path)
+        expected_bytes = primitives.encoded(source)
+        result = witnesses(box.store, [worktree], directory, box.host_call, expected=[source])
+        assert primitives.encoded(result[0]) == expected_bytes
+        assert snapshot(tmp_path) == before
+        changed = {**source, "source_tree": "f" * 40}
+        with refusal("invalid_record") as caught:
+            witnesses(box.store, [worktree], directory, box.host_call, expected=[changed])
+        assert caught.value.code == 1
+        assert snapshot(tmp_path) == before
+        retried = witnesses(box.store, [worktree], directory, box.host_call, expected=[source])
+        assert primitives.encoded(retried[0]) == expected_bytes
+        assert snapshot(tmp_path) == before

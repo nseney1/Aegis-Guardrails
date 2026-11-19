@@ -64,7 +64,6 @@ def serve(monkeypatch, capsys, data, *, text=False, stream=None):
     stdin = stream if text else io.TextIOWrapper(stream, encoding="utf-8")
     # Own the module reference; do not replace shared sys or OS functions.
     monkeypatch.setattr(server, "sys", SimpleNamespace(**{**vars(sys), "stdin": stdin}))
-    monkeypatch.setattr(server, "harden_process", lambda: False)
     assert server.run_stdio_server() == 0
     captured = capsys.readouterr()
     assert "HOSTILE_MARKER" not in captured.out + captured.err
@@ -114,7 +113,6 @@ def test_plain_iterator_stdin_is_refused_without_consuming_it(mode, monkeypatch,
     line = PING.decode("utf-8")
     stdin = iter([line])
     monkeypatch.setattr(server, "sys", SimpleNamespace(**{**vars(sys), "stdin": stdin}))
-    monkeypatch.setattr(server, "harden_process", lambda: False)
 
     assert server.run_stdio_server() == 0
 

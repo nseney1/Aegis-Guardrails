@@ -12,7 +12,7 @@ yields no unadvised output; honest construction fails loudly before any handler.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import wraps
@@ -29,7 +29,7 @@ from aegis_core.redaction import clip_rendered_text, guidance_value
 
 __all__ = ["MailboxRefusal", "MailboxReasonError", "render_mailbox_refusal", "BusyError", "RoleTables", "MAX_BYTES", "MAX_RECORDS",
            "bounded_tree", "strict_json", "encoded", "digest", "parse_time", "safe_path",
-           "fields", "text", "integer", "matching", "strings", "operation", "validation",
+           "fields", "text", "integer", "matching", "strings", "validation",
            "status_entries", "bounded_inbox", "message_types", "record_types",
            "reply_reference", "validate_job_receipt", "witness_record", "lock_path", "LockReleaseWarning",
            "OWNER_EVIDENCE_LOCK", "MAX_RELEASE_WARNINGS", "validate_warnings",
@@ -543,62 +543,6 @@ def strict_json(raw):
         render_mailbox_refusal(error, reraise=True)
     except (ValueError, UnicodeError, RecursionError, OverflowError):
         raise MailboxRefusal("invalid_record") from None
-
-
-def operation(write=False, *, evidence=False, authorization=None, envelope=False, input_record=None):
-    """Normalize failures; authorize (position, keyword, member, action) before locking."""
-    def decorate(function):
-        @wraps(function)
-        def call(self, *args, **kwargs):
-            depth = getattr(self.calls, "depth", 0)
-            observed = [] if not depth and envelope else None
-            try:
-                if write:
-                    self.roles.authorize(self.caller_role, function.__name__)
-                if authorization is not None:
-                    position, keyword, member, action = authorization
-                    value = args[position] if len(args) > position else kwargs.get(keyword)
-                    requested = (type(value) is dict and member in value) if member is not None else value is not None
-                    if requested:
-                        self.roles.authorize(self.caller_role, action)
-                if input_record is not None:
-                    position, keyword, normalize = input_record
-                    if len(args) > position:
-                        args = (*args[:position], normalize(args[position]), *args[position + 1:])
-                    else:
-                        require(keyword in kwargs)
-                        kwargs = {**kwargs, keyword: normalize(kwargs[keyword])}
-                if write or evidence or input_record is not None:
-                    for argument in (*args, *kwargs.values()):
-                        if type(argument) in (dict, list, tuple):
-                            bounded_tree(argument)
-                kind = "evidence-destination" if evidence else "mailbox"
-                with self.store._warning_listener(observed):
-                    with self.store.creation(kind) if write or evidence else nullcontext():
-                        with self.store.evidence_transaction() if write or evidence else nullcontext():
-                            with self.store.lock(self.root) if write else nullcontext():
-                                self.calls.depth = depth + 1
-                                if not depth:
-                                    self.calls.history_bytes = {}
-                                    self.refresh()
-                                result = function(self, *args, **kwargs)
-                if not depth and envelope:
-                    warnings = self.store.drain_warnings()
-                    seen = {id(warning) for warning in warnings}
-                    warnings.extend(warning for warning in observed if id(warning) not in seen)
-                    if warnings:
-                        result = {**result, "warnings": warnings}
-                return result
-            except MailboxRefusal as error:
-                render_mailbox_refusal(error, reraise=True)
-            except OSError:
-                raise MailboxRefusal("io") from None
-            except (ValueError, KeyError, UnicodeError, RecursionError, OverflowError):
-                raise MailboxRefusal("invalid_record") from None
-            finally:
-                self.calls.depth = depth
-        return call
-    return decorate
 
 
 def validation(function):
