@@ -44,6 +44,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.display_attribution": 0,
     "aegis_core.errors": 0,
     "aegis_core.taxonomy": 0,
+    "aegis_core.merge_queue": 2,
     # Canonical message records and untrusted views (stdlib only).
     "aegis_core.message_codec": 0,
     # Shared format primitives and anchored content-addressed storage.
@@ -97,6 +98,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.rule_lint": 2,
     "aegis_core.rule_lint_capture": 2,
     "aegis_core.rule_lint_grammar": 2,
+    "aegis_core.rule_lint_reasons": 0,
     "aegis_core.rules": 1,
     "aegis_core.rule_inventory": 1,
     "aegis_core.yaml_engine": 1,
@@ -117,11 +119,17 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_isolation_verify": 0,
     "aegis_core.team_jobs_recipes": 0,
     "aegis_core.team_lease_custody": 0,
+    "aegis_core.team_lifecycle": 1,
+    "aegis_core.team_lifecycle_writers": 1,
     "aegis_core.team_mailbox": 1,
+    "aegis_core.team_mailbox_delivery": 1,
+    "aegis_core.team_mailbox_guidance": 1,
     "aegis_core.team_mailbox_index": 1,
     "aegis_core.team_mailbox_index_scan": 0,
     "aegis_core.team_mailbox_pager": 0,
     "aegis_core.team_mailbox_primitives": 0,
+    "aegis_core.team_mailbox_records": 1,
+    "aegis_core.team_mailbox_service": 1,
     "aegis_core.team_mailbox_store": 0,
     "aegis_core.team_metrics": 1,
     "aegis_core.team_paths": 1,
@@ -131,6 +139,9 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_supervisor_observe": 2,
     "aegis_core.team_supervisor_start": 1,
     "aegis_core.team_templates": 0,
+    "aegis_core.team_host_plan": 0,
+    "aegis_core.team_host_qualify_evidence": 0,
+    "aegis_core.team_host_registry": 0,
     "aegis_core.team_hosts": 2,
     "aegis_core.team_git_snapshot": 0,
     "aegis_core.team_gitops": 0,
@@ -178,6 +189,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.release_verify": 1,
     # v4.3 T8: human insights closed loop, a package (user-scope JSONL, cue detector, TF-IDF review, recurrence).
     "aegis_core.insights": 2,
+    "aegis_core.redaction_patterns": 0,
     # v4.3 T5: fail-to-pass regression check (gitsafe, testexec's snapshot pytest runner, human_gate exemptions).
     "aegis_core.regression": 2,
     "aegis_core.scan": 2,
@@ -197,6 +209,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_publish": 2,
     "aegis_core.team_qualify": 0,
     "aegis_core.team_queue": 2,
+    "aegis_core.team_roles": 0,
     # Read-only lane status report over lease declarations and the existing tip gate.
     "aegis_core.team_status": 3,
     # Rule packs (rule export/import): the loader, migrate's stripper, the lifecycle's id checks and events.

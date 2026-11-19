@@ -19,6 +19,7 @@ from aegis_core.primitives import sanitize_display
 from aegis_core.redaction import SECRET_REPLACEMENTS, guidance_value
 from aegis_core import team_mailbox_store as mailbox_storage
 from aegis_core.team_mailbox_primitives import (
+    render_mailbox_refusal,
     BusyError, MailboxRefusal, RoleTables, MAX_BYTES, MAX_RECORDS, MAX_HISTORY_BYTES,
     SHA256, GIT_ID, SLUG, bounded_tree, encoded, fields, integer, matching,
     parse_time, require, safe_path, strict_json, text, validation,
@@ -267,8 +268,8 @@ def board_operation(write=False):
                 if warnings:
                     result = {**({} if result is None else result), "warnings": warnings}
                 return result
-            except MailboxRefusal:
-                raise
+            except MailboxRefusal as error:
+                render_mailbox_refusal(error, reraise=True)
             except OSError:
                 raise MailboxRefusal("io") from None
             except (ValueError, KeyError, UnicodeError, RecursionError, OverflowError):
@@ -289,7 +290,7 @@ def initialize(path, *, clock, roles, hosts, caller_role):
     event = {"schema": SCHEMA, "seq": 1, "at": moment.astimezone(timezone.utc).isoformat(
         timespec="microseconds").replace("+00:00", "Z"), "kind": "init", "data": {}, "prev": None}
     event["digest"] = event_digest(event)
-    with Store(path.parent) as store, store.creation("mailbox"), store.evidence_transaction():
+    with Store.from_parent(path.parent) as store, store.creation("mailbox"), store.evidence_transaction():
         require(not store.exists(path), reason="exists")
         with store.directory(path, create=True, undo=[]) as root, ExitStack() as stack:
             for name in ("content", "positions", "events"):

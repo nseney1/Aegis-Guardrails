@@ -3,9 +3,10 @@
 The static contract checks literal direct patch syntax, reviewed registrations,
 missing-target flags and exact shared-module counts. It separately bans nested
 patch-framework imports, global/nonlocal declarations, non-annotation MonkeyPatch references
-and namespace capabilities. Namespace access admits only the read-only seam-copy
-shape or a registration of the complete operation; generated templates at the
-declared existing code boundaries are pinned by their complete outer construction.
+and recognizable namespace capabilities in honest test code. Recognized access
+requires the read-only seam-copy shape or a registered complete operation;
+generated templates at declared boundaries pin the complete outer construction.
+Dynamic and obfuscated namespace acquisition is checked by RF-11c at runtime.
 
 Patch objects or modules acquired dynamically at runtime are OUT of static scope:
 importlib.import_module, __import__, eval/exec, factories, and patchers passed
@@ -44,6 +45,10 @@ LEASED_SITES = {}
 # Exact computed calls: (file, scope, kind, syntax, occurrence) -> (shared, reason).
 # A newly permissive flag changes the key and requires its own explicit review.
 UNRESOLVED_TARGETS = {
+    ('tests/helpers_pathlookup.py', '_OwnedModulePatch.setattr', 'patch', 'self.patcher.setattr(module, name, value)', 0):
+        (False, 'The owned-context API validates module identity against the three governed import-baseline modules before this strict public MonkeyPatch call; it records the exact replacement and the live context owns undo. Shared process modules cannot be targets.'),
+    ('tests/helpers_pathlookup.py', '_OwnedModulePatch.delattr', 'patch', 'self.patcher.delattr(module, name)', 0):
+        (False, 'The owned-context API validates module identity against the three governed import-baseline modules before this strict public MonkeyPatch deletion; it records the exact absence and the live context owns undo. Shared process modules cannot be targets.'),
     ('tests/integration/test_hierarchy_mailbox_index.py', 'test_mode_guard_sentinel_is_local', 'patch', "monkeypatch.setattr(module, '_MISSING', mode)", 0):
         (False, 'MB-MODE-1 imports tools.hierarchy_mailbox_index as module and changes only its existing _MISSING binding to prove the guard uses its own sentinel; shared process modules and builtins stay untouched.'),
     ('tests/contract/test_mailbox_index_rollout.py', 'test_tip_prefilters_once_with_clean_git_environment', 'patch', "monkeypatch.setitem(globals(), '_tracked_names', observed_tracked_names)", 0):
@@ -974,6 +979,18 @@ AST_DIGEST_PREFIX = "ast-sha256:"
 # Namespace rows store canonical AST fingerprints, not copies of another file's
 # source syntax. Other ban rows retain the existing source-syntax representation.
 BAN_REGISTRATIONS = {
+    ('tests/helpers_pathlookup.py', '_ModuleSnapshot.__init__', 'namespace_vars', 'ast-sha256:2d9e05cb700ccabc6070835ca14fa0ec7233b76ff26e9e9961fc8af32ce492f5', 0):
+        'Read only namespace copy retains every original binding of pathlookup, gitsafe and primitives before a test; values are held by reference for identity comparison and no module dictionary is changed.',
+    ('tests/helpers_pathlookup.py', '_assert_module_state', 'namespace_vars', 'ast-sha256:58c50a673338f35b3d5d600b77b0ec6a718fbd4a4eb23813126ab4a95b007b58', 0):
+        'Read only namespace copy after test and MonkeyPatch context teardown compares added, removed and replaced bindings against retained originals; diagnostics contain names and change kinds without module values.',
+    ('tests/helpers_pathlookup.py', 'monkeypatch', 'constructor_reference', 'pytest.MonkeyPatch', 0):
+        'The module-local monkeypatch fixture creates its own public pytest MonkeyPatch context inside the governed_module_state lifetime, so native context exit undoes patches before the final identity comparison.',
+    ('tests/helpers_pathlookup.py', 'owned_module_patch', 'constructor_reference', 'pytest.MonkeyPatch', 0):
+        'The public context manager creates its own pytest MonkeyPatch context for a recorded broader-scope fixture request; context exit undoes every write before its ownership record is removed and before the dependent session-final comparison.',
+    ('tests/unit/core/test_pathlookup.py', 'test_clean_host_os_preserves_capability_names', 'namespace_getattr', 'ast-sha256:ac088cc128de8beeb4e22a4554a520447c0a0247468d7954e7983562206762fa', 0):
+        'Read-only capability-name comparison on the test-owned clean-host OS namespace for supports_dir_fd and supports_follow_symlinks; no namespace mutation.',
+    ('tests/unit/core/test_pathlookup.py', 'test_clean_host_os_preserves_capability_names', 'namespace_getattr', 'ast-sha256:ac088cc128de8beeb4e22a4554a520447c0a0247468d7954e7983562206762fa', 1):
+        'Read-only capability-name comparison on shared os for the same two fixed capability sets; no namespace mutation.',
     ('tests/integration/test_hierarchy_mailbox_index.py', '_attempt_mode_change', 'namespace___setattr__', 'ast-sha256:c14318d11a5f42a5304e3e4b5c6b0c94d67314fad49a3c7fd8e9d0a361ab91bc', 0):
         'MB-MODE-1 attempts a backing-slot write on the test-owned index to verify the captured descriptor cannot be reached by name.',
     ('tests/integration/test_hierarchy_mailbox_index.py', '_attempt_mode_change', 'namespace___delattr__', 'ast-sha256:0b91ff65a0ad33dd7b003bdbe2c1e0e77f608ca79e41d1cdd5bc8fb610ae3818', 0):
@@ -1734,8 +1751,104 @@ BAN_REGISTRATIONS = {
         'Reads vars(os) to copy os into an owned capability/AST namespace for artifact_reads; overrides are installed on the copy rather than the original namespace.',
     ('tests/unit/verification/test_scanners.py', 'descriptor_count', 'namespace_vars', 'ast-sha256:7753147a4a668b8a91f3b2cdb69544cb32cd1138f1fee1be01a8d8d866faf689', 0):
         'Reads vars(os) to copy os into an owned capability/AST namespace for descriptor_count; overrides are installed on the copy rather than the original namespace.',
+    ('tests/conftest.py', '_patch_pytest_api', 'constructor_reference', 'pytest.MonkeyPatch', 0):
+        'RF-11c inspects retained runtime entry points and public MonkeyPatch signatures before collection; these class/method references do not start patchers. Missing APIs and absent defaults refuse with a fixed UsageError.',
+    ('tests/conftest.py', '_PatchGuard._hook_instrument', 'namespace___dict__', 'ast-sha256:97dc38167fb196a243e5c2e4913e1d061e0fb5e71337e091a3ed5d5f191768b3', 0):
+        'RF-11c indexes actual module/class namespaces and canonical function globals to install and restore identity-preserving framework store witnesses; copied globals grant no authority, and concurrent calls plus code/default/signature restoration have public-session controls.',
+    ('tests/conftest.py', '_PatchGuard._hook_instrument', 'namespace___getattribute__', 'ast-sha256:2c98d178b59434cbffa0b7cbc294f68e85d51f8eb78d220b561d63b5d2865fbc', 0):
+        'RF-11c indexes actual module/class namespaces and canonical function globals to install and restore identity-preserving framework store witnesses; copied globals grant no authority, and concurrent calls plus code/default/signature restoration have public-session controls.',
+    ('tests/conftest.py', '_PatchGuard._hook_instrument', 'namespace___dict__', 'ast-sha256:da5bc6f819ea9277435d44c994b4b07c9816d6d0deba0caf306b71f5e275c8fa', 0):
+        'RF-11c indexes actual module/class namespaces and canonical function globals to install and restore identity-preserving framework store witnesses; copied globals grant no authority, and concurrent calls plus code/default/signature restoration have public-session controls.',
+    ('tests/conftest.py', '_PatchGuard._hook_instrument', 'namespace___getattribute__', 'ast-sha256:89bd898f14eba14158a01ea5e98a6254e3786475c93bb3d1567698f8550d3592', 0):
+        'RF-11c indexes actual module/class namespaces and canonical function globals to install and restore identity-preserving framework store witnesses; copied globals grant no authority, and concurrent calls plus code/default/signature restoration have public-session controls.',
+    ('tests/conftest.py', '_PatchGuard._hook_instrument', 'namespace___dict__', 'ast-sha256:63d92cac22725139f7e2add4764503bfda59886254582fccabde1e8425b9072b', 0):
+        'RF-11c indexes actual module/class namespaces and canonical function globals to install and restore identity-preserving framework store witnesses; copied globals grant no authority, and concurrent calls plus code/default/signature restoration have public-session controls.',
+    ('tests/conftest.py', '_PatchGuard._hook_index_modules', 'namespace___getattribute__', 'ast-sha256:718ac48ed311a007cdd176d8f18b3297c04bb9d0a7d5a62e91a997ba605650e9', 0):
+        'RF-11c indexes actual module/class namespaces and canonical function globals to install and restore identity-preserving framework store witnesses; copied globals grant no authority, and concurrent calls plus code/default/signature restoration have public-session controls.',
+    ('tests/conftest.py', '_PatchGuard._install', 'constructor_reference', 'MonkeyPatch', 0):
+        'RF-11c wraps the existing pytest class methods once per config and restores each original method on unconfigure; no test obtains a bypass patcher.',
+    ('tests/conftest.py', '_PatchGuard._install', 'constructor_reference', 'pytest.MonkeyPatch', 0):
+        'RF-11c indexes actual module namespace identities for per-test checks and the complete file-boundary backstop; setup-failure, alias, threaded and cross-file repair controls cover this read.',
+    ('tests/conftest.py', '_PatchGuard._install', 'constructor_reference', 'MonkeyPatch', 1):
+        'RF-11c wraps the existing pytest class methods once per config and restores each original method on unconfigure; no test obtains a bypass patcher.',
+    ('tests/conftest.py', '_PatchGuard._install', 'constructor_reference', 'MonkeyPatch', 2):
+        'RF-11c wraps the existing pytest class methods once per config and restores each original method on unconfigure; no test obtains a bypass patcher.',
+    ('tests/conftest.py', '_PatchGuard._install', 'constructor_reference', 'MonkeyPatch', 3):
+        'RF-11c wraps the existing pytest class methods once per config and restores each original method on unconfigure; no test obtains a bypass patcher.',
+    ('tests/conftest.py', '_PatchGuard._install', 'constructor_reference', 'MonkeyPatch', 4):
+        'RF-11c wraps the existing pytest class methods once per config and restores each original method on unconfigure; no test obtains a bypass patcher.',
+    ('tests/conftest.py', '_PatchGuard._install', 'constructor_reference', 'MonkeyPatch', 5):
+        'RF-11c indexes actual module namespace identities for per-test checks and the complete file-boundary backstop; setup-failure, alias, threaded and cross-file repair controls cover this read.',
+    ('tests/conftest.py', '_PatchGuard._install', 'constructor_reference', 'MonkeyPatch', 6):
+        'RF-11c indexes actual module namespace identities for per-test checks and the complete file-boundary backstop; setup-failure, alias, threaded and cross-file repair controls cover this read.',
+    ('tests/conftest.py', '_PatchGuard._install', 'constructor_reference', 'MonkeyPatch', 7):
+        'RF-11c indexes actual module namespace identities for per-test checks and the complete file-boundary backstop; setup-failure, alias, threaded and cross-file repair controls cover this read.',
+    ('tests/conftest.py', '_PatchGuard._install', 'constructor_reference', 'MonkeyPatch', 8):
+        'RF-11c indexes actual module namespace identities for per-test checks and the complete file-boundary backstop; setup-failure, alias, threaded and cross-file repair controls cover this read.',
+    ('tests/conftest.py', '_PatchGuard._install', 'constructor_reference', 'MonkeyPatch', 9):
+        'RF-11c indexes actual module namespace identities for per-test checks and the complete file-boundary backstop; setup-failure, alias, threaded and cross-file repair controls cover this read.',
+    ('tests/conftest.py', '_PatchGuard.record', 'namespace___getattribute__', 'ast-sha256:ab59a28b4bc6f74a552320fab078378b66015be87f8806fab5ebd65c4a55b4da', 0):
+        'RF-11c snapshots the actual module dictionary with the builtin descriptor, without invoking module hooks; teardown checks binding identity.',
+    ('tests/conftest.py', '_PatchGuard.pytest_runtest_setup', 'namespace___dict__', 'ast-sha256:7a9443fed15c79ae7d1e3c1dddaa4305768b27a79195e853e4700211ddbd4ec6', 0):
+        'RF-11c retains actual namespace identities for exact per-test checks and the complete boundary backstop; authenticated framework writes are distinguished from test/fixture/product writes, with failure/retry/thread and cross-file repair controls.',
+    ('tests/conftest.py', '_PatchGuard._fresh_module_owned', 'namespace___getattribute__', 'ast-sha256:4f1836feb7da3a82ffcd2b79ad641f9f212116a8b7a8b34aac4f0d1312557a05', 0):
+        'RF-11c indexes actual module namespace identities for per-test checks and the complete file-boundary backstop; setup-failure, alias, threaded and cross-file repair controls cover this read.',
+    ('tests/conftest.py', '_PatchGuard.pytest_unconfigure', 'namespace_delattr', 'ast-sha256:a90baba7aa94122f7f3643de73d6e385ad25539aed742a5e622cb913d562d037', 0):
+        'RF-11c retains actual namespace identities for exact per-test checks and the complete boundary backstop; authenticated framework writes are distinguished from test/fixture/product writes, with failure/retry/thread and cross-file repair controls.',
+    ('tests/conftest.py', '_PatchGuard.pytest_unconfigure', 'namespace_setattr', 'ast-sha256:9f969b71b27cde8e068095b97d4d53a66550fb1a269e7d730b0a1e908f673521', 0):
+        'RF-11c restores each saved framework method during session unconfigure.',
+    ('tests/conftest.py', '_PatchGuard.__init__', 'namespace_getattr', 'ast-sha256:c9d8274d4fdacdda9791a9cf93ccdd840060806baa4a377aaa5a5a49b8d5ce9b', 0):
+        'Warm the two declared cache initializers and the enabled Hypothesis plugin before trusted baselines; no first test-observed replacement is accepted.',
+    ('tests/conftest.py', '_PatchGuard.pytest_plugin_registered', 'namespace___getattribute__', 'ast-sha256:f2e6c1e91931247c8c0671707941b766da3faebba9356bd8d21b566bb16293ed', 0):
+        'Read the actual warnings module namespace to authenticate catch_warnings source alongside registered hooks; test callbacks gain no writer authority.',
+    ('tests/conftest.py', '_PatchGuard._start_baselines', 'namespace___getattribute__', 'ast-sha256:718ac48ed311a007cdd176d8f18b3297c04bb9d0a7d5a62e91a997ba605650e9', 0):
+        'Retain the original registry and resolve PROCESS_MODULES by actual module identity before collection, including the os.path import alias.',
+    ('tests/conftest.py', '_PatchGuard._baseline_module', 'namespace___getattribute__', 'ast-sha256:718ac48ed311a007cdd176d8f18b3297c04bb9d0a7d5a62e91a997ba605650e9', 0):
+        'Read the native module namespace at first sight and retain its identity and bindings before test code can touch an imported or resolved patch owner.',
+    ('tests/conftest.py', '_PatchGuard._install_imports.create', 'namespace___getattribute__', 'ast-sha256:4a04fe1ea0b209c38554ce8b88dd8969976bdbe038f6039c4ec6ee709a1a04fd', 0):
+        'Capture the native namespace of the exact module created for the active import before its initializer executes; unrelated registry entries receive no receipt.',
+    ('tests/conftest.py', '_PatchGuard._install_imports.load', 'namespace___getattribute__', 'ast-sha256:bc77b4f8c70594104231fd0f8a64223593c88de6ba1ded204dcc571f58d79af3', 0):
+        'Approve only the exact successful import in the trusted registry and retain the parent binding before the authenticated importer assigns its child attribute.',
+    ('tests/conftest.py', '_PatchGuard._install_imports.find', 'namespace___getattribute__', 'ast-sha256:d962d644f2e614a86b76964a82c232d43f63d52981234aa0ef732f30108dda40', 0):
+        'Read the real parent namespace after the matching import invocation and approve only its verified child-module binding, never an arbitrary package attribute.',
+    ('tests/conftest.py', '_PatchGuard._install_imports', 'namespace_getattr', 'ast-sha256:8cc7c32d6fefc585ee838aeace945af75feeb3b4e7d5d74d99c27890bff12b95', 0):
+        'Save original validated import entry points and install runtime governance wrappers; failure cleanup and unconfigure restore the exact originals in reverse order.',
+    ('tests/conftest.py', '_PatchGuard._install_imports', 'namespace_setattr', 'ast-sha256:9caea712555adacc07de3174f56e34c4f07fbf0d930011a3c3bbd0920fe2eeb5', 0):
+        'Save original validated import entry points and install runtime governance wrappers; failure cleanup and unconfigure restore the exact originals in reverse order.',
+    ('tests/conftest.py', '_PatchGuard._install', 'namespace_getattr', 'ast-sha256:8cc7c32d6fefc585ee838aeace945af75feeb3b4e7d5d74d99c27890bff12b95', 0):
+        'Save the original validated MonkeyPatch/mock entry points and install attribution wrappers; unconfigure restores these exact runtime governance operations.',
+    ('tests/conftest.py', '_PatchGuard._install', 'namespace_setattr', 'ast-sha256:9caea712555adacc07de3174f56e34c4f07fbf0d930011a3c3bbd0920fe2eeb5', 0):
+        'Save the original validated MonkeyPatch/mock entry points and install attribution wrappers; unconfigure restores these exact runtime governance operations.',
+    ('tests/conftest.py', '_PatchGuard.__init__', 'namespace___dict__', 'ast-sha256:4a1f95fed2e8d3b6d4d0c1870fdb98333b2ad5afa60e432731f175e2534d9af7', 0):
+        'RF-11c rounds 12-13 runtime governance: authenticate source-owned asynchronous callback entries and only their actual namespace stores; retain exact startup baselines, refuse unsupported APIs/running writer images, and restore governance bindings on failures and cleanup. Test source gains no framework writer authority.',
+    ('tests/conftest.py', '_PatchGuard._module_map', 'module_write', 'sys.modules = self.modules', 0):
+        'RF-11c round 16: seed one trusted module map before items; publish authenticated import receipts across registry copies and repair observed registries; freeze consumer alias spellings from authenticated initializers.',
+    ('tests/conftest.py', '_PatchGuard._module_map', 'namespace___getattribute__', 'ast-sha256:987470bff5325d9ec32c7a2cb9690c66e2479d1e1d275a3cfdc425f3a90a9028', 0):
+        'RF-11c round 16: seed one trusted module map before items; publish authenticated import receipts across registry copies and repair observed registries; freeze consumer alias spellings from authenticated initializers.',
+    ('tests/conftest.py', '_PatchGuard._module_map', 'namespace___getattribute__', 'ast-sha256:987470bff5325d9ec32c7a2cb9690c66e2479d1e1d275a3cfdc425f3a90a9028', 1):
+        'RF-11c round 16: seed one trusted module map before items; publish authenticated import receipts across registry copies and repair observed registries; freeze consumer alias spellings from authenticated initializers.',
+    ('tests/conftest.py', '_PatchGuard._module_map', 'namespace_sys_modules', 'ast-sha256:355d42dcbeb32343e552a7484b74dcbf94757235fc6bff3ca154b80b75083253', 0):
+        'RF-11c round 16: seed one trusted module map before items; publish authenticated import receipts across registry copies and repair observed registries; freeze consumer alias spellings from authenticated initializers.',
+    ('tests/conftest.py', '_PatchGuard._module_map', 'namespace_sys_modules', 'ast-sha256:355d42dcbeb32343e552a7484b74dcbf94757235fc6bff3ca154b80b75083253', 1):
+        'RF-11c round 16: seed one trusted module map before items; publish authenticated import receipts across registry copies and repair observed registries; freeze consumer alias spellings from authenticated initializers.',
+    ('tests/conftest.py', '_PatchGuard._module_map', 'namespace_sys_modules', 'ast-sha256:47a8361f169a2a04303bb72b2029cbd295cbda3c97a24e68aaed1de838cbade4', 0):
+        'RF-11c round 16: seed one trusted module map before items; publish authenticated import receipts across registry copies and repair observed registries; freeze consumer alias spellings from authenticated initializers.',
+    ('tests/conftest.py', '_PatchGuard._module_map', 'namespace_sys_modules', 'ast-sha256:6281abce2598e0e19a0ca3ad272254b9399865d8164648fddb49f6751b6026fa', 0):
+        'RF-11c round 16: seed one trusted module map before items; publish authenticated import receipts across registry copies and repair observed registries; freeze consumer alias spellings from authenticated initializers.',
+    ('tests/conftest.py', '_PatchGuard._module_map', 'namespace_sys_modules', 'ast-sha256:679b488aa0e8a09de364886bbaacb838a867605e9f18dbad5e3c20f5d35a1177', 0):
+        'RF-11c round 16: seed one trusted module map before items; publish authenticated import receipts across registry copies and repair observed registries; freeze consumer alias spellings from authenticated initializers.',
+    ('tests/conftest.py', '_PatchGuard._module_map', 'namespace_sys_modules', 'ast-sha256:7ebde5388563933df21e35920b6b3402478ce4a67b84625cfb765588343083d4', 0):
+        'RF-11c round 16: seed one trusted module map before items; publish authenticated import receipts across registry copies and repair observed registries; freeze consumer alias spellings from authenticated initializers.',
+    ('tests/conftest.py', '_PatchGuard._module_map', 'namespace_sys_modules', 'ast-sha256:86010dec74cda5f7a485176e0d22b2dc85d66cb6da07332d7e1a788f9119f802', 0):
+        'RF-11c round 16: seed one trusted module map before items; publish authenticated import receipts across registry copies and repair observed registries; freeze consumer alias spellings from authenticated initializers.',
+    ('tests/conftest.py', '_PatchGuard._module_map', 'namespace_sys_modules', 'ast-sha256:9e8dd2a5a482284f00a90b8be6732972e04b53167548be428f4ef277502622b9', 0):
+        'RF-11c round 16: seed one trusted module map before items; publish authenticated import receipts across registry copies and repair observed registries; freeze consumer alias spellings from authenticated initializers.',
+    ('tests/conftest.py', '_PatchGuard._framework_change', 'namespace_globals', 'ast-sha256:b4d8fb9ded80f8694e0579e057130fa3a11b29a16101aa633101251a88db1805', 0):
+        'RF-11c round 34: retain import refusals and restore copied guard infrastructure.',
+    ('tests/conftest.py', '_PatchGuard._callback_site', 'namespace___getattribute__', 'ast-sha256:88cfe19d49e4b5c80d7ce18b41d52eb09c6758213ee10ab1fd03a213dd503020', 0):
+        'RF-11c round 35: authenticate bootstrap displacement and nested patch attribution.',
 }
-BAN_LIMITS = {'constructor': 0, 'constructor_reference': 1, 'declaration': 20, 'import': 3, 'module_write': 42, 'namespace___class__': 3, 'namespace___delattr__': 2, 'namespace___dict__': 22, 'namespace___getattribute__': 1, 'namespace___setattr__': 13, 'namespace_builtin_import': 14, 'namespace_delattr': 0, 'namespace_generated_builtin_import': 5, 'namespace_getattr': 118, 'namespace_globals': 5, 'namespace_importlib': 5, 'namespace_locals': 0, 'namespace_setattr': 10, 'namespace_sys_modules': 51, 'namespace_vars': 65}
+BAN_LIMITS = {'constructor': 0, 'constructor_reference': 15, 'declaration': 20, 'import': 3, 'module_write': 43, 'namespace___class__': 3, 'namespace___delattr__': 2, 'namespace___dict__': 27, 'namespace___getattribute__': 15, 'namespace___setattr__': 13, 'namespace_builtin_import': 14, 'namespace_delattr': 1, 'namespace_generated_builtin_import': 5, 'namespace_getattr': 123, 'namespace_globals': 6, 'namespace_importlib': 5, 'namespace_locals': 0, 'namespace_setattr': 13, 'namespace_sys_modules': 59, 'namespace_vars': 67}
 
 # Formal 0715 example disposition (dynamic examples intentionally unasserted):
 # security 1 / correctness 2: global/nonlocal import/from-import rebindings,
@@ -1832,7 +1945,7 @@ GENERATED_NAMESPACE_SCOPES = {'tests/integration/test_hierarchy_background.py': 
 
 
 def _namespace_uses(tree, names, *, generated=True):
-    """Every namespace capability needs the seam shape or an exact whole operation."""
+    """Recognize honest-code namespace forms; RF-11c owns dynamic acquisition."""
     names = NamespaceNames(tree, names.rel)
     parents = {id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
 
@@ -2078,6 +2191,18 @@ def _ban_identity(key):
 # Each group lists zero-based occurrences of identical syntax within its lexical scope.
 # Registrations certify today's otherwise unprovable uses, never a wildcard.
 PROOF_REGISTRATION_GROUPS = {
+    ('tests/helpers_pathlookup.py', '_OwnedModulePatch.setattr', 'callable', 'self.patcher.setattr', False):
+        ((0,), 'This direct method call uses the public MonkeyPatch object supplied by owned_module_patch; _check_target restricts the target to an import-baseline governed module and successful strict replacements are individually recorded for the live context.'),
+    ('tests/helpers_pathlookup.py', '_OwnedModulePatch.delattr', 'callable', 'self.patcher.delattr', False):
+        ((0,), 'This direct method call uses the public MonkeyPatch object supplied by owned_module_patch; _check_target restricts the target to an import-baseline governed module and successful strict deletions are individually recorded for the live context.'),
+    ('tests/helpers_pathlookup.py', 'owned_module_patch', 'fixture', '_OwnedModulePatch(patcher, request.scope)', False):
+        ((0,), 'The context manager wraps its own public MonkeyPatch object with a recorded class/module/package/session scope, registers the wrapper only while live, and yields that API; undo finishes before ownership removal. Function scope and non-governed targets are refused.'),
+    ('tests/helpers_pathlookup.py', 'monkeypatch', 'fixture', '(yield patcher)', False):
+        ((0,), 'Fixture yields its own context-managed MonkeyPatch object to normal consumers; governed_module_state is its prerequisite, and context exit performs undo before the final module-state check.'),
+    ('tests/unit/core/test_pathlookup.py', 'test_clean_host_os_patch_restores_after_failure_and_retry', 'fixture', 'monkeypatch.context', False):
+        ((0,), 'Scoped pytest monkeypatch context restores only the helper regression patch after a raised failure and on retry; autouse fixture patches stay installed.'),
+    ('tests/unit/core/test_pathlookup.py', 'test_clean_host_os_patch_restores_after_failure_and_retry', 'callable', 'patch.setattr', False):
+        ((0,), 'Context-owned pytest MonkeyPatch replaces only aegis_core.pathlookup.os and restores it on exception exit; no shared process module is patched.'),
     ('tests/unit/core/test_team_git.py', 'test_runner_environment_redirects_refuse_before_spawn', 'fixture', 'monkeypatch.context', False):
         ((0,), 'GM-5 r7 fixture context restores the real ambient environment after the redirect refusal; its body is independently censused.'),
     ('tests/unit/core/test_team_git.py', 'test_runner_environment_redirects_refuse_before_spawn', 'fixture', 'scoped.setenv', False):
@@ -8041,7 +8166,6 @@ PROCESS_PATCH_LIMITS = {
     'tests/unit/mcp/test_mcp_runtime_binding.py': 2,
     'tests/unit/mcp/test_mcp_session_close_side_effects.py': 1,
     'tests/unit/mcp/test_mcp_session_stdio_contract.py': 1,
-    'tests/unit/mcp/test_server_hardening.py': 2,
     'tests/unit/test_p6_noadmin.py': 1,
     'tests/unit/verification/test_call_graph_ast.py': 1,
     'tests/unit/verification/test_checkpoint_fail_closed.py': 1,

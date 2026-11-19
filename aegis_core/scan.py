@@ -42,6 +42,7 @@ from aegis_core.guidance_projection import (
     estimate_tokens as estimate_tokens,
     field_text, finish_payload, project_detail, project_display_data, project_display_text,
     project_error_name, project_field, project_identifier,
+    projection_refusal, projection_refusal_reason, projection_refusal_repair, rule_error_rows_fit,
 )
 from aegis_core.match import normalize_path, workspace_files
 from aegis_core import gitsafe, match as rule_match, rule_integrity
@@ -303,33 +304,24 @@ def _projection_entries(matches: List[_Match], registry: Optional[SlotRegistry])
     """Collect safe locations within the failure envelope's node/character caps."""
     entries, errors = [], []
     code, size = None, 0
-    reasons = {"guidance_projection_invalid_field": "invalid_field", "guidance_projection_limit": "limit"}
     for match in matches:
         try:
             entries.append(_entry(match, registry))
         except GuidanceProjectionError as exc:
             code = code or exc.code
-            if (not isinstance(exc, _RuleProjectionError) or exc.code not in reasons
-                    or exc.field not in {"hypothesis", "prediction", "detail", "matched_files"}
-                    or 9 + 6 * (len(errors) + 1) > 4096):
+            reason = projection_refusal_reason(exc.code, exc.field) if isinstance(exc, _RuleProjectionError) else None
+            if reason is None or not rule_error_rows_fit(len(errors) + 1):
                 return [], _failure(code)
             try:
                 path = project_error_name(exc.path)
             except GuidanceProjectionError:
                 return [], _failure(code)
-            reason = exc.field + ": " + reasons[exc.code]
             size += len(path) + len(reason) + len("patherror")
             if size + len("statusFAILerrorrule_errors") + len(code) > MAX_GUIDANCE_CHARS:
                 return [], _failure(code)
             errors.append({"path": path, "error": reason})
     if code is None:
         return entries, None
-    # The complete schema check is authoritative; its own refusal must never
-    # replace the first selection refusal's documented code.
-    try:
-        checked_result_copy({"status": _STATUS_FAIL, "error": code, "rule_errors": errors}, None)
-    except GuidanceProjectionError:
-        return [], _failure(code)
     return [], _failure(code, errors)
 
 
@@ -422,6 +414,8 @@ def _tokens(value: object) -> int:
 
 
 def _failure(message: str, rule_errors: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
+    if projection_refusal_repair(message) is not None:
+        return projection_refusal(message, rule_errors)
     result: Dict[str, Any] = {"status": _STATUS_FAIL, "error": assembled_text(message)}
     if rule_errors is not None:
         result["rule_errors"] = rule_errors
@@ -454,9 +448,8 @@ def _ignored_warning(ruleset: RuleSet) -> str:
 
 def _broken(ruleset: RuleSet) -> Dict[str, Any]:
     broken = ruleset.errors
-    # The failure envelope has nine fixed JSON nodes and six per error row.
-    # Match checked_result_copy's node cap before allocating those rows.
-    if 9 + 6 * len(broken) > 4096:
+    # Check the shared envelope node cap before allocating error rows.
+    if not rule_error_rows_fit(len(broken)):
         return _failure("guidance_projection_limit")
     errors, size = [], 0
     try:
@@ -535,7 +528,7 @@ def simulate_rule_selection(workspace: Any, inventory: RuleInventory, ruleset: R
 
 
 def _cold_rules(rules: Tuple[Rule, ...], remaining: List[int]) -> Tuple[Rule, ...]:
-    outcomes, targets = {}, {r.id: (r.skips_tests, tuple(dict.fromkeys(r.target_paths))) for r in rules}
+    outcomes, targets = {}, {(r.id, r.path, r.digest): (r.skips_tests, tuple(dict.fromkeys(r.target_paths))) for r in rules}
     def evaluate(pattern: str, path: str, exact: bool) -> bool:
         if remaining[0] <= 0:
             raise _SimulationBudget
@@ -545,10 +538,11 @@ def _cold_rules(rules: Tuple[Rule, ...], remaining: List[int]) -> Tuple[Rule, ..
             outcomes[key] = normalize_path(pattern) == normalize_path(path) if exact else rule_match.matches(pattern, path)
         return outcomes[key]
     def applies(rule: Rule, path: str, exact: bool) -> bool:
-        if not exact and targets[rule.id][0] and rule_match.is_test_path(path):
+        skip_tests, patterns = targets[(rule.id, rule.path, rule.digest)]
+        if not exact and skip_tests and rule_match.is_test_path(path):
             return False
-        return any(evaluate(pattern, path, exact) for pattern in targets[rule.id][1])
-    return tuple(_ColdRule(**vars(replace(rule, meta={**rule.meta, "target_paths": targets[rule.id][1]})), _match_path=applies) for rule in rules)
+        return any(evaluate(pattern, path, exact) for pattern in patterns)
+    return tuple(_ColdRule(**vars(replace(rule, meta={**rule.meta, "target_paths": targets[(rule.id, rule.path, rule.digest)][1]})), _match_path=applies) for rule in rules)
 
 
 # Titles are branch-local text that reaches an agent: only the first few are listed.

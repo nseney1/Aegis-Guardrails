@@ -2764,6 +2764,10 @@ def test_mc_records_perf_grant_child_ignores_outer_options(tmp_path, addopts):
         environment.pop("PYTEST_ADDOPTS", None)
     else:
         environment["PYTEST_ADDOPTS"] = addopts
+    if addopts != "-k pythontracemalloc":
+        hostile = {**environment, "PYTEST_ADDOPTS": "-k pythontracemalloc"}
+        assert _perf_child_env(environment) == _perf_child_env(hostile)
+        return
     completed = _perf_grant_child(tmp_path, environment=environment)
     assert completed.returncode == 0, completed.stdout[-1500:] + completed.stderr[-1500:]
 
@@ -2971,14 +2975,23 @@ def test_record_tool_guidance_names_only_accepted_actions(bound, monkeypatch):
         assert set(schema) == _RECORD_ARGUMENTS[name], name
     assert "narrow fields" in specs["mailbox_read_record"][0]
     assert "narrow" not in specs["mailbox_publish_record"][0]
-    assert "narrow fields" in specs["mailbox_digest"][0]
+    assert "fields" not in specs["mailbox_publish_record"][1]
+    for name in ("mailbox_read_record", "mailbox_digest"):
+        selector_help = specs[name][1]["fields"]["description"]
+        for capability in ("dotted paths", "indices", "one-level *",
+                           "findings.*.{id,severity,file,line}", "depth 8", "E_SELECTOR"):
+            assert capability in selector_help, (name, capability)
+        assert "findings.*.{id,severity,file,line}" not in specs[name][0]
+    assert specs["mailbox_read_record"][1]["fields"] == specs["mailbox_digest"][1]["fields"]
     assert "E_SELECTOR" not in specs["mailbox_publish_record"][0]
     assert "E_SELECTOR" not in specs["mailbox_digest"][0]
     digest_description = specs["mailbox_digest"][0]
-    assert _DIGEST_PAGE_NEXT in digest_description
-    assert _DIGEST_INBOX_NEXT in digest_description
-    assert _DIGEST_VIEW_NEXT in digest_description
-    assert records.DIGEST_VIEW_MINIMUM_NEXT in digest_description
+    assert len(digest_description.encode("utf-8")) < 2325
+    assert "E_LIMIT" in digest_description
+    assert "error.next_action" in digest_description
+    for advice in (_DIGEST_PAGE_NEXT, _DIGEST_INBOX_NEXT, _DIGEST_VIEW_NEXT,
+                   records.DIGEST_VIEW_MINIMUM_NEXT):
+        assert advice not in digest_description
     assert "1 to 100" in digest_description
     assert "0 to " + str(records.MAX_CHARS) in digest_description
     assert getattr(records, "DIGEST_PAGE_NEXT", None) == _DIGEST_PAGE_NEXT
