@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from aegis_core.diagnostic_messages import receipt_value
 from aegis_core.rule_inventory import RuleInventoryError, read_rule_file, split_frontmatter
 from aegis_core.yaml_engine.document import AegisDocument
 from aegis_core.yaml_engine.parser import (
@@ -90,22 +91,30 @@ def parse_rule_file(filepath: str) -> Tuple[Dict[str, Any], str]:
     """Parse the rule file at ``filepath`` into (frontmatter_dict, body).
 
     Legacy missing/non-file and parse failures retain their exception types,
-    messages and ERR_AEGIS code. Newly refused unsafe reads use
-    RULE_FILE_READ_REFUSED. Public through ``aegis_sdk``.
+    prefixes and ERR_AEGIS code. File content is omitted from parse diagnostics
+    and displayed paths are canonicalized, redacted and bounded. Newly refused
+    unsafe reads use RULE_FILE_READ_REFUSED. Public through ``aegis_sdk``.
     """
     from aegis_core.errors import RuleNotFoundError, RuleParseError
 
     if (isinstance(filepath, (str, Path)) and len(str(filepath)) <= 32768
             and "\x00" not in str(filepath) and not os.path.isfile(filepath)):
-        raise RuleNotFoundError(f"Rule file not found: {filepath}")
+        raise RuleNotFoundError(f"Rule file not found: {receipt_value(str(filepath), 400, identifier=True)}")
     try:
         return _parse_rule_text(_read_rule_text(filepath))
     except FileNotFoundError:
-        raise RuleNotFoundError(f"Rule file not found: {filepath}") from None
+        raise RuleNotFoundError(f"Rule file not found: {receipt_value(str(filepath), 400, identifier=True)}") from None
     except RuleReadError:
         raise RuleParseError("Rule file read refused", code="RULE_FILE_READ_REFUSED") from None
     except ValueError as exc:
-        raise RuleParseError(f"Error parsing rule {filepath}: {exc}") from exc
+        # Only these source-owned delimiter diagnostics are public verbatim.
+        # Parser and decoder errors can contain arbitrary keys, values or bytes;
+        # do not format them, even in a chained traceback or before clipping.
+        diagnostic = "Invalid YAML frontmatter"
+        if type(exc) is ValueError and exc.args in (("No frontmatter delimiter",), ("Unclosed frontmatter",)):
+            diagnostic = exc.args[0]
+        shown_path = receipt_value(str(filepath), 400, identifier=True)
+        raise RuleParseError(f"Error parsing rule {shown_path}: {diagnostic}") from None
 
 
 def _rule_workspace_root(workspace):
