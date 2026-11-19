@@ -29,8 +29,8 @@ from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_core.errors import WorkspaceError
 from aegis_core.guidance_grammar import clip_redacted
 from aegis_core.guidance_projection import (
-    CONTROL_GUIDANCE, MAX_GUIDANCE_CHARS, GuidanceProjectionError,
-    contains_control_characters, project_diagnostic,
+    CONTROL_GUIDANCE, contains_control_characters, project_diagnostic,
+    projection_refusal_reason, projection_refusal_repair,
 )
 from aegis_core.hosts import GENERIC
 from aegis_core.workspace.layout import is_aegis_workspace
@@ -59,7 +59,7 @@ def run_scan(args: argparse.Namespace) -> int:
     try:
         # Discovery walks up from a missing path, so its error would name a parent.
         if raw_ws and not os.path.exists(raw_ws):
-            _error(f"workspace path does not exist: {_terminal_text(str(raw_ws), max_len=1024, escaped=False)}", projected=True)
+            _error(f"workspace path does not exist: {project_diagnostic(str(raw_ws), escaped=False, refuse_controls=True)}", projected=True)
             return EXIT_USAGE
         root = Workspace.resolve(raw_ws).root.resolve()
         try:
@@ -71,7 +71,7 @@ def run_scan(args: argparse.Namespace) -> int:
         _error(str(exc))
         return EXIT_USAGE
     if not governed:
-        displayed_root = _terminal_text(str(root), max_len=1024, escaped=False)
+        displayed_root = project_diagnostic(str(root), escaped=False, refuse_controls=True)
         _error(f"not an Aegis workspace (no .aegis/ in {displayed_root}); run aegis init", projected=True)
         return EXIT_USAGE
 
@@ -92,7 +92,7 @@ def run_scan(args: argparse.Namespace) -> int:
         print(json.dumps(result, indent=2, default=str))
     elif failed:
         _error(result.get("error", ""), projected=True)
-        _projection_errors(result)
+        _refusal_errors(result)
     else:
         print(_served_text(result.get("guidance", "")))
         for warning in result.get("warnings") or []:
@@ -100,18 +100,40 @@ def run_scan(args: argparse.Namespace) -> int:
     return EXIT_UNSERVED if failed else EXIT_SCANNED
 
 
-def _projection_errors(result: dict) -> None:
-    repairs = {
-        "guidance_projection_invalid_field": "Fix the field type and run `aegis rule lint <path>`.",
-        "guidance_projection_limit": "Shorten the instruction or slot expansion and run `aegis rule lint <path>`.",
-    }
-    repair = repairs.get(result.get("error"))
-    if repair is None or not result.get("rule_errors"):
-        return
-    for row in result["rule_errors"]:
-        suffix = ": " + row["error"]
-        path = _served_text(row["path"], max_len=1024 - len(suffix))
-        _error(path + suffix, projected=True)
+def _refusal_errors(result: dict) -> None:
+    """Attribute field repairs only to confirmed rows; otherwise give status advice.
+
+    Keep the core/JSON envelope unchanged. Only projection refusals need extra
+    location rows: load failures already name their files in the main error.
+    """
+    error = result.get("error", "")
+    repair = projection_refusal_repair(error)
+    confirmed_repairs = []
+    if repair is not None:
+        for row in result.get("rule_errors") or []:
+            suffix = ": " + row["error"]
+            path = _served_text(row["path"], max_len=1024 - len(suffix))
+            _error(path + suffix, projected=True)
+            field, _, reason = row["error"].partition(": ")
+            code = "guidance_projection_" + reason
+            if projection_refusal_reason(code, field) == row["error"]:
+                advice = projection_refusal_repair(code)
+                if advice is not None and advice not in confirmed_repairs:
+                    confirmed_repairs.append(advice)
+        repair = ("\n".join(confirmed_repairs) if confirmed_repairs else
+                  "Run `aegis status` to list unloadable and ignored files; once the rules load, "
+                  "fix field types or shorten fields and run `aegis rule lint <path>`, then retry `aegis scan`.")
+    elif error == "guidance_projection_budget":
+        repair = "Raise AEGIS_MAX_JIT_TOKENS and retry `aegis scan`."
+    elif error.startswith(("the rules directory cannot be read safely: ",
+                           "the user rules directory cannot be read safely: ")):
+        repair = "Remove unsafe links and restore read access to the rules directory, then run `aegis status`."
+    elif error.startswith("the reviewed (base) version of the rules cannot be read, so none is served: "):
+        repair = "Fetch the reviewed rules base and check rules.base_ref in the user config, then retry `aegis scan`."
+    elif result.get("rule_errors"):
+        repair = "Fix or move the invalid rule files and run `aegis rule lint <path>`; `aegis status` lists them."
+    else:
+        repair = "Run `aegis status` to diagnose the refusal, then retry `aegis scan`."
     print(repair, file=sys.stderr)
 
 
@@ -135,12 +157,12 @@ def _record_scan(root: Path, raw_files: List[str]) -> None:
         scan_compliance.record(root, "scan", host=scan_compliance.CLI_HOST, session=uuid.uuid4().hex,
                                files=inside, basis="files")
     except Exception as exc:  # telemetry only: never fail the scan
-        print("Warning: scan event not recorded: " + _terminal_text(str(exc), max_len=1024), file=sys.stderr)
+        print("Warning: scan event not recorded: " + project_diagnostic(str(exc), refuse_controls=True), file=sys.stderr)
 
 
 def _error(message: str, *, projected: bool = False) -> None:
     # Errors name rule files and directories, which a cloned repository chooses.
-    print("Error: " + (_served_text(message, max_len=1024) if projected else _terminal_text(message, max_len=1024)), file=sys.stderr)
+    print("Error: " + (_served_text(message, max_len=1024) if projected else project_diagnostic(message, refuse_controls=True)), file=sys.stderr)
 
 
 def _served_text(text: str, *, max_len: int | None = None) -> str:
@@ -150,16 +172,6 @@ def _served_text(text: str, *, max_len: int | None = None) -> str:
     if max_len is not None and len(text) > max_len:
         return clip_redacted(text, max_len - 3) + "..."
     return text
-
-
-def _terminal_text(text: str, *, max_len: int | None = None, escaped: bool = True) -> str:
-    """Project untrusted text, refusing whole values with non-layout controls."""
-    if len(text) > MAX_GUIDANCE_CHARS:
-        return GuidanceProjectionError.code
-    shown = project_diagnostic(CONTROL_GUIDANCE if contains_control_characters(text) else text, escaped=escaped)
-    if max_len is not None and (type(max_len) is not int or max_len < 3):
-        return "guidance_projection_invalid_field"
-    return shown if max_len is None or len(shown) <= max_len else clip_redacted(shown, max_len - 3) + "..."
 
 
 class ScanCommand(AegisCommand):

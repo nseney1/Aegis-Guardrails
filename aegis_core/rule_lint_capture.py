@@ -172,10 +172,8 @@ def capture_sources(root, rules, refuse, *, confined_file, iter_confined_files,
                      max_entries, max_source_files, max_source_bytes, max_source_total):
     sources, total, count = {}, 0, 0
     # Reuse public enumeration; reads themselves remain descriptor-confined.
-    for path, problem in iter_confined_files(root, root, suffix=""):
+    for path, problem in iter_confined_files(root, root, suffix="", skip_root_git=True):
         relative = path.relative_to(root).as_posix()
-        if relative.split("/", 1)[0] == ".git":
-            continue
         count += 1
         if count > max_entries:
             raise refuse("source_limit")
