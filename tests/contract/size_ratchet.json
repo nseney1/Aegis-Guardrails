@@ -79,8 +79,6 @@
   },
   "grandfathered": {
     "functions": {
-      "tools/hierarchy_candidate_status.py:Observer.suite": "M69 in-flight lane f2; exact shrink-only pin deferred to end-of-build pass",
-      "tools/hierarchy_candidate_status.py:markup_region": "M69 in-flight lane f2; exact shrink-only pin deferred to end-of-build pass",
       "tools/hierarchy_fresh_brief.py:lifecycle_records": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
       "tools/hierarchy_fresh_brief.py:mailbox_records": "M69 in-flight lane dispatcher; exact shrink-only pin deferred to end-of-build pass",
       "tools/hierarchy_host_authority.py:OwnedHostBinding.from_owned_channels": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
@@ -101,7 +99,6 @@
       "tools/hierarchy_wake.py:wake": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass"
     },
     "modules": {
-      "tools/hierarchy_candidate_status.py": "M69 in-flight lane f2; exact shrink-only pin deferred to end-of-build pass",
       "tools/hierarchy_fresh_brief.py": "M69 in-flight lane dispatcher; exact shrink-only pin deferred to end-of-build pass",
       "tools/hierarchy_host_authority.py": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
       "tools/hierarchy_jobs.py": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
