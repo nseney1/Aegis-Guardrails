@@ -40,7 +40,7 @@ concurrency guarantees live in one place:
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
@@ -645,7 +645,9 @@ def file_lock(lock_path: Path, timeout: float = 5.0, *, dir_fd: Optional[int] = 
     (``_hold``) on its own key and a 0o600 lock file, without participating in
     workspace/shared lock ordering. With ``dir_fd``, open only the basename relative
     to that caller-owned POSIX directory descriptor, refusing symlinks, hardlinks
-    and nonregular files; the caller retains ownership of the descriptor.
+    and nonregular files; the caller retains ownership of the descriptor. A transient
+    ENOENT from that open is retried a few times while the directory still exists
+    (``_file_lock_at``).
     """
     target = Path(os.fspath(lock_path))
     if dir_fd is not None:
@@ -660,33 +662,84 @@ def file_lock(lock_path: Path, timeout: float = 5.0, *, dir_fd: Optional[int] = 
         yield
 
 
+#: macOS can fail an anchored O_CREAT open with ENOENT while other processes create the same
+#: lock file in a directory that still exists (hosted CI, four first ManagerStore appends).
+#: _file_lock_at makes at most this many opens for that error, sleeping the delay, then
+#: twice the previous sleep, between them: 2 + 4 + 8 + 16 = 30 ms in all. When the lock
+#: file is already there, the next open drops O_CREAT and only looks the name up.
+_LOCK_OPEN_ENOENT_ATTEMPTS = 5
+_LOCK_OPEN_ENOENT_DELAY_SECONDS = 0.002
+
+
+def _refuse_unsafe_lock_entry(target: Path, directory: int, exc: OSError) -> bool:
+    """After a failed anchored open: raise for a symlink, or for anything but a private
+    regular file with one link, at the lock's name. Return True when such a file is
+    there, False when nothing can be stat'ed there."""
+    try:
+        info = os.stat(target.name, dir_fd=directory, follow_symlinks=False)
+    except OSError:
+        return False
+    if stat.S_ISLNK(info.st_mode):
+        raise _link_error(target) from exc
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise PathTraversalError(f"refusing to use {target}: not a private regular file", path=str(target)) from exc
+    return True
+
+
 @contextmanager
 def _file_lock_at(target: Path, timeout: float, directory: int) -> Iterator[None]:
-    """Open only the basename relative to a caller-owned POSIX directory descriptor."""
+    """Open only the basename relative to a caller-owned POSIX directory descriptor.
+
+    macOS can report ENOENT for the O_CREAT open while other processes first create the
+    same lock file, so that error alone is retried, a bounded number of times within
+    ``timeout``, while the directory is still linked. A removed directory is refused at
+    once (PathTraversalError), and the last ENOENT is raised when the retries run out.
+    A retry after a lock file was seen at the name opens it without O_CREAT, so it does
+    not go through the create path that just failed. The open retries and the lock wait
+    share the one ``timeout`` budget.
+    """
     if type(directory) is not int or directory < 0 or os.name != "posix":
         raise ValueError("dir_fd requires a POSIX directory descriptor")
     if not stat.S_ISDIR(os.fstat(directory).st_mode):
         raise ValueError("dir_fd requires a directory descriptor")
     key = f"file:{os.path.normcase(real_path(target))}"
-    flags = os.O_RDWR | os.O_CREAT | _O_NOFOLLOW | _O_NONBLOCK | _O_CLOEXEC
-    try:
-        fd = os.open(target.name, flags, _PRIVATE_FILE_MODE, dir_fd=directory)
-    except OSError as exc:
+    create = os.O_RDWR | os.O_CREAT | _O_NOFOLLOW | _O_NONBLOCK | _O_CLOEXEC
+    flags = create
+    deadline = time.monotonic() + max(0.0, timeout)
+    delay = _LOCK_OPEN_ENOENT_DELAY_SECONDS
+    attempt = 1
+    while True:
         try:
-            info = os.stat(target.name, dir_fd=directory, follow_symlinks=False)
-        except OSError:
-            raise exc
-        if stat.S_ISLNK(info.st_mode):
-            raise _link_error(target) from exc
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-            raise PathTraversalError(f"refusing to use {target}: not a private regular file", path=str(target)) from exc
-        raise
+            fd = os.open(target.name, flags, _PRIVATE_FILE_MODE, dir_fd=directory)
+            break
+        except OSError as exc:
+            present = _refuse_unsafe_lock_entry(target, directory, exc)
+            if not isinstance(exc, FileNotFoundError):
+                raise
+            info = os.fstat(directory)
+            if not stat.S_ISDIR(info.st_mode) or info.st_nlink == 0:
+                raise PathTraversalError(f"refusing to use {target}: its directory was removed",
+                                         path=str(target)) from exc
+            if attempt >= _LOCK_OPEN_ENOENT_ATTEMPTS or time.monotonic() + delay > deadline:
+                raise
+            time.sleep(delay)
+            if time.monotonic() >= deadline:  # the sleep overran the budget: no open after it
+                raise
+        flags = create & ~os.O_CREAT if present else create
+        delay *= 2
+        attempt += 1
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             raise PathTraversalError(f"refusing to use {target}: not a private regular file", path=str(target))
         _make_private(fd, _PRIVATE_FILE_MODE)
-        with _hold(target, key, timeout, shared=False, ordered=False, opened_fd=fd):
+        with ExitStack() as stack:
+            try:
+                # The lock wait gets only what the open retries left of the budget.
+                stack.enter_context(_hold(target, key, max(0.0, deadline - time.monotonic()),
+                                          shared=False, ordered=False, opened_fd=fd))
+            except LockTimeoutError:
+                raise _timeout_error(target, timeout, "file") from None  # name the caller's timeout
             yield
     finally:
         os.close(fd)

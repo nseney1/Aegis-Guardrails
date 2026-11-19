@@ -439,3 +439,124 @@ def test_public_lock_descriptor_refuses_unsafe_final_entry(tmp_path, kind):
         os.close(descriptor)
     assert outside.read_bytes() == b"retain bytes\n"
     assert outside.stat().st_mode == original_mode
+
+
+def _enoent(name):
+    import errno
+    return FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), name)
+
+
+def _route_lock_opens(patch, hook):
+    """Send each open of "audit.lock" relative to a dir fd to ``hook``; count the calls."""
+    real_open = os.open
+    calls = []
+
+    def lock_open(path, flags, mode=0o777, *, dir_fd=None):
+        if dir_fd is not None and os.fspath(path) == "audit.lock":
+            calls.append(flags)
+            return hook(real_open, path, flags, mode, dir_fd, len(calls))
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    patch.setattr(os, "open", lock_open)
+    patch.setattr(os, "supports_dir_fd", os.supports_dir_fd | {lock_open})
+    return calls
+
+
+def test_first_append_survives_a_transient_enoent_on_the_lock_open(tmp_path, monkeypatch):
+    # macOS hosted CI: four first appends raced and one anchored O_CREAT open of audit.lock
+    # returned ENOENT in a live directory. Here the follow-up stat fails once as well.
+    if os.name != "posix":
+        pytest.skip("POSIX descriptor anchoring")
+    root = tmp_path / "audit"
+    real_stat = os.stat
+    stat_failures = []
+
+    def transient(real_open, name, flags, mode, dir_fd, attempt):
+        if attempt == 1:
+            stat_failures.append("armed")
+            raise _enoent(name)
+        return real_open(name, flags, mode, dir_fd=dir_fd)
+
+    def flaky_stat(path, *args, dir_fd=None, follow_symlinks=True):
+        if dir_fd is not None and os.fspath(path) == "audit.lock" and stat_failures == ["armed"]:
+            stat_failures.append("failed")
+            raise _enoent(path)
+        return real_stat(path, *args, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    with monkeypatch.context() as patch:
+        calls = _route_lock_opens(patch, transient)
+        patch.setattr(os, "stat", flaky_stat)
+        patch.setattr(os, "supports_dir_fd", os.supports_dir_fd | {flaky_stat})
+        patch.setattr(os, "supports_follow_symlinks", os.supports_follow_symlinks | {flaky_stat})
+        row = ManagerStore(root).append({"kind": "scan"})
+    assert len(calls) == 2
+    # The stat saw no lock file, so the retry still creates it.
+    assert calls[1] == calls[0] and calls[1] & os.O_CREAT
+    assert stat_failures == ["armed", "failed"]
+    assert row["seq"] == 1
+    assert ManagerStore(root).read() == [row]
+    info = (root / "audit.lock").lstat()
+    assert info.st_nlink == 1 and (info.st_mode & 0o777) == 0o600
+    assert sorted(os.listdir(root)) == ["audit.jsonl", "audit.lock"]
+
+
+def test_first_append_locks_the_lock_file_a_racing_writer_created(tmp_path, monkeypatch):
+    # The hosted traceback shows the stat after the ENOENT found a private regular
+    # audit.lock: another writer had created it. The retry must open and lock that file.
+    if os.name != "posix":
+        pytest.skip("POSIX descriptor anchoring")
+    root = tmp_path / "audit"
+    created = []
+
+    def racing_creator(real_open, name, flags, mode, dir_fd, attempt):
+        if attempt == 1:
+            other = real_open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dir_fd)
+            created.append(os.fstat(other).st_ino)
+            os.close(other)
+            raise _enoent(name)
+        return real_open(name, flags, mode, dir_fd=dir_fd)
+
+    with monkeypatch.context() as patch:
+        calls = _route_lock_opens(patch, racing_creator)
+        ManagerStore(root).append({"kind": "scan"})
+    assert len(calls) == 2
+    # The stat found the racing writer's file, so the retry only looks it up (no O_CREAT).
+    assert calls[0] & os.O_CREAT and calls[1] == calls[0] & ~os.O_CREAT
+    info = (root / "audit.lock").lstat()
+    assert info.st_ino == created[0]
+    assert info.st_nlink == 1 and (info.st_mode & 0o777) == 0o600
+    assert [row["kind"] for row in ManagerStore(root).read()] == ["scan"]
+
+
+def test_store_removed_before_the_lock_open_is_unsafe_and_not_recreated(tmp_path, monkeypatch):
+    if os.name != "posix":
+        pytest.skip("POSIX descriptor anchoring")
+    from aegis_core import storage
+    root = tmp_path / "audit"
+    unlinked = []
+
+    def remove_store(real_open, name, flags, mode, dir_fd, attempt):
+        if attempt == 1:
+            root.rmdir()
+            nlink = os.fstat(dir_fd).st_nlink
+            # Shown with -rA: tells a hosted run which branch this platform took.
+            print(f"removed store directory: st_nlink={nlink} platform={sys.platform}")
+            unlinked.append(nlink == 0)
+        return real_open(name, flags, mode, dir_fd=dir_fd)
+
+    with monkeypatch.context() as patch:
+        calls = _route_lock_opens(patch, remove_store)
+        # Linux reports the removed directory with st_nlink 0: refused at once as unsafe.
+        # A platform keeping a nonzero count still fails closed after the bounded attempts.
+        with pytest.raises((ManagerError, FileNotFoundError)) as raised:
+            ManagerStore(root).append({"kind": "scan"})
+    if unlinked[0]:
+        assert isinstance(raised.value, ManagerError) and str(raised.value) == "unsafe_store"
+        assert len(calls) == 1
+    else:
+        assert isinstance(raised.value, FileNotFoundError)
+        assert len(calls) == storage._LOCK_OPEN_ENOENT_ATTEMPTS
+    if sys.platform.startswith("linux"):
+        assert unlinked == [True]
+    assert not root.exists()
+    assert os.listdir(tmp_path) == []
