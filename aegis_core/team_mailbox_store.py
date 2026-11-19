@@ -24,6 +24,7 @@ except ImportError:
 
 from aegis_core.workspace.layout import UserLayout
 from aegis_core.team_mailbox_primitives import (
+    render_mailbox_refusal,
     BusyError, MailboxRefusal, MAX_BYTES, MAX_RECORDS, MAX_STATUS_EVIDENCE_BYTES, MAX_RELEASE_WARNINGS,
     SHA256, SLUG, LockReleaseWarning, bounded_tree, lock_path, matching, require, safe_path, strict_json, validate_warnings, witness_record,
 )
@@ -92,7 +93,8 @@ def _account_home():
     require(type(home) is str and bool(home), reason="missing")
     try:
         return safe_path(home)
-    except MailboxRefusal:
+    except MailboxRefusal as error:
+        render_mailbox_refusal(error)
         raise MailboxRefusal("missing") from None
 
 
@@ -127,8 +129,24 @@ class _WitnessStage(str):
 class Store:
     """Use as a context or close explicitly. Paths are lexical names under held roots."""
     def __init__(self, root, *, delivery_roots=()):
+        self._initialize(root, delivery_roots=delivery_roots, parent_anchor=False)
+
+    @classmethod
+    def from_parent(cls, parent):
+        """Bind an initializer's selected parent without trusting its grandparent.
+
+        The selected directory must be owner-held and non-writable by others.
+        Reopen through the shared no-follow walk to refuse replacement during
+        validation, then confine every operation to this held parent's subtree.
+        """
+        store = cls.__new__(cls)
+        store._initialize(parent, delivery_roots=(), parent_anchor=True)
+        return store
+
+    def _initialize(self, root, *, delivery_roots, parent_anchor):
         require(descriptor_supported(), reason="unsupported_platform")
         self.root = safe_path(root)
+        self._parent_anchor = parent_anchor
         require(type(delivery_roots) in (tuple, list) and len(delivery_roots) <= 256)
         self.delivery_roots = tuple(safe_path(path) for path in delivery_roots)
         self.fd = self.parent_fd = None
@@ -138,10 +156,16 @@ class Store:
         self._warning_reservations = 0
         try:
             with refusals():
-                self.parent_fd = _open_absolute(self.root.parent)
+                self.parent_fd = _open_absolute(self.root if parent_anchor else self.root.parent)
                 _private_directory(self.parent_fd)
-                self.fd = os.open(self.root.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                                  dir_fd=self.parent_fd)
+                if parent_anchor:
+                    before = os.fstat(self.parent_fd)
+                    self.fd = _open_absolute(self.root)
+                    after = os.fstat(self.fd)
+                    require((before.st_dev, before.st_ino) == (after.st_dev, after.st_ino), reason="unsafe_path")
+                else:
+                    self.fd = os.open(self.root.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                      dir_fd=self.parent_fd)
                 _private_directory(self.fd)
             self._finalizer = weakref.finalize(self, _close_all, (self.fd, self.parent_fd))
         except BaseException:
@@ -167,6 +191,7 @@ class Store:
         try:
             return self.fd, path.relative_to(self.root).parts
         except ValueError:
+            require(not self._parent_anchor, reason="unsafe_path")
             try:
                 return self.parent_fd, path.relative_to(self.root.parent).parts
             except ValueError:
@@ -393,9 +418,9 @@ class Store:
                         _regular(info)
                     return True
         except MailboxRefusal as error:
-            if error.reason == "missing":
+            if render_mailbox_refusal(error)["reason"] == "missing":
                 return False
-            raise
+            render_mailbox_refusal(error, reraise=True)
 
     def entries(self, path, *, missing=False, parent=None):
         """Stream the census under a cap before allocating a sortable name list."""
@@ -411,9 +436,9 @@ class Store:
                         _regular(entry.stat(follow_symlinks=False))
                         result.append(Path(path) / entry.name)
         except MailboxRefusal as error:
-            if missing and error.reason == "missing" and not opened:
+            if missing and render_mailbox_refusal(error)["reason"] == "missing" and not opened:
                 return []
-            raise
+            render_mailbox_refusal(error, reraise=True)
         return sorted(result)
 
     def require_room(self, directory, needed=1):
@@ -582,10 +607,12 @@ class Store:
                 with self.lock(directory, destination=destination, parent=parent, owner=owner):
                     yield
                     completed = True
-            except (MailboxRefusal, OSError):
+            except (MailboxRefusal, OSError) as error:
                 if completed:
                     self._record_release_warning(slot)
-                if not completed or not transaction["committed"]:
+                if isinstance(error, MailboxRefusal):
+                    render_mailbox_refusal(error, reraise=not completed or not transaction["committed"])
+                elif not completed or not transaction["committed"]:
                     raise
 
     def publish_status_evidence(self, directory, raw, sha256, *, warnings=None):
@@ -647,9 +674,11 @@ class Store:
                     self._local.held = getattr(self._local, "held", set()) - {key}
                     try:
                         os.unlink(name, dir_fd=parent)
-                    except (MailboxRefusal, OSError):
+                    except (MailboxRefusal, OSError) as error:
                         self._record_release_warning(slot)
-                        if not completed:
+                        if isinstance(error, MailboxRefusal):
+                            render_mailbox_refusal(error, reraise=not completed)
+                        elif not completed:
                             raise
 
 

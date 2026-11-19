@@ -2,10 +2,17 @@
 
 Role tables and permissions are owner-injected policy; they confer no OS authority.
 Records retain the legacy wire format. No tools imports or process execution.
+Public mailbox boundaries render refusals from raw state and known advice families,
+never from instance methods. Class-creation checks are defence in depth: mixins,
+hooks skipping super(), __getattribute__ and metaclasses are outside those checks'
+scope. Direct calls to a custom subclass's own as_dict outside these boundaries
+are also outside this guarantee.
+Generic base-class handlers may mask an __init__-bypassing subclass; masking
+yields no unadvised output; honest construction fails loudly before any handler.
 """
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import wraps
@@ -14,12 +21,13 @@ import json
 import math
 from pathlib import Path
 import re
+import sys
 from types import MappingProxyType
 
 from aegis_core.primitives import json_preflight, sanitize_display
 from aegis_core.redaction import clip_rendered_text, guidance_value
 
-__all__ = ["MailboxRefusal", "BusyError", "RoleTables", "MAX_BYTES", "MAX_RECORDS",
+__all__ = ["MailboxRefusal", "MailboxReasonError", "render_mailbox_refusal", "BusyError", "RoleTables", "MAX_BYTES", "MAX_RECORDS",
            "bounded_tree", "strict_json", "encoded", "digest", "parse_time", "safe_path",
            "fields", "text", "integer", "matching", "strings", "operation", "validation",
            "status_entries", "bounded_inbox", "message_types", "record_types",
@@ -79,26 +87,250 @@ _NEXT = {
 }
 
 
+_MANIFEST_REPAIR_ACTIONS = {
+    "manifest": "Restore a bounded manifest with schema, writer_limit, endpoints and counterparts before retrying.",
+    "schema": "Repair the manifest schema field to use aegis.hierarchy-pilot/v1 before retrying.",
+    "writer_limit": "Repair the manifest writer_limit field to use an integer within the owner writer ceiling before retrying.",
+    "endpoints": "Repair the manifest endpoints field: check endpoint names, lane kinds and required hierarchy roles before retrying.",
+    "counterparts": "Repair the manifest counterparts field: check endpoint pairs, cross-hierarchy roles and unique membership before retrying.",
+}
+
+
+@contextmanager
+def _manifest_field(field):
+    """Attach only source-selected advice; legacy labels may contain input values."""
+    try:
+        yield
+    except MailboxRefusal as error:
+        payload = render_mailbox_refusal(error)
+        refusal = MailboxRefusal(payload["reason"])
+        refusal.next_action = _MANIFEST_REPAIR_ACTIONS[field]
+        render_mailbox_refusal(refusal, reraise=True)
+
+
+class MailboxReasonError(Exception):
+    """Programming error: a refusal reason has no fixed recovery advice."""
+
+
+_RECORD_ADVICE = MappingProxyType({
+    "E_FORMAT": "Supply a valid canonical record and matching retry arguments.",
+    "E_HASH": "Restore the record bytes from trusted evidence.",
+    "E_AUTH": "Use the current binding and granted record references.",
+    "E_REF": "Use a validated existing message or record reference.",
+    "E_SELECTOR": "Select fields present in the record schema.",
+    "E_SPAN": "Select spans present in the validated record.",
+    "E_LIMIT": "Reduce the record, selection or retained history.",
+})
+
+
+def _refusal_error(reason, *, consumption=False):
+    shown = (guidance_value(reason, limit=160, canonicalize=sanitize_display)
+             if type(reason) is str else "<non-string>")
+    shown = clip_rendered_text(shown, limit=160, canonicalize=sanitize_display)
+    message = ("mailbox refusal advice does not match reason: " if consumption
+               else "mailbox refusal reason has no advice: ")
+    raise MailboxReasonError(message + (shown or "<empty>")) from None
+
+
+def _refusal_policy(cls):
+    table = getattr(cls, "advice_table", None)
+    if table is MailboxRefusal.advice_table:
+        table = _NEXT
+    contract = getattr(cls, "advice_contract", None)
+    if (type(table) not in (dict, MappingProxyType) or not 0 < len(table) <= 128
+            or type(contract) is not str or contract not in {"mailbox", "busy", "record_codec"}):
+        raise MailboxReasonError("invalid mailbox refusal advice declaration") from None
+    for key, value in table.items():
+        if (type(key) is not str or not 0 < len(key) <= 160
+                or type(value) is not str or not 0 < len(value) <= MAX_BYTES):
+            raise MailboxReasonError("invalid mailbox refusal advice declaration") from None
+    return table, contract
+
+
+def _record_advice(state, reason, action, *, initializing=False):
+    record = state.get("record_error")
+    if type(record) is not dict or len(record) > 128:
+        _refusal_error(reason, consumption=True)
+    detail = record.get("error")
+    if type(detail) is not dict or len(detail) > 128:
+        _refusal_error(reason, consumption=True)
+    if initializing:
+        reason = detail.get("code")
+    if (type(reason) is not str or reason not in _RECORD_ADVICE
+            or type(detail.get("code")) is not str or detail["code"] != reason):
+        _refusal_error(reason, consumption=True)
+    selected = detail.get("next_action", _RECORD_ADVICE[reason])
+    if initializing:
+        action = selected
+    if (type(selected) is not str or not 0 < len(selected) <= MAX_BYTES
+            or action not in (selected, _RECORD_ADVICE[reason])):
+        _refusal_error(reason, consumption=True)
+    # Retain envelope bytes while making its advice fields an independent snapshot.
+    return {**record, "error": dict(detail)}
+
+
+def _refusal_state(error):
+    state = object.__getattribute__(error, "__dict__")
+    table, contract = _refusal_policy(type(error))
+    return _refusal_values(state, table, contract)
+
+
+def _refusal_values(state, table, contract):
+    reason, action = state.get("reason"), state.get("next_action")
+    code, status = state.get("code"), state.get("status")
+    if (type(reason) is not str or type(action) is not str or not 0 < len(action) <= MAX_BYTES
+            or type(code) is not int or code != 1 or type(status) is not str or status != "refused"):
+        _refusal_error(reason, consumption=True)
+    record = None
+    if contract == "record_codec":
+        record = _record_advice(state, reason, action)
+    else:
+        if reason not in table or contract == "busy" and reason != "busy":
+            _refusal_error(reason, consumption=True)
+        allowed = action == table[reason]
+        if (not allowed and contract == "mailbox" and table is _NEXT
+                and reason in {"invalid_record", "too_large"}):
+            allowed = action in _MANIFEST_REPAIR_ACTIONS.values()
+        if not allowed and contract == "busy":
+            path = state.get("_busy_path")
+            if type(path) is type(Path()):
+                try:
+                    expected = ("Inspect the current writer or abandoned lock at " + lock_display(path)
+                                + "; retry only after release.")
+                except MailboxRefusal:
+                    _refusal_error(reason, consumption=True)
+                allowed = action == expected
+        if not allowed:
+            _refusal_error(reason, consumption=True)
+    return {"status": status, "reason": reason, "next_action": action, "code": code}, record, contract
+
+
+
+def render_mailbox_refusal(error, *, record=False, reraise=False):
+    """Render known-family state; optionally rethrow a safe family instance.
+
+    Subclass metadata and instance methods supply no rendering authority.
+    Rebuilding exceptions also prevents a later caller from invoking an
+    overridden serializer after the boundary has validated their raw state.
+    """
+    module = sys.modules.get("aegis_core.team_mailbox_records")
+    record_family = vars(module).get("RecordRefusal") if module is not None else None
+    family = None
+    for base in type.__getattribute__(type(error), "__mro__"):
+        if base is BusyError or base is MailboxRefusal or base is record_family:
+            family = base
+            break
+    if family is None:
+        _refusal_error(None, consumption=True)
+    contract = ("busy" if family is BusyError else
+                "record_codec" if family is record_family else "mailbox")
+    state = object.__getattribute__(error, "__dict__")
+    payload, envelope, _contract = _refusal_values(state, _NEXT, contract)
+    if reraise:
+        refusal = ValueError.__new__(family)
+        refusal.reason, refusal.next_action = payload["reason"], payload["next_action"]
+        refusal.code, refusal.status = payload["code"], payload["status"]
+        if contract == "record_codec":
+            refusal.record_error = envelope
+        if contract == "busy":
+            refusal._busy_path = state.get("_busy_path")
+        ValueError.__init__(refusal, _refusal_message(payload, contract))
+        raise refusal from None
+    return envelope if record and contract == "record_codec" else payload
+
+
+def _refusal_message(payload, contract):
+    prefix = "record refused: " if contract == "record_codec" else "mailbox refused: "
+    return prefix + payload["reason"]
+
+
 class MailboxRefusal(ValueError):
-    """Operational refusal: code 1, fixed reason and a concrete next action."""
+    """Operational refusal: code 1, fixed reason and a concrete next action.
+
+    Advice is checked before construction and again at consumption. Subclasses
+    overriding initialization must declare their own table or advice contract.
+    The dictionary, text and public payload fields share one validation boundary.
+    """
+    advice_table = _NEXT
+    advice_contract = "mailbox"
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if any(name in cls.__dict__ for name in ("as_dict", "__str__", "__repr__", "__getattribute__")):
+            raise MailboxReasonError("mailbox refusal consumption methods cannot be overridden") from None
+        if "__init__" in cls.__dict__ and not any(
+                name in cls.__dict__ for name in ("advice_table", "advice_contract")):
+            raise MailboxReasonError("mailbox refusal initializer must declare advice") from None
+        _refusal_policy(cls)
+        if "__init__" in cls.__dict__:
+            initializer = cls.__dict__["__init__"]
+            if not callable(initializer):
+                raise MailboxReasonError("invalid mailbox refusal advice declaration") from None
+
+            @wraps(initializer)
+            def initialize(self, *args, **kwargs):
+                state = object.__getattribute__(self, "__dict__")
+                depth = state.get("_refusal_initializing", 0)
+                if type(depth) is not int or not 0 <= depth < 32:
+                    _refusal_error(state.get("reason"), consumption=True)
+                state["_refusal_initializing"] = depth + 1
+                try:
+                    result = initializer(self, *args, **kwargs)
+                    if result is not None:
+                        raise MailboxReasonError("mailbox refusal initializer must return None") from None
+                finally:
+                    state["_refusal_initializing"] = depth
+                if depth == 0:
+                    _refusal_state(self)
+            cls.__init__ = initialize
+
     def __init__(self, reason):
+        table, contract = _refusal_policy(type(self))
+        table = _RECORD_ADVICE if contract == "record_codec" else table
+        if type(reason) is not str or reason not in table:
+            _refusal_error(reason)
         self.reason = reason
-        self.next_action = _NEXT[reason]
+        self.next_action = table[reason]
         self.code = 1
         self.status = "refused"
         super().__init__("mailbox refused: " + reason)
 
     def as_dict(self):
-        return {"status": self.status, "reason": self.reason,
-                "next_action": self.next_action, "code": self.code}
+        return _refusal_state(self)[0]
+
+    def __getattribute__(self, name):
+        if name in {"reason", "next_action", "code", "status", "record_error", "args"}:
+            state = object.__getattribute__(self, "__dict__")
+            if (name == "record_error" and state.get("_refusal_initializing", 0)
+                    and _refusal_policy(type(self))[1] == "record_codec"):
+                return _record_advice(state, None, None, initializing=True)
+            payload, record, contract = _refusal_state(self)
+            if name in payload:
+                return payload[name]
+            if name == "record_error" and contract == "record_codec":
+                return record
+            if name == "args":
+                return (_refusal_message(payload, contract),)
+        return object.__getattribute__(self, name)
+
+    def __str__(self):
+        payload, _record, contract = _refusal_state(self)
+        return _refusal_message(payload, contract)
+
+    def __repr__(self):
+        return type(self).__name__ + "(" + repr(MailboxRefusal.__str__(self)) + ")"
 
 
 class BusyError(MailboxRefusal):
     """One lock-busy type, shared by every mailbox writer."""
+    advice_table = _NEXT
+    advice_contract = "busy"
+
     def __init__(self, path=None):
         super().__init__("busy")
+        self._busy_path = safe_path(path) if path is not None else None
         if path is not None:
-            self.next_action = "Inspect the current writer or abandoned lock at " + lock_display(path) + "; retry only after release."
+            self.next_action = "Inspect the current writer or abandoned lock at " + lock_display(self._busy_path) + "; retry only after release."
 
 
 @dataclass(frozen=True)
@@ -243,17 +475,26 @@ def bounded_tree(value, *, limit=MAX_BYTES, ascii_strings=False):
         require(budget[1] <= MAX_JSON_NODES, reason="too_large")
         if type(item) is str:
             require(len(item) <= budget[0], reason="too_large")
-            for char in item:
-                code = ord(char)
-                require(not 0xD800 <= code <= 0xDFFF)
+            if item.isascii():
+                budget[0] -= len(item)
                 if ascii_strings:
-                    cost = (2 if char in ('"', "\\", "\b", "\f", "\n", "\r", "\t")
-                            else 6 if code < 32 or 127 <= code <= 65535
-                            else 12 if code > 65535 else 1)
-                else:
-                    cost = 1 if code < 128 else 2 if code < 2048 else 3 if code < 65536 else 4
-                budget[0] -= cost
-                require(budget[0] >= 0, reason="too_large")
+                    budget[0] -= item.count('"') + item.count("\\")
+                    if not item.isprintable():
+                        budget[0] -= 5 * item.count("\x7f")
+                        budget[0] -= sum(item.count(chr(code)) * (1 if code in (8, 9, 10, 12, 13) else 5)
+                                         for code in range(32))
+            else:
+                for char in item:
+                    code = ord(char)
+                    require(not 0xD800 <= code <= 0xDFFF)
+                    if ascii_strings:
+                        cost = (2 if char in ('"', "\\", "\b", "\f", "\n", "\r", "\t")
+                                else 6 if code < 32 or 127 <= code <= 65535
+                                else 12 if code > 65535 else 1)
+                    else:
+                        cost = 1 if code < 128 else 2 if code < 2048 else 3 if code < 65536 else 4
+                    budget[0] -= cost
+                    require(budget[0] >= 0, reason="too_large")
             budget[0] -= 2
         elif type(item) in (dict, list, tuple):
             require(depth < MAX_JSON_DEPTH)
@@ -298,8 +539,8 @@ def strict_json(raw):
         result = json.loads(checked, object_pairs_hook=pairs, parse_constant=nonfinite)
         bounded_tree(result)
         return result
-    except MailboxRefusal:
-        raise
+    except MailboxRefusal as error:
+        render_mailbox_refusal(error, reraise=True)
     except (ValueError, UnicodeError, RecursionError, OverflowError):
         raise MailboxRefusal("invalid_record") from None
 
@@ -348,8 +589,8 @@ def operation(write=False, *, evidence=False, authorization=None, envelope=False
                     if warnings:
                         result = {**result, "warnings": warnings}
                 return result
-            except MailboxRefusal:
-                raise
+            except MailboxRefusal as error:
+                render_mailbox_refusal(error, reraise=True)
             except OSError:
                 raise MailboxRefusal("io") from None
             except (ValueError, KeyError, UnicodeError, RecursionError, OverflowError):
@@ -366,8 +607,8 @@ def validation(function):
     def call(*args, **kwargs):
         try:
             return function(*args, **kwargs)
-        except MailboxRefusal:
-            raise
+        except MailboxRefusal as error:
+            render_mailbox_refusal(error, reraise=True)
         except (ValueError, KeyError, UnicodeError, RecursionError, OverflowError):
             raise MailboxRefusal("invalid_record") from None
     return call
@@ -513,36 +754,41 @@ class RoleTables:
 
 
     def validate_manifest(self, manifest):
-        bounded_tree(manifest)
-        fields(manifest, {"schema", "endpoints", "counterparts", "writer_limit"})
-        require(manifest["schema"] == "aegis.hierarchy-pilot/v1", "unsupported manifest schema")
-        integer(manifest["writer_limit"], "writer_limit", maximum=MAX_WRITERS)
-        endpoints = manifest["endpoints"]
-        require(isinstance(endpoints, dict) and 0 < len(endpoints) <= 256, "invalid endpoints")
-        hierarchies = set()
-        for endpoint, definition in endpoints.items():
-            parts = self.endpoint_parts(endpoint)
-            hierarchies.add(parts[0])
-            if parts[1] == "lane":
-                fields(definition, {"kind"})
-                require(isinstance(definition["kind"], str) and definition["kind"] in self.lane_kinds, "invalid lane kind")
-            else:
-                fields(definition, set())
-        for hierarchy in hierarchies:
-            require(hierarchy + "/front-door" in endpoints and hierarchy + "/orchestrator" in endpoints,
-                    "each hierarchy requires a front door and orchestrator")
-        counterparts = manifest["counterparts"]
-        require(isinstance(counterparts, list) and len(counterparts) <= 256, "invalid counterparts")
-        paired = set()
-        for pair in counterparts:
-            require(isinstance(pair, list) and len(pair) == 2 and all(isinstance(p, str) and p in endpoints for p in pair),
-                    "counterparts must name two endpoints")
-            left, right = (self.endpoint_parts(p) for p in pair)
-            require("root" not in (left[1], right[1]), "root endpoints cannot be counterparts")
-            require(left[0] != right[0] and left[1] == right[1], "counterparts must have the same role across hierarchies")
-            require(left[1] in self.across_roles, "only front doors, orchestrators and lanes can be counterparts")
-            require(not any(p in paired for p in pair), "endpoint has more than one counterpart")
-            paired.update(pair)
+        with _manifest_field("manifest"):
+            bounded_tree(manifest)
+            fields(manifest, {"schema", "endpoints", "counterparts", "writer_limit"})
+        with _manifest_field("schema"):
+            require(manifest["schema"] == "aegis.hierarchy-pilot/v1", "unsupported manifest schema")
+        with _manifest_field("writer_limit"):
+            integer(manifest["writer_limit"], "writer_limit", maximum=MAX_WRITERS)
+        with _manifest_field("endpoints"):
+            endpoints = manifest["endpoints"]
+            require(isinstance(endpoints, dict) and 0 < len(endpoints) <= 256, "invalid endpoints")
+            hierarchies = set()
+            for endpoint, definition in endpoints.items():
+                parts = self.endpoint_parts(endpoint)
+                hierarchies.add(parts[0])
+                if parts[1] == "lane":
+                    fields(definition, {"kind"})
+                    require(isinstance(definition["kind"], str) and definition["kind"] in self.lane_kinds, "invalid lane kind")
+                else:
+                    fields(definition, set())
+            for hierarchy in hierarchies:
+                require(hierarchy + "/front-door" in endpoints and hierarchy + "/orchestrator" in endpoints,
+                        "each hierarchy requires a front door and orchestrator")
+        with _manifest_field("counterparts"):
+            counterparts = manifest["counterparts"]
+            require(isinstance(counterparts, list) and len(counterparts) <= 256, "invalid counterparts")
+            paired = set()
+            for pair in counterparts:
+                require(isinstance(pair, list) and len(pair) == 2 and all(isinstance(p, str) and p in endpoints for p in pair),
+                        "counterparts must name two endpoints")
+                left, right = (self.endpoint_parts(p) for p in pair)
+                require("root" not in (left[1], right[1]), "root endpoints cannot be counterparts")
+                require(left[0] != right[0] and left[1] == right[1], "counterparts must have the same role across hierarchies")
+                require(left[1] in self.across_roles, "only front doors, orchestrators and lanes can be counterparts")
+                require(not any(p in paired for p in pair), "endpoint has more than one counterpart")
+                paired.update(pair)
         return manifest
 
 

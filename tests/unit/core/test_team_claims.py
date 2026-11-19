@@ -92,6 +92,15 @@ def test_unclaim_preserves_queue_workspace_contract(make_store, binding_home, mo
     make_store.rename(root)
     assert queue.valid_workspace_spelling(str(root))
     assert not (Path(binding_home) / ".config/aegis" / binding.NAME).exists()
+    if shape == "depth-256":
+        # Exercise the binding seam at 256; depth 129 keeps the full transition.
+        with storage.locked(root):
+            with binding.claim_exclusion(root, validated_workspace=True):
+                state = json.loads((root / ".aegis/state/team-queue.json").read_bytes())
+                team_claims.check_writer(root, state, "ONE", "alpha", True)
+        # Retain the completion assertions without repeated Git work at 256.
+        root.rename(make_store)
+        root = make_store
     result = unclaim(root, revision)
     assert result["exit_code"] == 0 and result["item"]["state"] == "queued", result
     assert team.read_leases(root).get("alpha") is None

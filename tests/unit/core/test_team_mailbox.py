@@ -21,6 +21,15 @@ from aegis_core import team_mailbox as mail
 from aegis_core import team_mailbox_delivery as delivery_module
 from aegis_core import team_mailbox_store as store_module
 from aegis_core import team_mailbox_primitives as primitives
+from aegis_core import team_mailbox_records as records_module
+from aegis_core import message_codec as record_codec
+from aegis_core import team_mailbox_pager as pager_module
+from aegis_core import team_mailbox_guidance as guidance_module
+from aegis_core import team_board as board_module
+from aegis_core import team_lifecycle as lifecycle_module
+from aegis_core import team_roles as roles_module
+from aegis_core import team_host_plan as host_plan_module
+from aegis_core import team_host_registry as host_registry_module
 from aegis_core.team_mailbox_primitives import BusyError, MailboxRefusal, RoleTables
 from aegis_core.workspace.layout import UserLayout
 from tools import hierarchy_mailbox as legacy
@@ -95,6 +104,107 @@ def populated(tmp_path):
 
 def refusal(reason):
     return pytest.raises(MailboxRefusal, match="^mailbox refused: " + reason + "$")
+
+
+MANIFEST_REPAIR_ACTIONS = {
+    "manifest": "Restore a bounded manifest with schema, writer_limit, endpoints and counterparts before retrying.",
+    "schema": "Repair the manifest schema field to use aegis.hierarchy-pilot/v1 before retrying.",
+    "writer_limit": "Repair the manifest writer_limit field to use an integer within the owner writer ceiling before retrying.",
+    "endpoints": "Repair the manifest endpoints field: check endpoint names, lane kinds and required hierarchy roles before retrying.",
+    "counterparts": "Repair the manifest counterparts field: check endpoint pairs, cross-hierarchy roles and unique membership before retrying.",
+}
+
+
+@pytest.mark.parametrize("field,patch,reason", [
+    ("manifest", None, "invalid_record"),
+    ("manifest", {"extra": "PRIVATE\nmanifest"}, "invalid_record"),
+    ("manifest", {"schema": "x" * 262145}, "too_large"),
+    ("schema", {"schema": "PRIVATE\nschema"}, "invalid_record"),
+    ("writer_limit", {"writer_limit": "PRIVATE\nwriter"}, "invalid_record"),
+    ("writer_limit", {"writer_limit": True}, "invalid_record"),
+    ("writer_limit", {"writer_limit": 6}, "invalid_record"),
+    ("endpoints", {"endpoints": []}, "invalid_record"),
+    ("endpoints", {"endpoints": {}}, "invalid_record"),
+    ("endpoints", {"endpoints": {"alpha/lane/worker" + str(i): {"kind": "reviewer"}
+                                for i in range(257)}}, "invalid_record"),
+    ("endpoints", {"endpoints": {"PRIVATE\nendpoint": {}}}, "invalid_record"),
+    ("endpoints", {"endpoints": {"alpha/front-door": {"PRIVATE": "definition"}}}, "invalid_record"),
+    ("endpoints", {"endpoints": {"alpha/lane/work": {"kind": "PRIVATE\nkind"}}}, "invalid_record"),
+    ("endpoints", {"endpoints": {"alpha/root": {}}}, "invalid_record"),
+    ("counterparts", {"counterparts": "PRIVATE\npairs"}, "invalid_record"),
+    ("counterparts", {"counterparts": [[]] * 257}, "invalid_record"),
+    ("counterparts", {"counterparts": [["PRIVATE\npair", "alpha/front-door"]]}, "invalid_record"),
+    ("counterparts", {"counterparts": [["alpha/root", "alpha/front-door"]]}, "invalid_record"),
+    ("counterparts", {"counterparts": [["alpha/front-door", "alpha/orchestrator"]]}, "invalid_record"),
+], ids=["shape", "extra", "budget", "schema", "writer-type", "writer-bool", "writer-ceiling",
+        "endpoints-type", "endpoints-empty", "endpoints-limit", "endpoint-name", "endpoint-definition", "lane-kind",
+        "hierarchy-roles", "counterparts-type", "counterparts-limit", "counterpart-name", "counterpart-root", "counterpart-role"])
+def test_initialize_manifest_repair_context_is_fixed_before_storage(tmp_path, monkeypatch, field, patch, reason):
+    def unexpected_storage(*args, **kwargs):
+        pytest.fail("invalid manifest reached storage")
+
+    monkeypatch.setattr(mail, "initialize_store", unexpected_storage)
+    candidate = None if patch is None else {**MANIFEST, **patch}
+    root = tmp_path / "candidate"
+    for _ in range(2):
+        with refusal(reason) as caught:
+            mail.initialize(root, candidate, roles=ROLES, caller_role="owner")
+        assert caught.value.as_dict() == {"status": "refused", "reason": reason, "code": 1,
+                                          "next_action": MANIFEST_REPAIR_ACTIONS[field]}
+        assert "PRIVATE" not in str(caught.value) + json.dumps(caught.value.as_dict())
+        assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("field", ["schema", "writer_limit", "endpoints", "counterparts"])
+def test_initialize_manifest_repair_then_retry_preserves_existing_store(tmp_path, field):
+    existing = make_store(tmp_path)
+    before = snapshot(existing)
+    root = tmp_path / "candidate"
+    with refusal("invalid_record") as caught:
+        mail.initialize(root, {**MANIFEST, field: None}, roles=ROLES, caller_role="owner")
+    assert caught.value.next_action == MANIFEST_REPAIR_ACTIONS[field]
+    assert snapshot(existing) == before and not root.exists()
+    mail.initialize(root, MANIFEST, roles=ROLES, caller_role="owner")
+    with mailbox(root) as box:
+        assert box.manifest == MANIFEST
+    assert snapshot(existing) == before
+
+
+def test_initialize_manifest_repair_context_is_local_to_concurrent_calls(tmp_path):
+    fields = ["schema", "writer_limit", "endpoints", "counterparts"] * 8
+
+    def rejected(field):
+        with refusal("invalid_record") as caught:
+            mail.initialize(tmp_path / "candidate", {**MANIFEST, field: None}, roles=ROLES, caller_role="owner")
+        return caught.value.as_dict()
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(rejected, fields))
+    assert [result["next_action"] for result in results] == [MANIFEST_REPAIR_ACTIONS[field] for field in fields]
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("pairs", [
+    [["alpha/front-door", "beta/orchestrator"]],
+    [["alpha/router", "beta/router"]],
+    [["alpha/front-door", "beta/front-door"]] * 2,
+], ids=["different-roles", "unsupported-role", "duplicate-membership"])
+def test_initialize_manifest_counterpart_constraints_have_fixed_repair(tmp_path, pairs):
+    endpoints = {**MANIFEST["endpoints"], "alpha/router": {}, "beta/router": {},
+                 "beta/front-door": {}, "beta/orchestrator": {}}
+    candidate = {**MANIFEST, "endpoints": endpoints, "counterparts": pairs}
+    with refusal("invalid_record") as caught:
+        mail.initialize(tmp_path / "candidate", candidate, roles=ROLES, caller_role="owner")
+    assert caught.value.next_action == MANIFEST_REPAIR_ACTIONS["counterparts"]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_initialize_storage_refusal_keeps_platform_repair_advice(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_module, "descriptor_supported", lambda: False)
+    with refusal("unsupported_platform") as caught:
+        mail.initialize(tmp_path / "candidate", MANIFEST, roles=ROLES, caller_role="owner")
+    assert caught.value.as_dict() == MailboxRefusal("unsupported_platform").as_dict()
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_publish_inbox_and_retry(tmp_path):
@@ -707,6 +817,170 @@ def replacement_request(tmp_path, generation):
 
 def handoff_ack(binding):
     return {key: binding[key] for key in ("endpoint", "generation", "session", "checkpoint_sha256")}
+
+
+@pytest.mark.parametrize("ascii_strings", [False, True])
+@pytest.mark.parametrize("value", ["", "plain ASCII " * 1024, ''.join(chr(i) for i in range(128)),
+    "quote\"\\\b\f\n\r\t\x00\x1f\x7f", 'printable "quotes" and \\slashes',
+    "é中😀", ["a\n", {"quoted\"": "é😀"}]],
+    ids=["empty", "ordinary", "all-ascii", "escapes", "printable-escapes", "unicode", "nested"])
+def test_bounded_tree_string_wire_boundaries_and_retry(value, ascii_strings):
+    def utf8_budget(item):
+        if type(item) is str:
+            return len(item.encode("utf-8")) + 2
+        if type(item) is dict:
+            return 2 + max(0, len(item) - 1) + len(item) + sum(
+                utf8_budget(key) + utf8_budget(entry) for key, entry in item.items())
+        return 2 + max(0, len(item) - 1) + sum(utf8_budget(entry) for entry in item)
+
+    size = (len(json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode("utf-8"))
+            if ascii_strings else utf8_budget(value))
+    for _ in range(2):
+        with refusal("too_large") as caught:
+            primitives.bounded_tree(value, limit=size - 1, ascii_strings=ascii_strings)
+        assert caught.value.as_dict() == MailboxRefusal("too_large").as_dict()
+        assert primitives.bounded_tree(value, limit=size, ascii_strings=ascii_strings) is None
+
+
+@pytest.mark.parametrize("ascii_strings", [False, True])
+@pytest.mark.parametrize("value,limit,reason", [("a\ud800", 1, "too_large"),
+    ("\n\n\udfff", 3, "invalid_record"), ("a\ud800", 100, "invalid_record")])
+def test_bounded_tree_surrogate_refusal_precedence(value, limit, reason, ascii_strings):
+    # An escaped newline can exhaust the budget before the later surrogate.
+    expected = "too_large" if ascii_strings and value.startswith("\n") else reason
+    with refusal(expected) as caught:
+        primitives.bounded_tree(value, limit=limit, ascii_strings=ascii_strings)
+    assert caught.value.as_dict() == MailboxRefusal(expected).as_dict()
+
+
+def read_binding_surface(box, surface):
+    if surface == "status":
+        return box.status()["bindings"]["alpha/front-door"]
+    if surface == "inbox":
+        return box.inbox("alpha/front-door")["binding"]
+    if surface == "binding_view":
+        return box.binding_view("alpha/front-door")["binding"]
+    return box.fence(request())
+
+
+@pytest.mark.parametrize("surface", ["status", "inbox", "binding_view", "fence"])
+def test_binding_history_read_once_per_operation_then_fresh_retry(tmp_path, monkeypatch, surface):
+    root = make_store(tmp_path)
+    with mailbox(root) as box:
+        bind(box, "alpha/front-door")
+        binding = box.bind(replacement_request(tmp_path, 1))
+        reads = []
+        original_read = store_module.Store.read
+
+        def counted_read(self, path, **kwargs):
+            if path.suffix == ".json" and path.parent.name == "front-door":
+                reads.append(path.name)
+            return original_read(self, path, **kwargs)
+
+        monkeypatch.setattr(store_module.Store, "read", counted_read)
+        sender = {**request(), "session": binding["session"], "binding_generation": 2}
+
+        def observe():
+            reads.clear()
+            if surface == "fence":
+                return box.fence(sender)
+            return read_binding_surface(box, surface)
+
+        before = snapshot(root)
+        if surface == "fence":
+            with refusal("invalid_record"):
+                observe()
+        else:
+            assert observe()["ready"] is False
+        assert reads == ["000001.json", "000002.json"]
+        assert snapshot(root) == before
+        box.acknowledge_handoff(handoff_ack(binding))
+        result = observe()
+        assert result == primitives.binding_record(binding) if surface == "fence" else result["ready"] is True
+        assert reads == ["000001.json", "000002.json"]
+        path = root / "bindings" / "alpha" / "front-door" / "000001.json"
+        raw = path.read_bytes()
+        path.write_bytes(b"{")
+        before = snapshot(root)
+        with refusal("invalid_record") as caught:
+            observe()
+        assert caught.value.as_dict() == MailboxRefusal("invalid_record").as_dict()
+        assert snapshot(root) == before
+        path.write_bytes(raw)
+        observe()
+        assert reads == ["000001.json", "000002.json"]
+
+
+@pytest.mark.parametrize("kind", ["info", "dispatch"])
+def test_publish_validates_sender_and_recipient_histories_once(tmp_path, monkeypatch, kind):
+    root = make_store(tmp_path)
+    brief_path = tmp_path / "dispatch.md"
+    brief_path.write_bytes(b"dispatch brief")
+    brief = {"path": str(brief_path), "sha256": hashlib.sha256(b"dispatch brief").hexdigest()}
+    with mailbox(root) as box:
+        bind(box, "alpha/orchestrator")
+        bind(box, "alpha/lane/review")
+        reads = []
+        original_read = store_module.Store.read
+
+        def counted_read(self, path, **kwargs):
+            if path.suffix == ".json" and "bindings" in path.parts:
+                reads.append(path.relative_to(root).as_posix())
+            return original_read(self, path, **kwargs)
+
+        monkeypatch.setattr(store_module.Store, "read", counted_read)
+        result = box.publish({**request(), "from": "alpha/orchestrator", "session": "alpha/orchestrator",
+                              "to": "alpha/lane/review", "type": kind, "brief": brief})
+        assert result["message"]["type"] == kind
+        assert reads == ["bindings/alpha/orchestrator/000001.json", "bindings/alpha/lane/review/000001.json"]
+
+
+def test_binding_history_reuse_is_local_to_concurrent_operations(tmp_path):
+    root, box = populated(tmp_path)
+    with box:
+        binding = box.bind(replacement_request(tmp_path, 1))
+
+        def observe(endpoint):
+            return box.inbox(endpoint)["binding"]
+
+        endpoints = ["alpha/front-door", "alpha/orchestrator"] * 8
+        before = snapshot(root)
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            results = list(pool.map(observe, endpoints))
+        assert snapshot(root) == before
+        assert [(result["endpoint"], result["generation"], result["ready"]) for result in results] == [
+            (endpoint, 2 if endpoint == "alpha/front-door" else 1, endpoint != "alpha/front-door")
+            for endpoint in endpoints]
+        box.acknowledge_handoff(handoff_ack(binding))
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            assert all(result["ready"] for result in pool.map(observe, endpoints))
+
+
+@pytest.mark.parametrize("surface", ["status", "inbox", "binding_view", "fence", "ready"])
+def test_binding_history_reuse_preserves_reads_during_owner_lock(tmp_path, surface):
+    root, box = populated(tmp_path)
+    entered, release = Event(), Event()
+    with box, mailbox(root) as holder:
+        binding = box.current_binding("alpha/front-door")
+
+        def hold():
+            with holder.store.evidence_transaction():
+                entered.set()
+                assert release.wait(5)
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(hold)
+            try:
+                assert entered.wait(5)
+                before = snapshot(tmp_path)
+                result = box.ready(binding) if surface == "ready" else read_binding_surface(box, surface)
+                assert result is True if surface == "ready" else result["generation"] == 1
+                assert snapshot(tmp_path) == before
+            finally:
+                release.set()
+                future.result(timeout=5)
+        result = box.ready(binding) if surface == "ready" else read_binding_surface(box, surface)
+        assert result is True if surface == "ready" else result["generation"] == 1
 
 
 def test_binding_append_byte_budget_refuses_without_publication_then_retries(tmp_path, monkeypatch):
@@ -3522,3 +3796,1061 @@ def test_delivery_receipt_wire_bytes_after_busy_refusal_and_retry(tmp_path, kind
                     "at": "2026-11-16T12:00:00.000000Z", **receipt}
         assert paths[0].read_bytes() == json.dumps(expected, sort_keys=True, separators=(",", ":")).encode() + b"\n"
         assert box.delivery(directory, message_id="message")["message"]["state"] == state
+
+
+# Captured from the admitted checkout before changing refusal construction.
+REFUSAL_WIRE_SHA256 = {
+    "busy": "88c1d26eb0d381547b018fc4464b660563031b0151c23d4a36f0dbab1abebeda",
+    "closed": "30a41883a0953b7950cb20901f09ed7b4c672b9046d932c3a0f6b6a88aa17607",
+    "delivery_context_required": "61b79521b1c89cf58c1565ac32f9d2b56db444e7576d5c3afa388dbb51aa1ee6",
+    "exists": "1e6d1d86c2ea592de2adf8b07e6a9e4559d9455a75781cd81029db1d32f4cf27",
+    "host_unavailable": "42b241167aa5965fa8813a96d4dc4e4210e8b7e2007a0a5476220b0871e0ea91",
+    "invalid_record": "812a3301d93ed1483f1e32a9e135b5b9357be08b36e43269056e5f9bdc9fa8fc",
+    "io": "362d95e88b1318c552365089907c0b06b94002a33ed217c1dc1b91b340a9b514",
+    "missing": "f1f226b61b310b03d6f417806a32ee988ccf395efd81ec21f6faf90a473aab34",
+    "too_large": "36b641b57a1719462f7c0227fd7fc04c5469349becf14c4cee47d17d4acfff58",
+    "unauthorized": "d86ec41d7d0ebf227580d90ab099450b9e03317cc953b797d66ac5948c340104",
+    "unknown_host": "d114db378f4f63dcc37d33c9cadbec8554e71d1e23f3af4d8d23b87cca563c7d",
+    "unsafe_path": "e0d692d29d99687b605815236109bb78aa9c83f1a63c3c930f993e64ac3378a9",
+    "unsupported_platform": "7b81f3db77b03e445c96a5e5c6436185a23d000468222ed546338d80286f864d",
+}
+REFUSAL_ROUTES = ["constructor", "stored_constructor", "reflected_constructor",
+                  "require", "stored_require", "reflected_require", "subclass"]
+
+
+def raise_refusal_via(route, reason):
+    if route == "constructor":
+        raise MailboxRefusal(reason)
+    if route == "require":
+        primitives.require(False, reason=reason)
+    if route == "subclass":
+        class ChildRefusal(MailboxRefusal):
+            pass
+        raise ChildRefusal(reason)
+    if route == "stored_constructor":
+        callback = MailboxRefusal
+    elif route == "reflected_constructor":
+        callback = getattr(primitives, "MailboxRefusal")
+    elif route == "stored_require":
+        callback = primitives.require
+    else:
+        callback = getattr(primitives, "require")
+    if "require" in route:
+        callback(False, reason=reason)
+    else:
+        raise callback(reason)
+
+
+@pytest.mark.parametrize("route", REFUSAL_ROUTES)
+def test_unknown_mailbox_reason_is_a_programming_error(route):
+    with pytest.raises(Exception) as caught:
+        raise_refusal_via(route, "brand_new")
+    assert type(caught.value).__name__ == "MailboxReasonError"
+    assert type(caught.value) is primitives.MailboxReasonError
+    assert not isinstance(caught.value, (MailboxRefusal, ValueError, KeyError, RuntimeError))
+    assert str(caught.value) == "mailbox refusal reason has no advice: brand_new"
+
+
+@pytest.mark.parametrize("route", ["direct", "stored", "reflected", "subclass"])
+def test_busy_reason_requires_advice_through_every_constructor_route(monkeypatch, route):
+    monkeypatch.setattr(primitives, "_NEXT", {key: value for key, value in primitives._NEXT.items() if key != "busy"})
+    class ChildBusy(BusyError):
+        pass
+    callback = (getattr(primitives, "BusyError") if route == "reflected"
+                else ChildBusy if route == "subclass" else BusyError)
+    with pytest.raises(Exception) as caught:
+        if route == "direct":
+            BusyError()
+        else:
+            callback()
+    assert type(caught.value).__name__ == "MailboxReasonError"
+    assert type(caught.value) is primitives.MailboxReasonError
+    assert str(caught.value) == "mailbox refusal reason has no advice: busy"
+
+
+def test_refusal_wire_baseline_covers_every_advised_reason():
+    assert set(REFUSAL_WIRE_SHA256) == set(primitives._NEXT)
+
+
+@pytest.mark.parametrize("route", REFUSAL_ROUTES)
+@pytest.mark.parametrize("reason,expected", REFUSAL_WIRE_SHA256.items())
+def test_advised_refusal_payload_bytes_match_baseline(route, reason, expected):
+    with pytest.raises(MailboxRefusal) as caught:
+        raise_refusal_via(route, reason)
+    error = caught.value
+    assert error.args == ("mailbox refused: " + reason,)
+    assert error.code == 1 and error.status == "refused" and error.reason == reason
+    assert hashlib.sha256(primitives.encoded(error.as_dict())).hexdigest() == expected
+
+
+def test_busy_refusal_payload_bytes_match_baseline():
+    assert hashlib.sha256(primitives.encoded(BusyError().as_dict())).hexdigest() == REFUSAL_WIRE_SHA256["busy"]
+
+
+@pytest.mark.parametrize("wrapper", ["validation", "operation"])
+def test_programming_reason_error_is_not_normalized_into_an_operational_refusal(tmp_path, wrapper):
+    if wrapper == "validation":
+        @primitives.validation
+        def reject():
+            primitives.require(False, reason="brand_new")
+        call = reject
+    else:
+        @primitives.operation()
+        def reject(box):
+            primitives.require(False, reason="brand_new")
+        root = make_store(tmp_path)
+        with mailbox(root) as box:
+            before = snapshot(root)
+            with pytest.raises(Exception) as caught:
+                reject(box)
+            assert type(caught.value).__name__ == "MailboxReasonError"
+            assert type(caught.value) is primitives.MailboxReasonError
+            assert snapshot(root) == before
+            assert box.bindings("alpha/front-door") == []
+        return
+    with pytest.raises(Exception) as caught:
+        call()
+    assert type(caught.value).__name__ == "MailboxReasonError"
+    assert type(caught.value) is primitives.MailboxReasonError
+
+
+@pytest.mark.parametrize("reason", [None, True, 1, [], {}, object()])
+def test_nonstring_mailbox_reason_uses_a_fixed_programming_diagnostic(reason):
+    with pytest.raises(Exception) as caught:
+        MailboxRefusal(reason)
+    assert type(caught.value).__name__ == "MailboxReasonError"
+    assert type(caught.value) is primitives.MailboxReasonError
+    assert str(caught.value) == "mailbox refusal reason has no advice: <non-string>"
+
+
+def test_mailbox_reason_error_never_calls_untrusted_object_methods():
+    class Untrusted:
+        def __hash__(self):
+            pytest.fail("untrusted hash was called")
+        def __str__(self):
+            pytest.fail("untrusted string conversion was called")
+        def __repr__(self):
+            pytest.fail("untrusted representation was called")
+    with pytest.raises(Exception) as caught:
+        MailboxRefusal(Untrusted())
+    assert type(caught.value).__name__ == "MailboxReasonError"
+    assert str(caught.value) == "mailbox refusal reason has no advice: <non-string>"
+
+
+def test_mailbox_reason_diagnostic_canonicalizes_redacts_then_truncates():
+    secret = "ghp_" + "A" * 36
+    reason = "bad-" + secret[:6] + "\x1b[31m" + secret[6:] + "\n" + "x" * 400
+    with pytest.raises(Exception) as caught:
+        MailboxRefusal(reason)
+    assert type(caught.value).__name__ == "MailboxReasonError"
+    shown = str(caught.value)
+    assert shown.startswith("mailbox refusal reason has no advice: bad-")
+    assert len(shown) <= len("mailbox refusal reason has no advice: ") + 160
+    assert secret not in shown and "ghp_AA" not in shown
+    assert "\x1b" not in shown and "\n" not in shown
+
+
+def test_oversized_mailbox_reason_is_omitted_before_canonicalization(monkeypatch):
+    canonicalize = primitives.sanitize_display
+    def bounded_canonicalization(value, **kwargs):
+        assert len(value) <= 81920, "oversized reason reached canonicalization"
+        return canonicalize(value, **kwargs)
+    monkeypatch.setattr(primitives, "sanitize_display", bounded_canonicalization)
+    with pytest.raises(Exception) as caught:
+        MailboxRefusal("x" * 81921)
+    assert type(caught.value).__name__ == "MailboxReasonError"
+    assert str(caught.value) == "mailbox refusal reason has no advice: diagnostic_omitted_too_large"
+
+
+def test_mailbox_reason_checks_are_independent_across_retries_and_threads():
+    def observed(reason):
+        with pytest.raises(Exception) as caught:
+            raise_refusal_via("reflected_require", reason)
+        if reason == "brand_new":
+            assert type(caught.value).__name__ == "MailboxReasonError"
+            assert type(caught.value) is primitives.MailboxReasonError
+        else:
+            assert type(caught.value) is MailboxRefusal
+        return type(caught.value).__name__, str(caught.value)
+    expected = [("MailboxReasonError", "mailbox refusal reason has no advice: brand_new"),
+                ("MailboxRefusal", "mailbox refused: missing")]
+    assert [observed(reason) for reason in ["brand_new", "missing", "brand_new"]] == [*expected, expected[0]]
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(observed, ["brand_new", "missing"] * 6, timeout=10))
+    assert results == expected * 6
+
+
+def test_mailbox_reason_error_suppresses_untrusted_prior_context():
+    try:
+        raise ValueError("PRIVATE_CONTEXT")
+    except ValueError:
+        with pytest.raises(Exception) as caught:
+            MailboxRefusal("brand_new")
+    assert type(caught.value) is primitives.MailboxReasonError
+    rendered = "".join(traceback.format_exception(type(caught.value), caught.value, caught.value.__traceback__))
+    assert "PRIVATE_CONTEXT" not in rendered
+    assert caught.value.__suppress_context__ is True
+
+
+@pytest.mark.parametrize("reason", ["", "\ud800", "bad\nreason"], ids=["empty", "surrogate", "newline"])
+def test_malformed_string_mailbox_reason_has_a_bounded_programming_diagnostic(reason):
+    with pytest.raises(Exception) as caught:
+        MailboxRefusal(reason)
+    assert type(caught.value) is primitives.MailboxReasonError
+    shown = str(caught.value)
+    assert shown.startswith("mailbox refusal reason has no advice: ")
+    assert len(shown) <= len("mailbox refusal reason has no advice: ") + 160
+    assert "\n" not in shown and "\ud800" not in shown
+
+
+RECORD_REFUSAL_BASELINES = [
+    ('mailbox_publish_record', 'E_FORMAT', '0d861ad8457ef713d99a5a2953c1aaabdc3c9ed9d8ac3ab19bad0e5455ade157', '1d64557c34dded51f96591a808c4eaae793a5ecb23985aade2cc017da5b38628'),
+    ('mailbox_publish_record', 'E_HASH', '23cd9ebdcd7d6c00850d38cdf28575b874b1f1ed1fc52dfb2bd672b0675aa0dd', 'c1ece08db8409cb8551b125526c2faf45da9fd313fcd72c7abc0a88f1ea5af0b'),
+    ('mailbox_publish_record', 'E_AUTH', 'b46c9efab808a152f2b42f17c6cadb729d4f6df0a779f2985a49af8022df5703', '570412bacc676c0a0484043bb716787dc885bdda877711030f2ba2c980b2b738'),
+    ('mailbox_publish_record', 'E_REF', 'c84a1e2601b6eba363d5731e2ae8346cb9d35d1b97baa3cf0eca979cf550c975', 'fc6ab17c22269e85913c1a8a4bc48d4074299bdcaba0838ef904ede3e46b3a61'),
+    ('mailbox_publish_record', 'E_SELECTOR', '9d96c75dba68435b4701b283ce6ba2e4cdc9fdf30fa47bbb93eee887154fb1db', 'b790a82edf11706c9e856239f733dfe96f1e3faa6fa4bf6a5deec6aaffc165f2'),
+    ('mailbox_publish_record', 'E_SPAN', '048b6b6159ee2ceb897fc3fd1b6cfcd5bebeaf59f0a4449a0c6ce1604f1fe56c', '63c62d64a50a6a7e775d6cc9b9212cf45fafb37c7c03a3f528185cfb60510870'),
+    ('mailbox_publish_record', 'E_LIMIT', '689ec6614c1ba084a6bc8569b452aab465af850f8927e3d8fd3e5a6a2d465e04', '4808dc6fd1e77e417a5f02ad6296528f2d3b487cacefe0ad91a04a727b045112'),
+    ('mailbox_read_record', 'E_FORMAT', '0d861ad8457ef713d99a5a2953c1aaabdc3c9ed9d8ac3ab19bad0e5455ade157', '1d64557c34dded51f96591a808c4eaae793a5ecb23985aade2cc017da5b38628'),
+    ('mailbox_read_record', 'E_HASH', '23cd9ebdcd7d6c00850d38cdf28575b874b1f1ed1fc52dfb2bd672b0675aa0dd', 'c1ece08db8409cb8551b125526c2faf45da9fd313fcd72c7abc0a88f1ea5af0b'),
+    ('mailbox_read_record', 'E_AUTH', 'b46c9efab808a152f2b42f17c6cadb729d4f6df0a779f2985a49af8022df5703', '570412bacc676c0a0484043bb716787dc885bdda877711030f2ba2c980b2b738'),
+    ('mailbox_read_record', 'E_REF', 'c84a1e2601b6eba363d5731e2ae8346cb9d35d1b97baa3cf0eca979cf550c975', 'fc6ab17c22269e85913c1a8a4bc48d4074299bdcaba0838ef904ede3e46b3a61'),
+    ('mailbox_read_record', 'E_SELECTOR', '9d96c75dba68435b4701b283ce6ba2e4cdc9fdf30fa47bbb93eee887154fb1db', 'b790a82edf11706c9e856239f733dfe96f1e3faa6fa4bf6a5deec6aaffc165f2'),
+    ('mailbox_read_record', 'E_SPAN', '048b6b6159ee2ceb897fc3fd1b6cfcd5bebeaf59f0a4449a0c6ce1604f1fe56c', '63c62d64a50a6a7e775d6cc9b9212cf45fafb37c7c03a3f528185cfb60510870'),
+    ('mailbox_read_record', 'E_LIMIT', '89bc4cf9f0ebbd089efa3172516f302960924be4020dc29e4b741c79e13d36a0', '655e39c23159b521f7b2c181886c3205f3c65636566da918cbef4a4662b16f7d'),
+    ('mailbox_digest', 'E_FORMAT', '0d861ad8457ef713d99a5a2953c1aaabdc3c9ed9d8ac3ab19bad0e5455ade157', '1d64557c34dded51f96591a808c4eaae793a5ecb23985aade2cc017da5b38628'),
+    ('mailbox_digest', 'E_HASH', '23cd9ebdcd7d6c00850d38cdf28575b874b1f1ed1fc52dfb2bd672b0675aa0dd', 'c1ece08db8409cb8551b125526c2faf45da9fd313fcd72c7abc0a88f1ea5af0b'),
+    ('mailbox_digest', 'E_AUTH', 'b46c9efab808a152f2b42f17c6cadb729d4f6df0a779f2985a49af8022df5703', '570412bacc676c0a0484043bb716787dc885bdda877711030f2ba2c980b2b738'),
+    ('mailbox_digest', 'E_REF', 'c84a1e2601b6eba363d5731e2ae8346cb9d35d1b97baa3cf0eca979cf550c975', 'fc6ab17c22269e85913c1a8a4bc48d4074299bdcaba0838ef904ede3e46b3a61'),
+    ('mailbox_digest', 'E_SELECTOR', '9d96c75dba68435b4701b283ce6ba2e4cdc9fdf30fa47bbb93eee887154fb1db', 'b790a82edf11706c9e856239f733dfe96f1e3faa6fa4bf6a5deec6aaffc165f2'),
+    ('mailbox_digest', 'E_SPAN', '048b6b6159ee2ceb897fc3fd1b6cfcd5bebeaf59f0a4449a0c6ce1604f1fe56c', '63c62d64a50a6a7e775d6cc9b9212cf45fafb37c7c03a3f528185cfb60510870'),
+    ('mailbox_digest', 'E_LIMIT', '89bc4cf9f0ebbd089efa3172516f302960924be4020dc29e4b741c79e13d36a0', '655e39c23159b521f7b2c181886c3205f3c65636566da918cbef4a4662b16f7d'),
+]
+
+
+def consume_refusal(error, route):
+    if route == "as_dict":
+        return error.as_dict()
+    if route == "str":
+        return str(error)
+    if route == "repr":
+        return repr(error)
+    if route == "reason":
+        return error.reason
+    if route == "next_action":
+        return error.next_action
+    if route == "code":
+        return error.code
+    if route == "status":
+        return error.status
+    if route == "args":
+        return error.args
+    if route == "record_error":
+        return error.record_error
+    raise AssertionError("unknown refusal consumption route")
+
+
+def test_advice_declaration_is_required_for_the_reviewers_initializer():
+    with pytest.raises(primitives.MailboxReasonError, match="^mailbox refusal initializer must declare advice$"):
+        class NewRefusal(MailboxRefusal):
+            def __init__(self):
+                self.reason = "brand_new"
+                self.next_action = ""
+                self.code, self.status = 1, "refused"
+                ValueError.__init__(self, "mailbox refused: brand_new")
+
+
+def test_advice_declaration_must_be_local_to_an_overriding_initializer():
+    with pytest.raises(primitives.MailboxReasonError, match="^mailbox refusal initializer must declare advice$"):
+        class NewBusy(BusyError):
+            def __init__(self):
+                ValueError.__init__(self, "busy")
+
+
+@pytest.mark.parametrize("table", [None, {}, [], {"missing": ""}, {"missing": object()},
+                                  {None: "Retry."}, {str(index): "Retry." for index in range(129)}])
+def test_advice_declaration_refuses_invalid_tables(table):
+    with pytest.raises(primitives.MailboxReasonError, match="^invalid mailbox refusal advice declaration$"):
+        type("NewRefusal", (MailboxRefusal,), {"advice_table": table})
+
+
+def test_advice_declaration_refuses_unknown_contracts():
+    with pytest.raises(primitives.MailboxReasonError, match="^invalid mailbox refusal advice declaration$"):
+        type("NewRefusal", (MailboxRefusal,), {"advice_contract": "unknown"})
+
+
+@pytest.mark.parametrize("method", ["as_dict", "__str__", "__repr__", "__getattribute__"])
+def test_advice_declaration_cannot_replace_the_consumption_boundary(method):
+    with pytest.raises(primitives.MailboxReasonError, match="^mailbox refusal consumption methods cannot be overridden$"):
+        type("NewRefusal", (MailboxRefusal,), {
+            "advice_table": primitives._NEXT, method: lambda *args: "unadvised"})
+
+
+def test_declared_refusal_can_use_its_own_fixed_advice_table():
+    class DeclaredRefusal(MailboxRefusal):
+        advice_table = {"custom": "Retry with the custom schema."}
+        def __init__(self):
+            super().__init__("custom")
+    error = DeclaredRefusal()
+    assert error.as_dict() == {"status": "refused", "code": 1, "reason": "custom",
+                               "next_action": "Retry with the custom schema."}
+    assert str(error) == "mailbox refused: custom"
+
+
+@pytest.mark.parametrize("route", ["as_dict", "str", "repr", "reason", "next_action", "code", "status", "args"])
+@pytest.mark.parametrize("field,value", [("reason", "brand_new"), ("next_action", "unadvised"),
+                                         ("code", 2), ("status", "accepted")])
+def test_advice_consumption_refuses_corrupted_public_state(route, field, value):
+    class MutableRefusal(MailboxRefusal):
+        def corrupt(self):
+            if field == "reason":
+                self.reason = value
+            elif field == "next_action":
+                self.next_action = value
+            elif field == "code":
+                self.code = value
+            else:
+                self.status = value
+    error = MutableRefusal("missing")
+    error.corrupt()
+    with pytest.raises(primitives.MailboxReasonError, match="^mailbox refusal advice does not match reason: "):
+        consume_refusal(error, route)
+
+
+@pytest.mark.parametrize("route", ["as_dict", "str", "repr", "reason", "next_action", "args"])
+def test_advice_consumption_covers_a_declared_initializer_bypassed_entirely(route):
+    class DeclaredRefusal(MailboxRefusal):
+        advice_table = primitives._NEXT
+        def __init__(self):
+            self.reason, self.next_action = "missing", primitives._NEXT["missing"]
+            self.code, self.status = 1, "refused"
+            ValueError.__init__(self, "mailbox refused: missing")
+        def corrupt(self):
+            self.reason, self.next_action, self.code, self.status = "brand_new", "", 1, "refused"
+    error = ValueError.__new__(DeclaredRefusal)
+    DeclaredRefusal.corrupt(error)
+    with pytest.raises(primitives.MailboxReasonError, match="^mailbox refusal advice does not match reason: brand_new$"):
+        consume_refusal(error, route)
+
+
+@pytest.mark.parametrize("route", ["as_dict", "str", "repr", "reason", "next_action", "args"])
+def test_advice_consumption_refuses_uninitialized_objects_without_raw_attribute_errors(route):
+    error = ValueError.__new__(MailboxRefusal)
+    with pytest.raises(primitives.MailboxReasonError, match="^mailbox refusal advice does not match reason: <non-string>$"):
+        consume_refusal(error, route)
+
+
+def test_declared_refusal_cannot_finish_with_unadvised_state():
+    class DeclaredRefusal(MailboxRefusal):
+        advice_table = primitives._NEXT
+        def __init__(self):
+            self.reason, self.next_action, self.code, self.status = "brand_new", "", 1, "refused"
+    with pytest.raises(primitives.MailboxReasonError, match="^mailbox refusal advice does not match reason: brand_new$"):
+        DeclaredRefusal()
+
+
+def test_advice_initialization_failure_does_not_leave_consumption_unguarded():
+    retained = []
+    class BrokenRefusal(MailboxRefusal):
+        advice_table = primitives._NEXT
+        def __init__(self):
+            retained.append(self)
+            self.reason = "brand_new"
+            raise RuntimeError("initialization stopped")
+    with pytest.raises(RuntimeError, match="^initialization stopped$"):
+        BrokenRefusal()
+    with pytest.raises(primitives.MailboxReasonError, match="^mailbox refusal advice does not match reason: "):
+        retained[0].as_dict()
+    assert MailboxRefusal("missing").as_dict()["reason"] == "missing"
+
+
+@pytest.mark.parametrize("pathful", [False, True])
+def test_advice_consumption_preserves_busy_paths_and_refuses_changed_actions(tmp_path, pathful):
+    path = make_store(tmp_path) / ".write.lock" if pathful else None
+    error = BusyError(path)
+    expected = error.next_action
+    assert error.as_dict()["next_action"] == expected
+    assert str(error) == "mailbox refused: busy"
+    error.next_action = "unadvised"
+    with pytest.raises(primitives.MailboxReasonError, match="^mailbox refusal advice does not match reason: busy$"):
+        error.as_dict()
+
+
+@pytest.mark.parametrize("field", ["manifest", "schema", "writer_limit", "endpoints", "counterparts", "budget"])
+def test_contextual_refusal_advice_preserves_manifest_repairs(tmp_path, field):
+    candidate = (None if field == "manifest" else {**MANIFEST, "schema": "x" * (primitives.MAX_BYTES + 1)}
+                 if field == "budget" else {**MANIFEST, field: None})
+    with pytest.raises(MailboxRefusal) as caught:
+        mail.initialize(tmp_path / "new", candidate, roles=ROLES, caller_role="owner")
+    assert caught.value.as_dict()["next_action"] == MANIFEST_REPAIR_ACTIONS["manifest" if field == "budget" else field]
+    assert str(caught.value) == "mailbox refused: " + ("too_large" if field == "budget" else "invalid_record")
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("tool,code,expected_operational,expected_record", RECORD_REFUSAL_BASELINES)
+def test_record_envelope_baseline_is_preserved_at_every_consumption_boundary(tool, code, expected_operational, expected_record):
+    error = records_module.RecordRefusal(record_codec.CodecError(code), tool)
+    assert hashlib.sha256(primitives.encoded(error.as_dict())).hexdigest() == expected_operational
+    assert hashlib.sha256(primitives.encoded(error.record_error)).hexdigest() == expected_record
+    assert str(error) == "record refused: " + code
+    assert error.args == ("record refused: " + code,)
+
+
+@pytest.mark.parametrize("route", ["as_dict", "str", "repr", "reason", "next_action", "record_error"])
+@pytest.mark.parametrize("field,value", [("reason", "brand_new"), ("next_action", "unadvised")])
+def test_advice_consumption_checks_record_codec_state(route, field, value):
+    class MutableRecordRefusal(records_module.RecordRefusal):
+        def corrupt(self):
+            if field == "reason":
+                self.reason = value
+            else:
+                self.next_action = value
+    error = MutableRecordRefusal(record_codec.CodecError("E_FORMAT"), "mailbox_read_record")
+    error.corrupt()
+    with pytest.raises(primitives.MailboxReasonError, match="^mailbox refusal advice does not match reason: "):
+        consume_refusal(error, route)
+
+
+def test_contextual_refusal_advice_allows_record_detail_and_fixed_fallback():
+    error = records_module.RecordRefusal(record_codec.CodecError("E_AUTH", detail="binding"), "mailbox_read_record")
+    assert error.as_dict()["next_action"] == "refresh the connection from the current acknowledged endpoint binding"
+    error.next_action = "Use the current binding and granted record references."
+    assert error.as_dict()["next_action"] == "Use the current binding and granted record references."
+
+
+def test_advice_consumption_returns_an_independent_record_detail_snapshot():
+    error = records_module.RecordRefusal(record_codec.CodecError("E_AUTH", detail="binding"), "mailbox_read_record")
+    detail = error.record_error
+    detail["error"]["code"], detail["error"]["next_action"] = "brand_new", "unadvised"
+    assert error.record_error["error"]["code"] == "E_AUTH"
+    assert error.as_dict()["next_action"] == "refresh the connection from the current acknowledged endpoint binding"
+
+
+def test_advice_consumption_and_class_checks_retry_and_run_concurrently():
+    def observe(bad):
+        class DeclaredRefusal(MailboxRefusal):
+            advice_table = primitives._NEXT
+            def __init__(self):
+                self.reason, self.next_action = "missing", primitives._NEXT["missing"]
+                self.code, self.status = 1, "refused"
+        error = DeclaredRefusal()
+        if bad:
+            error.next_action = "unadvised"
+            with pytest.raises(primitives.MailboxReasonError) as caught:
+                error.as_dict()
+            return str(caught.value)
+        return error.as_dict()["reason"]
+    expected = ["mailbox refusal advice does not match reason: missing", "missing"]
+    assert [observe(value) for value in [True, False, True]] == [*expected, expected[0]]
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(observe, [True, False] * 6, timeout=10)) == expected * 6
+
+    def rejected(_):
+        with pytest.raises(primitives.MailboxReasonError, match="^mailbox refusal initializer must declare advice$"):
+            type("NewRefusal", (MailboxRefusal,), {"__init__": lambda self: None})
+        return True
+    assert rejected(None) and rejected(None)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(rejected, range(6), timeout=10)) == [True] * 6
+
+
+@pytest.mark.parametrize("route", ["as_dict", "str", "repr", "reason", "next_action", "code", "status", "args"])
+def test_advice_consumption_inside_an_initializer_never_exports_unadvised_fields(route):
+    observed = []
+    class DeclaredRefusal(MailboxRefusal):
+        advice_table = primitives._NEXT
+        def __init__(self):
+            self.reason, self.next_action, self.code, self.status = "brand_new", "", 1, "refused"
+            observed.append(consume_refusal(self, route))
+    with pytest.raises(primitives.MailboxReasonError):
+        DeclaredRefusal()
+    assert observed == []
+
+
+def test_advice_consumption_checks_early_record_metadata_during_initialization():
+    observed = []
+    class DeclaredRecordRefusal(MailboxRefusal):
+        advice_contract = "record_codec"
+        def __init__(self):
+            self.record_error = {"error": {"code": "brand_new", "next_action": "unadvised"}}
+            observed.append(self.record_error)
+    with pytest.raises(primitives.MailboxReasonError):
+        DeclaredRecordRefusal()
+    assert observed == []
+
+
+
+PUBLIC_REFUSAL_BOUNDARIES = (
+    "renderer", "validation", "operation", "host_call", "strict_json", "manifest",
+    "pager", "records", "board", "lifecycle", "roles", "role_endpoint",
+    "host_plan", "host_registry", "guidance", "store_exists", "store_entries",
+    "store_home", "publication_lock", "publication_lock_committed", "lock_cleanup",
+    "history", "delivery", "record_probe",
+)
+
+
+def boundary_refusal(shape, *, advised=False):
+    """The two reviewed class-hook bypasses; no product namespace mutation."""
+    payload = {"status": "refused", "code": 1,
+               "reason": "invalid_record" if advised else "brand_new",
+               "next_action": primitives._NEXT["invalid_record"] if advised else ""}
+    class PayloadMixin:
+        def __init__(self, payload):
+            self.payload = payload
+            if advised:
+                self.reason, self.next_action = payload["reason"], payload["next_action"]
+                self.code, self.status = 1, "refused"
+        def as_dict(self):
+            return {"status": "refused", "code": 1, "reason": "brand_new", "next_action": ""}
+        def __str__(self):
+            raise AssertionError("the boundary called instance __str__")
+        def __repr__(self):
+            raise AssertionError("the boundary called instance __repr__")
+        def __getattribute__(self, name):
+            raise AssertionError("the boundary called instance __getattribute__")
+
+    if shape == "mixin":
+        class NewRefusal(PayloadMixin, MailboxRefusal):
+            pass
+    else:
+        class Intermediate(MailboxRefusal):
+            def __init_subclass__(cls, **kwargs):
+                pass
+        class NewRefusal(Intermediate):
+            __init__ = PayloadMixin.__init__
+            as_dict = PayloadMixin.as_dict
+            __str__ = PayloadMixin.__str__
+            __repr__ = PayloadMixin.__repr__
+            def __getattribute__(self, name):
+                raise AssertionError("the boundary called instance __getattribute__")
+    return NewRefusal(payload)
+
+
+def invoke_refusal_boundary(route, error, tmp_path, monkeypatch):
+    def fail(*args, **kwargs):
+        raise error
+
+    if route == "renderer":
+        return primitives.render_mailbox_refusal(error)
+    if route == "validation":
+        return primitives.validation(fail)()
+    if route == "strict_json":
+        monkeypatch.setattr(primitives, "json_preflight", fail)
+        return primitives.strict_json("{}")
+    if route == "manifest":
+        monkeypatch.setattr(primitives, "bounded_tree", fail)
+        return ROLES.validate_manifest(MANIFEST)
+    if route == "pager":
+        return pager_module.bounded_inbox({"messages": [], "remaining": 0}, fail)
+    if route == "lifecycle":
+        return lifecycle_module.boundary(fail)()
+    if route == "roles":
+        monkeypatch.setattr(roles_module, "json_preflight", fail)
+        return roles_module.load_registry("{}")
+    if route == "role_endpoint":
+        monkeypatch.setattr(roles_module, "_GRAMMAR", SimpleNamespace(endpoint_parts=fail))
+        return roles_module.role("alpha/front-door")
+    if route == "host_registry":
+        return host_registry_module.guarded(fail)()
+    if route == "host_plan":
+        @contextmanager
+        def source(*args):
+            yield SimpleNamespace(read_bytes=lambda limit: b"{}")
+        monkeypatch.setattr(host_plan_module, "descriptor_supported", lambda: True)
+        monkeypatch.setattr(host_plan_module, "confined_file", source)
+        monkeypatch.setattr(host_plan_module, "strict_json", fail)
+        return host_plan_module.read_plan(tmp_path)
+    if route == "guidance":
+        return guidance_module.error_result(error, tool="mailbox_read_record", max_chars=60000)
+
+    root = make_store(tmp_path)
+    with mailbox(root, hosts={"test-host": SimpleNamespace(probe=fail)}) as box:
+        if route == "operation":
+            monkeypatch.setattr(mail.Mailbox, "refresh", fail)
+            return box.endpoint("alpha/front-door")
+        if route == "host_call":
+            return box.host_call("probe")
+        if route == "records":
+            service = records_module.Records(box, {"from": "alpha/front-door", "host": "test-host",
+                "session": "alpha/front-door", "binding_generation": 1})
+            monkeypatch.setattr(records_module.Records, "_digest", fail)
+            return service.call("mailbox_digest", {})
+        if route in {"store_exists", "store_entries"}:
+            @contextmanager
+            def directory(*args, **kwargs):
+                fail()
+                yield
+            monkeypatch.setattr(store_module.Store, "directory", directory)
+            if route == "store_exists":
+                return box.store.exists(root / "absent")
+            return box.store.entries(root / "absent", missing=True)
+        if route == "store_home":
+            original = store_module.safe_path
+            home = str(store_module.UserLayout.current().home)
+            def path(value):
+                if value == home:
+                    fail()
+                return original(value)
+            monkeypatch.setattr(store_module, "safe_path", path)
+            with box.store.evidence_transaction():
+                pass
+        if route == "publication_lock":
+            with box.store.evidence_transaction() as transaction:
+                with box.store.publication_lock(root, transaction):
+                    fail()
+        if route == "publication_lock_committed":
+            original = store_module.Store.lock
+            @contextmanager
+            def late_failure(*args, **kwargs):
+                with original(*args, **kwargs):
+                    yield
+                fail()
+            with box.store.evidence_transaction() as transaction:
+                transaction["committed"] = True
+                monkeypatch.setattr(store_module.Store, "lock", late_failure)
+                with box.store.publication_lock(root, transaction):
+                    pass
+            return box.store.drain_warnings()
+        if route == "lock_cleanup":
+            monkeypatch.setattr(store_module, "os", SimpleNamespace(**{**vars(os), "unlink": fail}))
+            try:
+                with box.store.lock(root):
+                    raise OSError("body did not finish")
+            finally:
+                for path in (root / ".write.lock",
+                             store_module.UserLayout.current().aegis_dir / primitives.OWNER_EVIDENCE_LOCK):
+                    if path.exists():
+                        path.unlink()
+        if route in {"history", "delivery", "record_probe"}:
+            bind(box, "alpha/front-door")
+            bind(box, "alpha/orchestrator")
+            box.publish({**request(), "body": "x" * 2000})
+            if route == "history":
+                monkeypatch.setattr(mail.Mailbox, "validate_message", fail)
+                return box.messages()
+            sender = {"from": "alpha/orchestrator", "host": "test-host",
+                      "session": "alpha/orchestrator", "binding_generation": 1}
+            if route == "record_probe":
+                service = records_module.Records(box, sender, inbox=fail)
+                return service.call("mailbox_digest", {"max_chars": 500})
+            directory = root.parent / "delivery"
+            box.record_read(directory, sender, ["message"])
+            history = box.messages()
+            monkeypatch.setattr(mail.Mailbox, "_delivery_receipt", fail)
+            return box.delivery_receipts(directory, "reads", sender["from"], history)
+        if route == "board":
+            # A real Board and Store; the callback fails before any event read/write.
+            with board_module.Board(root, clock=lambda: NOW, roles=ROLES, hosts=HOSTS, caller_role="owner") as value:
+                monkeypatch.setattr(board_module.Board, "_cursor_arguments", fail)
+                return value.status()
+    raise AssertionError("unknown public refusal boundary")
+
+
+@pytest.mark.parametrize("route", PUBLIC_REFUSAL_BOUNDARIES)
+@pytest.mark.parametrize("shape", ["mixin", "skipped_hook"])
+def test_public_refusal_boundary_rejects_both_reviewed_class_bypasses(route, shape, tmp_path, monkeypatch):
+    error = boundary_refusal(shape)
+    with pytest.raises(primitives.MailboxReasonError, match="^mailbox refusal advice does not match reason: "):
+        invoke_refusal_boundary(route, error, tmp_path, monkeypatch)
+
+
+@pytest.mark.parametrize("route", PUBLIC_REFUSAL_BOUNDARIES)
+@pytest.mark.parametrize("shape", ["mixin", "skipped_hook"])
+def test_public_refusal_boundary_rebuilds_advised_state_without_instance_methods(route, shape, tmp_path, monkeypatch):
+    error = boundary_refusal(shape, advised=True)
+    if route in {"renderer", "guidance"}:
+        result = invoke_refusal_boundary(route, error, tmp_path, monkeypatch)
+        assert result == MailboxRefusal("invalid_record").as_dict()
+    elif route == "publication_lock_committed":
+        warnings = invoke_refusal_boundary(route, error, tmp_path, monkeypatch)
+        assert warnings and all(value["reason"] == "lock_release" for value in warnings)
+    elif route == "record_probe":
+        with pytest.raises(records_module.RecordRefusal) as caught:
+            invoke_refusal_boundary(route, error, tmp_path, monkeypatch)
+        assert primitives.render_mailbox_refusal(caught.value)["reason"] == "E_LIMIT"
+    else:
+        with pytest.raises(ValueError) as caught:
+            invoke_refusal_boundary(route, error, tmp_path, monkeypatch)
+        assert type(caught.value) is not type(error)
+        assert "brand_new" not in str(caught.value)
+        assert caught.value.as_dict()["next_action"]
+
+
+@pytest.mark.parametrize("reraise", [False, True])
+@pytest.mark.parametrize("reason,expected_hash", REFUSAL_WIRE_SHA256.items())
+def test_public_refusal_renderer_preserves_every_mailbox_payload(reason, expected_hash, reraise):
+    error = MailboxRefusal(reason)
+    if reraise:
+        with pytest.raises(MailboxRefusal) as caught:
+            primitives.render_mailbox_refusal(error, reraise=True)
+        assert type(caught.value) is MailboxRefusal
+        assert caught.value.__suppress_context__ is True
+        payload = caught.value.as_dict()
+    else:
+        payload = primitives.render_mailbox_refusal(error)
+    assert hashlib.sha256(primitives.encoded(payload)).hexdigest() == expected_hash
+
+
+@pytest.mark.parametrize("reraise", [False, True])
+@pytest.mark.parametrize("tool,code,operational,record", RECORD_REFUSAL_BASELINES)
+def test_public_refusal_renderer_preserves_every_record_envelope(tool, code, operational, record, reraise):
+    error = records_module.RecordRefusal(record_codec.CodecError(code), tool)
+    if reraise:
+        with pytest.raises(records_module.RecordRefusal) as caught:
+            primitives.render_mailbox_refusal(error, reraise=True)
+        assert type(caught.value) is records_module.RecordRefusal
+        assert caught.value.__suppress_context__ is True
+        error = caught.value
+    assert hashlib.sha256(primitives.encoded(primitives.render_mailbox_refusal(error))).hexdigest() == operational
+    assert hashlib.sha256(primitives.encoded(primitives.render_mailbox_refusal(error, record=True))).hexdigest() == record
+
+
+def test_public_refusal_renderer_ignores_a_subclass_advice_declaration():
+    class NewAdvice(MailboxRefusal):
+        advice_table = {"brand_new": "invented advice"}
+    error = NewAdvice("brand_new")
+    with pytest.raises(primitives.MailboxReasonError, match="^mailbox refusal advice does not match reason: brand_new$"):
+        primitives.render_mailbox_refusal(error)
+
+
+def test_public_refusal_renderer_rejects_mismatched_advice_and_retries_concurrently():
+    class Mutable(MailboxRefusal):
+        def corrupt(self):
+            self.next_action = "unadvised"
+
+    def attempt(index):
+        error = Mutable("missing")
+        if index % 2:
+            error.corrupt()
+            with pytest.raises(primitives.MailboxReasonError,
+                               match="^mailbox refusal advice does not match reason: missing$"):
+                primitives.render_mailbox_refusal(error)
+        else:
+            assert primitives.render_mailbox_refusal(error) == MailboxRefusal("missing").as_dict()
+        with pytest.raises(primitives.MailboxReasonError,
+                           match="^mailbox refusal advice does not match reason: "):
+            primitives.validation(lambda: (_ for _ in ()).throw(boundary_refusal("skipped_hook")))()
+        return primitives.render_mailbox_refusal(MailboxRefusal("missing"))
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        pending = [pool.submit(attempt, index) for index in range(18)]
+        assert all(task.result(timeout=10) == MailboxRefusal("missing").as_dict() for task in pending)
+
+
+
+def test_public_refusal_renderer_ignores_metaclass_policy_and_mro_overrides():
+    class Intermediate(MailboxRefusal):
+        def __init_subclass__(cls, **kwargs):
+            pass
+    class ClassModel(type):
+        def __getattribute__(cls, name):
+            raise AssertionError("the boundary consulted subclass class metadata")
+    class NewRefusal(Intermediate, metaclass=ClassModel):
+        def __init__(self):
+            self.reason, self.next_action = "missing", primitives._NEXT["missing"]
+            self.code, self.status = 1, "refused"
+    assert primitives.render_mailbox_refusal(NewRefusal()) == MailboxRefusal("missing").as_dict()
+
+
+@pytest.mark.parametrize("pathful", [False, True])
+def test_public_refusal_renderer_preserves_busy_advice_and_rejects_family_spoofing(tmp_path, pathful):
+    path = make_store(tmp_path) / ".write.lock" if pathful else None
+    error = BusyError(path)
+    expected = primitives.encoded(error.as_dict())
+    assert primitives.encoded(primitives.render_mailbox_refusal(error)) == expected
+    with pytest.raises(BusyError) as caught:
+        primitives.render_mailbox_refusal(error, reraise=True)
+    assert type(caught.value) is BusyError
+    assert primitives.encoded(caught.value.as_dict()) == expected
+
+    class Intermediate(BusyError):
+        def __init_subclass__(cls, **kwargs):
+            pass
+    class WrongFamily(Intermediate):
+        advice_contract = "mailbox"
+        def __init__(self):
+            self.reason, self.next_action = "missing", primitives._NEXT["missing"]
+            self.code, self.status = 1, "refused"
+    with pytest.raises(primitives.MailboxReasonError,
+                       match="^mailbox refusal advice does not match reason: missing$"):
+        primitives.render_mailbox_refusal(WrongFamily())
+
+
+PURE_DOMAIN_BASELINES = [('host_registry',
+  'endpoint_mismatch',
+  None,
+  'f91476258c6d54599fafa77abcfb5b44012e18225dfdd26c29ff20fa650bc1a1'),
+ ('host_registry',
+  'hierarchy_mismatch',
+  None,
+  '2f70b494027c5b879331989d850eac1702c6041c28b13ae48fe0028e633493ea'),
+ ('host_registry', 'host_mismatch', None, '6e1d9737d8675ff365b716f6bad689f62d4a2408605134ffb40545864422ac29'),
+ ('host_registry', 'invalid_json', None, 'dd4b83bd28d6367b79da864a3eb03ccc842bda301920f20ed08f356eee76c0d9'),
+ ('host_registry', 'invalid_plan', None, 'e3599f36b1e6baeb280065f55bbe2a5aa8d818b199bc560c8e864ebfd7098fd8'),
+ ('host_registry',
+  'invalid_purpose',
+  None,
+  '9daf50f45043cb9454000854a5ea544c409625cbc3436bb580a6000f3015a844'),
+ ('host_registry',
+  'invalid_record',
+  None,
+  'f13695b8ba1f56cbb8758266fdf9ff8475391d88c865c621530a633cec6eb27a'),
+ ('host_registry',
+  'invalid_session',
+  None,
+  'efe795975fd4ac0f56260481d9596515f59d68be75ad310b7d14e2f43c4aba09'),
+ ('host_registry', 'io', None, '4bbd4ab2c8aa7385d9be016227adc2caa3cd514da6ef223ad8de3620c1f802ae'),
+ ('host_registry', 'plan_keys', None, 'ba54d7cba940952ab79cfbbf799bd5d9bd2821af08466f7a21646171bfeb4085'),
+ ('host_registry', 'plan_mismatch', None, '9e0460cc247e2cb12918dcdf9f9d2e16abd52751b0275581d10c499c8e4d6bd0'),
+ ('host_registry', 'plan_schema', None, '012a3314fda5f22352e048582fd6350bb5b015ace9c73ea3cc35c1322659aa7d'),
+ ('host_registry',
+  'session_mismatch',
+  None,
+  '2387530bc78e79842e756b093ad13fc70ebd90fbc721f54e877a5cf478261607'),
+ ('host_registry', 'too_large', None, 'ff05ebc363a233decfee83df6e2cc1b61496ababc3c99e6a8b848c80b16c5ff9'),
+ ('host_registry', 'unknown_host', None, '636f706f51c6a9f64b206f57ce1fa5bfe31536984a0c53cabc860ed57210b564'),
+ ('host_registry',
+  'unqualified_host',
+  None,
+  'f4089660103e7f1e03309bd5b3d52729d732eb344bc71b1e33c9e04acc00d04c'),
+ ('host_registry', 'unsafe_path', None, 'f2460c224721d8f66fb3e1fe2a885dcd55688c7da0ae0b82142f3d5140b1fccd'),
+ ('host_registry',
+  'unsupported_platform',
+  None,
+  '0a30f692a408f3db4d9ce989788999fabf025f0cddc89af75304a45866a28afd'),
+ ('roles', 'duplicate_key', None, '95239294c5c4838ada017b98efbc4b23b5d101f8b84e4276c4de79f0b9fcf2a2'),
+ ('roles', 'duplicate_role', None, '8d6bdefcfa1b5b4b4583232ddf0354280e77c52184dcf5a482dd2e9ab25d625b'),
+ ('roles', 'independent_session', None, '14860ac703842d562a999e6a02a38aae1f4426103efb1d6c9c9ac8c52d028dbf'),
+ ('roles', 'invalid_registry', None, '0d2afc64caee2e57dc602c439abe26ad7dc569495022fd63985c7dbe7854e245'),
+ ('roles', 'missing_registry', None, 'd86da109b2b3566080a5783c4f3a495d207ae1185efe18c089337d2e9e9ea7d7'),
+ ('roles', 'not_permitted', None, 'e2b4830c2c418d2f6cfffb0b2f988dae662987b7f30236ed03eab8fe99f5c38e'),
+ ('roles', 'policy_io', None, '3f061ac325ef3580d809351e289e56a03c9973da6a9839a2c05ddd59b4961525'),
+ ('roles', 'registry_io', None, '14772a2933d3726dfb4c872e1fd5b5fd90f2bc51ef12dd65513728d65367b675'),
+ ('roles', 'too_large', None, '7ed03372a8fa81f31c6889ca62b463fca3d0df9d2e05cf22ebfb072911096c74'),
+ ('roles', 'unknown_action', None, '90c0f24b4727501cd00b35539db5ecb3c7ba28997c276309b955c5c06b51c992'),
+ ('roles', 'unknown_endpoint', None, '7844d5c51182a93baa0c8ffb0e8b9c4bdb31c62f6bb53036d929b8241e429e9f'),
+ ('roles', 'unknown_key', None, 'a7a656d9174e91df4b57a3ff6f4d50371bf5d74ea6b1dc19bd27194a18d0d052'),
+ ('roles', 'unsupported_schema', None, '14b3a3d08a462fe9905849d246bc37468511d861820959378eff116a96459bef'),
+ ('lifecycle', 'invalid_policy', None, '48682c196db2535a5c9ed1af3ef124cfea966309a05ebc3d532ed8134277f018'),
+ ('lifecycle',
+  'invalid_policy',
+  'policy',
+  '1a109fe858ce8dd227d332c3fb8938e25a91acef0eab2618fa241fa477c8dca5'),
+ ('lifecycle', 'invalid_record', None, '8e46e9c72d419d7467e98ba1c31401b73a543872ba0f9843fbfdb89cf8ba50a8'),
+ ('lifecycle',
+  'invalid_record',
+  'policy',
+  '8c17f1b3786182f1ab6770cd03aef3fea431665bf59d260864ede81b648a306d'),
+ ('lifecycle', 'unqualified', None, '72b6e23024cf2aee45cf69327f671ba0a8b3cac5282aa1cf5c25548d068382be'),
+ ('lifecycle', 'unqualified', 'policy', '42c25df33c0b92df965a599ff6b64d026a168fc6046f0ee0fef009315950ffff'),
+ ('lifecycle', 'unsafe_path', None, 'ae525a2090b3bfb851e71c7e2ee4816d595907e018fb6043007ee16fc65f1231'),
+ ('lifecycle', 'unsafe_path', 'policy', '418f77cf7099ab7356c806f0686856ef2614d8f6fa2371610ac42010a93d5cdc')]
+
+
+
+def overlapping_refusal(domain, shape, *, advised=False):
+    payload = {"status": "refused", "code": 1,
+               "reason": "invalid_record" if advised else "brand_new",
+               "next_action": primitives._NEXT["invalid_record"] if advised else ""}
+    class PayloadMixin:
+        def __init__(self, payload):
+            self.payload = payload
+            if advised:
+                self.reason, self.next_action = payload["reason"], payload["next_action"]
+                self.code, self.status = 1, "refused"
+        def as_dict(self):
+            return self.payload
+
+    if shape == "mixin":
+        class NewRefusal(PayloadMixin, domain, MailboxRefusal):
+            pass
+    else:
+        class Intermediate(domain, MailboxRefusal):
+            def __init_subclass__(cls, **kwargs):
+                pass
+        class NewRefusal(Intermediate):
+            __init__ = PayloadMixin.__init__
+            as_dict = PayloadMixin.as_dict
+    return NewRefusal(payload)
+
+
+OVERLAPPING_REFUSAL_FAMILIES = (
+    ("host_registry", host_registry_module.HostRefusal),
+    ("roles", roles_module.RoleRefusal),
+    ("lifecycle", lifecycle_module.LifecycleRefusal),
+    ("records", record_codec.CodecError),
+)
+
+
+@pytest.mark.parametrize("route,domain", OVERLAPPING_REFUSAL_FAMILIES)
+@pytest.mark.parametrize("shape", ["mixin", "skipped_hook"])
+def test_mailbox_overlap_priority_refuses_an_unadvised_domain_subclass(route, domain, shape, tmp_path, monkeypatch):
+    error = overlapping_refusal(domain, shape)
+    with pytest.raises(primitives.MailboxReasonError,
+                       match="^mailbox refusal advice does not match reason: <non-string>$"):
+        invoke_refusal_boundary(route, error, tmp_path, monkeypatch)
+
+
+@pytest.mark.parametrize("route,domain", OVERLAPPING_REFUSAL_FAMILIES)
+@pytest.mark.parametrize("shape", ["mixin", "skipped_hook"])
+def test_mailbox_overlap_priority_rebuilds_an_advised_domain_subclass(route, domain, shape, tmp_path, monkeypatch):
+    error = overlapping_refusal(domain, shape, advised=True)
+    with pytest.raises(ValueError) as caught:
+        invoke_refusal_boundary(route, error, tmp_path, monkeypatch)
+    assert type(caught.value) is not type(error)
+    assert caught.value.as_dict()["next_action"]
+    assert "brand_new" not in str(caught.value)
+
+
+@pytest.mark.parametrize("route,code,field,expected", PURE_DOMAIN_BASELINES)
+def test_mailbox_overlap_priority_preserves_pure_domain_payloads(route, code, field, expected, tmp_path, monkeypatch):
+    error = (host_registry_module.HostRefusal(code) if route == "host_registry" else
+             roles_module.RoleRefusal(code) if route == "roles" else
+             lifecycle_module.LifecycleRefusal(code, field=field))
+    with pytest.raises(ValueError) as caught:
+        invoke_refusal_boundary(route, error, tmp_path, monkeypatch)
+    assert caught.value is error
+    assert hashlib.sha256(primitives.encoded(caught.value.as_dict())).hexdigest() == expected
+
+
+@pytest.mark.parametrize("code,expected", [(code, record) for tool, code, _operational, record in
+                                         RECORD_REFUSAL_BASELINES if tool == "mailbox_digest"])
+def test_mailbox_overlap_priority_preserves_pure_codec_envelopes(code, expected, tmp_path, monkeypatch):
+    with pytest.raises(records_module.RecordRefusal) as caught:
+        invoke_refusal_boundary("records", record_codec.CodecError(code), tmp_path, monkeypatch)
+    assert hashlib.sha256(primitives.encoded(caught.value.record_error)).hexdigest() == expected
+
+
+@pytest.mark.parametrize("route", ["host_registry", "lifecycle"])
+def test_mailbox_overlap_priority_retries_and_runs_concurrently(route):
+    domain = host_registry_module.HostRefusal if route == "host_registry" else lifecycle_module.LifecycleRefusal
+    wrap = host_registry_module.guarded if route == "host_registry" else lifecycle_module.boundary
+
+    def attempt(index):
+        def reject():
+            raise overlapping_refusal(domain, "mixin" if index % 2 else "skipped_hook")
+        with pytest.raises(primitives.MailboxReasonError,
+                           match="^mailbox refusal advice does not match reason: <non-string>$"):
+            wrap(reject)()
+        pure = domain("invalid_record")
+        def refuse():
+            raise pure
+        with pytest.raises(domain) as caught:
+            wrap(refuse)()
+        assert caught.value is pure
+        return pure.as_dict()
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(attempt, index) for index in range(18)]
+        assert all(value.result(timeout=10) == domain("invalid_record").as_dict() for value in futures)
+
+
+
+@contextmanager
+def generic_handler_public_probe(route, tmp_path, monkeypatch):
+    """Inject ordinary construction at a public port inside the reviewed try."""
+    entered, closed = [], []
+
+    def unknown(*args, **kwargs):
+        entered.append(route)
+        raise MailboxRefusal("brand_new")
+
+    if route == "read_plan":
+        @contextmanager
+        def source(base, parts):
+            if Path(base).name == "missing":
+                raise host_plan_module.ConfinedFileError("missing")
+            try:
+                yield SimpleNamespace(read_bytes=unknown)
+            finally:
+                closed.append(route)
+        monkeypatch.setattr(host_plan_module, "descriptor_supported", lambda: True)
+        monkeypatch.setattr(host_plan_module, "confined_file", source)
+        def bad():
+            return host_plan_module.read_plan(tmp_path / "unknown")
+        def control():
+            assert host_plan_module.read_plan(tmp_path / "missing") is None
+            return "advised"
+        yield bad, control, entered, closed
+        return
+
+    if route == "validate_policy":
+        original = lifecycle_module.fields
+        def fields(value, *args, **kwargs):
+            if value.get("proof") == "unknown":
+                unknown()
+            return original(value, *args, **kwargs)
+        monkeypatch.setattr(lifecycle_module, "fields", fields)
+        def bad():
+            return lifecycle_module.validate_policy({"proof": "unknown"})
+        def control():
+            with pytest.raises(lifecycle_module.LifecycleRefusal) as caught:
+                lifecycle_module.validate_policy({})
+            assert caught.value.code == "invalid_policy" and caught.value.field == "schema"
+            assert caught.value.as_dict()["next_action"]
+            return "advised"
+        yield bad, control, entered, closed
+        return
+
+    if route == "claude_init":
+        bad_line = '{"proof":"unknown"}'
+        def loads(value, *args, **kwargs):
+            if value == bad_line:
+                unknown()
+            return json.loads(value, *args, **kwargs)
+        monkeypatch.setattr(host_registry_module, "json", SimpleNamespace(**{**vars(json), "loads": loads}))
+        def bad():
+            return host_registry_module.claude_init(bad_line)
+        def control():
+            result = host_registry_module.claude_init('{"type":"system","subtype":"init","session_id":"fixture"}')
+            assert result["session_id"] == "fixture"
+            return "advised"
+        yield bad, control, entered, closed
+        return
+
+    assert route == "digest"
+    root = make_store(tmp_path)
+    with mailbox(root) as box:
+        bind(box, "alpha/front-door")
+        bind(box, "alpha/orchestrator")
+        box.publish({**request(), "body": "x" * 2000})
+        sender = {"from": "alpha/orchestrator", "host": "test-host",
+                  "session": "alpha/orchestrator", "binding_generation": 1}
+        service = records_module.Records(box, sender, inbox=unknown)
+        def bad():
+            return service.call("mailbox_digest", {"max_chars": 500})
+        def control():
+            result = service.call("mailbox_digest", {"max_chars": 60000})
+            assert json.loads(result)["messages"][0]["body"] == "x" * 2000
+            return "advised"
+        yield bad, control, entered, closed
+
+
+@pytest.mark.parametrize("route", ["read_plan", "validate_policy", "claude_init", "digest"])
+def test_generic_handler_normal_construction_fails_loudly_and_retries(route, tmp_path, monkeypatch):
+    with generic_handler_public_probe(route, tmp_path, monkeypatch) as (bad, control, entered, closed):
+        for _attempt in range(2):
+            with pytest.raises(primitives.MailboxReasonError,
+                               match="^mailbox refusal reason has no advice: brand_new$") as caught:
+                bad()
+            assert type(caught.value) is primitives.MailboxReasonError
+            assert control() == "advised"
+        assert entered == [route, route]
+        if route == "read_plan":
+            assert closed == entered
+
+
+@pytest.mark.parametrize("route", ["read_plan", "validate_policy", "claude_init", "digest"])
+def test_generic_handler_normal_construction_propagates_concurrently(route, tmp_path, monkeypatch):
+    with generic_handler_public_probe(route, tmp_path, monkeypatch) as (bad, control, entered, closed):
+        def attempt():
+            with pytest.raises(primitives.MailboxReasonError,
+                               match="^mailbox refusal reason has no advice: brand_new$") as caught:
+                bad()
+            assert type(caught.value) is primitives.MailboxReasonError
+            return control()
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            pending = [pool.submit(attempt) for _index in range(12)]
+            assert all(future.result(timeout=10) == "advised" for future in pending)
+        assert entered == [route] * 12
+        if route == "read_plan":
+            assert closed == entered
