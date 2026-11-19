@@ -29,6 +29,7 @@ from aegis_core.team_mailbox_primitives import (
 from aegis_core.team_mailbox_store import Store, initialize_store
 from aegis_core.team_mailbox_service import operation, witnesses
 from aegis_core.team_mailbox_delivery import MailboxDelivery
+from aegis_core.team_mailbox_index_scan import pending_entry
 
 __all__ = ["Mailbox", "MailboxRefusal", "initialize"]
 
@@ -190,7 +191,7 @@ class Mailbox(MailboxDelivery):
         for path in entries:
             safe_path(path)
             require(re.fullmatch(r"\d{6}\.(json|ack)", path.name) is not None
-                    or re.fullmatch(r"\.pending-[0-9a-f]{32}", path.name) is not None,
+                    or pending_entry(path, self.root),
                     "unexpected binding history entry")
         for path in (p for p in entries if p.suffix == ".json"):
             require(len(result) < MAX_RECORDS, "binding history exceeds record limit")
@@ -339,7 +340,7 @@ class Mailbox(MailboxDelivery):
             safe_path(folder)
             for path in self.store.entries(folder):
                 safe_path(path)
-                if re.fullmatch(r"\.pending-[0-9a-f]{32}", path.name):
+                if pending_entry(path, self.root, message_folders=folders):
                     continue
                 require(path.suffix == ".md", "unexpected mailbox entry: " + str(path))
                 require(len(records) < MAX_RECORDS, "mailbox exceeds record limit")
