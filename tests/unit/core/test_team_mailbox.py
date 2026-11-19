@@ -810,6 +810,170 @@ def handoff_ack(binding):
     return {key: binding[key] for key in ("endpoint", "generation", "session", "checkpoint_sha256")}
 
 
+@pytest.mark.parametrize("ascii_strings", [False, True])
+@pytest.mark.parametrize("value", ["", "plain ASCII " * 1024, ''.join(chr(i) for i in range(128)),
+    "quote\"\\\b\f\n\r\t\x00\x1f\x7f", 'printable "quotes" and \\slashes',
+    "é中😀", ["a\n", {"quoted\"": "é😀"}]],
+    ids=["empty", "ordinary", "all-ascii", "escapes", "printable-escapes", "unicode", "nested"])
+def test_bounded_tree_string_wire_boundaries_and_retry(value, ascii_strings):
+    def utf8_budget(item):
+        if type(item) is str:
+            return len(item.encode("utf-8")) + 2
+        if type(item) is dict:
+            return 2 + max(0, len(item) - 1) + len(item) + sum(
+                utf8_budget(key) + utf8_budget(entry) for key, entry in item.items())
+        return 2 + max(0, len(item) - 1) + sum(utf8_budget(entry) for entry in item)
+
+    size = (len(json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode("utf-8"))
+            if ascii_strings else utf8_budget(value))
+    for _ in range(2):
+        with refusal("too_large") as caught:
+            primitives.bounded_tree(value, limit=size - 1, ascii_strings=ascii_strings)
+        assert caught.value.as_dict() == MailboxRefusal("too_large").as_dict()
+        assert primitives.bounded_tree(value, limit=size, ascii_strings=ascii_strings) is None
+
+
+@pytest.mark.parametrize("ascii_strings", [False, True])
+@pytest.mark.parametrize("value,limit,reason", [("a\ud800", 1, "too_large"),
+    ("\n\n\udfff", 3, "invalid_record"), ("a\ud800", 100, "invalid_record")])
+def test_bounded_tree_surrogate_refusal_precedence(value, limit, reason, ascii_strings):
+    # An escaped newline can exhaust the budget before the later surrogate.
+    expected = "too_large" if ascii_strings and value.startswith("\n") else reason
+    with refusal(expected) as caught:
+        primitives.bounded_tree(value, limit=limit, ascii_strings=ascii_strings)
+    assert caught.value.as_dict() == MailboxRefusal(expected).as_dict()
+
+
+def read_binding_surface(box, surface):
+    if surface == "status":
+        return box.status()["bindings"]["alpha/front-door"]
+    if surface == "inbox":
+        return box.inbox("alpha/front-door")["binding"]
+    if surface == "binding_view":
+        return box.binding_view("alpha/front-door")["binding"]
+    return box.fence(request())
+
+
+@pytest.mark.parametrize("surface", ["status", "inbox", "binding_view", "fence"])
+def test_binding_history_read_once_per_operation_then_fresh_retry(tmp_path, monkeypatch, surface):
+    root = make_store(tmp_path)
+    with mailbox(root) as box:
+        bind(box, "alpha/front-door")
+        binding = box.bind(replacement_request(tmp_path, 1))
+        reads = []
+        original_read = store_module.Store.read
+
+        def counted_read(self, path, **kwargs):
+            if path.suffix == ".json" and path.parent.name == "front-door":
+                reads.append(path.name)
+            return original_read(self, path, **kwargs)
+
+        monkeypatch.setattr(store_module.Store, "read", counted_read)
+        sender = {**request(), "session": binding["session"], "binding_generation": 2}
+
+        def observe():
+            reads.clear()
+            if surface == "fence":
+                return box.fence(sender)
+            return read_binding_surface(box, surface)
+
+        before = snapshot(root)
+        if surface == "fence":
+            with refusal("invalid_record"):
+                observe()
+        else:
+            assert observe()["ready"] is False
+        assert reads == ["000001.json", "000002.json"]
+        assert snapshot(root) == before
+        box.acknowledge_handoff(handoff_ack(binding))
+        result = observe()
+        assert result == primitives.binding_record(binding) if surface == "fence" else result["ready"] is True
+        assert reads == ["000001.json", "000002.json"]
+        path = root / "bindings" / "alpha" / "front-door" / "000001.json"
+        raw = path.read_bytes()
+        path.write_bytes(b"{")
+        before = snapshot(root)
+        with refusal("invalid_record") as caught:
+            observe()
+        assert caught.value.as_dict() == MailboxRefusal("invalid_record").as_dict()
+        assert snapshot(root) == before
+        path.write_bytes(raw)
+        observe()
+        assert reads == ["000001.json", "000002.json"]
+
+
+@pytest.mark.parametrize("kind", ["info", "dispatch"])
+def test_publish_validates_sender_and_recipient_histories_once(tmp_path, monkeypatch, kind):
+    root = make_store(tmp_path)
+    brief_path = tmp_path / "dispatch.md"
+    brief_path.write_bytes(b"dispatch brief")
+    brief = {"path": str(brief_path), "sha256": hashlib.sha256(b"dispatch brief").hexdigest()}
+    with mailbox(root) as box:
+        bind(box, "alpha/orchestrator")
+        bind(box, "alpha/lane/review")
+        reads = []
+        original_read = store_module.Store.read
+
+        def counted_read(self, path, **kwargs):
+            if path.suffix == ".json" and "bindings" in path.parts:
+                reads.append(path.relative_to(root).as_posix())
+            return original_read(self, path, **kwargs)
+
+        monkeypatch.setattr(store_module.Store, "read", counted_read)
+        result = box.publish({**request(), "from": "alpha/orchestrator", "session": "alpha/orchestrator",
+                              "to": "alpha/lane/review", "type": kind, "brief": brief})
+        assert result["message"]["type"] == kind
+        assert reads == ["bindings/alpha/orchestrator/000001.json", "bindings/alpha/lane/review/000001.json"]
+
+
+def test_binding_history_reuse_is_local_to_concurrent_operations(tmp_path):
+    root, box = populated(tmp_path)
+    with box:
+        binding = box.bind(replacement_request(tmp_path, 1))
+
+        def observe(endpoint):
+            return box.inbox(endpoint)["binding"]
+
+        endpoints = ["alpha/front-door", "alpha/orchestrator"] * 8
+        before = snapshot(root)
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            results = list(pool.map(observe, endpoints))
+        assert snapshot(root) == before
+        assert [(result["endpoint"], result["generation"], result["ready"]) for result in results] == [
+            (endpoint, 2 if endpoint == "alpha/front-door" else 1, endpoint != "alpha/front-door")
+            for endpoint in endpoints]
+        box.acknowledge_handoff(handoff_ack(binding))
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            assert all(result["ready"] for result in pool.map(observe, endpoints))
+
+
+@pytest.mark.parametrize("surface", ["status", "inbox", "binding_view", "fence", "ready"])
+def test_binding_history_reuse_preserves_reads_during_owner_lock(tmp_path, surface):
+    root, box = populated(tmp_path)
+    entered, release = Event(), Event()
+    with box, mailbox(root) as holder:
+        binding = box.current_binding("alpha/front-door")
+
+        def hold():
+            with holder.store.evidence_transaction():
+                entered.set()
+                assert release.wait(5)
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(hold)
+            try:
+                assert entered.wait(5)
+                before = snapshot(tmp_path)
+                result = box.ready(binding) if surface == "ready" else read_binding_surface(box, surface)
+                assert result is True if surface == "ready" else result["generation"] == 1
+                assert snapshot(tmp_path) == before
+            finally:
+                release.set()
+                future.result(timeout=5)
+        result = box.ready(binding) if surface == "ready" else read_binding_surface(box, surface)
+        assert result is True if surface == "ready" else result["generation"] == 1
+
+
 def test_binding_append_byte_budget_refuses_without_publication_then_retries(tmp_path, monkeypatch):
     root = make_store(tmp_path)
     control = tmp_path / "control"
