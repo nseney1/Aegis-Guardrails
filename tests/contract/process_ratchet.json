@@ -83,6 +83,14 @@
     "count": 1,
     "reason": "Explicit user-configured model command boundary."
   },
+  "process:aegis_core/team_session_wake.py:_capture:subprocess.run": {
+    "count": 1,
+    "reason": "TA-2b: owner host control or fixed process census; fixed timeout, bounded output parsing and no shell."
+  },
+  "process:aegis_core/team_session_wake.py:start_turn:subprocess.Popen": {
+    "count": 1,
+    "reason": "TA-2b: bound owner-profile host launch with fixed prompt, descriptor cwd, private logs and new process group."
+  },
   "process:aegis_core/team_supervisor_start.py:_spawn:subprocess.Popen": {
     "count": 1,
     "reason": "SUPERVISOR-START-1: explicit owner argv starts only from a lock-held eligible supervisor plan; no shell or repository cwd; close_fds; kernel identity registration and atomic failure/success checkpoints."
