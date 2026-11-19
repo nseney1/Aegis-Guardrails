@@ -9,6 +9,25 @@ commands supply cooperative leases and a post-lane check; they do not start agen
 worktrees. A read-only reviewer claims no paths, and its verdict applies to the
 exact tree it reviewed. Review verdicts belong in the pull request, not the ledger.
 
+## On this branch
+
+These surfaces are in the tree. This page is the entry; the linked pages are the depth.
+
+| Surface | What you can use | Depth |
+|---|---|---|
+| Repository lanes | `aegis team claim` and `aegis check --lane` | the sections below |
+| Work queue | `aegis team queue` | [Queue work for teams](#queue-work-for-teams) |
+| Model selection | `aegis team model` and the `aegis_team_model` tool; a choice requires an admitted binding | [Model selection](model-selection.md) |
+| Team profile | `aegis team config`, `aegis team doctor` and `aegis team hosts` | [Team profiles](teams-profile.md) |
+| Message codec | `aegis msg` plus `aegis_msg_read` and `aegis_msg_write` | [Delivery over MCP](how-it-works.md#delivery-over-mcp) |
+| Product mailbox | `aegis_core.team_mailbox`; there is no mailbox subcommand | [Architecture](architecture.md#where-to-read-next) |
+| Hierarchy runs | `tools/hierarchy_team.py`, outside the installed wheel | [Runtime guide](agent-hierarchies.md) and [prerequisites](hierarchy-team.md#prerequisites) |
+| Git delivery | snapshot, plans, compare-and-swap publish, qualification and the publisher, as libraries | [Architecture](architecture.md#git-delivery) |
+| Proposals and lint | proposal records, including source `mine`; `aegis rule lint` reports and exits 0 | [Proposals and rule lint](how-it-works.md#proposals-and-rule-lint) |
+| Supervisor | profile-driven pauses and backoff | [Supervisor profile](teams-supervisor.md) |
+
+`aegis_core.merge_queue.MergeQueue` is an in-tree library whose landing wiring is separate work. `tools/hierarchy_templates/` is outside the wheel. The wheel includes `aegis_core/team_templates/role-registry.json`, which `team_roles.registry` reads. [Absorption](teams-absorption.md) describes the package boundary for templates that are not moved yet. Snapshots refuse `unsupported_platform` unless `descriptor_support` is true: `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `stat` and `readlink`. The queue refuses `unsupported_platform`, and the proposal store refuses `unsupported`, unless `storage.confined_descriptor_supported` is true: `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `mkdir`, `link`, `rename`, `unlink` and `stat`. That function does not use `readlink`. Both are false when `os.name` is not `posix`, so Windows fails them. Neither function tests for macOS. Qualification writes call `team_qualify.descriptor_supported` and otherwise refuse `unsupported_platform`. That function is true only when `team_git.descriptor_support` is true, `team_gitops.descriptor_supported` is true (`fcntl` is available and `storage.confined_descriptor_supported` is true), and `gitops_fds.descriptor_supported` is true (`sys.platform` is `linux`, `os.name` is `posix`, and `prctl(37)` returns 0). Publisher activation is not wired. A separate OS principal is not in this branch (`OS-PRINCIPAL-1`). File modes do not isolate another process running as the owner.
+
 ## Setup and limits of each surface
 
 **Repository lanes** use `aegis team claim` and `aegis check --lane`, included in

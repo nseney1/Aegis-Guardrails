@@ -1468,21 +1468,84 @@ def test_the_hook_takes_its_session_and_workspace_from_the_canonical_keys_only(t
 _REVIEWED_PYTHON_PATHS = reviewed_python_paths(REPO)
 
 
-def _python_sources(root: Path = REPO, paths=None) -> tuple:
+def test_insights_census_stream_reads_each_source_only_when_consumed(tmp_path):
+    reads = []
+
+    class ObservedPath(type(tmp_path)):
+        def read_text(self, *args, **kwargs):
+            reads.append(self.name)
+            return super().read_text(*args, **kwargs)
+
+    first, second = tmp_path / "first.py", tmp_path / "second.py"
+    first.write_text("insights.first\n", encoding="utf-8")
+    second.write_text("insights.old\n", encoding="utf-8")
+    for attempt in range(2):
+        reads.clear()
+        rows = _python_sources(ObservedPath(tmp_path), (first.name, second.name))
+        assert reads == []
+        assert next(rows) == (first, "insights.first\n")
+        assert reads == [first.name]
+        second.write_text(f"insights.current_{attempt}\n", encoding="utf-8")
+        assert next(rows) == (second, f"insights.current_{attempt}\n")
+        with pytest.raises(StopIteration):
+            next(rows)
+    second.unlink()
+    for _ in range(2):
+        rows = _python_sources(tmp_path, (first.name, second.name))
+        assert next(rows) == (first, "insights.first\n")
+        with pytest.raises(FileNotFoundError) as failure:
+            next(rows)
+        assert failure.value.filename == str(second)
+    second.write_text("insights.restored\n", encoding="utf-8")
+    assert _defined_names_referenced_outside(
+        tmp_path / "insights.py", _python_sources(tmp_path, (first.name, second.name)), set(),
+    ) == {"insights", "first", "restored"}
+
+
+def test_insights_census_stream_parses_before_requesting_the_next_row(tmp_path):
+    def rows():
+        yield tmp_path / "caller.py", "insights syntax (\n"
+        raise AssertionError("census requested another row before parsing")
+
+    for _ in range(2):
+        with pytest.raises(SyntaxError) as failure:
+            _defined_names_referenced_outside(tmp_path / "insights.py", rows(), set())
+        assert failure.value.filename == str(tmp_path / "caller.py")
+
+
+def test_insights_census_streams_are_independent_across_interleaved_attempts(tmp_path):
+    paths = ("first.py", "second.py")
+    for name in paths:
+        (tmp_path / name).write_text("insights.original\n", encoding="utf-8")
+    first = _python_sources(tmp_path, paths)
+    second = _python_sources(tmp_path, paths)
+    assert next(first) == next(second) == (tmp_path / paths[0], "insights.original\n")
+    (tmp_path / paths[1]).write_text("insights syntax (\n", encoding="utf-8")
+    with pytest.raises(SyntaxError) as failure:
+        _defined_names_referenced_outside(tmp_path / "insights.py", first, set())
+    assert failure.value.filename == str(tmp_path / paths[1])
+    (tmp_path / paths[1]).write_text("insights.recovered\n", encoding="utf-8")
+    assert _defined_names_referenced_outside(tmp_path / "insights.py", second, set()) == {
+        "insights", "recovered",
+    }
+    assert _defined_names_referenced_outside(tmp_path / "insights.py", _python_sources(tmp_path, paths), set()) == {
+        "insights", "original", "recovered",
+    }
+
+
+def _python_sources(root: Path = REPO, paths=None):
     # Freeze membership, not contents: edited or missing reviewed files still fail.
     root = type(root)(real_path(root))
-    return tuple((root / name, (root / name).read_text(encoding="utf-8"))
-                 for name in (_REVIEWED_PYTHON_PATHS if paths is None else paths))
+    return ((root / name, (root / name).read_text(encoding="utf-8"))
+            for name in (_REVIEWED_PYTHON_PATHS if paths is None else paths))
 
 
 def _defined_names_referenced_outside(module_file: Path, sources, skip) -> set:
     """Identifiers in sources mentioning insights before or after NFKC,
     except ``module_file`` (a package's ``__init__.py``: the whole package) and nodes in ``skip``."""
-    sources = tuple(sources)
-    check_census_rows(sources)
     inside = module_file.resolve().parent if module_file.name == "__init__.py" else module_file.resolve()
     seen = set()
-    for path, text in sources:
+    for path, text in check_census_rows(sources):
         if path.resolve() == inside or inside in path.resolve().parents:
             continue
         # Python normalizes identifiers with NFKC before exposing them in the AST.
@@ -1598,7 +1661,7 @@ def test_insights_census_ignores_files_created_after_collection(tmp_path: Path, 
     scope = runpy.run_path(str(module))
     scan = scope["_python_sources"]
     references = scope["_defined_names_referenced_outside"]
-    initial = scan()
+    initial = tuple(scan())
     assert reviewed in {path for path, _ in initial}
     assert not any("untracked_" in path.name for path, _ in initial)
     assert not any("outside_census" in path.name or "__pycache__" in path.parts for path, _ in initial)
@@ -1610,15 +1673,15 @@ def test_insights_census_ignores_files_created_after_collection(tmp_path: Path, 
             during_scan.write_text("insights.late_name\n", encoding="utf-8")
             return super().read_text(*args, **kwargs)
 
-    assert scan(InterleavedPath(tmp_path)) == initial
+    assert tuple(scan(InterleavedPath(tmp_path))) == initial
     assert during_scan.is_file()
     for directory in (reviewed.parent, tmp_path / "tests"):
         late = directory / "late.py"
         for source in ("insights.late_name\n", "insights syntax (\n"):
             late.write_text(source, encoding="utf-8")
-            assert scan() == initial
+            assert tuple(scan()) == initial
         late.unlink()
-        assert scan() == initial
+        assert tuple(scan()) == initial
     reviewed.write_text("insights.changed_name\n", encoding="utf-8")
     assert references(module, scan(), set()) == {"insights", "changed_name"}
     reviewed.write_text("insights syntax (\n", encoding="utf-8")
@@ -1629,7 +1692,7 @@ def test_insights_census_ignores_files_created_after_collection(tmp_path: Path, 
     reviewed.unlink()
     for _ in range(2):
         with pytest.raises(FileNotFoundError) as failure:
-            scan()
+            tuple(scan())
         assert failure.value.filename == str(reviewed)
     reviewed.write_text("insights.restored_name\n", encoding="utf-8")
     assert references(module, scan(), set()) == {"insights", "restored_name"}
@@ -1761,7 +1824,7 @@ def test_insights_census_accepts_gitfiles(tmp_path: Path, layout: str, relative:
         "module = Path(sys.argv[2])\n"
         "scope = runpy.run_path(str(module))\n"
         "for attempt in range(2):\n"
-        "    sources = scope['_python_sources']()\n"
+        "    sources = tuple(scope['_python_sources']())\n"
         "    assert {path.relative_to(scope['REPO']).as_posix() for path, _ in sources} == "
         "{'aegis_core/consumer.py', 'tests/unit/core/test_insights.py'}\n"
         "    seen = scope['_defined_names_referenced_outside'](module, sources, set())\n"
