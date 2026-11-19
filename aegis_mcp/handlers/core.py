@@ -7,7 +7,7 @@ import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 from aegis_core import hosts
-from aegis_core.guidance_projection import project_display_text
+from aegis_core.guidance_projection import project_diagnostic, project_display_text
 from aegis_core.primitives import parse_utc
 from aegis_core.scan import scan, scan_user_layer
 from aegis_core.skills.slots import render_scan_result as render_scan_result
@@ -80,7 +80,7 @@ def _record_scan(workspace: Any, args: dict, files: Optional[List[str]]) -> None
             binding=args.get("_binding"), basis=basis,
         )
     except Exception as exc:  # telemetry only: never fail the scan
-        print("aegis-mcp: scan event not recorded: " + project_display_text(str(exc)), file=sys.stderr)
+        print("aegis-mcp: scan event not recorded: " + project_diagnostic(str(exc), refuse_controls=True), file=sys.stderr)
         return
     stamp = parse_utc(row["ts"])
     if stamp is not None:
@@ -112,7 +112,7 @@ def _record_exposure(workspace: Any, args: dict, res: dict, files: Optional[List
     except Exception as exc:  # telemetry only: never fail the scan
         error = exc
     if error is not None:
-        print("aegis-mcp: exposure record not written: " + project_display_text(str(error)), file=sys.stderr)
+        print("aegis-mcp: exposure record not written: " + project_diagnostic(str(error), refuse_controls=True), file=sys.stderr)
 
 
 def _scan_user_layer(args: dict) -> dict:

@@ -34,6 +34,37 @@ def results(rig):
             if row["op"] == "commit" and row["kind"] == "result"]
 
 
+@pytest.fixture
+def terminal_observation(rig, monkeypatch):
+    """Successful concurrent recovery waits for durable completion, not host speed."""
+    terminal, waiting = Event(), Event()
+    clock = _ObservationClock()
+    # One real watchdog covers every participant, including sequential waits.
+    # Progress still depends on events; custody's observation clock is separate.
+    deadline = time.monotonic() + 60.0
+    def remaining():
+        return max(0.0, deadline - time.monotonic())
+    class TerminalJournal(team_gitops.GitOpsJournal):
+        def reconcile(self, *args, **kwargs):
+            rows = super().reconcile(*args, **kwargs)
+            if any(row["op"] == "commit" and row["kind"] in ("result", "tombstone")
+                   for row in (rows or self.read().rows)):
+                terminal.set()
+            return rows
+    def wait_for_terminal(delay):
+        waiting.set()
+        assert terminal.wait(remaining()), "the binding owner did not publish a terminal record"
+        clock.sleep(delay)
+    rig.journal = TerminalJournal(rig.journal.common_dir)
+    monkeypatch.setattr(custody, "team_gitops", SimpleNamespace(
+        GitOpsJournal=TerminalJournal, GitOpsError=team_gitops.GitOpsError, Observation=team_gitops.Observation))
+    # Only custody's observation clock is paused. Journal locks and Event waits
+    # retain real bounded timeouts; timeout/refusal tests use their own clocks.
+    monkeypatch.setattr(custody, "time", SimpleNamespace(
+        monotonic=clock.monotonic, sleep=wait_for_terminal))
+    return SimpleNamespace(waiting=waiting, remaining=remaining)
+
+
 class _ObservationClock:
     """Monotonic seam: sleep advances this clock and does not call time.sleep."""
 
@@ -447,7 +478,9 @@ def test_crash_before_cas_is_observed_not_retried(rig, monkeypatch):
     assert git(rig.repo, "rev-parse", "HEAD").decode().strip() == rig.options["expected_head"]
 
 
-def test_distinct_request_ids_for_identical_commit_share_one_operation(rig, monkeypatch):
+def test_distinct_request_ids_for_identical_commit_share_one_operation(rig, monkeypatch,
+                                                                     terminal_observation):
+    remaining = terminal_observation.remaining
     gate = Barrier(2)
     calls = []
     real = team_git.cas_fast_forward
@@ -455,14 +488,14 @@ def test_distinct_request_ids_for_identical_commit_share_one_operation(rig, monk
         calls.append(1)
         return real(*args, **kwargs)
     def governance(commit, tree):
-        gate.wait(timeout=10)
+        gate.wait(timeout=remaining())
         return True
     monkeypatch.setattr(custody, "team_git", SimpleNamespace(**{**vars(team_git), "cas_fast_forward": observed}))
     with make_store(rig.repo) as second_store, ThreadPoolExecutor(max_workers=2) as pool:
         other = SimpleNamespace(repo=rig.repo, store=second_store, options=rig.options, journal=rig.journal)
         pending = [pool.submit(run, candidate, request_id=request, governance_check=governance)
                    for candidate, request in ((rig, "commit-1"), (other, "commit-2"))]
-        outcomes = [future.result(timeout=20) for future in pending]
+        outcomes = [future.result(timeout=remaining()) for future in pending]
     rows = [row for row in rig.journal.read().rows if row["op"] == "commit"]
     assert [row["kind"] for row in rows] == ["intent", "result"]
     assert calls == [1]
@@ -634,14 +667,16 @@ def test_foreign_journal_admission_race_preserves_request_conflict_and_retry(rig
     assert run(rig, request_id="commit-2").status == "committed"
 
 
-def test_distinct_request_waits_for_active_binding_owner_then_recovers(rig, monkeypatch):
+def test_distinct_request_waits_for_active_binding_owner_then_recovers(rig, monkeypatch,
+                                                                     terminal_observation):
+    remaining = terminal_observation.remaining
     entered, release, alias_waiting = Event(), Event(), Event()
     calls = []
     real_cas = team_git.cas_fast_forward
     def blocked(*args, **kwargs):
         calls.append(1)
         entered.set()
-        assert release.wait(15)
+        assert release.wait(remaining())
         return real_cas(*args, **kwargs)
     class ObservedJournal:
         @contextmanager
@@ -664,17 +699,20 @@ def test_distinct_request_waits_for_active_binding_owner_then_recovers(rig, monk
         other = SimpleNamespace(repo=rig.repo, store=second_store, options=rig.options, journal=rig.journal)
         first = pool.submit(run, rig, journal=observed)
         try:
-            assert entered.wait(10)
+            assert entered.wait(remaining())
             second = pool.submit(run, other, request_id="commit-2", journal=observed)
-            assert alias_waiting.wait(10), "the attached caller bypassed binding serialization"
+            assert alias_waiting.wait(remaining()), "the attached caller bypassed binding serialization"
+            assert terminal_observation.waiting.wait(remaining()), "the attached caller did not observe the active binding"
         finally:
             release.set()
-        original, recovered = first.result(timeout=15), second.result(timeout=15)
+        original, recovered = first.result(timeout=remaining()), second.result(timeout=remaining())
     assert original.status == "committed" and recovered.status == "committed_recovered"
     assert recovered.commit == original.commit and recovered.tree == original.tree
     rows = [row for row in rig.journal.read().rows if row["op"] == "commit"]
     assert [row["kind"] for row in rows] == ["intent", "result"]
     assert calls == [1]
+    assert run(rig, request_id="commit-2", journal=observed).status == "committed_recovered"
+    assert calls == [1] and len(results(rig)) == 1
 
 
 @pytest.mark.parametrize("missing", ["journal", "subreaper"])
@@ -1027,17 +1065,18 @@ def test_same_id_stale_history_recovers_recorded_ref_without_branch_discovery(ri
     assert rows[1]["status"] == "done" and state(rig) == published[0]
 
 
-def test_distinct_input_fingerprints_still_share_identical_commit_binding(rig):
+def test_distinct_input_fingerprints_still_share_identical_commit_binding(rig, terminal_observation):
+    remaining = terminal_observation.remaining
     gate = Barrier(2)
     def governance(commit, tree):
-        gate.wait(timeout=10)
+        gate.wait(timeout=remaining())
         return True
     with make_store(rig.repo) as second_store, ThreadPoolExecutor(max_workers=2) as pool:
         other = SimpleNamespace(repo=rig.repo, store=second_store, options=rig.options, journal=rig.journal)
         pending = [pool.submit(run, candidate, request_id=request, actor=actor, governance_check=governance)
                    for candidate, request, actor in ((rig, "commit-1", "custodian-1"),
                                                      (other, "commit-2", "custodian-2"))]
-        outcomes = [future.result(timeout=20) for future in pending]
+        outcomes = [future.result(timeout=remaining()) for future in pending]
     assert outcomes[0].commit == outcomes[1].commit
     assert sorted(item.status for item in outcomes) == ["committed", "committed_recovered"]
     rows = [row for row in rig.journal.read().rows if row["op"] == "commit"]

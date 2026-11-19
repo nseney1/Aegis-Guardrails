@@ -122,11 +122,12 @@ def read_confined_bytes(root: Path, path: Path, error_type=PathTraversalError, m
         return stream.read()
 
 
-def iter_confined_files(root: Path, directory: Path, suffix: str = ".md"):
+def iter_confined_files(root: Path, directory: Path, suffix: str = ".md", *, skip_root_git: bool = False):
     """Yield (path, problem) without descending links or paths outside root.
 
     Unsafe entries and listing failures are yielded for the caller to report; they
-    are never read. Missing directories contain no files.
+    are never read. Missing directories contain no files. With skip_root_git,
+    omit root's .git entry (including files and links) before descent.
     """
     if directory.is_symlink() or not is_within(directory, root, unresolvable=False):
         yield directory, "a symlink or outside the workspace; not followed"
@@ -135,6 +136,9 @@ def iter_confined_files(root: Path, directory: Path, suffix: str = ".md"):
         return
     failures = []
     for folder, dirs, files in os.walk(directory, followlinks=False, onerror=failures.append):
+        if skip_root_git and Path(folder) == root:
+            dirs[:] = [name for name in dirs if name != ".git"]
+            files = [name for name in files if name != ".git"]
         dirs.sort()
         for name in list(dirs):
             path = Path(folder, name)

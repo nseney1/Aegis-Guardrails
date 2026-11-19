@@ -41,12 +41,18 @@ writer requests retain their original IDs, holders and path/repository scope.
 
 | Planned team | Retained routes and next obligation |
 |---|---|
-| Aegis Runtime | `aegis47-live`, `aegis47-multihost`, `prototype47`, and closed `prototype47-flowfix-20261102` history; native/runtime qualification and recovery. Runtime g20 stays stopped. |
+| Aegis Runtime | `aegis-live` (live initiative), `aegis47-live` (read-only history), `aegis47-multihost`, `prototype47`, and closed `prototype47-flowfix-20261102` history; native/runtime qualification and recovery. Runtime g20 stays stopped. |
 | Aegis Delivery | `aegis`, `aegis47-build`, and unstaffed D2-probe history; B1 partial, CLI/MCP, product integration and CI. Delivery g8 stays stopped; g9 remains unverified. Preserve req-00000392. |
 | Stormheir Engine | `stormheir-engine` and `stormheir-engine-native`; seven-file partial, 13 unexecuted cases, two P1 findings, controls and exact game adoption. Preserve req-00000360 and req-00000422. |
 | Stormheir Content | `stormheir`; Settings/T140 metadata and source adoption, hero capture and zero-fallback instrumentation, content/art/audio. Preserve req-00000357 and owner visual/audio acceptance. |
 | Stormheir Campaign | `stormheir-campaign`; capped G2 partial, scoped 6+64 test claims, 332-pointer reconciliation, actual worker/backend/assets and compatibility. |
 | Stormheir Integration & Acceptance | New planning scope with no current actor, registry row or grant. One integrator with independent review inside existing capacity; exact combined source, shared-seam ownership, compatibility and end-to-end validation. |
+
+Use version-free initiative names, such as `aegis-live`. Retiring an initiative
+under a new name requires a fresh provision and a read-only history marker in
+the old initiative; preserve its historical evidence and references. For this
+rename, the marker is `aegis47-live/RENAMED-TO-aegis-live.md`; provisioning
+`aegis-live` belongs to the separate SUB-2 acceptance run.
 
 Content must explicitly transfer the agreed shared integration responsibilities.
 Before that transfer, Content and Integration & Acceptance exchange a correlated

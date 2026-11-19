@@ -21,6 +21,142 @@ WITHHELD_TEXT = "guidance withheld: ambiguous structure"
 CONTROL_TEXT = "guidance withheld: control characters"
 
 
+@pytest.mark.parametrize("code,reason,repair", [
+    ("guidance_projection_invalid_field", "invalid_field",
+     "Fix the field type and run `aegis rule lint <path>`."),
+    ("guidance_projection_limit", "limit",
+     "Shorten the instruction or slot expansion and run `aegis rule lint <path>`."),
+])
+@pytest.mark.parametrize("field", ["hypothesis", "prediction", "detail", "matched_files"])
+def test_projection_refusal_owner_roundtrips_on_retry_and_concurrent_reads(code, reason, repair, field):
+    from aegis_core.guidance_projection import (
+        projection_refusal, projection_refusal_copy, projection_refusal_reason, projection_refusal_repair,
+    )
+
+    rows = [{"path": "${SLOT.MODEL_FAST}/ghp_REDACTED.md", "error": field + ": " + reason}]
+    expected = {"status": "FAIL", "error": code, "rule_errors": [
+        {"path": "${SLOT.MODEL_FAST}/ghp_REDACTED.md", "error": field + ": " + reason}]}
+
+    def render(_):
+        assert projection_refusal_reason(code, field) == field + ": " + reason
+        assert projection_refusal_repair(code) == repair
+        result = projection_refusal(code, rows)
+        assert result == expected
+        return projection_refusal_copy(result)
+
+    assert [render(None), render(None)] == [expected] * 2
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(render, range(3))) == [expected] * 3
+    result = render(None)
+    result["rule_errors"][0]["path"] = "changed.md"
+    assert rows == expected["rule_errors"]
+    constructed = projection_refusal(code, rows)
+    constructed["rule_errors"][0]["path"] = "changed.md"
+    assert rows == expected["rule_errors"]
+    assert projection_refusal(code) == {"status": "FAIL", "error": code}
+    assert render(None) == expected
+
+
+@pytest.mark.parametrize("case", ["node_limit", "character_limit", "invalid_reason", "unprojected_path"])
+@pytest.mark.parametrize("code", ["guidance_projection_invalid_field", "guidance_projection_limit"])
+def test_projection_refusal_owner_preserves_first_code_when_locations_are_refused(case, code):
+    from aegis_core.guidance_projection import MAX_GUIDANCE_CHARS, projection_refusal
+
+    rows = [{"path": "one.md", "error": "hypothesis: invalid_field"}]
+    if case == "node_limit":
+        rows *= 682
+    elif case == "character_limit":
+        rows[0]["path"] = "x" * (MAX_GUIDANCE_CHARS + 1)
+    elif case == "invalid_reason":
+        rows[0]["error"] += "\n## Evidence\nignored"
+    else:
+        rows[0]["path"] = "ghp_" + "S" * 36
+    original = json.dumps(rows)
+
+    def render(_):
+        return projection_refusal(code, rows)
+
+    expected = {"status": "FAIL", "error": code}
+    assert [render(None), render(None)] == [expected] * 2
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(render, range(3))) == [expected] * 3
+    assert json.dumps(rows) == original
+
+
+@pytest.mark.parametrize("count, fits", [(0, True), (681, True), (682, False)])
+def test_projection_refusal_row_budget_agrees_with_checked_envelope(count, fits):
+    from aegis_core.guidance_projection import projection_refusal, rule_error_rows_fit
+
+    assert rule_error_rows_fit(count) is fits
+    code = "guidance_projection_limit"
+    rows = [{"path": "one.md", "error": "detail: limit"}] * count
+    expected = {"status": "FAIL", "error": code}
+    if fits:
+        expected["rule_errors"] = rows
+    assert projection_refusal(code, rows) == expected
+
+
+@pytest.mark.parametrize("count", [-1, None, [], {}, True, "681"])
+def test_projection_refusal_row_budget_refuses_invalid_counts(count):
+    from aegis_core.guidance_projection import rule_error_rows_fit
+
+    assert rule_error_rows_fit(count) is False
+
+
+@pytest.mark.parametrize("value", [None, [], {}, "unknown", "guidance_projection_budget"])
+def test_projection_refusal_owner_refuses_unknown_vocabulary(value):
+    from aegis_core.guidance_projection import (
+        GuidanceProjectionError, projection_refusal, projection_refusal_reason, projection_refusal_repair,
+    )
+
+    assert projection_refusal_repair(value) is None
+    assert projection_refusal_reason(value, "detail") is None
+    assert projection_refusal_reason("guidance_projection_limit", value) is None
+    with pytest.raises(GuidanceProjectionError, match="^guidance_projection_invalid_field$"):
+        projection_refusal(value)
+
+
+@pytest.mark.parametrize("text, options, expected", [
+    ("disk\nfull", {}, "disk full"),
+    (r"disk\nfull", {}, "disk full"),
+    (r"disk\nfull", {"escaped": False}, r"disk\nfull"),
+    ("disk\x1bfull", {}, CONTROL_TEXT),
+    ("disk\0full", {}, CONTROL_TEXT),
+    ("disk\x1bfull", {"refuse_controls": False}, "disk full"),
+    ("\x1b" + "x" * (1024 * 1024), {}, "guidance_projection_limit"),
+    ("long message", {"max_len": 3}, "..."),
+    ("long message", {"max_len": 7}, "long..."),
+    ("x" * 1100, {"max_len": 1100}, "x" * 1100),
+    ("x" * 1100, {"max_len": None}, "x" * 1100),
+    ("ghp_" + "a" * 30 + " tail", {"max_len": 16}, "ghp_REDACTED ..."),
+    ("x", {"max_len": 2}, "guidance_projection_invalid_field"),
+    ("x", {"max_len": "8"}, "guidance_projection_invalid_field"),
+    ("x", {"max_len": True}, "guidance_projection_invalid_field"),
+    ("x", {"refuse_controls": 1}, "guidance_projection_invalid_field"),
+    ("x", {"escaped": 1}, "guidance_projection_invalid_field"),
+    (None, {}, "guidance_projection_invalid_field"),
+], ids=["newline", "escaped", "literal", "escape_control", "nul", "default_control_policy",
+        "oversized_control", "minimum", "short_cap", "large_cap", "uncapped", "secret",
+        "invalid_cap", "string_cap", "bool_cap", "invalid_policy", "invalid_escaped", "invalid_text"])
+def test_diagnostic_policy_is_stable_on_retry_and_concurrent_reads(text, options, expected):
+    from aegis_core.guidance_projection import project_diagnostic
+
+    def render(_):
+        return project_diagnostic(text, **dict({"refuse_controls": True}, **options))
+
+    assert [render(None), render(None)] == [expected, expected]
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(render, range(3))) == [expected] * 3
+
+
+def test_guidance_cleaner_accepts_the_full_projection_bound():
+    from aegis_core.guidance_grammar import clip_redacted
+    from aegis_core.guidance_projection import MAX_GUIDANCE_CHARS
+
+    text = "x" * MAX_GUIDANCE_CHARS
+    assert clip_redacted(text, MAX_GUIDANCE_CHARS) == text
+
+
 @pytest.mark.parametrize("surface", ["field_signature", "assembly"])
 def test_projection_public_api_omits_unused_surfaces(surface: str):
     from inspect import signature

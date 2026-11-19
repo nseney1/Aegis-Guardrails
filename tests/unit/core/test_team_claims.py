@@ -92,6 +92,15 @@ def test_unclaim_preserves_queue_workspace_contract(make_store, binding_home, mo
     make_store.rename(root)
     assert queue.valid_workspace_spelling(str(root))
     assert not (Path(binding_home) / ".config/aegis" / binding.NAME).exists()
+    if shape == "depth-256":
+        # Exercise the binding seam at 256; depth 129 keeps the full transition.
+        with storage.locked(root):
+            with binding.claim_exclusion(root, validated_workspace=True):
+                state = json.loads((root / ".aegis/state/team-queue.json").read_bytes())
+                team_claims.check_writer(root, state, "ONE", "alpha", True)
+        # Retain the completion assertions without repeated Git work at 256.
+        root.rename(make_store)
+        root = make_store
     result = unclaim(root, revision)
     assert result["exit_code"] == 0 and result["item"]["state"] == "queued", result
     assert team.read_leases(root).get("alpha") is None
@@ -750,22 +759,27 @@ def test_unclaim_unsupported_platform_is_fixed(tmp_path, monkeypatch):
 
 def test_oversized_receipt_log_refuses_before_releasing(make_store, monkeypatch):
     revision, oid = held(make_store)
-    monkeypatch.setattr(team_claims, "MAX_EVENT_BYTES", 32)
-    path = make_store / ".aegis" / "state" / "team-queue.json"
+    target = receipt_path(make_store, "ab" * 32)
+    target.parent.mkdir()
+    target.write_bytes(b"x" * (65536 + 1))
+    monkeypatch.setattr(team_claims, "secrets", SimpleNamespace(token_hex=lambda size: "ab" * 32))
+    path = make_store / ".aegis/state/team-queue.json"
     before = path.read_bytes()
     result = unclaim(make_store, revision)
     assert result["reason"] == "unclaim_event_unavailable" and result["exit_code"] == 1
     assert path.read_bytes() == before and team.read_leases(make_store).get("alpha").oid == oid
 
 
+
 def test_event_failure_after_release_can_be_retried(make_store, monkeypatch):
-    revision, _ = held(make_store)
+    revision, oid = held(make_store)
     monkeypatch.setattr(team_claims, "events", SimpleNamespace(**{**vars(events), "try_append": lambda *a, **kw: OSError("private-value")}))
     result = unclaim(make_store, revision)
-    monkeypatch.setattr(team_claims, "events", events)
-    assert result["reason"] == "unclaim_recovery_required" and "private-value" not in json.dumps(result)
-    assert not unclaim(make_store, revision)["refused"]
-    assert len(receipts(make_store)) == 1
+    assert result["exit_code"] == 0 and result["released_lease_ids"] == [oid], result
+    assert "private-value" not in json.dumps(result) and receipts(make_store) == []
+    assert not receipt_path(make_store, result["item"]["revision"]).exists()
+    assert unclaim(make_store, revision)["reason"] == "stale_revision"
+
 
 
 @pytest.mark.parametrize("phase", ["before-publication", "after-publication"])
@@ -792,15 +806,19 @@ def test_symlink_receipt_log_refuses_without_echo_or_changes(make_store, tmp_pat
     revision, oid = held(make_store)
     outside = tmp_path / "private-value"
     outside.write_text("token=private-value", encoding="utf-8")
-    log = events.events_path(make_store)
-    log.rename(log.with_name("retained-events"))
-    symlink_or_skip(outside, log)
-    path = make_store / ".aegis" / "state" / "team-queue.json"
+    target = make_store / ".aegis/state/unclaim-receipts"
+    target.mkdir()
+    # Every initial generated ID must refuse this non-directory ancestor.
+    target.rmdir()
+    symlink_or_skip(outside, target, target_is_directory=False)
+    path = make_store / ".aegis/state/team-queue.json"
     before = path.read_bytes()
     result = unclaim(make_store, revision)
-    assert result["reason"] == "unclaim_event_unavailable" and result["exit_code"] == 1
+    assert result["reason"] == "queue_io_unavailable" and result["exit_code"] == 1
     assert "private-value" not in json.dumps(result)
     assert path.read_bytes() == before and team.read_leases(make_store).get("alpha").oid == oid
+    assert outside.read_text(encoding="utf-8") == "token=private-value"
+
 
 
 def test_fingerprint_changes_when_a_lease_expires(make_store):
@@ -865,12 +883,18 @@ def test_recovery_keeps_intent_when_a_new_lane_lease_appears(make_store, monkeyp
 
 def test_event_capacity_is_checked_before_any_change(make_store, monkeypatch):
     revision, oid = held(make_store)
-    monkeypatch.setattr(team_claims, "MAX_EVENT_BYTES", events.events_path(make_store).stat().st_size + 1)
-    path = make_store / ".aegis" / "state" / "team-queue.json"
-    before = path.read_bytes()
+    # The size bound is for this receipt, independent of events history.
+    monkeypatch.setattr(team_claims, "MAX_RECEIPT_BYTES", 32)
     result = unclaim(make_store, revision)
-    assert result["reason"] == "unclaim_event_unavailable"
-    assert path.read_bytes() == before and team.read_leases(make_store).get("alpha").oid == oid
+    assert result["reason"] == "unclaim_recovery_required", result
+    assert team.read_leases(make_store).get("alpha") is None
+    path = make_store / ".aegis/state/team-queue.json"
+    intent = json.loads(path.read_bytes())["unclaim"]
+    assert not receipt_path(make_store, intent["to_revision"]).exists()
+    monkeypatch.setattr(team_claims, "MAX_RECEIPT_BYTES", 65536)
+    recovered = unclaim(make_store, revision)
+    assert recovered["exit_code"] == 0 and recovered["released_lease_ids"] == [oid]
+
 
 
 def test_non_git_lease_free_hold_remains_unmet(make_store, tmp_path):
@@ -933,7 +957,7 @@ def test_crash_and_lease_state_matrix(make_store, monkeypatch, record_property, 
     # A rollback must preserve formatting as well as decoded scheduling facts.
     path.write_text(json.dumps(json.loads(path.read_text()), indent=2) + "\n", encoding="utf-8")
     original_bytes = path.read_bytes()
-    original_publish, original_release, original_append = queue._publish, team_claims._release_lease, events.try_append
+    original_publish, original_release, original_write = queue._publish, team_claims._release_lease, team_claims._write_receipt
     armed, removed_by_us = [True], []
 
     def publication(root, state, **kwargs):
@@ -954,15 +978,14 @@ def test_crash_and_lease_state_matrix(make_store, monkeypatch, record_property, 
             raise OSError("injected after release")
         return result
 
-    def appending(root, kind, result, detail, **kwargs):
-        outcome = original_append(root, kind, result, detail, **kwargs)
-        if armed[0] and phase == "after-receipt" and result == "queue_unclaim":
+    def writing(root, intent):
+        original_write(root, intent)
+        if armed[0] and phase == "after-receipt":
             raise OSError("injected after receipt")
-        return outcome
 
     monkeypatch.setattr(queue, "_publish", publication)
     monkeypatch.setattr(team_claims, "_release_lease", releasing)
-    monkeypatch.setattr(team_claims, "events", SimpleNamespace(**{**vars(events), "try_append": appending}))
+    monkeypatch.setattr(team_claims, "_write_receipt", writing)
     first = unclaim(make_store, revision)
     assert first["reason"] == "unclaim_recovery_required"
     # Every blocked recovery in this matrix is an injected I/O failure. The cause
@@ -1073,24 +1096,22 @@ def test_last_publication_guard_refuses_a_new_lease(make_store, monkeypatch, mut
     assert "unclaim" in state and state["items"]["ONE"]["state"] == "claimed"
 
 
-@pytest.mark.parametrize("offset,admitted", [(0, True), (-1, True), (1, False), (16383, False), (16384, False)])
-def test_event_reservation_boundaries(make_store, monkeypatch, offset, admitted):
-    revision, oid = held(make_store)
-    log = events.events_path(make_store)
-    # The reserved region includes both bounded events; padding is valid JSONL whitespace.
-    monkeypatch.setattr(team_claims, "MAX_EVENT_BYTES", 32768)
-    monkeypatch.setattr(team_claims, "EVENT_MARGIN", 16384)
-    target = team_claims.MAX_EVENT_BYTES - team_claims.EVENT_MARGIN + offset
-    log.write_bytes(log.read_bytes() + b" " * (target - log.stat().st_size - 1) + b"\n")
-    path = make_store / ".aegis" / "state" / "team-queue.json"
-    before = path.read_bytes()
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+def test_event_reservation_boundaries(make_store, monkeypatch, offset):
+    revision, oid, path = plant_pending(make_store, monkeypatch)
+    pending = json.loads(path.read_bytes())["unclaim"]
+    target = receipt_path(make_store, pending["to_revision"])
+    target.parent.mkdir()
+    # White-space padding cannot evade the file byte cap before JSON decoding.
+    body = json.dumps(receipt_detail(pending)).encode("ascii")
+    target.write_bytes(body + b" " * (65536 + offset - len(body)))
     result = unclaim(make_store, revision)
-    assert result["refused"] is not admitted
-    if admitted:
-        assert result["released_lease_ids"] == [oid]
+    if offset > 0:
+        _assert_recovery_cause(result, "unclaim_event_unavailable")
     else:
-        assert result["reason"] == "unclaim_event_unavailable"
-        assert path.read_bytes() == before and team.read_leases(make_store).get("alpha").oid == oid
+        _assert_recovery_cause(result, "unclaim_lease_refused", lane="alpha", lease_oid=oid)
+    assert json.loads(path.read_bytes())["unclaim"] == pending
+
 
 
 @pytest.mark.parametrize("failure", ["start", "timeout", "nonzero"])
@@ -1148,36 +1169,31 @@ def test_initial_receipt_log_is_read_once(make_store, monkeypatch):
         opened.append(args)
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(team_claims, "storage", SimpleNamespace(**{**vars(storage), "confined_file": counted}))
+    monkeypatch.setattr(team_claims, "storage", SimpleNamespace(**{
+        **vars(storage), "confined_file": counted, "ConfinedFileError": storage.ConfinedFileError}))
     assert not unclaim(make_store, revision)["refused"]
-    assert len(opened) == 1
+    receipt_opens = [args for args in opened if args[1][0] == "unclaim-receipts"]
+    assert len(receipt_opens) == 3  # Initial absence, exclusive create, removal.
+    assert all(args[1][0] == "unclaim-receipts" for args in opened), opened
+
 
 
 def test_recovery_reads_bounded_event_slack(make_store, monkeypatch):
     revision, _ = held(make_store)
-    monkeypatch.setattr(team_claims, "MAX_EVENT_BYTES", 32768)
-    monkeypatch.setattr(team_claims, "EVENT_MARGIN", 16384)
-    original_append, original_publish = events.try_append, queue._publish
-
-    def appended_after_other_events(root, kind, result, detail, **kwargs):
-        if result == "queue_unclaim":
-            log = events.events_path(root)
-            padding = team_claims.MAX_EVENT_BYTES + 100 - log.stat().st_size
-            log.write_bytes(log.read_bytes() + b" " * (padding - 1) + b"\n")
-        return original_append(root, kind, result, detail, **kwargs)
+    original_publish = queue._publish
 
     def publication(root, state, **kwargs):
         if "unclaim" not in state:
             raise OSError("injected before final")
         return original_publish(root, state, **kwargs)
 
-    monkeypatch.setattr(team_claims, "events", SimpleNamespace(**{**vars(events), "try_append": appended_after_other_events}))
     monkeypatch.setattr(queue, "_publish", publication)
     assert unclaim(make_store, revision)["reason"] == "unclaim_recovery_required"
-    monkeypatch.setattr(team_claims, "events", events)
     monkeypatch.setattr(queue, "_publish", original_publish)
-    assert events.events_path(make_store).stat().st_size > team_claims.MAX_EVENT_BYTES
-    assert not unclaim(make_store, revision)["refused"] and len(receipts(make_store)) == 1
+    # The receipt already exists; unrelated malformed history cannot defeat it.
+    events.events_path(make_store).write_bytes(b"private-value")
+    assert not unclaim(make_store, revision)["refused"]
+
 
 
 def test_retry_release_cas_refusal_retains_intent(make_store, monkeypatch):
@@ -1599,18 +1615,18 @@ def cause_of(result):
 
 def test_initial_event_refusal_restores_queue_bytes(make_store):
     revision, oid = held(make_store)
-    log = events.events_path(make_store)
-    original_log = log.read_bytes()
-    log.write_bytes(original_log + b'{"token":"private-value"\n')
-    path = make_store / ".aegis" / "state" / "team-queue.json"
+    target = make_store / ".aegis/state/unclaim-receipts"
+    target.write_bytes(b"not a directory")
+    path = make_store / ".aegis/state/team-queue.json"
     before = path.read_bytes()
     result = unclaim(make_store, revision)
     assert result["reason"] == "unclaim_event_unavailable" and result["exit_code"] == 1
     assert "private-value" not in json.dumps(result)
     assert path.read_bytes() == before and "unclaim" not in json.loads(before)
     assert team.read_leases(make_store).get("alpha").oid == oid
-    log.write_bytes(original_log)
+    target.unlink()
     assert not unclaim(make_store, revision)["refused"]
+
 
 
 def test_initial_duplicate_rows_are_not_a_receipt_conflict(make_store):
@@ -1627,9 +1643,10 @@ def test_initial_duplicate_rows_are_not_a_receipt_conflict(make_store):
 def test_recovery_cause_names_the_blocker_and_retries(make_store, monkeypatch, blocker):
     revision, oid, path = plant_pending(make_store, monkeypatch)
     before = path.read_bytes()
-    log = events.events_path(make_store)
-    original_log = log.read_bytes()
     pending = json.loads(before)["unclaim"]
+    log = receipt_path(make_store, pending["to_revision"])
+    log.parent.mkdir()
+    original_log = b""
     if blocker == "foreign":
         # A second src/** lease cannot be claimed while alpha's live lease overlaps it.
         team.release(make_store, "alpha", oid, caller="external")
@@ -1669,7 +1686,7 @@ def test_recovery_cause_names_the_blocker_and_retries(make_store, monkeypatch, b
     elif blocker == "unreadable":
         team.release(make_store, "beta", bad, caller="owner")
     else:
-        log.write_bytes(original_log)
+        log.unlink()
     recovered = unclaim(make_store, revision)
     assert not recovered["refused"], recovered
     assert recovered["item"]["state"] == "queued"
@@ -1739,213 +1756,6 @@ def test_concurrent_recovery_retries_keep_one_lease_cause(make_store, monkeypatc
     assert recovered["released_lease_ids"] == []
 
 
-def _receipt_row(token, **detail):
-    body = {"unclaim_id": token, "writer_stopped": True, "released_lease_ids": []}
-    body.update(detail)
-    return json.dumps({"event": "lease_claimed", "result": "queue_unclaim", "detail": body},
-                      separators=(",", ":")).encode("ascii")
-
-
-def _parity_log(case):
-    token = "ab" * 32
-    row = _receipt_row(token)
-    other = b'{"event":"lease_claimed","result":"released","detail":{}}'
-    if case == "lf":
-        raw = other + b"\n" + row + b"\n"
-    elif case == "crlf":
-        raw = other + b"\r\n" + row + b"\r\n"
-    elif case == "blank-rows":
-        raw = b"\n \n\t\n\v\n\f\n\r\n" + row + b"\n\n"
-    elif case == "missing-trailing-newline":
-        raw = row
-    elif case == "torn-last-row":
-        raw = row + b"\n" + b'{"event":"private-value"\n'
-    elif case == "duplicate-receipt":
-        raw = (row + b"\n") * 2
-    elif case == "cr-terminated":
-        raw = other + b"\r" + row + b"\n"
-    elif case in ("boundary-exact", "boundary-over"):
-        boundary = team_claims.MAX_EVENT_BYTES - team_claims.EVENT_MARGIN
-        line = row + b"\n"
-        extra = 0 if case == "boundary-exact" else 1
-        raw = line + (b" " * (boundary + extra - len(line) - 1)) + b"\n"
-        assert len(raw) == boundary + extra and raw.endswith(b"\n")
-    else:
-        raise AssertionError(case)
-    return token, raw
-
-
-def _oracle_scan(raw, correlation, decode):
-    if correlation is None and len(raw) > team_claims.MAX_EVENT_BYTES - team_claims.EVENT_MARGIN:
-        raise team_claims.ClaimRefusal("unclaim_event_unavailable")
-    if raw and not raw.endswith(b"\n"):
-        raise team_claims.ClaimRefusal("unclaim_event_unavailable")
-    receipt = None
-    for line in raw.splitlines():
-        if not line.strip():
-            continue
-        try:
-            row = decode(line, "invalid_queue_state")
-        except ValueError:
-            raise team_claims.ClaimRefusal("unclaim_event_unavailable") from None
-        if type(row) is not dict:
-            raise team_claims.ClaimRefusal("unclaim_event_unavailable")
-        detail = row.get("detail")
-        if (correlation is not None and row.get("event") == "lease_claimed" and
-                row.get("result") == "queue_unclaim" and type(detail) is dict and
-                detail.get("unclaim_id") == correlation):
-            if receipt is not None:
-                raise team_claims.ClaimRefusal("unclaim_event_unavailable")
-            receipt = detail
-    return receipt
-
-
-def _scan_outcome(raw, correlation, decode):
-    try:
-        return ("ok", team_claims._scan_event_log(raw, correlation, decode))
-    except team_claims.ClaimRefusal as error:
-        return ("refuse", error.reason)
-
-
-def _oracle_outcome(raw, correlation, decode):
-    try:
-        return ("ok", _oracle_scan(raw, correlation, decode))
-    except team_claims.ClaimRefusal as error:
-        return ("refuse", error.reason)
-
-
-@pytest.mark.parametrize("case", ["lf", "crlf", "blank-rows", "missing-trailing-newline", "torn-last-row",
-    "duplicate-receipt", "boundary-exact", "boundary-over", "cr-terminated"])
-def test_event_log_decoder_matches_splitlines_parity(case):
-    token, raw = _parity_log(case)
-    expected_lines = [line for line in raw.splitlines() if line.strip()]
-    assert list(team_claims._iter_event_rows(raw)) == expected_lines
-    correlation = None if case == "boundary-over" else token
-    assert _scan_outcome(raw, correlation, queue._json) == _oracle_outcome(raw, correlation, queue._json)
-    if case == "boundary-exact":
-        assert _scan_outcome(raw, None, queue._json) == ("ok", None)
-        assert _oracle_outcome(raw, None, queue._json) == ("ok", None)
-    if case == "boundary-over":
-        seen = []
-
-        def decode(line, reason):
-            seen.append(line)
-            return queue._json(line, reason)
-
-        assert _scan_outcome(raw, None, decode) == ("refuse", "unclaim_event_unavailable")
-        assert seen == []
-    if case in ("missing-trailing-newline", "torn-last-row", "duplicate-receipt"):
-        assert _scan_outcome(raw, token, queue._json)[0] == "refuse"
-        rendered = json.dumps(_scan_outcome(raw, token, queue._json))
-        assert "private-value" not in rendered
-
-
-def test_overlong_event_row_is_refused_before_decode():
-    raw = b"{" + (b"x" * team_claims._EVENT_ROW_BYTES) + b"}\n"
-    assert team_claims._EVENT_ROW_BYTES == queue.MAX_BYTES
-    seen = []
-
-    def decode(line, reason):
-        seen.append(len(line))
-        raise AssertionError("decoded an overlong row")
-
-    with pytest.raises(team_claims.ClaimRefusal) as caught:
-        team_claims._scan_event_log(raw, "ab" * 32, decode)
-    assert caught.value.reason == "unclaim_event_unavailable" and caught.value.blockers is None
-    assert seen == []
-    assert "x" * 32 not in str(caught.value)
-
-
-def test_receipt_scan_memory_is_one_row():
-    import tracemalloc
-    token = "cd" * 32
-    rows = [b'{"event":"lease_denied","result":"refused","detail":{"n":%d}}\n' % index
-            for index in range(6000)]
-    rows.append(_receipt_row(token) + b"\n")
-    raw = b"".join(rows)
-    assert len(raw) > 256 * 1024
-    team_claims._scan_event_log(_receipt_row(token) + b"\n", token, queue._json)
-    tracemalloc.start()
-    found = team_claims._scan_event_log(raw, token, queue._json)
-    _current, peak = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
-    assert found["unclaim_id"] == token
-    assert peak < 128 * 1024, peak
-
-
-class CountingBuffer(bytes):
-    """Bytes whose ``find`` reports how many bytes each delimiter search examines."""
-
-    def __new__(cls, data, budget):
-        obj = bytes.__new__(cls, data)
-        obj.examined = 0
-        obj.budget = budget
-        return obj
-
-    def find(self, sub, start=0, end=None):
-        if end is None:
-            end = len(self)
-        if start < 0:
-            start = max(0, len(self) + start)
-        found = bytes.find(self, sub, start, end)
-        span = (end - start) if found < 0 else (found - start + len(sub))
-        self.examined += span
-        if self.examined > self.budget:
-            raise RuntimeError("delimiter search exceeded the linear budget: %s > %s" % (
-                self.examined, self.budget))
-        return found
-
-
-def _budget_log(case):
-    cap = team_claims.MAX_EVENT_BYTES - team_claims.EVENT_MARGIN
-    if case == "lf-rows":
-        row = b'{"event":"lease_denied","result":"refused","detail":{}}\n'
-        raw = row * (cap // len(row))
-    elif case == "blank-lf":
-        raw = b"\n" * 15728640
-    elif case == "cr-rows":
-        unit = b"{}\r"
-        raw = unit * ((cap - 1) // len(unit)) + b"\n"
-    else:
-        raise AssertionError(case)
-    assert 0 < len(raw) <= cap or case == "blank-lf"
-    if case == "blank-lf":
-        assert len(raw) == 15728640
-    else:
-        assert len(raw) > cap - 80
-    return raw
-
-
-@pytest.mark.parametrize("case", ["lf-rows", "blank-lf", "cr-rows"])
-def test_event_row_delimiter_search_is_linear(case):
-    raw = _budget_log(case)
-    rows = raw.count(b"\n") + raw.count(b"\r")
-    # Two full scans plus a few bytes of bookkeeping per row. A suffix rescan
-    # exceeds this on the third row and aborts, so the quadratic shape cannot
-    # run to the end of a 15 MiB log.
-    budget = 2 * len(raw) + 8 * rows
-    buf = CountingBuffer(raw, budget)
-    produced = 0
-    for _line in team_claims._iter_event_rows(buf):
-        produced += 1
-    assert buf.examined <= budget
-    assert buf.examined >= len(raw)
-    if case == "blank-lf":
-        assert produced == 0
-    elif case == "lf-rows":
-        assert produced == raw.count(b"\n")
-    else:
-        assert produced == raw.count(b"\r")
-
-
-@pytest.mark.timing
-def test_blank_lf_receipt_scan_finishes_within_the_lock_timeout():
-    raw = b"\n" * 15728640
-    started = time.monotonic()
-    assert list(team_claims._iter_event_rows(raw)) == []
-    assert time.monotonic() - started < 5.0
-
-
 def _assert_recovery_cause(result, category, *, lane=None, lease_oid=None):
     assert result["reason"] == "unclaim_recovery_required" and result["exit_code"] == 1, result
     assert [row["reason"] for row in result["blockers"]] == [
@@ -1969,15 +1779,20 @@ def _assert_recovery_cause(result, category, *, lane=None, lease_oid=None):
 
 
 def _append_correlated(root, pending, **overrides):
-    body = {"unclaim_id": pending["to_revision"], "writer_stopped": True,
-            "released_lease_ids": list(pending.get("released_lease_ids", []))}
+    body = receipt_detail(pending)
     body.update(overrides)
-    row = json.dumps({"event": "lease_claimed", "result": "queue_unclaim", "detail": body,
-                      "note": "private-value"}, separators=(",", ":")).encode("ascii") + b"\n"
-    log = events.events_path(root)
-    original = log.read_bytes()
-    log.write_bytes(original + row)
-    return log, original
+    target = receipt_path(root, pending["to_revision"])
+    target.parent.mkdir(exist_ok=True)
+    original = target.read_bytes() if target.exists() else None
+    target.write_text(json.dumps(body), encoding="utf-8")
+    return target, original
+
+
+def _restore_receipt(target, original):
+    if original is None:
+        target.unlink()
+    else:
+        target.write_bytes(original)
 
 
 def _patch_gitsafe(monkeypatch, **methods):
@@ -2013,7 +1828,7 @@ def test_inconsistent_receipt_names_event_cause(make_store, monkeypatch, defect)
         _assert_recovery_cause(result, "unclaim_event_unavailable")
         assert path.read_bytes() == before
         assert "ab" * 20 not in json.dumps(result["blockers"])
-    log.write_bytes(original)
+    _restore_receipt(log, original)
     recovered = unclaim(make_store, revision)
     assert not recovered["refused"], recovered
     assert oid in recovered["released_lease_ids"]
@@ -2031,7 +1846,7 @@ def test_concurrent_inconsistent_receipts_keep_the_event_cause(make_store, monke
     assert [result["reason"] for result in results] == ["unclaim_recovery_required"] * 2
     for result in results:
         _assert_recovery_cause(result, "unclaim_event_unavailable")
-    log.write_bytes(original)
+    _restore_receipt(log, original)
     recovered = unclaim(make_store, revision)
     assert not recovered["refused"], recovered
 
@@ -2045,7 +1860,7 @@ def test_receipt_while_lease_held_names_observed_oid(make_store, monkeypatch):
         result = unclaim(make_store, revision)
         _assert_recovery_cause(result, "unclaim_lease_refused", lane="alpha", lease_oid=oid)
         assert path.read_bytes() == before
-    log.write_bytes(original)
+    _restore_receipt(log, original)
     recovered = unclaim(make_store, revision)
     assert not recovered["refused"], recovered
     assert recovered["released_lease_ids"] == [oid]
@@ -2373,3 +2188,339 @@ def test_read_only_list_without_pending_unclaim_emits_no_recovery_command(make_s
     assert mcp["refused"] is False
     assert "aegis team queue unclaim" not in mcp_text
     assert "--workspace" not in mcp_text
+
+
+def receipt_path(root, token):
+    return root / ".aegis/state/unclaim-receipts" / (token + ".json")
+
+
+def receipt_detail(intent):
+    return {"queue": True, "action": "unclaim", "unclaim_id": intent["to_revision"],
+            "item_id": intent["id"], "lane": intent["lane"], "caller": intent["caller"],
+            "reason": intent["reason"], "writer_stopped": True,
+            "from_revision": intent["revision"], "to_revision": intent["to_revision"],
+            "from_state": "claimed", "to_state": "queued",
+            "released_lease_ids": intent.get("released_lease_ids", [])}
+
+
+@pytest.mark.parametrize("recovering", [False, True])
+@pytest.mark.parametrize("fault", ["malformed", "oversized", "forged", "symlink"])
+def test_shared_events_never_decide_unclaim(make_store, monkeypatch, recovering, fault):
+    if recovering:
+        revision, oid, path = plant_pending(make_store, monkeypatch)
+        intent = json.loads(path.read_bytes())["unclaim"]
+    else:
+        revision, oid = held(make_store)
+        intent = None
+    log = events.events_path(make_store)
+    if fault == "oversized":
+        with log.open("wb") as output:
+            output.truncate(18 * 1024 * 1024)
+    elif fault == "forged" and intent is not None:
+        # A hostile producer copies all fields, but owns no private receipt.
+        row = {"event": "lease_claimed", "result": "queue_unclaim", "detail": receipt_detail(intent)}
+        log.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    elif fault == "symlink":
+        log.unlink()
+        outside = make_store.parent / "private-value"
+        outside.write_bytes(b"keep")
+        symlink_or_skip(outside, log)
+    else:
+        log.write_bytes(b'{"private-value"\n')
+    result = unclaim(make_store, revision)
+    assert result["exit_code"] == 0 and result["released_lease_ids"] == [oid], result
+    assert not receipt_path(make_store, result["item"]["revision"]).exists()
+    assert team.read_leases(make_store).get("alpha") is None
+    if fault == "symlink":
+        assert outside.read_bytes() == b"keep"
+
+
+@pytest.mark.parametrize("fault", ["torn", "scalar", "null", "oversized", "writer_stopped", "released_lease_ids",
+                                  "item_id", "caller", "lane", "from_revision", "to_revision", "unclaim_id",
+                                  "action", "from_state", "to_state", "queue", "extra", "symlink", "directory", "fifo"])
+def test_private_receipt_refusals_preserve_intent_and_retry(make_store, monkeypatch, fault):
+    revision, oid, path = plant_pending(make_store, monkeypatch)
+    before = path.read_bytes()
+    intent = json.loads(before)["unclaim"]
+    target = receipt_path(make_store, intent["to_revision"])
+    target.parent.mkdir(exist_ok=True)
+    body = receipt_detail(intent)
+    if fault == "symlink":
+        outside = make_store.parent / "private-value"
+        outside.write_bytes(b"keep")
+        symlink_or_skip(outside, target)
+    elif fault == "directory":
+        target.mkdir()
+    elif fault == "fifo":
+        os.mkfifo(target)
+    elif fault == "oversized":
+        target.write_bytes(b"x" * (65536 + 1))
+    elif fault == "torn":
+        target.write_bytes(b'{"token":"private-value"')
+    elif fault == "scalar":
+        target.write_bytes(b'"private-value"')
+    elif fault == "null":
+        target.write_bytes(b"null")
+    else:
+        body[fault] = False if fault == "writer_stopped" else ["ab" * 20] if fault == "released_lease_ids" else "private-value"
+        target.write_text(json.dumps(body), encoding="utf-8")
+    for _ in range(2):
+        result = unclaim(make_store, revision)
+        _assert_recovery_cause(result, "unclaim_event_unavailable")
+        assert path.read_bytes() == before
+        assert team.read_leases(make_store).get("alpha").oid == oid
+    if fault == "directory":
+        target.rmdir()
+    else:
+        target.unlink()
+    assert unclaim(make_store, revision)["exit_code"] == 0
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("intervening_claim", [False, True])
+def test_finalized_receipt_recovery_consumes_only_its_transaction(make_store, monkeypatch, intervening_claim):
+    revision, oid = held(make_store)
+    publish, token = queue._publish, []
+
+    def interrupted(root, state, **kwargs):
+        if "unclaim" not in state:
+            target = receipt_path(root, state["items"]["ONE"]["revision"])
+            body = json.loads(target.read_bytes())
+            assert body["released_lease_ids"] == [oid]
+            assert target.stat().st_mode & 0o777 == 0o600
+            token.append(body["to_revision"])
+            publish(root, state, **kwargs)
+            raise OSError("private-value")
+        return publish(root, state, **kwargs)
+
+    monkeypatch.setattr(queue, "_publish", interrupted)
+    first = unclaim(make_store, revision, reason="Paused")
+    assert first["reason"] == "unclaim_recovery_required", first
+    monkeypatch.setattr(queue, "_publish", publish)
+    target = receipt_path(make_store, token[0])
+    original = target.read_bytes()
+    wrong = queue.unclaim(make_store, "ONE", expect=revision, lane="alpha", caller="other",
+                          writer_stopped=True, now=103)
+    assert wrong["refused"] and target.read_bytes() == original
+    if intervening_claim:
+        claimed = queue.claim(make_store, "ONE", expect=token[0], lane="alpha", now=103, caller="scheduler")
+        assert claimed["exit_code"] == 0, claimed
+        assert not target.exists(), "the old receipt must not lose its revision reference"
+        assert unclaim(make_store, revision)["reason"] == "stale_revision"
+        assert len(receipts(make_store)) == 1
+        return
+    with ProcessPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(race_unclaim, [(make_store, revision)] * 2, timeout=30))
+    assert sorted(row["refused"] for row in results) == [False, True]
+    recovered = next(row for row in results if not row["refused"])
+    assert recovered["released_lease_ids"] == [oid]
+    assert not target.exists() and len(receipts(make_store)) == 1
+
+
+@pytest.mark.parametrize("failure", ["unlink", "fsync"])
+def test_cleanup_failure_is_typed_after_commit_and_can_be_retried(make_store, monkeypatch, failure):
+    revision, oid = held(make_store)
+    removed = []
+
+    def unlink(path, **kwargs):
+        selected = path.endswith(".json")
+        if selected and failure == "unlink":
+            raise OSError("token=private-value\nunlink failed")
+        result = os.unlink(path, **kwargs)
+        if selected:
+            removed.append(path)
+        return result
+
+    def fsync(fd):
+        if removed and failure == "fsync":
+            raise OSError("token=private-value\nfsync failed")
+        return os.fsync(fd)
+
+    monkeypatch.setattr("aegis_core.storage_confined.os", SimpleNamespace(**{**vars(os), "unlink": unlink, "fsync": fsync}))
+    result = unclaim(make_store, revision)
+    assert result["reason"] == "queue_io_unavailable" and result["exit_code"] == 1, result
+    assert "private-value" not in json.dumps(result)
+    state = json.loads((make_store / ".aegis/state/team-queue.json").read_bytes())
+    assert "unclaim" not in state and state["items"]["ONE"]["state"] == "queued"
+    assert team.read_leases(make_store).get("alpha") is None
+    monkeypatch.setattr("aegis_core.storage_confined.os", os)
+    retry = unclaim(make_store, revision)
+    if failure == "unlink":
+        assert retry["exit_code"] == 0 and retry["released_lease_ids"] == [oid], retry
+    else:
+        assert retry["reason"] == "stale_revision", retry
+    assert not receipt_path(make_store, state["items"]["ONE"]["revision"]).exists()
+
+
+def test_racing_exclusive_receipt_create_never_overwrites(make_store, monkeypatch):
+    revision, oid = held(make_store)
+    write = team_claims._write_receipt
+    retained = []
+
+    def another_creator(root, intent):
+        write(root, intent)
+        target = receipt_path(root, intent["to_revision"])
+        retained.append((target, target.read_bytes()))
+        write(root, intent)
+
+    monkeypatch.setattr(team_claims, "_write_receipt", another_creator)
+    result = unclaim(make_store, revision)
+    _assert_recovery_cause(result, "queue_io_unavailable")
+    target, original = retained[0]
+    assert target.read_bytes() == original
+    monkeypatch.setattr(team_claims, "_write_receipt", write)
+    recovered = unclaim(make_store, revision)
+    assert recovered["exit_code"] == 0 and recovered["released_lease_ids"] == [oid], recovered
+    assert not target.exists()
+
+
+def interrupt_final_publication(root, revision, monkeypatch):
+    """Leave a real completed transaction's receipt after a lost final ack."""
+    publish = queue._publish
+
+    def interrupted(directory, state, **kwargs):
+        result = publish(directory, state, **kwargs)
+        if "unclaim" not in state:
+            raise OSError("private-value")
+        return result
+
+    monkeypatch.setattr(queue, "_publish", interrupted)
+    try:
+        first = unclaim(root, revision)
+    finally:
+        monkeypatch.setattr(queue, "_publish", publish)
+    assert first["reason"] == "unclaim_recovery_required", first
+    state = json.loads((root / ".aegis/state/team-queue.json").read_bytes())
+    token = state["items"]["ONE"]["revision"]
+    target = receipt_path(root, token)
+    assert target.is_file()
+    return token, target
+
+
+def test_repeated_final_interruptions_and_claims_leave_no_orphan_receipts(make_store, monkeypatch):
+    revision, _ = held(make_store)
+    for cycle in range(3):
+        token, target = interrupt_final_publication(make_store, revision, monkeypatch)
+        claimed = queue.claim(make_store, "ONE", expect=token, lane="alpha", now=103 + cycle, caller="owner")
+        assert claimed["exit_code"] == 0, claimed
+        assert sorted(target.parent.iterdir()) == []
+        revision = claimed["item"]["revision"]
+
+
+@pytest.mark.parametrize("fault", ["unlink", "fsync"])
+def test_revision_reconciliation_cleanup_failure_and_missing_retry(make_store, monkeypatch, fault):
+    revision, _ = held(make_store)
+    token, target = interrupt_final_publication(make_store, revision, monkeypatch)
+    path = make_store / ".aegis/state/team-queue.json"
+    before = path.read_bytes()
+    calls = []
+
+    def unlink(name, **kwargs):
+        if name == target.name:
+            calls.append("unlink")
+            if fault == "unlink":
+                raise OSError("token=private-value")
+        return os.unlink(name, **kwargs)
+
+    def fsync(fd):
+        calls.append("fsync")
+        if fault == "fsync":
+            raise OSError("token=private-value")
+        return os.fsync(fd)
+
+    monkeypatch.setattr("aegis_core.storage_confined.os", SimpleNamespace(**{
+        **vars(os), "unlink": unlink, "fsync": fsync}))
+    failed = queue.claim(make_store, "ONE", expect=token, lane="alpha", now=103, caller="owner")
+    assert failed["reason"] == "queue_io_unavailable" and failed["exit_code"] == 1, failed
+    assert "private-value" not in json.dumps(failed) and path.read_bytes() == before
+    assert target.exists() is (fault == "unlink")
+    monkeypatch.setattr("aegis_core.storage_confined.os", SimpleNamespace(**{**vars(os), "fsync": lambda fd: calls.append("retry-fsync") or os.fsync(fd)}))
+    retried = queue.claim(make_store, "ONE", expect=token, lane="alpha", now=104, caller="owner")
+    assert retried["exit_code"] == 0, retried
+    assert "retry-fsync" in calls, "a missing-file retry must complete parent durability"
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("fault", ["caller", "lane", "reason", "from_revision", "released_lease_ids", "item_id", "extra", "scalar", "oversized", "symlink", "caller-surrogate", "reason-surrogate"])
+def test_revision_reconciliation_refuses_bad_receipt_without_changing_queue(make_store, monkeypatch, fault):
+    revision, _ = held(make_store)
+    token, target = interrupt_final_publication(make_store, revision, monkeypatch)
+    original = target.read_bytes()
+    body = json.loads(original)
+    if fault == "scalar":
+        target.write_bytes(b"null")
+    elif fault == "oversized":
+        target.write_bytes(b"x" * (65536 + 1))
+    elif fault == "symlink":
+        target.unlink()
+        outside = make_store.parent / "private-value"
+        outside.write_bytes(b"keep")
+        symlink_or_skip(outside, target)
+    elif fault in ("caller-surrogate", "reason-surrogate"):
+        body[fault.partition("-")[0]] = chr(0xD800)
+        target.write_text(json.dumps(body), encoding="utf-8")
+    else:
+        body[fault] = {"caller": "token=private-value", "lane": "bad/lane", "reason": "private-value\nnext",
+                       "from_revision": "private-value", "released_lease_ids": ["private-value"]}.get(fault, "private-value")
+        target.write_text(json.dumps(body), encoding="utf-8")
+    path = make_store / ".aegis/state/team-queue.json"
+    before = path.read_bytes()
+    for _ in range(2):
+        result = queue.claim(make_store, "ONE", expect=token, lane="alpha", now=103, caller="owner")
+        assert result["reason"] == "unclaim_event_unavailable" and result["exit_code"] == 1, result
+        assert path.read_bytes() == before and "private-value" not in json.dumps(result)
+    if fault == "symlink":
+        target.unlink()
+        assert outside.read_bytes() == b"keep"
+    target.write_bytes(original)
+    assert queue.claim(make_store, "ONE", expect=token, lane="alpha", now=104, caller="owner")["exit_code"] == 0
+    assert not target.exists()
+
+
+def race_completed_claim(arguments):
+    root, token = arguments
+    return queue.claim(root, "ONE", expect=token, lane="alpha", now=103, caller="owner")
+
+
+@pytest.mark.parametrize("competitor", ["claim", "unclaim"])
+def test_revision_reconciliation_serializes_concurrent_mutations(make_store, monkeypatch, competitor):
+    revision, _ = held(make_store)
+    token, target = interrupt_final_publication(make_store, revision, monkeypatch)
+    with ProcessPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(race_completed_claim, (make_store, token))
+        second = (pool.submit(race_completed_claim, (make_store, token)) if competitor == "claim"
+                  else pool.submit(race_unclaim, (make_store, revision)))
+        results = [first.result(timeout=30), second.result(timeout=30)]
+    if competitor == "claim":
+        assert sorted(row["refused"] for row in results) == [False, True]
+        assert next(row for row in results if row["refused"])["reason"] == "stale_revision"
+    else:
+        assert results[0]["exit_code"] == 0, results
+        assert results[1].get("reason") in (None, "stale_revision"), results
+    state = json.loads((make_store / ".aegis/state/team-queue.json").read_bytes())
+    assert state["items"]["ONE"]["state"] == "claimed"
+    assert sorted(target.parent.iterdir()) == []
+
+
+@pytest.mark.parametrize("refusal", ["stale", "blocked", "invalid-result"])
+def test_refused_mutation_does_not_remove_completed_receipt(make_store, monkeypatch, refusal):
+    revision, _ = held(make_store)
+    token, target = interrupt_final_publication(make_store, revision, monkeypatch)
+    path = make_store / ".aegis/state/team-queue.json"
+    before, original = path.read_bytes(), target.read_bytes()
+    if refusal == "invalid-result":
+        # Reject the resulting queue before the before_publish cleanup hook.
+        monkeypatch.setattr(queue, "MAX_BYTES", len(before))
+    result = queue.claim(make_store, "ONE", expect="0" * 64 if refusal == "stale" else token,
+                         lane="absent" if refusal == "blocked" else "alpha", now=103, caller="owner",
+                         branch="x" * 180 if refusal == "invalid-result" else None)
+    assert result["reason"] == {"stale": "stale_revision", "blocked": "blocked", "invalid-result": "queue_size_limit"}[refusal], result
+    assert path.read_bytes() == before and target.read_bytes() == original
+
+
+@pytest.mark.parametrize("reason", ["unclaim_event_unavailable", "unclaim_recovery_required"])
+def test_unclaim_guidance_names_private_receipt_store(reason):
+    result = queue.refusal(reason, verb="unclaim")
+    assert result["reason"] == reason and result["exit_code"] == 1
+    assert ".aegis/state/unclaim-receipts" in result["next_action"]
+    assert "events" not in result["next_action"] and "16 MiB" not in result["next_action"]

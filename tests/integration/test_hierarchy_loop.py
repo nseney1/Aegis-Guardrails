@@ -25,8 +25,11 @@ from tests.integration.test_hierarchy_sweep import EVIDENCE, SealedFleet, ago, c
 
 
 LOOP = ROOT / "tools" / "hierarchy_loop.py"
+LINUX_ONLY = pytest.mark.skipif(not sys.platform.startswith("linux"),
+                                reason="run-open reads /proc and wake uses POSIX process groups")
 
 
+@LINUX_ONLY
 @pytest.mark.parametrize("mode", ["once","run"])
 @pytest.mark.parametrize("damage", ["request","plan"])
 def test_round13_planning_target_error_keeps_serving_and_runs_jobs(tmp_path,mode,damage):
@@ -34,8 +37,6 @@ def test_round13_planning_target_error_keeps_serving_and_runs_jobs(tmp_path,mode
     if os.geteuid()==0: pytest.skip("mode-000 witness requires an unprivileged runner")
     seam="loop-"+mode
     assert r13_consumer_probe(tmp_path,seam,True,damage)==R13_CONSUMER_GOLDENS[(seam,True,damage)]
-pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"),
-                                reason="run-open reads /proc and the wake supports POSIX process groups only")
 # Loads the loop with one step's tool swapped for a script, which is how a test makes a step misbehave.
 SWAPPED = """
 import importlib.util, sys
@@ -149,6 +150,879 @@ def step_states(result):
     return {row["step"]: row["state"] for row in result["steps"]}
 
 
+def subscription_file(world, *, budget=6):
+    path = world.tmp / "subscriptions.json"
+    path.write_text(json.dumps({"schema": "aegis.team-subscriptions/v1", "subscriptions": [
+        {"subscriber": "pilot/root", "match": [{"type": "info", "from": "pilot/orchestrator"}],
+         "budget": {"notices_per_hour": budget}}]}), encoding="utf-8")
+    return path
+
+
+@LINUX_ONLY
+@pytest.mark.parametrize("damage,code", [
+    ("missing", "SUBSCRIPTIONS_IO"), ("oversize", "SUBSCRIPTIONS_LIMIT"),
+    ("json", "SUBSCRIPTIONS_INVALID"), ("entry", "SUBSCRIPTIONS_INVALID"),
+    ("duplicate", "SUBSCRIPTIONS_INVALID"), ("link", "SUBSCRIPTIONS_IO"),
+])
+def test_subscriptions_refused_before_any_pass(world, damage, code):
+    from conftest import symlink_or_skip
+    config = subscription_file(world)
+    if damage == "missing":
+        config.unlink()
+    elif damage == "oversize":
+        with config.open("wb") as stream:
+            stream.truncate(262145)
+    elif damage == "json":
+        config.write_text('{"secret=never-echo":')
+    elif damage == "duplicate":
+        config.write_text('{"schema":1,"schema":2}')
+    elif damage == "link":
+        saved = config.rename(config.with_suffix(".saved"))
+        symlink_or_skip(saved, config)
+    else:
+        value = json.loads(config.read_text())
+        value["subscriptions"][0]["subscriber"] = "pilot/front-door"
+        config.write_text(json.dumps(value))
+    result = json.loads(world.loop("--subscriptions", str(config), "once", expect=2))
+    assert result["code"] == code
+    assert "secret" not in json.dumps(result)
+    assert not world.status_path.exists() and not world.launches()
+
+
+@LINUX_ONLY
+@pytest.mark.parametrize("value", ["0", "-1", "secret=never-echo", "1\n2"])
+def test_nudge_refuses_nonpositive_before_start(world, value):
+    result = json.loads(world.loop("run", "--nudge-seconds", value, "--passes", "1", expect=2))
+    assert result == {"code": "SUBSCRIPTIONS_INVALID", "error": "invalid subscriptions configuration"}
+    assert not world.status_path.exists()
+
+
+@LINUX_ONLY
+def test_nudge_large_positive_integer_never_overflows(world):
+    result = json.loads(world.loop("run", "--nudge-seconds", "9" * 5000, "--passes", "1"))
+    assert result["pass_id"] == 1 and result["holds"] == []
+
+
+@LINUX_ONLY
+@pytest.mark.parametrize("flags", [("--subscriptions",), ("run", "--nudge-seconds"),
+                                    ("run", "--nudge-seconds", "-secret=never-echo")])
+def test_subscription_option_syntax_errors_have_fixed_diagnostics(world, flags):
+    result = json.loads(world.loop(*flags, expect=2))
+    assert result == {"code": "SUBSCRIPTIONS_INVALID", "error": "invalid subscriptions configuration"}
+
+
+@LINUX_ONLY
+def test_notify_precedes_sweep_retries_without_duplicates_and_reports_budget(world):
+    config = subscription_file(world, budget=1)
+    world.publish("sub-first", "info", "Original body must never appear in a notice.")
+    flags = ("--subscriptions", str(config), "once")
+    first = json.loads(world.loop(*flags, expect=3))
+    assert [row["step"] for row in first["steps"]] == ["router_status", "route", "notify", "sweep", "run_open"]
+    assert first["subscriptions_sha256"] == hashlib.sha256(config.read_bytes()).hexdigest()
+    assert first["subscription_suppressed"] == []
+    notify = next(row for row in first["steps"] if row["step"] == "notify")
+    assert notify["published"] == 1 and notify["state"] == "ok"
+    second = json.loads(world.loop(*flags, expect=3))
+    assert next(row for row in second["steps"] if row["step"] == "notify")["published"] == 0
+    world.publish("sub-second", "info", "Another original body.")
+    third = json.loads(world.loop(*flags, expect=3))
+    assert third["subscription_suppressed"] == [
+        {"initiative": "pilot", "subscriber": "pilot/root", "reason": "budget", "held": 1}]
+    messages = world.inbox("pilot/root")
+    notices = [row for row in messages if row["message"]["message_id"].startswith("notice-")]
+    assert len(notices) == 1
+    assert "Original body" not in notices[0]["message"]["body"]
+
+
+@LINUX_ONLY
+def test_subscriptions_ignore_unrelated_registered_mailboxes(world):
+    from tests.integration.test_hierarchy_sweep import second_initiative
+    other_root = second_initiative(world)
+    config = subscription_file(world)
+    world.publish("sub-only-pilot", "info", "Original")
+    result = json.loads(world.loop("--subscriptions", str(config), "once", expect=3))
+    assert next(row for row in result["steps"] if row["step"] == "notify")["published"] == 1
+    assert not holds(result, "notify")
+    assert not (other_root.parent / "subscriptions").exists()
+
+
+@LINUX_ONLY
+def test_subscriptions_partition_frozen_configuration_across_two_mailboxes(world):
+    from tests.integration.test_hierarchy_provision import INITIATIVE, LANES
+    base = world.tmp / "initiatives" / "second"
+    provision("init", world.request(store=str(world.workspace.store), base=str(base), source=str(world.source),
+                                    initiative={**INITIATIVE, "id": "second"}, lanes=LANES, roles=["router"]))
+    for role in ("front-door", "orchestrator", "router"):
+        provision("add-role", world.request(base=str(base), endpoint="second/" + role,
+                                             host="claude-code", cwd=str(world.tmp)))
+    other_root = base / "mailbox"
+    config = subscription_file(world)
+    value = json.loads(config.read_text())
+    value["subscriptions"].append({"subscriber": "second/orchestrator", "match": [{"from": "second/front-door"}]})
+    config.write_text(json.dumps(value))
+    world.publish("sub-pilot", "info", "Pilot body")
+    world.publish("sub-second", "info", "Second body", root=other_root,
+                  sender="second/front-door", to="second/orchestrator")
+    result = json.loads(world.loop("--subscriptions", str(config), "once", expect=3))
+    assert next(row for row in result["steps"] if row["step"] == "notify")["published"] == 2
+    assert result["subscriptions_sha256"] == hashlib.sha256(config.read_bytes()).hexdigest()
+    for root, subscriber in ((world.root, "pilot/root"), (other_root, "second/orchestrator")):
+        snapshot, = (root.parent / "subscriptions").glob("configuration-*.json")
+        assert [entry["subscriber"] for entry in json.loads(snapshot.read_text())["subscriptions"]] == [subscriber]
+
+
+@LINUX_ONLY
+def test_notify_lock_failure_is_hold_and_later_steps_continue_then_recover(world):
+    config = subscription_file(world)
+    world.publish("sub-first", "info", "Original")
+    lock = world.root / ".write.lock"
+    lock.write_text("test-owned lock")
+    flags = ("--subscriptions", str(config), "once")
+    failed = json.loads(world.loop(*flags, expect=3))
+    assert ("notify", "SUBSCRIPTIONS_MAILBOX_LOCKED", "pilot") in {
+        (row["step"], row["kind"], row.get("initiative")) for row in failed["holds"]}
+    assert next(row for row in failed["steps"] if row["step"] == "notify")["state"] == "hold"
+    assert [row["step"] for row in failed["steps"]][-2:] == ["sweep", "run_open"]
+    assert lock.read_text() == "test-owned lock"
+    lock.unlink()
+    recovered = json.loads(world.loop(*flags, expect=3))
+    assert next(row for row in recovered["steps"] if row["step"] == "notify")["published"] == 1
+
+
+@LINUX_ONLY
+def test_without_subscriptions_public_entry_preserves_baseline_bytes(world):
+    before = {str(path): path.read_bytes() for path in world.root.rglob("*.md")}
+    raw = world.loop("once")
+    value = json.loads(raw)
+    for field in ("started_at", "finished_at"):
+        assert re.fullmatch(STAMP, value[field])
+        raw = raw.replace(value[field], "STAMP")
+    expected = {"schema": "aegis.loop-status/v1", "pass_id": 1, "started_at": "STAMP", "finished_at": "STAMP",
+                "interval": None, "steps": [{"step": "router_status", "state": "ok", "exit": 0, "router": "router-1"},
+                    {"step": "route", "state": "skipped"},
+                    {"step": "sweep", "state": "ok", "exit": 0, "woken": []},
+                    {"step": "run_open", "state": "ok", "exit": 0, "rows": []}],
+                "holds": [], "stopped": False, "consecutive_journal_unavailable": 0,
+                "current_step": None, "step_started_at": None}
+    assert raw == json.dumps(expected, sort_keys=True) + "\n"
+    assert world.status_path.read_bytes() == (json.dumps(value, sort_keys=True) + "\n").encode()
+    assert before == {str(path): path.read_bytes() for path in world.root.rglob("*.md")}
+
+
+@LINUX_ONLY
+def test_subscriptions_unsupported_probe_refuses_cleanly(world, monkeypatch, capsys):
+    import hierarchy_loop
+    import hierarchy_loop_subscriptions
+    config = subscription_file(world)
+    monkeypatch.setattr("hierarchy_loop_subscriptions.supported", lambda: False)
+    assert hierarchy_loop.main([*world.flags(), "--subscriptions", str(config), "once"]) == 2
+    assert json.loads(capsys.readouterr().out) == {
+        "code": "SUBSCRIPTIONS_UNSUPPORTED", "error": "subscription descriptor operations unavailable"}
+
+
+def probed_loop(world, source, *flags, expect):
+    """Run LP's public entry with a local boundary probe, like SWAPPED above."""
+    prelude = ("import sys\nfrom pathlib import Path\nfrom types import SimpleNamespace\n"
+               "sys.path.insert(0, sys.argv[1])\nimport hierarchy_loop as loop\n"
+               "import hierarchy_loop_subscriptions as helper\n")
+    script = world.script("subscription-probe.py", prelude + source + "\nsys.exit(loop.main(sys.argv[2:]))\n")
+    result = subprocess.run([sys.executable, "-I", "-B", str(script), str(LOOP.parent), *world.flags(), *flags],
+                            capture_output=True, text=True, timeout=90, env=world.env())
+    assert not result.stderr and result.returncode == expect, result.stdout + result.stderr
+    return [json.loads(line) for line in result.stdout.splitlines()]
+
+
+@LINUX_ONLY
+def test_subscriptions_configuration_is_frozen_until_restart(world):
+    config = subscription_file(world)
+    expected_hash = hashlib.sha256(config.read_bytes()).hexdigest()
+    world.publish("sub-frozen", "info", "Original")
+    result, = probed_loop(world, """
+original = loop.one_pass
+def changed(*args, **kwargs):
+    Path(sys.argv[sys.argv.index('--subscriptions') + 1]).write_text('invalid replacement')
+    return original(*args, **kwargs)
+loop.one_pass = changed
+""", "--subscriptions", str(config), "once", expect=3)
+    assert result["subscriptions_sha256"] == expected_hash
+    assert next(row for row in result["steps"] if row["step"] == "notify")["published"] == 1
+
+
+@pytest.mark.parametrize("change", ["mail", "none", "removed", "stop"])
+def test_nudge_wait_is_stat_only_and_bounded(polling_mailbox, monkeypatch, change):
+    from types import SimpleNamespace
+    import hierarchy_loop_subscriptions as helper
+    now, sleeps, stopped, changed = [0.0], [], [False], [False]
+
+    def sleep(seconds):
+        now[0] += seconds
+        sleeps.append(seconds)
+        if now[0] >= 1 and change == "mail" and not changed[0]:
+            (polling_mailbox / "a" / "root" / "test-new.md").touch()
+            changed[0] = True
+        elif now[0] >= 1 and change == "removed" and not changed[0]:
+            (polling_mailbox / "a" / "root").rename(polling_mailbox / "a" / "root-old")
+            changed[0] = True
+        elif change == "stop":
+            stopped[0] = True
+
+    clock = SimpleNamespace(monotonic=lambda: now[0], sleep=sleep)
+    monkeypatch.setattr("hierarchy_loop_subscriptions.time", clock)
+    with helper.InboxNudge([polling_mailbox]) as watcher:
+        def unexpected_open(*args, **kwargs):
+            pytest.fail("nudge wait must use stat calls only")
+        monkeypatch.setattr("hierarchy_loop_subscriptions.os", SimpleNamespace(**{**vars(os), "open": unexpected_open}))
+        watcher.wait(30, 2, lambda: stopped[0])
+    assert now[0] == (30 if change == "none" else 2 if change in {"mail", "removed"} else 0.2)
+    assert sleeps and max(sleeps) <= 0.2
+
+
+@LINUX_ONLY
+def test_notify_notice_reaches_the_existing_sweep_wake_path(world):
+    config = subscription_file(world)
+    value = json.loads(config.read_text())
+    value["subscriptions"][0].update(subscriber="pilot/orchestrator", match=[{"from": "pilot/front-door"}])
+    config.write_text(json.dumps(value))
+    world.publish("sub-wake", "info", "Original", sender="pilot/front-door", to="pilot/orchestrator")
+    result = json.loads(world.loop("--subscriptions", str(config), "once", expect=3))
+    assert next(row for row in result["steps"] if row["step"] == "notify")["published"] == 1
+    assert world.woken() == ["pilot/orchestrator"]
+    assert len([row for row in world.inbox("pilot/orchestrator")
+                if row["message"]["message_id"].startswith("notice-")]) == 1
+
+
+@LINUX_ONLY
+def test_nudge_public_run_observes_mail_arriving_during_a_pass(world):
+    results = probed_loop(world, """
+now = [0.0]
+original = loop.one_pass
+def pass_with_arrival(*args, **kwargs):
+    result = original(*args, **kwargs)
+    if result[2]['pass_id'] == 1:
+        mailbox = helper.Mailbox(helper.active_mailboxes(args[0].store)[0]['mailbox_root'])
+        binding = mailbox.current_binding('pilot/orchestrator')
+        mailbox.publish({'message_id': 'sub-arrival', 'from': 'pilot/orchestrator', 'to': 'pilot/root',
+                         'type': 'info', 'body': 'New mail', 'host': binding['host'],
+                         'session': binding['session'], 'binding_generation': binding['generation']})
+    else:
+        assert now[0] == 2
+    return result
+def sleep(seconds):
+    now[0] += seconds
+loop.one_pass = pass_with_arrival
+helper.time = SimpleNamespace(monotonic=lambda: now[0], sleep=sleep)
+""", "run", "--interval", "30", "--passes", "2", "--nudge-seconds", "2", expect=3)
+    assert [row["pass_id"] for row in results] == [1, 2]
+
+
+@LINUX_ONLY
+def test_notify_concurrent_loop_entries_publish_at_most_once(world):
+    from concurrent.futures import ThreadPoolExecutor
+    config = subscription_file(world)
+    world.publish("sub-concurrent", "info", "Original")
+    argv = [sys.executable, "-I", "-B", str(LOOP), *world.flags(), "--subscriptions", str(config), "once"]
+
+    def run():
+        return subprocess.run(argv, capture_output=True, text=True, timeout=90, env=world.env())
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: run(), range(2)))
+    assert all(not result.stderr and result.returncode in {2, 3} for result in results)
+    assert any(result.returncode == 3 for result in results)
+    assert len([row for row in world.inbox("pilot/root")
+                if row["message"]["message_id"].startswith("notice-")]) == 1
+
+
+@LINUX_ONLY
+def test_nudge_setup_failure_is_hold_and_next_pass_recovers(world):
+    first, second = probed_loop(world, """
+original = helper.prepare_nudge
+attempts = []
+def prepare(args):
+    attempts.append(True)
+    if len(attempts) == 1:
+        return None, helper.SubscriptionError('IO')
+    return original(args)
+helper.prepare_nudge = prepare
+""", "run", "--interval", "5", "--passes", "2", "--nudge-seconds", "1", expect=0)
+    assert ("nudge", "SUBSCRIPTIONS_IO", None) in holds(first)
+    assert second["holds"] == []
+
+
+@LINUX_ONLY
+@pytest.mark.parametrize("damage", ["ancestor", "file"])
+def test_subscriptions_descriptor_read_survives_concurrent_rename(world, monkeypatch, damage):
+    from contextlib import contextmanager
+    from conftest import symlink_or_skip
+    import hierarchy_loop_subscriptions as helper
+    original = helper.confined_file
+    parent = world.tmp / "config-dir"
+    parent.mkdir()
+    source = subscription_file(world).rename(parent / "subscriptions.json")
+    expected = hashlib.sha256(source.read_bytes()).hexdigest()
+    changed = []
+
+    @contextmanager
+    def swapped(root, parts, **kwargs):
+        with original(root, parts, **kwargs) as target:
+            if root == parent and not changed:
+                changed.append(True)
+                if damage == "ancestor":
+                    parent.rename(world.tmp / "saved-config")
+                    symlink_or_skip(world.tmp, parent, target_is_directory=True)
+                else:
+                    source.rename(parent / "saved.json")
+                    symlink_or_skip(parent / "saved.json", source)
+            yield target
+
+    monkeypatch.setattr("hierarchy_loop_subscriptions.confined_file", swapped)
+    if damage == "ancestor":
+        result = helper.LoopSubscriptions(world.workspace.store, str(source))
+        assert result.sha256 == expected
+    else:
+        with pytest.raises(helper.SubscriptionError) as caught:
+            helper.LoopSubscriptions(world.workspace.store, str(source))
+        assert caught.value.code == "SUBSCRIPTIONS_IO"
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_nudge_closes_all_descriptors_on_success_and_partial_open_failure(polling_mailbox, monkeypatch, failed):
+    import errno
+    from types import SimpleNamespace
+    import hierarchy_loop_subscriptions as helper
+    if not helper.supported():
+        pytest.skip("descriptor confinement unavailable")
+    opened = []
+
+    def open_directory(*args, **kwargs):
+        if failed and len(opened) == 3:
+            raise OSError(errno.EMFILE, "test-owned descriptor refusal")
+        descriptor = os.open(*args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr("hierarchy_loop_subscriptions.os", SimpleNamespace(**{**vars(os), "open": open_directory}))
+    if failed:
+        with pytest.raises(OSError) as caught:
+            helper.InboxNudge([polling_mailbox])
+        assert caught.value.errno == errno.EMFILE
+    else:
+        with helper.InboxNudge([polling_mailbox]):
+            assert opened
+    for descriptor in opened:
+        with pytest.raises(OSError) as caught:
+            os.fstat(descriptor)
+        assert caught.value.errno == errno.EBADF
+
+
+@LINUX_ONLY
+@pytest.mark.parametrize("damage", ["link", "mode"])
+def test_notify_refuses_unsafe_state_without_writing_elsewhere(world, damage):
+    from conftest import symlink_or_skip
+    config = subscription_file(world)
+    state = world.root.parent / "subscriptions"
+    outside = world.tmp / "outside-state"
+    outside.mkdir()
+    if damage == "link":
+        symlink_or_skip(outside, state, target_is_directory=True)
+    else:
+        state.mkdir(mode=0o777)
+        state.chmod(0o777)
+    result = json.loads(world.loop("--subscriptions", str(config), "once", expect=3))
+    expected = "SUBSCRIPTIONS_PATH" if damage == "link" else "SUBSCRIPTIONS_IO"
+    assert ("notify", expected, None) in holds(result)
+    assert list(outside.iterdir()) == []
+
+
+@pytest.fixture
+def polling_mailbox(tmp_path):
+    root = tmp_path.resolve() / "mailbox"
+    invoke(root, "init", {"schema": "aegis.hierarchy-pilot/v1", "writer_limit": 3, "counterparts": [],
+                          "endpoints": {"a/" + role: {} for role in ("front-door", "root", "router", "orchestrator")}})
+    return root
+
+
+@LINUX_ONLY
+def test_r2_state_equal_to_mailbox_refuses_before_snapshot_write(world):
+    from tests.integration.test_hierarchy_workspace import Workspace
+    config = subscription_file(world)
+    world.publish("placement", "info", "Original")
+    root = world.root.rename(world.root.parent / "subscriptions")
+    fresh = world.tmp / "placement-store"
+    fresh.mkdir()
+    world.workspace = Workspace(fresh)
+    world.workspace.run("init", {"writer_limit": 3, "heavy_limit": 3})
+    world.workspace.register("pilot", mailbox_root=str(root), delivery_dir=str(world.base / "delivery"))
+    before = {path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+    result = json.loads(world.loop("--subscriptions", str(config), "once", expect=3))
+    assert ("notify", "SUBSCRIPTIONS_PATH", None) in holds(result)
+    assert before == {path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+
+
+@LINUX_ONLY
+@pytest.mark.parametrize("flags", [
+    ("--subs", "safe.json", "run", "--passes", "secret=VALUE"),
+    ("run", "--nudge-s", "1", "--passes", "secret=VALUE"),
+    ("--subs=safe.json", "once"), ("run", "--nudge-s=1", "--passes", "1"),
+])
+def test_r2_abbreviations_refuse_without_echo(world, flags):
+    assert json.loads(world.loop(*flags, expect=2)) == {
+        "code": "SUBSCRIPTIONS_INVALID", "error": "invalid subscriptions configuration"}
+
+
+def test_r2_nudge_shares_ancestor_descriptors(polling_mailbox):
+    import hierarchy_loop_subscriptions as helper
+    if not helper.supported():
+        pytest.skip("descriptor confinement unavailable")
+    with helper.InboxNudge([polling_mailbox]) as watcher:
+        identities = [(os.fstat(fd).st_dev, os.fstat(fd).st_ino) for fd in watcher.descriptors]
+        assert len(identities) == len(set(identities))
+
+
+@LINUX_ONLY
+def test_r2_child_descriptor_pressure_holds_then_continues_and_recovers(world):
+    first, second = probed_loop(world, """
+import errno
+original = loop.subprocess.run
+original_prepare = helper.prepare_nudge
+failed = []
+watchers = []
+def prepared(args):
+    watcher, error = original_prepare(args)
+    assert error is None and watcher.descriptors and not watcher.closed
+    watchers.append(watcher)
+    return watcher, error
+def pressured(*args, **kwargs):
+    if not failed:
+        assert watchers and not watchers[0].closed
+        failed.append(True)
+        raise OSError(errno.EMFILE, 'secret=never-echo')
+    assert watchers[0].closed
+    return original(*args, **kwargs)
+helper.prepare_nudge = prepared
+loop.subprocess = SimpleNamespace(**{**vars(loop.subprocess), 'run': pressured})
+""", "run", "--interval", "5", "--passes", "2", "--nudge-seconds", "1", expect=0)
+    assert ("nudge", "NUDGE_LIMIT", None) in holds(first)
+    assert [row["step"] for row in first["steps"]][-2:] == ["sweep", "run_open"]
+    assert second["holds"] == []
+    assert "secret" not in json.dumps(first)
+
+
+@pytest.mark.parametrize("change", [False, True])
+def test_r2_nudge_portable_stat_polling(polling_mailbox, monkeypatch, change):
+    from types import SimpleNamespace
+    import hierarchy_loop_subscriptions as helper
+    now = [0.0]
+
+    def sleep(seconds):
+        now[0] += seconds
+        if change and now[0] >= 1:
+            (polling_mailbox / "a" / "root" / "new.md").touch()
+
+    monkeypatch.setattr("hierarchy_loop_subscriptions.supported", lambda: False)
+    monkeypatch.setattr("hierarchy_loop_subscriptions.time", SimpleNamespace(monotonic=lambda: now[0], sleep=sleep))
+    args = SimpleNamespace(subscriptions=None, nudge_seconds="2", interval=5)
+    helper.configure(args)
+    with helper.InboxNudge([polling_mailbox]) as watcher:
+        watcher.wait(5, args.nudge_seconds, lambda: False)
+    assert now[0] == (2 if change else 5)
+
+
+def test_r2_nudge_unsupported_is_typed_and_recoverable(polling_mailbox, monkeypatch):
+    from types import SimpleNamespace
+    import hierarchy_loop_subscriptions as helper
+    monkeypatch.setattr("hierarchy_loop_subscriptions.active_mailboxes", lambda _: [{"mailbox_root": str(polling_mailbox)}])
+    monkeypatch.setattr("hierarchy_loop_subscriptions.supported", lambda: False)
+    monkeypatch.setattr("hierarchy_loop_subscriptions.path_polling_supported", lambda: False)
+    watcher, error = helper.prepare_nudge(SimpleNamespace(store="unused"))
+    assert watcher is None and error.code == "NUDGE_UNSUPPORTED"
+    assert str(error) == "nudge metadata polling unavailable"
+    monkeypatch.setattr("hierarchy_loop_subscriptions.path_polling_supported", lambda: True)
+    watcher, error = helper.prepare_nudge(SimpleNamespace(store="unused"))
+    assert error is None
+    watcher.close()
+
+
+def test_r2_nudge_unavailable_store_is_typed(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import hierarchy_loop_subscriptions as helper
+    monkeypatch.setattr("hierarchy_loop_subscriptions.supported", lambda: False)
+    watcher, error = helper.prepare_nudge(SimpleNamespace(store=tmp_path / "missing-store"))
+    assert watcher is None and error.code == "NUDGE_IO"
+    assert str(error) == "nudge metadata I/O refused"
+
+
+def test_r2_nudge_budget_exhaustion_is_typed_and_recoverable(polling_mailbox, monkeypatch):
+    from types import SimpleNamespace
+    import hierarchy_loop_subscriptions as helper
+    if not helper.supported():
+        pytest.skip("descriptor confinement unavailable")
+    monkeypatch.setattr("hierarchy_loop_subscriptions.active_mailboxes", lambda _: [{"mailbox_root": str(polling_mailbox)}])
+    monkeypatch.setattr("hierarchy_loop_subscriptions.descriptor_capacity", lambda: 0)
+    watcher, error = helper.prepare_nudge(SimpleNamespace(store="unused"))
+    assert watcher is None and error.code == "NUDGE_LIMIT"
+    monkeypatch.setattr("hierarchy_loop_subscriptions.descriptor_capacity", lambda: 64)
+    watcher, error = helper.prepare_nudge(SimpleNamespace(store="unused"))
+    assert error is None
+    watcher.close()
+
+
+@LINUX_ONLY
+def test_r2_partial_notify_marks_totals_and_suppression_unknown(world):
+    manifest = world.root / "manifest.json"
+    value = json.loads(manifest.read_text())
+    value["endpoints"].update({"b/" + role: {} for role in ("front-door", "root", "router", "orchestrator")})
+    manifest.write_text(json.dumps(value))
+    for role in ("front-door", "root", "router", "orchestrator"):
+        (world.root / "b" / role).mkdir(parents=True, exist_ok=True)
+    invoke(world.root, "bind", {"endpoint": "b/orchestrator", "host": "host-one", "session": "b-orch", "expected_generation": 0})
+    invoke(world.root, "bind", {"endpoint": "b/root", "host": "host-one", "session": "b-root", "expected_generation": 0})
+    world.publish("partial-first", "info", "Original")
+    world.publish("partial-second", "info", "Original", sender="b/orchestrator", to="b/root")
+    config = subscription_file(world, budget=1)
+    value = json.loads(config.read_text())
+    value["subscriptions"].append({"subscriber": "b/root", "match": [{"from": "b/orchestrator"}]})
+    config.write_text(json.dumps(value))
+    result = json.loads(world.loop("--subscriptions", str(config), "once", expect=3))
+    step = next(row for row in result["steps"] if row["step"] == "notify")
+    assert step["published"] is None and step["complete"] is False
+    assert result["subscription_suppressed_complete"] is False
+    assert len([row for row in world.inbox("pilot/root") if row["message"]["message_id"].startswith("notice-")]) == 1
+    world.publish("partial-held", "info", "Queued while second subscriber fails")
+    incomplete = json.loads(world.loop("--subscriptions", str(config), "once", expect=3))
+    assert incomplete["subscription_suppressed_complete"] is False
+    invoke(world.root, "bind", {"endpoint": "b/router", "host": "host-one", "session": "b-router", "expected_generation": 0})
+    recovered = json.loads(world.loop("--subscriptions", str(config), "once", expect=3))
+    step = next(row for row in recovered["steps"] if row["step"] == "notify")
+    assert step["complete"] is True and step["published"] == 1
+    assert recovered["subscription_suppressed_complete"] is True
+    assert recovered["subscription_suppressed"] == [
+        {"initiative": "pilot", "subscriber": "pilot/root", "reason": "budget", "held": 1}]
+    assert len([row for row in world.inbox("pilot/root") if row["message"]["message_id"].startswith("notice-")]) == 1
+
+
+@LINUX_ONLY
+@pytest.mark.parametrize("empty", [False, True])
+@pytest.mark.parametrize("paused", [False, True])
+def test_r4_state_overlap_with_unselected_mailbox_refuses_before_any_write(world, empty, paused):
+    from concurrent.futures import ThreadPoolExecutor
+    from tests.integration.test_hierarchy_sweep import second_initiative
+    from tests.integration.test_hierarchy_workspace import Workspace
+    config = subscription_file(world)
+    if empty:
+        config.write_text(json.dumps({"schema": "aegis.team-subscriptions/v1", "subscriptions": []}))
+    other = second_initiative(world).rename(world.root.parent / "subscriptions")
+    fresh = world.tmp / "overlap-store"
+    fresh.mkdir()
+    world.workspace = Workspace(fresh)
+    world.workspace.run("init", {"writer_limit": 3, "heavy_limit": 3})
+    world.workspace.register("pilot", mailbox_root=str(world.root), delivery_dir=str(world.base / "delivery"))
+    world.workspace.register("second", mailbox_root=str(other), delivery_dir=str(world.tmp / "second-delivery"))
+    if paused:
+        world.workspace.run("update", {"initiative": "second", "source": "owner", "state": "paused"})
+    before = {path.relative_to(other): path.read_bytes() for path in other.rglob("*") if path.is_file()}
+    for _ in range(2):
+        result = json.loads(world.loop("--subscriptions", str(config), "once", expect=3))
+        assert ("notify", "SUBSCRIPTIONS_PATH", None) in holds(result)
+        assert [row["step"] for row in result["steps"]][-2:] == ["sweep", "run_open"]
+        assert before == {path.relative_to(other): path.read_bytes() for path in other.rglob("*") if path.is_file()}
+    argv = [sys.executable, "-I", "-B", str(LOOP), *world.flags(), "--subscriptions", str(config), "once"]
+
+    def run(_):
+        return subprocess.run(argv, capture_output=True, text=True, timeout=90, env=world.env())
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(run, range(2)))
+    assert all(not result.stderr and result.returncode in {2, 3} for result in results)
+    assert any(result.returncode == 3 for result in results)
+    assert before == {path.relative_to(other): path.read_bytes() for path in other.rglob("*") if path.is_file()}
+
+    other = other.rename(other.with_name("other-mailbox"))
+    recovered_store = world.tmp / "recovered-store"
+    recovered_store.mkdir()
+    world.workspace = Workspace(recovered_store)
+    world.workspace.run("init", {"writer_limit": 3, "heavy_limit": 3})
+    world.workspace.register("pilot", mailbox_root=str(world.root), delivery_dir=str(world.base / "delivery"))
+    world.workspace.register("second", mailbox_root=str(other), delivery_dir=str(world.tmp / "second-delivery"))
+    recovered = json.loads(world.loop("--subscriptions", str(config), "once"))
+    assert not holds(recovered, "notify")
+    assert recovered["subscription_suppressed_complete"] is True
+    assert before == {path.relative_to(other): path.read_bytes() for path in other.rglob("*") if path.is_file()}
+
+
+def test_r4_discovery_without_o_path_uses_store_portable_reader(tmp_path, polling_mailbox, monkeypatch):
+    from types import SimpleNamespace
+    import hierarchy_loop_subscriptions as helper
+    from tests.integration.test_hierarchy_workspace import Workspace
+    workspace = Workspace(tmp_path)
+    workspace.run("init", {"writer_limit": 3, "heavy_limit": 3})
+    workspace.register("a", mailbox_root=str(polling_mailbox), delivery_dir=str(tmp_path / "delivery"))
+    portable_os = SimpleNamespace(**{**vars(os)})
+    if hasattr(portable_os, "O_PATH"):
+        del portable_os.O_PATH
+    monkeypatch.setattr("hierarchy_loop_subscriptions.os", portable_os)
+    monkeypatch.setattr("hierarchy_workspace.os", portable_os)
+    monkeypatch.setattr("hierarchy_loop_subscriptions.supported", lambda: False)
+    assert [row["id"] for row in helper.active_mailboxes(workspace.store)] == ["a"]
+    watcher, error = helper.prepare_nudge(SimpleNamespace(store=workspace.store))
+    assert error is None
+    with watcher:
+        assert not watcher.descriptors
+
+
+@LINUX_ONLY
+def test_r4_notify_without_o_path_keeps_subscription_discovery(world):
+    config = subscription_file(world)
+    world.publish("no-o-path", "info", "Original")
+    result, = probed_loop(world, """
+import os
+import hierarchy_workspace as workspace_module
+portable_os = SimpleNamespace(**{**vars(os)})
+if hasattr(portable_os, 'O_PATH'):
+    del portable_os.O_PATH
+helper.os = workspace_module.os = portable_os
+""", "--subscriptions", str(config), "once", expect=3)
+    assert not holds(result, "notify")
+    assert next(row for row in result["steps"] if row["step"] == "notify")["published"] == 1
+
+
+@LINUX_ONLY
+@pytest.mark.parametrize("failed", [False, True])
+def test_r4_later_step_heartbeats_report_current_notify_suppression(world, failed):
+    config = subscription_file(world, budget=1)
+    world.publish("heartbeat-first", "info", "Original")
+    world.loop("--subscriptions", str(config), "once", expect=3)
+    world.publish("heartbeat-held", "info", "Queued")
+    lock = world.root / ".write.lock"
+    if failed:
+        lock.write_text("test-owned lock")
+    log = world.tmp / "heartbeats.jsonl"
+    tools = {}
+    for kind, summary in (("sweep", EMPTY_SWEEP), ("jobs", {"rows": []})):
+        tools[kind] = world.script("heartbeat-" + kind + ".py", (
+            "import json\nfrom pathlib import Path\n"
+            "with Path(%r).open('a', encoding='utf-8') as stream:\n"
+            "    stream.write(Path(%r).read_text(encoding='utf-8').strip() + '\\n')\n"
+            "print(json.dumps(%r))\n") % (str(log), str(world.status_path), summary))
+    source = "loop.TOOLS.update(sweep=Path(%r), jobs=Path(%r))" % (str(tools["sweep"]), str(tools["jobs"]))
+
+    def run(expect):
+        result, = probed_loop(world, source, "--subscriptions", str(config), "once", expect=expect)
+        beats = [json.loads(line) for line in log.read_text().splitlines()][-2:]
+        assert [beat["current_step"] for beat in beats] == ["sweep", "run_open"]
+        for beat in beats:
+            assert beat["subscription_suppressed"] == result["subscription_suppressed"]
+            assert beat["subscription_suppressed_complete"] == result["subscription_suppressed_complete"]
+        return result
+
+    result = run(3 if failed else 0)
+    assert result["subscription_suppressed_complete"] is (not failed)
+    if failed:
+        lock.unlink()
+        result = run(0)
+        assert result["subscription_suppressed_complete"] is True
+    assert result["subscription_suppressed"] == [
+        {"initiative": "pilot", "subscriber": "pilot/root", "reason": "budget", "held": 1}]
+
+
+@pytest.mark.parametrize("reason", ["EMFILE", "ENFILE", "EACCES"])
+def test_r4_descriptor_capacity_maps_exhaustion_and_preserves_other_refusals(monkeypatch, reason):
+    import errno
+    from types import SimpleNamespace
+    import hierarchy_loop_subscriptions as helper
+    pytest.importorskip("resource", reason="descriptor limits require POSIX resource support")
+
+    def unavailable(*args, **kwargs):
+        raise OSError(getattr(errno, reason), "secret=never-echo")
+
+    monkeypatch.setattr("hierarchy_loop_subscriptions.os", SimpleNamespace(**{**vars(os), "scandir": unavailable}))
+    with pytest.raises(helper.NudgeError) as caught:
+        helper.descriptor_capacity()
+    assert caught.value.code == ("NUDGE_UNSUPPORTED" if reason == "EACCES" else "NUDGE_LIMIT")
+    assert "secret" not in str(caught.value)
+    monkeypatch.setattr("hierarchy_loop_subscriptions.os", os)
+    assert 0 <= helper.descriptor_capacity() <= helper.MAX_NUDGE_DESCRIPTORS
+
+
+@pytest.mark.parametrize("reason", ["EMFILE", "ENFILE", "EIO"])
+def test_r4_nudge_open_failure_is_typed_closes_descriptors_and_recovers(polling_mailbox, monkeypatch, reason):
+    import errno
+    from types import SimpleNamespace
+    import hierarchy_loop_subscriptions as helper
+    if not helper.supported():
+        pytest.skip("descriptor confinement unavailable")
+    opened = []
+
+    def open_directory(*args, **kwargs):
+        if len(opened) == 3:
+            raise OSError(getattr(errno, reason), "secret=never-echo")
+        descriptor = os.open(*args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr("hierarchy_loop_subscriptions.active_mailboxes", lambda _: [{"mailbox_root": str(polling_mailbox)}])
+    monkeypatch.setattr("hierarchy_loop_subscriptions.os", SimpleNamespace(**{**vars(os), "open": open_directory}))
+    args = SimpleNamespace(store="unused")
+    watcher, error = helper.prepare_nudge(args)
+    assert watcher is None and error.code == ("NUDGE_IO" if reason == "EIO" else "NUDGE_LIMIT")
+    assert "secret" not in str(error)
+    for descriptor in opened:
+        with pytest.raises(OSError) as caught:
+            os.fstat(descriptor)
+        assert caught.value.errno == errno.EBADF
+    monkeypatch.setattr("hierarchy_loop_subscriptions.os", os)
+    watcher, error = helper.prepare_nudge(args)
+    assert error is None
+    watcher.close()
+
+
+@pytest.mark.parametrize("reader", ["descriptor", "portable"])
+@pytest.mark.parametrize("stage", ["registry", "directory", "enumeration", "file", "watcher"])
+@pytest.mark.parametrize("reason", ["EMFILE", "ENFILE", "EIO"])
+def test_r4b_real_registry_nudge_exhaustion_recovers(tmp_path, polling_mailbox, monkeypatch, reader, stage, reason):
+    from concurrent.futures import ThreadPoolExecutor
+    import errno
+    from types import SimpleNamespace
+    import hierarchy_loop_subscriptions as helper
+    import hierarchy_workspace as registry
+    from tests.integration.test_hierarchy_workspace import Workspace
+    if reader == "descriptor" and not registry._memo_supported():
+        pytest.skip("descriptor registry replay unavailable")
+    if stage == "watcher" and not helper.supported():
+        pytest.skip("descriptor watcher unavailable")
+    workspace = Workspace(tmp_path)
+    workspace.run("init", {"writer_limit": 3, "heavy_limit": 3})
+    workspace.register("a", mailbox_root=str(polling_mailbox), delivery_dir=str(tmp_path / "delivery"))
+    events = workspace.store / "events"
+    enabled, hits, opened, watcher_opened = [True], [], [], []
+
+    def refuse(at):
+        if enabled[0] and stage == at:
+            hits.append(at)
+            raise OSError(getattr(errno, reason), "secret=never-echo")
+
+    class RegistryPath(type(polling_mailbox)):
+        def stat(self, *args, **kwargs):
+            if self == events and kwargs.get("follow_symlinks", True):
+                refuse("registry")
+            return super().stat(*args, **kwargs)
+
+        def iterdir(self):
+            if self == events:
+                refuse("directory")
+            for path in super().iterdir():
+                if self == events:
+                    refuse("enumeration")
+                yield path
+
+        def open(self, *args, **kwargs):
+            if self.parent == events:
+                refuse("file")
+            stream = super().open(*args, **kwargs)
+            opened.append(stream.fileno())
+            return stream
+
+    def registry_open(path, *args, **kwargs):
+        if path == "events":
+            refuse("directory")
+        elif str(path).endswith(".json"):
+            refuse("file")
+        descriptor = os.open(path, *args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    def registry_scandir(path):
+        refuse("enumeration")
+        return os.scandir(path)
+
+    def watcher_open(*args, **kwargs):
+        if len(watcher_opened) >= 3:
+            refuse("watcher")
+        descriptor = os.open(*args, **kwargs)
+        opened.append(descriptor)
+        watcher_opened.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr("hierarchy_mailbox.Path", RegistryPath)
+    monkeypatch.setattr("hierarchy_workspace._memo_supported", lambda: reader == "descriptor")
+    monkeypatch.setattr("hierarchy_workspace.os", SimpleNamespace(**{**vars(os), "open": registry_open,
+                                                                  "scandir": registry_scandir}))
+    monkeypatch.setattr("hierarchy_loop_subscriptions.os", SimpleNamespace(**{**vars(os), "open": watcher_open}))
+    if stage != "watcher":
+        monkeypatch.setattr("hierarchy_loop_subscriptions.supported", lambda: False)
+    args = SimpleNamespace(store=workspace.store)
+
+    def refused(_):
+        watcher, error = helper.prepare_nudge(args)
+        assert watcher is None and error.code == ("NUDGE_IO" if reason == "EIO" else "NUDGE_LIMIT")
+        assert str(error) == ("nudge metadata I/O refused" if reason == "EIO"
+                              else "nudge descriptor or metadata budget exhausted")
+
+    refused(None)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(refused, range(2)))
+    assert hits == [stage] * 3
+    for descriptor in set(opened):
+        with pytest.raises(OSError) as caught:
+            os.fstat(descriptor)
+        assert caught.value.errno == errno.EBADF
+    enabled[0] = False
+    watcher, error = helper.prepare_nudge(args)
+    assert error is None
+    with watcher:
+        assert watcher.snapshot() == watcher.baseline
+    for descriptor in set(opened):
+        with pytest.raises(OSError) as caught:
+            os.fstat(descriptor)
+        assert caught.value.errno == errno.EBADF
+
+
+@pytest.mark.parametrize("links", ["cause", "context", "branched", "cycle", "cycle_without_exhaustion"])
+@pytest.mark.parametrize("reason", ["EMFILE", "ENFILE", "EIO"])
+def test_r4b_registry_refusal_chain_is_classified_before_io(tmp_path, polling_mailbox, monkeypatch, links, reason):
+    import errno
+    from types import SimpleNamespace
+    import hierarchy_loop_subscriptions as helper
+    from tests.integration.test_hierarchy_workspace import Workspace
+    workspace = Workspace(tmp_path)
+    workspace.run("init", {"writer_limit": 3, "heavy_limit": 3})
+    workspace.register("a", mailbox_root=str(polling_mailbox), delivery_dir=str(tmp_path / "delivery"))
+    enabled, hits = [True], []
+    wrapper = OSError(errno.EIO, "secret=wrapped")
+    failure = OSError(getattr(errno, reason), "secret=never-echo")
+    if links == "cause":
+        wrapper.__cause__ = failure
+    elif links == "context":
+        wrapper.__context__ = failure
+    else:
+        wrapper.__cause__ = ValueError("unrelated branch")
+        if links != "cycle_without_exhaustion":
+            wrapper.__context__ = failure
+        if links in {"cycle", "cycle_without_exhaustion"}:
+            wrapper.__cause__.__context__ = wrapper
+
+    class RegistryPath(type(polling_mailbox)):
+        def stat(self, *args, **kwargs):
+            if self == workspace.store / "events" and kwargs.get("follow_symlinks", True) and enabled[0]:
+                hits.append(True)
+                raise wrapper from wrapper.__cause__
+            return super().stat(*args, **kwargs)
+
+    monkeypatch.setattr("hierarchy_mailbox.Path", RegistryPath)
+    monkeypatch.setattr("hierarchy_loop_subscriptions.supported", lambda: False)
+    for _ in range(2):
+        watcher, error = helper.prepare_nudge(SimpleNamespace(store=workspace.store))
+        assert watcher is None
+        assert error.code == ("NUDGE_LIMIT" if reason != "EIO" and links != "cycle_without_exhaustion" else "NUDGE_IO")
+        assert "secret" not in str(error)
+    assert len(hits) == 2
+    enabled[0] = False
+    watcher, error = helper.prepare_nudge(SimpleNamespace(store=workspace.store))
+    assert error is None
+    watcher.close()
+
+
+@LINUX_ONLY
 @pytest.mark.parametrize("exit_code", [0, 2, 3, 7])
 @pytest.mark.parametrize("planned", [True, None])
 def test_hostenv_run_child_actual_environment(tmp_path, monkeypatch, exit_code, planned):
@@ -184,6 +1058,7 @@ def test_hostenv_run_child_actual_environment(tmp_path, monkeypatch, exit_code, 
     assert environment == before and dict(os.environ) == parent_before
 
 
+@LINUX_ONLY
 def test_hostenv_no_plan_run_child_preserves_pre_hostenv_environment(tmp_path, monkeypatch):
     from types import SimpleNamespace
     import hierarchy_loop
@@ -207,6 +1082,7 @@ def test_hostenv_no_plan_run_child_preserves_pre_hostenv_environment(tmp_path, m
     assert environment == before and dict(os.environ) == parent_before
 
 
+@LINUX_ONLY
 @pytest.mark.parametrize("plan_state", ["absent", "present", "unreadable"])
 def test_hostenv_loop_reuses_dispatcher_plan_opt_in(tmp_path, monkeypatch, plan_state):
     from types import SimpleNamespace
@@ -234,6 +1110,7 @@ def test_hostenv_loop_reuses_dispatcher_plan_opt_in(tmp_path, monkeypatch, plan_
         assert "CLAUDE_CODE_MESSAGING_TOKEN" not in result["names"] and "PATH" in result["names"]
 
 
+@LINUX_ONLY
 def test_hostenv_concurrent_children_keep_plan_selection_local(tmp_path, monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
     from types import SimpleNamespace
@@ -265,6 +1142,7 @@ def world(tmp_path):
     return World(tmp_path)
 
 
+@LINUX_ONLY
 def test_an_approved_request_is_routed_and_the_orchestrator_woken_in_the_same_pass(world):
     world.approved(request("feature-1", team="pilot"))
 
@@ -284,6 +1162,7 @@ def test_an_approved_request_is_routed_and_the_orchestrator_woken_in_the_same_pa
     assert json.loads(world.status_path.read_text()) == result
 
 
+@LINUX_ONLY
 def test_a_second_pass_routes_nothing_wakes_nothing_and_writes_nothing(world):
     world.approved(request("feature-1", team="pilot"))
     first = world.once(expect=3)
@@ -299,6 +1178,7 @@ def test_a_second_pass_routes_nothing_wakes_nothing_and_writes_nothing(world):
     assert len(world.inbox("pilot/orchestrator")) == 1
 
 
+@LINUX_ONLY
 def test_mail_the_orchestrator_ignored_gets_no_second_turn_from_a_later_pass(world):
     world.plan({"pilot/orchestrator": {"ignore": True}})
     world.approved(request("feature-1", team="pilot"))
@@ -316,6 +1196,7 @@ def test_mail_the_orchestrator_ignored_gets_no_second_turn_from_a_later_pass(wor
     assert len(world.inbox("pilot/orchestrator")) == 1
 
 
+@LINUX_ONLY
 def test_a_second_instance_is_refused_while_the_first_holds_either_lock(world):
     import fcntl
 
@@ -332,6 +1213,7 @@ def test_a_second_instance_is_refused_while_the_first_holds_either_lock(world):
     assert not (world.ledger.path / ".loop.lock").exists() and not (world.workspace.store / ".loop.lock").exists()
 
 
+@LINUX_ONLY
 def test_a_held_journal_lock_is_a_hold_and_after_three_passes_an_owner_hold_and_is_never_removed(world):
     # From ROOT, so reading it owes no answer and no silent_role hold outlives the lock.
     world.send("pilot/root", "pilot/orchestrator", "hello")
@@ -359,6 +1241,7 @@ def test_a_held_journal_lock_is_a_hold_and_after_three_passes_an_owner_hold_and_
     assert recovered["consecutive_journal_unavailable"] == 0 and recovered["holds"] == []
 
 
+@LINUX_ONLY
 def test_after_router_rotation_the_new_current_router_routes(tmp_path):
     world = World(tmp_path, router_policy(tmp_path))
     checkpoint = world.ledger.cli("checkpoint")["sha256"]
@@ -372,6 +1255,7 @@ def test_after_router_rotation_the_new_current_router_routes(tmp_path):
     assert world.ledger.status()["requests"]["feature-1"]["routed"]["actor"] == "router-2"
 
 
+@LINUX_ONLY
 def test_root_is_never_woken_and_its_queue_is_reported_for_root(world):
     world.send("pilot/orchestrator", "pilot/root", "for-root")
 
@@ -382,6 +1266,7 @@ def test_root_is_never_woken_and_its_queue_is_reported_for_root(world):
     assert world.launches() == []
 
 
+@LINUX_ONLY
 def test_a_run_open_receipt_wakes_the_requester_on_the_next_pass(world):
     world.request_job("job-1", "ok")
 
@@ -400,6 +1285,7 @@ def test_a_run_open_receipt_wakes_the_requester_on_the_next_pass(world):
     assert [row["message"]["type"] for row in world.inbox("pilot/orchestrator")] == ["job_receipt", "job_receipt"]
 
 
+@LINUX_ONLY
 def test_status_reads_not_running_stale_and_running(world):
     import fcntl
 
@@ -436,6 +1322,7 @@ def test_status_reads_not_running_stale_and_running(world):
     assert world.status(expect=3)["state"] == "not_running"
 
 
+@LINUX_ONLY
 def test_status_text_groups_holds_by_who_must_act(world):
     world.send("pilot/orchestrator", "pilot/root", "for-root")
     (world.ledger.path / ".write.lock").write_text("fixture writer")
@@ -451,6 +1338,7 @@ def test_status_text_groups_holds_by_who_must_act(world):
     assert any("router_status journal_unavailable" in line for line in root_block)
 
 
+@LINUX_ONLY
 def test_sigterm_during_a_step_lets_it_finish_and_stops_before_the_next(world):
     world.approved(request("feature-1", team="pilot"))
     signalling = world.script("router-then-term.py", (
@@ -470,6 +1358,7 @@ def test_sigterm_during_a_step_lets_it_finish_and_stops_before_the_next(world):
     assert world.ledger.status()["requests"]["feature-1"]["routed"] is None
 
 
+@LINUX_ONLY
 def test_a_step_killed_mid_pass_is_a_hold_and_the_pass_continues(world):
     killed = world.script("killed.py", "import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n")
 
@@ -481,6 +1370,7 @@ def test_a_step_killed_mid_pass_is_a_hold_and_the_pass_continues(world):
     assert json.loads(world.status_path.read_text()) == result
 
 
+@LINUX_ONLY
 @pytest.mark.parametrize("args, error", [
     (["run", "--interval", "4"], "--interval must be between 5 and 600 seconds"),
     (["run", "--interval", "601"], "--interval must be between 5 and 600 seconds"),
@@ -492,6 +1382,7 @@ def test_bad_arguments_are_refused(world, args, error):
     assert not world.status_path.exists()
 
 
+@LINUX_ONLY
 def test_a_relative_path_is_refused(world):
     proc = subprocess.run([sys.executable, "-I", "-B", str(LOOP), "--lifecycle", "lifecycle", "--store",
                            str(world.workspace.store), "--recipes", str(world.recipes_path), "--state-dir",
@@ -512,6 +1403,7 @@ def answering(world, name, outputs):
         "sys.exit(9)\n") % ({key: tuple(value) for key, value in outputs.items()},))
 
 
+@LINUX_ONLY
 def test_a_broken_store_is_a_store_hold_for_root_and_never_counts_toward_the_journal_lock(world):
     (world.ledger.path / ".write.lock").write_text("fixture writer")
     assert world.once(expect=3)["consecutive_journal_unavailable"] == 1
@@ -530,6 +1422,7 @@ def test_a_broken_store_is_a_store_hold_for_root_and_never_counts_toward_the_jou
         assert step_states(result)["route"] == "skipped"
 
 
+@LINUX_ONLY
 def test_a_store_failure_after_three_journal_failures_keeps_the_count_but_raises_no_journal_lock(world):
     lock = world.ledger.path / ".write.lock"
     lock.write_text("fixture writer")
@@ -544,6 +1437,7 @@ def test_a_store_failure_after_three_journal_failures_keeps_the_count_but_raises
     assert set(holds(result, "router_status")) == {("router_status", "store_unavailable", None)}
 
 
+@LINUX_ONLY
 def test_a_router_status_refusal_from_neither_journal_nor_store_is_a_router_status_error(world):
     refusing = answering(world, "refusing-router.py", {"status": (2, {"state": "hold", "error": "policy refused"})})
 
@@ -556,6 +1450,7 @@ def test_a_router_status_refusal_from_neither_journal_nor_store_is_a_router_stat
     assert [result["consecutive_journal_unavailable"] for result in passes] == [0, 0, 0]
 
 
+@LINUX_ONLY
 def test_an_endpoint_failing_to_start_three_passes_running_is_skipped_until_the_owner_clears_status(world):
     log = world.tmp / "sweep-argv.log"
     failing = world.script("failing-sweep.py", (
@@ -595,6 +1490,7 @@ def test_an_endpoint_failing_to_start_three_passes_running_is_skipped_until_the_
     assert ("sweep", "start_failing", "pilot/orchestrator") not in holds(cleared)
 
 
+@LINUX_ONLY
 def test_a_start_failing_hold_survives_a_failed_sweep_step(world):
     log = world.tmp / "sweep-argv.log"
     status = {"schema": "aegis.loop-status/v1", "pass_id": 4, "consecutive_journal_unavailable": 0, "interval": None,
@@ -614,6 +1510,7 @@ def test_a_start_failing_hold_survives_a_failed_sweep_step(world):
     assert (kept["detail"], kept["count"], kept["act"]) == ("why", 2, "owner")
 
 
+@LINUX_ONLY
 def test_a_long_step_reads_as_running_with_its_name_not_stale(world):
     world.once()
     started, release = world.tmp / "sweep-started", world.tmp / "sweep-release"
@@ -655,6 +1552,7 @@ def test_a_long_step_reads_as_running_with_its_name_not_stale(world):
     assert (final["pass_id"], final["current_step"], final["step_started_at"]) == (2, None, None)
 
 
+@LINUX_ONLY
 def test_a_status_file_that_cannot_be_written_is_reported_and_the_loop_goes_on(world):
     world.status_path.mkdir(parents=True)
 
@@ -668,6 +1566,7 @@ def test_a_status_file_that_cannot_be_written_is_reported_and_the_loop_goes_on(w
     assert world.status_path.is_dir() and list(world.state_dir.iterdir()) == [world.status_path]
 
 
+@LINUX_ONLY
 @pytest.mark.parametrize("change, error", [
     ({"holds": [{"step": "sweep"}]}, "status file has a bad hold"),
     ({"pass_id": "7"}, "status file has a bad pass_id"),
@@ -689,6 +1588,7 @@ def test_a_status_file_of_the_wrong_shape_restarts_the_counts_with_an_owner_hold
     assert world.once()["holds"] == []
 
 
+@LINUX_ONLY
 def test_a_status_probes_shared_lock_does_not_refuse_a_starting_loop(world):
     world.lock_path("lifecycle").touch(mode=0o600)
 
@@ -699,6 +1599,7 @@ def test_a_status_probes_shared_lock_does_not_refuse_a_starting_loop(world):
     assert json.loads(proc.stdout.splitlines()[-1])["pass_id"] == 1
 
 
+@LINUX_ONLY
 @pytest.mark.parametrize("which", ["lifecycle", "store"])
 def test_a_lock_path_that_is_a_symlink_is_refused_and_its_target_untouched(world, which):
     path, target = world.lock_path(which), world.tmp / "elsewhere.lock"
@@ -714,6 +1615,7 @@ def test_a_lock_path_that_is_a_symlink_is_refused_and_its_target_untouched(world
     assert target.read_text() == "other journal's lock" and not world.status_path.exists()
 
 
+@LINUX_ONLY
 def test_a_lock_path_that_is_not_a_regular_file_is_refused(world):
     os.mkfifo(world.lock_path("store"))
 
@@ -722,6 +1624,7 @@ def test_a_lock_path_that_is_not_a_regular_file_is_refused(world):
     assert not world.status_path.exists()
 
 
+@LINUX_ONLY
 def test_router_request_rows_and_unresolved_escalations_become_holds(world):
     status = {"router": "router-1", "escalations": [
         {"request_id": "r-esc", "reason": "over budget", "team": "pilot", "root_decision": None},
@@ -748,6 +1651,7 @@ def test_router_request_rows_and_unresolved_escalations_become_holds(world):
     }
 
 
+@LINUX_ONLY
 def test_a_lost_route_report_still_raises_each_held_request(world):
     status = {"router": "router-1", "escalations": [], "requests": [{"request_id": "r1", "state": "ready"}]}
     router = answering(world, "reportless-router.py", {"status": (0, status), "route": (0, {
@@ -760,6 +1664,7 @@ def test_a_lost_route_report_still_raises_each_held_request(world):
                      ("route", "request_held", "r1"): ("router", json.dumps({"reason": "delivery_error"}))}
 
 
+@LINUX_ONLY
 def test_a_root_past_its_limit_is_a_rotate_hold_for_root(world):
     codex_transcript(world, "root-session", 90)
 
@@ -769,6 +1674,7 @@ def test_a_root_past_its_limit_is_a_rotate_hold_for_root(world):
     assert held["act"] == "root" and json.loads(held["detail"])["state"] == "rotate_now"
 
 
+@LINUX_ONLY
 def test_a_job_that_needs_root_is_a_hold_for_root_and_a_finished_one_is_not(world):
     jobs = answering(world, "fixed-jobs.py", {"run-open": (3, {"rows": [
         {"job": "pilot/job-1", "state": "abandoned", "pid": 7}, {"job": "pilot/job-2", "state": "completed"}]})})
@@ -779,6 +1685,7 @@ def test_a_job_that_needs_root_is_a_hold_for_root_and_a_finished_one_is_not(worl
         ("run_open", "job_abandoned", "pilot/job-1"): ("root", json.dumps({"pid": 7}))}
 
 
+@LINUX_ONLY
 def test_the_real_sweep_skips_an_endpoint_under_a_start_failing_hold(world):
     world.send("pilot/root", "pilot/orchestrator", "hello")
     world.state_dir.mkdir()
@@ -805,6 +1712,7 @@ def root_lines(text):
     return block[:next((i for i, line in enumerate(block) if not line.startswith("  ")), len(block))]
 
 
+@LINUX_ONLY
 def test_a_route_the_orchestrator_reads_and_leaves_unanswered_is_a_silent_role_hold_for_root_until_it_publishes(world):
     world.approved(request("feature-1", team="pilot"))
     route = "route-" + world.ledger.status()["requests"]["feature-1"]["raw"]["sha256"]
@@ -827,6 +1735,7 @@ def test_a_route_the_orchestrator_reads_and_leaves_unanswered_is_a_silent_role_h
     assert ("sweep", "root_queue", "pilot/root") in holds(answered)
 
 
+@LINUX_ONLY
 def test_a_lane_that_accepts_its_dispatch_and_stops_is_a_stalled_dispatch_hold_for_root_until_it_answers(world):
     world.add_role("pilot/lane/review", cwd=str(world.tmp))
     world.plan({"pilot/lane/review": {"send": [{"message_id": "review-1-accepted", "to": "pilot/orchestrator",
