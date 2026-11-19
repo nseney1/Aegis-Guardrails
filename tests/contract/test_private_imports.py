@@ -161,7 +161,6 @@ PRIVATE_IMPORTS = {'aegis_cli/check.py:aegis_cli.verify._append_step_summary': 1
  'aegis_core/storage.py:aegis_core.atomicio._write_all': 1,
  'aegis_core/verification/security_pack.py:aegis_core.ast.policy._new_findings': 1,
  'aegis_core/workspace/base.py:aegis_core.workspace.hooks._find_git_dirs': 1,
- 'aegis_core/yaml_engine/frontmatter.py:aegis_core.yaml_engine.parser._CLOSING_DELIM_RE': 1,
  'aegis_core/yaml_engine/serializer.py:aegis_core.yaml_engine.parser._BOOL_FALSE': 1,
  'aegis_core/yaml_engine/serializer.py:aegis_core.yaml_engine.parser._BOOL_TRUE': 1,
  'aegis_core/yaml_engine/serializer.py:aegis_core.yaml_engine.parser._FLOAT_RE': 1,

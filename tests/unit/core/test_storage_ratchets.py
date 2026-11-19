@@ -359,7 +359,8 @@ AUDIT_READ_ONLY_OPERATIONS = {
     ("aegis_core/manager_store.py", "ManagerStore._read", "aegis_core.manager_store.ManagerStore._audit"): "passes O_RDONLY to the generic audit opener; no append/create flags",
     ("aegis_core/manager_store.py", "ManagerStore.read", "aegis_core.manager_store.ManagerStore._anchor"): "bind directory descriptors for the separate manager audit store; any mutation belongs to the deeper registered writer/storage frame",
     ("aegis_core/message_codec_store.py", "Store._read_bytes", "aegis_core.message_codec_store.Store._open"): "passes O_RDONLY to Store._open; never requests record creation",
-    ("aegis_core/migrate.py", "<module>", "aegis_core.workspace.confinement.read_confined_bytes"): "read-only bounded existing config or migration source bytes; this approved call requests read-only inspection",
+    ("aegis_core/migrate.py", "<module>", "aegis_core.rule_inventory.read_rule_file"): "FRONTMATTER-BOUNDED-READ: partial binding of the shared bounded read-only rule facade.",
+    ("aegis_core/migrate.py", "apply", "aegis_core.workspace.confinement.read_confined_bytes"): "FRONTMATTER-BOUNDED-READ: separate bounded read-only config check with MAX_CONFIG_BYTES.",
     ("aegis_core/migrate.py", "_plan_rules", "aegis_core.migrate._input"): "bounded migration rule and target reads through the declared partial; this approved call requests read-only inspection",
     ("aegis_core/model_select.py", "_check_log_generation", "aegis_core.model_select._open_log"): "read-only anchored decision log generation check before atomic publication; closes the inspected stream without mutation",
     ("aegis_core/model_select.py", "_input", "aegis_core.model_select._open_regular"): "read-only bounded decision input config inspection; this approved call requests read-only inspection",
@@ -370,6 +371,7 @@ AUDIT_READ_ONLY_OPERATIONS = {
     ("aegis_core/model_select.py", "select_and_append", "aegis_core.model_select._publish"): "atomic publication of the caller-selected decision log; any mutation belongs to the deeper registered writer/storage frame",
     ("aegis_core/packaging.py", "_is_ours", "aegis_core.storage.read_json_dict"): "read the existing export manifest through the storage boundary; this approved call requests read-only inspection",
     ("aegis_core/rule_inventory.py", "inventory_rules", "aegis_core.rule_inventory._read_stable_file"): "read-only bounded stable rule inventory bytes; this approved call requests read-only inspection",
+    ("aegis_core/rule_inventory.py", "read_rule_file", "aegis_core.rule_inventory._read_stable_file"): "FRONTMATTER-BOUNDED-READ: one bounded read-only delegate to the existing stable inventory kernel.",
     ("aegis_core/scan_compliance.py", "_tail", "aegis_core.storage.read_tail_bytes"): "read bounded compliance evidence through the storage boundary; this approved call requests read-only inspection",
     ("aegis_core/scan_compliance.py", "report", "aegis_core.storage.read_jsonl"): "read stored scan activity through the storage boundary; this approved call requests read-only inspection",
     ("aegis_core/sync.py", "read_derived", "aegis_core.storage.read_json_dict"): "read derived metadata through the storage boundary; this approved call requests read-only inspection",
@@ -436,6 +438,7 @@ AUDIT_READ_ONLY_OPERATIONS = {
     ("aegis_core/verification/scanners.py", "_SarifLineCache.fill", "os.open"): "read-only SARIF root directory descriptor; this approved call requests read-only inspection",
     ("aegis_core/verification/scanners.py", "_sarif_open_artifact", "os.open"): "read-only confined SARIF artifact directory walk and file inspection; this approved call requests read-only inspection",
     ("aegis_core/workspace/confinement.py", "read_confined_bytes", "os.open"): "read-only bounded confined file inspection; this approved call requests read-only inspection",
+    ("aegis_core/yaml_engine/frontmatter.py", "_read_rule_text", "aegis_core.rule_inventory.read_rule_file"): "FRONTMATTER-BOUNDED-READ: one bounded read-only rule snapshot before text decoding/parsing.",
 }
 
 # These atomicio wrappers expose its descriptor opener transitively. Other
@@ -444,6 +447,7 @@ _ATOMIC_WRAPPERS = {
     "aegis_core.atomicio.open_regular", "aegis_core.atomicio.create_private_file",
     "aegis_core.atomicio.atomic_write_bytes", "aegis_core.atomicio.atomic_write_text",
     "aegis_core.atomicio.atomic_write_and_unlink",
+    "aegis_core.rule_inventory.read_rule_file",
 }
 # Opener -> flags position in a function/bound-method call; None means no flags
 # parameter. Fixed-flag readers may remain declared so their calls stay reviewed.
@@ -488,7 +492,7 @@ FORWARDING_OPENERS = dict.fromkeys(_ATOMIC_WRAPPERS, None) | {
     "aegis_core.workspace.confinement.read_confined_bytes": None,
 }
 _PARTIAL_OPENERS = {
-    "aegis_core.migrate._input": "aegis_core.workspace.confinement.read_confined_bytes",
+    "aegis_core.migrate._input": "aegis_core.rule_inventory.read_rule_file",
 }
 CAPABILITY_REFERENCES = {
     ("aegis_core/model_select.py", "<module>", "os.open"): "probe directory-descriptor support before any decision-log I/O",
@@ -576,7 +580,8 @@ REVIEWED_DESCRIPTOR_OPERATIONS = {
     ("aegis_core/message_codec_store.py", "Store._read_bytes", "aegis_core.message_codec_store.Store._open"): (1, "read or exclusively create a message record in the bound private store"),
     ("aegis_core/message_codec_store.py", "Store.write", "aegis_core.message_codec_store.Store._open"): (1, "read or exclusively create a message record in the bound private store"),
     ("aegis_core/message_codec_store.py", "Store.write", "os.link"): (1, "publish a content-addressed message record within the bound private message store"),
-    ("aegis_core/migrate.py", "<module>", "aegis_core.workspace.confinement.read_confined_bytes"): (1, "read-only bounded existing config or migration source bytes"),
+    ("aegis_core/migrate.py", "<module>", "aegis_core.rule_inventory.read_rule_file"): (1, "FRONTMATTER-BOUNDED-READ: partial binding of the shared bounded read-only rule facade."),
+    ("aegis_core/migrate.py", "apply", "aegis_core.workspace.confinement.read_confined_bytes"): (1, "FRONTMATTER-BOUNDED-READ: separate bounded read-only config check with MAX_CONFIG_BYTES."),
     ("aegis_core/migrate.py", "_plan_rules", "aegis_core.migrate._input"): (2, "bounded migration rule and target reads through the declared partial"),
     ("aegis_core/migrate.py", "apply", "aegis_core.migrate._input"): (2, "bounded config and unchanged-input reads through the declared partial"),
     ("aegis_core/model_select.py", "_check_log_generation", "aegis_core.model_select._open_log"): (1, "read-only anchored decision log generation check before atomic publication"),
@@ -589,6 +594,7 @@ REVIEWED_DESCRIPTOR_OPERATIONS = {
     ("aegis_core/model_select.py", "select_and_append", "aegis_core.model_select._publish"): (1, "atomic publication of the caller-selected decision log"),
     ("aegis_core/packaging.py", "_is_ours", "aegis_core.storage.read_json_dict"): (1, "read the existing export manifest through the storage boundary"),
     ("aegis_core/rule_inventory.py", "inventory_rules", "aegis_core.rule_inventory._read_stable_file"): (1, "read-only bounded stable rule inventory bytes"),
+    ("aegis_core/rule_inventory.py", "read_rule_file", "aegis_core.rule_inventory._read_stable_file"): (1, "FRONTMATTER-BOUNDED-READ: one bounded read-only delegate to the existing stable inventory kernel."),
     ("aegis_core/scan_compliance.py", "_tail", "aegis_core.storage.read_tail_bytes"): (1, "read bounded compliance evidence through the storage boundary"),
     ("aegis_core/scan_compliance.py", "report", "aegis_core.storage.read_jsonl"): (1, "read stored scan activity through the storage boundary"),
     ("aegis_core/sync.py", "read_derived", "aegis_core.storage.read_json_dict"): (1, "read derived metadata through the storage boundary"),
@@ -699,6 +705,7 @@ REVIEWED_DESCRIPTOR_OPERATIONS = {
     ("aegis_core/verification/scanners.py", "_SarifLineCache.fill", "os.open"): (1, "read-only SARIF root directory descriptor"),
     ("aegis_core/verification/scanners.py", "_sarif_open_artifact", "os.open"): (2, "read-only confined SARIF artifact directory walk and file inspection"),
     ("aegis_core/workspace/confinement.py", "read_confined_bytes", "os.open"): (1, "read-only bounded confined file inspection"),
+    ("aegis_core/yaml_engine/frontmatter.py", "_read_rule_text", "aegis_core.rule_inventory.read_rule_file"): (1, "FRONTMATTER-BOUNDED-READ: one bounded read-only rule snapshot before text decoding/parsing."),
 }
 
 
