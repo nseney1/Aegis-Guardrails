@@ -40,6 +40,20 @@ _ID = re.compile(r"[a-z0-9][a-z0-9_-]{1,63}\Z")
 _INSIGHT_ID = re.compile(r"ins-[0-9a-f]{12}\Z")
 _KEY = re.compile(r"[A-Za-z0-9_.:/@+-]{1,256}\Z")
 _LEGACY_FIELDS = {"id", "type", "status", "enforcement", "kind", "hypothesis", "target_paths", "insight_ids"}
+PROPOSAL_FIELD_POLICIES = {
+    "id": "identity", "source": "identity", "kind": "text", "candidate_key": "identity",
+    "evidence_ids": "identity", "target_paths": "path", "revision": "identity",
+    "parent_proposals": "identity", "source_lineage": "identity", "insight_ids": "identity",
+    "status": "identity", "type": "identity", "enforcement": "identity", "amends": "identity",
+    "hypothesis": "text", "prediction": "text", "do": "text", "labels": "text",
+    "guidance": "text", "legacy": "identity", "count": "identity",
+}
+PROPOSAL_DECISION_FIELD_POLICIES = {
+    "v": "identity", "ts": "identity", "event": "identity", "decision": "identity",
+    "proposal_ids": "identity", "revisions": "identity", "evidence_ids": "identity",
+    "operation_id": "identity", "reason": "text", "rule_id": "identity",
+    "rule_digest": "identity", "until": "identity", "insight_ids": "identity",
+}
 
 
 class ProposalError(ValueError):
@@ -181,6 +195,7 @@ def bounded_tuple(value, maximum, check):
 
 def checked_path(value):
     if (type(value) is not str or not 1 <= len(value) <= 512 or value.startswith("/")
+            or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value)
             or any(c in value for c in ("\\", ":", "\x00"))
             or any(p in ("", ".", "..") or p.endswith((".", " ")) for p in value.split("/"))
             or clean_text(value, 512) != value):
@@ -212,6 +227,8 @@ class Proposal:
     legacy: bool = dataclass_field(default=False, init=False, compare=False)
 
     def __post_init__(self):
+        if {item.name for item in fields(self)} | {"count"} != set(PROPOSAL_FIELD_POLICIES):
+            raise ProposalError("invalid")
         checked_id(self.id)
         if (any(type(getattr(self, name)) is not str for name in ("source", "status", "type", "enforcement"))
                 or self.source not in SOURCES or self.status not in ("needs_draft", "proposal")
