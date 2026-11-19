@@ -29,7 +29,7 @@ from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_core.errors import WorkspaceError
 from aegis_core.guidance_grammar import clip_redacted
 from aegis_core.guidance_projection import (
-    CONTROL_GUIDANCE, contains_control_characters, project_diagnostic,
+    CONTROL_GUIDANCE, contains_control_characters, project_diagnostic, projection_refusal_repair,
 )
 from aegis_core.hosts import GENERIC
 from aegis_core.workspace.layout import is_aegis_workspace
@@ -100,11 +100,7 @@ def run_scan(args: argparse.Namespace) -> int:
 
 
 def _projection_errors(result: dict) -> None:
-    repairs = {
-        "guidance_projection_invalid_field": "Fix the field type and run `aegis rule lint <path>`.",
-        "guidance_projection_limit": "Shorten the instruction or slot expansion and run `aegis rule lint <path>`.",
-    }
-    repair = repairs.get(result.get("error"))
+    repair = projection_refusal_repair(result.get("error"))
     if repair is None or not result.get("rule_errors"):
         return
     for row in result["rule_errors"]:

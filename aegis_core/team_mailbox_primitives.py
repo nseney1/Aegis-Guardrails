@@ -262,17 +262,26 @@ def bounded_tree(value, *, limit=MAX_BYTES, ascii_strings=False):
         require(budget[1] <= MAX_JSON_NODES, reason="too_large")
         if type(item) is str:
             require(len(item) <= budget[0], reason="too_large")
-            for char in item:
-                code = ord(char)
-                require(not 0xD800 <= code <= 0xDFFF)
+            if item.isascii():
+                budget[0] -= len(item)
                 if ascii_strings:
-                    cost = (2 if char in ('"', "\\", "\b", "\f", "\n", "\r", "\t")
-                            else 6 if code < 32 or 127 <= code <= 65535
-                            else 12 if code > 65535 else 1)
-                else:
-                    cost = 1 if code < 128 else 2 if code < 2048 else 3 if code < 65536 else 4
-                budget[0] -= cost
-                require(budget[0] >= 0, reason="too_large")
+                    budget[0] -= item.count('"') + item.count("\\")
+                    if not item.isprintable():
+                        budget[0] -= 5 * item.count("\x7f")
+                        budget[0] -= sum(item.count(chr(code)) * (1 if code in (8, 9, 10, 12, 13) else 5)
+                                         for code in range(32))
+            else:
+                for char in item:
+                    code = ord(char)
+                    require(not 0xD800 <= code <= 0xDFFF)
+                    if ascii_strings:
+                        cost = (2 if char in ('"', "\\", "\b", "\f", "\n", "\r", "\t")
+                                else 6 if code < 32 or 127 <= code <= 65535
+                                else 12 if code > 65535 else 1)
+                    else:
+                        cost = 1 if code < 128 else 2 if code < 2048 else 3 if code < 65536 else 4
+                    budget[0] -= cost
+                    require(budget[0] >= 0, reason="too_large")
             budget[0] -= 2
         elif type(item) in (dict, list, tuple):
             require(depth < MAX_JSON_DEPTH)
