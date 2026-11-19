@@ -244,7 +244,10 @@ def _target_retry(error, failure, maximum):
 
 
 def tool_specs(properties, max_bytes):
-    selector = {"type": "array", "maxItems": 16, "items": {"type": "string", "maxLength": 1024}}
+    selector = {"type": "array", "maxItems": 16, "items": {"type": "string", "maxLength": 1024},
+                "description": ("Codec selectors: dotted paths, indices, one-level *, and row projection "
+                                "findings.*.{id,severity,file,line}; at most 16 selectors, depth 8. "
+                                "Unknown paths refuse E_SELECTOR.")}
     expand = {"type": "array", "maxItems": 64,
               "items": {"type": "string", "maxLength": 64, "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"}}
     maximum = {"type": "integer", "minimum": 0, "maximum": MAX_CHARS}
@@ -258,10 +261,6 @@ def tool_specs(properties, max_bytes):
              "prereview.lens); handoffs reasoning_summary/base_head/files_changed/tests/findings_addressed/"
              "assumptions/open_questions/hold_kind/hold_reason/status; lead reports reasoning_summary/head/"
              "reviews/hold_kind/hold_reason/next_action/status. ")
-    # Selector grammar and the narrow-fields recovery belong only to the record view.
-    selectors = ("fields uses codec selectors: dotted paths, indices, one-level *, and row projection "
-                 "findings.*.{id,severity,file,line}; at most 16 selectors, depth 8. "
-                 "Unknown paths refuse E_SELECTOR. Oversize output refuses E_LIMIT: narrow fields. ")
     receipts = "Delivery receipts follow successful flush; protocol acknowledgments remain separate. "
     return [
         ("mailbox_publish_record", False, untrusted + kinds + receipts +
@@ -274,12 +273,13 @@ def tool_specs(properties, max_bytes):
                                                  "handoff.v1", "leadreport.v1"]},
           "content": {"type": "string", "maxLength": max_bytes}},
          ["message_id", "to", "type", "kind", "content"]),
-        ("mailbox_read_record", True, untrusted + selectors + kinds +
+        ("mailbox_read_record", True, untrusted + kinds +
          "Read a grant-index-authorized record: choose exactly one of message_id or ref (full hash). "
          + delegation + NEXT_ACTIONS["cited_reference"] + ". "
          "Altered bytes E_HASH; stub mismatch "
          "E_FORMAT; attribution or access mismatch E_AUTH. Hashes grant no access. "
-         "expand names at most 64 refs to read one level within max_chars.",
+         "expand names at most 64 refs to read one level within max_chars. "
+         "Oversize output refuses E_LIMIT: narrow fields.",
          {"message_id": properties["message_id"], "ref": reference, "fields": selector, "outline": {"type": "boolean"},
           "expand": expand, "max_chars": maximum}, []),
         ("mailbox_digest", True, untrusted + kinds +
@@ -288,15 +288,8 @@ def tool_specs(properties, max_bytes):
          "Outline fallback affects only that ref's records row; inbox rows remain visible. "
          "refs adds up to 64 full-hash grant-authorized records in records, using the same fields/outline and total limit. "
          "expand names at most 64 refs to read one level within max_chars. "
-         "Oversize output refuses E_LIMIT. An aggregate message page: " + DIGEST_PAGE_NEXT + ". "
-         "One ordinary message that does not fit: " + DIGEST_INBOX_NEXT + ". "
-         "A record view or explicit refs: " + DIGEST_VIEW_NEXT + ". "
-         "A max_chars below the minimum record view: " + DIGEST_VIEW_MINIMUM_NEXT + ". "
-         "Record-view budget refusals include a measured retry with tool and options; minimum_max_chars includes the complete returned view. "
-         "Record-read retry.target identifies the failing collection and index; received-message retry.options includes its authorized message_id and measured max_chars, while explicit refs resolve from the original request. Ordinary-message failures preserve inbox recovery regardless of other records. "
-         "With a planned inbox and a digest cursor, restart mailbox_inbox from the start without after_message_id and follow fresh oldest-first pages. "
-         "max_chars below the page envelope: pass max_chars large enough for the digest page, as an integer from 0 to "
-         + str(MAX_CHARS) + ". "
+         "Oversize output refuses E_LIMIT; follow error.next_action and any measured retry. "
+         "A digest cursor does not carry a planned inbox's ordering or generation filter. "
          "limit is an integer from 1 to 100 and max_chars is an integer from 0 to " + str(MAX_CHARS) + "; "
          "an invalid value refuses E_LIMIT and names that range.",
          {"after_message_id": properties["message_id"], "refs": {"type": "array", "maxItems": 64, "items": reference},
