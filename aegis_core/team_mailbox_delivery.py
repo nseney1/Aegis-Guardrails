@@ -10,10 +10,12 @@ import re
 import uuid
 
 from aegis_core.team_mailbox_primitives import (
+    render_mailbox_refusal,
     DELIVERY_MEANING, DELIVERY_RECEIPT, MAX_BYTES, MAX_DELIVERY_IDS, MAX_HISTORY_BYTES,
     MAX_RECORDS, SLUG, WAKE_STATES, MailboxRefusal, encoded, fields, integer, matching,
-    operation, parse_time, record_types, require, safe_path, strict_json, strings, text,
+    parse_time, record_types, require, safe_path, strict_json, strings, text,
 )
+from aegis_core.team_mailbox_service import operation
 
 __all__ = ["MailboxDelivery"]
 
@@ -98,8 +100,8 @@ class MailboxDelivery:
                 raw = self.store.read(path, limit=min(MAX_BYTES, MAX_HISTORY_BYTES - total_bytes))
                 total_bytes += len(raw)
                 receipts.append(self._delivery_receipt(strict_json(raw), kind, endpoint, history, records))
-            except MailboxRefusal:
-                raise
+            except MailboxRefusal as error:
+                render_mailbox_refusal(error, reraise=True)
             except (ValueError, KeyError, UnicodeError):
                 raise MailboxRefusal("invalid_record") from None
         self.calls.history_bytes[folder] = total_bytes

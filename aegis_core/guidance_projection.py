@@ -17,6 +17,7 @@ from aegis_core.taxonomy import JIT_DEFAULT_MAX_TOKENS, RULE_TYPES, WORDS_TO_TOK
 
 __all__ = ["CONTROL_GUIDANCE", "GuidanceProjectionError", "GuidanceResult", "MAX_GUIDANCE_CHARS",
            "SLOT_REF_PATTERN", "WITHHELD_GUIDANCE", "checked_result_copy", "projection_refusal_copy",
+           "projection_refusal", "projection_refusal_reason", "projection_refusal_repair", "rule_error_rows_fit",
            "assembled_text", "contains_control_characters", "estimate_tokens", "field_text", "finish_payload",
            "instruction_body", "normalize_layout", "redact_clean_text", "project_detail", "detail_instruction_visible", "project_display_data",
            "project_envelope_fields", "project_field", "project_identifier", "project_rule_entries",
@@ -29,6 +30,16 @@ SLOT_REF_PATTERN = re.compile(r"\$\{(?:SLOT|RULE)\.([A-Za-z0-9_\-]+)\}|\$\{([A-Z
 WITHHELD_GUIDANCE = "guidance withheld: ambiguous structure"
 CONTROL_GUIDANCE = "guidance withheld: control characters"
 MAX_IDENTIFIER_ITEMS = 4096
+_MAX_PROJECTION_NODES = 4096
+_PROJECTION_REFUSALS = {
+    "guidance_projection_invalid_field": (
+        "invalid_field", "Fix the field type and run `aegis rule lint <path>`."),
+    "guidance_projection_limit": (
+        "limit", "Shorten the instruction or slot expansion and run `aegis rule lint <path>`."),
+}
+_PROJECTION_FIELDS = frozenset({"hypothesis", "prediction", "detail", "matched_files"})
+_PROJECTION_REASONS = frozenset(field + ": " + reason
+                               for field in _PROJECTION_FIELDS for reason, _ in _PROJECTION_REFUSALS.values())
 _MAX_ERROR_NAME_PASSES = 32
 _IDENTIFIER_FIELDS = frozenset({"id", "name", "path", "_path", "matched_files", "files"})
 _CONTROL_CANDIDATES = re.compile(r"[^\t\n\r\x20-\x7e]")
@@ -570,7 +581,7 @@ def checked_result_copy(result: Dict[str, Any], registry: Optional[_Slots]) -> D
     def node():
         nonlocal nodes
         nodes += 1
-        if nodes > 4096:
+        if nodes > _MAX_PROJECTION_NODES:
             raise GuidanceProjectionError(GuidanceProjectionError.code)
 
     def mapping(value, context="root"):
@@ -578,7 +589,7 @@ def checked_result_copy(result: Dict[str, Any], registry: Optional[_Slots]) -> D
         node()
         if type(value) is not dict:
             raise _InvalidField(_InvalidField.code)
-        if len(value) > 4096:
+        if len(value) > _MAX_PROJECTION_NODES:
             raise GuidanceProjectionError(GuidanceProjectionError.code)
         copied = {}
         for key, item in value.items():
@@ -616,7 +627,7 @@ def checked_result_copy(result: Dict[str, Any], registry: Optional[_Slots]) -> D
             elif kind == "records":
                 if type(item) is not list:
                     raise _InvalidField(_InvalidField.code)
-                cap = MAX_GUIDANCE_ITEMS if key in {"relevant_rules", "invariant_warnings"} else 4096
+                cap = MAX_GUIDANCE_ITEMS if key in {"relevant_rules", "invariant_warnings"} else _MAX_PROJECTION_NODES
                 if len(item) > cap:
                     raise GuidanceProjectionError(GuidanceProjectionError.code)
                 copied[key] = [mapping(x, key) for x in item]
@@ -629,6 +640,41 @@ def checked_result_copy(result: Dict[str, Any], registry: Optional[_Slots]) -> D
         return copied
 
     return mapping(result)
+
+
+def rule_error_rows_fit(count: int) -> bool:
+    """Preflight the nine fixed JSON nodes and six nodes per error row."""
+    return type(count) is int and 0 <= count <= (_MAX_PROJECTION_NODES - 9) // 6
+
+
+def projection_refusal_reason(code: str, field: str) -> Optional[str]:
+    """Construct a fixed location reason, or decline unknown vocabulary."""
+    if type(code) is not str or type(field) is not str or field not in _PROJECTION_FIELDS:
+        return None
+    spec = _PROJECTION_REFUSALS.get(code)
+    return field + ": " + spec[0] if spec is not None else None
+
+
+def projection_refusal_repair(code: str) -> Optional[str]:
+    """Return the fixed operator repair for a recognized projection code."""
+    spec = _PROJECTION_REFUSALS.get(code) if type(code) is str else None
+    return spec[1] if spec is not None else None
+
+
+def projection_refusal(code: str, rule_errors: Optional[list] = None) -> Dict[str, Any]:
+    """Build a canonical refusal; invalid locations never replace its first code."""
+    if projection_refusal_repair(code) is None:
+        raise _InvalidField(_InvalidField.code)
+    result = {"status": "FAIL", "error": code}
+    if rule_errors is None:
+        return result
+    if type(rule_errors) is not list or not rule_error_rows_fit(len(rule_errors)):
+        return result
+    try:
+        snapshot = projection_refusal_copy(dict(result, rule_errors=rule_errors))
+    except GuidanceProjectionError:
+        return result
+    return snapshot if snapshot is not None else result
 
 
 def projection_refusal_copy(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -646,17 +692,14 @@ def projection_refusal_copy(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
     if type(result["status"]) is not str or type(result["error"]) is not str:
         return None
-    if result["status"] != "FAIL" or result["error"] not in {
-            "guidance_projection_invalid_field", "guidance_projection_limit"}:
+    if result["status"] != "FAIL" or result["error"] not in _PROJECTION_REFUSALS:
         return None
     snapshot = checked_result_copy(result, None)
-    reasons = {field + ": " + reason for field in ("hypothesis", "prediction", "detail", "matched_files")
-               for reason in ("invalid_field", "limit")}
     # Bounds/type validation precedes inspection; eligibility uses the original
     # reason so Evidence removal cannot manufacture a canonical refusal token.
     for row in result.get("rule_errors", []):
         if (set(row) != {"path", "error"} or type(row["error"]) is not str
-                or row["error"] not in reasons or project_error_name(row["path"]) != row["path"]):
+                or row["error"] not in _PROJECTION_REASONS or project_error_name(row["path"]) != row["path"]):
             return None
     return snapshot
 

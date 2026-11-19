@@ -433,6 +433,7 @@ def test_replacement_spans_keep_only_explicit_backreference_context():
                 end, payload = end - 1, payload[:-1]
         batches = []
         observed = redaction.redact_insight_text(value, 81920, on_replacements=batches.append)
+        # ROUND-8c drops privacy reinterpretation of this original family span.
         assert batches[0] == ((start, end, payload),), name
         assert observed == redaction.redact_insight_text(value, 81920), name
     batches = []
@@ -470,7 +471,8 @@ def test_redaction_batches_use_the_current_pass_coordinates_across_families():
         batches.append(spans)
 
     result = redact_insight_text(value, max_len=81920, on_replacements=observe)
-    assert len(batches) >= 3
+    # ROUND-6 unions all families in one pass over the original source.
+    assert len(batches) == 1
     assert result == redact_insight_text(value, max_len=81920) == " ".join(state[0].split())
     assert not any(secret in result for secret in secrets)
 

@@ -21,6 +21,7 @@ from aegis_core.message_codec_format import escape_char, neutral_text
 from aegis_core.message_codec_views import Renderer
 from aegis_core.team_mailbox import Mailbox
 from aegis_core.team_mailbox_primitives import (
+    render_mailbox_refusal,
     BusyError, MailboxRefusal, SLUG, fields, text, integer, require,
 )
 from aegis_core.team_mailbox_guidance import MAX_CHARS, NEXT_ACTIONS
@@ -54,6 +55,7 @@ class _RecordCodec:
 
 class RecordRefusal(MailboxRefusal):
     """Typed operational refusal retaining the codec's fixed wire envelope."""
+    advice_contract = "record_codec"
     def __init__(self, error, tool):
         self.record_error = guidance.error_result(error, tool=tool, max_chars=MAX_CHARS)
         detail = self.record_error["error"]
@@ -104,10 +106,10 @@ class Records:
                 "in_reply_to", "acknowledgment", "readiness", "result", "receipt", "ref", "refs", "fields",
                 "outline", "expand", "max_chars", "after_message_id", "limit"})
             return handlers[name](arguments)
+        except MailboxRefusal as error:
+            render_mailbox_refusal(error, reraise=True)
         except codec.CodecError as error:
             raise RecordRefusal(error, name) from None
-        except MailboxRefusal:
-            raise
         except RecursionError:
             raise RecordRefusal(codec.CodecError("E_FORMAT"), name) from None
         except (OSError, UnicodeError, RuntimeError):
@@ -904,7 +906,8 @@ def digest(codec, mailbox, sender, arguments, *, inbox):
                     retry["after_message_id"] = after
                 try:
                     return inbox(retry, item["message_id"], history)
-                except MailboxRefusal:
+                except MailboxRefusal as error:
+                    render_mailbox_refusal(error)
                     return None
             chosen = _options(codec, dict(arguments, **edits))
             if tool == "mailbox_read_record":
