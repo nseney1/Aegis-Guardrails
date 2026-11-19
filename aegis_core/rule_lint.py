@@ -5,8 +5,9 @@ Filesystem candidates use bounded confined reads; rule sets use the runtime inve
 Unsupported platforms report a fixed refusal. In-memory lint works on every host.
 
 Example and command analysis lives in rule_lint_grammar. Confined rule and source
-capture lives in rule_lint_capture. This module keeps the public API, the served-text
-decisions, the gate dry run and report assembly.
+capture lives in rule_lint_capture. Fixed loader and paper-gate repair text lives in
+rule_lint_reasons. This module keeps the public API, the served-text decisions, the
+gate dry run and report assembly.
 """
 from __future__ import annotations
 
@@ -44,6 +45,7 @@ from aegis_core.rule_lint_grammar import (
     command_roles,
     quiet_parse as _quiet_parse,
 )
+from aegis_core.rule_lint_reasons import loader_message, loader_reason_ids, paper_gate_message
 from aegis_core.rules import Rule, load_rules, rule_path_id
 from aegis_core.skills.slots import DEFAULT_SLOTS, PLATFORM_SLOT_PROFILES, SlotRegistry
 from aegis_core.storage import ConfinedFileError, confined_file
@@ -135,8 +137,7 @@ def _load(data, path):
         return None
     if len(loaded.rules) != 1:
         return None
-    rule = loaded.rules[0]
-    return rule if _accepted(rule, path) else None
+    return loaded.rules[0]
 
 
 def _destination(path):
@@ -149,13 +150,8 @@ def _destination(path):
 
 
 def _accepted(rule, path):
-    destination = _destination(path)
-    if destination is None:
-        return False
-    if (not rule.ok or rule.expired or rule.legacy_keys
-            or rule.meta.get("id") != destination.id or rule.meta.get("type") != destination.type):
-        return False
-    return True
+    """Byte-identical acceptance: empty classifier reasons, and only those."""
+    return not loader_reason_ids(rule, _destination(path))
 
 
 def _guidance(body):
@@ -233,7 +229,7 @@ def _enforcement(rule, original):
     unchanged = (isinstance(original, Rule) and original.id == rule.id
                  and (original.type, original.enforcement, original.meta.get("forbid_ast"))
                  == (rule.type, rule.enforcement, spec))
-    return [_finding(5, "paper_gate", "gate requires a valid non-empty forbid_ast specification",
+    return [_finding(5, "paper_gate", paper_gate_message(rule),
                      "warning" if unchanged else "error")]
 
 
@@ -315,8 +311,9 @@ def lint_rule(data, path, *, original=None, command_slots=None, sources=None):
     if len(data) > MAX_RULE_BYTES:
         return _refusal(path, "too_large")
     rule = _load(data, path)
-    if rule is None:
-        return LintResult(display_text(path), (_finding(1, "loader", "final accepted bytes or destination fail the rule loader"),))
+    if rule is None or not _accepted(rule, path):
+        message = loader_message(rule, _destination(path))
+        return LintResult(display_text(path), (_finding(1, "loader", message),))
     return _lint_loaded(rule, data, path, original, command_slots, sources)
 
 
@@ -405,7 +402,8 @@ def lint_workspace(root, paths=(), *, command_slots=None):
             if rule.id in duplicates:
                 result = LintResult(display_text(rule.path), (_duplicate_finding(),))
             elif not _accepted(rule, rule.path):
-                result = LintResult(display_text(rule.path), (_finding(1, "loader", "final accepted bytes or destination fail the rule loader"),))
+                message = loader_message(rule, _destination(rule.path))
+                result = LintResult(display_text(rule.path), (_finding(1, "loader", message),))
             else:
                 result = _lint_loaded(rule, snapshot[rule.path], rule.path, None, command_slots, sources,
                                       source_error if rule in gates else None,

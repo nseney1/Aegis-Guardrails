@@ -14,6 +14,7 @@ from collections.abc import Sized
 from functools import wraps
 
 from aegis_core.team_mailbox_primitives import (
+    render_mailbox_refusal,
     MAX_BYTES, MAX_INBOX_RESPONSE_BYTES, MAX_RECORDS, MAX_JSON_DEPTH, MAX_JSON_NODES, MAX_JSON_ITEMS, SLUG,
     MailboxRefusal, bounded_tree, integer, matching, require, text, validation,
 )
@@ -40,8 +41,8 @@ def _boundary(function):
     def call(*args, **kwargs):
         try:
             return function(*args, **kwargs)
-        except MailboxRefusal:
-            raise
+        except MailboxRefusal as error:
+            render_mailbox_refusal(error, reraise=True)
         except OSError:
             raise MailboxRefusal("io") from None
         except (ValueError, KeyError, UnicodeError, RecursionError, OverflowError, AttributeError):
