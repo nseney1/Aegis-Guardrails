@@ -493,6 +493,104 @@ def test_unexpected_hidden_entries_are_ambiguous(tmp_path, area):
         call()
 
 
+@pytest.mark.parametrize("name,area", [
+    (".pending-root-id", "root"),
+    (".pending-grants", "records"),
+    (".pending-stub", "message"),
+    (".pending-stub", "across"),
+    (".pending-" + "a" * 32, "message"),
+])
+def test_legacy_pending_names_mid_write_parity_and_retry(tmp_path, name, area):
+    from aegis_core.team_mailbox_index import Index
+    from tools.hierarchy_mailbox_index import MailboxIndex
+
+    root, box = populated(tmp_path)
+    folders = {"root": root, "records": root.parent / "mailbox-records",
+               "message": root / "alpha" / "orchestrator", "across": root / "across" / "orchestrator"}
+    folder = folders[area]
+    folder.mkdir(exist_ok=True)
+    with box:
+        box.publish(request())
+        expected = box.messages()
+        indexed = Index(box, mode="indexed")
+        shadow = Index(box)
+        old = legacy.Mailbox(root)
+        old_index = MailboxIndex(old, mode="indexed")
+        pending = folder / name
+        with pending.open("wb") as stream:
+            stream.write(b"\xff incomplete staging bytes")
+            stream.flush()
+            before = snapshot(root.parent)
+            # Keep the writer's stage open while independent readers inspect it.
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                reads = [pool.submit(reader.messages) for reader in (box, indexed, shadow)]
+                assert [read.result(timeout=10) for read in reads] == [expected] * 3
+            assert old.messages() == old_index.messages() == expected
+            with refusal("invalid_record"):
+                box.publish(request())
+            assert snapshot(root.parent) == before
+        pending.unlink()
+        assert indexed.messages() == shadow.messages() == box.messages() == expected
+        assert indexed.verify() == []
+
+
+@pytest.mark.parametrize("name,area", [
+    (name, area)
+    for name in (".pending-root-id", ".pending-grants", ".pending-stub",
+                 ".pending-x", ".pending-" + "A" * 32, ".pending-stub.md")
+    for area in ("binding", "message", "across")
+    if name != ".pending-stub" or area == "binding"
+])
+def test_legacy_pending_names_wrong_folder_refuses_then_retries(tmp_path, name, area):
+    from aegis_core.team_mailbox_index import Index
+
+    root, box = populated(tmp_path)
+    with box:
+        box.publish(request())
+        indexed = Index(box, mode="indexed")
+        expected = box.messages()
+        assert indexed.messages() == expected
+        if area == "binding":
+            folder = root / "bindings" / "alpha" / "front-door"
+            reads = [lambda: box.bindings("alpha/front-door")]
+        else:
+            folder = root / ("alpha" if area == "message" else "across") / "orchestrator"
+            reads = [box.messages, indexed.messages]
+        bad = folder / name
+        bad.write_bytes(b"\xff incomplete staging bytes")
+        before = snapshot(root.parent)
+        for read in reads:
+            with refusal("invalid_record"):
+                read()
+            assert snapshot(root.parent) == before
+        bad.unlink()
+        assert len(box.bindings("alpha/front-door")) == 1
+        assert indexed.messages() == box.messages() == expected
+        assert indexed.verify() == []
+
+
+@pytest.mark.parametrize("name,allowed", [
+    (".pending-root-id", {"root"}),
+    (".pending-grants", {"records"}),
+    (".pending-stub", {"message", "across"}),
+    (".pending-" + "a" * 32, {"root", "records", "message", "across", "binding", "other"}),
+    (".pending-x", set()),
+    (".pending-stub.md", set()),
+    (".pending-root-id-extra", set()),
+    (".pending-grants-extra", set()),
+])
+def test_pending_entry_exact_folder_contract(tmp_path, name, allowed):
+    from aegis_core.team_mailbox_index_scan import pending_entry
+
+    root = tmp_path / "mail"
+    folders = {"root": root, "records": tmp_path / "mailbox-records",
+               "message": root / "alpha" / "orchestrator", "across": root / "across" / "orchestrator",
+               "binding": root / "bindings" / "alpha" / "front-door", "other": tmp_path / "other"}
+    message_folders = {folders["message"], folders["across"]}
+    for area, folder in folders.items():
+        assert pending_entry(folder / name, root, message_folders=message_folders) is (area in allowed)
+
+
 def test_sizes_refused_before_open_or_parse_and_then_retry(tmp_path, monkeypatch):
     root, box = populated(tmp_path)
 
