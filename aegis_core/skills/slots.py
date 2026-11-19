@@ -494,7 +494,7 @@ def _render_plain_result(source: Dict[str, Any], registry: Optional[SlotRegistry
                          staged_mandatory_count: Optional[int] = None) -> Dict[str, Any]:
     from copy import deepcopy
     from aegis_core.guidance_projection import (
-        GuidanceProjectionError, checked_result_copy, finish_payload, projection_refusal_copy,
+        GuidanceProjectionError, checked_result_copy, finish_payload, projection_refusal, projection_refusal_copy,
     )
 
     try:
@@ -517,7 +517,7 @@ def _render_plain_result(source: Dict[str, Any], registry: Optional[SlotRegistry
         return _PlainScanResult(payload, replay_source if replay_source is not None else snapshot,
                                 identities=identities, mandatory_count=staged_mandatory_count)
     except GuidanceProjectionError as exc:
-        return {"status": "FAIL", "error": exc.code}
+        return projection_refusal(exc.code)
 
 
 def _project_scan_fields(result: Dict[str, Any], registry: Optional[SlotRegistry]) -> Dict[str, Any]:
