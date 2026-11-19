@@ -17,9 +17,10 @@ import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from aegis_core._version import __version__
-from aegis_core.redaction import (
-    SECRET_REPLACEMENTS as _DISPLAY_HOOK_SECRETS,
-    TOKEN_REDACTIONS as _DISPLAY_TOKEN_SECRETS,
+from aegis_core.redaction_patterns import (
+    CONTROL_RE as _DISPLAY_CONTROLS,
+    RedactionRefusal, bound_redaction_spans, SECRET_REPLACEMENTS as _DISPLAY_HOOK_SECRETS,
+    TOKEN_REDACTIONS as _DISPLAY_TOKEN_SECRETS, PII_REDACTIONS as _DISPLAY_PRIVACY,
 )
 
 __all__ = [
@@ -38,6 +39,7 @@ __all__ = [
     "real_key",
     "real_path",
     "safe_parts",
+    "redact_display_secrets",
     "sanitize_display",
     "split_lines",
     "strict_loads",
@@ -372,10 +374,10 @@ def aegis_import_root() -> str:
     return str(Path(__file__).resolve().parent.parent)
 
 
-_DISPLAY_CONTROLS = re.compile(r'[\x00-\x1f\x7f-\x9f]')
 _DISPLAY_PLAIN = re.compile(r'[^\x00-\x1f\x7f-\x9f]+')
 _DISPLAY_PARAMETERS = re.compile(r'[\x30-\x3f]+')
 _DISPLAY_INTERMEDIATES = re.compile(r'[\x20-\x2f]+')
+_DISPLAY_COMPLETE_CSI = re.compile(r'(?:\x1b\[|\x9b)[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]')
 _DISPLAY_IGNORED = re.compile(r'[\x00-\x08\x0b-\x17\x19\x1c-\x1f\x7f-\x8f\x91-\x97\x99-\x9a\x9c]+')
 _DISPLAY_ESCAPE_KINDS = {'[': 'csi', 'P': 'dcs', ']': 'osc', 'X': 'sos', '^': 'pm', '_': 'apc'}
 _DISPLAY_C1_KINDS = dict(zip('\x90\x98\x9b\x9d\x9e\x9f', ('dcs', 'sos', 'csi', 'osc', 'pm', 'apc')))
@@ -493,7 +495,8 @@ def _display_segmented_secret_spans(text, boundaries, segments):
         yield from _display_secret_spans(text, starts, pos=start, endpos=end)
 
 
-def _display_mapped_secret_spans(text, boundaries, source_map, *, segments=None, include_pem=True, pos=0, charge=None):
+def _display_mapped_secret_spans(text, boundaries, source_map, *, segments=None, include_pem=True, pos=0, charge=None,
+                                 scan_text=None):
     """Map a detection view's spans back through its compressed source runs."""
     offsets = [row[1] for row in source_map]
 
@@ -501,25 +504,18 @@ def _display_mapped_secret_spans(text, boundaries, source_map, *, segments=None,
         index = bisect.bisect_right(offsets, position) - 1
         return source_map[index][0] + position - offsets[index]
 
-    spans = (_display_secret_spans(text, boundaries, include_pem=include_pem, pos=pos, charge=charge) if segments is None else
-             _display_segmented_secret_spans(text, boundaries, segments))
+    spans = (scan_text(text) if scan_text is not None else
+             _display_secret_spans(text, boundaries, include_pem=include_pem, pos=pos, charge=charge)
+             if segments is None else _display_segmented_secret_spans(text, boundaries, segments))
     for start, end, payload in spans:
         yield to_source(start), to_source(end - 1) + 1, payload
 
 
-def _display_secret_masks(canonical, deleted, separator_segments, deleted_segments, attributable, *, source):
-    """Union detection views in source coordinates, then project one mask.
-
-    Each map entry is (source start, canonical start, length), compressed by
-    emitted run. No per-control map or copied suffix is needed for matching.
-    Source separators are hard segment edges; suppressed strings seal both
-    source views so hidden detection context cannot mask visible ordinary text.
-
-    Suppressed printable finals also admit bounded optional-byte attribution.
-    Its budget exhaustion masks only the candidate window in source space.
-    """
+def _display_secret_masks(canonical, deleted, separator_segments, deleted_segments, attributable, *, source,
+                          source_spans=False, raw_spans=(), extra_spans=(), scan_text=None):
+    """Keep secret-material coverage and disjoint privacy; known masks own their bytes."""
     text, boundaries, source_map = canonical
-    if not text:
+    if not text and not source_spans:
         return text
     source_starts = [row[0] for row in source_map]
     output_starts = [row[1] for row in source_map]
@@ -529,28 +525,59 @@ def _display_secret_masks(canonical, deleted, separator_segments, deleted_segmen
         return 0 if index < 0 else output_starts[index] + min(position - source_starts[index], source_map[index][2])
 
     spans = list(_display_mapped_secret_spans(text, boundaries, source_map))
-    # A canonical PEM extent covering every emitted character already fixes
-    # the complete visible mask. Source views cannot extend that coverage.
-    last_source = source_map[-1][0] + source_map[-1][2]
-    if any(start == source_starts[0] and end == last_source and payload == '[REDACTED_PEM]'
-           for start, end, payload in spans):
+    if not source_spans and any(start == source_starts[0] and end == source_map[-1][0] + source_map[-1][2]
+                               and payload == '[REDACTED_PEM]' for start, end, payload in spans):
         return '[REDACTED_PEM]'
-    # Both source views share renderer-normalized text and its source map.
-    # Their segments differ: one stops at removals, the other joins over them.
     spans.extend(_display_mapped_secret_spans(*deleted, segments=separator_segments))
-    # Identical text, starts and maps have identical source spans; reuse them.
     if separator_segments != deleted_segments and (deleted != canonical or len(deleted_segments) > 1):
         spans.extend(_display_mapped_secret_spans(*deleted, segments=deleted_segments))
-    if attributable:
+    if attributable and text:
         extra, _stats = _display_attribution(*source, canonical)
         spans.extend(extra)
-    merged = []
-    for start, end, payload in sorted(spans, key=lambda span: (span[0], -span[1])):
-        if merged and start < merged[-1][1]:
-            if end > merged[-1][1]:
-                merged[-1] = (merged[-1][0], end, '[REDACTED]')
-        else:
-            merged.append((start, end, payload))
+    if source_spans:
+        known_count = len(spans)
+        spans.extend(extra_spans)
+        if scan_text is not None:
+            for view in (canonical, deleted):
+                spans.extend(_display_mapped_secret_spans(*view, scan_text=scan_text))
+        expanded = []
+        for start, end, payload in spans:
+            if payload != '[REDACTED_PEM]' and to_output(start) < to_output(end):
+                # Suppressed header edges must not consume replacement bytes.
+                left = bisect.bisect_right(source_starts, start) - 1
+                start = min(start, source_starts[left] + source_map[left][2]) if left >= 0 else 0
+                right = bisect.bisect_right(source_starts, end - 1) - 1
+                if right < 0 or end > source_starts[right] + source_map[right][2]:
+                    end = source_starts[right + 1] if right + 1 < len(source_starts) else len(source[0])
+            expanded.append((start, end, payload))
+        spans, extra_spans = expanded[:known_count] + list(raw_spans), expanded[known_count:]
+
+    def merge(candidates):
+        merged = []
+        for start, end, payload in sorted(candidates, key=lambda span: (span[0], -span[1])):
+            if merged and start < merged[-1][1]:
+                if end > merged[-1][1]:
+                    merged[-1] = (merged[-1][0], end, '[REDACTED]')
+            else:
+                merged.append((start, end, payload))
+        return merged
+
+    merged = merge(spans)
+    if source_spans:
+        additional, ends, privacy = [], [span[1] for span in merged], {mask for _pattern, mask in _DISPLAY_PRIVACY}
+        for start, end, payload in extra_spans:
+            index = bisect.bisect_right(ends, start)
+            if payload in privacy and index < len(merged) and merged[index][0] < end:
+                continue
+            while index < len(merged) and merged[index][0] < end:
+                left, right, _known = merged[index]
+                if start < left:
+                    additional.append((start, left, payload))
+                start = max(start, right)
+                index += 1
+            if start < end:
+                additional.append((start, end, payload))
+        return tuple(sorted((*merged, *merge(additional))))
     shown, cursor = [], 0
     for start, end, payload in merged:
         start, end = to_output(start), to_output(end)
@@ -560,6 +587,59 @@ def _display_secret_masks(canonical, deleted, separator_segments, deleted_segmen
         cursor = end
     shown.append(text[cursor:])
     return ''.join(shown)
+
+
+def redact_display_secrets(text, *, limit, on_replacements=None, bound=False, extra_spans=(), protected_spans=(), scan_text=None,
+                           tail_candidates=None):
+    """Bound before parsing; union original-coordinate spans before one replacement.
+
+    ``bound`` means the caller supplied an input head, not a complete field.
+    The word, unfinished-family and PEM guards all constrain the same source cut.
+    The trusted ``tail_candidates`` callback selects a deleted-view token, then
+    parser maps carry its first character back to the bounded original source.
+    Initial withholding is separate from replacement events. The observer sees
+    only changed spans that survive the cut, once, before any replacement.
+    """
+    if type(bound) is not bool or type(text) is not str or type(limit) is not int or limit < 0 or len(text) > limit:
+        raise RedactionRefusal('too_large' if type(text) is str and type(limit) is int
+                               and limit >= 0 and len(text) > limit else 'invalid')
+    if tail_candidates is not None and (not bound or not callable(tail_candidates)):
+        raise RedactionRefusal('invalid')
+    for group in (extra_spans, protected_spans):
+        if type(group) is tuple and (len(group) > 32 * len(text) or any(
+                type(row) is tuple and len(row) == 3 and type(row[2]) is str and len(row[2]) > 128 for row in group)):
+            raise RedactionRefusal('too_large')
+        if type(group) is not tuple or any(type(row) is not tuple or len(row) != 3 or
+                type(row[0]) is not int or type(row[1]) is not int or type(row[2]) is not str or
+                not 0 <= row[0] < row[1] <= len(text) for row in group):
+            raise RedactionRefusal('invalid')
+    raw_spans = (*_display_secret_spans(text, ()), *protected_spans)
+    control = _DISPLAY_CONTROLS.search(text)
+    if control is None and not bound and not raw_spans and not extra_spans:
+        return text
+    index = control.start() if control is not None else len(text)
+    views = _display_views(text, index)
+    detection_views = _display_views(text, index, detection=True)
+    for view, segments in ((detection_views[0], None), (detection_views[1], detection_views[3])):
+        raw_spans = (*raw_spans, *_display_mapped_secret_spans(*view, segments=segments))
+        if scan_text is not None:
+            extra_spans = (*extra_spans, *_display_mapped_secret_spans(*view, scan_text=scan_text))
+    spans = _display_secret_masks(*views, source=(text, index), source_spans=True,
+                                  raw_spans=raw_spans, extra_spans=extra_spans, scan_text=scan_text)
+    stop, marker = len(text), ''
+    if bound:
+        stop, marker = bound_redaction_spans(text, spans,
+            (*detection_views[:2], views[0], views[1], (text, (), [(0, 0, len(text))])), _display_matches,
+            _display_render_spans(text, index, detection=True), tail_candidates)
+        spans = tuple(span for span in spans if span[1] <= stop)
+    spans = tuple(span for span in spans if text[span[0]:span[1]] != span[2])
+    if on_replacements is not None and spans:
+        on_replacements(spans)
+    parts, cursor = [], 0
+    for start, end, payload in spans:
+        parts.extend((text[cursor:start], payload))
+        cursor = end
+    return (''.join((*parts, text[cursor:stop])) if spans else text[:stop]) + marker
 
 
 _DISPLAY_ATTRIBUTION_RATE = 1024
@@ -779,11 +859,9 @@ def _display_header_run(text, index, limit, mode, phase):
     return _DISPLAY_PLAIN.match(text, index, limit).end(), 0, None, 0
 
 
-def _display_render_spans(text, index):
+def _display_render_spans(text, index, *, detection=False):
     """Emit (start, end, provenance, visible, replacement, sealed-string end).
 
-    Header state and byte suppression live in this one machine. No second
-    parser infers what BEL, whitespace, cancellation or abandonment meant.
     Plain=0, introducer=1, parameter=2, intermediate=3, final=4, control=5.
     """
     if index:
@@ -795,6 +873,11 @@ def _display_render_spans(text, index):
         if string_until and index >= string_until:
             string_until, mode, phase = 0, None, 0
         char = text[index]
+        csi = _DISPLAY_COMPLETE_CSI.match(text, index) if detection and not string_until else None
+        if csi is not None:
+            yield index, csi.end(), 1, False, None, 0
+            index, mode, phase = csi.end(), None, 0
+            continue
         if char == '\x1b' and not string_until:
             drop_until, string_until, literal_until = _display_escape_limit(text, index, literal_until)
             mode, phase = 'escape', 1
@@ -826,7 +909,7 @@ def _display_render_spans(text, index):
         index = end
 
 
-def _display_views(text, index):
+def _display_views(text, index, *, detection=False):
     """Build canonical/deleted views and their maps from renderer events once."""
     shown, boundaries, source_map = [], [], []
     deleted, deleted_boundaries, deleted_map = [], [], []
@@ -836,7 +919,7 @@ def _display_views(text, index):
     previous_end = deleted_end = -1
     previous_kind = deleted_kind = None
     attributable = False
-    for start, end, kind, visible, replacement, sealed in _display_render_spans(text, index):
+    for start, end, kind, visible, replacement, sealed in _display_render_spans(text, index, detection=detection):
         attributable = attributable or (kind == 4 and not visible and not sealed)
         if sealed != previous_seal:
             deleted_split = True
