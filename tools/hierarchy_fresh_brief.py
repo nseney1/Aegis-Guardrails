@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+from collections import ChainMap
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -20,7 +21,112 @@ from types import FunctionType
 import uuid
 
 sys.dont_write_bytecode = True
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# These are captured public APIs, not direct filesystem operations. The
+# structural census reviews this literal list; every raw syscall stays below.
+_ACQUISITION_CALL_ALLOWLIST = {
+    "datetime.now(timezone.utc).isoformat().replace": "Trusted UTC timestamp formatting replaces a literal suffix; it performs no filesystem IO.",
+    "read": "The _link_snapshot callback comes from _symlink_reader and enters _acquire(link).",
+    "operation.exists": "Operation existence checks consume the write-once witness ledger.",
+    "self.operation.exists": "Captured mailbox existence checks delegate to the operation ledger.",
+    "brief.operation.exists": "Brief discovery uses the operation's captured existence API.",
+    "mailbox.operation.exists": "Mailbox discovery uses the operation's captured existence API.",
+    "self.read": "Operation cached reads revalidate their captured witnesses before reuse.",
+    "operation.read": "Operation reads acquire and verify through the single filesystem boundary.",
+    "declaration.read": "Declaration reads inherit and compare the parent's immutable witnesses.",
+    "self.operation.read": "Captured mailbox reads use the operation's bounded acquisition API.",
+    "brief.operation.read": "Brief reads use the operation's bounded captured-reference API.",
+}
+
+
+def _acquire(kind, *args, _guard=None, _negative=None, _path=None, _before=None,
+             _expected_mark=None, _reader=None, **kwargs):
+    """One acquisition transaction: validate after IO, before recording or delivery."""
+    if kind == "source":
+        # Trusted installation metadata, never a user-derived path.
+        try:
+            return Path(args[0]).resolve()
+        except OSError as error:
+            raise ValueError("reference parent changed while opening") from error
+    guard = _acquisition_guard(_guard)
+    opened = transferred = None
+    try:
+        if kind == "witness":
+            ledger = _operation_ledger(guard)
+            return ledger.observe(*args) if ledger is not None else None
+        if kind == "proof":
+            return args[0](*args[1], **args[2])
+        if kind == "negative-leaf":
+            path, parent = args
+            try:
+                info = (os.lstat(path) if parent is None else
+                        os.stat(path.name, dir_fd=parent, follow_symlinks=False))
+            except FileNotFoundError as missing:
+                if missing.errno == errno.ENOENT:
+                    return
+                raise
+            _acquisition_replacement(guard, path, info)
+        if kind == "peer-directory":
+            return _admit_publication_directory(guard, args[0], _before)
+        ledger, path = _acquisition_prepare(kind, args, kwargs, guard, _path, _negative)
+        mutation = (_AcquisitionMutation(ledger, kind, args, kwargs).capture()
+                    if ledger is not None and kind in {"replace", "rename", "unlink"} else None)
+        if kind == "mkdir":
+            try:
+                os.mkdir(*args, **kwargs)
+            except FileExistsError as error:
+                if error.errno != errno.EEXIST:
+                    raise
+            return _acquire("peer-directory", path, _guard=guard)
+        if kind == "names":
+            with os.scandir(args[0]) as entries:
+                value = _bounded_directory_names(entries)
+        elif kind == "link":
+            directory, name, size = args
+            buffer = _acquisition_link_buffer(directory, size)
+            count = _reader(directory, os.fsencode(name), buffer, size + 1)
+            value = buffer.raw[:max(0, min(count, size + 1))]
+        elif kind == "stream-read":
+            value = args[0].read(*args[1:], **kwargs)
+        else:
+            value = getattr(os, "fstat" if kind == "identify" else kind)(*args, **kwargs)
+        if kind == "open":
+            opened = value
+        elif kind == "fdopen":
+            transferred = value
+        descriptor = _acquisition_descriptor(kind, args, value)
+        info = (os.fstat(descriptor) if descriptor is not None else
+                value if kind in {"stat", "lstat", "fstat", "identify"} else None)
+        if mutation is not None:
+            mutation.finish()
+        elif ledger is not None and not ledger.validating.get():
+            if kind == "identify":
+                path = ledger.directory_path(args[0], info)
+            _AttachmentCheck(ledger, path, info).run()
+            if kind in {"open", "stat", "lstat", "fstat", "identify"}:
+                path = _acquisition_record(ledger, kind, path, info, value, args, _before)
+        _acquisition_expected(guard, _path, value, _expected_mark)
+        if kind == "link":
+            require(count == size, "public link changed while reading")
+        opened = transferred = None
+        return (path, value) if kind == "identify" else value
+    except BaseException as error:
+        _acquisition_close_opened(opened, guard, error)
+        if transferred is not None:
+            _acquisition_close_transferred(transferred, guard, error)
+        _acquisition_observed_error(kind, args, kwargs, guard, error, _path, _negative)
+        _acquisition_mkdir_recheck(kind, args, kwargs, guard, error, _path)
+        _acquisition_failure(kind, args, guard, error, transferred=transferred is not None)
+        if not isinstance(error, Exception):
+            raise
+        if (isinstance(error, FileNotFoundError) and error.errno == errno.ENOENT
+                and _negative is not None and _expected_mark is None):
+            _acquisition_absence(guard, _negative, error)
+            raise
+        if kind in {"open", "mkdir"} and _path is not None and _before is not None:
+            _acquisition_recheck_open(guard, _path, _before, args, kwargs)
+        _acquisition_refuse(guard, error)
+
+sys.path.insert(0, str(_acquire("source", __file__).parent))
 from hierarchy_mailbox import (Mailbox, MAX_BYTES, SHA256, SLUG, TERMINAL_JOB_STATES, digest, encoded,  # noqa: E402
                                endpoint_parts, fields, integer, matching, parse_time, require,
                                strict_json, text)
@@ -65,16 +171,19 @@ def cli_path(value, flag):
 
 def _directory_names(directory):
     """Bound discovery itself, including pending/ignored names, before retaining the list."""
+    return _acquire("names", directory)
+
+
+def _bounded_directory_names(entries):
     names, used = [], 0
-    with os.scandir(directory) as entries:
-        for entry in entries:
-            require(len(names) < MAX_LIST_ENTRIES, "directory listing exceeds entry limit")
-            name = entry.name
-            require(len(name) <= MAX_LIST_BYTES - used, "directory listing exceeds byte limit")
-            size = len(os.fsencode(name)) + 1
-            require(size <= MAX_LIST_BYTES - used, "directory listing exceeds byte limit")
-            used += size
-            names.append(name)
+    for entry in entries:
+        require(len(names) < MAX_LIST_ENTRIES, "directory listing exceeds entry limit")
+        name = entry.name
+        require(len(name) <= MAX_LIST_BYTES - used, "directory listing exceeds byte limit")
+        size = len(os.fsencode(name)) + 1
+        require(size <= MAX_LIST_BYTES - used, "directory listing exceeds byte limit")
+        used += size
+        names.append(name)
     return tuple(sorted(names))
 
 
@@ -132,6 +241,9 @@ GLOBAL, ROW_UNKNOWN, ABSENT, QUARANTINE = "global", "row_unknown", "absent", "qu
 
 class _ProofPathError(ValueError):
     """Directory proof failed without establishing a public path."""
+    def __init__(self, message, *, acquisition=None):
+        super().__init__(message)
+        self.acquisition = acquisition
 
 
 def _fatal_path_error(error, guard=None):
@@ -174,19 +286,1039 @@ class _ProofFailure:
         self.stage, self.error = stage, error
 
 
+class _MetadataDirectory:
+    """A diagnostic metadata witness, never authority for a public-chain proof."""
+    def __init__(self, path, guard, marks):
+        self.path, self.guard, self.marks = path, guard, tuple(marks)
+        self.closed = False
+
+
+class _AbsentReference:
+    """A revalidated negative edge and the complete existing directory prefix."""
+    def __init__(self, path, ancestors, *, non_directory=False, requested=None):
+        self.path, self.ancestors = path, tuple(ancestors)
+        self.requested = path if requested is None else requested
+        self.non_directory = non_directory
+        self.outcome = _AcquisitionOutcome("ABSENT", negative=(self.path, self.ancestors))
+
+
+class _AcquisitionOutcome:
+    """A detected filesystem fact, independent of its caller's refusal contract."""
+    def __init__(self, kind, error=None, *, replacement=False, negative=None):
+        self.kind, self.error, self.replacement = kind, error, replacement
+        self.negative = negative
+
+
+_private_classification = ContextVar("fresh_private_classification", default=False)
+
+
+
+def _acquisition_guard(guard):
+    if guard is None:
+        from hierarchy_router import _operation_guard
+        return _operation_guard()
+    return guard
+
+
+
+def _acquisition_descriptor(kind, args, value):
+    if kind == "open":
+        return value
+    if kind in {"fstat", "identify", "read", "fdopen"}:
+        return args[0]
+    if kind == "stream-read":
+        return args[0].fileno()
+    if kind == "names" and type(args[0]) is int:
+        return args[0]
+    return None
+
+
+def _acquisition_observed_error(kind, args, kwargs, guard, error, path, negative):
+    """An error cannot authorize a later absent-to-peer recovery."""
+    if not isinstance(error, OSError) or error.errno == errno.ENOENT:
+        return
+    ledger = _operation_ledger(guard)
+    if ledger is None or ledger.validating.get() or kind in {"proof", "witness", "peer-directory"}:
+        return
+    path = ledger.acquisition_path(kind, args, kwargs, path, negative)
+    captured = ledger.positive.get(path)
+    if path in ledger.negative_edges or captured is not None and captured[2] == stat.S_IFDIR:
+        changed = _acquisition_changed(guard)
+        changed.__cause__ = error
+        if kind in {"open", "mkdir"} and kwargs.get("dir_fd") is not None:
+            token = ledger.peer_validation.set(path)
+            try:
+                info = _acquire("stat", args[0], dir_fd=kwargs["dir_fd"],
+                                 follow_symlinks=False, _guard=guard, _path=path)
+                _acquisition_replacement(guard, path, info)
+            finally:
+                ledger.peer_validation.reset(token)
+        raise changed
+
+
+class _AttachmentCheck:
+    """A bounded validation transaction; provisional IO never enters the ledger."""
+    def __init__(self, ledger, path, info, *, absent=False):
+        self.absent = absent
+        self.ledger, self.guard, self.path, self.info = ledger, ledger.guard, path, info
+        self.positive = ChainMap(ledger.positive, ledger.provisional.get())
+        self.stack = []
+
+    def metadata(self, kind, value, *, path, **kwargs):
+        return _acquire(kind, value, _guard=self.guard, _path=path, **kwargs)
+
+    def compare(self, path, info, expected):
+        if expected is not None and _directory_mark(info) != expected:
+            _acquisition_replacement(self.guard, path, info)
+
+    def run(self):
+        path, ledger = self.path, self.ledger
+        _acquisition_require(path is not None, self.guard, "reference parent changed while opening")
+        parents = list(reversed(path.parents)) if path != path.parent else []
+        for parent in parents:
+            _acquisition_require(parent in self.positive, self.guard, "reference parent changed while opening")
+        expected = _directory_mark(self.info) if self.info is not None else self.positive.get(path)
+        if self.info is not None:
+            self.compare(path, self.info, self.positive.get(path))
+            if path in ledger.owned and ledger.owned[path] != file_identity(self.info):
+                _acquisition_replacement(self.guard, path, self.info)
+        token = ledger.validating.set(True)
+        try:
+            if _reference_descriptors():
+                self.anchored(parents, expected)
+            else:
+                self.portable(parents, expected)
+        except BaseException as error:
+            if isinstance(error, Exception):
+                _acquisition_refuse(self.guard, error)
+            raise
+        finally:
+            try:
+                _close_witness_stack(self.stack, self.guard, sys.exc_info()[1])
+            finally:
+                ledger.validating.reset(token)
+
+    def leaf(self, parent, expected):
+        path = self.path
+        if self.absent:
+            return _acquire("negative-leaf", path, parent, _guard=self.guard)
+        if expected is None:
+            _acquisition_require(path in self.ledger.negative_edges, self.guard,
+                                 "reference parent changed while opening")
+        info = self.metadata("stat", path.name, path=path, dir_fd=parent, follow_symlinks=False)
+        self.compare(path, info, expected)
+
+    def keep(self, path, descriptor):
+        try:
+            self.stack.append((path, descriptor, None))
+        except BaseException as error:
+            _acquisition_close_opened(descriptor, self.guard, error)
+            raise
+
+    def anchored(self, parents, expected):
+        path = self.path
+        root = Path(path.anchor)
+        flags = (_search_directory_flag() or os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+        descriptor = _acquire("open", str(root), flags, _guard=self.guard, _path=root)
+        self.keep(root, descriptor)
+        root_mark = self.positive.get(root, expected if path == root else None)
+        self.compare(root, self.metadata("fstat", descriptor, path=root), root_mark)
+        for child in parents[1:]:
+            info = self.metadata("stat", child.name, path=child, dir_fd=descriptor, follow_symlinks=False)
+            mark = self.positive[child]
+            self.compare(child, info, mark)
+            _acquisition_require(mark[2] == stat.S_IFDIR, self.guard, "reference parent changed while opening")
+            descriptor = _acquire("open", child.name, flags, dir_fd=descriptor, _guard=self.guard, _path=child)
+            self.keep(child, descriptor)
+            self.compare(child, self.metadata("fstat", descriptor, path=child), mark)
+        if path != root:
+            self.leaf(descriptor, expected)
+        for index in range(len(self.stack) - 1, 0, -1):
+            child = self.stack[index][0]
+            info = self.metadata("stat", child.name, path=child, dir_fd=self.stack[index - 1][1],
+                                 follow_symlinks=False)
+            self.compare(child, info, self.positive[child])
+        self.compare(root, self.metadata("lstat", root, path=root), root_mark)
+
+    def portable(self, parents, expected):
+        # Unsupported platforms retain metadata witnesses, never proof authority.
+        for parent in parents:
+            self.compare(parent, self.metadata("lstat", parent, path=parent), self.positive[parent])
+        if self.absent:
+            _acquire("negative-leaf", self.path, None, _guard=self.guard)
+        else:
+            self.compare(self.path, self.metadata("lstat", self.path, path=self.path), expected)
+        for parent in reversed(parents):
+            self.compare(parent, self.metadata("lstat", parent, path=parent), self.positive[parent])
+
+
+
+class _AcquisitionMutation:
+    """Validate both endpoints of a publication mutation before admitting its effect."""
+    def __init__(self, ledger, kind, args, kwargs):
+        self.ledger, self.guard, self.kind, self.args, self.kwargs = ledger, ledger.guard, kind, args, kwargs
+        source_fd = kwargs.get("dir_fd") if kind == "unlink" else kwargs.get("src_dir_fd")
+        receipt = ledger.handles.get(source_fd)
+        _acquisition_require(receipt is not None, self.guard, "reference parent changed while opening")
+        self.source, self.source_fd = receipt[0] / args[0], source_fd
+        self.destination = None
+        if kind != "unlink":
+            destination = ledger.handles.get(kwargs.get("dst_dir_fd"))
+            _acquisition_require(destination is not None, self.guard, "reference parent changed while opening")
+            self.destination = destination[0] / args[1]
+        self.info = None
+
+    def capture(self):
+        ledger = self.ledger
+        _acquisition_require(self.source.parent in ledger.outputs, self.guard,
+                             "reference parent changed while opening")
+        token = ledger.validating.set(True)
+        try:
+            self.info = _acquire("stat", self.source.name, dir_fd=self.source_fd,
+                follow_symlinks=False, _guard=self.guard, _path=self.source)
+        finally:
+            ledger.validating.reset(token)
+        _AttachmentCheck(ledger, self.source, self.info).run()
+        _acquisition_identity(self.guard, self.source, self.info)
+        owned = ledger.owned.get(self.source) == file_identity(self.info)
+        expected = ledger.positive.get(self.source)
+        _acquisition_require(owned or expected == _directory_mark(self.info), self.guard,
+                             "reference parent changed while opening")
+        if self.destination is not None:
+            _acquisition_require(owned and self.destination in ledger.outputs, self.guard,
+                                 "reference parent changed while opening")
+            _AttachmentCheck(ledger, self.destination, None, absent=True).run()
+        return self
+
+    def finish(self):
+        _AttachmentCheck(self.ledger, self.source, None, absent=True).run()
+        if self.destination is not None:
+            _AttachmentCheck(self.ledger, self.destination, self.info).run()
+            self.ledger.observe("effect", self.destination, file_identity(self.info))
+
+
+def _admit_publication_directory(guard, path, before):
+    opened = None
+    try:
+        with _peer_publication_directory(guard, path, before) as peer:
+            peer.directory(_acquire("stat", path.name, dir_fd=peer.parent,
+                                    follow_symlinks=False, _guard=guard, _path=path))
+            opened = _acquire("open", path.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                              dir_fd=peer.parent, _guard=guard, _path=path, _before=peer.info)
+            peer.directory(_acquire("fstat", opened, _guard=guard, _path=path))
+            for _ in range(2):
+                names = _acquire("names", opened, _guard=guard, _path=path)
+                peer.names(names)
+                for name in names:
+                    peer.name(name)
+                    peer.entry(name, _acquire("stat", name, dir_fd=opened, follow_symlinks=False,
+                                             _guard=guard, _path=path / name))
+            peer.recheck_parent()
+            peer.directory(_acquire("fstat", opened, _guard=guard, _path=path))
+            peer.directory(_acquire("stat", path.name, dir_fd=peer.parent,
+                                    follow_symlinks=False, _guard=guard, _path=path))
+            peer.admit(opened)
+        value, opened = opened, None
+        return value
+    finally:
+        _acquisition_close_opened(opened, guard, sys.exc_info()[1])
+
+
+def _acquisition_mkdir_recheck(kind, args, kwargs, guard, error, path):
+    if (kind != "mkdir" or path is None or not isinstance(error, OSError)
+            or error.errno not in {errno.ENOENT, errno.ENOTDIR, errno.ELOOP}):
+        return
+    ledger = _operation_ledger(guard)
+    token = ledger.peer_validation.set(path) if ledger is not None else None
+    try:
+        # This is refusal diagnostics, never permission to adopt a peer. Preserve
+        # an observed private replacement before reducing the original errno.
+        _acquire("stat", args[0], dir_fd=kwargs.get("dir_fd"), follow_symlinks=False,
+                 _guard=guard, _path=path)
+    finally:
+        if token is not None:
+            ledger.peer_validation.reset(token)
+
+
+def _acquisition_expected(guard, path, value, expected):
+    if expected is not None:
+        if _reference_mark(value) != expected:
+            _acquisition_replacement(guard, path, value)
+        _acquire("witness", "ancestor", path, value, _guard=guard)
+
+
+def _acquisition_absence(guard, negative, error):
+    path, expected = negative
+    check = final = None
+    try:
+        try:
+            path, expected = _acquisition_negative_expected(guard, path, expected)
+            if _descriptor_capabilities():
+                check, marks = _proof_parent(path.parent, _guard=guard, _expected=expected)
+                _acquisition_require(len(marks) == len(path.parent.parts)
+                        and (expected is None or _same_path_ancestors(marks, expected)),
+                        guard, "reference parent changed while opening")
+                _acquire("negative-leaf", path, check, _guard=guard)
+                final, after = _proof_parent(path.parent, _guard=guard, _expected=marks)
+                _acquisition_require(_same_path_ancestors(marks, after), guard,
+                                     "reference parent changed while opening")
+            else:
+                marks = _reference_ancestors(path, _guard=guard, _expected=expected)
+                _acquire("negative-leaf", path, None, _guard=guard)
+                after = _reference_ancestors(path, _guard=guard, _expected=marks)
+                _acquisition_require(_same_path_ancestors(marks, after), guard,
+                                     "reference parent changed while opening")
+        finally:
+            _acquisition_close_negative(final, check)
+    except Exception as failed:
+        _acquisition_refuse(guard, failed)
+    _acquire("witness", "negative", _AbsentReference(path, expected), _guard=guard)
+    _acquisition_detect(guard, "ABSENT", error, negative=(path, expected))
+
+
+@contextmanager
+def _peer_publication_directory(guard, path, before):
+    ledger = _operation_ledger(guard)
+    captured = ledger.peer_directory(path) if ledger is not None else None
+    _acquisition_require(captured is not None, guard, "reference parent changed while opening")
+    parent, marks = _proof_parent(path.parent, _guard=guard, _expected=captured.ancestors)
+    token = ledger.peer_validation.set(path)
+    provisional = ledger.provisional.set({})
+    try:
+        _acquisition_require(_same_path_ancestors(marks, captured.ancestors), guard,
+                             "reference parent changed while opening")
+        info = _acquire("fstat", parent, _guard=guard)
+        yield _PeerPublicationDirectory(ledger, path, parent, info, captured, before)
+    finally:
+        try:
+            _close_rechecked_reference(parent, guard, sys.exc_info()[1])
+        finally:
+            ledger.provisional.reset(provisional)
+            ledger.peer_validation.reset(token)
+
+
+class _PeerPublicationDirectory:
+    """Provisional peer metadata; no witness is rebound before validation."""
+    def __init__(self, ledger, path, parent, parent_info, captured, before):
+        self.ledger, self.path, self.parent = ledger, path, parent
+        self.owner, self.parent_identity = os.geteuid(), file_identity(parent_info)
+        self.captured, self.before, self.info = captured, before, None
+        self.listing, self.entries = None, {}
+
+    def directory(self, info):
+        guard = self.ledger.guard
+        _acquisition_identity(guard, self.path, info)
+        _acquisition_require(stat.S_ISDIR(info.st_mode) and not _reparse(info)
+                and info.st_uid == self.owner and stat.S_IMODE(info.st_mode) == 0o700,
+                guard, "reference parent changed while opening")
+        previous = self.info if self.info is not None else self.before
+        if previous is not None and _directory_mark(previous) != _directory_mark(info):
+            _acquisition_replacement(guard, self.path, info)
+        self.info = info
+        self.ledger.provisional.get()[self.path] = _directory_mark(info)
+
+    def names(self, names):
+        _acquisition_require(self.listing is None or self.listing == names, self.ledger.guard,
+                             "reference parent changed while opening")
+        self.listing = names
+
+    def name(self, name):
+        _acquisition_require(re.fullmatch(r"(?:(?:fresh|check)-[a-f0-9]{64}[.]md|[.]fresh-[a-f0-9]{32})", name) is not None,
+                             self.ledger.guard, "reference parent changed while opening")
+
+    def entry(self, name, info):
+        guard = self.ledger.guard
+        _acquisition_identity(guard, self.path / name, info)
+        _acquisition_require(stat.S_ISREG(info.st_mode) and not _reparse(info) and info.st_uid == self.owner
+                and stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and 0 <= info.st_size <= MAX_BYTES,
+                guard, "reference parent changed while opening")
+        mark = _directory_mark(info)
+        _acquisition_require(name not in self.entries or self.entries[name] == mark,
+                             guard, "reference parent changed while opening")
+        self.entries.setdefault(name, mark)
+
+    def recheck_parent(self):
+        guard = self.ledger.guard
+        parent, marks = _proof_parent(self.path.parent, _guard=guard, _expected=self.captured.ancestors)
+        try:
+            _acquisition_require(_same_path_ancestors(marks, self.captured.ancestors)
+                    and file_identity(_acquire("fstat", parent, _guard=guard)) == self.parent_identity,
+                    guard, "reference parent changed while opening")
+        finally:
+            _close_rechecked_reference(parent, guard, sys.exc_info()[1])
+
+    def admit(self, descriptor):
+        _acquisition_require(self.ledger.peer_directory(self.path, validating=True) is self.captured, self.ledger.guard,
+                             "reference parent changed while opening")
+        # The ruling admits this one absent-to-validated-peer-directory effect.
+        # Keep the original negative object; all later identities must match.
+        self.ledger.observe("effect", self.path, file_identity(self.info))
+        self.ledger.acquired("open", self.path, self.info, descriptor=descriptor)
+        self.ledger.peer_directories.discard(self.path)
+
+
+def _acquisition_prepare(kind, args, kwargs, guard, path, negative):
+    if kind not in {"open", "mkdir", "stat", "lstat", "fstat", "identify", "read", "fdopen", "names", "link", "stream-read", "replace", "rename", "unlink"}:
+        raise KeyError(kind)
+    ledger = _operation_ledger(guard)
+    if ledger is not None and ledger.validating.get():
+        return ledger, path
+    if kind == "identify":
+        return ledger, None
+    # Relative lookups use the caller's held parent acquired through this
+    # boundary. Namespace changes cannot replace that descriptor's inode.
+    # Borrowed directory/stream entry points bind before exposing content.
+    if ledger is not None and kind in {"names", "link"} and type(args[0]) is int and ledger.peer_validation.get() is None:
+        _bind_directory_descriptor(args[0], guard, revalidate=kind == "names")
+    path = ledger.acquisition_path(kind, args, kwargs, path, negative) if ledger is not None else path
+    if kind in {"names", "link", "read", "fdopen", "stream-read"} and ledger is not None:
+        if kind in {"read", "fdopen", "stream-read"}:
+            descriptor = args[0].fileno() if kind == "stream-read" else args[0]
+            _acquire("fstat", descriptor, _guard=guard, _path=path)
+        elif kind == "names":
+            if type(args[0]) is not int:
+                _acquire("lstat", args[0], _guard=guard, _path=path)
+        else:
+            _acquire("stat", args[1], dir_fd=args[0], follow_symlinks=False,
+                     _guard=guard, _path=path)
+    return ledger, path
+
+
+def _acquisition_record(ledger, kind, path, info, value, args, before):
+    if ledger.peer_validation.get() is not None and path is not None and (path == ledger.peer_validation.get() or ledger.peer_validation.get() in path.parents):
+        return path
+    if kind == "identify":
+        path = ledger.directory_path(args[0], info)
+        ledger.observe("descriptor", path, (args[0], info))
+        kind = "fstat"
+    if ledger.peer_directories and ledger.peer_directory(path) is not None:
+        peer = _acquire("peer-directory", path, _guard=ledger.guard, _before=info)
+        _close_rechecked_reference(peer, ledger.guard, None)
+    owned = kind == "open" and bool(args[1] & os.O_CREAT and args[1] & os.O_EXCL)
+    ledger.acquired(kind, path, info,
+                    descriptor=value if kind in {"open", "mkdir"} else args[0] if kind == "fstat" else None,
+                    owned=owned)
+    return path
+
+
+def _bind_directory_descriptor(descriptor, guard, *, revalidate=True):
+    ledger = _operation_ledger(guard)
+    previous = ledger.handles.get(descriptor)
+    path, info = _acquire("identify", descriptor, _guard=guard)
+    # A receipt identifies an inode, not its current ancestor attachment. Even
+    # the same descriptor can outlive a rename. Names reach the caller here;
+    # link text stays inside its existing complete-chain proof boundary.
+    if revalidate or previous is None or previous[:2] != (path, file_identity(info)):
+        _bind_descriptor(descriptor, info, path, guard, content=False)
+
+
+def _acquisition_recheck_open(guard, path, before, args, kwargs):
+    try:
+        now = _acquire("stat", args[0], dir_fd=kwargs.get("dir_fd"),
+                       follow_symlinks=False, _guard=guard, _path=path)
+    except Exception as checking:
+        _raise_global(checking, guard=guard)
+        observed = _acquisition_fact(checking)
+        if observed is not None and (observed.kind == "PRIVATE" or _operation_ledger(guard) is not None):
+            # A ledger already latched this observation; never reduce its typed
+            # cause to the earlier syscall's diagnostic. Legacy readers without
+            # an operation retain their original OS-error priority.
+            raise
+    else:
+        if _reference_mark(now) != _reference_mark(before):
+            _acquisition_replacement(guard, path, now)
+
+
+def _acquisition_link_buffer(directory, size):
+    import ctypes
+    require(type(size) is int and 0 < size <= MAX_SYMLINK_BYTES, "public link proof unavailable")
+    require(type(directory) is int and directory >= 0, "public link proof unavailable")
+    return ctypes.create_string_buffer(size + 1)
+
+
+def _acquisition_close_opened(opened, guard, error):
+    if opened is not None:
+        try:
+            os.close(opened)
+        except OSError as closing:
+            _raise_global(error, guard=guard)
+            _raise_global(closing, guard=guard)
+
+
+def _acquisition_close_transferred(stream, guard, error):
+    try:
+        stream.close()
+    except BaseException as closing:
+        _raise_global(error, guard=guard)
+        _raise_global(closing, guard=guard)
+        if not isinstance(closing, Exception):
+            raise
+        _acquisition_refuse(guard, error)
+
+
+def _acquisition_close_negative(final, check):
+    try:
+        if final is not None:
+            _proof_close(final, os.close)
+    finally:
+        if check is not None:
+            _proof_close(check, os.close)
+
+
+def _operation_ledger(guard):
+    context = getattr(guard, "_witness_context", None)
+    return context.get() if context is not None else None
+
+
+def _private_context(guard):
+    ledger = _operation_ledger(guard)
+    return ledger.classification if ledger is not None else _private_classification
+
+
+def _acquisition_negative_expected(guard, path, expected):
+    if expected is None:
+        ledger = _operation_ledger(guard)
+        captured = (ledger.output_negatives.get(path) or ledger.negatives.get(path)) if ledger is not None else None
+        if captured is not None:
+            if path in ledger.outputs and captured.path in ledger.outputs and captured.path in ledger.positive:
+                return path, ledger.prefix(path.parent)
+            return captured.path, captured.ancestors
+        missing, _marks = _scope_reference_info(path, guard)
+        _acquisition_require(isinstance(missing, _AbsentReference), guard,
+                             "reference parent changed while opening")
+        return missing.path, missing.ancestors
+    return path, expected
+
+
+class _WitnessLedger:
+    """Write-once namespace witnesses; known output effects retain their original negatives."""
+    def __init__(self, guard, parent=None):
+        self.guard = guard
+        if parent is not None:
+            _acquisition_require(sum(map(len, (parent.positive, parent.negatives, parent.outputs,
+                parent.effects, parent.output_negatives, parent.prospective, parent.handles, parent.owned))) <= MAX_INPUT_NODES, guard,
+                "reference parent changed while opening")
+        self.positive = {} if parent is None else dict(parent.positive)
+        self.negatives = {} if parent is None else dict(parent.negatives)
+        self.outputs = set() if parent is None else set(parent.outputs)
+        self.effects = {} if parent is None else dict(parent.effects)
+        self.owned = {} if parent is None else dict(parent.owned)
+        self.output_negatives = {} if parent is None else dict(parent.output_negatives)
+        self.prospective = set() if parent is None else set(parent.prospective)
+        self.handles = {} if parent is None else dict(parent.handles)
+        self.negative_edges = {} if parent is None else dict(parent.negative_edges)
+        self.peer_directories = set()
+        self.peer_validation = ContextVar("fresh_peer_directory_validation", default=None)
+        self.classification = ContextVar("fresh_witness_private_diagnostic", default=False)
+        self.validating = ContextVar("fresh_attachment_validation", default=False)
+        self.provisional = ContextVar("fresh_provisional_directory", default={})
+
+    def peer_directory(self, path, *, validating=False):
+        if path not in self.peer_directories:
+            return None
+        captured = self.negative_edges.get(path)
+        if ((validating or self.peer_validation.get() != path)
+                and path in self.outputs
+                and path not in self.positive and path not in self.effects
+                and captured is not None and captured.path == path and captured in self.prospective):
+            return captured
+        return None
+
+    def directory_path(self, descriptor, info):
+        """A borrowed directory may route only to an already captured identity."""
+        mark = _directory_mark(info)
+        previous = self.handles.get(descriptor)
+        if previous is not None and self.positive.get(previous[0]) == mark and previous[1] == file_identity(info):
+            return previous[0]
+        matches = [path for path, expected in self.positive.items() if expected == mark]
+        _acquisition_require(stat.S_ISDIR(info.st_mode) and len(matches) == 1, self.guard,
+                             "reference parent changed while opening")
+        return matches[0]
+
+    def acquisition_path(self, kind, args, kwargs, path, negative):
+        """Bind relative operations to a descriptor acquired through this boundary."""
+        if path is not None:
+            return path if isinstance(path, Path) else Path(path)
+        if negative is not None:
+            return negative[0] if isinstance(negative[0], Path) else Path(negative[0])
+        if kind in {"fstat", "read", "fdopen", "stream-read"}:
+            descriptor = args[0].fileno() if kind == "stream-read" else args[0]
+            receipt = self.handles.get(descriptor)
+            _acquisition_require(receipt is not None, self.guard, "reference parent changed while opening")
+            return receipt[0]
+        descriptor = (kwargs.get("dst_dir_fd") if kind in {"replace", "rename"} else
+            args[0] if kind == "link" or kind == "names" and type(args[0]) is int else kwargs.get("dir_fd"))
+        value = args[1] if kind in {"link", "replace", "rename"} else args[0]
+        if descriptor is not None:
+            receipt = self.handles.get(descriptor)
+            _acquisition_require(receipt is not None, self.guard, "reference parent changed while opening")
+            return receipt[0] if kind == "names" else receipt[0] / value
+        path = Path(value)
+        _acquisition_require(path.is_absolute(), self.guard, "reference parent changed while opening")
+        return path
+
+    def acquired(self, kind, path, info, *, descriptor=None, owned=False):
+        """Compare before exposure; handle receipts carry no new input authority."""
+        previous = self.handles.get(descriptor) if descriptor is not None and kind == "fstat" else None
+        if previous is not None:
+            if previous[0] != path or previous[1] != file_identity(info):
+                _acquisition_replacement(self.guard, path, info)
+            owned = previous[2]
+        _acquisition_identity(self.guard, path, info)
+        if owned:
+            _acquisition_require(path.parent in self.outputs, self.guard, "reference parent changed while opening")
+        self.observe("owned" if owned else "ancestor", path, info)
+        if kind in {"open", "mkdir"}:
+            _acquisition_require(descriptor in self.handles or len(self.handles) < MAX_INPUT_NODES,
+                                 self.guard, "reference parent changed while opening")
+            self.handles[descriptor] = path, file_identity(info), owned
+
+    def prefix(self, path):
+        result, current = [], None
+        for component in path.parts:
+            current = Path(component) if current is None else current / component
+            _acquisition_require(current in self.positive, self.guard, "reference parent changed while opening")
+            result.append((component, self.positive[current]))
+        return tuple(result)
+
+    def observe(self, kind, path, value=None):
+        if kind == "negative":
+            absent = path
+            path = absent.path
+            if path in self.positive or path in self.effects:
+                raise _acquisition_changed(self.guard)
+            destination = self.negatives
+            previous = self.negatives.get(absent.requested)
+            if (previous is not None and previous.path != path and absent.requested in self.outputs
+                    and previous.path in self.outputs and previous.path in self.positive):
+                # Keep the initial edge. A known output directory creation has
+                # its own subsequent leaf-negative witness, never a replacement
+                # for the operation's original observation.
+                destination = self.output_negatives
+                previous = destination.get(absent.requested)
+            if previous is not None:
+                _acquisition_require(previous.path == path
+                    and _same_ancestors(previous.ancestors, absent.ancestors), self.guard,
+                    "reference parent changed while opening")
+            captured = destination.setdefault(absent.requested, absent)
+            self.negative_edges.setdefault(path, captured)
+            # Only first capture can carry namespace intent. Rechecking an
+            # earlier input absence never grants publication permission.
+            if previous is None and (path in self.outputs or path.parent in self.outputs):
+                self.prospective.add(captured)
+            return absent
+        path = path if isinstance(path, Path) else Path(path)
+        if kind == "descriptor":
+            descriptor, info = value
+            _acquisition_require(path in self.positive and self.positive[path] == _directory_mark(info),
+                                 self.guard, "reference parent changed while opening")
+            _acquisition_require(descriptor in self.handles or len(self.handles) < MAX_INPUT_NODES,
+                                 self.guard, "reference parent changed while opening")
+            self.handles[descriptor] = path, file_identity(info), False
+            return
+        if kind in {"output", "output-directory"}:
+            # An early namespace declaration may select its prospective leaf
+            # for publication. Original input negatives stay immutable.
+            namespace = kind == "output" and path.parent in self.outputs
+            for output in ((path,) if kind == "output-directory" else (path.parent, path)):
+                _acquisition_require(output in self.outputs or not any(
+                    item.path == output and not (namespace and output == path and item in self.prospective)
+                    for item in self.negatives.values()), self.guard,
+                    "reference parent changed while opening")
+                self.outputs.add(output)
+            return
+        if kind == "publication-directory":
+            _acquisition_require(path in self.outputs, self.guard, "reference parent changed while opening")
+            if path in self.positive or path in self.effects:
+                return
+            _acquisition_require(path in self.peer_directories or len(self.peer_directories) < MAX_INPUT_NODES,
+                                 self.guard, "reference parent changed while opening")
+            self.peer_directories.add(path)
+            return
+        if kind == "effect":
+            _acquisition_require(path in self.outputs, self.guard, "reference parent changed while opening")
+            previous = self.effects.setdefault(path, value)
+            _acquisition_require(previous == value, self.guard, "reference parent changed while opening")
+            return
+        require(kind in {"ancestor", "owned"}, "invalid witness kind")
+        mark = _directory_mark(value)
+        previous = self.positive.get(path)
+        # An admitted positive already has its complete immutable parent graph.
+        # Rechecking that membership only rebuilds Path objects; identities and
+        # negative edges still compare on every acquisition below.
+        changed = (previous is None and path != path.parent and path.parent not in self.positive or
+            previous is not None and previous != mark or
+            path in self.effects and self.effects[path] != file_identity(value)) or (path in self.negative_edges and path not in self.effects)
+        if changed:
+            error = _acquisition_changed(self.guard)
+            if self.classification.get():
+                # The mismatch is already latched. Finish only the diagnostic
+                # link lookup so a typed privacy cause can take precedence;
+                # this observation never enters the ledger or certifies input.
+                return
+            raise error
+        if kind == "owned":
+            identity = file_identity(value)
+            _acquisition_require(path in self.owned or len(self.owned) < MAX_INPUT_NODES, self.guard,
+                                 "reference parent changed while opening")
+            _acquisition_require(self.owned.setdefault(path, identity) == identity, self.guard,
+                                 "reference parent changed while opening")
+        if kind == "ancestor" and not _reparse(value):
+            self.positive.setdefault(path, mark)
+
+    def _check(self, path, info, mark):
+        _acquisition_identity(self.guard, path, info, replacement=_directory_mark(info) != mark)
+        if _directory_mark(info) != mark:
+            _acquisition_replacement(self.guard, path, info)
+
+    def _negative(self, absent, descriptor):
+        path = absent.path
+        try:
+            info = (_acquire("stat", path.name, dir_fd=descriptor, follow_symlinks=False,
+                             _guard=self.guard, _negative=(path, absent.ancestors))
+                    if descriptor is not None else _acquire("lstat", path, _guard=self.guard,
+                             _negative=(path, absent.ancestors)))
+        except FileNotFoundError:
+            return
+        _acquisition_replacement(self.guard, path, info)
+
+    def verify(self):
+        """Walk attached children, then check each attachment again after its descendants."""
+        children, negatives = {}, {}
+        for path in self.positive:
+            if path != path.parent:
+                children.setdefault(path.parent, []).append(path)
+        for absent in (*self.negatives.values(), *self.output_negatives.values()):
+            path = absent.path
+            if path not in self.positive and path not in self.effects:
+                negatives[path] = absent
+        for path, absent in negatives.items():
+            # Keep the original complete chain; no discovery may move this edge.
+            _acquisition_require(all(parent in self.positive for parent in path.parents), self.guard,
+                                 "reference parent changed while opening")
+        if not _reference_descriptors():
+            ordered = sorted(self.positive.items(), key=lambda item: len(item[0].parts))
+            for path, mark in ordered:
+                self._check(path, _acquire("lstat", path, _guard=self.guard), mark)
+            for path in negatives:
+                self._negative(negatives[path], None)
+            for path, mark in ordered:
+                if mark[2] == stat.S_IFDIR:
+                    self._check(path, _acquire("lstat", path, _guard=self.guard), mark)
+            return
+        roots = [path for path in self.positive if path == path.parent]
+        for root in roots:
+            self._verify_root(root, children, negatives)
+
+    def _verify_root(self, root, children, negatives):
+        flags = (_search_directory_flag() or os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+        stack = []
+        try:
+            descriptor = _acquire("open", str(root), flags, _guard=self.guard)
+            stack.append((root, descriptor, iter(children.get(root, ()))))
+            self._check(root, _acquire("fstat", descriptor, _guard=self.guard), self.positive[root])
+            while stack:
+                path, descriptor, pending = stack[-1]
+                child = next(pending, None)
+                if child is not None:
+                    info = _acquire("stat", child.name, dir_fd=descriptor, follow_symlinks=False, _guard=self.guard)
+                    self._check(child, info, self.positive[child])
+                    if self.positive[child][2] != stat.S_IFDIR:
+                        continue
+                    opened = _acquire("open", child.name, flags, dir_fd=descriptor, _guard=self.guard,
+                                      _path=child, _before=info)
+                    stack.append((child, opened, iter(children.get(child, ()))))
+                    self._check(child, _acquire("fstat", opened, _guard=self.guard), self.positive[child])
+                    continue
+                for absent in negatives:
+                    if absent.parent == path:
+                        self._negative(negatives[absent], descriptor)
+                for output, identity in self.effects.items():
+                    if output.parent == path:
+                        info = _acquire("stat", output.name, dir_fd=descriptor, follow_symlinks=False, _guard=self.guard)
+                        if file_identity(info) != identity:
+                            _acquisition_replacement(self.guard, output, info)
+                if len(stack) > 1:
+                    info = _acquire("stat", path.name, dir_fd=stack[-2][1], follow_symlinks=False, _guard=self.guard)
+                    self._check(path, info, self.positive[path])
+                stack.pop()
+                _close_rechecked_reference(descriptor, self.guard, None)
+        finally:
+            _close_witness_stack(stack, self.guard, sys.exc_info()[1])
+
+
+def _close_witness_stack(stack, guard, error):
+    """Release every ancestor even when cleanup also fails; keep the strongest cause."""
+    failure = error
+    while stack:
+        _path, descriptor, _pending = stack.pop()
+        try:
+            _close_rechecked_reference(descriptor, guard, failure)
+        except BaseException as cleanup:
+            failure = cleanup
+    if failure is not error:
+        _acquisition_refuse(guard, failure)
+
+
+
+def _acquisition_detect(guard, kind, error=None, *, replacement=False, negative=None):
+    """Latch an observed change/privacy cause before diagnostics or optional IO."""
+    previous = getattr(error, "_acquisition_outcome", None)
+    replacement = replacement or bool(previous is not None and previous.replacement)
+    outcome = _AcquisitionOutcome(kind, error, replacement=replacement or kind == "CHANGED", negative=negative)
+    if error is not None:
+        error._acquisition_outcome = outcome
+    if kind == "CHANGED" or kind == "PRIVATE" and replacement:
+        context = getattr(guard, "_acquisition_context", None)
+        owner = context.get() if context is not None else None
+        if owner is not None:
+            owner.fail(error)
+    return outcome
+
+
+def _acquisition_changed(guard, message="reference parent changed while opening"):
+    error = ValueError("reference parent changed while opening")
+    _acquisition_detect(guard, "CHANGED", error)
+    return error
+
+
+def _acquisition_refuse(guard, error):
+    """Refuse an unproved acquisition error before any caller can reduce it."""
+    from hierarchy_router import PrivatePathError
+    _raise_global(error, guard=guard)
+    if isinstance(error, PrivatePathError):
+        _acquisition_detect(guard, "PRIVATE", error, replacement=True)
+        raise error
+    raise _acquisition_changed(guard) from error
+
+
+def _acquisition_failure(kind, args, guard, error, *, transferred=False):
+    """Release transferred handles before propagating a captured policy failure."""
+    if kind == "fdopen" and not transferred:
+        # fdopen has not accepted ownership if it raises.
+        try:
+            os.close(args[0])
+        except OSError as closing:
+            _raise_global(error, guard=guard)
+            _acquisition_refuse(guard, closing)
+    _raise_global(error, guard=guard)
+    detected = _acquisition_fact(error)
+    if detected is not None and (kind == "witness" or detected.kind == "CHANGED"):
+        raise error
+    observed = _acquisition_fact(error)
+    if observed is not None and observed.kind == "PRIVATE" and not observed.replacement:
+        raise error
+    if kind == "proof":
+        from hierarchy_router import PrivatePathError
+        if isinstance(error, PrivatePathError):
+            _acquisition_detect(guard, "PRIVATE", error)
+            raise error
+        observed = _acquisition_fact(error)
+        if observed is not None and observed.kind == "ABSENT":
+            raise error
+        if observed is not None and observed.kind == "PRIVATE":
+            raise observed.error if observed.replacement else error
+
+
+def _acquisition_require(condition, guard, message):
+    if not condition:
+        raise _acquisition_changed(guard, message)
+
+
+def _acquisition_replacement(guard, path, info=None):
+    """Inspect a replacement before reducing its observed cause to a mismatch."""
+    from hierarchy_router import PrivatePathError
+    if info is not None:
+        _acquisition_identity(guard, path, info, replacement=True)
+        if stat.S_ISLNK(info.st_mode) or _reparse(info):
+            result = _private_symlink_target(guard, path, path)
+            if isinstance(result, _ProofFailure):
+                error = result.error
+                if isinstance(error, PrivatePathError):
+                    _acquisition_detect(guard, "PRIVATE", error, replacement=True)
+                    raise error
+    raise _acquisition_changed(guard)
+
+
+def _acquisition_open_refusal(error, guard, path, directory, *, before, ancestors):
+    """The errno triggers a check; the anchored witness decides the outcome."""
+    if directory is not None:
+        proof = _ProvedChain(guard, path, (), (), directory, path, ancestors)
+        _LeafLookup("present" if before is not None else "error", before if before is not None else error, proof)
+        _recheck_scope_witness(proof)
+    else:
+        # Ordinary portable readers retain metadata diagnostics. They cannot
+        # certify a fresh-brief proof through this branch.
+        if ancestors:
+            _acquisition_require(_same_ancestors(_reference_ancestors(path, _guard=guard), ancestors),
+                                 guard, "reference parent changed while opening")
+        info = _acquire("lstat", path, _guard=guard)
+        changed = before is not None and _reference_mark(info) != _reference_mark(before)
+        _acquisition_identity(guard, path, info, replacement=changed)
+        if changed:
+            _acquisition_replacement(guard, path, info)
+        if ancestors:
+            _acquisition_require(_same_ancestors(_reference_ancestors(path, _guard=guard), ancestors),
+                                 guard, "reference parent changed while opening")
+    _acquisition_refuse(guard, error)
+
+
+def _acquisition_identity(guard, path, info, *, replacement=False, revalidating=False):
+    ledger = _operation_ledger(guard)
+    canonical = path if isinstance(path, Path) else Path(path)
+    previous = ledger.positive.get(canonical) if ledger is not None else None
+    replacement = replacement or previous is not None and previous != _directory_mark(info)
+    effect = ledger.effects.get(canonical) if ledger is not None else None
+    replacement = replacement or effect is not None and effect != file_identity(info)
+    replacement = replacement or ledger is not None and canonical in ledger.negative_edges
+    try:
+        guard.check_identity(path, info)
+    except ValueError as exc:
+        from hierarchy_router import PrivatePathError
+        if isinstance(exc, PrivatePathError):
+            _acquisition_detect(guard, "PRIVATE", exc, replacement=replacement or revalidating)
+        raise
+    if replacement and not _private_context(guard).get() and (stat.S_ISLNK(info.st_mode) or _reparse(info)):
+        from hierarchy_router import PrivatePathError
+        result = _private_symlink_target(guard, path, path)
+        if isinstance(result, _ProofFailure) and isinstance(result.error, PrivatePathError):
+            _acquisition_detect(guard, "PRIVATE", result.error, replacement=True)
+            raise result.error
+
+
+def _acquisition_ancestor(guard, path, info, expected, *, replacement=False, identity_path=None):
+    """Compare a later walk with this acquisition's already captured prefix."""
+    index = len(path.parts) - 1
+    previous = expected[index] if index < len(expected) else None
+    changed = previous is not None and (previous[0] != (path.name or path.anchor)
+        or not _same_mark(_directory_mark(info), previous[1]))
+    # Active-ledger observations were already screened by _acquire.
+    if _operation_ledger(guard) is None:
+        _acquisition_identity(guard, path if identity_path is None else identity_path, info,
+                              replacement=replacement or changed)
+    if changed:
+        _acquisition_replacement(guard, path, info)
+    _acquire("witness", "ancestor", path, info, _guard=guard)
+
+
+def _acquisition_map(outcome, caller):
+    """Only an anchored negative witness permits absence reduction."""
+    if outcome.kind == "ABSENT":
+        return ABSENT
+    if outcome.kind == "PRIVATE" and not outcome.replacement:
+        return QUARANTINE
+    return GLOBAL
+
+
+def _acquisition_fact(error):
+    """Carry an already detected fact through public diagnostic wrappers."""
+    seen = set()
+    for _ in range(MAX_INPUT_DEPTH):
+        if error is None or id(error) in seen:
+            return None
+        seen.add(id(error))
+        outcome = getattr(error, "_acquisition_outcome", None)
+        if outcome is not None:
+            return outcome
+        error = error.__cause__
+    return None
+
+
+def _acquisition_caller(guard, *, trust=False):
+    context = getattr(guard, "_acquisition_route", None)
+    return "trust" if trust else context.get() if context is not None else "public"
+
+
+def _acquisition_error(error, guard, *, caller="public", path=None):
+    """A detected change always refuses; policy privacy keeps its typed cause."""
+    outcome = _acquisition_fact(error)
+    if outcome is not None and outcome.kind == "CHANGED":
+        mapped = ValueError("reference parent changed while opening")
+        mapped._acquisition_outcome = outcome
+        raise mapped from error
+    if outcome is not None and outcome.kind == "PRIVATE" and outcome.replacement:
+        raise outcome.error
+    raise error
+
+
+def _metadata_ancestor_marks(path, guard):
+    require(len(path.parts) <= MAX_INPUT_NODES, "public chain proof exceeds limit")
+    marks, current = [], None
+    for component in path.parts:
+        current = Path(component) if current is None else current / component
+        guard.refuse(current)
+        info = _acquire("lstat", current, _guard=guard)
+        _acquisition_ancestor(guard, current, info, ())
+        _reference_directory(info, current, _ancestors=marks, _guard=guard)
+        require(info.st_ino, "public component identity unavailable")
+        marks.append((component, _directory_mark(info)))
+    return marks
+
+
+def _metadata_parent_recheck(directory):
+    from hierarchy_router import PrivatePathError, SymlinkPathError
+    if directory.closed:
+        raise _ProofPathError("public metadata witness already closed")
+    try:
+        marks = tuple(_metadata_ancestor_marks(directory.path, directory.guard))
+    except (PrivatePathError, SymlinkPathError) as exc:
+        exc._unproved_ancestor = True
+        raise
+    except (ValueError, OSError) as exc:
+        _raise_global(exc, guard=directory.guard)
+        raise _ProofPathError("public ancestor changed") from exc
+    if marks != directory.marks:
+        raise _ProofPathError("public ancestor changed")
+
+
+def _metadata_info(directory, name=None):
+    _metadata_parent_recheck(directory)
+    pending = None
+    try:
+        return _acquire("lstat", directory.path / name if name else directory.path, _guard=directory.guard)
+    except BaseException as exc:
+        pending = exc
+        raise
+    finally:
+        try:
+            _metadata_parent_recheck(directory)
+        finally:
+            _raise_global(pending, guard=directory.guard)
+
+
+def _proof_close(directory, close):
+    if isinstance(directory, _MetadataDirectory):
+        directory.closed = True
+    else:
+        close(directory)
+
+
+def _require_proof_descriptor(directory):
+    if type(directory) is not int or directory < 0:
+        raise _ProofPathError("public chain requires descriptor anchoring")
+    return directory
+
+
 class _ProvedChain:
     def __init__(self, guard, original, observations, links, directory=None, leaf=None, ancestors=()):
+        if directory is not None:
+            _require_proof_descriptor(directory)
         self.guard, self.original = guard, original
         self.observations, self.links = tuple(observations), tuple(links)
         self.directory, self.leaf, self.valid = directory, leaf, True
         self.ancestors = ancestors
         self.leaf_outcome = None
+        self.expected = None
+        self.expected_ancestors = ()
+        self.reference_mark = None
+        self.failure = None
 
     def proved(self, guard):
         if not self.valid or guard is not self.guard:
             return False
         result = _proof_operation(guard, "recheck", _proof_recheck, self)
         self.valid = isinstance(result, _ProofValue)
+        self.failure = result.error if isinstance(result, _ProofFailure) else None
         return self.valid
 
 
@@ -201,16 +1333,20 @@ class _LinkLookupFailure:
         return self.proof.proved(guard)
 
 
+def _leaf_outcome(kind, value, guard):
+    return (("present", value.st_dev, value.st_ino, value.st_mode,
+             stat.S_ISLNK(value.st_mode), _reparse(value),
+             (value.st_dev, value.st_ino) in guard.identities())
+            if kind == "present" else ("errno", value.errno))
+
+
 class _LeafLookup:
     leaf_refusal = False
 
     def __init__(self, kind, value, proof):
         self.kind, self.value, self.proof = kind, value, proof
         # Retain the raw lookup result, independently of consumer diagnostics.
-        proof.leaf_outcome = (("present", value.st_dev, value.st_ino, value.st_mode,
-                               stat.S_ISLNK(value.st_mode), _reparse(value),
-                               (value.st_dev, value.st_ino) in proof.guard.identities())
-                              if kind == "present" else ("errno", value.errno))
+        proof.leaf_outcome = _leaf_outcome(kind, value, proof.guard)
 
 
 class _HopBoundary:
@@ -218,22 +1354,36 @@ class _HopBoundary:
         self.stage = stage
 
 
-def _disposition(error, *, guard, seam, path=None, inert=False):
-    """Preserve each public seam's contract; private and unproved chains quarantine.
+def _proof_failure_disposition(error, failure):
+    """Carry the detection site's outcome through an alias's diagnostic boundary."""
+    acquired = _acquisition_fact(failure)
+    if acquired is not None:
+        error._acquisition_outcome = acquired
+        return _acquisition_map(acquired, "trust")
+    return QUARANTINE
 
-    Scope checks accept absent/non-directory paths. Isolated successor trials
-    keep their original ValueError/TypeError/KeyError -> UNKNOWN boundary.
-    Inert evidence exempts public scope observations, never private identity.
-    """
+
+def _disposition(error, *, guard, seam, path=None, inert=False):
+    """Only a complete negative witness permits an acquisition's absence reduction."""
     from hierarchy_router import PrivatePathError, SymlinkPathError, _lexical_path
     fatal = _fatal_path_error(error, guard)
     if fatal is not None:
         fatal._global_path_failure = fatal._path_failure = True
         error._path_failure = True
         return GLOBAL
+    acquired = _acquisition_fact(error)
+    if acquired is not None:
+        caller = ("trust" if isinstance(error, _ProofPathError) else
+                  "inert" if seam == "scope" and inert else "trial" if seam == "trial" else
+                  "metadata" if seam == "readiness" else "stored" if seam == "scope" else
+                  "reader-check" if seam == "reader-check" else "public")
+        return _acquisition_map(acquired, caller)
     if isinstance(error, SymlinkPathError):
         error._path_failure = True
-    if isinstance(error, (PrivatePathError, _ProofPathError)):
+        _recheck_observed_link(error, guard)
+    if isinstance(error, _ProofPathError):
+        return QUARANTINE
+    if isinstance(error, PrivatePathError) or getattr(error, "_unproved_ancestor", False):
         return QUARANTINE
     classified = getattr(error, "_private_alias_for", None)
     if isinstance(error, SymlinkPathError) or classified is not None:
@@ -243,7 +1393,11 @@ def _disposition(error, *, guard, seam, path=None, inert=False):
         if classified is None or classified[0] is not guard or classified[1] != candidate:
             if not isinstance(error, SymlinkPathError):
                 return QUARANTINE
-            proof = _private_symlink_target(guard, error.path, candidate)
+            proof = _private_symlink_target(guard, error.path, candidate,
+                                            _observed=getattr(error, "_observed_link", None))
+            _recheck_observed_link(error, guard,
+                private=proof.error if isinstance(proof, _ProofFailure)
+                and isinstance(proof.error, PrivatePathError) else None)
             classified = guard, candidate, proof
             error._private_alias_for = classified
         if isinstance(classified[2], _LinkLookupFailure):
@@ -251,7 +1405,7 @@ def _disposition(error, *, guard, seam, path=None, inert=False):
             # A consuming scope can suppress a public lookup failure only while
             # every link and ancestor remains the captured public identity.
             if not proof.proved(guard):
-                return QUARANTINE
+                return _proof_failure_disposition(error, proof.proof.failure)
             if proof.through and not (seam == "scope" and inert):
                 proof.error._private_alias_for = classified
                 if error is proof.error:
@@ -260,22 +1414,23 @@ def _disposition(error, *, guard, seam, path=None, inert=False):
                 raise proof.error from error
         elif isinstance(classified[2], _ProvedChain):
             if not classified[2].proved(guard):
-                return QUARANTINE
+                return _proof_failure_disposition(error, classified[2].failure)
+            if (classified[2].leaf_outcome == ("errno", errno.ENOENT)
+                    and (seam == "scope" and inert or seam == "scope-check"
+                         and _acquisition_caller(guard) == "inert")):
+                _acquisition_detect(guard, "ABSENT", error)
+                return ABSENT
         elif isinstance(classified[2], _ProofFailure):
-            return QUARANTINE
+            return _proof_failure_disposition(error, classified[2].error)
         else:
             return QUARANTINE
+    if isinstance(error, SymlinkPathError):
+        _recheck_observed_link(error, guard)
     if path is not None and seam in {"scope", "readiness", "trial", "consume"}:
         try:
             guard.refuse(path)
         except PrivatePathError:
             return QUARANTINE
-    if seam in {"check", "scope-check"} and isinstance(error, OSError) and error.errno in {errno.ENOENT, errno.ENOTDIR}:
-        return ABSENT
-    if seam == "exists" and isinstance(error, FileNotFoundError):
-        return ABSENT
-    if seam == "scope" and inert:
-        return ABSENT
     if seam == "trial" and isinstance(error, (ValueError, TypeError, KeyError)):
         return ROW_UNKNOWN
     return GLOBAL
@@ -286,6 +1441,30 @@ def _walk_error(error, path, *, seam, anchored=True):
     from hierarchy_router import SymlinkPathError
     _raise_global(error)
     error._path_failure = True
+    acquired = _acquisition_fact(error)
+    if acquired is not None and (acquired.kind == "CHANGED"
+            or acquired.kind == "PRIVATE" and acquired.replacement):
+        if seam in {"lock", "lock-preflight"} and acquired.kind == "CHANGED":
+            cause = error
+            for _ in range(MAX_INPUT_DEPTH):
+                if cause is None:
+                    break
+                if isinstance(cause, OSError):
+                    lock_parent = (cause.errno == errno.ENOTDIR
+                        and isinstance(cause.filename, str)
+                        and Path(cause.filename).is_absolute()
+                        and Path(cause.filename) in Path(path).parents)
+                    if seam == "lock" and cause.errno in {None, errno.ENOTDIR} or lock_parent:
+                        mapped = _diagnostic_error(cause, path, seam="lock", anchored=anchored)
+                        mapped._acquisition_outcome = acquired
+                        if seam == "lock-preflight":
+                            mapped.source = "journal"
+                        raise mapped from error
+                    break
+                cause = cause.__cause__
+        _acquisition_error(error, None)
+    if getattr(error, "_unproved_ancestor", False):
+        raise error
     classified = getattr(error, "_private_alias_for", None)
     if classified is not None and isinstance(classified[2], _ProofFailure):
         failure = classified[2].error
@@ -299,6 +1478,9 @@ def _walk_error(error, path, *, seam, anchored=True):
             refused._path_failure = True
             raise refused from error
     mapped = _diagnostic_error(error, path, seam=seam, anchored=anchored)
+    acquired = getattr(error, "_acquisition_outcome", None)
+    if acquired is not None:
+        mapped._acquisition_outcome = acquired
     if mapped is error:
         raise error
     raise mapped from error
@@ -317,7 +1499,10 @@ def _diagnostic_error(error, path, *, seam, anchored=True):
     if seam == "lock" and error.errno is None:
         return ValueError("cannot create journal lock")
     filename = error.filename
-    if seam in {"check", "exists", "lock", "link"}:
+    if seam == "exists" and getattr(error, "_search_only_parent_error", False):
+        # Baseline exists() exposed a consuming parent's relative open error.
+        filename = error.filename
+    elif seam in {"check", "exists", "lock", "link"}:
         filename = str(path)
     elif seam in {"parent", "parent-check"}:
         component = Path(filename) if filename is not None else Path(path)
@@ -330,17 +1515,20 @@ def _diagnostic_error(error, path, *, seam, anchored=True):
         return error
     mapped = type(error)(error.errno, message, filename)
     mapped._path_failure = True
+    if getattr(error, "_search_only_parent_error", False):
+        mapped._search_only_parent_error = True
     return mapped
 
 
 @lru_cache(maxsize=1)
 def _symlink_reader():
-    """Optional descriptor-relative readlinkat with a caller-bounded buffer."""
+    """Optional bounded readlinkat; pathname link text cannot certify a chain."""
     if os.name != "posix":
         return None
     try:
         import ctypes
-        function = ctypes.CDLL(None, use_errno=True).readlinkat
+        library = ctypes.CDLL(None, use_errno=True)
+        function = library.readlinkat
     except (ImportError, AttributeError):
         return None
     function.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t)
@@ -349,34 +1537,34 @@ def _symlink_reader():
     def read(directory, name, size):
         if type(size) is not int or not 0 < size <= MAX_SYMLINK_BYTES:
             return None
-        buffer = ctypes.create_string_buffer(size + 1)
-        count = function(directory, os.fsencode(name), buffer, size + 1)
-        if count < 0:
+        if type(directory) is not int or directory < 0:
             return None
-        return buffer.raw[:count] if count == size else None
+        return _acquire("link", directory, name, size, _reader=function)
     return read
+
+
+def _proof_result(action, args, kwargs):
+    value = action(*args, **kwargs)
+    try:
+        return _ProofValue(value)
+    except BaseException:
+        if isinstance(value, _ProvedChain) and value.directory is not None:
+            descriptor, value.directory = value.directory, None
+            _proof_close(descriptor, os.close)
+        raise
 
 
 def _proof_operation(guard, stage, action, *args, **kwargs):
     """The sole proof exception boundary: no errno can turn a proof into absence."""
-    value = None
     try:
-        if action is os.close:
+        if action is os.close or action is _proof_close:
             # A latched policy refusal cannot prevent release of an owned handle.
-            value = action(*args, **kwargs)
+            result = _acquire("proof", _proof_result, (action, args, kwargs), {}, _guard=guard)
             guard.current()
-            return _ProofValue(value)
+            return result
         guard.current()
-        value = action(*args, **kwargs)
-        return _ProofValue(value)
+        return _acquire("proof", _proof_result, (action, args, kwargs), {}, _guard=guard)
     except Exception as exc:
-        if isinstance(value, _ProvedChain) and value.directory is not None:
-            descriptor, value.directory = value.directory, None
-            try:
-                os.close(descriptor)
-            except Exception as closing:
-                _raise_global(exc, guard=guard)
-                exc = closing
         _raise_global(exc, guard=guard)
         return _ProofFailure(stage, exc)
 
@@ -386,62 +1574,134 @@ def _final_leaf_lookup(proof):
     require(isinstance(proof, _ProvedChain) and proof.valid and proof.directory is not None,
             "final lookup requires a live proved-chain token")
     proof.guard.current()
+    _require_proof_descriptor(proof.directory)
     try:
         proof.guard.refuse(proof.leaf)
-        info = os.stat(proof.leaf.name, dir_fd=proof.directory, follow_symlinks=False)
-        return _LeafLookup("present", info, proof)
+        info = _acquire("stat", proof.leaf.name, dir_fd=proof.directory, follow_symlinks=False,
+                        _guard=proof.guard, _path=proof.leaf, _expected_mark=proof.reference_mark,
+                        _negative=(proof.leaf, proof.ancestors) if proof.expected is None
+                        or proof.expected == ("errno", errno.ENOENT) else None)
+        changed = proof.expected is not None and proof.expected != _leaf_outcome("present", info, proof.guard)
+        _acquisition_ancestor(proof.guard, proof.leaf, info, proof.expected_ancestors, replacement=changed)
+        result = _LeafLookup("present", info, proof)
     except Exception as exc:
         _raise_global(exc, guard=proof.guard)
+        from hierarchy_router import PrivatePathError
+        if isinstance(exc, PrivatePathError):
+            _acquisition_detect(proof.guard, "PRIVATE", exc)
+        elif _acquisition_fact(exc) is None:
+            _acquisition_refuse(proof.guard, exc)
         if isinstance(exc, (FileNotFoundError, NotADirectoryError)):
-            return _LeafLookup("absent", exc, proof)
-        if not isinstance(exc, OSError):
+            result = _LeafLookup("absent", exc, proof)
+        elif not isinstance(exc, OSError):
             return _ProofFailure("final leaf", exc)
+        else:
+            try:
+                _walk_error(exc, proof.original, seam="link")
+            except OSError as mapped:
+                result = _LeafLookup("error", mapped, proof)
+                result.leaf_refusal = True
+    return result
+
+
+def _proof_parent_failure(exc, *, _guard, current, before, marks, _error_depth):
+    from hierarchy_router import SymlinkPathError
+    # Revalidate while the failed acquisition's prefix is still held open.
+    if marks and not isinstance(exc, SymlinkPathError):
+        if _error_depth >= MAX_INPUT_DEPTH:
+            raise _acquisition_changed(_guard) from exc
+        prefix = current.parent
+        check, checked = _proof_parent(prefix, _guard=_guard, _revalidating=True,
+                                       _error_depth=_error_depth + 1, _expected=marks)
         try:
-            _walk_error(exc, proof.original, seam="link")
-        except OSError as mapped:
-            result = _LeafLookup("error", mapped, proof)
-            result.leaf_refusal = True
-            return result
+            _acquisition_require(checked == marks, _guard, "reference parent changed while opening")
+            if before is not None:
+                now = _acquire("stat", current.name, dir_fd=check, follow_symlinks=False, _guard=_guard)
+                if _reference_mark(now) != _reference_mark(before):
+                    _acquisition_replacement(_guard, current, now)
+        finally:
+            _proof_close(check, os.close)
+    if not isinstance(exc, SymlinkPathError):
+        _acquisition_refuse(_guard, exc)
 
 
-def _proof_parent(path, *, _guard):
-    """Raw descriptor walk; its caller must consume the proof-operation result."""
+def _proof_parent(path, *, _guard, _revalidating=False, _consume=False, _error_depth=0,
+                  _expected=None, _captured=False, _absent=None):
+    """Raw search-only walk; its caller must consume the proof-operation result."""
     from hierarchy_router import _lexical_path
     path = _lexical_path(path)
     require(path.is_absolute() and ".." not in path.parts, "path must be absolute without traversal")
     require(_descriptor_capabilities(), "secure link proof requires directory descriptor support")
-    _guard(path)
-    flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
-    directory, pending = None, None
+    # A readable anchored handle is safe when no search-only handle exists.
+    # If permissions prevent that open, the proof fails and aliases quarantine.
+    flags = (_search_directory_flag() or os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+    directory, pending, before = None, None, None
     marks = []
     current = Path(path.anchor)
     try:
-        before = os.stat(path.anchor, follow_symlinks=False)
-        _guard.check_identity(current, before)
-        _reference_directory(before, current)
-        directory = os.open(path.anchor, flags)
-        info = os.fstat(directory)
-        _guard.check_identity(current, info)
-        require(_directory_mark(before) == _directory_mark(info), "public ancestor changed")
+        _guard(path)
+        expected = _ancestor_components(_expected) if _expected is not None else ()
+        before = _acquire("stat", path.anchor, follow_symlinks=False, _guard=_guard)
+        _acquisition_ancestor(_guard, current, before, expected, replacement=_revalidating)
+        _reference_directory(before, current, _ancestors=marks, _guard=_guard)
+        directory = _acquire("open", path.anchor, flags, _guard=_guard, _path=current, _before=before)
+        info = _acquire("fstat", directory, _guard=_guard)
+        _acquisition_identity(_guard, current, info,
+                              replacement=_directory_mark(before) != _directory_mark(info))
+        _acquisition_require(_directory_mark(before) == _directory_mark(info), _guard,
+                             "reference parent changed while opening")
         marks.append((path.anchor, _directory_mark(info)))
         for component in path.parts[1:]:
             current = current / component
-            _guard.refuse(current)
-            before = os.stat(component, dir_fd=directory, follow_symlinks=False)
-            _guard.check_identity(current, before)
-            _reference_directory(before, current)
+            # The immutable full pathname was screened above. Keep the policy
+            # snapshot current; each stat/open identity is still checked below.
+            _guard.current()
+            before = None
+            # A recorded component cannot become a new negative edge merely
+            # because this walk has reached only its shorter existing prefix.
+            before = _acquire("stat", component, dir_fd=directory, follow_symlinks=False, _guard=_guard,
+                              _negative=(current, marks) if not _captured and len(marks) >= len(expected) else None)
+            if _absent is not None and current == _absent.path:
+                _acquisition_replacement(_guard, current, before)
+            _acquisition_ancestor(_guard, current, before, expected, replacement=_revalidating)
+            if _consume and stat.S_ISLNK(before.st_mode):
+                # Refuse a private/unproved alias before opening it. A proved
+                # public link retains the consuming reader's native errno.
+                from hierarchy_router import SymlinkPathError
+                alias = SymlinkPathError(current)
+                if _disposition(alias, guard=_guard, seam="consume", path=path) == QUARANTINE:
+                    raise alias
+            if not _consume or _reparse(before):
+                _reference_directory(before, current, _ancestors=marks, _guard=_guard)
             previous = directory
-            directory = os.open(component, flags, dir_fd=previous)
+            directory = _acquire("open", component, flags, dir_fd=previous, _guard=_guard, _path=current, _before=before)
             os.close(previous)
-            info = os.fstat(directory)
-            _guard.check_identity(current, info)
-            require(_directory_mark(before) == _directory_mark(info), "public ancestor changed")
+            info = _acquire("fstat", directory, _guard=_guard)
+            _acquisition_identity(_guard, current, info,
+                                  replacement=_directory_mark(before) != _directory_mark(info))
+            _acquisition_require(_directory_mark(before) == _directory_mark(info), _guard,
+                                 "reference parent changed while opening")
             marks.append((component, _directory_mark(info)))
         result = directory, marks
         directory = None
         return result
-    except BaseException as exc:
+    except Exception as exc:
         pending = exc
+        from hierarchy_router import PrivatePathError, SymlinkPathError
+        if isinstance(exc, PrivatePathError):
+            _acquisition_detect(_guard, "PRIVATE", exc, replacement=_revalidating or _captured)
+        elif getattr(exc, "_acquisition_outcome", None) is None and isinstance(exc, (OSError, ValueError)):
+            if _captured:
+                if before is not None:
+                    _acquisition_replacement(_guard, current, before)
+                _acquisition_refuse(_guard, exc)
+            if _revalidating and isinstance(exc, SymlinkPathError):
+                _acquisition_replacement(_guard, current, _acquire("stat", current.name, dir_fd=directory, follow_symlinks=False, _guard=_guard))
+            if isinstance(exc, OSError) and (exc.errno == errno.ELOOP or
+                    exc.errno == errno.ENOTDIR and before is not None and stat.S_ISDIR(before.st_mode)):
+                _acquisition_open_refusal(exc, _guard, current, directory, before=before, ancestors=marks)
+            _proof_parent_failure(exc, _guard=_guard, current=current, before=before,
+                                  marks=marks, _error_depth=_error_depth)
         raise
     finally:
         if directory is not None:
@@ -451,17 +1711,22 @@ def _proof_parent(path, *, _guard):
                 _raise_global(pending, guard=_guard)
 
 
-def _proof_check(path, *, _guard):
+def _proof_check(path, *, _guard, _revalidating=False, _expected=None, _expected_mark=None):
     """Non-following component metadata; links are data, never exception control flow."""
     from hierarchy_router import _lexical_path
     path = _lexical_path(path)
     _guard.refuse(path)
     directory, pending = None, None
     try:
-        directory, ancestors = _proof_parent(path.parent, _guard=_guard)
-        info = (os.stat(path.name, dir_fd=directory, follow_symlinks=False) if path.name
-                else os.fstat(directory))
-        _guard.check_identity(path, info)
+        directory, ancestors = _proof_parent(path.parent, _guard=_guard, _revalidating=_revalidating,
+                                             _expected=_expected)
+        _require_proof_descriptor(directory)
+        info = (_acquire("stat", path.name, dir_fd=directory, follow_symlinks=False, _guard=_guard,
+                         _path=path, _expected_mark=_expected_mark)
+                if path.name else _acquire("fstat", directory, _guard=_guard))
+        _acquisition_identity(_guard, path, info, revalidating=_revalidating)
+        if stat.S_ISDIR(info.st_mode):
+            _acquire("witness", "ancestor", path, info, _guard=_guard)
         require(info.st_ino and all(mark[1] for _component, mark in ancestors),
                 "public component identity unavailable")
         return info, ancestors
@@ -471,7 +1736,7 @@ def _proof_check(path, *, _guard):
     finally:
         if directory is not None:
             try:
-                os.close(directory)
+                _proof_close(directory, os.close)
             finally:
                 _raise_global(pending, guard=_guard)
 
@@ -480,61 +1745,113 @@ def _stable_link(guard, snapshot):
     path, mark, ancestors = snapshot
     directory, pending = None, None
     try:
-        directory, current = _proof_parent(path.parent, _guard=guard)
+        directory, current = _proof_parent(path.parent, _guard=guard, _revalidating=True, _expected=ancestors)
+        _require_proof_descriptor(directory)
+        info = _acquire("stat", path.name, dir_fd=directory, follow_symlinks=False, _guard=guard)
+        _acquisition_identity(guard, path, info, replacement=_reference_mark(info) != mark)
+        if _reference_mark(info) != mark:
+            _acquisition_replacement(guard, path, info)
         return (ancestors == current
-                and mark == _reference_mark(os.stat(path.name, dir_fd=directory, follow_symlinks=False)))
+                and mark == _reference_mark(info))
     except BaseException as exc:
         pending = exc
         raise
     finally:
         if directory is not None:
             try:
-                os.close(directory)
+                _proof_close(directory, os.close)
             finally:
                 _raise_global(pending, guard=guard)
 
 
-def _link_snapshot(guard, path):
+def _link_snapshot(guard, path, *, _observed=None):
     """Bounded link text plus its full ancestry; all failures belong to the proof entry."""
-    directory, pending = None, None
+    directory, pending, before = None, None, None
     try:
         directory, ancestors = _proof_parent(path.parent, _guard=guard)
-        before = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+        _require_proof_descriptor(directory)
+        before = _acquire("stat", path.name, dir_fd=directory, follow_symlinks=False, _guard=guard)
+        require(before.st_ino, "public link proof unavailable")
+        replaced = _observed is not None and _reference_mark(before) != _reference_mark(_observed)
+        _acquisition_identity(guard, path, before, replacement=replaced)
+        if replaced:
+            _acquisition_replacement(guard, path, before)
         require(stat.S_ISLNK(before.st_mode) and not _reparse(before) and before.st_ino
                 and all(mark[1] for _component, mark in ancestors)
                 and 0 < before.st_size <= MAX_SYMLINK_BYTES, "public link proof unavailable")
         read = _symlink_reader()
         require(read is not None, "public link reader unavailable")
         raw = read(directory, path.name, before.st_size)
-        require(raw is not None and len(raw) == before.st_size and b"\0" not in raw,
-                "public link changed while reading")
-        after = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
-        require(_reference_mark(before) == _reference_mark(after), "public link changed while reading")
+        if raw is None or len(raw) != before.st_size or b"\0" in raw:
+            proof = _ProvedChain(guard, path, (), (), directory, path, ancestors)
+            _LeafLookup("present", before, proof)
+            _recheck_scope_witness(proof)
+            error = ValueError("public link changed while reading")
+            _acquisition_refuse(guard, error)
+            raise error
+        after = _acquire("stat", path.name, dir_fd=directory, follow_symlinks=False, _guard=guard)
+        require(after.st_ino, "public link proof unavailable")
+        _acquisition_identity(guard, path, after, replacement=_reference_mark(before) != _reference_mark(after))
+        if _reference_mark(before) != _reference_mark(after):
+            _acquisition_replacement(guard, path, after)
+        _acquisition_require(_reference_mark(before) == _reference_mark(after), guard, "public link changed while reading")
         snapshot = path, _reference_mark(before), ancestors
-        require(_stable_link(guard, snapshot), "public link ancestry changed")
+        _acquisition_require(_stable_link(guard, snapshot), guard, "public link ancestry changed")
         return raw, snapshot
+    except Exception as exc:
+        pending = exc
+        if directory is not None and isinstance(exc, OSError) and getattr(exc, "_acquisition_outcome", None) is None:
+            _acquisition_open_refusal(exc, guard, path, directory,
+                                      before=before if before is not None else _observed, ancestors=ancestors)
+        raise
     except BaseException as exc:
         pending = exc
         raise
     finally:
         if directory is not None:
             try:
-                os.close(directory)
+                _proof_close(directory, os.close)
             finally:
                 _raise_global(pending, guard=guard)
 
 
 def _proof_link(guard, path, observed):
-    raw, snapshot = _link_snapshot(guard, path)
-    require(snapshot[1] == _reference_mark(observed), "public link changed before capture")
+    raw, snapshot = _link_snapshot(guard, path, _observed=observed)
+    _acquisition_require(snapshot[1] == _reference_mark(observed), guard, "public link changed before capture")
     return raw, snapshot
+
+
+def _chain_parent_marks(guard, parent, observations):
+    """Compare captured common prefixes before another walk reaches a replacement."""
+    expected, remaining = [], MAX_INPUT_NODES
+    for value, mark, ancestors, directory in observations:
+        count = len(ancestors) + int(directory)
+        remaining -= count
+        require(remaining >= 0, "public chain proof exceeds limit")
+        for index in range(min(count, len(parent.parts))):
+            component, captured = (ancestors[index] if index < len(ancestors)
+                                   else (value.name or value.anchor, mark))
+            if component != parent.parts[index]:
+                break
+            if index < len(expected):
+                _acquisition_require(expected[index] == (component, captured), guard,
+                                     "reference parent changed while opening")
+            else:
+                expected.append((component, captured))
+    return expected
 
 
 def _proof_token(guard, original, leaf, observations, links):
     directory, pending = None, None
     try:
-        directory, ancestors = _proof_parent(leaf.parent, _guard=guard)
+        expected = _chain_parent_marks(guard, leaf.parent, observations)
+        directory, ancestors = _proof_parent(leaf.parent, _guard=guard, _expected=expected)
         proof = _ProvedChain(guard, original, observations, links, directory, leaf, ancestors)
+        for value, mark, _ancestors, is_directory in observations:
+            if value == leaf and not is_directory:
+                _acquisition_require(proof.reference_mark is None or proof.reference_mark == mark,
+                                     guard, "reference parent changed while opening")
+                proof.reference_mark = mark
         _proof_recheck(proof)
         directory = None
         return proof
@@ -544,7 +1861,7 @@ def _proof_token(guard, original, leaf, observations, links):
     finally:
         if directory is not None:
             try:
-                os.close(directory)
+                _proof_close(directory, os.close)
             finally:
                 _raise_global(pending, guard=guard)
 
@@ -565,16 +1882,20 @@ def _proof_recheck(proof):
         ancestor_path = None
         for component, ancestor_mark in ancestors:
             ancestor_path = Path(component) if ancestor_path is None else ancestor_path / component
-            require(ancestor_path not in opened or opened[ancestor_path] == ancestor_mark,
+            _acquisition_require(ancestor_path not in opened or opened[ancestor_path] == ancestor_mark, proof.guard,
                     "final lookup parent ancestry changed")
-        require(not directory or path not in opened or opened[path] == mark,
+        _acquisition_require(not directory or path not in opened or opened[path] == mark, proof.guard,
                 "final lookup parent changed")
-        info, current = _proof_check(path, _guard=proof.guard)
-        require(mark == (_directory_mark(info) if directory else _reference_mark(info))
-                and ancestors == current, "public component changed")
+        info, current = _proof_check(path, _guard=proof.guard, _revalidating=True,
+                                     _expected=ancestors, _expected_mark=None if directory else mark)
+        if mark != (_directory_mark(info) if directory else _reference_mark(info)):
+            _acquisition_replacement(proof.guard, path, info)
+        _acquisition_require(mark == (_directory_mark(info) if directory else _reference_mark(info))
+                and ancestors == current, proof.guard, "public component changed")
     for snapshot in proof.links:
         remaining -= len(snapshot[0].parent.parts) + 1
-        require(remaining >= 0 and _stable_link(proof.guard, snapshot), "public link changed")
+        require(remaining >= 0, "public chain proof exceeds limit")
+        _acquisition_require(_stable_link(proof.guard, snapshot), proof.guard, "public link changed")
     if proof.leaf is not None:
         _recheck_final_witness(proof)
     return True
@@ -584,24 +1905,33 @@ def _recheck_final_witness(proof):
     """Re-open the captured parent chain and repeat its no-follow leaf lookup."""
     directory, pending = None, None
     try:
-        directory, current = _proof_parent(proof.leaf.parent, _guard=proof.guard)
-        require(current == proof.ancestors, "final lookup parent ancestry changed")
+        directory, current = _proof_parent(proof.leaf.parent, _guard=proof.guard, _revalidating=True, _expected=proof.ancestors)
+        _acquisition_require(current == proof.ancestors, proof.guard, "final lookup parent ancestry changed")
         if proof.directory is not None:
-            info = os.fstat(proof.directory)
-            proof.guard.check_identity(proof.leaf.parent, info)
-            require(_directory_mark(info) == current[-1][1], "final lookup descriptor changed")
+            _require_proof_descriptor(proof.directory)
+            info = _acquire("fstat", proof.directory, _guard=proof.guard)
+            _acquisition_identity(proof.guard, proof.leaf.parent, info)
+            _acquisition_require(_directory_mark(info) == current[-1][1], proof.guard, "final lookup descriptor changed")
         if proof.leaf_outcome is not None:
             fresh = _ProvedChain(proof.guard, proof.original, (), (), directory, proof.leaf, current)
+            fresh.expected = proof.leaf_outcome
+            fresh.reference_mark = proof.reference_mark
             result = _final_leaf_lookup(fresh)
-            require(isinstance(result, _LeafLookup) and fresh.leaf_outcome == proof.leaf_outcome,
-                    "final leaf outcome changed")
+            if isinstance(result, _ProofFailure):
+                if getattr(result.error, "_acquisition_outcome", None) is not None:
+                    raise result.error
+            if isinstance(result, _LeafLookup) and result.kind == "present":
+                _acquisition_identity(proof.guard, proof.leaf, result.value)
+            if not isinstance(result, _LeafLookup) or fresh.leaf_outcome != proof.leaf_outcome:
+                _acquisition_replacement(proof.guard, proof.leaf,
+                    result.value if isinstance(result, _LeafLookup) and result.kind == "present" else None)
     except BaseException as exc:
         pending = exc
         raise
     finally:
         if directory is not None:
             try:
-                os.close(directory)
+                _proof_close(directory, os.close)
             finally:
                 _raise_global(pending, guard=proof.guard)
 
@@ -614,105 +1944,170 @@ def _lookup_chain_leaf(guard, candidate, value, observations, links, stage):
     proof = token.value
     try:
         result = _final_leaf_lookup(proof)
+        if isinstance(result, _LeafLookup) and result.kind != "present":
+            checked = _proof_operation(guard, "final outcome", _proof_recheck, proof)
+            if isinstance(checked, _ProofFailure):
+                return checked
+            if result.kind == "absent":
+                _acquisition_detect(guard, "ABSENT", result.value)
+            else:
+                _acquisition_refuse(guard, result.value)
     finally:
-        cleanup = _proof_operation(guard, "cleanup", os.close, proof.directory)
+        cleanup = (_proof_operation(guard, "cleanup", _proof_close, proof.directory, os.close)
+                   if isinstance(proof.directory, _MetadataDirectory)
+                   else _proof_operation(guard, "cleanup", os.close, proof.directory))
         proof.directory = None
     return cleanup if isinstance(cleanup, _ProofFailure) else result
 
 
-def _resolve_public_chain(guard, path, candidate):
+def _recheck_failed_chain_links(guard, result, links):
+    from hierarchy_router import PrivatePathError
+    if not isinstance(result, _ProofFailure):
+        return result
+    acquired = _acquisition_fact(result.error)
+    if acquired is not None and acquired.kind == "ABSENT":
+        # A negative edge reached before the final lookup has no completed
+        # chain token. Its earlier observations still owe full revalidation.
+        result = _ProofFailure(result.stage, _acquisition_changed(guard))
+    require(len(links) <= MAX_SYMLINK_HOPS, "public link chain exceeds limit")
+    remaining, changed, refused = MAX_INPUT_NODES, False, result
+    private = result.error if isinstance(result.error, PrivatePathError) else None
+    for snapshot in links:
+        remaining -= len(snapshot[0].parent.parts) + 1
+        require(remaining >= 0, "public chain proof exceeds limit")
+        checked = _proof_operation(guard, "failed chain link", _stable_link, guard, snapshot)
+        if isinstance(checked, _ProofFailure):
+            changed = True
+            refused = checked
+            if isinstance(checked.error, PrivatePathError):
+                private = checked.error
+        elif not checked.value:
+            changed = True
+            refused = _ProofFailure("failed chain link", _acquisition_changed(guard))
+    if changed and private is not None:
+        _acquisition_detect(guard, "PRIVATE", private, replacement=True)
+        return _ProofFailure("failed chain link", private)
+    return refused
+
+
+def _chain_check(guard, observed, stage, action, *args, **kwargs):
+    if action is _proof_check and observed is not None:
+        observed_path, mark, ancestors = observed
+        value = args[0]
+        if value == observed_path or value in observed_path.parents:
+            kwargs["_expected"] = ancestors
+            if value == observed_path:
+                kwargs["_expected_mark"] = mark
+    return _proof_operation(guard, stage, action, *args, **kwargs)
+
+
+def _chain_observe(guard, observed, observations, value, info, ancestors):
+    if observed is not None and value == observed[0]:
+        if (_reference_mark(info) != observed[1]
+                or not _same_path_ancestors(ancestors, observed[2])):
+            _acquisition_replacement(guard, value, info)
+    is_directory = stat.S_ISDIR(info.st_mode)
+    mark = _directory_mark(info) if is_directory else _reference_mark(info)
+    observations.append((value, mark, ancestors, is_directory))
+
+
+def _resolve_public_chain(guard, path, candidate, *, _observed=None):
     from hierarchy_router import _lexical_path
     require(_descriptor_capabilities(), "secure link proof requires directory descriptor support")
     path, candidate = _lexical_path(path), _lexical_path(candidate)
     through = path != candidate
     pending, cursor = list(candidate.parts[1:]), Path(candidate.anchor)
     observations, links = [], []
+    if _observed is not None:
+        observed_path, observed_mark, observed_ancestors = _observed
+        observations.append((observed_path, observed_mark, observed_ancestors, False))
+        links.append(_observed)
     remaining, hops, seen_link = MAX_INPUT_NODES, 0, False
 
-    def checked(stage, action, *args, **kwargs):
-        return _proof_operation(guard, stage, action, *args, **kwargs)
-
-    def observe(value, info, ancestors):
-        is_directory = stat.S_ISDIR(info.st_mode)
-        mark = _directory_mark(info) if is_directory else _reference_mark(info)
-        observations.append((value, mark, ancestors, is_directory))
-
-    while pending:
-        component = pending.pop(0)
-        if isinstance(component, _HopBoundary):
-            remaining -= len(cursor.parent.parts) + 1
-            require(remaining >= 0, "public chain proof exceeds limit")
-            result = checked(component.stage, _proof_check, cursor, _guard=guard)
-            if isinstance(result, _ProofFailure):
-                return result
-            info, ancestors = result.value
-            if any(isinstance(item, str) for item in pending):
-                _reference_directory(info, cursor)
-            observe(cursor, info, ancestors)
-            continue
-        if component == "..":
-            for stage, value in (("traversal prefix", cursor), ("post-traversal", cursor.parent)):
-                remaining -= len(value.parent.parts) + 1
+    def walk():
+        nonlocal pending, cursor, remaining, hops, seen_link
+        while pending:
+            component = pending.pop(0)
+            if isinstance(component, _HopBoundary):
+                remaining -= len(cursor.parent.parts) + 1
                 require(remaining >= 0, "public chain proof exceeds limit")
-                result = checked(stage, _proof_check, value, _guard=guard)
+                result = _chain_check(guard, _observed, component.stage, _proof_check, cursor, _guard=guard)
                 if isinstance(result, _ProofFailure):
                     return result
                 info, ancestors = result.value
-                _reference_directory(info, value)
-                observe(value, info, ancestors)
-            cursor = cursor.parent
-            continue
-        value = cursor / component
-        boundary = pending[0] if pending and isinstance(pending[0], _HopBoundary) else None
-        # Boundaries recheck proof components; only remaining pathname parts
-        # determine whether this is the leaf under the last proved parent.
-        final = not any(isinstance(item, str) for item in pending)
-        stage = (boundary.stage if boundary else
-                 "traversal prefix" if pending and pending[0] == ".." else
-                 "suffix ancestor" if seen_link else "prefix ancestor")
-        remaining -= len(value.parent.parts) + 1
-        require(remaining >= 0, "public chain proof exceeds limit")
-        if final:
-            result = _lookup_chain_leaf(guard, candidate, value, observations, links,
-                                        boundary.stage if boundary else "suffix ancestor" if seen_link else "prefix ancestor")
-            if isinstance(result, _ProofFailure):
-                return result
-            proof = result.proof
-            if result.kind != "present":
-                return _LinkLookupFailure(result.value, proof, through=through) if result.leaf_refusal else proof
-            info = result.value
-            identity = checked("final identity", guard.check_identity, value, info)
-            if isinstance(identity, _ProofFailure):
-                return identity
-            # Parent marks belong to the token that authorized this exact lookup.
-            ancestors = _proof_parent_marks(proof, value)
-        else:
-            result = checked(stage, _proof_check, value, _guard=guard)
-            if isinstance(result, _ProofFailure):
-                return result
-            info, ancestors = result.value
-        observe(value, info, ancestors)
-        if stat.S_ISLNK(info.st_mode) or _reparse(info):
-            hops += 1
-            require(hops <= MAX_SYMLINK_HOPS, "public link chain exceeds limit")
-            captured = checked("link", _proof_link, guard, value, info)
-            if isinstance(captured, _ProofFailure):
-                return captured
-            raw, snapshot = captured.value
-            require(len(os.fspath(value.parent)) + len(raw) + sum(len(x) + 1 for x in pending if isinstance(x, str)) + 2
-                    <= MAX_INPUT_NODES, "public link target exceeds limit")
-            links.append(snapshot)
-            target = _lexical_path(value.parent / os.fsdecode(raw))
-            destination = "direct-leaf destination" if not through and value == path else "hop target"
-            pending = list(target.parts[1:]) + [_HopBoundary(destination)] + pending
-            cursor, seen_link = Path(target.anchor), True
-            continue
-        if any(isinstance(item, str) for item in pending):
-            _reference_directory(info, value)
-        cursor = value
-        if final:
-            return proof
-    return _ProvedChain(guard, candidate, observations, links)
+                if any(isinstance(item, str) for item in pending):
+                    _reference_directory(info, cursor, _guard=guard)
+                _chain_observe(guard, _observed, observations, cursor, info, ancestors)
+                continue
+            if component == "..":
+                for stage, value in (("traversal prefix", cursor), ("post-traversal", cursor.parent)):
+                    remaining -= len(value.parent.parts) + 1
+                    require(remaining >= 0, "public chain proof exceeds limit")
+                    result = _chain_check(guard, _observed, stage, _proof_check, value, _guard=guard)
+                    if isinstance(result, _ProofFailure):
+                        return result
+                    info, ancestors = result.value
+                    _reference_directory(info, value, _guard=guard)
+                    _chain_observe(guard, _observed, observations, value, info, ancestors)
+                cursor = cursor.parent
+                continue
+            value = cursor / component
+            boundary = pending[0] if pending and isinstance(pending[0], _HopBoundary) else None
+            # Boundaries recheck proof components; only remaining pathname parts
+            # determine whether this is the leaf under the last proved parent.
+            final = not any(isinstance(item, str) for item in pending)
+            stage = (boundary.stage if boundary else
+                     "traversal prefix" if pending and pending[0] == ".." else
+                     "suffix ancestor" if seen_link else "prefix ancestor")
+            remaining -= len(value.parent.parts) + 1
+            require(remaining >= 0, "public chain proof exceeds limit")
+            if final:
+                result = _lookup_chain_leaf(guard, candidate, value, observations, links,
+                                            boundary.stage if boundary else "suffix ancestor" if seen_link else "prefix ancestor")
+                if isinstance(result, _ProofFailure):
+                    return result
+                proof = result.proof
+                if result.kind != "present":
+                    return _LinkLookupFailure(result.value, proof, through=through) if result.leaf_refusal else proof
+                info = result.value
+                identity = _chain_check(guard, _observed, "final identity", guard.check_identity, value, info)
+                if isinstance(identity, _ProofFailure):
+                    return identity
+                # Parent marks belong to the token that authorized this exact lookup.
+                ancestors = _proof_parent_marks(proof, value)
+            else:
+                result = _chain_check(guard, _observed, stage, _proof_check, value, _guard=guard)
+                if isinstance(result, _ProofFailure):
+                    return result
+                info, ancestors = result.value
+            _chain_observe(guard, _observed, observations, value, info, ancestors)
+            if stat.S_ISLNK(info.st_mode) or _reparse(info):
+                hops += 1
+                require(hops <= MAX_SYMLINK_HOPS, "public link chain exceeds limit")
+                captured = _chain_check(guard, _observed, "link", _proof_link, guard, value, info)
+                if isinstance(captured, _ProofFailure):
+                    return captured
+                raw, snapshot = captured.value
+                require(len(os.fspath(value.parent)) + len(raw) + sum(len(x) + 1 for x in pending if isinstance(x, str)) + 2
+                        <= MAX_INPUT_NODES, "public link target exceeds limit")
+                if _observed is None or snapshot[0] != observed_path:
+                    links.append(snapshot)
+                target = _lexical_path(value.parent / os.fsdecode(raw))
+                destination = "direct-leaf destination" if not through and value == path else "hop target"
+                pending = list(target.parts[1:]) + [_HopBoundary(destination)] + pending
+                cursor, seen_link = Path(target.anchor), True
+                continue
+            if any(isinstance(item, str) for item in pending):
+                _reference_directory(info, value, _guard=guard)
+            cursor = value
+            if final:
+                return proof
+        return _ProvedChain(guard, candidate, observations, links)
+
+    result = _proof_operation(guard, "chain", walk)
+    if isinstance(result, _ProofValue):
+        result = result.value
+    return _recheck_failed_chain_links(guard, result, links)
 
 
 def _proof_parent_marks(proof, value):
@@ -721,11 +2116,77 @@ def _proof_parent_marks(proof, value):
     return proof.ancestors
 
 
-def _private_symlink_target(guard, path, candidate):
-    result = _proof_operation(guard, "chain", _resolve_public_chain, guard, path, candidate)
+def _private_symlink_target(guard, path, candidate, *, _observed=None):
+    context = _private_context(guard)
+    token = context.set(True)
+    try:
+        result = _proof_operation(guard, "chain", _resolve_public_chain, guard, path, candidate, _observed=_observed)
+    finally:
+        context.reset(token)
     if isinstance(result, _ProofFailure):
         return result
     return result.value
+
+
+def _stored_reference_check(path, guard, *, trial=False, inert=False):
+    """Stored scopes retain their original typed refusal, not proof quarantine."""
+    caller = "inert" if inert else "trial" if trial else "stored"
+    route = getattr(guard, "_acquisition_route", None)
+    if route is None:
+        route = guard._acquisition_route = ContextVar("fresh_acquisition_caller", default="public")
+    token = route.set(caller)
+    try:
+        return _acquire("proof", guard.check, (path,), {"scope": True}, _guard=guard)
+    finally:
+        route.reset(token)
+
+
+def _raise_reference_acquisition(error, path, guard):
+    """Restore an ordinary reader's OS refusal without weakening a failed proof."""
+    original = error.acquisition
+    if getattr(guard, "_proof_refusals", False) or not isinstance(original, OSError):
+        raise error
+    _raise_global(error, guard=guard)
+    _walk_error(original, path, seam="check")
+
+
+def _ordinary_reference_check(path, guard):
+    """Preserve the reader's checked-open contract without certifying a proof."""
+    if getattr(guard, "_proof_refusals", False):
+        return guard.check(path)
+    from hierarchy_router import SymlinkPathError, _lexical_path
+    path = _lexical_path(path)
+    require(path.is_absolute() and ".." not in path.parts, "path must be absolute without traversal")
+    guard.refuse(path)
+    directory, failure = None, None
+    try:
+        if _reference_descriptors():
+            directory, ancestors = _reference_parent(path.parent, _guard=guard, _checking=True)
+            info = (_acquire("stat", path.name, dir_fd=directory, follow_symlinks=False, _guard=guard, _negative=(path, ancestors)) if path.name
+                    else _acquire("fstat", directory, _guard=guard))
+        else:
+            ancestors = _reference_ancestors(path, _guard=guard, _checking=True)
+            info = _acquire("lstat", path, _guard=guard, _negative=(path, ancestors))
+        _acquisition_identity(guard, path, info)
+        if stat.S_ISLNK(info.st_mode) or _reparse(info):
+            raise _link_refusal(info, path, ancestors)
+        _acquire("witness", "ancestor", path, info, _guard=guard)
+        return info, ancestors
+    except (ValueError, OSError) as exc:
+        failure = exc
+        if _disposition(exc, guard=guard, seam="reader-check", path=path) == ABSENT:
+            acquired = _acquisition_fact(exc)
+            _acquisition_require(acquired.negative is not None, guard, "reference parent changed while opening")
+            negative, captured = acquired.negative
+            observation = getattr(guard, "_acquisition_observation", None)
+            if observation is None:
+                observation = guard._acquisition_observation = ContextVar("fresh_acquisition_observation", default=None)
+            observation.set((path, _AbsentReference(negative, captured, requested=path)))
+            return None
+        _walk_error(exc, path, seam="check")
+    finally:
+        if directory is not None:
+            _close_reference_directory(directory, guard=guard, error=failure)
 
 
 def _inert_evidence_reducer(*, _guard):
@@ -736,6 +2197,7 @@ def _inert_evidence_reducer(*, _guard):
     Per-call refusals are restored in finally; no pinned namespace is changed.
     """
     refusals, inert_paths = None, set()
+    route = {"trial": False}
 
     def lexical_path(value):
         path = Path(value)
@@ -745,7 +2207,7 @@ def _inert_evidence_reducer(*, _guard):
     def scope_path(value):
         path = lexical_path(value)
         try:
-            _guard.check(path, scope=True)
+            _stored_reference_check(path, _guard, trial=route["trial"], inert=path in inert_paths)
         except (ValueError, OSError) as exc:
             outcome = _disposition(exc, guard=_guard, seam="scope", path=path, inert=path in inert_paths)
             if outcome == ABSENT:
@@ -785,11 +2247,14 @@ def _inert_evidence_reducer(*, _guard):
         nonlocal refusals, inert_paths
         previous, refusals = refusals, _refusals
         previous_paths, inert_paths = inert_paths, _inert_paths
+        previous_trial = route["trial"]
+        route["trial"] = envelope["event"]["type"] in {"disposition", "resolve"}
         try:
             return namespace["reduce_event"](policy, state, envelope, at)
         finally:
             refusals = previous
             inert_paths = previous_paths
+            route["trial"] = previous_trial
     reduce.validate_policy = validate_policy
     return reduce
 
@@ -807,15 +2272,39 @@ def _reference_mark(info):
 
 
 def _directory_mark(info):
-    return _reference_mark(info)[:4]
+    return info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode), _reparse(info)
 
 
 def _same_mark(left, right):
-    return left[2:] == right[2:] and all(not a or not b or a == b for a, b in zip(left[:2], right[:2]))
+    return left == right or (left[2:] == right[2:]
+        and all(not a or not b or a == b for a, b in zip(left[:2], right[:2])))
 
 
 def _same_ancestors(left, right):
-    return len(left) == len(right) and all(a[0] == b[0] and _same_mark(a[1], b[1]) for a, b in zip(left, right))
+    return left == right or (len(left) == len(right)
+        and all(a[0] == b[0] and _same_mark(a[1], b[1]) for a, b in zip(left, right)))
+
+
+def _ancestor_components(marks):
+    """Normalize complete root-first chains without allocating every full prefix."""
+    require(len(marks) <= MAX_INPUT_NODES, "reference ancestry exceeds limit")
+    result = []
+    for component, mark in marks:
+        if (isinstance(component, str) and component not in {"", ".", ".."}
+                and not any(separator in component for separator in ("/", "\\", ":"))):
+            result.append((component, mark))
+        else:
+            path = Path(component)
+            result.append((path.name or path.anchor, mark))
+    return result
+
+
+def _same_path_ancestors(left, right):
+    """Compare captured prefixes across component-keyed and portable readers."""
+    require(len(left) <= MAX_INPUT_NODES and len(right) <= MAX_INPUT_NODES, "reference ancestry exceeds limit")
+    if left == right:
+        return True
+    return _same_ancestors(_ancestor_components(left), _ancestor_components(right))
 
 
 def _descriptor_capabilities():
@@ -824,17 +2313,45 @@ def _descriptor_capabilities():
             and {"open", "stat"} <= names)
 
 
+def _search_directory_flag():
+    """Prefer Linux's existing handle, then native search-only directory access."""
+    for name in ("O_PATH", "O_SEARCH", "O_EXEC"):
+        flag = getattr(os, name, None)
+        if flag is not None:
+            return flag
+    return None
+
+
 def _reference_descriptors():
     """Select the reference reader; bounded link proofs independently require native primitives."""
     return _descriptor_capabilities()
 
 
-def _reference_directory(info, path):
+def _link_refusal(info, path, ancestors):
+    from hierarchy_router import SymlinkPathError
+    error = SymlinkPathError(path)
+    error._observed_link = path, _reference_mark(info), _ancestor_components(ancestors)
+    return error
+
+
+def _recheck_observed_link(error, guard, *, private=None):
+    snapshot = getattr(error, "_observed_link", None)
+    if snapshot is not None:
+        result = _proof_operation(guard, "observed link", _stable_link, guard, snapshot)
+        if isinstance(result, _ProofFailure):
+            if private is not None:
+                _acquisition_detect(guard, "PRIVATE", private, replacement=True)
+                raise private
+            _acquisition_refuse(guard, result.error)
+        _acquisition_require(result.value, guard, "reference parent changed while opening")
+
+
+def _reference_directory(info, path, *, _guard, _ancestors=()):
     from hierarchy_router import SymlinkPathError
     if stat.S_ISLNK(info.st_mode) or _reparse(info):
-        raise SymlinkPathError(path)
+        raise _link_refusal(info, path, _ancestors)
     if not stat.S_ISDIR(info.st_mode):
-        raise NotADirectoryError(errno.ENOTDIR, None, str(path))
+        _acquisition_refuse(_guard, NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), str(path)))
 
 
 def _close_reference_directory(descriptor, *, guard, error=None):
@@ -845,71 +2362,52 @@ def _close_reference_directory(descriptor, *, guard, error=None):
         # an unrelated request's ambient exception context.
         _raise_global(error, guard=guard)
         _raise_global(exc, guard=guard)
+        if _acquisition_fact(error) is not None:
+            raise error
         raise _ProofPathError("cannot complete public path proof") from exc
 
 
-def _reference_parent(path, *, _guard=None, _checking=False, _classifying=False):
+def _reference_parent(path, *, _guard=None, _checking=False, _classifying=False, _expected=None, _absent=None):
     """Walk without following links, with bounded handles and recorded ancestor identities."""
     from hierarchy_router import _operation_guard, _lexical_path
     path = _lexical_path(path)
     require(path.is_absolute() and ".." not in path.parts, "path must be absolute without traversal")
     guard = _operation_guard() if _guard is None else _guard
-    guard(path)
-    require(_descriptor_capabilities() if _classifying else _reference_descriptors(),
-            "secure reference hashing requires directory descriptor support")
-    flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
-    descriptor = None
-    marks = []
-    current = Path(path.anchor)
+    supported = _descriptor_capabilities() if _classifying else _reference_descriptors()
+    metadata_first = _checking and not _classifying and _search_directory_flag() is None
+    if not supported or metadata_first:
+        guard(path)
+    require(supported, "secure reference hashing requires directory descriptor support")
+    if metadata_first:
+        # Kind-only checks must reach ENOTDIR before a readable-handle fallback
+        # can introduce EACCES on an otherwise searchable public prefix.
+        _metadata_ancestor_marks(path, guard)
     try:
-        before = os.stat(path.anchor, follow_symlinks=False)
-        guard.check_identity(path, before)
-        _reference_directory(before, Path(path.anchor))
-        descriptor = os.open(path.anchor, flags)
-        info = os.fstat(descriptor)
-        guard.check_identity(path, info)
-        require(_same_mark(_directory_mark(info), _directory_mark(before)), "reference parent changed while opening")
-        _reference_directory(info, Path(path.anchor))
-        marks.append((path.anchor, _directory_mark(info)))
-        current = Path(path.anchor)
-        for component in path.parts[1:]:
-            current = current / component
-            before = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
-            guard.check_identity(path, before)
-            if _checking or _reparse(before):
-                _reference_directory(before, current)
-            elif stat.S_ISLNK(before.st_mode):
-                from hierarchy_router import SymlinkPathError
-                refused = SymlinkPathError(current)
-                if _disposition(refused, guard=guard, seam="consume", path=path) == QUARANTINE:
-                    raise refused
-            # Native O_DIRECTORY|O_NOFOLLOW reports its own baseline errno for
-            # public failures; it cannot open a link or follow its target.
-            previous = descriptor
-            descriptor = os.open(component, flags, dir_fd=previous)
-            _close_reference_directory(previous, guard=guard)
-            info = os.fstat(descriptor)
-            guard.check_identity(path, info)
-            require(_same_mark(_directory_mark(info), _directory_mark(before)), "reference parent changed while opening")
-            _reference_directory(info, current)
-            marks.append((component, _directory_mark(info)))
-        return descriptor, marks
+        return _proof_parent(path, _guard=guard, _consume=not _checking, _expected=_expected, _absent=_absent)
     except OSError as exc:
-        if descriptor is not None:
-            _close_reference_directory(descriptor, guard=guard, error=exc)
+        current = Path(exc.filename) if exc.filename is not None else path
         _disposition(exc, guard=guard, seam="parent", path=current)
+        if _search_directory_flag() is None:
+            exc._search_only_parent_error = True
         _walk_error(exc, current, seam="parent-check" if _checking else "parent")
-    except BaseException as exc:
-        if descriptor is not None:
-            _close_reference_directory(descriptor, guard=guard, error=exc)
-        raise
+
+
+def check_reference_parent_access(path, *, guard):
+    """Preserve consuming-parent refusal order without search-only handles."""
+    if _reference_descriptors() and _search_directory_flag() is None:
+        try:
+            directory, _ancestors = _reference_parent(Path(path).parent, _guard=guard)
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            _raise_global(exc, guard=guard)
+            return
+        _close_reference_directory(directory, guard=guard)
 
 
 def _reparse(info):
     return bool(getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
 
 
-def _reference_ancestors(path, *, _guard=None, _checking=False):
+def _reference_ancestors(path, *, _guard=None, _checking=False, _expected=None, _absent=None):
     """Portable identity witnesses; no path resolution or link traversal."""
     from hierarchy_router import _operation_guard, _lexical_path
     path = _lexical_path(path)
@@ -918,10 +2416,13 @@ def _reference_ancestors(path, *, _guard=None, _checking=False):
     guard(path)
     result = []
     try:
+        expected = _ancestor_components(_expected) if _expected is not None else ()
         for parent in reversed(path.parents):
-            info = os.lstat(parent)
-            guard.check_identity(path, info)
-            _reference_directory(info, parent)
+            info = _acquire("lstat", parent, _guard=guard)
+            if _absent is not None and parent == _absent.path:
+                _acquisition_replacement(guard, parent, info)
+            _acquisition_ancestor(guard, parent, info, expected, identity_path=path)
+            _reference_directory(info, parent, _ancestors=result, _guard=guard)
             result.append((str(parent), _directory_mark(info)))
     except (ValueError, OSError) as exc:
         seam = "ancestor-check" if _checking else "ancestors"
@@ -930,57 +2431,254 @@ def _reference_ancestors(path, *, _guard=None, _checking=False):
     return result
 
 
+def _missing_input_info(path, guard, *, expected=None):
+    """Capture a second anchored negative witness, never a pathname diagnosis."""
+    try:
+        info, _ancestors = _scope_reference_info(path, guard)
+    except (ValueError, OSError) as exc:
+        _acquisition_error(exc, guard, path=path)
+    if not isinstance(info, _AbsentReference):
+        raise _acquisition_changed(guard, "captured missing input changed")
+    if expected is not None:
+        _acquisition_require(info.path == expected.path and info.non_directory == expected.non_directory
+            and _same_ancestors(info.ancestors, expected.ancestors), guard, "captured missing input changed")
+    if info.non_directory:
+        error = NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), str(path))
+        _acquisition_refuse(guard, error)
+        raise error
+    return info
+
+
+def _recheck_scope_prefix(proof):
+    """Revalidate the complete prefix after the last leaf outcome was read."""
+    directory, pending = None, None
+    try:
+        directory, current = _proof_parent(proof.leaf.parent, _guard=proof.guard, _revalidating=True, _expected=proof.ancestors)
+        _acquisition_require(current == proof.ancestors, proof.guard, "final lookup parent ancestry changed")
+        return True
+    except BaseException as exc:
+        pending = exc
+        raise
+    finally:
+        if directory is not None:
+            _close_reference_directory(directory, guard=proof.guard, error=pending)
+
+
+def _recheck_scope_witness(proof):
+    """A changed prefix is a proof refusal even if its replacement is public."""
+    # The first pass repeats the captured leaf outcome. The second re-opens
+    # every ancestor after that lookup and checks the outcome under that chain.
+    # The end-prefix pass closes the last lookup's namespace window. Every
+    # validation is mandatory; a failed proof is never retried.
+    for stage, action in (("scope outcome", _recheck_final_witness),
+                          ("scope prefix after lookup", _recheck_final_witness),
+                          ("scope end prefix", _recheck_scope_prefix)):
+        checked = _proof_operation(proof.guard, stage, action, proof)
+        if isinstance(checked, _ProofFailure):
+            error = checked.error
+            if getattr(error, "_acquisition_outcome", None) is None:
+                _acquisition_detect(proof.guard, "CHANGED", error)
+            raise error
+
+
+def _scope_reference_info(path, guard):
+    """Prove absence at its first negative edge, including during acquisition."""
+    require(len(path.parts) <= MAX_INPUT_NODES, "public chain proof exceeds limit")
+    directory, pending = None, None
+    try:
+        current = Path(path.anchor)
+        directory, ancestors = _proof_parent(current, _guard=guard)
+        flags = (_search_directory_flag() or os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+        info = _acquire("fstat", directory, _guard=guard)
+        if not info.st_ino:
+            raise _ProofPathError("secure scope proof requires descriptor anchoring")
+        for component in path.parts[1:]:
+            current = current / component
+            proof = _ProvedChain(guard, path, (), (), directory, current, list(ancestors))
+            result = _final_leaf_lookup(proof)
+            if isinstance(result, _ProofFailure):
+                if getattr(result.error, "_acquisition_outcome", None) is None:
+                    _recheck_scope_witness(proof)
+                    _acquisition_refuse(guard, result.error)
+                raise result.error
+            if result.kind == "error":
+                _recheck_scope_witness(proof)
+                _acquisition_refuse(guard, result.value)
+                raise result.value
+            if result.kind == "absent":
+                # A detached prefix can also produce ENOENT/ENOTDIR. Re-open
+                # every existing ancestor by name and repeat this negative
+                # lookup before accepting it as evidence about the scope.
+                _recheck_scope_witness(proof)
+                _acquisition_detect(guard, "ABSENT")
+                absent = _AbsentReference(current, ancestors, requested=path)
+                _acquire("witness", "negative", absent, _guard=guard)
+                return absent, ancestors
+            info = result.value
+            _acquisition_identity(guard, current, info)
+            if not info.st_ino:
+                raise _ProofPathError("secure scope proof requires descriptor anchoring")
+            if current == path:
+                _recheck_scope_witness(proof)
+                return info, ancestors
+            if stat.S_ISLNK(info.st_mode) or _reparse(info):
+                _reference_directory(info, current, _ancestors=ancestors, _guard=guard)
+            if not stat.S_ISDIR(info.st_mode):
+                _acquisition_refuse(guard,
+                    NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), str(current)))
+            previous = directory
+            try:
+                directory = _acquire("open", component, flags, dir_fd=previous, _guard=guard, _path=current, _before=info)
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    _acquisition_open_refusal(exc, guard, current, previous, before=info, ancestors=ancestors)
+                _recheck_scope_witness(proof)
+                _acquisition_refuse(guard, exc)
+                raise
+            _close_reference_directory(previous, guard=guard)
+            opened = _acquire("fstat", directory, _guard=guard)
+            _acquisition_identity(guard, current, opened,
+                                  replacement=_directory_mark(info) != _directory_mark(opened))
+            _reference_directory(opened, current, _ancestors=ancestors, _guard=guard)
+            _acquisition_require(_directory_mark(info) == _directory_mark(opened), guard,
+                                 "reference parent changed while opening")
+            ancestors.append((component, _directory_mark(opened)))
+        return info, ancestors  # The trusted filesystem root itself.
+    except Exception as exc:
+        pending = exc
+        _raise_global(exc, guard=guard)
+        from hierarchy_router import PrivatePathError, SymlinkPathError
+        if isinstance(exc, _ProofPathError):
+            _acquisition_refuse(guard, exc)
+        if isinstance(exc, (PrivatePathError, SymlinkPathError)):
+            if isinstance(exc, PrivatePathError): _acquisition_detect(guard, "PRIVATE", exc)
+            raise
+        if not isinstance(exc, (ValueError, OSError)):
+            refused = _ProofPathError("secure scope proof requires descriptor anchoring")
+            _acquisition_refuse(guard, refused)
+            raise refused from exc
+        # Our own identity/kind invariants are proof failures. Only an OS
+        # acquisition error retains the stored walk's original refusal type.
+        if getattr(exc, "_acquisition_outcome", None) is None:
+            _acquisition_refuse(guard, exc)
+        raise
+    except BaseException as exc:
+        pending = exc
+        raise
+    finally:
+        if directory is not None:
+            _close_reference_directory(directory, guard=guard, error=pending)
+
+
 def _reference_check(path, *, _guard, _scope=False, _classifying=False):
     """Validate every existing component top down, including a regular-file leaf."""
-    from hierarchy_router import _lexical_path
+    from hierarchy_router import PrivatePathError, SymlinkPathError, _lexical_path
     path = _lexical_path(path)
     require(path.is_absolute() and ".." not in path.parts, "path must be absolute without traversal")
-    directory, failure = None, None
     try:
-        anchored = _descriptor_capabilities() if _classifying else _reference_descriptors()
-        require(not _classifying or anchored, "secure link proof requires directory descriptor support")
-        if anchored:
-            directory, ancestors = _reference_parent(path.parent, _guard=_guard, _checking=True,
-                                                     _classifying=_classifying)
-            info = (os.stat(path.name, dir_fd=directory, follow_symlinks=False) if path.name
-                    else os.fstat(directory))
-        else:
-            ancestors = _reference_ancestors(path, _guard=_guard, _checking=True)
-            info = os.lstat(path)
-        _guard.check_identity(path, info)
+        # Capability flags choose the handle, never the proof algorithm.
+        # Every successful or absent result comes from the same anchored walk.
+        if not _descriptor_capabilities():
+            unsupported = _ProofPathError("secure scope proof requires directory descriptor support")
+            _acquisition_detect(_guard, "CHANGED", unsupported)
+            raise unsupported
+        info, ancestors = _scope_reference_info(path, _guard)
+        observation = getattr(_guard, "_acquisition_observation", None)
+        if observation is not None:
+            observation.set((path, info))
+        if isinstance(info, _AbsentReference):
+            return None
+        _acquisition_identity(_guard, path, info)
         if stat.S_ISLNK(info.st_mode) or _reparse(info):
-            from hierarchy_router import SymlinkPathError
-            raise SymlinkPathError(path)
+            raise _link_refusal(info, path, ancestors)
         return info, ancestors
     except (ValueError, OSError) as exc:
-        failure = exc
+        acquired = getattr(exc, "_acquisition_outcome", None)
+        if acquired is not None:
+            if isinstance(exc, _ProofPathError) and not _descriptor_capabilities():
+                raise
+            caller = _acquisition_caller(_guard, trust=_classifying or getattr(_guard, "_proof_refusals", False)
+                                         or isinstance(exc, _ProofPathError))
+            if _acquisition_map(acquired, caller) == ABSENT:
+                return None
+            _acquisition_error(exc, _guard, caller=caller, path=path)
+        if isinstance(exc, _ProofPathError) and not _classifying and not getattr(_guard, "_proof_refusals", False):
+            original = exc.acquisition
+            if (isinstance(original, (ValueError, OSError))
+                    and not isinstance(original, (PrivatePathError, SymlinkPathError, _ProofPathError,
+                                                  FileNotFoundError, NotADirectoryError))):
+                # An ordinary caller keeps its HEAD refusal. Unproved negative
+                # edges and failed identity/revalidation proofs stay wrapped.
+                _raise_global(exc, guard=_guard)
+                _walk_error(original, path, seam="check")
+        if (isinstance(exc, ValueError)
+                and not isinstance(exc, (PrivatePathError, SymlinkPathError, _ProofPathError))):
+            _raise_global(exc, guard=_guard)
+            raise _ProofPathError("secure scope proof requires descriptor anchoring") from exc
+        if isinstance(exc, OSError):
+            _raise_global(exc, guard=_guard)
+            raise _ProofPathError("secure scope proof requires descriptor anchoring") from exc
         if _classifying:
             _raise_global(exc, guard=_guard)
             raise
         if _disposition(exc, guard=_guard, seam="scope-check" if _scope else "check", path=path) == ABSENT:
             return None
         _walk_error(exc, path, seam="check")
+
+
+def _bind_descriptor(descriptor, before, path, guard, *, content=True):
+    """Adopt a caller-owned descriptor only after anchoring its exact pathname."""
+    if _operation_ledger(guard) is None:
+        return
+    path = Path(path)
+    directory, pending = None, None
+    try:
+        if _reference_descriptors():
+            directory, _marks = _reference_parent(path.parent, _guard=guard)
+            current = _acquire("stat", path.name, dir_fd=directory, follow_symlinks=False,
+                               _guard=guard, _path=path)
+        else:
+            _reference_ancestors(path, _guard=guard)
+            current = _acquire("lstat", path, _guard=guard, _path=path)
+        _acquisition_require(_directory_mark(current) == _directory_mark(before), guard,
+                             "reference parent changed while opening")
+        _acquire("witness", "descriptor", path, (descriptor, before), _guard=guard)
+        actual = _acquire("fstat", descriptor, _guard=guard, _path=path,
+                          _expected_mark=_reference_mark(before) if content else None)
+        _acquisition_require(_directory_mark(actual) == _directory_mark(before), guard,
+                             "reference parent changed while opening")
+    except BaseException as error:
+        pending = error
+        raise
     finally:
         if directory is not None:
-            _close_reference_directory(directory, guard=_guard, error=failure)
+            _close_rechecked_reference(directory, guard, pending)
 
 
-def _stream_reference(descriptor, before, path, consume=None):
-    """Finite declared-length read plus one EOF probe; never follow an append stream."""
+def _stream_reference(descriptor, before, path, consume=None, *, _guard=None, _opened_here=False):
+    """Finite declared-length read plus one EOF probe; never follow an append stream.
+
+    _opened_here is reserved for _read_reference's checked, still-owned handle.
+    """
+    if _guard is None:
+        from hierarchy_router import _operation_guard
+        _guard = _operation_guard()
+    if not _opened_here:
+        _bind_descriptor(descriptor, before, path, _guard)
     mark = _reference_mark(before)
     sha, remaining = hashlib.sha256(), before.st_size
     while remaining:
         requested = min(65536, remaining)
-        chunk = os.read(descriptor, requested)
-        require(len(chunk) == requested, "reference changed while hashing: " + str(path))
+        chunk = _acquire("read", descriptor, requested, _guard=_guard)
+        _acquisition_require(len(chunk) == requested, _guard, "reference changed while hashing: " + str(path))
         remaining -= len(chunk)
         sha.update(chunk)
         if consume is not None:
             consume(chunk)
     # Refuse observed growth before probing EOF, preserving the initial-size budget on changed files.
-    require(_same_mark(_reference_mark(os.fstat(descriptor)), mark), "reference changed while hashing: " + str(path))
-    require(os.read(descriptor, 1) == b"", "reference content exceeds reported size: " + str(path))
-    require(_same_mark(_reference_mark(os.fstat(descriptor)), mark), "reference changed while hashing: " + str(path))
+    _acquisition_require(_same_mark(_reference_mark(_acquire("fstat", descriptor, _guard=_guard)), mark), _guard, "reference changed while hashing: " + str(path))
+    _acquisition_require(_acquire("read", descriptor, 1, _guard=_guard) == b"", _guard, "reference content exceeds reported size: " + str(path))
+    _acquisition_require(_same_mark(_reference_mark(_acquire("fstat", descriptor, _guard=_guard)), mark), _guard, "reference changed while hashing: " + str(path))
     return sha.hexdigest()
 
 
@@ -990,63 +2688,88 @@ def _read_reference(path, *, limit=MAX_EVIDENCE_BYTES, capture=False, _witness=N
     path = _lexical_path(path)
     require(path.is_absolute() and ".." not in path.parts, "path must be absolute without traversal")
     guard = _operation_guard() if _guard is None else _guard
-    checked = guard.check(path)
+    checked = _ordinary_reference_check(path, guard)
+    expected = checked[1] if checked is not None else None
+    absent = None
+    if expected is None:
+        observation = guard._acquisition_observation.get()
+        if (observation is not None and observation[0] == path
+                and getattr(getattr(observation[1], "outcome", None), "kind", None) == "ABSENT"):
+            absent = observation[1]
+            expected = absent.ancestors
+    if checked is None:
+        _acquisition_require(isinstance(absent, _AbsentReference) and absent.requested == path
+                and (absent.path == path or absent.path in path.parents), guard,
+                "reference parent changed while opening")
     require(path.is_absolute() and ".." not in path.parts, "path must be absolute without traversal")
     anchored = _reference_descriptors()
     directory = None
     try:
         if anchored:
-            directory, ancestors = _reference_parent(path.parent, _guard=guard)
-            before = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+            directory, ancestors = _reference_parent(path.parent, _guard=guard, _expected=expected, _absent=absent)
+            before = _acquire("stat", path.name, dir_fd=directory, follow_symlinks=False, _guard=guard,
+                              _negative=(path, expected) if checked is None else None)
         else:
-            ancestors = _reference_ancestors(path, _guard=guard)
-            before = os.lstat(path)
-        guard.check_identity(path, before)
+            ancestors = _reference_ancestors(path, _guard=guard, _expected=expected, _absent=absent)
+            before = _acquire("lstat", path, _guard=guard,
+                              _negative=(path, expected) if checked is None else None)
+        replaced = checked is None or not (_same_mark(_reference_mark(checked[0]), _reference_mark(before))
+                                           and _same_path_ancestors(checked[1], ancestors))
+        _acquisition_identity(guard, path, before, replacement=replaced)
+        if replaced:
+            _acquisition_replacement(guard, path, before)
         require(stat.S_ISREG(before.st_mode) and not _reparse(before), "reference must be a regular file: " + str(path))
-        require(checked is not None and _same_mark(_reference_mark(checked[0]), _reference_mark(before)),
-                "reference changed while opening")
+        _acquisition_require(checked is not None and _same_mark(_reference_mark(checked[0]), _reference_mark(before)),
+                guard, "reference changed while opening")
         require(limit is None or before.st_size <= limit, budget_error or "input exceeds " + str(limit) + " bytes")
         mark = _reference_mark(before)
         cached = _cache.get(path, {}).get(mark) if _cache is not None and not capture else None
         chunks = []
         if cached is not None:
             sha, previous_ancestors = cached
-            require(_same_ancestors(ancestors, previous_ancestors), "cached evidence reference path changed")
+            _acquisition_require(_same_ancestors(ancestors, previous_ancestors), guard, "cached evidence reference path changed")
         else:
             flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
-            descriptor = (os.open(path.name, flags, dir_fd=directory) if anchored else os.open(path, flags))
+            descriptor = (_acquire("open", path.name, flags, dir_fd=directory, _guard=guard, _path=path, _before=before) if anchored else _acquire("open", path, flags, _guard=guard, _path=path, _before=before))
             try:
-                opened = os.fstat(descriptor)
-                guard.check_identity(path, opened)
-                require(stat.S_ISREG(opened.st_mode) and not _reparse(opened) and _same_mark(_reference_mark(opened), mark),
-                        "reference changed while opening: " + str(path))
+                opened = _acquire("fstat", descriptor, _guard=guard)
+                _acquisition_identity(guard, path, opened, replacement=not _same_mark(_reference_mark(opened), mark))
+                _acquisition_require(stat.S_ISREG(opened.st_mode) and not _reparse(opened) and _same_mark(_reference_mark(opened), mark),
+                        guard, "reference changed while opening: " + str(path))
                 if not anchored:
-                    require(_same_ancestors(_reference_ancestors(path, _guard=guard), ancestors), "reference path changed while opening: " + str(path))
-                sha = _stream_reference(descriptor, before, path, chunks.append if capture else None)
+                    _acquisition_require(_same_ancestors(_reference_ancestors(path, _guard=guard, _expected=ancestors), ancestors), guard, "reference path changed while opening: " + str(path))
+                sha = _stream_reference(descriptor, before, path, chunks.append if capture else None, _guard=guard, _opened_here=True)
                 if not anchored:
-                    require(_same_ancestors(_reference_ancestors(path, _guard=guard), ancestors),
-                            "reference path changed while hashing")
-                current = (os.stat(path.name, dir_fd=directory, follow_symlinks=False) if anchored else os.lstat(path))
-                require(_same_mark(_reference_mark(current), mark), "reference changed while hashing: " + str(path))
+                    _acquisition_require(_same_ancestors(_reference_ancestors(path, _guard=guard, _expected=ancestors), ancestors),
+                            guard, "reference path changed while hashing")
+                current = (_acquire("stat", path.name, dir_fd=directory, follow_symlinks=False, _guard=guard, _path=path, _expected_mark=mark) if anchored else _acquire("lstat", path, _guard=guard, _path=path, _expected_mark=mark))
+                _acquisition_identity(guard, path, current, replacement=not _same_mark(_reference_mark(current), mark))
+                _acquisition_require(_same_mark(_reference_mark(current), mark), guard, "reference changed while hashing: " + str(path))
             finally:
                 os.close(descriptor)
         if anchored:
-            returned, current_ancestors = _reference_parent(path.parent, _guard=guard)
+            returned, current_ancestors = _reference_parent(path.parent, _guard=guard, _expected=ancestors)
             try:
-                require(_same_ancestors(current_ancestors, ancestors)
-                        and _same_mark(_reference_mark(os.stat(path.name, dir_fd=returned, follow_symlinks=False)), mark),
-                        "reference path changed while hashing: " + str(path))
+                current = _acquire("stat", path.name, dir_fd=returned, follow_symlinks=False, _guard=guard, _path=path, _expected_mark=mark)
+                _acquisition_identity(guard, path, current, replacement=not _same_mark(_reference_mark(current), mark))
+                _acquisition_require(_same_ancestors(current_ancestors, ancestors)
+                        and _same_mark(_reference_mark(current), mark),
+                        guard, "reference path changed while hashing: " + str(path))
             finally:
                 os.close(returned)
         else:
-            require(_same_ancestors(_reference_ancestors(path, _guard=guard), ancestors) and _same_mark(_reference_mark(os.lstat(path)), mark),
-                    "reference path changed while hashing: " + str(path))
+            current = _acquire("lstat", path, _guard=guard, _path=path, _expected_mark=mark)
+            _acquisition_identity(guard, path, current, replacement=not _same_mark(_reference_mark(current), mark))
+            _acquisition_require(_same_ancestors(_reference_ancestors(path, _guard=guard, _expected=ancestors), ancestors) and _same_mark(_reference_mark(current), mark),
+                    guard, "reference path changed while hashing: " + str(path))
         if _witness is not None:
             _witness.update(path=path, mark=mark, ancestors=ancestors, anchored=anchored)
         if _cache is not None:
             _cache.setdefault(path, {})[mark] = sha, ancestors
         return {"path": str(path), "sha256": sha}, b"".join(chunks) if capture else None
     except (ValueError, OSError) as exc:
+        if getattr(guard, "_proof_refusals", False) and getattr(exc, "_acquisition_outcome", None) is not None:
+            _acquisition_error(exc, guard, caller="trust", path=path)
         _disposition(exc, guard=guard, seam="read", path=path)
         _walk_error(exc, path, seam="read", anchored=anchored)
     finally:
@@ -1110,9 +2833,34 @@ def _unread_attachment(mailbox, reference, *, _authoritative=False):
     return raw
 
 
-def _declaration_operation(operation):
-    """Isolate optional declarations, while shared privacy policy remains authoritative."""
+def _declaration_operation(operation, *, _proof=True):
+    """Isolate semantic declarations while inheriting every required witness."""
+    def policy(action, *args):
+        try:
+            return action(*args)
+        except (ValueError, OSError) as exc:
+            _raise_global(exc, operation=operation)
+            raise
+
     class DeclarationGuard:
+        _proof_refusals = True
+
+        @property
+        def _acquisition_context(self):
+            return operation.path_guard._acquisition_context
+
+        @property
+        def _witness_context(self):
+            return operation.path_guard._witness_context
+
+        @property
+        def _acquisition_observation(self):
+            return operation.path_guard._acquisition_observation
+
+        @property
+        def _acquisition_route(self):
+            return operation.path_guard._acquisition_route
+
         @property
         def _identity_error(self):
             return getattr(operation.path_guard, "_identity_error", None)
@@ -1125,37 +2873,35 @@ def _declaration_operation(operation):
             return operation.path_guard._latch_global(error)
 
         def __call__(self, path):
-            with operation.capture():
-                return operation.path_guard(path)
+            return policy(operation.path_guard, path)
 
         def verify(self):
-            with operation.capture():
-                return operation.path_guard.verify()
+            return policy(operation.path_guard.verify)
 
         def identities(self):
-            with operation.capture():
-                return operation.path_guard.identities()
+            return policy(operation.path_guard.identities)
 
         def current(self):
-            with operation.capture():
-                return operation.path_guard.current()
+            return policy(operation.path_guard.current)
 
         def refuse(self, *paths):
-            with operation.capture():
-                return operation.path_guard.refuse(*paths)
+            return policy(operation.path_guard.refuse, *paths)
 
         def check(self, path, *, scope=False):
             self.refuse(path)
             return _reference_check(path, _guard=self, _scope=scope)
 
         def check_identity(self, path, info):
-            with operation.capture():
-                return operation.path_guard.check_identity(path, info)
+            return policy(operation.path_guard.check_identity, path, info)
 
         def active(self):
             return operation.path_guard.active()
 
-    return _Operation(reference_cache=operation.reference_cache, _path_guard=DeclarationGuard())
+    declaration = _Operation(reference_cache=operation.reference_cache,
+        _path_guard=DeclarationGuard() if _proof else operation.path_guard,
+        _witness_parent=operation.witnesses)
+    declaration._detection_owner = operation
+    return declaration
 
 
 def _recheck_consumed_reference(operation, path):
@@ -1177,25 +2923,71 @@ class UnverifiedAttachment(ValueError):
 
 
 def _recheck_reference(witness, *, _guard=None):
-    """Metadata-only revalidation of the exact captured identity, never a second content read."""
+    """Metadata-only revalidation of the exact captured identity."""
+    _recheck_references((witness,), _guard=_guard)
+
+
+def _close_rechecked_reference(descriptor, guard, pending):
+    try:
+        os.close(descriptor)
+    except BaseException as cleanup:
+        _raise_global(pending, guard=guard)
+        _raise_global(cleanup, guard=guard)
+        if _acquisition_fact(pending) is not None:
+            raise pending
+        raise
+
+
+def _recheck_references(witnesses, *, _guard=None):
+    """Share held parents, retaining every leaf and the complete end-prefix check."""
     from hierarchy_router import _operation_guard
     guard = _operation_guard() if _guard is None else _guard
-    path = Path(witness["path"])
-    guard.check(path)
-    if witness["anchored"]:
-        directory, ancestors = _reference_parent(path.parent, _guard=guard)
+    groups = {}
+    for witness in witnesses:
+        path = Path(witness["path"])
+        guard.refuse(path)
+        groups.setdefault((path.parent, witness["anchored"]), []).append(witness)
+    for (parent, anchored), group in groups.items():
+        directory, pending = None, None
+        expected = group[0]["ancestors"]
         try:
-            info = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
-            guard.check_identity(path, info)
-            mark = _reference_mark(info)
+            if anchored:
+                directory, ancestors = _reference_parent(parent, _guard=guard, _expected=expected)
+            else:
+                ancestors = _reference_ancestors(parent / "entry", _guard=guard, _expected=expected)
+            for witness in group:
+                path = Path(witness["path"])
+                if anchored:
+                    info = _acquire("stat", path.name, dir_fd=directory, follow_symlinks=False,
+                                    _guard=guard, _path=path, _expected_mark=witness["mark"])
+                else:
+                    info = _acquire("lstat", path, _guard=guard, _path=path, _expected_mark=witness["mark"])
+                _acquisition_identity(guard, path, info,
+                                      replacement=not _same_mark(_reference_mark(info), witness["mark"]))
+                _acquisition_require(_same_ancestors(ancestors, witness["ancestors"])
+                        and _same_mark(_reference_mark(info), witness["mark"]), guard,
+                        "captured reference changed before content promotion")
+            if anchored:
+                final, after = _reference_parent(parent, _guard=guard, _expected=expected)
+                final_pending = None
+                try:
+                    _acquisition_require(_same_ancestors(after, expected), guard,
+                                         "reference parent changed while opening")
+                except BaseException as error:
+                    final_pending = error
+                    raise
+                finally:
+                    _close_rechecked_reference(final, guard, final_pending)
+            else:
+                after = _reference_ancestors(parent / "entry", _guard=guard, _expected=expected)
+                _acquisition_require(_same_ancestors(after, expected), guard,
+                                     "reference parent changed while opening")
+        except BaseException as error:
+            pending = error
+            raise
         finally:
-            os.close(directory)
-    else:
-        ancestors, info = _reference_ancestors(path, _guard=guard), os.lstat(path)
-        guard.check_identity(path, info)
-        mark = _reference_mark(info)
-    require(_same_ancestors(ancestors, witness["ancestors"]) and _same_mark(mark, witness["mark"]),
-            "captured reference changed before content promotion")
+            if directory is not None:
+                _close_rechecked_reference(directory, guard, pending)
 
 
 class CaptureChanged(ValueError):
@@ -1212,28 +3004,26 @@ def _capture_attempt(method):
     return captured
 
 
+def _latch_operation_path_failure(operation, error):
+    """Global policy has priority; filesystem outcomes latch where observed."""
+    _raise_global(error, operation=operation)
+
+
 def _operation_context(method):
     @wraps(method)
     def captured(self, *args, **kwargs):
-        from hierarchy_router import PrivatePathError
-        with self.operation.path_guard.active():
+        with self.operation.active():
             try:
                 return method(self, *args, **kwargs)
             except (ValueError, OSError) as exc:
-                _raise_global(exc, operation=self.operation)
-                outcome = _disposition(exc, guard=self.operation.path_guard, seam="operation")
-                # Path failures latch here. Existing domain validators retain
-                # their caller's row refusal, rather than gaining a new latch.
-                if (isinstance(exc, PrivatePathError)
-                        or outcome == GLOBAL and getattr(exc, "_path_failure", False)):
-                    self.operation.fail(exc)
+                _latch_operation_path_failure(self.operation, exc)
                 raise
     return captured
 
 
 class _Operation:
     """One captured identity per path; bounded byte promotions preserve its original witnesses."""
-    def __init__(self, *, reference_cache=None, parent=None, _path_guard=None):
+    def __init__(self, *, reference_cache=None, parent=None, _path_guard=None, _witness_parent=None):
         self.files, self.parsed, self.folders, self.journals = {}, {}, {}, {}
         self.reference_cache = {} if reference_cache is None else reference_cache
         self.failed_validation = False
@@ -1241,8 +3031,46 @@ class _Operation:
         self.parent = parent
         from hierarchy_router import _CapturedPathGuard, _path_context
         self.path_guard = (_path_context().get() or _CapturedPathGuard()) if _path_guard is None else _path_guard
+        if not hasattr(self.path_guard, "_acquisition_context"):
+            self.path_guard._acquisition_context = ContextVar("fresh_acquisition_owner", default=self)
+        if not hasattr(self.path_guard, "_acquisition_route"):
+            self.path_guard._acquisition_route = ContextVar("fresh_acquisition_caller", default="public")
+        if not hasattr(self.path_guard, "_acquisition_observation"):
+            self.path_guard._acquisition_observation = ContextVar("fresh_acquisition_observation", default=None)
+        self.witnesses = _WitnessLedger(self.path_guard, _witness_parent)
+        if not hasattr(self.path_guard, "_witness_context"):
+            self.path_guard._witness_context = ContextVar("fresh_witness_ledger", default=self.witnesses)
         self.absences, self.validators = {}, [self.path_guard.verify]
         self.existences = {}
+
+    @contextmanager
+    def active(self):
+        context = self.path_guard._acquisition_context
+        token = context.set(getattr(self, "_detection_owner", self))
+        witness_token = self.path_guard._witness_context.set(self.witnesses)
+        try:
+            with self.path_guard.active():
+                yield
+        finally:
+            context.reset(token)
+            self.path_guard._witness_context.reset(witness_token)
+
+    @contextmanager
+    def required(self):
+        context = self.path_guard._acquisition_route
+        token = context.set("required")
+        try:
+            yield
+        finally:
+            context.reset(token)
+
+    @_capture_attempt
+    def output_directory(self, path):
+        """Declare the publication namespace before its first metadata acquisition."""
+        path = Path(path)
+        require(path.is_absolute() and ".." not in path.parts, "path must be absolute without traversal")
+        _acquire("witness", "output-directory", path, _guard=self.path_guard)
+        return path
 
     @_capture_attempt
     def read(self, path, *, limit=MAX_BYTES, capture=True, budget_error=None):
@@ -1253,18 +3081,25 @@ class _Operation:
                                        _guard=self.path_guard, _cache=self.reference_cache)
             self.files[path] = ref, raw, witness
         else:
-            self.path_guard.check(path)
+            _recheck_reference(self.files[path][2], _guard=self.path_guard)
         ref, raw, witness = self.files[path]
         require(limit is None or witness["mark"][4] <= limit, budget_error or "input exceeds " + str(limit) + " bytes")
         if capture and raw is None:
             current = {}
             promoted, raw = _read_reference(path, limit=limit, capture=True, _witness=current, budget_error=budget_error,
                                             _guard=self.path_guard, _cache=self.reference_cache)
-            require(promoted == ref and _same_mark(current["mark"], witness["mark"])
+            _acquisition_require(promoted == ref and _same_mark(current["mark"], witness["mark"])
                     and _same_ancestors(current["ancestors"], witness["ancestors"]),
-                    "captured reference changed before content promotion: " + str(path))
+                    self.path_guard, "captured reference changed before content promotion: " + str(path))
             self.files[path] = ref, raw, witness
         return ref, raw
+
+    @_capture_attempt
+    def recheck_files(self, paths, *, limit=MAX_BYTES):
+        witnesses = [self.files[Path(path)][2] for path in paths]
+        _recheck_references(witnesses, _guard=self.path_guard)
+        for witness in witnesses:
+            require(limit is None or witness["mark"][4] <= limit, "input exceeds " + str(limit) + " bytes")
 
     @_capture_attempt
     def json(self, path, *, limit=MAX_BYTES, private=True):
@@ -1273,6 +3108,8 @@ class _Operation:
             self.parsed[path] = _bounded_json(self.read(path, limit=limit)[1].decode("utf-8"))
             ref, _raw, witness = self.files[path]
             self.files[path] = ref, None, witness
+        else:
+            self.read(path, limit=limit, capture=False)
         if private:
             _private_paths(self.parsed[path], paths=self.path_guard)
         return self.parsed[path]
@@ -1292,27 +3129,20 @@ class _Operation:
             info, ancestors = checked
             if path in self.existences:
                 previous, previous_ancestors = self.existences[path]
-                require(_same_mark(_directory_mark(info), previous)
-                        and _same_ancestors(ancestors, previous_ancestors), "captured existing input changed")
-            self.existences[path] = _directory_mark(info), ancestors
+                if not (_same_mark(_directory_mark(info), previous)
+                        and _same_ancestors(ancestors, previous_ancestors)):
+                    raise _acquisition_changed(self.path_guard)
+            _acquire("witness", "ancestor", path, info, _guard=self.path_guard)
+            self.existences.setdefault(path, (_directory_mark(info), ancestors))
             return True
         else:
-            require(path not in self.existences, "captured existing input changed")
-            missing = path
-            while True:
-                parent = missing.parent
-                try:
-                    if _reference_descriptors():
-                        descriptor, ancestors = _reference_parent(parent, _guard=self.path_guard)
-                        os.close(descriptor)
-                    else:
-                        ancestors = _reference_ancestors(missing, _guard=self.path_guard, _checking=True)
-                    break
-                except FileNotFoundError as exc:
-                    if _disposition(exc, guard=self.path_guard, seam="exists", path=missing) != ABSENT:
-                        _walk_error(exc, missing, seam="exists")
-                    missing = parent
-            self.absences[missing] = ancestors
+            if path in self.existences:
+                raise _acquisition_changed(self.path_guard)
+            observed = self.path_guard._acquisition_observation.get()
+            expected = (observed[1] if observed is not None and observed[0] == path
+                        and getattr(getattr(observed[1], "outcome", None), "kind", None) == "ABSENT" else None)
+            missing = _missing_input_info(path, self.path_guard, expected=expected)
+            self.absences.setdefault(missing.path, missing.ancestors)
             return False
 
     def reference(self, path):
@@ -1326,59 +3156,100 @@ class _Operation:
         require(self.reference(text(ref["path"], "reference path")) == ref,
                 "reference sha256 mismatch: " + ref["path"])
 
-    def _members(self, path, *, membership=True):
+    def _members(self, path, *, membership=True, _expected=None):
         try:
-            return self._directory_members(path, membership=membership)
+            return self._directory_members(path, membership=membership, _expected=_expected)
         except (ValueError, OSError) as exc:
             _disposition(exc, guard=self.path_guard, seam="members", path=path)
             _walk_error(exc, path, seam="members", anchored=_reference_descriptors())
 
-    def _directory_members(self, path, *, membership=True):
-        self.path_guard.check(path)
+    def _directory_members(self, path, *, membership=True, _expected=None):
         path = Path(path)
+        checked = self.path_guard.check(path) if _expected is None else None
+        if checked is None and _expected is None:
+            observation = self.path_guard._acquisition_observation.get()
+            absent = observation[1] if observation is not None and observation[0] == path else None
+            _acquisition_require(getattr(getattr(absent, "outcome", None), "kind", None) == "ABSENT"
+                    and not absent.non_directory
+                    and (absent.path == path or absent.path in path.parents)
+                    and len(absent.ancestors) == len(absent.path.parent.parts),
+                    self.path_guard, "reference parent changed while opening")
+            filename = (absent.path.name or absent.path.anchor) if _reference_descriptors() else str(absent.path)
+            error = FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), filename)
+            error._acquisition_outcome = absent.outcome
+            raise error
+        if _expected is None:
+            captured_mark = _directory_mark(checked[0])
+            captured = _ancestor_components(checked[1])
+            if len(captured) < len(path.parts):
+                captured.append((path.name or path.anchor, captured_mark))
+        else:
+            captured_mark, _names, captured = _expected
+            self.path_guard.refuse(path)
         if _reference_descriptors():
-            directory, ancestors = _reference_parent(path, _guard=self.path_guard)
+            directory, ancestors = _reference_parent(path, _guard=self.path_guard, _expected=captured)
             # O_PATH descriptors cannot be enumerated. Open the same anchored identity for listing.
             listing = None
             try:
-                info = os.fstat(directory)
-                self.path_guard.check_identity(path, info)
+                info = _acquire("fstat", directory, _guard=self.path_guard)
+                _acquisition_identity(self.path_guard, path, info,
+                                      replacement=_directory_mark(info) != captured_mark)
                 mark, names = _directory_mark(info), None
+                _acquisition_require(mark == captured_mark and _same_path_ancestors(ancestors, captured),
+                                     self.path_guard, "reference parent changed while opening")
                 if membership:
-                    listing = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
-                    require(_same_mark(mark, _directory_mark(os.fstat(listing))), "captured directory changed")
+                    listing = _acquire("open", ".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory, _guard=self.path_guard)
+                    _acquisition_require(_same_mark(mark, _directory_mark(_acquire("fstat", listing, _guard=self.path_guard))), self.path_guard, "captured directory changed")
                     names = _directory_names(listing)
-                    require(_same_mark(mark, _directory_mark(os.fstat(listing))), "captured directory changed")
+                    _acquisition_require(_same_mark(mark, _directory_mark(_acquire("fstat", listing, _guard=self.path_guard))), self.path_guard, "captured directory changed")
             finally:
                 if listing is not None:
                     os.close(listing)
                 os.close(directory)
         else:
-            ancestors = _reference_ancestors(path / "entry", _guard=self.path_guard)
-            info = os.lstat(path)
-            self.path_guard.check_identity(path, info)
+            ancestors = _reference_ancestors(path / "entry", _guard=self.path_guard, _expected=captured)
+            info = _acquire("lstat", path, _guard=self.path_guard)
+            _acquisition_identity(self.path_guard, path, info,
+                                  replacement=_directory_mark(info) != captured_mark)
             mark = _directory_mark(info)
+            _acquisition_require(mark == captured_mark and _same_path_ancestors(ancestors, captured),
+                                 self.path_guard, "reference parent changed while opening")
             names = _directory_names(path) if membership else None
+        if _reference_descriptors():
+            directory, after = _reference_parent(path, _guard=self.path_guard, _expected=ancestors)
+            try:
+                _acquisition_require(_same_path_ancestors(after, ancestors), self.path_guard,
+                                     "reference parent changed while opening")
+            finally:
+                os.close(directory)
+        else:
+            after = _reference_ancestors(path / "entry", _guard=self.path_guard, _expected=ancestors)
+            _acquisition_require(_same_path_ancestors(after, ancestors), self.path_guard,
+                                 "reference parent changed while opening")
         return mark, names, ancestors
 
     @_capture_attempt
     def entries(self, path, *, optional=False, append=False, identity_only=False):
         path = Path(path)
-        if path in self.folders and not append:
-            if identity_only:
-                return []
-            if self.folders[path][1] is not None:
-                return [path / name for name in self.folders[path][1]]
+        previous = self.folders.get(path)
         try:
-            current = self._members(path, membership=not identity_only)
-        except FileNotFoundError:
+            current = self._members(path, membership=not identity_only or previous is not None and previous[1] is not None,
+                                    _expected=previous)
+        except FileNotFoundError as error:
             require(optional and path not in self.folders, "captured directory disappeared: " + str(path))
-            self.exists(path)
+            outcome = _acquisition_fact(error)
+            _acquisition_require(outcome is not None and outcome.negative is not None, self.path_guard,
+                                 "reference parent changed while opening")
+            edge, ancestors = outcome.negative
+            expected = _AbsentReference(edge, ancestors, requested=path)
+            missing = _missing_input_info(path, self.path_guard, expected=expected)
+            self.absences.setdefault(missing.path, missing.ancestors)
             return []
         if path in self.folders:
             previous = self.folders[path]
-            require(_same_mark(current[0], previous[0]) and _same_ancestors(current[2], previous[2])
-                    and (previous[1] is None or set(previous[1]) <= set(current[1])), "captured directory changed: " + str(path))
+            _acquisition_require(_same_mark(current[0], previous[0]) and _same_ancestors(current[2], previous[2])
+                    and (previous[1] is None or (set(previous[1]) <= set(current[1]) if append
+                                                 else previous[1] == current[1])), self.path_guard, "captured directory changed: " + str(path))
         self.folders[path] = current
         return [] if identity_only else [path / name for name in current[1]]
 
@@ -1387,15 +3258,25 @@ class _Operation:
         """Adopt only this operation's known committed append, never an arbitrary membership change."""
         path = Path(path)
         if path.parent in self.folders and self.folders[path.parent][1] is not None:
-            previous, current = self.folders[path.parent], self._members(path.parent)
-            require(_same_mark(previous[0], current[0]) and _same_ancestors(previous[2], current[2])
+            previous = self.folders[path.parent]
+            current = self._members(path.parent, _expected=previous)
+            _acquisition_require(_same_mark(previous[0], current[0]) and _same_ancestors(previous[2], current[2])
                     and set(current[1]) == set(previous[1]) | {path.name},
-                    "captured directory changed during publication: " + str(path.parent))
+                    self.path_guard, "captured directory changed during publication: " + str(path.parent))
             self.folders[path.parent] = current
         actual, _raw = self.read(path, limit=life.MAX_BYTES if path.suffix == ".json" else MAX_BYTES)
-        require(expected is None or actual["sha256"] == expected, "committed publication content changed: " + str(path))
+        _acquisition_require(expected is None or actual["sha256"] == expected, self.path_guard, "committed publication content changed: " + str(path))
 
     def fail(self, error):
+        from hierarchy_router import PrivatePathError
+        previous = self.validation_failure
+        if isinstance(error, PrivatePathError) and not isinstance(previous, PrivatePathError):
+            self.validation_failure = error
+        acquired = getattr(previous, "_acquisition_outcome", None)
+        if acquired is not None and acquired.kind == "CHANGED" and error.__cause__ is previous:
+            error._acquisition_outcome = acquired
+            if isinstance(error, CaptureChanged):
+                self.validation_failure = error
         if not self.failed_validation:
             self.validation_failure = (error if isinstance(error, (ValueError, OSError))
                                        else ValueError("captured input validation failed"))
@@ -1406,7 +3287,7 @@ class _Operation:
     @contextmanager
     def capture(self):
         """A failed attempt remains failed even if it never registered a witness."""
-        with self.path_guard.active():
+        with self.active():
             try:
                 yield
             except (ValueError, OSError, TypeError, KeyError, RecursionError) as exc:
@@ -1426,22 +3307,18 @@ class _Operation:
         A Hold or any exception skips proof creation, including checks outside
         capture(). Recovery may inspect captured metadata but cannot mint proof.
         """
-        from hierarchy_router import PrivatePathError
-        with self.path_guard.active():
+        with self.active(), self.required():
             try:
                 verification(*args)
                 self.verify()
                 return object()
             except (ValueError, OSError, TypeError, KeyError, RecursionError) as exc:
-                _raise_global(exc, operation=self)
-                outcome = _disposition(exc, guard=self.path_guard, seam="operation")
-                if (isinstance(exc, PrivatePathError)
-                        or outcome == GLOBAL and getattr(exc, "_path_failure", False)):
-                    self.fail(exc)
+                _latch_operation_path_failure(self, exc)
                 # A semantic HOLD mints no proof, but retains its validated
                 # inputs for the owner's existing blocked-disposition drafts.
                 raise
 
+    @_capture_attempt
     def verify(self):
         from hierarchy_router import PrivatePathError
         try:
@@ -1450,54 +3327,45 @@ class _Operation:
                 validate()
             for path, (mark, ancestors) in self.existences.items():
                 current = self.path_guard.check(path)
-                require(current is not None and _same_mark(_directory_mark(current[0]), mark)
-                        and _same_ancestors(current[1], ancestors), "captured existing input changed")
+                _acquisition_require(current is not None and _same_mark(_directory_mark(current[0]), mark)
+                        and _same_ancestors(current[1], ancestors), self.path_guard, "captured existing input changed")
             groups = {}
             for _ref, _raw, witness in self.files.values():
                 groups.setdefault(witness["path"].parent, []).append(witness)
-            for path in set(self.folders) | {p.parent for p in self.absences}:
+            for path in self.folders:
                 groups.setdefault(path, [])
             for parent, witnesses in groups.items():
                 descriptor = listing = None
                 path = parent
                 try:
                     anchored = _reference_descriptors()
+                    expected = witnesses[0]["ancestors"] if witnesses else self.folders[parent][2]
                     if anchored:
-                        descriptor, ancestors = _reference_parent(parent, _guard=self.path_guard)
+                        descriptor, ancestors = _reference_parent(parent, _guard=self.path_guard, _expected=expected)
                     else:
-                        ancestors = _reference_ancestors(parent / "entry", _guard=self.path_guard)
+                        ancestors = _reference_ancestors(parent / "entry", _guard=self.path_guard, _expected=expected)
                     for witness in witnesses:
                         path = witness["path"]
-                        info = (os.stat(path.name, dir_fd=descriptor, follow_symlinks=False) if anchored else os.lstat(path))
-                        self.path_guard.check_identity(path, info)
-                        require(_same_ancestors(ancestors, witness["ancestors"])
+                        info = (_acquire("stat", path.name, dir_fd=descriptor, follow_symlinks=False, _guard=self.path_guard, _path=path, _expected_mark=witness["mark"]) if anchored else _acquire("lstat", path, _guard=self.path_guard, _path=path, _expected_mark=witness["mark"]))
+                        _acquisition_identity(self.path_guard, path, info,
+                                              replacement=not _same_mark(_reference_mark(info), witness["mark"]))
+                        _acquisition_require(_same_ancestors(ancestors, witness["ancestors"])
                                 and _same_mark(_reference_mark(info), witness["mark"]),
-                                "captured attachment identity/content metadata changed: " + str(path))
-                    for path, previous in self.absences.items():
-                        if path.parent != parent:
-                            continue
-                        require(_same_ancestors(ancestors, previous), "captured absent input parent changed: " + str(path))
-                        try:
-                            info = os.stat(path.name, dir_fd=descriptor, follow_symlinks=False) if anchored else os.lstat(path)
-                        except FileNotFoundError:
-                            pass
-                        else:
-                            self.path_guard.check_identity(path, info)
-                            raise ValueError("captured absent input changed (appeared): " + str(path))
+                                self.path_guard, "captured attachment identity/content metadata changed: " + str(path))
                     if parent in self.folders:
                         path = parent
                         previous = self.folders[parent]
                         if previous[1] is None:
-                            mark = _directory_mark(os.fstat(descriptor) if anchored else os.lstat(parent))
+                            mark = _directory_mark(_acquire("fstat", descriptor, _guard=self.path_guard) if anchored else _acquire("lstat", parent, _guard=self.path_guard))
                             names = None
                         elif anchored:
-                            listing = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptor)
-                            mark, names = _directory_mark(os.fstat(listing)), _directory_names(listing)
+                            listing = _acquire("open", ".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptor, _guard=self.path_guard)
+                            mark, names = _directory_mark(_acquire("fstat", listing, _guard=self.path_guard)), _directory_names(listing)
                         else:
-                            mark, names = _directory_mark(os.lstat(parent)), _directory_names(parent)
-                        require(_same_mark(mark, previous[0]) and names == previous[1]
+                            mark, names = _directory_mark(_acquire("lstat", parent, _guard=self.path_guard)), _directory_names(parent)
+                        _acquisition_require(_same_mark(mark, previous[0]) and names == previous[1]
                                 and _same_ancestors(ancestors, previous[2]),
-                                "captured directory membership changed: " + str(parent))
+                                self.path_guard, "captured directory membership changed: " + str(parent))
                 except PrivatePathError:
                     raise
                 except (ValueError, OSError) as exc:
@@ -1508,9 +3376,28 @@ class _Operation:
                         os.close(listing)
                     if descriptor is not None:
                         os.close(descriptor)
+            for path, previous in self.absences.items():
+                try:
+                    try:
+                        info, ancestors = _scope_reference_info(path, self.path_guard)
+                    except _ProofPathError as exc:
+                        _raise_reference_acquisition(exc, path, self.path_guard)
+                    # The shared walk checks private identity before returning
+                    # either the leaf or its anchored negative witness.
+                    _acquisition_require(_same_ancestors(ancestors, previous), self.path_guard, "captured absent input parent changed: " + str(path))
+                    _acquisition_require(isinstance(info, _AbsentReference), self.path_guard, "captured absent input changed (appeared): " + str(path))
+                except PrivatePathError:
+                    raise
+                except (ValueError, OSError) as exc:
+                    _raise_global(exc, operation=self)
+                    raise CaptureChanged(path, exc) from exc
+            self.witnesses.verify()
         except (ValueError, OSError, TypeError, KeyError, RecursionError) as exc:
             _raise_global(exc, operation=self)
             self.fail(exc)
+            if (getattr(self.path_guard, "_proof_refusals", False)
+                    and getattr(exc, "_acquisition_outcome", None) is not None):
+                _acquisition_error(exc, self.path_guard, caller="trust")
             raise
 
     @_capture_attempt
@@ -1594,6 +3481,7 @@ class _CapturedLifecycle(Lifecycle):
         paths = self.operation.entries(self.root / "events", append=True)
         require(len(paths) <= life.MAX_EVENTS, "lifecycle event limit reached")
         if self._snapshot is not None and len(paths) == len(self.records):
+            self.operation.recheck_files(paths, limit=life.MAX_BYTES)
             return copy.deepcopy(self._snapshot)
         state, genesis = life.initial_state(policy), None
         # Dependency captures belong to this operation, not a journal revision.
@@ -1849,6 +3737,7 @@ class _CapturedMailbox(Mailbox):
             self.root = Path(root)
             self.manifest = protocol.validate_manifest(self.operation.json(self.root / "manifest.json"))
         self._records = None
+        self._record_folders = None
         self.message_refusals = {}
         self._stored_message_paths = None
         self._stored_message_refusals = None
@@ -1866,7 +3755,8 @@ class _CapturedMailbox(Mailbox):
         stored = self._stored_message_paths is not None
         if not stored:
             try:
-                self.operation.path_guard.check(path)
+                with self.operation.required():
+                    self.operation.path_guard.check(path)
             except PrivatePathError as exc:
                 self.operation.fail(exc)
                 raise
@@ -1909,8 +3799,17 @@ class _CapturedMailbox(Mailbox):
             require(candidate.is_absolute() and ".." not in candidate.parts, "path must be absolute without traversal")
             if candidate in private:
                 return candidate
+            # Historical readiness remains a local metadata declaration even
+            # when its mailbox is inspected inside a required proof pass.
+            route = self.operation.path_guard._acquisition_route
+            token = route.set("metadata") if self._stored_message_paths is not None else None
             try:
-                self.operation.path_guard.check(candidate, scope=True)
+                observation = (_declaration_operation(self.operation, _proof=False)
+                    if self._stored_message_paths is not None else self.operation)
+                with observation.active():
+                    self.operation.path_guard.check(candidate, scope=True)
+                    if observation is not self.operation:
+                        observation.verify()
                 return candidate
             except (ValueError, OSError) as exc:
                 if (self._stored_message_paths is None or _disposition(exc, guard=self.operation.path_guard,
@@ -1919,6 +3818,9 @@ class _CapturedMailbox(Mailbox):
                 self._stored_message_paths.add(candidate)
                 self._stored_message_refusals.append(str(exc))
                 return candidate
+            finally:
+                if token is not None:
+                    route.reset(token)
         original = Mailbox.readiness
         function = FunctionType(original.__code__, dict(original.__globals__, safe_path=path),
                                 original.__name__, original.__defaults__, original.__closure__)
@@ -1938,12 +3840,16 @@ class _CapturedMailbox(Mailbox):
         # Repeated checks share one content-addressed packet. Reuse its capture,
         # including after a partial batch, without rereading it through publish().
         require_secure_publication()
+        fields(reference, {"path", "sha256"})
+        matching(reference["sha256"], SHA256, "brief sha256")
+        text(reference["path"], "brief path")
+        _acquire("witness", "output", reference["path"], _guard=self.operation.path_guard)
         self.brief(reference, verify=False)
         if Path(reference["path"]) not in self.operation.files:
-            try:
-                os.lstat(reference["path"])
-            except FileNotFoundError:
-                publish(raw, reference)
+            info, _ancestors = _acquire("proof", _scope_reference_info,
+                (Path(reference["path"]), self.operation.path_guard), {}, _guard=self.operation.path_guard)
+            if isinstance(info, _AbsentReference):
+                publish(raw, reference, _operation=self.operation)
                 return
         require(self.brief(reference) == raw, "content-addressed brief already exists with different bytes")
 
@@ -2017,7 +3923,8 @@ class _CapturedMailbox(Mailbox):
     def ready(self, binding):
         if binding["generation"] == 1:
             return True
-        path = safe_path(self.root / "bindings" / binding["endpoint"] / ("%06d.ack" % binding["generation"]))
+        with self.operation.required():
+            path = safe_path(self.root / "bindings" / binding["endpoint"] / ("%06d.ack" % binding["generation"]))
         if not self.operation.exists(path):
             return False
         ack = self.operation.json(path)
@@ -2028,15 +3935,21 @@ class _CapturedMailbox(Mailbox):
     @_operation_context
     def messages(self):
         if self._records is not None:
+            self.operation.json(self.root / "manifest.json")
+            for folder in self._record_folders:
+                self.operation.entries(folder)
+            self.operation.recheck_files([record["path"] for record in self._records.values()])
             return dict(self._records)
         records = {}
         folders = {self.root / endpoint.split("/")[0] / endpoint.split("/")[1]
                    for endpoint in self.manifest["endpoints"]}
         folders |= {self.root / "across" / role for role in protocol.ACROSS_ROLES}
-        for folder in sorted(folders):
+        self._record_folders = sorted(folders)
+        for folder in self._record_folders:
             safe_path(folder)
             for path in self.operation.entries(folder):
-                require(not path.is_symlink(), "symlink mailbox entry is not supported")
+                info, _ancestors = _proof_check(path, _guard=self.operation.path_guard)
+                require(not stat.S_ISLNK(info.st_mode), "symlink mailbox entry is not supported")
                 if path.name.startswith(".pending-"):
                     continue
                 require(path.suffix == ".md", "unexpected mailbox entry: " + str(path))
@@ -2138,6 +4051,10 @@ class Brief:
             if set(value) == {"path", "sha256"}:
                 try:
                     if self.authoritative:
+                        if not _descriptor_capabilities():
+                            refused = _ProofPathError("secure scope proof requires directory descriptor support")
+                            _acquisition_detect(self.operation.path_guard, "CHANGED", refused)
+                            raise refused
                         self.check_reference(value)
                     else:
                         path = Path(text(value["path"], "reference path"))
@@ -2297,7 +4214,7 @@ def role_contract(brief, mailbox, base, setup, endpoint):
     require(plan is None or plan["hierarchy"] == endpoint_parts(endpoint)[0], "host plan hierarchy mismatch")
     host, _ = hierarchy_hosts.plan_host(plan, endpoint)
     family = hierarchy_hosts.family(host) if host is not None else "codex"
-    source = safe_path(setup["source"]) if setup else Path(__file__).resolve().parents[1]
+    source = safe_path(setup["source"]) if setup else _acquire("source", __file__).parents[1]
     if plan is not None:
         brief.add("Evidence references", "host_plan", brief.reference(base / hierarchy_hosts.PLAN_FILE))
     if role == "root":
@@ -2796,7 +4713,7 @@ def protect_stores(output, mailbox, base, run, lifecycle, delivery, setup):
     for path in mailbox.operation.entries(folder, optional=True):
         # Capture each selected directory's identity even when its provision is absent.
         safe_path(path)
-        if stat.S_ISDIR(os.lstat(path).st_mode):
+        if stat.S_ISDIR(_acquire("lstat", path, _guard=mailbox.operation.path_guard).st_mode):
             mailbox.operation.entries(path, identity_only=True)
             provisions.add(path / "provision.json")
     values = [setup] if setup is not None else []
@@ -2835,6 +4752,7 @@ def _prepare(args, *, _mailbox, _request_id, _operation):
     require(endpoint_parts(args.endpoint)[0] == args.initiative, "endpoint is outside initiative " + args.initiative)
     mailbox, base, run, setup = locate(cli_path(args.root, "--root"), args.initiative,
                                      _mailbox=_mailbox, _operation=_operation)
+    mailbox.operation.output_directory(base / "briefs")
     args._prepared_mailbox = mailbox
     mailbox.endpoint(args.endpoint)
     at, as_of = composition_time(args.as_of)
@@ -2873,6 +4791,7 @@ def _prepare(args, *, _mailbox, _request_id, _operation):
     inspect(raw, _check_ref=mailbox.check_ref, _operation=mailbox.operation)  # Validate before publication.
     sha = hashlib.sha256(raw).hexdigest()
     reference = {"path": str(base / "briefs" / ("fresh-" + sha + ".md")), "sha256": sha}
+    _acquire("witness", "output", reference["path"], _guard=mailbox.operation.path_guard)
     mailbox.brief(reference, verify=False)
     return raw, {"ok": True, "brief": reference, "entries": len(brief.seen),
                  "coverage": {"lifecycle": lifecycle_coverage}, "as_of": as_of, "target_generation": generation}
@@ -2887,21 +4806,17 @@ def require_secure_publication():
     # supports both descriptors. Inspect the native capability names so wrapping
     # an OS call for a deterministic boundary test does not change its capability.
     names = {function.__name__ for function in os.supports_dir_fd}
-    require(hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW")
+    require(hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW") and callable(getattr(os, "geteuid", None))
             and {"open", "mkdir", "rename", "unlink", "stat"} <= names,
             "secure brief publication requires directory descriptor support")
 
 
 def open_directory(path):
     """Traverse from the filesystem root, opening every component without following links."""
-    flags = directory_flags()
     descriptor = None
     try:
-        descriptor = os.open(path.anchor, flags)
-        for component in path.parts[1:]:
-            child = os.open(component, flags, dir_fd=descriptor)
-            os.close(descriptor)
-            descriptor = child
+        from hierarchy_router import _operation_guard
+        descriptor, _marks = _proof_parent(path, _guard=_operation_guard())
         return descriptor
     except OSError as exc:
         if descriptor is not None:
@@ -2909,6 +4824,10 @@ def open_directory(path):
         if exc.errno == errno.EACCES:
             raise PublicationRefused("publication directory permission denied: " + str(path)) from exc
         raise PublicationRefused("publication directory changed or unavailable") from exc
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
 
 
 def directory_flags():
@@ -2917,53 +4836,81 @@ def directory_flags():
     return getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
-def check_directory(base_fd, directory_fd, name):
-    try:
-        current = os.stat(name, dir_fd=base_fd, follow_symlinks=False)
-    except OSError as exc:
-        if exc.errno == errno.EACCES:
-            raise PublicationRefused("publication directory permission denied: " + name) from exc
-        raise PublicationRefused("publication directory changed") from exc
-    opened = os.fstat(directory_fd)
+def check_directory(base_fd, directory_fd, name, *, path):
+    from hierarchy_router import _operation_guard
+    guard = _operation_guard()
+    current = _acquire("stat", name, dir_fd=base_fd, follow_symlinks=False, _guard=guard)
+    opened = _acquire("fstat", directory_fd, _guard=guard)
     if not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
-        raise PublicationRefused("publication directory changed")
+        _acquisition_replacement(guard, path, current)
+
+
+def _publication_directory_failure(path, base_fd, error):
+    from hierarchy_router import _operation_guard
+    guard = _operation_guard()
+    if error.errno in {errno.ELOOP, errno.ENOTDIR, errno.ENOENT}:
+        try:
+            current = _acquire("stat", path.name, dir_fd=base_fd,
+                               follow_symlinks=False, _guard=guard)
+        except (ValueError, OSError) as checking:
+            _raise_global(checking, guard=guard)
+        else:
+            _acquisition_replacement(guard, path, current)
+    _acquisition_refuse(guard, error)
 
 
 def file_identity(value):
     return value.st_dev, value.st_ino
 
 
-def check_returned_path(path, identity):
+def check_returned_path(path, identity, *, directory_fd, ancestors):
+    from hierarchy_router import _operation_guard
+    guard = _operation_guard()
+    returned, _marks = _proof_parent(path.parent, _guard=guard, _expected=ancestors)
     try:
-        returned = os.stat(path, follow_symlinks=False)
-    except OSError as exc:
-        raise RuntimeError("published brief pathname no longer identifies written file: " + str(path)) from exc
-    if file_identity(returned) != identity:
-        raise RuntimeError("published brief pathname no longer identifies written file: " + str(path))
+        _acquisition_require(file_identity(_acquire("fstat", returned, _guard=guard))
+                == file_identity(_acquire("fstat", directory_fd, _guard=guard)), guard,
+                "reference parent changed while opening")
+        leaf = _acquire("stat", path.name, dir_fd=returned, follow_symlinks=False, _guard=guard)
+        _acquisition_require(file_identity(leaf) == identity, guard, "reference parent changed while opening")
+    finally:
+        os.close(returned)
+    _check_output_ancestor(path, directory_fd, _expected=ancestors)
 
 
-def _check_output_ancestor(path, directory_fd):
+def _check_output_ancestor(path, directory_fd, *, _expected=None):
     """Preserve the output-path refusal before an input witness can obscure a moved ancestor."""
+    from hierarchy_router import _operation_guard
+    guard = _operation_guard()
+    # The held directory is already a positive witness, even before its full
+    # pathname ancestry has been recorded for later returned-path checks.
+    returned, ancestors = _proof_parent(path.parent, _guard=guard, _expected=_expected, _captured=True)
     try:
-        returned = open_directory(path.parent)
-    except PublicationRefused as exc:
-        raise RuntimeError("published brief pathname no longer identifies written file: " + str(path)) from exc
-    try:
-        if file_identity(os.fstat(returned)) != file_identity(os.fstat(directory_fd)):
-            raise RuntimeError("published brief pathname no longer identifies written file: " + str(path))
+        _acquisition_require(file_identity(_acquire("fstat", returned, _guard=guard))
+                == file_identity(_acquire("fstat", directory_fd, _guard=guard)), guard,
+                "reference parent changed while opening")
+        return ancestors
     finally:
         os.close(returned)
 
 
-def remove_written_file(directory_fd, name, identity):
+def remove_written_file(directory_fd, name, identity, *, _failure=None):
     try:
-        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return
-    # Another composer can have replaced the same content address. Remove only
-    # our inode; never delete the other tool's publication during cleanup.
-    if file_identity(current) == identity:
-        os.unlink(name, dir_fd=directory_fd)
+        current = _acquire("stat", name, dir_fd=directory_fd, follow_symlinks=False)
+        # Another composer can have replaced the same content address. Remove
+        # only our inode, through the held directory, during cleanup.
+        if file_identity(current) == identity:
+            _acquire("unlink", name, dir_fd=directory_fd)
+    except (ValueError, OSError) as exc:
+        from hierarchy_router import PrivatePathError
+        _raise_global(exc)
+        acquired = _acquisition_fact(exc)
+        cause = exc.__cause__ if acquired is not None and acquired.kind == "CHANGED" else exc
+        if isinstance(cause, FileNotFoundError) and cause.errno == errno.ENOENT:
+            return  # Another actor already removed the owned entry; no unlink is needed.
+        if isinstance(_failure, PrivatePathError):
+            raise _failure
+        raise
 
 
 def sync_publication_directory(directory_fd):
@@ -2973,94 +4920,117 @@ def sync_publication_directory(directory_fd):
         return
     # O_PATH handles permit traversal but cannot be fsynced. Reopen the anchored
     # directory read-only on POSIX, rather than resolving its pathname again.
-    descriptor = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd)
+    descriptor = _acquire("open", ".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd)
     try:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
 
 
+def _publication_context(method):
+    @wraps(method)
+    def publication(raw, reference, *, _operation=None):
+        operation = _operation
+        if operation is None:
+            from hierarchy_router import _operation_guard
+            guard = _operation_guard()
+            context = getattr(guard, "_acquisition_context", None)
+            operation = context.get() if context is not None else None
+            if operation is None:
+                operation = _Operation(_path_guard=guard)
+        with operation.active():
+            return method(raw, reference, _operation=operation)
+    return publication
+
+
+@_publication_context
 def publish(raw, reference, *, _operation=None):
     require_secure_publication()
     path = Path(reference["path"])
+    _acquire("witness", "output", path)
+    _acquire("witness", "publication-directory", path.parent)
     base_fd = open_directory(path.parent.parent)
     directory_fd = None
     pending = None
     try:
         try:
             try:
-                directory_fd = os.open(path.parent.name, directory_flags(), dir_fd=base_fd)
+                directory_fd = _acquire("open", path.parent.name, directory_flags(), dir_fd=base_fd, _negative=(path.parent, None))
             except FileNotFoundError:
-                try:
-                    os.mkdir(path.parent.name, mode=0o700, dir_fd=base_fd)
-                except FileExistsError:
-                    pass  # Another composer created the same output directory.
-                directory_fd = os.open(path.parent.name, directory_flags(), dir_fd=base_fd)
+                directory_fd = _acquire("mkdir", path.parent.name, mode=0o700,
+                                        dir_fd=base_fd, _path=path.parent)
         except OSError as exc:
-            if exc.errno == errno.EACCES:
-                raise PublicationRefused("publication directory permission denied: " + str(path.parent)) from exc
-            if exc.errno in {errno.ELOOP, errno.ENOTDIR, errno.ENOENT}:
-                raise PublicationRefused("publication directory changed") from exc
-            raise
-        check_directory(base_fd, directory_fd, path.parent.name)
+            _publication_directory_failure(path.parent, base_fd, exc)
+        check_directory(base_fd, directory_fd, path.parent.name, path=path.parent)
+        ancestors = _check_output_ancestor(path, directory_fd)
         try:
-            existing = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+            existing = _acquire("open", path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd, _negative=(path, None))
         except FileNotFoundError:
             existing = None
         except OSError as exc:
             if exc.errno == errno.ELOOP:
                 raise PublicationRefused("content-addressed brief is a symlink") from exc
-            if not stat.S_ISREG(os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False).st_mode):
+            if not stat.S_ISREG(_acquire("stat", path.name, dir_fd=directory_fd, follow_symlinks=False).st_mode):
                 raise PublicationRefused("brief must be a regular file") from exc
             raise
         if existing is not None:
-            metadata = os.fstat(existing)
-            if not stat.S_ISREG(metadata.st_mode):
-                os.close(existing)
-                raise PublicationRefused("brief must be a regular file")
-            with os.fdopen(existing, "rb") as stream:
-                if stream.read(MAX_BYTES + 1) != raw:
-                    raise PublicationRefused("content-addressed brief already exists with different bytes")
-            check_directory(base_fd, directory_fd, path.parent.name)
-            check_returned_path(path, file_identity(metadata))
+            try:
+                metadata = _acquire("fstat", existing)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise PublicationRefused("brief must be a regular file")
+                owned, existing = existing, None
+                with _acquire("fdopen", owned, "rb") as stream:
+                    if _acquire("stream-read", stream, MAX_BYTES + 1) != raw:
+                        raise PublicationRefused("content-addressed brief already exists with different bytes")
+            finally:
+                if existing is not None:
+                    os.close(existing)
+            check_directory(base_fd, directory_fd, path.parent.name, path=path.parent)
+            check_returned_path(path, file_identity(metadata), directory_fd=directory_fd, ancestors=ancestors)
             sync_publication_directory(directory_fd)
             sync_publication_directory(base_fd)
-            check_returned_path(path, file_identity(metadata))
+            check_returned_path(path, file_identity(metadata), directory_fd=directory_fd, ancestors=ancestors)
             if _operation is not None:
                 _operation.verify()
             return
         pending = ".fresh-" + uuid.uuid4().hex
-        descriptor = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory_fd)
-        with os.fdopen(descriptor, "wb") as stream:
-            identity = file_identity(os.fstat(stream.fileno()))
+        descriptor = _acquire("open", pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory_fd)
+        with _acquire("fdopen", descriptor, "wb") as stream:
+            identity = file_identity(_acquire("fstat", stream.fileno()))
             stream.write(raw)
             stream.flush()
             os.fsync(stream.fileno())
-        check_directory(base_fd, directory_fd, path.parent.name)
-        _check_output_ancestor(path, directory_fd)
+        check_directory(base_fd, directory_fd, path.parent.name, path=path.parent)
+        _check_output_ancestor(path, directory_fd, _expected=ancestors)
         if _operation is not None:
             _operation.verify()
-        os.replace(pending, path.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        _acquire("replace", pending, path.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
         pending = None
+        _acquire("witness", "effect", path, identity)
+        try:
+            check_returned_path(path, identity, directory_fd=directory_fd, ancestors=ancestors)
+        except (ValueError, RuntimeError) as exc:
+            remove_written_file(directory_fd, path.name, identity, _failure=exc)
+            raise
         if _operation is not None:
             try:
                 _operation.verify()
             except (ValueError, OSError) as exc:
                 raise PublicationRefused("committed brief " + str(path) + " requires reconciliation; verify this original path before reuse: " + str(exc)) from exc
         try:
-            check_directory(base_fd, directory_fd, path.parent.name)
-            check_returned_path(path, identity)
+            check_returned_path(path, identity, directory_fd=directory_fd, ancestors=ancestors)
+            check_directory(base_fd, directory_fd, path.parent.name, path=path.parent)
             sync_publication_directory(directory_fd)
             sync_publication_directory(base_fd)
-            check_returned_path(path, identity)
-        except (PublicationRefused, RuntimeError):
-            remove_written_file(directory_fd, path.name, identity)
+            check_returned_path(path, identity, directory_fd=directory_fd, ancestors=ancestors)
+        except (ValueError, RuntimeError) as exc:
+            remove_written_file(directory_fd, path.name, identity, _failure=exc)
             raise
     finally:
         if directory_fd is not None:
             try:
                 if pending is not None:
-                    os.unlink(pending, dir_fd=directory_fd)
+                    _acquire("unlink", pending, dir_fd=directory_fd)
             except FileNotFoundError:
                 pass
             finally:
@@ -3088,12 +5058,12 @@ def main(argv=None):
         if args.command == "compose":
             raw, answer = prepare(args)
         else:
-            from hierarchy_router import preflight_paths, _lexical_path
+            from hierarchy_router import _lexical_path
             path = _lexical_path(args.path)
             if not path.is_absolute() or ".." in path.parts:
                 cli_path(args.path, "--path")
             operation = _Operation()
-            preflight_paths(path, _guard=operation.path_guard)
+            _ordinary_reference_check(path, operation.path_guard)
             matching(args.sha256, SHA256, "brief sha256")
             require(path.suffix == ".md", "brief must be a Markdown file")
             _reference, raw = operation.read(path)
@@ -3114,6 +5084,12 @@ def main(argv=None):
         print(json.dumps({"error": str(exc)}, sort_keys=True))
         return 2
     except Exception as exc:
+        acquired = _acquisition_fact(exc)
+        if acquired is not None:
+            message = ("owner-private host directory is not an input" if acquired.kind == "PRIVATE"
+                       else "reference parent changed while opening")
+            print(json.dumps({"error": message}, sort_keys=True))
+            return 2
         print(json.dumps({"error": "brief publication failed: " + str(exc)}, sort_keys=True))
         return 3
     print(json.dumps(answer, sort_keys=True))

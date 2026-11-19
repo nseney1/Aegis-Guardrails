@@ -645,7 +645,7 @@ def blamed(source, action):
 
 @_request_context
 def status(lifecycle, store, wait, recipes=None, *, _operation=None):
-    from hierarchy_fresh_brief import _Operation
+    from hierarchy_fresh_brief import _Operation, check_reference_parent_access
     operation = _Operation() if _operation is None else _operation
     preflight_paths(lifecycle.root, store.path, *([recipes] if recipes is not None else []),
                     _guard=operation.path_guard)
@@ -654,6 +654,7 @@ def status(lifecycle, store, wait, recipes=None, *, _operation=None):
     operation.verify()
     from hierarchy_small_change_dispatch import _CapturedStore
     def load_store():
+        check_reference_parent_access(store.path, guard=operation.path_guard)
         checked = operation.path_guard.check(store.path)
         require(checked is None or stat.S_ISDIR(checked[0].st_mode), "workspace store is not initialized")
         return _CapturedStore(store.path, operation).load()
@@ -845,7 +846,11 @@ def main(argv=None):
                     cli_path(value, flag)  # Pinned lexical refusal, before any metadata.
         operation = _Operation()
         with operation.capture():
-            preflight_paths(args.lifecycle, args.store, *([args.recipes] if getattr(args, "recipes", None) is not None else []), _guard=operation.path_guard)
+            try:
+                preflight_paths(args.lifecycle, args.store, *([args.recipes] if getattr(args, "recipes", None) is not None else []), _guard=operation.path_guard)
+            except (ValueError, OSError) as exc:
+                from hierarchy_fresh_brief import _walk_error
+                _walk_error(exc, Path(args.lifecycle) / ".write.lock", seam="lock-preflight")
             lifecycle_path, store_path = cli_path(args.lifecycle, "--lifecycle"), cli_path(args.store, "--store")
             lifecycle = blamed("journal", lambda: Lifecycle(lifecycle_path))
             store = blamed("store", lambda: Store(store_path))

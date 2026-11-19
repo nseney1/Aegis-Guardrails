@@ -174,6 +174,7 @@ AUDIT_WRITERS = {
     ("tools/hierarchy_fixture_broker.py", "Work.__init__"): "existing mkdir; source lines 219",
     ("tools/hierarchy_fixture_broker.py", "worker"): "existing subprocess DEVNULL; source lines 461",
     ("tools/hierarchy_foundation_acceptance.py", "inspect_legacy"): "existing TemporaryDirectory, ; source lines 287, 290, 291, 294",
+    ("tools/hierarchy_fresh_brief.py", "_acquire"): "DISP-MACOS-OPATH centralized descriptor acquisition; publication open moved here from publish",
     ("tools/hierarchy_fresh_brief.py", "publish"): "existing mkdir, open, replace, unlink; source lines 2020, 2058, 2068, 2088",
     ("tools/hierarchy_fresh_brief.py", "remove_written_file"): "existing unlink; source lines 1991",
     ("tools/hierarchy_jobs.py", "commit_steps"): "existing mkdir, write_text; source lines 1937, 1938",

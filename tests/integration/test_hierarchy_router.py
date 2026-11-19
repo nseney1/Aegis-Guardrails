@@ -298,7 +298,7 @@ def test_round8_stored_public_scope_symlink_is_a_global_cli_refusal(loop):
     loop.approved(request("hostile", paths=[str(linked / "file.py")]))
     linked.rmdir()
     symlink_or_skip(public, linked, target_is_directory=True)
-    expected = "symlink paths are not supported: " + str(linked)
+    expected = "reference parent changed while opening"
     for _ in range(2):
         answer = loop.run("status", "--wait", "5", expect=2)
         assert answer["error"].encode() == expected.encode()

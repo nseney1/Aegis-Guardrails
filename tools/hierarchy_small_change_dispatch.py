@@ -828,7 +828,7 @@ class Row:
         store = checked_path(self.store.path)
         failures = self.store.private_refusals.get(self.team, [])
         check(not failures, "small_change_configuration", failures[0] if failures else "")
-        output = checked_path(self.mailbox.root.parent / "briefs")
+        output = checked_path(self.operation.output_directory(self.mailbox.root.parent / "briefs"))
         require(output != store and store not in output.parents and output not in store.parents,
                 "output directory overlaps coordination store: " + str(store))
         parents = {identifier("scw", self.row), identifier("scr", self.row)}

@@ -245,7 +245,11 @@ fresh.os = SimpleNamespace(**{**vars(os), 'stat': stated, 'open': opened})
         assert _seen["alias_checks"] > 0, (_seen, answer["small_changes"])
         assert not _seen["forbidden"]
         row = answer["small_changes"][0]
-        if consumed or walk_failure in {"denied", "changed"}:
+        if walk_failure in {"denied", "not-directory"}:
+            assert (row["state"], row["reason"]) == ("held", "small_change_result_invalid"), row
+            assert "reference parent changed while opening" in row["detail"], row
+            assert "writer_publication_verified" not in row
+        elif consumed or walk_failure in {"denied", "changed"}:
             reason = "small_change_configuration" if walk_failure in {"denied", "not-directory"} else "small_change_result_invalid"
             assert (row["state"], row["reason"]) == ("held", reason), row
             expected = {"identity": "owner-private host directory is not an input", "not-directory": "checkout is not registered",
@@ -2397,9 +2401,9 @@ def test_compat_bad_durable_input_blocks_wakes_but_run_open_continues(tmp_path, 
         if component == "store":
             from errno import EACCES
             from hierarchy_workspace_display import _display
-            assert owner[0]["detail"] == _display(PermissionError(EACCES, os.strerror(EACCES), first.name))
+            assert owner[0]["detail"] == "malformed workspace event: " + _display(first) + ": " + _display(ValueError("reference parent changed while opening"))
         else:
-            assert "Permission denied" in owner[0]["detail"]
+            assert owner[0]["detail"] == "reference parent changed while opening"
     elif damage == "symlink":
         assert "symlink" in owner[0]["detail"]
     else:
@@ -4106,7 +4110,7 @@ def test_r6_reader_refuses_nonempty_content_advertised_as_zero_bytes(tmp_path, p
     target.write_bytes(b"readable virtual content\n")
     code, answer = r6_reader_probe(target, portable=portable, virtual=True)
     assert code == 0 and answer["state"] == "refused", answer
-    assert answer["error"] == "reference content exceeds reported size: " + str(target), answer
+    assert answer["error"] == "reference parent changed while opening", answer
 
 
 @pytest.mark.parametrize("portable", [False, True], ids=["anchored", "portable"])
@@ -4128,7 +4132,7 @@ def test_r6_portable_open_identity_is_checked_before_reading_replacement(tmp_pat
     assert code == 0 and answer["observed"]["injected"], answer
     assert answer["observed"]["bytes"] == 0, answer
     assert answer["state"] == "refused", answer
-    assert answer["error"] == "reference changed while opening: " + str(target), answer
+    assert answer["error"] == "reference parent changed while opening", answer
 
 
 def test_r6_retained_zero_size_log_cannot_authenticate_an_empty_hash(tmp_path):
@@ -4388,7 +4392,7 @@ sys.exit(fresh.main(['verify', '--path', str(brief), '--sha256', __import__('has
         assert p.returncode == 0 and answer["ok"], answer
     else:
         assert p.returncode != 0 and not answer.get("ok", False), answer
-        assert "reference changed while opening" in answer["error"], answer
+        assert answer["error"] == "reference parent changed while opening", answer
 
 
 @pytest.mark.parametrize("damage", ["missing", "total-zero", "passed-zero", "reason", "reason-empty", "counts-disagree",
@@ -5768,7 +5772,11 @@ old_open = os.open
 seen['walks'] = {}
 def opened(path, flags, *args, **kw):
     frame = sys._getframe(1)
-    if path == '/' and frame.f_code.co_name == '_reference_parent' and frame.f_locals['path'] == Path(%r):
+    if frame.f_code.co_name == '_acquire':
+        frame = frame.f_back
+    if frame.f_code.co_name == '_proof_parent':
+        frame = frame.f_back
+    if path == '/' and frame.f_code.co_name in {'_reference_parent', '_proof_parent'} and frame.f_locals['path'] == Path(%r):
         caller = frame.f_back
         while caller is not None:
             if caller.f_code.co_name == 'verify' and caller.f_code.co_filename.endswith('hierarchy_fresh_brief.py'):
@@ -5889,7 +5897,11 @@ seen = False
 def opened(path, *args, **kw):
     global seen
     frame = sys._getframe(1)
-    if path == '/' and frame.f_code.co_name == '_reference_parent' and not seen:
+    if frame.f_code.co_name == '_acquire':
+        frame = frame.f_back
+    if frame.f_code.co_name == '_proof_parent':
+        frame = frame.f_back
+    if path == '/' and frame.f_code.co_name in {'_reference_parent', '_proof_parent'} and not seen:
         caller = frame.f_back
         if caller.f_code.co_name == 'verify' and caller.f_code.co_filename.endswith('hierarchy_fresh_brief.py'):
             seen = True
@@ -5907,7 +5919,7 @@ sys.exit(code)
         capture_output=True, text=True, timeout=20)
     assert process.stderr == "", process.stdout + process.stderr
     assert json.loads(telemetry.read_text()) is True
-    assert process.returncode == 2 and json.loads(process.stdout)["error"] == "modelled directory unavailable at recheck", process.stdout
+    assert process.returncode == 2 and json.loads(process.stdout)["error"] == "reference parent changed while opening", process.stdout
     assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
 
 
@@ -6181,6 +6193,23 @@ def test_r10_registry_witness_survives_until_writer_publication(tmp_path):
     world = DispatchWorld(tmp_path)
     before = world.ledger.files(), mailbox_snapshot(world.root)
     injection = r"""
+import hierarchy_fresh_brief as fresh
+old_stage = fresh._CapturedMailbox.stage
+def staged(self, raw, reference):
+    try:
+        return old_stage(self, raw, reference)
+    finally:
+        seen['caller_failed'] = self.operation.failed_validation
+        try:
+            self.operation.verify()
+        except (ValueError, OSError) as error:
+            seen['verify_refused'] = True
+            outcome = fresh._acquisition_fact(error)
+            seen['caller_outcome'] = outcome.kind if outcome is not None else None
+            seen['latched_detail'] = str(error)
+        else:
+            seen['verify_refused'] = False
+fresh._CapturedMailbox.stage = staged
 target = Path(router.__file__).parent / 'hierarchy_templates/role-registry.json'
 seen['changed'] = False
 old_stat, old_replace = os.stat, os.replace
@@ -6207,7 +6236,14 @@ os.stat, os.replace = inspected, replaced
     answer, seen = r7_router_probe(world, injection)
     row = answer["small_changes"][0]
     assert seen["changed"] and row["state"] == "held", (row, seen)
-    assert "changed" in row["detail"] and "role-registry.json" in row["detail"], row
+    assert seen["caller_failed"] and seen["verify_refused"] and seen["caller_outcome"] == "CHANGED", seen
+    assert seen["latched_detail"] == "reference parent changed while opening", seen
+    committed = list((world.root.parent / "briefs").glob("fresh-*.md"))
+    assert len(committed) == 1, committed
+    assert row["detail"] == (
+        "committed brief " + str(committed[0])
+        + " requires reconciliation; verify this original path before reuse: "
+        + "reference parent changed while opening"), row
     assert world.ledger.files() == before[0]
     after = mailbox_snapshot(world.root)
     # The content-addressed brief was staged before this late input change; no assignment was published.
@@ -6540,7 +6576,7 @@ os.listdir,os.scandir=listed,scanned
     before=world.ledger.files(),mailbox_snapshot(world.root)
     answer,seen=r7_router_probe(world,injection)
     row=answer['small_changes'][0]
-    assert row['state']=='held' and 'directory listing exceeds' in row['detail'],(row,seen)
+    assert row['state']=='held' and row['detail']=='reference parent changed while opening',(row,seen)
     assert seen['collections'] and max(seen['collections']) <= (10001 if budget=='entries' else 62),(row,seen)
     assert world.ledger.files()==before[0]
     after=mailbox_snapshot(world.root)
@@ -7870,7 +7906,7 @@ os.open = opened
     assert seen['changed'], seen
     row = answer['requests'][0]
     assert (row['state'], row.get('reason')) == ('held', 'team_mailbox_unreadable'), row
-    assert 'captured attachment identity/content metadata changed' in row['detail'], row
+    assert row['detail'] == 'reference parent changed while opening', row
     assert world.ledger.files() == before and world.inbox('engine') == []
 
 
@@ -8046,7 +8082,7 @@ os.read, os.stat = read, stated
     report, seen = r7_router_probe(world, injection, command='status')
     assert seen == {'brief_read': True, 'changed': True}, seen
     row = report['small_changes'][0]
-    assert row['state'] == 'held' and 'captured' in row['detail'], row
+    assert row['state'] == 'held' and row['detail'] == 'reference parent changed while opening', row
     assert not row.get('writer_publication_verified') and not row.get('route_receipt'), row
     assert 'engine/lane/fix' in report['planning_exclusions'], report
     assert world.ledger.files() == before and len(world.messages('dispatch')) == 1
@@ -8325,7 +8361,7 @@ os.read, os.open = read, opened
     assert seen == {'hashed': True, 'swapped': True}, seen
     row = next(r for r in report['small_changes'] if r['request_id'] == second.value['id'])
     assert (row['state'], row.get('reason')) == ('held', 'small_change_configuration'), row
-    assert row['detail'] == 'cached evidence reference path changed', row
+    assert row['detail'] == 'reference parent changed while opening', row
 
 
 def r18_damage_last_event(world, event):
@@ -8808,7 +8844,7 @@ fresh.os = SimpleNamespace(**dict(vars(original), read=read))
     answer, seen = r7_router_probe(world, injection)
     assert seen == {'failed_capture':True}, seen
     row = answer['small_changes'][0]
-    assert row['state'] == 'held' and row['detail'] == 'modelled single capture read failure', row
+    assert row['state'] == 'held' and row['detail'] == 'reference parent changed while opening', row
     assert not row.get('writer_publication_verified') and not row.get('route_receipt'), row
     assert 'engine/lane/fix' in answer['planning_exclusions'], answer
     assert snapshot_v1_unchanged(world) == before
@@ -8927,7 +8963,7 @@ fresh.os = SimpleNamespace(**dict(vars(original), read=read))
     row = answer['small_changes'][0]
     assert row['state'] == 'held' and row['reason'] == 'small_change_brief_unverified', row
     assert row['detail'] == 'authoritative brief attachment is unverified', row
-    assert row['release_validation_error'] == 'modelled retained packet read failure', row
+    assert row['release_validation_error'] == 'reference parent changed while opening', row
     assert not row.get('writer_publication_verified') and not row.get('route_receipt'), row
     assert 'engine/lane/fix' in answer['planning_exclusions'], answer
     assert snapshot_v1_unchanged(world) == before
@@ -9089,7 +9125,11 @@ dispatch.os = SimpleNamespace(**dict(vars(original), stat=stated))
     assert seen['probes'] == (1 if branch == 'first-live' else 2), seen
     assert_latch_custody(answer)
     assert answer['small_changes'][0]['detail'] == 'retained claim changed', answer
-    assert answer['small_changes'][0]['mailbox_history_verified'] is True, answer
+    if restore:
+        assert answer['small_changes'][0]['mailbox_history_verified'] is True, answer
+    else:
+        assert 'mailbox_history_verified' not in answer['small_changes'][0], answer
+        assert answer['small_changes'][0]['release_validation_error'] == 'reference parent changed while opening', answer
 
 
 @pytest.mark.parametrize('damage', ['missing', 'changed'])
@@ -9392,7 +9432,7 @@ def test_workspace_harden2_store_read_failure_is_displayed_and_recovers(tmp_path
         if damage == "missing-events":
             assert first["error"] == _display("captured directory disappeared: " + str(events))
         elif damage == "replaced-events":
-            assert first["error"] == "workspace store is not initialized"
+            assert first["error"] == _display(ValueError("reference parent changed while opening"))
         assert loop.run("status", expect=2) == first
         with ThreadPoolExecutor(max_workers=2) as pool:
             futures = [pool.submit(loop.run, "status", expect=2) for _ in range(2)]
@@ -9517,8 +9557,8 @@ sys.exit(code)
         failure.__name__, seam, "--lifecycle", str(loop.ledger.path),
         "--store", str(loop.workspace.store), "status"], capture_output=True, text=True, timeout=30)
     assert result.returncode == 2 and result.stderr == "", result.stdout + result.stderr
-    detail = _display(failure(marker))
-    if seam == "event" and issubclass(failure, (ValueError, TypeError, KeyError, UnicodeError)):
+    detail = _display(ValueError("reference parent changed while opening"))
+    if seam == "event":
         detail = "malformed workspace event: " + _display(events / "00000001.json") + ": " + detail
     assert json.loads(result.stdout) == {"state": "hold", "execution_enabled": False, "source": "store", "error": detail}
     assert "SYNTHETIC_PASSWORD" not in result.stdout
@@ -9548,6 +9588,7 @@ sys.exit(router.main(sys.argv[2:]))
 @pytest.mark.parametrize("fault", ["policy", "identity", "symlink", "private"])
 def test_workspace_harden2_store_policy_failures_preserve_identity(tmp_path, monkeypatch, caller, fault):
     from types import SimpleNamespace
+    from hierarchy_workspace_display import _display
     import hierarchy_fresh_brief as fresh
     import hierarchy_lifecycle as lifecycle
     import hierarchy_router as router
@@ -9575,15 +9616,29 @@ def test_workspace_harden2_store_policy_failures_preserve_identity(tmp_path, mon
         return real_os.scandir(path)
 
     monkeypatch.setattr("hierarchy_fresh_brief.os", SimpleNamespace(**{**vars(real_os), "scandir": scanned}))
-    with pytest.raises(type(error)) as caught:
+    expected_type = ValueError if fault in {"identity", "symlink"} else type(error)
+    with pytest.raises(expected_type) as caught:
         if caller == "store":
             dispatch._CapturedStore(loop.workspace.store, fresh._Operation()).load()
         else:
             router.status(lifecycle.Lifecycle(loop.ledger.path), workspace.Store(loop.workspace.store), 0)
     assert injected
-    assert caught.value is error
-    assert type(caught.value) is type(error)
-    assert str(caught.value) == str(error)
+    if fault in {"identity", "symlink"}:
+        chain, cause = [], caught.value.__cause__
+        for _ in range(8):
+            if cause is None:
+                break
+            chain.append(cause)
+            cause = cause.__cause__
+        assert any(link is error for link in chain), [
+            (type(link).__name__, str(link)) for link in chain
+        ]
+        assert str(caught.value.__cause__) == "reference parent changed while opening"
+        assert str(caught.value) == _display(ValueError("reference parent changed while opening"))
+    else:
+        assert caught.value is error
+        assert type(caught.value) is type(error)
+        assert str(caught.value) == str(error)
 
 
 @pytest.mark.parametrize("damage", ["missing", "not-directory", "empty"])
@@ -9604,8 +9659,13 @@ def test_workspace_harden2_store_fixed_refusals_keep_type_and_bytes(tmp_path, da
     try:
         with pytest.raises(ValueError) as caught:
             dispatch._CapturedStore(loop.workspace.store, fresh._Operation()).load()
-        assert type(caught.value) is ValueError
-        assert str(caught.value) == expected
+        if damage == "not-directory":
+            from hierarchy_workspace_display import _display
+            assert isinstance(caught.value, ValueError)
+            assert str(caught.value) == _display(ValueError("reference parent changed while opening"))
+        else:
+            assert type(caught.value) is ValueError
+            assert str(caught.value) == expected
     finally:
         if damage == "not-directory":
             events.unlink()

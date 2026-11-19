@@ -33,11 +33,2319 @@ from tests.conftest import symlink_or_skip
 
 
 TOOL = ROOT / "tools" / "hierarchy_fresh_brief.py"
+secure_reference = pytest.mark.skipif(not portable_fresh._descriptor_capabilities(),
+    reason="public reference proofs require directory descriptors")
+
+
+class _OwnedDescriptor:
+    """One open lifetime; reusing its integer never changes this receipt."""
+    def __init__(self, descriptor):
+        self.descriptor = descriptor
+        self.closed = False
+
+    def __index__(self):
+        return self.descriptor
+
+class _OwnedDescriptorStream:
+    def __init__(self, stream, receipt, owner, closefd):
+        self.stream, self.receipt, self.owner, self.closefd = stream, receipt, owner, closefd
+
+    def __enter__(self):
+        return self.stream.__enter__()
+
+    def __exit__(self, *args):
+        try:
+            return self.stream.__exit__(*args)
+        finally:
+            if self.closefd and self.stream.closed:
+                self.owner.released(self.receipt)
+
+    def close(self):
+        try:
+            self.stream.close()
+        finally:
+            if self.closefd and self.stream.closed:
+                self.owner.released(self.receipt)
+
+class _OwnedDescriptors:
+    def __init__(self):
+        import os as native_os
+        from threading import RLock
+        self.native = SimpleNamespace(**{**vars(native_os)})
+        self.lock = RLock()
+        self.current, self.receipts = {}, []
+
+    def open(self, *args, **kwargs):
+        receipt = _OwnedDescriptor(None)
+        descriptor = self.native.open(*args, **kwargs)
+        receipt.descriptor = descriptor
+        try:
+            with self.lock:
+                self.current[descriptor] = receipt
+                self.receipts.append(receipt)
+        except BaseException:
+            self.native.close(descriptor)
+            self.released(receipt)
+            raise
+        return descriptor
+
+    def capture(self, descriptor):
+        with self.lock:
+            return self.current[descriptor]
+
+    def released(self, receipt):
+        with self.lock:
+            receipt.closed = True
+            if self.current.get(receipt.descriptor) is receipt:
+                del self.current[receipt.descriptor]
+
+    def close(self, descriptor):
+        with self.lock:
+            receipt = self.current.get(descriptor)
+        self.native.close(descriptor)
+        if receipt is not None:
+            self.released(receipt)
+
+    def fdopen(self, descriptor, *args, **kwargs):
+        closefd = kwargs.get("closefd", args[5] if len(args) > 5 else True)
+        with self.lock:
+            receipt = self.current.get(descriptor)
+        if receipt is None:
+            return self.native.fdopen(descriptor, *args, **kwargs)
+        wrapper = _OwnedDescriptorStream(None, receipt, self, closefd)
+        wrapper.stream = self.native.fdopen(descriptor, *args, **kwargs)
+        return wrapper
+
+    def assert_closed(self):
+        if not all(receipt.closed for receipt in self.receipts):
+            raise AssertionError("test-owned descriptor was not closed")
+
+    def cleanup(self):
+        for receipt in self.receipts:
+            if not receipt.closed:
+                self.close(receipt.descriptor)
+
+class _DescriptorPaths(dict):
+    """Path lookup by fd, with independent ownership receipts for leak checks."""
+    def __init__(self):
+        super().__init__()
+        self.receipts = set()
+
+    def __setitem__(self, descriptor, path):
+        self.receipts.add(capture_public_test_handle(descriptor))
+        super().__setitem__(descriptor, path)
+
+    def closed(self):
+        return all(receipt.closed for receipt in self.receipts)
+
+@pytest.fixture(autouse=True)
+def owned_descriptors(monkeypatch):
+    ledger = _OwnedDescriptors()
+    namespace = SimpleNamespace(**{**vars(ledger.native), "open": ledger.open, "close": ledger.close,
+                                  "fdopen": ledger.fdopen, "_descriptor_ledger": ledger})
+    # Patch these consumers' module references; the global OS module stays intact.
+    monkeypatch.setattr("tests.integration.test_hierarchy_fresh_brief.os", namespace)
+    monkeypatch.setattr(portable_fresh, "os", namespace)
+    monkeypatch.setattr(alias_fresh, "os", namespace)
+    monkeypatch.setattr(alias_router, "os", namespace)
+    monkeypatch.setattr("tools.hierarchy_fresh_brief.protocol.os", namespace)
+    monkeypatch.setattr("tools.hierarchy_fresh_brief.life.os", namespace)
+    try:
+        yield ledger
+        ledger.assert_closed()
+    finally:
+        ledger.cleanup()
+
+OWNED_DESCRIPTOR_DRIVER = r'''from types import SimpleNamespace
+
+class _OwnedDescriptor:
+    """One open lifetime; reusing its integer never changes this receipt."""
+    def __init__(self, descriptor):
+        self.descriptor = descriptor
+        self.closed = False
+
+    def __index__(self):
+        return self.descriptor
+
+class _OwnedDescriptorStream:
+    def __init__(self, stream, receipt, owner, closefd):
+        self.stream, self.receipt, self.owner, self.closefd = stream, receipt, owner, closefd
+
+    def __enter__(self):
+        return self.stream.__enter__()
+
+    def __exit__(self, *args):
+        try:
+            return self.stream.__exit__(*args)
+        finally:
+            if self.closefd and self.stream.closed:
+                self.owner.released(self.receipt)
+
+    def close(self):
+        try:
+            self.stream.close()
+        finally:
+            if self.closefd and self.stream.closed:
+                self.owner.released(self.receipt)
+
+class _OwnedDescriptors:
+    def __init__(self):
+        import os as native_os
+        from threading import RLock
+        self.native = SimpleNamespace(**{**vars(native_os)})
+        self.lock = RLock()
+        self.current, self.receipts = {}, []
+
+    def open(self, *args, **kwargs):
+        receipt = _OwnedDescriptor(None)
+        descriptor = self.native.open(*args, **kwargs)
+        receipt.descriptor = descriptor
+        try:
+            with self.lock:
+                self.current[descriptor] = receipt
+                self.receipts.append(receipt)
+        except BaseException:
+            self.native.close(descriptor)
+            self.released(receipt)
+            raise
+        return descriptor
+
+    def capture(self, descriptor):
+        with self.lock:
+            return self.current[descriptor]
+
+    def released(self, receipt):
+        with self.lock:
+            receipt.closed = True
+            if self.current.get(receipt.descriptor) is receipt:
+                del self.current[receipt.descriptor]
+
+    def close(self, descriptor):
+        with self.lock:
+            receipt = self.current.get(descriptor)
+        self.native.close(descriptor)
+        if receipt is not None:
+            self.released(receipt)
+
+    def fdopen(self, descriptor, *args, **kwargs):
+        closefd = kwargs.get("closefd", args[5] if len(args) > 5 else True)
+        with self.lock:
+            receipt = self.current.get(descriptor)
+        if receipt is None:
+            return self.native.fdopen(descriptor, *args, **kwargs)
+        wrapper = _OwnedDescriptorStream(None, receipt, self, closefd)
+        wrapper.stream = self.native.fdopen(descriptor, *args, **kwargs)
+        return wrapper
+
+    def assert_closed(self):
+        if not all(receipt.closed for receipt in self.receipts):
+            raise AssertionError("test-owned descriptor was not closed")
+
+    def cleanup(self):
+        for receipt in self.receipts:
+            if not receipt.closed:
+                self.close(receipt.descriptor)
+'''
+
+def search_only_platform(monkeypatch, capability="none", *, lstat=None, fstat=None, stat_call=None, closing=None, opening=None):
+    """Select an explicit descriptor/search fixture; callers may then override its reader."""
+    native_flags = {"O_PATH": getattr(os, "O_PATH", None), "O_SEARCH": getattr(os, "O_SEARCH", None),
+                    "O_EXEC": getattr(os, "O_EXEC", None)}
+    search_flag = native_flags.get(capability)
+    if capability != "none" and search_flag is None:
+        search_flag = native_flags["O_PATH"]
+    if capability != "none" and search_flag is None:
+        pytest.skip("native search flag or Linux O_PATH emulation unavailable")
+    live, opened = _DescriptorPaths(), []
+    def open_descriptor(path, flags, *args, **kwargs):
+        parent = live.get(kwargs.get("dir_fd"))
+        actual = parent / path if parent is not None else Path(path)
+        if opening is not None:
+            opening(path, flags, *args, **kwargs)
+        descriptor = os.open(path, flags, *args, **kwargs)
+        live[descriptor] = actual
+        opened.append((actual, flags))
+        return descriptor
+    def close_descriptor(descriptor):
+        path = live.pop(descriptor)
+        os.close(descriptor)
+        if closing is not None:
+            closing(path)
+    namespace = SimpleNamespace(**{**vars(os), "open": open_descriptor, "close": close_descriptor,
+                                  "lstat": lstat or os.lstat, "fstat": fstat or os.fstat,
+                                  "stat": stat_call or os.stat})
+    if hasattr(namespace, "O_PATH"): del namespace.O_PATH
+    if hasattr(namespace, "O_SEARCH"): del namespace.O_SEARCH
+    if hasattr(namespace, "O_EXEC"): del namespace.O_EXEC
+    if capability == "O_PATH": namespace.O_PATH = search_flag
+    elif capability == "O_SEARCH": namespace.O_SEARCH = search_flag
+    elif capability == "O_EXEC": namespace.O_EXEC = search_flag
+    else: assert capability == "none"
+    monkeypatch.setattr(portable_fresh, "os", namespace)
+    monkeypatch.setattr(portable_fresh, "_search_directory_flag", lambda: search_flag)
+    monkeypatch.setattr(portable_fresh, "_reference_descriptors", lambda: portable_fresh._descriptor_capabilities())
+    return live, opened
+
+
+def capture_public_test_handle(handle):
+    if isinstance(handle, portable_fresh._MetadataDirectory):
+        return handle
+    return os._descriptor_ledger.capture(handle)
+
+
+def assert_public_handle_closed(handle):
+    if not handle.closed:
+        raise AssertionError("test-owned descriptor was not closed")
+
+
+def close_public_test_handle(handle):
+    if isinstance(handle, portable_fresh._MetadataDirectory):
+        portable_fresh._proof_close(handle, os.close)
+    elif not handle.closed:
+        os.close(handle.descriptor)
+
+
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+def test_search_only_public_directory_metadata_golden(tmp_path, monkeypatch, capability):
+    if os.name != "posix" or not portable_fresh._descriptor_capabilities():
+        pytest.skip("execute-only directory witness requires POSIX directory descriptors")
+    if os.geteuid() == 0:
+        pytest.skip("execute-only directory witness requires an unprivileged runner")
+    public = tmp_path / "public"
+    public.mkdir()
+    target = public / "note.md"
+    target.write_bytes(b"public fixture")
+    live, opened = search_only_platform(monkeypatch, capability)
+    public.chmod(0o111)
+    try:
+        # Search-only handles can certify this directory without read access.
+        with pytest.raises(PermissionError) as failure:
+            descriptor = os.open(public, os.O_RDONLY | os.O_DIRECTORY)
+            os.close(descriptor)
+        assert failure.value.errno == errno.EACCES
+        for _ in range(2):
+            operation = portable_fresh._Operation()
+            answer = {"directory": stat.S_ISDIR(operation.path_guard.check(public)[0].st_mode)}
+            if capability == "none":
+                for path in (target, public / "missing"):
+                    for scope in (False, True):
+                        with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+                            operation.path_guard.check(path, scope=scope)
+                answer.update(file="refused", missing="refused")
+                expected = b'{"directory": true, "file": "refused", "missing": "refused"}\n'
+            else:
+                answer.update(file=portable_fresh.safe_path(target) == target,
+                              missing=operation.path_guard.check(public / "missing") is None)
+                assert operation.path_guard.check(target, scope=True) is not None
+                expected = b'{"directory": true, "file": true, "missing": true}\n'
+            assert (json.dumps(answer, sort_keys=True) + "\n").encode() == expected
+            if capability == "none":
+                with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+                    operation.verify()
+            else:
+                operation.verify()
+            assert live.closed()
+        if capability == "none":
+            assert not any(path == public for path, _flags in opened)
+    finally:
+        public.chmod(0o700)
+
+
+@pytest.mark.parametrize("surface", ["safe-path", "scope-false", "scope-true", "preflight", "checked-path"])
+def test_search_only_metadata_without_descriptor_support(tmp_path, monkeypatch, surface):
+    target = tmp_path / "note.md"
+    target.write_bytes(b"public fixture")
+    live, opened = search_only_platform(monkeypatch)
+    monkeypatch.setattr(portable_fresh, "_descriptor_capabilities", lambda: False)
+    for _ in range(2):
+        with pytest.raises(portable_fresh._ProofPathError,
+                           match="^secure scope proof requires directory descriptor support$"):
+            if surface == "safe-path":
+                portable_fresh.safe_path(target)
+            elif surface.startswith("scope-"):
+                portable_fresh._Operation().path_guard.check(target, scope=surface == "scope-true")
+            elif surface == "preflight":
+                alias_router.preflight_paths(target)
+            else:
+                import hierarchy_small_change_dispatch as dispatch
+                dispatch.checked_path(target)
+    assert live.closed() and opened == []
+
+
+def test_search_only_metadata_denial_and_retry(tmp_path, monkeypatch):
+    if os.name != "posix" or not portable_fresh._descriptor_capabilities():
+        pytest.skip("directory permission witness requires POSIX directory descriptors")
+    if os.geteuid() == 0:
+        pytest.skip("permission witness requires an unprivileged runner")
+    public = tmp_path / "public"
+    public.mkdir()
+    target = public / "note.md"
+    target.write_bytes(b"public fixture")
+    live, opened = search_only_platform(monkeypatch)
+    operation = portable_fresh._Operation()
+    public.chmod(0)
+    try:
+        for mode in (0, 0o111):
+            public.chmod(mode)
+            for _ in range(2):
+                with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+                    operation.path_guard.check(target)
+        public.chmod(0o700)
+        assert operation.path_guard.check(target) is not None
+        with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+            operation.path_guard.check(target / "not-a-directory")
+        with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+            operation.verify()
+        assert live.closed() and all(flags & os.O_DIRECTORY for _path, flags in opened)
+        assert portable_fresh._Operation().read(target)[1] == b"public fixture"
+    finally:
+        public.chmod(0o700)
+
+
+@pytest.mark.parametrize("replacement", ["directory", "symlink", "leaf"])
+def test_search_only_metadata_concurrent_replacement_refuses_and_retries(tmp_path, monkeypatch, replacement):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    if os.name != "posix" or not portable_fresh._descriptor_capabilities():
+        pytest.skip("directory replacement witness requires POSIX directory descriptors")
+    public, alternate, parked = (tmp_path / name for name in ("public", "alternate", "parked"))
+    public.mkdir()
+    target = public / "note.md"
+    target.write_bytes(b"original public fixture")
+    if replacement == "leaf":
+        alternate.write_bytes(b"replacement fixture")
+    else:
+        alternate.mkdir()
+        (alternate / "note.md").write_bytes(b"replacement fixture")
+        if replacement == "symlink":
+            symlink_or_skip(alternate, tmp_path / "link", target_is_directory=True)
+    entered, changed = Event(), Event()
+    armed = [True]
+    def replace():
+        assert entered.wait(10), "metadata observation did not reach the replacement boundary"
+        if replacement == "leaf":
+            target.rename(parked)
+            alternate.rename(target)
+        else:
+            public.rename(parked)
+            (tmp_path / "link" if replacement == "symlink" else alternate).rename(public)
+        changed.set()
+    def stat_call(path, *args, **kwargs):
+        info = os.stat(path, *args, **kwargs)
+        actual = live.get(kwargs.get("dir_fd"), Path(".")) / path
+        if actual == target and armed[0]:
+            armed[0] = False
+            entered.set()
+            assert changed.wait(10), "replacement did not finish"
+        return info
+    live, opened = search_only_platform(monkeypatch, stat_call=stat_call)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            pending = workers.submit(replace)
+            with pytest.raises(ValueError) as failure:
+                portable_fresh.safe_path(target)
+            assert str(failure.value) == "reference parent changed while opening"
+            pending.result(timeout=10)
+        if replacement == "symlink":
+            public.unlink()
+            parked.rename(public)
+        assert portable_fresh.safe_path(target) == target
+        assert live.closed()
+        # Symlink classification may open directory proofs, never file content.
+        assert all(flags & os.O_DIRECTORY for _path, flags in opened)
+    finally:
+        for directory in (public, parked):
+            if directory.is_dir() and not directory.is_symlink():
+                directory.chmod(0o700)
+
+
+@pytest.mark.parametrize("capability", ["O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("walk", ["reference", "proof"])
+def test_search_only_descriptor_walk_failure_closes_and_retries(tmp_path, monkeypatch, capability, walk):
+    if os.name != "posix" or not portable_fresh._descriptor_capabilities():
+        pytest.skip("directory descriptor failure witness requires POSIX descriptor support")
+    public = tmp_path / "public"
+    public.mkdir()
+    target = public / "note.md"
+    target.write_bytes(b"public fixture")
+    armed = [True]
+    live = _DescriptorPaths()
+    def fstat(descriptor):
+        if live.get(descriptor) == public and armed[0]:
+            armed[0] = False
+            raise OSError(errno.EIO, "fixture directory metadata failure")
+        return os.fstat(descriptor)
+    live, opened = search_only_platform(monkeypatch, capability, fstat=fstat)
+    operation = portable_fresh._Operation()
+    if walk == "proof":
+        # A public symlink enters the bounded descriptor proof through safe_path.
+        linked = tmp_path / "linked"
+        symlink_or_skip(public, linked, target_is_directory=True)
+        with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+            portable_fresh.safe_path(linked / "note.md")
+        assert live.closed()
+        for _ in range(2):
+            with pytest.raises(alias_router.SymlinkPathError) as failure:
+                portable_fresh.safe_path(linked / "note.md")
+            assert str(failure.value) == "symlink paths are not supported: " + str(linked)
+            assert live.closed()
+    else:
+        with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+            operation.path_guard.check(target)
+        with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+            operation.verify()
+        assert live.closed()
+    assert not armed[0]
+    assert portable_fresh._Operation().read(target)[1] == b"public fixture"
+    assert live.closed()
+    search_flag = portable_fresh._search_directory_flag()
+    assert search_flag is not None and any(path == public and flags & search_flag for path, flags in opened)
+
+
+@secure_reference
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("window", ["capture", "final-read", "scope-outcome", "scope-end-prefix"])
+@pytest.mark.parametrize("ancestor", ["public", "sub"])
+def test_dbg_captured_ancestor_disappearance_latches_before_optional_reduction(tmp_path, monkeypatch, capability, window, ancestor):
+    public, held = tmp_path / "public", tmp_path / "held"
+    (public / "sub").mkdir(parents=True)
+    target = public / "sub" / "note.md"
+    target.write_bytes(b"public fixture")
+    captured = public if ancestor == "public" else target.parent
+    reference = ref(target)
+    origin = tmp_path / "origin.json"
+    origin.write_bytes(b"{}")
+    live, _opened = search_only_platform(monkeypatch, capability)
+    changed = []
+    def remove():
+        if not changed:
+            captured.rename(held)
+            changed.append(True)
+    if window == "capture":
+        parent = portable_fresh._reference_parent
+        def acquire(path, *args, **kwargs):
+            if Path(path) == target.parent and kwargs.get("_expected"):
+                remove()
+            return parent(path, *args, **kwargs)
+        monkeypatch.setattr(portable_fresh, "_reference_parent", acquire)
+    elif window == "final-read":
+        stream = portable_fresh._stream_reference
+        def consume(*args, **kwargs):
+            result = stream(*args, **kwargs)
+            if Path(args[2]) == target:
+                remove()
+            return result
+        monkeypatch.setattr(portable_fresh, "_stream_reference", consume)
+    else:
+        recheck = (portable_fresh._recheck_final_witness if window == "scope-outcome"
+                   else portable_fresh._recheck_scope_prefix)
+        def verify(proof):
+            if proof.leaf == target:
+                remove()
+            return recheck(proof)
+        if window == "scope-outcome":
+            monkeypatch.setattr(portable_fresh, "_recheck_final_witness", verify)
+        else:
+            monkeypatch.setattr(portable_fresh, "_recheck_scope_prefix", verify)
+    operation = portable_fresh._Operation()
+    brief = portable_fresh.Brief(_operation=operation)
+    try:
+        brief.evidence(reference, ref(origin))
+        assert changed and live.closed()
+        assert [row["kind"] for row in brief.sections["Evidence references"]] == ["unverified_evidence"]
+        assert operation.failed_validation
+    finally:
+        if changed:
+            held.rename(captured)
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+        operation.verify()
+    assert live.closed()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("seam", ["disposition", "resolve"])
+@pytest.mark.parametrize("missing", [False, True])
+@pytest.mark.parametrize("fault", ["enoent", "eacces", "eio", "policy"])
+def test_search_only_final_parent_failure_is_proof_and_retry_is_healthy(tmp_path, monkeypatch, seam, missing, fault):
+    if not portable_fresh._descriptor_capabilities() or portable_fresh._symlink_reader() is None:
+        pytest.skip("bounded link metadata proof unavailable")
+    world, linked, public, private, home, path = r14_trial(tmp_path, seam)
+    if missing:
+        (public / "note.md").unlink()
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: home)
+    state = {"leaf": False, "injected": False}
+    def stat_call(value, *args, **kwargs):
+        actual = live.get(kwargs.get("dir_fd"), Path(".")) / value
+        value = Path(actual)
+        if value == public / "note.md":
+            state["leaf"] = True
+        elif value == public and state["leaf"] and not state["injected"]:
+            state["injected"] = True
+            if fault == "policy":
+                raise alias_router.CapturedPolicyError("controlled metadata policy failure")
+            code = {"enoent": errno.ENOENT, "eacces": errno.EACCES, "eio": errno.EIO}[fault]
+            raise OSError(code, "controlled metadata-parent failure", str(value))
+        return os.stat(value, *args, **kwargs)
+    live, opened = search_only_platform(monkeypatch, stat_call=stat_call)
+    try:
+        if fault == "policy":
+            operation = portable_fresh._Operation()
+            with pytest.raises(alias_router.CapturedPolicyError, match="^controlled metadata policy failure$"):
+                operation.lifecycle(world.ledger.path).load()
+            assert operation.failed_validation and operation.path_guard._global_failure is not None
+        else:
+            r14_assert_quarantined(world, path)
+        assert state["injected"]
+        assert live.closed()
+        assert not any(value == private or private in value.parents for value, _flags in opened)
+        healthy = tmp_path / "healthy-retry.md"
+        healthy.write_bytes(b"healthy retry")
+        retry = portable_fresh._Operation()
+        assert retry.read(healthy)[1] == b"healthy retry"
+        retry.verify()
+        assert live.closed()
+    finally:
+        public.chmod(0o700)
+
+
+@lifecycle_only
+@pytest.mark.parametrize("replacement", ["directory", "private-link"])
+def test_search_only_linked_parent_concurrent_replacement_is_quarantined(tmp_path, monkeypatch, replacement):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    if not portable_fresh._descriptor_capabilities() or portable_fresh._symlink_reader() is None:
+        pytest.skip("bounded link metadata proof unavailable")
+    world, linked, public, private, home, path = r14_trial(tmp_path, "disposition")
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: home)
+    parked, alternate = tmp_path / "parked", tmp_path / "alternate"
+    if replacement == "directory":
+        alternate.mkdir()
+        (alternate / "note.md").write_bytes(b"replacement directory")
+    else:
+        symlink_or_skip(private, alternate, target_is_directory=True)
+    entered, changed = Event(), Event()
+    armed = [True]
+    def replace():
+        assert entered.wait(10), "final metadata lookup did not reach the replacement boundary"
+        public.rename(parked)
+        alternate.rename(public)
+        changed.set()
+    def stat_call(value, *args, **kwargs):
+        info = os.stat(value, *args, **kwargs)
+        actual = live.get(kwargs.get("dir_fd"), Path(".")) / value
+        if Path(actual) == public / "note.md" and armed[0]:
+            armed[0] = False
+            entered.set()
+            assert changed.wait(10), "parent replacement did not finish"
+        return info
+    live, opened = search_only_platform(monkeypatch, stat_call=stat_call)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            pending = workers.submit(replace)
+            r14_assert_quarantined(world, path, private=replacement == "private-link")
+            pending.result(timeout=10)
+        assert not armed[0] and live.closed()
+        assert not any(value == private or private in value.parents
+                       for value, _flags in opened)
+    finally:
+        if parked.exists():
+            public.rename(alternate)
+            parked.rename(public)
+        public.chmod(0o700)
+    retry = portable_fresh._Operation()
+    assert retry.path_guard.check(public / "note.md") is not None
+    retry.verify()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("fault", ["oversize", "repoint"])
+def test_search_only_link_capture_is_bounded_and_revalidated(tmp_path, monkeypatch, fault):
+    native = portable_fresh._symlink_reader()
+    if not portable_fresh._descriptor_capabilities() or native is None:
+        pytest.skip("bounded link metadata proof unavailable")
+    world, linked, public, private, home, path = r14_trial(tmp_path, "disposition")
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: home)
+    calls = []
+    def stat_call(value, *args, **kwargs):
+        info = os.stat(value, *args, **kwargs)
+        actual = live.get(kwargs.get("dir_fd"), Path(".")) / value
+        if fault == "oversize" and Path(actual) == linked:
+            return SimpleNamespace(st_dev=info.st_dev, st_ino=info.st_ino, st_mode=info.st_mode,
+                                   st_size=portable_fresh.MAX_SYMLINK_BYTES + 1,
+                                   st_mtime_ns=info.st_mtime_ns, st_ctime_ns=info.st_ctime_ns)
+        return info
+    def read(directory, name, size):
+        assert fault != "oversize", "oversize link reached the allocator/reader"
+        assert type(directory) is int and not Path(name).is_absolute() and 0 < size <= portable_fresh.MAX_SYMLINK_BYTES
+        raw = native(directory, name, size)
+        calls.append((directory, name, size))
+        if live[directory] / name == linked and len(calls) == 1:
+            linked.unlink()
+            symlink_or_skip(private, linked, target_is_directory=True)
+        return raw
+    live, _opened = search_only_platform(monkeypatch, stat_call=stat_call)
+    monkeypatch.setattr(portable_fresh, "_symlink_reader", lambda: read)
+    r14_assert_quarantined(world, path, private=fault == "repoint")
+    assert bool(calls) == (fault == "repoint")
+    assert live.closed()
+
+
+@lifecycle_only
+def test_search_only_failed_token_allocation_releases_descriptor(tmp_path, monkeypatch):
+    if not portable_fresh._descriptor_capabilities() or portable_fresh._symlink_reader() is None:
+        pytest.skip("bounded link metadata proof unavailable")
+    world, linked, public, private, home, path = r14_trial(tmp_path, "disposition")
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: home)
+    original, failed, directories = portable_fresh._ProofValue, [], []
+    class AllocationFailure(original):
+        def __init__(self, value):
+            if isinstance(value, portable_fresh._ProvedChain) and value.directory is not None:
+                failed.append(value)
+                directories.append(capture_public_test_handle(value.directory))
+                raise MemoryError("controlled metadata token allocation failure")
+            super().__init__(value)
+    live, _opened = search_only_platform(monkeypatch)
+    monkeypatch.setattr(portable_fresh, "_ProofValue", AllocationFailure)
+    r14_assert_quarantined(world, path)
+    assert failed
+    for directory in directories:
+        assert_public_handle_closed(directory)
+    assert all(proof.directory is None for proof in failed)
+    for proof in failed:
+        with pytest.raises(ValueError, match="^final lookup requires a live proved-chain token$"):
+            portable_fresh._final_leaf_lookup(proof)
+    assert live.closed()
+
+
+@pytest.mark.parametrize("fault", [False, True])
+def test_search_only_diagnostic_witness_cleanup_and_retry(tmp_path, monkeypatch, fault):
+    if not portable_fresh._descriptor_capabilities():
+        pytest.skip("directory descriptors unavailable")
+    leaf = tmp_path / "note.md"
+    leaf.write_bytes(b"public fixture")
+    captured, armed = [], [fault]
+    def lstat(value, *args, **kwargs):
+        if Path(value) == leaf and armed[0]:
+            armed[0] = False
+            raise OSError(errno.EIO, "controlled diagnostic metadata failure", str(leaf))
+        return os.lstat(value, *args, **kwargs)
+    live, _opened = search_only_platform(monkeypatch, lstat=lstat)
+    def diagnose():
+        guard = portable_fresh._Operation().path_guard
+        directory = portable_fresh._MetadataDirectory(tmp_path, guard,
+            portable_fresh._metadata_ancestor_marks(tmp_path, guard))
+        captured.append(directory)
+        try:
+            return portable_fresh._metadata_info(directory, leaf.name)
+        finally:
+            portable_fresh._proof_close(directory, os.close)
+    if fault:
+        with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+            diagnose()
+    assert stat.S_ISREG(diagnose().st_mode)
+    assert portable_fresh._Operation().path_guard.check(leaf) is not None
+    assert captured and live.closed()
+    for directory in captured:
+        assert_public_handle_closed(directory)
+        with pytest.raises(portable_fresh._ProofPathError,
+                           match="^public chain requires descriptor anchoring$"):
+            portable_fresh._ProvedChain(directory.guard, leaf, (), (), directory, leaf)
+    reader = portable_fresh._symlink_reader()
+    if reader is not None:
+        assert reader(None, str(leaf), 1) is None
+        assert reader(-100, str(leaf), 1) is None
+
+
+@pytest.mark.parametrize("surface", ["scope-false", "scope-true", "safe-path", "preflight", "checked-path"])
+@pytest.mark.parametrize("descriptors", [True, False], ids=["anchored", "unsupported"])
+def test_search_only_metadata_parent_substitution_cannot_certify_scope(tmp_path, monkeypatch, surface, descriptors):
+    if descriptors and not portable_fresh._descriptor_capabilities():
+        pytest.skip("directory descriptors unavailable")
+    parent, parked, alternate = (tmp_path / name for name in ("parent", "parked", "alternate"))
+    for directory in (parent, alternate): directory.mkdir()
+    home = tmp_path / "owner"
+    private = home / ".codex"
+    private.mkdir(parents=True)
+    (private / "note.md").write_bytes(b"private fixture")
+    symlink_or_skip(private, parent / "alias", target_is_directory=True)
+    (alternate / "alias").mkdir()
+    def lstat(value, *args, **kwargs):
+        if Path(value) != parent / "alias":
+            return os.lstat(value, *args, **kwargs)
+        parent.rename(parked)
+        alternate.rename(parent)
+        try:
+            return os.lstat(value, *args, **kwargs)
+        finally:
+            parent.rename(alternate)
+            parked.rename(parent)
+    live, _opened = search_only_platform(monkeypatch, lstat=lstat)
+    monkeypatch.setattr(portable_fresh, "_descriptor_capabilities", lambda: descriptors)
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: home)
+    for _ in range(2):
+        operation = portable_fresh._Operation()
+        expected = alias_router.SymlinkPathError if descriptors else portable_fresh._ProofPathError
+        with pytest.raises(expected) as refused:
+            if surface.startswith("scope-"):
+                operation.path_guard.check(parent / "alias", scope=surface == "scope-true")
+            elif surface == "safe-path":
+                portable_fresh.safe_path(parent / "alias")
+            elif surface == "preflight":
+                alias_router.preflight_paths(parent / "alias", _guard=operation.path_guard)
+            else:
+                import hierarchy_small_change_dispatch as dispatch
+                dispatch.checked_path(parent / "alias")
+        assert portable_fresh._disposition(refused.value, guard=operation.path_guard, seam="scope",
+                                          path=parent / "alias", inert=True) == (portable_fresh.QUARANTINE if descriptors else portable_fresh.GLOBAL)
+        assert live.closed()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("seam", ["disposition", "resolve"])
+def test_search_only_readlink_parent_substitution_restored_is_quarantined(tmp_path, monkeypatch, seam):
+    native = portable_fresh._symlink_reader()
+    if not portable_fresh._descriptor_capabilities() or native is None:
+        pytest.skip("bounded descriptor-relative link reader unavailable")
+    world, linked, public, private, home, path = r14_trial(tmp_path, seam)
+    parent, parked, alternate = (tmp_path / name for name in ("parent", "parked", "alternate"))
+    benign = tmp_path / "clean" / "public"
+    for directory in (parent, alternate, benign): directory.mkdir(parents=True)
+    (benign / "note.md").write_bytes(b"public substitution")
+    assert len(os.fsencode(private)) == len(os.fsencode(benign))
+    symlink_or_skip(private, parent / "alias", target_is_directory=True)
+    symlink_or_skip(benign, alternate / "alias", target_is_directory=True)
+    linked.unlink()
+    symlink_or_skip(parent / "alias", linked, target_is_directory=True)
+    live, _opened = search_only_platform(monkeypatch)
+    calls = []
+    def read(directory, name, size):
+        value = Path(name) if directory is None else live[directory] / name
+        if value != parent / "alias":
+            return native(directory, name, size)
+        parent.rename(parked)
+        alternate.rename(parent)
+        try:
+            calls.append(value)
+            return native(directory, name, size)
+        finally:
+            parent.rename(alternate)
+            parked.rename(parent)
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: home)
+    monkeypatch.setattr(portable_fresh, "_symlink_reader", lambda: read)
+    r14_assert_quarantined(world, path, local=True)
+    assert calls and live.closed()
+    linked.unlink()
+    symlink_or_skip(public, linked, target_is_directory=True)
+    r15_assert_healthy_retry(world, repair_link=True)
+    assert live.closed()
+
+
+@lifecycle_only
+def test_search_only_router_regular_store_leaf_preserves_refusal_and_retry(tmp_path, monkeypatch, capsysbinary):
+    from tests.integration.test_hierarchy_router import Loop
+    if not portable_fresh._descriptor_capabilities():
+        pytest.skip("directory descriptors unavailable")
+    world = Loop(tmp_path)
+    leaf = tmp_path / "store-file"
+    leaf.write_bytes(b"not a directory")
+    live, _opened = search_only_platform(monkeypatch)
+    arguments = ["--lifecycle", str(world.ledger.path), "--store", str(leaf), "status"]
+    assert alias_router.main(arguments) == 2
+    output = capsysbinary.readouterr()
+    assert not output.err
+    assert json.loads(output.out) == {"state": "hold", "execution_enabled": False, "source": "store",
+                                     "error": "workspace store is not initialized"}
+    assert live.closed()
+    arguments[3] = str(world.workspace.store)
+    assert alias_router.main(arguments) == 0
+    assert not capsysbinary.readouterr().err
+    assert live.closed()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("capability", ["none", "O_PATH"])
+def test_search_only_existing_allocation_cleanup_on_each_platform(tmp_path, monkeypatch, capability):
+    if not portable_fresh._descriptor_capabilities():
+        pytest.skip("directory descriptors unavailable")
+    search_only_platform(monkeypatch, capability)
+    test_round14_failed_result_allocation_releases_the_proved_token(tmp_path, monkeypatch, "value", "stored")
+
+
+@lifecycle_only
+def test_search_only_missing_publish_scope_rechecks_anchored_parent(tmp_path, monkeypatch):
+    from tests.integration.test_hierarchy_router import Loop
+    if not portable_fresh._descriptor_capabilities():
+        pytest.skip("directory descriptors unavailable")
+    world = Loop(tmp_path)
+    world.team("engine")
+    public, parked, home = (tmp_path / name for name in ("public", "parked", "owner"))
+    private = home / ".codex"
+    public.mkdir()
+    private.mkdir(parents=True)
+    probe = tmp_path / "symlink-capability"
+    symlink_or_skip(private, probe, target_is_directory=True)
+    probe.unlink()
+    target = public / "missing"
+    world.approved(request("hostile", paths=[str(target)]))
+    armed = [True]
+    def stat_call(value, *args, **kwargs):
+        actual = live.get(kwargs.get("dir_fd"), Path(".")) / value
+        if actual == target and armed[0]:
+            armed[0] = False
+            public.rename(parked)
+            symlink_or_skip(private, public, target_is_directory=True)
+        return os.stat(value, *args, **kwargs)
+    live, _opened = search_only_platform(monkeypatch, stat_call=stat_call)
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: home)
+    try:
+        operation = portable_fresh._Operation()
+        journal = operation.lifecycle(world.ledger.path)
+        with pytest.raises(alias_router.PrivatePathError): journal.load()
+        assert not armed[0] and operation.failed_validation
+        with pytest.raises(alias_router.PrivatePathError): operation.verify()
+        assert live.closed() and operation.path_guard._global_failure is None
+    finally:
+        if parked.exists():
+            public.unlink()
+            parked.rename(public)
+    retry = portable_fresh._Operation()
+    journal = retry.lifecycle(world.ledger.path)
+    journal.load()
+    assert journal.refusals_for("hostile") == []
+    retry.verify()
+    assert live.closed()
+
+
+@pytest.mark.parametrize("fault", ["ancestor", "appeared"])
+def test_search_only_changed_metadata_has_typed_quarantine_refusal(tmp_path, monkeypatch, fault):
+    if not portable_fresh._descriptor_capabilities():
+        pytest.skip("directory descriptors unavailable")
+    public, parked, alternate = (tmp_path / name for name in ("public", "parked", "alternate"))
+    public.mkdir()
+    alternate.mkdir()
+    leaf = public / "note.md"
+    if fault == "ancestor":
+        leaf.write_bytes(b"original fixture")
+        (alternate / "note.md").write_bytes(b"different fixture")
+    calls = []
+    def stat_call(value, *args, **kwargs):
+        actual = live.get(kwargs.get("dir_fd"), Path(".")) / value
+        if actual == leaf:
+            calls.append(value)
+            if fault == "appeared" and len(calls) == 2:
+                leaf.write_bytes(b"appeared after missing lookup")
+            result = os.stat(value, *args, **kwargs)
+            if fault == "ancestor" and len(calls) == 1:
+                public.rename(parked)
+                alternate.rename(public)
+            return result
+        return os.stat(value, *args, **kwargs)
+    live, _opened = search_only_platform(monkeypatch, stat_call=stat_call)
+    operation = portable_fresh._Operation()
+    with pytest.raises(ValueError) as failure:
+        if fault == "ancestor": operation.path_guard.check(leaf)
+        else: operation.exists(leaf)
+    assert str(failure.value) == "reference parent changed while opening"
+    for inert in (False, True):
+        assert portable_fresh._disposition(failure.value, guard=operation.path_guard,
+            seam="scope", path=leaf, inert=inert) == portable_fresh.GLOBAL
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+        operation.verify()
+    assert live.closed()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("seam", ["router:--lifecycle", "router:--store", "router:--recipes"])
+@pytest.mark.parametrize("fault", ["denied", "missing", "not-directory", "symlink"])
+@pytest.mark.parametrize("planned", [False, True])
+def test_search_only_router_negative_parent_goldens(tmp_path, seam, fault, planned):
+    if not portable_fresh._descriptor_capabilities():
+        pytest.skip("directory descriptors unavailable")
+    if fault == "denied" and os.geteuid() == 0:
+        pytest.skip("mode-000 witness requires an unprivileged runner")
+    expected = reference_negative_golden(seam, fault, planned, "search-only")
+    assert r9_public_probe(tmp_path, seam, fault, planned, "search-only") == expected
+
+
+@pytest.mark.parametrize("fault", ["policy", "enotdir", "eacces"])
+def test_search_only_failed_leaf_revalidation_preserves_refusal_kind(tmp_path, monkeypatch, fault):
+    if not portable_fresh._descriptor_capabilities():
+        pytest.skip("directory descriptors unavailable")
+    if fault == "eacces" and (os.name != "posix" or os.geteuid() == 0):
+        pytest.skip("mode-000 leaf witness requires an unprivileged POSIX runner")
+    public, parked, alternate = (tmp_path / name for name in ("public", "parked", "alternate"))
+    for directory in (public, alternate): directory.mkdir()
+    home = tmp_path / "owner"
+    private = home / ".codex"
+    private.mkdir(parents=True)
+    (private / "note.md").write_bytes(b"controlled private fixture")
+    if fault in {"enotdir", "eacces"}:
+        probe = tmp_path / "symlink-capability"
+        symlink_or_skip(private / "note.md", probe)
+        probe.unlink()
+    leaf = public / "note.md"
+    if fault != "enotdir": leaf.write_bytes(b"public fixture")
+    (alternate / "note.md").write_bytes(b"replacement fixture")
+    denied = tmp_path / "denied"
+    denied.mkdir()
+    if fault == "eacces": denied.chmod(0)
+    calls = []
+    def stat_call(value, *args, **kwargs):
+        actual = live.get(kwargs.get("dir_fd"), Path(".")) / value
+        if actual == leaf:
+            calls.append(value)
+            if len(calls) == (2 if fault == "enotdir" else 1):
+                public.rename(parked)
+                if fault == "policy":
+                    alternate.rename(public)
+                    raise alias_router.CapturedPolicyError("controlled metadata leaf policy failure")
+                symlink_or_skip(denied if fault == "eacces" else private / "note.md", public,
+                                target_is_directory=fault == "eacces")
+        return os.stat(value, *args, **kwargs)
+    live, _opened = search_only_platform(monkeypatch, stat_call=stat_call)
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: home)
+    operation = portable_fresh._Operation()
+    try:
+        expected = alias_router.CapturedPolicyError if fault == "policy" else ValueError
+        with pytest.raises(expected) as failure:
+            operation.exists(leaf)
+        if fault == "policy":
+            assert str(failure.value) == "controlled metadata leaf policy failure"
+            assert operation.path_guard._global_failure is failure.value
+        else:
+            assert str(failure.value) in {"reference parent changed while opening",
+                                          "owner-private host directory is not an input"}
+            assert portable_fresh._disposition(failure.value, guard=operation.path_guard,
+                seam="readiness", path=leaf) == portable_fresh.GLOBAL
+        assert live.closed()
+    finally:
+        denied.chmod(0o700)
+        if parked.exists():
+            if public.is_symlink(): public.unlink()
+            else: public.rename(alternate)
+            parked.rename(public)
+    retry = portable_fresh._Operation()
+    assert retry.exists(leaf) == (fault != "enotdir")
+    retry.verify()
+    assert live.closed()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("prior", ["proof", "policy"])
+def test_search_only_fallback_cleanup_refuses_without_losing_policy(tmp_path, monkeypatch, prior):
+    if not portable_fresh._descriptor_capabilities() or portable_fresh._symlink_reader() is None:
+        pytest.skip("bounded descriptor-relative link reader unavailable")
+    world, linked, public, private, home, path = r14_trial(tmp_path, "disposition")
+    armed = [True]
+    def closing(value):
+        if value == public and armed[0]:
+            armed[0] = False
+            if prior == "policy":
+                raise alias_router.CapturedPolicyError("controlled fallback cleanup policy failure")
+            raise OSError(errno.EIO, "controlled fallback proof close failure")
+    live, _opened = search_only_platform(monkeypatch, closing=closing)
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: home)
+    if prior == "policy":
+        operation = portable_fresh._Operation()
+        with pytest.raises(alias_router.CapturedPolicyError,
+                           match="^controlled fallback cleanup policy failure$"):
+            operation.lifecycle(world.ledger.path).load()
+        assert operation.failed_validation and operation.path_guard._global_failure is not None
+    else:
+        r14_assert_quarantined(world, path)
+    assert not armed[0] and live.closed()
+    r15_assert_healthy_retry(world, repair_link=True)
+    assert live.closed()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("surface", ["guard", "lifecycle"])
+def test_search_only_parent_open_identity_failure_never_exempts_inert_scope(tmp_path, monkeypatch, surface):
+    from tests.integration.test_hierarchy_router import Loop
+    if not portable_fresh._descriptor_capabilities():
+        pytest.skip("directory descriptors unavailable")
+    world = Loop(tmp_path)
+    world.team("engine"); world.team("docs")
+    world.approved(request("healthy", team="docs"))
+    public, parked, alternate, home = (tmp_path / name for name in ("public", "parked", "alternate", "owner"))
+    private = home / ".codex"
+    for directory in (public, alternate, private): directory.mkdir(parents=True)
+    (public / "note.md").write_bytes(b"original public fixture")
+    (private / "note.md").write_bytes(b"controlled private fixture")
+    symlink_or_skip(private / "note.md", alternate / "note.md")
+    path = str(public / "note.md")
+    first = request("first"); world.ledger.publish(first)
+    following = request("following", paths=[path])
+    world.ledger.event("disposition", status="FINAL", resolution={"kind": "next",
+        "request": raw_request(following), "evidence": [{"path": path, "sha256": "0" * 64}]},
+        **world.ledger.target(first))
+    world.ledger.approve(following)
+    armed = [True]
+    def stat_call(value, *args, **kwargs):
+        info = os.stat(value, *args, **kwargs)
+        actual = live.get(kwargs.get("dir_fd"), Path(".")) / value
+        if actual == public and armed[0]:
+            armed[0] = False
+            public.rename(parked)
+            alternate.rename(public)
+        return info
+    live, _opened = search_only_platform(monkeypatch, stat_call=stat_call)
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: home)
+    try:
+        if surface == "guard":
+            operation = portable_fresh._Operation()
+            with pytest.raises(ValueError) as failure:
+                operation.path_guard.check(Path(path), scope=True)
+            assert portable_fresh._disposition(failure.value, guard=operation.path_guard,
+                seam="scope", path=Path(path), inert=True) == portable_fresh.GLOBAL
+            with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+                operation.verify()
+        else:
+            r14_assert_quarantined(world, path)
+        assert not armed[0] and live.closed()
+    finally:
+        if parked.exists():
+            public.rename(alternate)
+            parked.rename(public)
+    r15_assert_healthy_retry(world)
+    assert live.closed()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("depth,swap_depth", [(0, 0), (1, 0), (1, 1), (2, 0), (2, 1), (2, 2)])
+@pytest.mark.parametrize("phase", ["stat", "kind", "open-missing", "open-notdir"])
+@pytest.mark.parametrize("surface", ["guard", "guard-false", "preflight", "checked-path", "inert", "readiness"])
+@pytest.mark.parametrize("destination", ["private", "public"])
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+def test_search_only_parent_acquisition_failure_quarantines_every_prefix(tmp_path, monkeypatch, depth, swap_depth, phase, surface, destination, capability):
+    if os.name != "posix" or not portable_fresh._descriptor_capabilities():
+        pytest.skip("parent acquisition races require POSIX directory descriptors")
+    public, parked, home = (tmp_path / name for name in ("public", "parked", "owner"))
+    private = home / ".codex" if destination == "private" else tmp_path / "public-target"
+    private.mkdir(parents=True)
+    prefix = public
+    ancestors = [public]
+    for level in range(depth):
+        prefix = prefix / ("level" + str(level))
+        ancestors.append(prefix)
+    prefix.mkdir(parents=True)
+    failing = prefix / "sub"
+    target = failing / "note.md"
+    if phase == "kind": failing.write_bytes(b"non-directory public component")
+    elif phase.startswith("open-"): failing.mkdir()
+    swapped = ancestors[swap_depth]
+    private_target = private / target.relative_to(swapped)
+    private_target.parent.mkdir(parents=True)
+    private_target.write_bytes(b"controlled private fixture")
+    symlink_probe = tmp_path / "symlink-capability"
+    symlink_or_skip(private, symlink_probe, target_is_directory=True)
+    symlink_probe.unlink()
+    if surface == "inert":
+        from tests.integration.test_hierarchy_router import Loop
+        world = Loop(tmp_path)
+        world.team("engine"); world.team("docs")
+        world.approved(request("healthy", team="docs"))
+        first = request("first"); world.ledger.publish(first)
+        following = request("following", paths=[str(target)])
+        world.ledger.event("disposition", status="FINAL", resolution={"kind": "next",
+            "request": raw_request(following), "evidence": [{"path": str(target), "sha256": "0" * 64}]},
+            **world.ledger.target(first))
+        world.ledger.approve(following)
+    elif surface == "readiness":
+        mailbox_root = tmp_path / "mailbox"
+        mailbox_root.mkdir()
+        (mailbox_root / "manifest.json").write_text(json.dumps({"schema": "aegis.hierarchy-pilot/v1",
+            "endpoints": {"a/front-door": {}, "a/orchestrator": {}}, "counterparts": [], "writer_limit": 3}))
+    armed = [True]
+    def swap():
+        armed[0] = False
+        swapped.rename(parked)
+        symlink_or_skip(private, swapped, target_is_directory=True)
+    def actual(value, kwargs):
+        return live.get(kwargs.get("dir_fd"), Path(".")) / value
+    def stat_call(value, *args, **kwargs):
+        if actual(value, kwargs) == failing and armed[0] and phase in {"stat", "kind"}:
+            if phase == "stat":
+                with pytest.raises(FileNotFoundError): os.stat(value, *args, **kwargs)
+                swap()
+                return os.stat(value, *args, **kwargs)
+            info = os.stat(value, *args, **kwargs)
+            swap()
+            return info
+        return os.stat(value, *args, **kwargs)
+    def opening(value, flags, *args, **kwargs):
+        if actual(value, kwargs) == failing and armed[0] and phase.startswith("open-"):
+            os.rmdir(value, dir_fd=kwargs["dir_fd"])
+            if phase == "open-notdir":
+                descriptor = os.open(value, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                     0o600, dir_fd=kwargs["dir_fd"])
+                try: pass
+                finally: os.close(descriptor)
+            swap()
+    live, _opened = search_only_platform(monkeypatch, capability, stat_call=stat_call, opening=opening)
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: home)
+    try:
+        if surface in {"guard", "guard-false", "preflight", "checked-path"}:
+            operation = portable_fresh._Operation()
+            with operation.path_guard.active():
+                with pytest.raises(ValueError) as failure:
+                    if surface in {"guard", "guard-false"}:
+                        operation.path_guard.check(target, scope=surface == "guard")
+                    elif surface == "preflight":
+                        alias_router.preflight_paths(target, _guard=operation.path_guard)
+                    else:
+                        import hierarchy_small_change_dispatch as dispatch
+                        dispatch.checked_path(target)
+            assert portable_fresh._disposition(failure.value, guard=operation.path_guard,
+                seam="scope", path=target, inert=True) == portable_fresh.GLOBAL
+            with pytest.raises(ValueError, match="^(reference parent changed while opening|owner-private host directory is not an input)$"):
+                operation.verify()
+        elif surface == "inert":
+            r14_assert_quarantined(world, str(target), private=destination == "private" and phase == "stat")
+        else:
+            mailbox = portable_fresh._CapturedMailbox(mailbox_root)
+            mailbox._stored_message_paths, mailbox._stored_message_refusals = set(), []
+            readiness = dict(worktree=str(target), scan_workspace=str(target), branch="feature/fixture",
+                base_revision="a" * 40, lease_ref="refs/aegis/lanes/fixture", lease_oid="b" * 40,
+                lease_expires_at="2099-01-01T00:00:00Z", owned_paths=["src/**"], scan_evidence="fixture scan",
+                hook_evidence="fixture hook", enforcement_tier="advisory")
+            typed = destination == "private" and phase == "stat"
+            expected = alias_router.PrivatePathError if typed else ValueError
+            message = ("owner-private host directory is not an input" if typed
+                       else "reference parent changed while opening")
+            with pytest.raises(expected,match="^"+message+"$"):
+                mailbox.readiness(readiness, observe=False)
+            with pytest.raises(expected,match="^"+message+"$"): mailbox.operation.verify()
+            assert mailbox.operation.failed_validation
+        assert not armed[0] and live.closed()
+    finally:
+        if parked.exists():
+            swapped.unlink()
+            parked.rename(swapped)
+    retry = portable_fresh._Operation()
+    if phase in {"kind", "open-notdir"}:
+        with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+            retry.path_guard.check(target, scope=True)
+        with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+            retry.verify()
+    else:
+        assert retry.path_guard.check(target, scope=True) is None
+        retry.verify()
+        if surface == "inert": r15_assert_healthy_retry(world)
+    assert live.closed()
+
+
+@pytest.mark.parametrize("depth", [0, 1, 2])
+@pytest.mark.parametrize("kind", ["missing", "file"])
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+def test_search_only_intact_prefix_proves_genuine_absence(tmp_path, monkeypatch, depth, kind, capability):
+    if os.name != "posix" or not portable_fresh._descriptor_capabilities():
+        pytest.skip("negative scope witnesses require POSIX directory descriptors")
+    prefix = tmp_path / "public"
+    for level in range(depth): prefix = prefix / ("level" + str(level))
+    prefix.mkdir(parents=True)
+    child = prefix / "sub"
+    if kind == "file": child.write_bytes(b"non-directory public component")
+    live, _opened = search_only_platform(monkeypatch, capability)
+    for _ in range(2):
+        operation = portable_fresh._Operation()
+        if kind == "missing":
+            assert operation.path_guard.check(child / "note.md", scope=True) is None
+            assert operation.exists(child / "note.md") is False
+            operation.verify()
+        else:
+            with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+                operation.path_guard.check(child / "note.md", scope=True)
+            with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+                operation.verify()
+        assert live.closed()
+
+
+@pytest.mark.parametrize("scope", [False, True])
+@pytest.mark.parametrize("allocation", ["proof", "negative"])
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+def test_search_only_scope_allocation_failure_closes_and_retries(tmp_path, monkeypatch, scope, allocation, capability):
+    if os.name != "posix" or not portable_fresh._descriptor_capabilities():
+        pytest.skip("anchored allocation cleanup requires POSIX directory descriptors")
+    leaf = tmp_path / "missing"
+    live, _opened = search_only_platform(monkeypatch, capability)
+    original = portable_fresh._ProvedChain if allocation == "proof" else portable_fresh._AbsentReference
+    armed = [True]
+    class AllocationFailure(original):
+        def __init__(self, *args, **kwargs):
+            if armed[0]:
+                armed[0] = False
+                raise MemoryError("controlled scope allocation failure")
+            super().__init__(*args, **kwargs)
+    if allocation == "proof":
+        monkeypatch.setattr(portable_fresh, "_ProvedChain", AllocationFailure)
+    else:
+        monkeypatch.setattr(portable_fresh, "_AbsentReference", AllocationFailure)
+    operation = portable_fresh._Operation()
+    with pytest.raises(ValueError, match="^reference parent changed while opening$") as refused:
+        operation.path_guard.check(leaf, scope=scope)
+    assert portable_fresh._disposition(refused.value, guard=operation.path_guard,
+        seam="scope", path=leaf, inert=True) == portable_fresh.GLOBAL
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+        operation.verify()
+    assert not armed[0] and live.closed()
+    retry = portable_fresh._Operation()
+    assert retry.exists(leaf) is False
+    retry.verify()
+    assert live.closed()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("scope", [False, True])
+@pytest.mark.parametrize("when", [1, 2, 3], ids=["initial", "recheck", "last-prefix"])
+@pytest.mark.parametrize("missing", [False, True], ids=["present", "absent"])
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+def test_search_only_successful_leaf_private_swap_is_not_stale_success(tmp_path, monkeypatch, scope, when, missing, capability):
+    if not portable_fresh._descriptor_capabilities():
+        pytest.skip("leaf replacement requires directory descriptors")
+    public, home, parked = (tmp_path / name for name in ("public", "owner", "parked"))
+    public.mkdir()
+    private = home / ".codex"
+    private.mkdir(parents=True)
+    secret = private / "note.md"
+    secret.write_bytes(b"private fixture")
+    target = public / "note.md"
+    if not missing: target.write_bytes(b"public fixture")
+    symlink_probe = tmp_path / "symlink-capability"
+    symlink_or_skip(secret, symlink_probe)
+    symlink_probe.unlink()
+    armed, calls = [True], []
+    def observe(value, *args, **kwargs):
+        kwargs.setdefault("follow_symlinks", False)
+        actual = live.get(kwargs.get("dir_fd"), Path(".")) / value
+        try:
+            return os.stat(value, *args, **kwargs)
+        finally:
+            if actual == target:
+                calls.append(actual)
+                if len(calls) == when and armed[0]:
+                    armed[0] = False
+                    if when == 3:
+                        public.rename(parked)
+                        symlink_or_skip(private, public, target_is_directory=True)
+                    else:
+                        if target.exists(): target.unlink()
+                        symlink_or_skip(secret, target)
+    live, _opened = search_only_platform(monkeypatch, capability, stat_call=observe, lstat=observe)
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: home)
+    operation = portable_fresh._Operation()
+    with pytest.raises(ValueError) as refused:
+        operation.path_guard.check(target, scope=scope)
+    assert portable_fresh._disposition(refused.value, guard=operation.path_guard,
+        seam="scope", path=target, inert=True) == portable_fresh.GLOBAL
+    assert not armed[0] and live.closed()
+    if parked.exists():
+        public.unlink()
+        parked.rename(public)
+    if target.exists(): target.unlink()
+    target.write_bytes(b"healthy retry")
+    retry = portable_fresh._Operation()
+    assert retry.path_guard.check(target, scope=scope) is not None
+    retry.verify()
+    assert live.closed()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("surface", ["scope-false", "scope-true", "missing-input", "exists"])
+def test_search_only_intermediate_private_file_swap_is_typed(tmp_path, monkeypatch, surface):
+    if not portable_fresh._descriptor_capabilities():
+        pytest.skip("intermediate replacement requires directory descriptors")
+    public, parked, home = (tmp_path / name for name in ("public", "parked", "owner"))
+    sub = public / "sub"
+    sub.mkdir(parents=True)
+    target = sub / "missing"
+    private = home / ".codex"
+    private.mkdir(parents=True)
+    secret = private / "file"
+    secret.write_bytes(b"non-directory private fixture")
+    capability = tmp_path / "symlink-capability"
+    symlink_or_skip(secret, capability)
+    capability.unlink()
+    armed = [True]
+    def swap(value, kwargs):
+        actual = live.get(kwargs.get("dir_fd"), Path(".")) / value
+        if actual == sub and armed[0]:
+            armed[0] = False
+            public.rename(parked)
+            symlink_or_skip(secret, public)
+    def lstat(value, *args, **kwargs):
+        swap(value, kwargs)
+        return os.lstat(value, *args, **kwargs)
+    def stat_call(value, *args, **kwargs):
+        swap(value, kwargs)
+        return os.stat(value, *args, **kwargs)
+    live, _opened = search_only_platform(monkeypatch, stat_call=stat_call, lstat=lstat)
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: home)
+    operation = portable_fresh._Operation()
+    try:
+        with pytest.raises(ValueError) as refused:
+            if surface.startswith("scope-"):
+                operation.path_guard.check(target, scope=surface == "scope-true")
+            elif surface == "missing-input":
+                portable_fresh._missing_input_info(target, operation.path_guard)
+            else:
+                operation.exists(target)
+        assert portable_fresh._disposition(refused.value, guard=operation.path_guard,
+            seam="scope", path=target, inert=True) == portable_fresh.GLOBAL
+        assert not armed[0] and live.closed()
+    finally:
+        if parked.exists():
+            public.unlink()
+            parked.rename(public)
+    retry = portable_fresh._Operation()
+    assert retry.exists(target) is False
+    retry.verify()
+    assert live.closed()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("destination", ["private", "public"])
+def test_search_only_optional_private_ancestor_failure_latches_parent(tmp_path, monkeypatch, capability, destination):
+    if not portable_fresh._descriptor_capabilities() or portable_fresh._symlink_reader() is None:
+        pytest.skip("private target classification requires bounded descriptor link reads")
+    public, home, held, alternate = (tmp_path / name for name in ("public", "owner", "held", "alternate"))
+    linked, private = public / "linked", home / ".codex"
+    for folder in (linked, private, alternate):
+        folder.mkdir(parents=True)
+        (folder / "note.md").write_bytes(b"fixture evidence")
+    symlink_probe = tmp_path / "symlink-capability"
+    symlink_or_skip(private, symlink_probe, target_is_directory=True)
+    symlink_probe.unlink()
+    reference = ref(linked / "note.md")
+    origin = tmp_path / "origin.json"
+    origin.write_bytes(b"{}")
+    observations = []
+    def stat_call(value, *args, **kwargs):
+        actual = live.get(kwargs.get("dir_fd"), Path(".")) / value
+        if actual == linked:
+            observations.append(actual)
+            if len(observations) == 2:
+                linked.rename(held)
+                symlink_or_skip(private if destination == "private" else alternate,
+                                linked, target_is_directory=True)
+        return os.stat(value, *args, **kwargs)
+    live, _opened = search_only_platform(monkeypatch, capability, stat_call=stat_call)
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: home)
+    brief = portable_fresh.Brief()
+    if destination == "private":
+        with pytest.raises(alias_router.PrivatePathError):
+            brief.evidence(reference, ref(origin))
+    else:
+        brief.evidence(reference, ref(origin))
+        assert [row["kind"] for row in brief.sections["Evidence references"]] == ["unverified_evidence"]
+    assert len(observations) >= 2 and live.closed()
+    linked.unlink()
+    held.rename(linked)
+    if destination == "private":
+        with pytest.raises(alias_router.PrivatePathError): brief.operation.verify()
+        assert brief.operation.failed_validation
+    else:
+        with pytest.raises(ValueError): brief.operation.verify()
+        assert brief.operation.failed_validation
+    retry = portable_fresh.Brief()
+    retry.evidence(reference, ref(origin))
+    retry.operation.verify()
+    assert [row["kind"] for row in retry.sections["Evidence references"]] == ["evidence"]
+    assert live.closed()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("surface", ["prove", "ready"])
+def test_search_only_unreadable_ancestor_latches_parent_before_witnesses(tmp_path, monkeypatch, surface):
+    if not portable_fresh._descriptor_capabilities() or os.geteuid() == 0:
+        pytest.skip("unreadable ancestor requires unprivileged POSIX descriptor support")
+    public = tmp_path / "public"
+    public.mkdir()
+    target = public / "note.md"
+    target.write_bytes(b"fixture evidence")
+    if surface == "ready":
+        (public / "manifest.json").write_text(json.dumps({"schema": "aegis.hierarchy-pilot/v1",
+            "endpoints": {"a/front-door": {}, "a/orchestrator": {}}, "counterparts": [], "writer_limit": 3}))
+        mailbox = portable_fresh._CapturedMailbox(public)
+        operation = mailbox.operation
+        binding = {"generation": 2, "endpoint": "a/orchestrator"}
+    else:
+        operation = portable_fresh._Operation()
+    live, _opened = search_only_platform(monkeypatch)
+    public.chmod(0o111)
+    try:
+        with pytest.raises(ValueError, match="^reference parent changed while opening$") as caught:
+            if surface == "prove": operation.prove(portable_fresh.safe_path, target)
+            else: mailbox.ready(binding)
+        assert operation.failed_validation
+        assert type(operation.validation_failure) is ValueError
+        assert str(operation.validation_failure) == "reference parent changed while opening"
+        assert live.closed()
+    finally:
+        public.chmod(0o700)
+    with pytest.raises(ValueError, match="^reference parent changed while opening$") as retained:
+        operation.verify()
+    assert retained.value is operation.validation_failure
+    if surface == "prove":
+        retry = portable_fresh._Operation()
+        assert retry.prove(portable_fresh.safe_path, target) is not None
+    else:
+        retry_mailbox = portable_fresh._CapturedMailbox(public)
+        assert retry_mailbox.ready(binding) is False
+        retry_mailbox.operation.verify()
+    assert live.closed()
+
+
+def test_search_only_unsupported_proof_latches_parent(tmp_path, monkeypatch):
+    target = tmp_path / "note.md"
+    target.write_bytes(b"fixture evidence")
+    original = portable_fresh._descriptor_capabilities
+    monkeypatch.setattr(portable_fresh, "_descriptor_capabilities", lambda: False)
+    operation = portable_fresh._Operation()
+    with pytest.raises(portable_fresh._ProofPathError) as caught:
+        operation.prove(portable_fresh.safe_path, target)
+    assert str(caught.value) == "secure scope proof requires directory descriptor support"
+    assert operation.failed_validation and operation.validation_failure is caught.value
+    monkeypatch.setattr(portable_fresh, "_descriptor_capabilities", original)
+    with pytest.raises(portable_fresh._ProofPathError) as retained: operation.verify()
+    assert retained.value is caught.value
+    if original():
+        assert portable_fresh._Operation().prove(portable_fresh.safe_path, target) is not None
+
+
+@lifecycle_only
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("field", ["paths", "scope", "disposition", "resolve"])
+@pytest.mark.parametrize("failure", ["denied", "changed"])
+def test_search_only_stored_walk_preserves_typed_refusal(tmp_path, monkeypatch, capability, field, failure):
+    if not portable_fresh._descriptor_capabilities():
+        pytest.skip("stored ancestor witness requires directory descriptor support")
+    ledger = Ledger(tmp_path)
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    bad = request("hostile", paths=[str(blocked / "scope")])
+    ledger.publish(request("healthy"))
+    if field == "scope":
+        change = SmallChange(ledger, bad)
+        change.plan["plan"]["path_scopes"] = [bad["paths"]]
+        change.register()
+    elif field in {"disposition", "resolve"}:
+        first = request("first")
+        ledger.publish(first)
+        extra = {"status": "FINAL"}
+        if field == "resolve":
+            ledger.event("disposition", status="HOLD", resolution={"kind": "blocked", "owner": "engine/coordinator",
+                "next_decision": "review", "condition": "reviewed", "evidence": ledger.evidence}, **ledger.target(first))
+            extra = {"blocker_sha256": portable_fresh.digest(ledger.status()["requests"]["first"]["resolution"])}
+        ledger.event(field, resolution={"kind": "next", "request": raw_request(bad), "evidence": ledger.evidence},
+                     **extra, **ledger.target(first))
+    else:
+        ledger.publish(bad)
+    fault = (PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(blocked)) if failure == "denied"
+             else ValueError("reference parent changed while opening"))
+    armed = [True]
+    def stat_call(path, *args, **kwargs):
+        if armed[0] and Path(path).name == "blocked":
+            raise fault
+        return os.stat(path, *args, **kwargs)
+    live, _opened = search_only_platform(monkeypatch, capability, stat_call=stat_call)
+    operation = portable_fresh._Operation()
+    journal = operation.lifecycle(ledger.path)
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+        journal.load()
+    assert operation.failed_validation
+    armed[0] = False
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+        operation.verify()
+    assert live.closed()
+    retry = portable_fresh._Operation()
+    _policy, state = retry.lifecycle(ledger.path).load()
+    assert "hostile" in state["requests"]
+    retry.verify()
+    assert live.closed()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("failure", ["denied", "changed"])
+def test_search_only_optional_proof_keeps_quarantine(tmp_path, monkeypatch, capability, failure):
+    if not portable_fresh._descriptor_capabilities():
+        pytest.skip("proof ancestor witness requires directory descriptor support")
+    public = tmp_path / "public"
+    public.mkdir()
+    target, origin = public / "note.md", tmp_path / "origin.json"
+    target.write_bytes(b"fixture evidence")
+    origin.write_bytes(b"{}")
+    reference, source = ref(target), ref(origin)
+    armed = [True]
+    def stat_call(path, *args, **kwargs):
+        if armed[0] and Path(path).name == "public":
+            if failure == "denied":
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(public))
+            raise ValueError("reference parent changed while opening")
+        return os.stat(path, *args, **kwargs)
+    live, _opened = search_only_platform(monkeypatch, capability, stat_call=stat_call)
+    brief = portable_fresh.Brief()
+    brief.evidence(reference, source)
+    assert [row["kind"] for row in brief.sections["Evidence references"]] == ["unverified_evidence"]
+    assert live.closed()
+    armed[0] = False
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+        brief.operation.verify()
+    retry = portable_fresh.Brief()
+    retry.evidence(reference, source)
+    assert [row["kind"] for row in retry.sections["Evidence references"]] == ["evidence"]
+    retry.operation.verify()
+    assert live.closed()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("backend", ["descriptor", "portable"])
+@pytest.mark.parametrize("change", ["missing", "public", "private", "parent"])
+def test_search_only_absence_verification_keeps_anchored_identity(tmp_path, monkeypatch, capability, backend, change):
+    if not portable_fresh._descriptor_capabilities():
+        pytest.skip("anchored absence verification requires directory descriptor support")
+    private, public = tmp_path / "private-file", tmp_path / "public"
+    private.write_bytes(b"fixture private identity")
+    public.mkdir()
+    target = public / "note.md"
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: tmp_path / "owner")
+    monkeypatch.setattr(alias_router, "_home_declarations", lambda: (("ROUND8_HOME", ".private"),))
+    monkeypatch.setattr(alias_router, "os", SimpleNamespace(**{**vars(os),
+        "environ": {**os.environ, "ROUND8_HOME": str(private)}}))
+    live, _opened = search_only_platform(monkeypatch, capability)
+    monkeypatch.setattr(portable_fresh, "_reference_descriptors", lambda: backend == "descriptor")
+    operation = portable_fresh._Operation()
+    assert operation.exists(target) is False
+    if change == "private":
+        os.link(private, target)
+    elif change == "public":
+        target.write_bytes(b"ordinary appeared file")
+    elif change == "parent":
+        public.rename(tmp_path / "previous-public")
+        public.mkdir()
+    if change == "missing":
+        operation.verify()
+    else:
+        expected = alias_router.PrivatePathError if change == "private" else portable_fresh.CaptureChanged
+        with pytest.raises(expected) as caught:
+            operation.verify()
+        if change == "private":
+            assert str(caught.value) == "owner-private host directory is not an input"
+        else:
+            assert str(caught.value) == "reference parent changed while opening"
+        with pytest.raises(expected) as retained:
+            operation.verify()
+        assert retained.value is caught.value
+    assert live.closed()
+    if target.exists(): target.unlink()
+    retry = portable_fresh._Operation()
+    assert retry.exists(target) is False
+    retry.verify()
+    assert live.closed()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("surface", ["file-ref", "read"])
+@pytest.mark.parametrize("kind", ["generic", "missing", "not-directory", "denied"])
+def test_search_only_ordinary_read_keeps_os_refusal(tmp_path, monkeypatch, capability, surface, kind):
+    if not portable_fresh._descriptor_capabilities():
+        pytest.skip("directory acquisition refusal requires descriptor support")
+    public = tmp_path / "public"
+    public.mkdir()
+    target = public / "note.md"
+    target.write_bytes(b"ordinary reference")
+    failures = {"generic": OSError, "missing": FileNotFoundError,
+                "not-directory": NotADirectoryError, "denied": PermissionError}
+    fault = failures[kind]("modelled directory unavailable")
+    armed = [True]
+    def opening(path, flags, *args, **kwargs):
+        if armed[0] and Path(path).name == "public":
+            raise fault
+    live, _opened = search_only_platform(monkeypatch, capability, opening=opening)
+    operation = portable_fresh._Operation()
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+        if surface == "file-ref": portable_fresh.file_ref(target)
+        else: operation.read(target)
+    assert live.closed()
+    armed[0] = False
+    if surface == "read":
+        with pytest.raises(ValueError, match="^reference parent changed while opening$"): operation.verify()
+    assert portable_fresh._Operation().read(target)[1] == b"ordinary reference"
+    assert live.closed()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("surface", ["guard", "preflight", "checked-path", "exists", "members",
+                                     "lifecycle", "mailbox", "recheck", "cached-read", "verify-existing", "prove"])
+@pytest.mark.parametrize("failure", [OSError, PermissionError], ids=["generic", "denied"])
+def test_search_only_ordinary_callers_preserve_head_refusal(tmp_path, monkeypatch, capability, surface, failure):
+    if not portable_fresh._descriptor_capabilities():
+        pytest.skip("ordinary acquisition refusal requires directory descriptors")
+    public = tmp_path / "public"
+    public.mkdir()
+    target = public / "note.md"
+    target.write_bytes(b"ordinary reference")
+    operation = portable_fresh._Operation()
+    if surface in {"recheck", "cached-read"}:
+        operation.read(target)
+    elif surface == "verify-existing":
+        assert operation.exists(target)
+    fault = failure("modelled directory unavailable")
+    def stat_call(path, *args, **kwargs):
+        if Path(path).name == "public":
+            raise fault
+        return os.stat(path, *args, **kwargs)
+    live, _opened = search_only_platform(monkeypatch, capability, stat_call=stat_call)
+    with operation.path_guard.active():
+        with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+            if surface == "guard": operation.path_guard.check(target)
+            elif surface == "preflight": alias_router.preflight_paths(target)
+            elif surface == "checked-path":
+                import hierarchy_small_change_dispatch as dispatch
+                dispatch.checked_path(target)
+            elif surface == "exists": operation.exists(target)
+            elif surface == "members": operation.entries(public)
+            elif surface == "lifecycle": operation.lifecycle(public)
+            elif surface == "mailbox": portable_fresh._CapturedMailbox(public, _operation=operation)
+            elif surface == "recheck":
+                portable_fresh._recheck_reference(operation.files[target][2], _guard=operation.path_guard)
+            elif surface == "cached-read": operation.read(target)
+            elif surface == "verify-existing": operation.verify()
+            else: operation.prove(portable_fresh.safe_path, target)
+    assert operation.failed_validation
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+        operation.verify()
+    assert live.closed()
+
+
+@pytest.mark.parametrize("backend", ["no-search", "no-descriptor"])
+@pytest.mark.parametrize("surface", ["reference", "read", "verify"])
+def test_portable_ordinary_read_keeps_proof_boundary(tmp_path, monkeypatch, capsys, backend, surface):
+    if backend == "no-search" and not portable_fresh._descriptor_capabilities():
+        pytest.skip("search-handle emulation requires directory descriptors")
+    target = tmp_path / "ordinary.bin"
+    data = b"ordinary bounded reference\n" * 17
+    target.write_bytes(data)
+    reference = {"path": str(target), "sha256": hashlib.sha256(data).hexdigest()}
+    live, _opened = search_only_platform(monkeypatch)
+    if backend == "no-descriptor":
+        monkeypatch.setattr(portable_fresh, "_descriptor_capabilities", lambda: False)
+    if surface == "reference":
+        assert portable_fresh.file_ref(target) == reference
+    elif surface == "read":
+        operation = portable_fresh._Operation()
+        assert operation.read(target) == (reference, data)
+        operation.verify()
+        assert operation.read(target) == (reference, data)
+    else:
+        brief = tmp_path / "ordinary.md"
+        lines = ["# Fresh thread brief", "<!-- aegis.hierarchy-fresh-brief/v1 -->", "Resume path: Verify first."]
+        for section in SECTIONS:
+            lines += ["## " + section, "- " + json.dumps({"kind": "evidence", "ref": reference})]
+        raw = ("\n".join(lines) + "\n").encode()
+        brief.write_bytes(raw)
+        assert portable_fresh.main(["verify", "--path", str(brief), "--sha256", hashlib.sha256(raw).hexdigest()]) == 0
+        output = capsys.readouterr()
+        assert output.err == "" and json.loads(output.out)["entries"] == len(SECTIONS)
+    assert live.closed()
+    if backend == "no-descriptor":
+        with pytest.raises(portable_fresh._ProofPathError) as refused:
+            portable_fresh.safe_path(target)
+        assert str(refused.value) == "secure scope proof requires directory descriptor support"
+        declaration = portable_fresh.Brief()
+        declaration.evidence(reference, reference)
+        assert [row["kind"] for row in declaration.sections["Evidence references"]] == ["unverified_evidence"]
+        with pytest.raises(portable_fresh._ProofPathError): declaration.operation.verify()
+        authoritative = portable_fresh.Brief(_authoritative=True)
+        with pytest.raises(portable_fresh._ProofPathError): authoritative.evidence(reference, reference)
+        assert live.closed()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("caller", ["trust", "inert", "stored", "public", "trial", "scope", "resolve", "inert-resolve"])
+@pytest.mark.parametrize("outcome", ["absent", "error", "changed", "private"])
+def test_round10_acquisition_outcome_by_caller(tmp_path, monkeypatch, capability, caller, outcome):
+    if os.name != "posix" or not portable_fresh._descriptor_capabilities():
+        pytest.skip("physical acquisition witnesses require POSIX directory descriptors")
+    if outcome == "error" and os.geteuid() == 0:
+        pytest.skip("permission witness requires an unprivileged runner")
+    public, held, alternate = (tmp_path / name for name in ("public", "held", "alternate"))
+    public.mkdir()
+    alternate.mkdir()
+    target = public / "note.md"
+    target.write_bytes(b"public evidence")
+    (alternate / target.name).write_bytes(b"public evidence")
+    private = tmp_path / "private-file"
+    private.write_bytes(b"private evidence")
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: tmp_path / "owner")
+    monkeypatch.setattr(alias_router, "_home_declarations", lambda: (("ROUND10_HOME", ".private"),))
+    monkeypatch.setattr(alias_router, "os", SimpleNamespace(**{**vars(os),
+        "environ": {**os.environ, "ROUND10_HOME": str(private)}}))
+    reference = ref(target)
+    origin = tmp_path / "origin.json"
+    origin.write_bytes(b"{}")
+    ledger = Ledger(tmp_path)
+    hostile = request("hostile", paths=[str(target)])
+    caller_kind = {"scope": "stored", "resolve": "trial", "inert-resolve": "inert"}.get(caller, caller)
+    if caller == "stored":
+        ledger.publish(hostile)
+    elif caller == "scope":
+        change = SmallChange(ledger, hostile)
+        change.plan["plan"]["path_scopes"] = [hostile["paths"]]
+        change.register()
+    elif caller_kind in {"trial", "inert"}:
+        first = request("first")
+        ledger.publish(first)
+        kind, extra = "disposition", {"status": "FINAL"}
+        if caller in {"resolve", "inert-resolve"}:
+            kind = "resolve"
+            ledger.event("disposition", status="HOLD", resolution={"kind": "blocked", "owner": "engine/coordinator",
+                "next_decision": "review", "condition": "reviewed", "evidence": ledger.evidence}, **ledger.target(first))
+            extra = {"blocker_sha256": portable_fresh.digest(ledger.status()["requests"]["first"]["resolution"])}
+        ledger.event(kind, **extra, resolution={"kind": "next",
+            "request": raw_request(hostile), "evidence": [reference] if caller_kind == "inert" else ledger.evidence},
+            **ledger.target(first))
+    armed, swapped = [True], [False]
+    def opening(value, flags, *args, **kwargs):
+        actual = live.get(kwargs.get("dir_fd"), Path(".")) / value
+        if armed[0] and outcome == "changed" and actual == public:
+            armed[0] = False
+            public.rename(held)
+            alternate.rename(public)
+            swapped[0] = True
+    def stat_call(value, *args, **kwargs):
+        info = os.stat(value, *args, **kwargs)
+        actual = live.get(kwargs.get("dir_fd"), Path(".")) / value
+        if armed[0] and outcome == "private" and actual == target:
+            armed[0] = False
+            target.rename(held)
+            os.link(private, target)
+            swapped[0] = True
+        return info
+    live, _opened = search_only_platform(monkeypatch, capability, opening=opening, stat_call=stat_call)
+    operation = portable_fresh._Operation()
+    journal = operation.lifecycle(ledger.path) if caller_kind in {"stored", "trial", "inert"} else None
+    brief = portable_fresh.Brief(_operation=operation) if caller == "trust" else None
+    if outcome == "absent": target.unlink()
+    if outcome == "error": public.chmod(0)
+    try:
+        if outcome in {"error", "changed"} and caller != "trust":
+            with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+                if journal is not None: journal.load()
+                else: operation.exists(target)
+        elif outcome == "private":
+            with pytest.raises(alias_router.PrivatePathError):
+                if journal is not None: journal.load()
+                elif caller == "trust": brief.evidence(reference, ref(origin))
+                else: operation.exists(target)
+        elif caller == "trust":
+            brief.evidence(reference, ref(origin))
+            assert [row["kind"] for row in brief.sections["Evidence references"]] == ["unverified_evidence"]
+        elif journal is not None:
+            _policy, state = journal.load()
+            if outcome == "private":
+                assert "hostile" in journal.private_refusals
+            else:
+                assert "hostile" in state["requests"] and journal.private_refusals == {}
+        else:
+            assert operation.exists(target) is False
+        assert live.closed()
+    finally:
+        public.chmod(0o700)
+        if swapped[0] and outcome == "changed":
+            public.rename(alternate)
+            held.rename(public)
+        elif swapped[0]:
+            target.unlink()
+            held.rename(target)
+    if outcome != "absent":
+        assert operation.failed_validation
+        if outcome != "error":
+            assert swapped[0]
+        refused = alias_router.PrivatePathError if outcome == "private" else ValueError
+        message = ("^owner-private host directory is not an input$" if outcome == "private"
+                   else "^reference parent changed while opening$")
+        with pytest.raises(refused, match=message): operation.verify()
+        with pytest.raises(refused, match=message): operation.prove(lambda: None)
+    else:
+        operation.verify()
+    assert live.closed()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("caller", ["declaration", "stored"])
+def test_round11_stable_private_observation_stays_local(tmp_path, monkeypatch, capability, caller):
+    if not portable_fresh._descriptor_capabilities():
+        pytest.skip("stable private identity requires directory descriptors")
+    private, alias = tmp_path / "private-file", tmp_path / "alias.md"
+    private.write_bytes(b"private evidence")
+    os.link(private, alias)
+    reference = ref(alias)
+    ledger = Ledger(tmp_path)
+    ledger.publish(request("private-row", paths=[str(alias)]))
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: tmp_path / "owner")
+    monkeypatch.setattr(alias_router, "_home_declarations", lambda: (("ROUND11_HOME", ".private"),))
+    monkeypatch.setattr(alias_router, "os", SimpleNamespace(**{**vars(os),
+        "environ": {**os.environ, "ROUND11_HOME": str(private)}}))
+    live, _opened = search_only_platform(monkeypatch, capability)
+    operation = portable_fresh._Operation()
+    if caller == "declaration":
+        brief = portable_fresh.Brief(_operation=operation)
+        with pytest.raises(alias_router.PrivatePathError): brief.evidence(reference, reference)
+    else:
+        journal = operation.lifecycle(ledger.path)
+        _policy, state = journal.load()
+        assert "private-row" in state["requests"]
+        assert "private-row" in journal.private_refusals
+    assert not operation.failed_validation
+    operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+def test_round11_portable_reader_keeps_a_stable_public_declaration(tmp_path, monkeypatch):
+    target = tmp_path / "public.md"
+    target.write_bytes(b"public evidence")
+    reference = ref(target)
+    monkeypatch.setattr(portable_fresh, "_reference_descriptors", lambda: False)
+    brief = portable_fresh.Brief()
+    brief.evidence(reference, reference)
+    assert [row["kind"] for row in brief.sections["Evidence references"]] == ["evidence"]
+    brief.operation.verify()
+
+
+def test_round11_unsupported_authoritative_proof_latches_before_wrapping(tmp_path, monkeypatch):
+    target = tmp_path / "public.md"
+    target.write_bytes(b"public evidence")
+    reference = ref(target)
+    monkeypatch.setattr(portable_fresh, "_descriptor_capabilities", lambda: False)
+    brief = portable_fresh.Brief(_authoritative=True)
+    with pytest.raises(portable_fresh._ProofPathError) as caught:
+        brief.evidence(reference, reference)
+    assert str(caught.value) == "secure scope proof requires directory descriptor support"
+    with pytest.raises(portable_fresh._ProofPathError) as retained: brief.operation.verify()
+    assert retained.value is caught.value
+    with pytest.raises(portable_fresh._ProofPathError): brief.operation.prove(lambda: None)
+
+
+@lifecycle_only
+def test_round11_inert_scope_does_not_exempt_a_proof_allocation_failure(tmp_path, monkeypatch):
+    if not portable_fresh._descriptor_capabilities():
+        pytest.skip("proof allocation witness requires directory descriptors")
+    target = tmp_path / "missing.md"
+    ledger = Ledger(tmp_path)
+    first = request("first")
+    ledger.publish(first)
+    following = request("following", paths=[str(target)])
+    ledger.event("disposition", status="FINAL", resolution={"kind": "next", "request": raw_request(following),
+        "evidence": [{"path": str(target), "sha256": "0" * 64}]}, **ledger.target(first))
+    original = portable_fresh._ProvedChain
+    armed = [True]
+    class AllocationFailure(original):
+        def __init__(self, *args, **kwargs):
+            if armed[0] and Path(args[1]) == target:
+                armed[0] = False
+                raise MemoryError("controlled proof allocation failure")
+            super().__init__(*args, **kwargs)
+    monkeypatch.setattr(portable_fresh, "_ProvedChain", AllocationFailure)
+    operation = portable_fresh._Operation()
+    journal = operation.lifecycle(ledger.path)
+    with pytest.raises(ValueError,match="^reference parent changed while opening$"): journal.load()
+    assert not armed[0] and operation.failed_validation
+    with pytest.raises(ValueError,match="^reference parent changed while opening$"): operation.verify()
+    retry = portable_fresh._Operation()
+    _policy, state = retry.lifecycle(ledger.path).load()
+    assert "following" in state["requests"]
+    retry.verify()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("window", ["before-stat", "after-stat"])
+def test_round11_link_capture_replacement_keeps_typed_privacy_cause(tmp_path, monkeypatch, window):
+    if not portable_fresh._descriptor_capabilities() or portable_fresh._symlink_reader() is None:
+        pytest.skip("link capture requires descriptor-backed link reads")
+    private, public, alias, held = (tmp_path / name for name in ("private-file", "public.md", "alias.md", "held"))
+    private.write_bytes(b"private evidence")
+    public.write_bytes(b"public evidence")
+    symlink_or_skip(public, alias)
+    reference = ref(alias)
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: tmp_path / "owner")
+    monkeypatch.setattr(alias_router, "_home_declarations", lambda: (("ROUND11_HOME", ".private"),))
+    monkeypatch.setattr(alias_router, "os", SimpleNamespace(**{**vars(os),
+        "environ": {**os.environ, "ROUND11_HOME": str(private)}}))
+    changed = []
+    def replace():
+        alias.rename(held)
+        os.link(private, alias)
+        changed.append(True)
+    def stat_call(value, *args, **kwargs):
+        actual = live.get(kwargs.get("dir_fd"), Path(".")) / value
+        frame = sys._getframe(1)
+        if frame.f_code.co_name == "_acquire": frame = frame.f_back
+        at_capture = actual == alias and frame.f_code.co_name == "_link_snapshot" and not changed
+        if at_capture and window == "before-stat": replace()
+        info = os.stat(value, *args, **kwargs)
+        if at_capture and window == "after-stat": replace()
+        return info
+    live, _opened = search_only_platform(monkeypatch, "none", stat_call=stat_call)
+    brief = portable_fresh.Brief()
+    try:
+        with pytest.raises(alias_router.PrivatePathError): brief.evidence(reference, reference)
+        assert changed and brief.operation.failed_validation and live.closed()
+    finally:
+        if changed:
+            alias.unlink()
+            held.rename(alias)
+    with pytest.raises(alias_router.PrivatePathError): brief.operation.verify()
+    assert live.closed()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("backend", ["descriptor", "portable"])
+@pytest.mark.parametrize("window,initial", [("before-read", "present"), ("after-read", "present"),
+                                         ("verify", "present"), ("before-read", "absent")])
+@pytest.mark.parametrize("destination", ["public", "private"])
+def test_round11_reference_parent_walk_keeps_the_earlier_witness(tmp_path, monkeypatch, capability, backend,
+                                                              window, initial, destination):
+    if not portable_fresh._descriptor_capabilities() or portable_fresh._symlink_reader() is None:
+        pytest.skip("physical parent replacements require descriptor-backed link proofs")
+    public, held, alternate, home = (tmp_path / name for name in ("public", "held", "alternate", "owner"))
+    private = home / ".codex"
+    for folder in (public, alternate, private):
+        folder.mkdir(parents=True)
+        (folder / "note.md").write_bytes(b"public evidence")
+    probe = tmp_path / "symlink-capability"
+    symlink_or_skip(alternate, probe, target_is_directory=True)
+    probe.unlink()
+    target = public / "note.md"
+    reference = ref(target)
+    if initial == "absent":
+        target.unlink()
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: home)
+    changed = [False]
+    def read_stage():
+        frame = sys._getframe(1)
+        while frame is not None:
+            if (frame.f_code.co_name == "verify" and frame.f_code.co_filename == portable_fresh.__file__
+                    and getattr(frame.f_locals.get("self"), "_detection_owner", None) is not None
+                    and frame.f_locals.get("parent") == public):
+                return "verify"
+            if (frame.f_code.co_name == "_read_reference" and frame.f_code.co_filename == portable_fresh.__file__
+                    and frame.f_locals.get("path") == target and "checked" in frame.f_locals):
+                return "after-read" if "sha" in frame.f_locals else "before-read"
+            frame = frame.f_back
+        return None
+    def replace():
+        changed[0] = True
+        public.rename(held)
+        symlink_or_skip(private if destination == "private" else alternate, public, target_is_directory=True)
+    def opening(value, flags, *args, **kwargs):
+        # The old ancestry is already captured. Substitute before the new
+        # consuming walk has observed this component, rather than inside a
+        # single stat/open identity comparison.
+        if backend == "descriptor" and not changed[0] and read_stage() == window:
+            replace()
+    def lstated(value, *args, **kwargs):
+        if backend == "portable" and Path(value) == public and not changed[0] and read_stage() == window:
+            replace()
+        return os.lstat(value, *args, **kwargs)
+    live, _opened = search_only_platform(monkeypatch, capability, opening=opening, lstat=lstated)
+    monkeypatch.setattr(portable_fresh, "_reference_descriptors", lambda: backend == "descriptor")
+    brief = portable_fresh.Brief()
+    try:
+        if destination == "private":
+            with pytest.raises(alias_router.PrivatePathError): brief.evidence(reference, reference)
+        else:
+            brief.evidence(reference, reference)
+            assert [row["kind"] for row in brief.sections["Evidence references"]] == ["unverified_evidence"]
+        assert changed[0] and brief.operation.failed_validation
+        expected = alias_router.PrivatePathError if destination == "private" else ValueError
+        with pytest.raises(expected):
+            brief.operation.verify()
+        assert live.closed()
+    finally:
+        if changed[0]:
+            public.unlink()
+            held.rename(public)
+    with pytest.raises(expected):
+        brief.operation.verify()
+    if initial == "absent":
+        target.write_bytes(b"public evidence")
+    independent = portable_fresh._Operation()
+    assert independent.reference(target) == reference
+    independent.verify()
+    assert not independent.failed_validation and live.closed()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("capability,window", [("none", "open"), ("O_PATH", "stat")])
+@pytest.mark.parametrize("kind", ["disposition", "resolve"])
+def test_round10_detached_error_prefix_is_never_inert(tmp_path, monkeypatch, capability, window, kind):
+    if not portable_fresh._descriptor_capabilities() or os.geteuid() == 0:
+        pytest.skip("detached permission witness requires unprivileged POSIX descriptors")
+    public, held, private = (tmp_path / name for name in ("public", "held", "private"))
+    sub = public / "sub"
+    sub.mkdir(parents=True)
+    private.mkdir()
+    target = sub / "note.md"
+    target.write_bytes(b"public evidence")
+    symlink_or_skip(private, tmp_path / "probe", target_is_directory=True)
+    (tmp_path / "probe").unlink()
+    ledger = Ledger(tmp_path)
+    first, following = request("first"), request("following", paths=[str(target)])
+    ledger.publish(first)
+    extra = {"status": "FINAL"}
+    if kind == "resolve":
+        ledger.event("disposition", status="HOLD", resolution={"kind": "blocked", "owner": "engine/coordinator",
+            "next_decision": "review", "condition": "reviewed", "evidence": ledger.evidence}, **ledger.target(first))
+        extra = {"blocker_sha256": portable_fresh.digest(ledger.status()["requests"]["first"]["resolution"])}
+    ledger.event(kind, resolution={"kind": "next", "request": raw_request(following), "evidence": [ref(target)]},
+                 **extra, **ledger.target(first))
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: tmp_path / "owner")
+    monkeypatch.setattr(alias_router, "_home_declarations", lambda: (("ROUND10_HOME", ".private"),))
+    monkeypatch.setattr(alias_router, "os", SimpleNamespace(**{**vars(os),
+        "environ": {**os.environ, "ROUND10_HOME": str(private)}}))
+    swaps = []
+    def substitute():
+        if not public.is_symlink():
+            public.rename(held)
+            public.symlink_to(private, target_is_directory=True)
+            swaps.append(True)
+    def restore(_path=None):
+        if _path in {None, public, sub} and public.is_symlink():
+            public.unlink()
+            held.rename(public)
+    def opening(value, flags, *args, **kwargs):
+        actual = live.get(kwargs.get("dir_fd"), Path(".")) / value
+        if window == "open" and actual == sub:
+            substitute()
+    def stat_call(value, *args, **kwargs):
+        actual = live.get(kwargs.get("dir_fd"), Path(".")) / value
+        if window == "stat" and actual == target:
+            substitute()
+        return os.stat(value, *args, **kwargs)
+    live, _opened = search_only_platform(monkeypatch, capability, opening=opening, stat_call=stat_call,
+                                         closing=restore)
+    operation = portable_fresh._Operation()
+    journal = operation.lifecycle(ledger.path)
+    sub.chmod(0)
+    try:
+        with pytest.raises(ValueError,match="^reference parent changed while opening$"): journal.load()
+        assert swaps and operation.failed_validation
+    finally:
+        restore()
+        sub.chmod(0o700)
+    with pytest.raises(ValueError,match="^reference parent changed while opening$"): operation.verify()
+    assert live.closed()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("verify", [False, True])
+@pytest.mark.parametrize("surface", ["brief", "unread"])
+def test_round10_wrapped_pre_witness_refusal_latches_parent(tmp_path, pilot, monkeypatch, verify, surface):  # noqa: F811
+    if not portable_fresh._descriptor_capabilities() or os.geteuid() == 0:
+        pytest.skip("execute-only witness requires unprivileged POSIX descriptors")
+    root, public = pilot[0], tmp_path / "public"
+    public.mkdir()
+    target = public / "note.md"
+    target.write_bytes(b"public note")
+    reference = ref(target)
+    mailbox = portable_fresh._CapturedMailbox(root)
+    live, _opened = search_only_platform(monkeypatch)
+    public.chmod(0o111)
+    try:
+        with pytest.raises(portable_fresh.UnverifiedAttachment) as caught:
+            if surface == "brief": mailbox.brief(reference, verify=verify)
+            else: portable_fresh._unread_attachment(mailbox, reference)
+        assert str(caught.value) == "reference parent changed while opening"
+        assert mailbox.operation.failed_validation and target not in mailbox.operation.files
+    finally:
+        public.chmod(0o700)
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"): mailbox.operation.verify()
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"): mailbox.operation.prove(lambda: None)
+    assert live.closed()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+def test_round10_second_absence_walk_keeps_permission_error(tmp_path, monkeypatch, capability):
+    if not portable_fresh._descriptor_capabilities() or os.geteuid() == 0:
+        pytest.skip("second-walk permission witness requires unprivileged POSIX descriptors")
+    public = tmp_path / "public"
+    public.mkdir()
+    target = public / "missing.md"
+    operation = portable_fresh._Operation()
+    closes = []
+    def closing(path):
+        if path == public:
+            closes.append(path)
+            if len(closes) == 4: public.chmod(0)
+    live, _opened = search_only_platform(monkeypatch, capability, closing=closing)
+    try:
+        with pytest.raises(ValueError, match="^reference parent changed while opening$"): operation.exists(target)
+    finally:
+        public.chmod(0o700)
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"): operation.verify()
+    assert operation.failed_validation and live.closed()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("module_name", ["canonical", "alias"])
+def test_round10_second_absence_walk_compares_the_first_prefix(tmp_path, monkeypatch, capability, module_name):
+    if not portable_fresh._descriptor_capabilities():
+        pytest.skip("negative prefix substitution requires directory descriptors")
+    public, alternate, held = (tmp_path / name for name in ("public", "alternate", "held"))
+    public.mkdir()
+    alternate.mkdir()
+    target = public / "missing.md"
+    closes = []
+    def closing(path):
+        if path == public:
+            closes.append(path)
+            if len(closes) == 4:
+                public.rename(held)
+                alternate.rename(public)
+    live, _opened = search_only_platform(monkeypatch, capability, closing=closing)
+    module = portable_fresh if module_name == "canonical" else alias_fresh
+    operation = module._Operation()
+    try:
+        with pytest.raises(ValueError): operation.exists(target)
+        assert operation.failed_validation and live.closed()
+    finally:
+        if held.exists():
+            public.rename(alternate)
+            held.rename(public)
+    with pytest.raises(ValueError): operation.verify()
+    assert live.closed()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("native_error", ["ENOTDIR", "ELOOP"])
+@pytest.mark.parametrize("destination", ["public", "private"])
+@pytest.mark.parametrize("surface", ["evidence", "verify", "second-absence"])
+def test_round10_open_symlink_substitution_latches_at_every_seam(tmp_path, monkeypatch, capability,
+                                                               native_error, destination, surface):
+    if not portable_fresh._descriptor_capabilities():
+        pytest.skip("stat/open substitution requires POSIX directory descriptors")
+    public, held, alternate, private = (tmp_path / name for name in ("public", "held", "alternate", "private"))
+    for folder in (public, alternate, private):
+        folder.mkdir()
+        (folder / "note.md").write_bytes(b"fixture evidence")
+    probe = tmp_path / "probe"
+    symlink_or_skip(private, probe, target_is_directory=True)
+    probe.unlink()
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: tmp_path / "owner")
+    monkeypatch.setattr(alias_router, "_home_declarations", lambda: (("ROUND10_HOME", ".private"),))
+    monkeypatch.setattr(alias_router, "os", SimpleNamespace(**{**vars(os),
+        "environ": {**os.environ, "ROUND10_HOME": str(private)}}))
+    target = public / ("missing.md" if surface == "second-absence" else "note.md")
+    reference = ref(public / "note.md")
+    operation = portable_fresh._Operation()
+    if surface == "verify": operation.read(target)
+    armed, observed, closes = [surface != "second-absence"], [], []
+    def closing(path):
+        if surface == "second-absence" and path == public:
+            closes.append(path)
+            if len(closes) == 4: armed[0] = True
+    def opening(value, flags, *args, **kwargs):
+        actual = live.get(kwargs.get("dir_fd"), Path(".")) / value
+        if armed[0] and actual == public:
+            armed[0] = False
+            public.rename(held)
+            public.symlink_to(private if destination == "private" else alternate, target_is_directory=True)
+            if native_error == "ELOOP":
+                # Translate only a real no-follow open refusal, modelling BSD's
+                # errno at this OS boundary rather than injecting a stat error.
+                try:
+                    descriptor = os.open(value, flags, *args, **kwargs)
+                except OSError as exc:
+                    assert exc.errno in {errno.ENOTDIR, errno.ELOOP}
+                    observed.append(exc.errno)
+                    raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), os.fspath(value)) from exc
+                else:
+                    os.close(descriptor)
+                    pytest.fail("no-follow open accepted a symlink")
+            observed.append(errno.ENOTDIR)
+    live, _opened = search_only_platform(monkeypatch, capability, opening=opening, closing=closing)
+    try:
+        if surface == "evidence":
+            brief = portable_fresh.Brief(_operation=operation)
+            if destination == "private":
+                with pytest.raises(alias_router.PrivatePathError): brief.evidence(reference, reference)
+            else:
+                brief.evidence(reference, reference)
+                assert [row["kind"] for row in brief.sections["Evidence references"]] == ["unverified_evidence"]
+        else:
+            with pytest.raises((ValueError, OSError)):
+                if surface == "verify": operation.verify()
+                else: operation.exists(target)
+        assert observed and operation.failed_validation and live.closed()
+    finally:
+        if public.is_symlink():
+            public.unlink()
+            held.rename(public)
+    expected = alias_router.PrivatePathError if destination == "private" else ValueError
+    with pytest.raises(expected): operation.verify()
+    with pytest.raises(expected): operation.prove(lambda: None)
+    assert live.closed()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("lookup", [1, 2, 3])
+@pytest.mark.parametrize("replacement", ["inode", "symlink"])
+def test_round10_absent_private_replacement_latches_before_reduction(tmp_path, monkeypatch, capability, lookup, replacement):
+    if not portable_fresh._descriptor_capabilities():
+        pytest.skip("negative leaf replacement requires directory descriptors")
+    private, public = tmp_path / "private-file", tmp_path / "public"
+    private.write_bytes(b"private evidence")
+    public.mkdir()
+    target = public / "missing.md"
+    if replacement == "symlink":
+        probe = tmp_path / "probe"
+        symlink_or_skip(private, probe)
+        probe.unlink()
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: tmp_path / "owner")
+    monkeypatch.setattr(alias_router, "_home_declarations", lambda: (("ROUND10_HOME", ".private"),))
+    monkeypatch.setattr(alias_router, "os", SimpleNamespace(**{**vars(os),
+        "environ": {**os.environ, "ROUND10_HOME": str(private)}}))
+    observations = []
+    def stat_call(value, *args, **kwargs):
+        actual = live.get(kwargs.get("dir_fd"), Path(".")) / value
+        try:
+            return os.stat(value, *args, **kwargs)
+        except FileNotFoundError:
+            if actual == target:
+                observations.append(actual)
+                if len(observations) == lookup:
+                    if replacement == "inode": os.link(private, target)
+                    else: target.symlink_to(private)
+            raise
+    live, _opened = search_only_platform(monkeypatch, capability, stat_call=stat_call)
+    brief = portable_fresh.Brief()
+    reference = {"path": str(target), "sha256": "0" * 64}
+    with pytest.raises(alias_router.PrivatePathError): brief.evidence(reference, reference)
+    assert len(observations) == lookup
+    assert brief.operation.failed_validation and live.closed()
+    target.unlink()
+    with pytest.raises(alias_router.PrivatePathError): brief.operation.verify()
+    with pytest.raises(alias_router.PrivatePathError): brief.operation.prove(lambda: None)
+    assert live.closed()
 
 
 R17_CHAIN_SHAPES = ("direct", "target-prefix", "two-nested", "ancestor-suffix")
 R17_LEAF_OUTCOMES = ("absent", "enotdir", "eacces", "eio", "present")
-R17_CHAIN_SETUP = r'''
+R17_CHAIN_SETUP = OWNED_DESCRIPTOR_DRIVER + r'''
 import errno
 from types import SimpleNamespace
 ordinary, public, real = root / 'ordinary', root / 'public', root / 'real'
@@ -63,6 +2371,7 @@ else:
     (root / 'hop').symlink_to(real, target_is_directory=True)
 if outcome != 'absent': leaf.write_bytes(b'public final leaf')
 real_os, descriptors = fresh.os, {}
+fd_owner = _OwnedDescriptors()
 codes = dict(enotdir=errno.ENOTDIR, eacces=errno.EACCES, eio=errno.EIO, enoent=errno.ENOENT)
 def actual(path, kwargs):
     if isinstance(path, int): return None
@@ -80,13 +2389,15 @@ def opened(path, *args, **kwargs):
     value = actual(path, kwargs)
     if outcome.startswith('proof-') and outcome != 'proof-result' and value == leaf.parent:
         failure(outcome[len('proof-'):])
-    descriptor = real_os.open(path, *args, **kwargs)
+    descriptor = fd_owner.open(path, *args, **kwargs)
     descriptors[descriptor] = value
     return descriptor
 def closed(descriptor):
     descriptors.pop(descriptor, None)
-    return real_os.close(descriptor)
-fresh.os = SimpleNamespace(**{**vars(real_os), 'stat': stated, 'open': opened, 'close': closed})
+    return fd_owner.close(descriptor)
+def lstated(path, *args, **kwargs):
+    return stated(path, *args, **{**kwargs, 'follow_symlinks': False})
+fresh.os = SimpleNamespace(**{**vars(real_os), 'stat': stated, 'lstat': lstated, 'open': opened, 'close': closed, 'fdopen': fd_owner.fdopen})
 if outcome == 'proof-result':
     original_lookup = fresh._LeafLookup
     class FailedResult(original_lookup):
@@ -109,6 +2420,10 @@ def r17_chain_probe(shape, outcome):
         "shape = " + repr(shape) + "\noutcome = " + repr(outcome) + "\n" + R17_CHAIN_SETUP)
 
 
+R17_INERT_ABSENT_GOLDEN = (0,
+    b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b"")
+
+
 @lifecycle_only
 @pytest.mark.parametrize("shape", R17_CHAIN_SHAPES)
 @pytest.mark.parametrize("outcome", R17_LEAF_OUTCOMES)
@@ -119,7 +2434,9 @@ def test_round17_pathname_final_leaf_keeps_baseline_bytes(tmp_path, shape, outco
     if not portable_fresh._descriptor_capabilities() or portable_fresh._symlink_reader() is None:
         pytest.skip("bounded directory-relative link proof unavailable")
     consumer = "shared-" + seam if inert else seam
-    if shape in {"direct", "two-nested"}:
+    if inert and outcome == "absent":
+        expected = R17_INERT_ABSENT_GOLDEN
+    elif shape in {"direct", "two-nested"}:
         expected = R13_LEAF_GOLDENS[(consumer, False, backend)]
     elif outcome in {"eacces", "eio"}:
         expected = R10_PUBLIC_GOLDENS[(consumer, "link-to-denied" if outcome == "eacces" else "link-to-io", False, backend)]
@@ -137,22 +2454,22 @@ def test_round17_pathname_final_leaf_keeps_baseline_bytes(tmp_path, shape, outco
 def test_round17_parent_proof_failure_is_quarantined_and_consumed(tmp_path, shape, fault, seam, backend):
     if not portable_fresh._descriptor_capabilities() or portable_fresh._symlink_reader() is None:
         pytest.skip("bounded directory-relative link proof unavailable")
-    probe = r17_chain_probe(shape, "proof-" + fault).replace(
-        "print(json.dumps({'result': result}, sort_keys=True))", """
-assert journal.refusals_for('hostile', consume=True)
-assert journal.refusals_for('hostile', consume=True)
-assert journal.refusals_for('healthy', consume=True) == []
-journal.operation.verify()
-assert journal.operation.path_guard._global_failure is None
-print(json.dumps({'result': result}, sort_keys=True))
+    boundary = "except (ValueError, OSError, TypeError, KeyError) as error:"
+    probe = r17_chain_probe(shape, "proof-" + fault).replace(boundary, boundary + """
+    assert journal.operation.failed_validation
+    for attempt in range(2):
+        try:
+            journal.operation.verify()
+        except ValueError as refused:
+            assert type(refused) is ValueError
+            assert str(refused) == 'reference parent changed while opening'
+        else:
+            raise AssertionError('failed acquisition verified')
+    assert journal.operation.path_guard._global_failure is None
+    fd_owner.assert_closed()
 """)
     status, raw, stderr = r9_public_probe(tmp_path, seam, "symlink", False, backend, _probe=probe)
-    assert status == 0 and stderr == b"", (status, raw, stderr)
-    result = json.loads(raw)["result"]
-    assert {"first", "healthy", "hostile"} <= set(result["requests"])
-    assert result["unknown"] == {}
-    assert result["refusals"]["hostile"]
-    assert "healthy" not in result["refusals"]
+    assert (status, raw, stderr) == (2, b'{"error": "reference parent changed while opening"}\n', b"")
 
 
 def test_round17_only_final_leaf_lookup_assigns_leaf_refusal():
@@ -202,7 +2519,7 @@ def test_round17_nested_leaf_witness_rejects_concurrent_replacement(tmp_path, mo
         result = original(proof)
         if proof.leaf == leaf and not changed.is_set():
             assert result.kind == "absent"
-            reached.append(proof.leaf_outcome); descriptors.append(proof.directory)
+            reached.append(proof.leaf_outcome); descriptors.append(capture_public_test_handle(proof.directory))
             entered.set()
             assert changed.wait(10), "nested leaf replacement did not complete"
         return result
@@ -212,16 +2529,15 @@ def test_round17_nested_leaf_witness_rejects_concurrent_replacement(tmp_path, mo
     with ThreadPoolExecutor(max_workers=1) as pool:
         mutation = pool.submit(replace)
         try:
-            r14_assert_quarantined(world, path)
+            r14_assert_quarantined(world, path, private=True)
             assert reached
         finally:
             entered.set()
             mutation.result(timeout=15)
     for descriptor in set(descriptors):
-        with pytest.raises(OSError) as error: os.fstat(descriptor)
-        assert error.value.errno == errno.EBADF
+        assert_public_handle_closed(descriptor)
     leaf.unlink(); leaf.write_bytes(b"healthy retry")
-    r15_assert_healthy_retry(world)
+    r15_assert_healthy_retry(world, repair_link=True)
 
 
 def r15_trial(tmp_path,seam,shape):
@@ -236,7 +2552,17 @@ def r15_trial(tmp_path,seam,shape):
     return (*result,leaf)
 
 
-def r15_assert_healthy_retry(world):
+def r15_assert_healthy_retry(world, *, repair_link=False):
+    if repair_link:
+        # A present alias no longer qualifies for the inert ABSENT exemption.
+        # Repair the fixture into a direct public input before retrying replay.
+        linked = world.tmp / "l1"
+        destination = linked.resolve(strict=True)
+        linked.unlink()
+        if destination.is_dir():
+            shutil.copytree(destination, linked)
+        else:
+            shutil.copyfile(destination, linked)
     operation=portable_fresh._Operation()
     journal=operation.lifecycle(world.ledger.path)
     _policy,state=journal.load()
@@ -244,6 +2570,7 @@ def r15_assert_healthy_retry(world):
     assert journal.refusals_for("following")==[]
     assert journal.refusals_for("healthy")==[]
     operation.verify()
+    assert not operation.failed_validation
     assert operation.path_guard._global_failure is None
 
 
@@ -267,11 +2594,13 @@ def test_round15_private_root_final_leaf_is_refused_before_a_second_metadata_pro
             relative=(parent.st_dev,parent.st_ino)==home_id
         if direct or relative: touches.append("snapshot" if direct else "final leaf")
         return real_os.stat(value,*args,**kwargs)
+    def lstated(value, *args, **kwargs):
+        return metadata(value, *args, **{**kwargs, "follow_symlinks": False})
     monkeypatch.setattr(alias_router,"_owner_home",lambda:home)
-    monkeypatch.setattr(alias_router,"os",SimpleNamespace(**{**vars(real_os),"stat":metadata}))
-    monkeypatch.setattr(portable_fresh,"os",SimpleNamespace(**{**vars(real_os),"stat":metadata}))
+    monkeypatch.setattr(alias_router,"os",SimpleNamespace(**{**vars(real_os),"stat":metadata, "lstat": lstated}))
+    monkeypatch.setattr(portable_fresh,"os",SimpleNamespace(**{**vars(real_os),"stat":metadata, "lstat": lstated}))
     monkeypatch.setattr(portable_fresh,"_reference_descriptors",lambda:backend=="native")
-    r14_assert_quarantined(world,path)
+    r14_assert_quarantined(world, path, local=True)
     assert touches==["snapshot"]
 
 
@@ -281,6 +2610,8 @@ def test_round15_private_root_final_leaf_is_refused_before_a_second_metadata_pro
 @pytest.mark.parametrize("fault",["enoent","eacces"])
 @pytest.mark.parametrize("shape",["ordinary","single","multi"])
 def test_round15_opened_parent_aba_is_part_of_the_final_witness(tmp_path,monkeypatch,seam,backend,fault,shape):
+    if portable_fresh._search_directory_flag() is None:
+        pytest.skip("requires search-only proof handles; no-search refusal has dedicated regression coverage")
     from concurrent.futures import ThreadPoolExecutor
     from queue import Queue
     if not portable_fresh._descriptor_capabilities() or portable_fresh._symlink_reader() is None:
@@ -316,13 +2647,14 @@ def test_round15_opened_parent_aba_is_part_of_the_final_witness(tmp_path,monkeyp
             finally: flags["active"]=False
         return operation(guard,stage,action,*args,**kwargs)
     def stated(value,*args,**kwargs):
+        info=real_os.stat(value,*args,**kwargs)
         if flags["active"] and not flags["swapped"] and not flags["restored"] and value==public.name and kwargs.get("dir_fd") is not None:
             signal("swap"); flags["swapped"]=True
-        return real_os.stat(value,*args,**kwargs)
+        return info
     def fstated(descriptor):
         info=real_os.fstat(descriptor)
         if flags["active"] and flags["swapped"] and not flags["restored"] and (info.st_dev,info.st_ino)==alternate_identity:
-            signal("restore"); captured.append(descriptor); flags["restored"]=True
+            signal("restore"); captured.append(capture_public_test_handle(descriptor)); flags["restored"]=True
         return info
     monkeypatch.setattr(alias_router,"_owner_home",lambda:home)
     monkeypatch.setattr(portable_fresh,"_reference_descriptors",lambda:backend=="native")
@@ -335,8 +2667,7 @@ def test_round15_opened_parent_aba_is_part_of_the_final_witness(tmp_path,monkeyp
                 r14_assert_quarantined(world,path)
                 assert captured
                 for descriptor in set(captured):
-                    with pytest.raises(OSError) as error: real_os.fstat(descriptor)
-                    assert error.value.errno==errno.EBADF
+                    assert_public_handle_closed(descriptor)
             finally:
                 commands.put(None); mutation.result(timeout=25)
     finally:
@@ -344,7 +2675,7 @@ def test_round15_opened_parent_aba_is_part_of_the_final_witness(tmp_path,monkeyp
         alternate.chmod(0o700)
     flags["enabled"]=False
     leaf.unlink(); leaf.write_bytes(b"healthy retry")
-    r15_assert_healthy_retry(world)
+    r15_assert_healthy_retry(world, repair_link=True)
 
 
 @lifecycle_only
@@ -358,12 +2689,13 @@ def test_round15_leaf_outcome_is_revalidated_before_inert_scope(tmp_path,monkeyp
     from queue import Queue
     if not portable_fresh._descriptor_capabilities() or portable_fresh._symlink_reader() is None:
         pytest.skip("bounded directory-relative link proof unavailable")
+    if fault == "eacces" and (os.name != "posix" or os.geteuid() == 0):
+        pytest.skip("physical leaf permission failure requires an unprivileged POSIX runner")
     world,linked,public,private,home,path,leaf=r15_trial(tmp_path,seam,shape)
     leaf.unlink()
     commands,acks=Queue(),Queue()
-    real_os=portable_fresh.os
     original,checked=portable_fresh._final_leaf_lookup,portable_fresh._reference_check
-    flags={"inside":False,"enabled":True}
+    flags={"enabled":True}
     reached=[]
     def reset():
         if leaf.is_symlink() or leaf.is_file(): leaf.unlink()
@@ -384,34 +2716,39 @@ def test_round15_leaf_outcome_is_revalidated_before_inert_scope(tmp_path,monkeyp
     def check(value,*args,**kwargs):
         if flags["enabled"] and Path(value)==Path(path): signal("reset")
         return checked(value,*args,**kwargs)
-    def stated(value,*args,**kwargs):
-        if flags["enabled"] and flags["inside"] and value==leaf.name and kwargs.get("dir_fd") is not None and fault=="eacces":
-            raise PermissionError(errno.EACCES,os.strerror(errno.EACCES),value)
-        return real_os.stat(value,*args,**kwargs)
     def lookup(proof):
         target=flags["enabled"] and proof.leaf==leaf and not leaf.exists() and not leaf.is_symlink()
-        flags["inside"]=target
+        denied=target and fault=="eacces"
+        mode=stat.S_IMODE(leaf.parent.stat().st_mode) if denied else None
+        if denied: leaf.parent.chmod(0)
         try: result=original(proof)
-        finally: flags["inside"]=False
+        finally:
+            if denied: leaf.parent.chmod(mode)
         if target:
-            assert result.kind==("absent" if fault=="enoent" else "error")
-            reached.append(result.kind); signal("replace")
+            if fault=="enoent":
+                assert result.kind=="absent"
+                reached.append(result.kind)
+            else:
+                assert isinstance(result,portable_fresh._ProofFailure)
+                assert type(result.error) is ValueError
+                assert str(result.error)=="reference parent changed while opening"
+                reached.append("error")
+            signal("replace")
         return result
     monkeypatch.setattr(alias_router,"_owner_home",lambda:home)
     monkeypatch.setattr(portable_fresh,"_reference_descriptors",lambda:backend=="native")
     monkeypatch.setattr(portable_fresh,"_reference_check",check)
     monkeypatch.setattr(portable_fresh,"_final_leaf_lookup",lookup)
-    monkeypatch.setattr(portable_fresh,"os",SimpleNamespace(**{**vars(real_os),"stat":stated}))
     with ThreadPoolExecutor(max_workers=1) as pool:
         mutation=pool.submit(mutate)
         try:
-            r14_assert_quarantined(world,path)
+            r14_assert_quarantined(world, path, private=fault == "enoent" and replacement == "private")
             assert reached
         finally:
             commands.put(None); mutation.result(timeout=25)
     flags["enabled"]=False
     reset(); leaf.write_bytes(b"healthy retry")
-    r15_assert_healthy_retry(world)
+    r15_assert_healthy_retry(world, repair_link=True)
 
 
 @lifecycle_only
@@ -483,10 +2820,10 @@ def test_round15_direct_leaf_proof_failure_keeps_original_diagnostic(tmp_path,mo
     monkeypatch.setattr(portable_fresh,"_reference_descriptors",lambda:backend=="native")
     monkeypatch.setattr(portable_fresh,"_proof_operation",proof)
     operation=portable_fresh._Operation()
-    with pytest.raises(alias_router.SymlinkPathError) as error: operation.path_guard.check(path)
-    assert str(error.value)=="symlink paths are not supported: "+str(linked)
+    with pytest.raises(ValueError,match="^reference parent changed while opening$"): operation.path_guard.check(path)
     assert reached and operation.path_guard._global_failure is None
-    operation.verify()
+    assert operation.failed_validation
+    with pytest.raises(ValueError,match="^reference parent changed while opening$"): operation.verify()
 
 
 @lifecycle_only
@@ -508,10 +2845,10 @@ def test_round15_ignored_proof_errnos_keep_the_original_symlink_diagnostic(tmp_p
     monkeypatch.setattr(portable_fresh,"_reference_descriptors",lambda:backend=="native")
     monkeypatch.setattr(portable_fresh,"_proof_operation",proof)
     operation=portable_fresh._Operation()
-    with pytest.raises(alias_router.SymlinkPathError) as error: operation.path_guard.check(path)
-    assert str(error.value)=="symlink paths are not supported: "+str(linked)
+    with pytest.raises(ValueError,match="^reference parent changed while opening$"): operation.path_guard.check(path)
     assert reached and operation.path_guard._global_failure is None
-    operation.verify()
+    assert operation.failed_validation
+    with pytest.raises(ValueError,match="^reference parent changed while opening$"): operation.verify()
 
 
 @lifecycle_only
@@ -527,263 +2864,146 @@ def test_round15_dangling_parent_keeps_ec27eebf_bytes(tmp_path,seam,planned,back
     probe=R10_PUBLIC_PROBE.replace("root = Path(root)\n","root = Path(root)\n"+R15_DANGLING_PROBE).replace(
         "target if seam == 'worktree' else root","target")
     actual=r9_public_probe(tmp_path,seam,"symlink",planned,backend,_probe=probe)
-    if seam not in {"paths","scope","disposition","resolve","shared-disposition","shared-resolve",
-                    "worktree","scan_workspace"}:
-        assert actual==R15_DANGLING_GOLDENS[(seam,planned,backend)]
-        return
-    # The later proof-layer ruling requires quarantine here. Preserve the
-    # literal baseline diagnostic, without restoring the superseded GLOBAL/
-    # UNKNOWN disposition or suppressing an unproved inert occurrence.
-    assert actual[0]==0 and actual[2]==b""
-    result=json.loads(actual[1])["result"]
-    errors=result["refusals"]
-    if isinstance(errors,dict):
-        errors=[item[1] for rows in errors.values() for item in rows]
-        assert "healthy" in result["requests"]
-        assert result["unknown"]=={}
-    expected=json.loads(R15_DANGLING_GOLDENS[("check",planned,backend)][1])["error"].encode()
-    assert errors and all(value.encode()==expected for value in errors)
+    assert actual==R15_DANGLING_GOLDENS[(seam,planned,backend)]
 
 
-R15_DANGLING_GOLDENS = {('check', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('check', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('check', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('check', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+R15_DANGLING_GOLDENS = {('check', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('check', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('check', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('check', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('compose-file', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('compose-file', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('compose-file', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('compose-file', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('compose:--delivery-dir', False, 'native'): (2,
-                                               b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                               b''),
- ('compose:--delivery-dir', False, 'portable'): (2,
-                                                 b'{"error": "symlink paths are not supported: {CASE}/ordinary"'
-                                                 b'}\n',
-                                                 b''),
- ('compose:--delivery-dir', True, 'native'): (2,
-                                              b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                              b''),
- ('compose:--delivery-dir', True, 'portable'): (2,
-                                                b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                                b''),
- ('compose:--lifecycle', False, 'native'): (2,
-                                            b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                            b''),
- ('compose:--lifecycle', False, 'portable'): (2,
-                                              b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                              b''),
- ('compose:--lifecycle', True, 'native'): (2,
-                                           b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                           b''),
- ('compose:--lifecycle', True, 'portable'): (2,
-                                             b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                             b''),
- ('compose:--root', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('compose:--root', False, 'portable'): (2,
-                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                         b''),
- ('compose:--root', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('compose:--root', True, 'portable'): (2,
-                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                        b''),
- ('disposition', False, 'native'): (0,
-                                    b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"f'
-                                    b'irst": "lifecycle row UNKNOWN at event fault-event: symlink paths are not su'
-                                    b'pported: {CASE}/ordinary"}}}\n',
-                                    b''),
- ('disposition', False, 'portable'): (0,
-                                      b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown":'
-                                      b' {"first": "lifecycle row UNKNOWN at event fault-event: symlink paths ar'
-                                      b'e not supported: {CASE}/ordinary"}}}\n',
-                                      b''),
- ('disposition', True, 'native'): (0,
-                                   b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"f'
-                                   b'irst": "lifecycle row UNKNOWN at event fault-event: symlink paths are not su'
-                                   b'pported: {CASE}/ordinary"}}}\n',
-                                   b''),
- ('disposition', True, 'portable'): (0,
-                                     b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown":'
-                                     b' {"first": "lifecycle row UNKNOWN at event fault-event: symlink paths ar'
-                                     b'e not supported: {CASE}/ordinary"}}}\n',
-                                     b''),
- ('exists', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('exists', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('exists', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('exists', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('loop:--lifecycle', False, 'native'): (2,
-                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                         b''),
- ('loop:--lifecycle', False, 'portable'): (2,
-                                           b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                           b''),
- ('loop:--lifecycle', True, 'native'): (2,
-                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                        b''),
- ('loop:--lifecycle', True, 'portable'): (2,
-                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                          b''),
- ('loop:--recipes', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('loop:--recipes', False, 'portable'): (2,
-                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                         b''),
- ('loop:--recipes', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('loop:--recipes', True, 'portable'): (2,
-                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                        b''),
- ('loop:--state-dir', False, 'native'): (2,
-                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                         b''),
- ('loop:--state-dir', False, 'portable'): (2,
-                                           b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                           b''),
- ('loop:--state-dir', True, 'native'): (2,
-                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                        b''),
- ('loop:--state-dir', True, 'portable'): (2,
-                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                          b''),
- ('loop:--store', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('loop:--store', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('loop:--store', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('loop:--store', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('members', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('members', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('members', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('members', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('paths', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('paths', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('paths', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('paths', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('read', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('read', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('read', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('read', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('resolve', False, 'native'): (0,
-                                b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first'
-                                b'": "lifecycle row UNKNOWN at event fault-event: symlink paths are not supported:'
-                                b' {CASE}/ordinary"}}}\n',
-                                b''),
- ('resolve', False, 'portable'): (0,
-                                  b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"f'
-                                  b'irst": "lifecycle row UNKNOWN at event fault-event: symlink paths are not su'
-                                  b'pported: {CASE}/ordinary"}}}\n',
-                                  b''),
- ('resolve', True, 'native'): (0,
-                               b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first'
-                               b'": "lifecycle row UNKNOWN at event fault-event: symlink paths are not supported:'
-                               b' {CASE}/ordinary"}}}\n',
-                               b''),
- ('resolve', True, 'portable'): (0,
-                                 b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"f'
-                                 b'irst": "lifecycle row UNKNOWN at event fault-event: symlink paths are not su'
-                                 b'pported: {CASE}/ordinary"}}}\n',
-                                 b''),
+ ('compose:--delivery-dir', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('compose:--delivery-dir', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('compose:--delivery-dir', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('compose:--delivery-dir', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('compose:--lifecycle', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('compose:--lifecycle', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('compose:--lifecycle', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('compose:--lifecycle', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('compose:--root', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('compose:--root', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('compose:--root', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('compose:--root', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('exists', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('exists', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('exists', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('exists', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--lifecycle', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--lifecycle', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--lifecycle', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--lifecycle', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--recipes', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--recipes', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--recipes', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--recipes', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--state-dir', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--state-dir', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--state-dir', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--state-dir', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--store', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--store', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--store', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--store', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('members', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('members', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('members', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('members', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('read', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('read', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('read', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('read', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('router:--lifecycle', False, 'native'): (2,
-                                           b'{"error":"symlink paths are not supported: {CASE}/ordinary","executi'
-                                           b'on_enabled":false,"source":"arguments","state":"hold"}\n',
+                                           b'{"error":"reference parent changed while opening","execution_enabled":fa'
+                                           b'lse,"source":"arguments","state":"hold"}\n',
                                            b''),
  ('router:--lifecycle', False, 'portable'): (2,
-                                             b'{"error":"symlink paths are not supported: {CASE}/ordinary","exe'
-                                             b'cution_enabled":false,"source":"arguments","state":"hold"}\n',
+                                             b'{"error":"reference parent changed while opening","execution_enabled":fa'
+                                             b'lse,"source":"arguments","state":"hold"}\n',
                                              b''),
  ('router:--lifecycle', True, 'native'): (2,
-                                          b'{"error":"symlink paths are not supported: {CASE}/ordinary","executi'
-                                          b'on_enabled":false,"source":"arguments","state":"hold"}\n',
+                                          b'{"error":"reference parent changed while opening","execution_enabled":fa'
+                                          b'lse,"source":"arguments","state":"hold"}\n',
                                           b''),
  ('router:--lifecycle', True, 'portable'): (2,
-                                            b'{"error":"symlink paths are not supported: {CASE}/ordinary","executi'
-                                            b'on_enabled":false,"source":"arguments","state":"hold"}\n',
+                                            b'{"error":"reference parent changed while opening","execution_enabled":fa'
+                                            b'lse,"source":"arguments","state":"hold"}\n',
                                             b''),
  ('router:--recipes', False, 'native'): (2,
-                                         b'{"error":"symlink paths are not supported: {CASE}/ordinary","executi'
-                                         b'on_enabled":false,"source":"arguments","state":"hold"}\n',
+                                         b'{"error":"reference parent changed while opening","execution_enabled":false,'
+                                         b'"source":"arguments","state":"hold"}\n',
                                          b''),
  ('router:--recipes', False, 'portable'): (2,
-                                           b'{"error":"symlink paths are not supported: {CASE}/ordinary","executi'
-                                           b'on_enabled":false,"source":"arguments","state":"hold"}\n',
+                                           b'{"error":"reference parent changed while opening","execution_enabled":fa'
+                                           b'lse,"source":"arguments","state":"hold"}\n',
                                            b''),
  ('router:--recipes', True, 'native'): (2,
-                                        b'{"error":"symlink paths are not supported: {CASE}/ordinary","execution_e'
-                                        b'nabled":false,"source":"arguments","state":"hold"}\n',
+                                        b'{"error":"reference parent changed while opening","execution_enabled":false,'
+                                        b'"source":"arguments","state":"hold"}\n',
                                         b''),
  ('router:--recipes', True, 'portable'): (2,
-                                          b'{"error":"symlink paths are not supported: {CASE}/ordinary","executi'
-                                          b'on_enabled":false,"source":"arguments","state":"hold"}\n',
+                                          b'{"error":"reference parent changed while opening","execution_enabled":fa'
+                                          b'lse,"source":"arguments","state":"hold"}\n',
                                           b''),
  ('router:--store', False, 'native'): (2,
-                                       b'{"error":"symlink paths are not supported: {CASE}/ordinary","execution_e'
-                                       b'nabled":false,"source":"arguments","state":"hold"}\n',
+                                       b'{"error":"reference parent changed while opening","execution_enabled":false,'
+                                       b'"source":"arguments","state":"hold"}\n',
                                        b''),
  ('router:--store', False, 'portable'): (2,
-                                         b'{"error":"symlink paths are not supported: {CASE}/ordinary","executi'
-                                         b'on_enabled":false,"source":"arguments","state":"hold"}\n',
+                                         b'{"error":"reference parent changed while opening","execution_enabled":false,'
+                                         b'"source":"arguments","state":"hold"}\n',
                                          b''),
  ('router:--store', True, 'native'): (2,
-                                      b'{"error":"symlink paths are not supported: {CASE}/ordinary","execution_e'
-                                      b'nabled":false,"source":"arguments","state":"hold"}\n',
+                                      b'{"error":"reference parent changed while opening","execution_enabled":false,'
+                                      b'"source":"arguments","state":"hold"}\n',
                                       b''),
  ('router:--store', True, 'portable'): (2,
-                                        b'{"error":"symlink paths are not supported: {CASE}/ordinary","execution_e'
-                                        b'nabled":false,"source":"arguments","state":"hold"}\n',
+                                        b'{"error":"reference parent changed while opening","execution_enabled":false,'
+                                        b'"source":"arguments","state":"hold"}\n',
                                         b''),
- ('scan_workspace', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('scan_workspace', False, 'portable'): (2,
-                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                         b''),
- ('scan_workspace', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('scan_workspace', True, 'portable'): (2,
-                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                        b''),
- ('scope', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('scope', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('scope', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('scope', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('shared-disposition', False, 'native'): (0,
-                                           b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostil'
-                                           b'e"], "unknown": {}}}\n',
-                                           b''),
- ('shared-disposition', False, 'portable'): (0,
-                                             b'{"result": {"refusals": {}, "requests": ["first", "healthy", "ho'
-                                             b'stile"], "unknown": {}}}\n',
-                                             b''),
- ('shared-disposition', True, 'native'): (0,
-                                          b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostil'
-                                          b'e"], "unknown": {}}}\n',
-                                          b''),
- ('shared-disposition', True, 'portable'): (0,
-                                            b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostil'
-                                            b'e"], "unknown": {}}}\n',
-                                            b''),
- ('shared-resolve', False, 'native'): (0,
-                                       b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"],'
-                                       b' "unknown": {}}}\n',
-                                       b''),
- ('shared-resolve', False, 'portable'): (0,
-                                         b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostil'
-                                         b'e"], "unknown": {}}}\n',
-                                         b''),
- ('shared-resolve', True, 'native'): (0,
-                                      b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"],'
-                                      b' "unknown": {}}}\n',
-                                      b''),
- ('shared-resolve', True, 'portable'): (0,
-                                        b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"],'
-                                        b' "unknown": {}}}\n',
-                                        b''),
- ('verify:--path', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('verify:--path', False, 'portable'): (2,
-                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                        b''),
- ('verify:--path', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('verify:--path', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('worktree', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('worktree', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('worktree', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('worktree', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b'')}
+ ('scan_workspace', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scan_workspace', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scan_workspace', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scan_workspace', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-disposition', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-disposition', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-disposition', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-disposition', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-resolve', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-resolve', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-resolve', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-resolve', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('verify:--path', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('verify:--path', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('verify:--path', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('verify:--path', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('worktree', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('worktree', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('worktree', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('worktree', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b'')}
 
 
 # The list is deliberately explicit: legacy readers are outside this classifier graph.
 R14_CLASSIFIER_FUNCTIONS = (
+    "_proof_close", "_require_proof_descriptor", "_ProvedChain.__init__",
     "_proof_operation", "_final_leaf_lookup", "_private_symlink_target",
     "_resolve_public_chain", "_lookup_chain_leaf", "_proof_parent", "_proof_check", "_proof_recheck",
     "_proof_token", "_proof_link", "_link_snapshot", "_stable_link",
@@ -796,7 +3016,7 @@ R14_PROOF_STAGES = ("prefix ancestor","link","hop target","traversal prefix",
 R14_PROOF_ERRORS = ("enoent","enotdir","eacces","eio","eloop","permission-no-errno")
 
 
-def test_round14_classifier_has_only_two_exception_boundaries():
+def test_round14_classifier_has_explicit_exception_boundaries():
     tree=ast.parse(TOOL.read_text(encoding="utf-8"))
     functions={}
     class Inventory(ast.NodeVisitor):
@@ -813,6 +3033,13 @@ def test_round14_classifier_has_only_two_exception_boundaries():
             "Exception","BaseException"}
     for name in R14_CLASSIFIER_FUNCTIONS:
         if name in {"_proof_operation","_final_leaf_lookup"}: continue
+        if name in {"_proof_parent", "_link_snapshot"}:
+            # Shared acquisition must revalidate a refused OS operation while
+            # its prefix descriptor is still live, then report one outcome.
+            assert any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                       and node.func.id == "_acquisition_open_refusal"
+                       for node in ast.walk(functions[name]))
+            continue
         for node in ast.walk(functions[name]):
             if isinstance(node,ast.ExceptHandler):
                 caught={item.id for item in ast.walk(node.type) if isinstance(item,ast.Name)} if node.type else family
@@ -858,8 +3085,21 @@ def r14_trial(tmp_path,seam,stage="hop target"):
     return world,linked,public,private,home,path
 
 
-def r14_assert_quarantined(world,path):
+def r14_assert_quarantined(world,path, *, private=False, local=False):
     operation=portable_fresh._Operation(); journal=operation.lifecycle(world.ledger.path)
+    if not local:
+        expected_type = alias_router.PrivatePathError if private else ValueError
+        message = ("owner-private host directory is not an input" if private
+                   else "reference parent changed while opening")
+        with pytest.raises(expected_type, match="^" + message + "$"):
+            journal.load()
+        assert operation.failed_validation
+        for _ in range(2):
+            with pytest.raises(expected_type, match="^" + message + "$"):
+                operation.verify()
+        assert operation.path_guard._global_failure is None
+        return operation,journal
+    # Q1 still isolates a stable private reference from independent rows.
     _policy,state=journal.load()
     assert "healthy" in state["requests"]
     assert journal.refusals_for("healthy")==[]
@@ -869,6 +3109,7 @@ def r14_assert_quarantined(world,path):
         brief=portable_fresh.Brief(_operation=operation)
         portable_fresh.lifecycle_records(brief,world.ledger.path,portable_fresh.parse_time("2030-01-01T00:00:00Z"))
         assert path not in json.dumps(brief.sections["Approved scope"])
+    assert not operation.failed_validation
     operation.verify()
     assert operation.path_guard._global_failure is None
     return operation,journal
@@ -961,38 +3202,55 @@ def test_round14_suffix_replacement_after_leaf_lookup_invalidates_the_whole_toke
     monkeypatch.setattr(portable_fresh,"_final_leaf_lookup",lookup)
     with ThreadPoolExecutor(max_workers=1) as pool:
         mutation=pool.submit(replace)
-        try: operation,journal=r14_assert_quarantined(world,path)
+        try: operation,journal=r14_assert_quarantined(world, path, private=replacement == "private")
         finally:
             entered.set()
             mutation.result(timeout=15)
-    assert journal.refusals_for("following",consume=True)
+    assert operation.failed_validation
     assert operation.path_guard._global_failure is None
 
 
 @lifecycle_only
-def test_round14_failed_result_allocation_releases_the_proved_token(tmp_path,monkeypatch):
+@pytest.mark.parametrize("allocation", ["value", "leaf"])
+@pytest.mark.parametrize("caller", ["stored", "declaration"])
+def test_round14_failed_result_allocation_releases_the_proved_token(tmp_path,monkeypatch,allocation,caller):
     if not portable_fresh._descriptor_capabilities(): pytest.skip("directory descriptors unavailable")
     world,linked,public,private,home,path=r14_trial(tmp_path,"disposition")
     monkeypatch.setattr(alias_router,"_owner_home",lambda:home)
-    original=portable_fresh._ProofValue
+    original=portable_fresh._ProofValue if allocation == "value" else portable_fresh._LeafLookup
     descriptors=[]
     class AllocationFailure(original):
-        def __init__(self,value):
-            if isinstance(value,portable_fresh._ProvedChain) and value.directory is not None:
-                descriptors.append(value.directory)
+        def __init__(self,*args):
+            proof = args[0] if allocation == "value" else args[2]
+            if (isinstance(proof,portable_fresh._ProvedChain) and proof.directory is not None
+                    and (allocation == "value" or proof.leaf == public / "note.md")):
+                descriptors.append(capture_public_test_handle(proof.directory))
                 raise MemoryError("controlled proof-result allocation failure")
-            super().__init__(value)
-    monkeypatch.setattr(portable_fresh,"_ProofValue",AllocationFailure)
+            super().__init__(*args)
+    if allocation == "value":
+        monkeypatch.setattr(portable_fresh,"_ProofValue",AllocationFailure)
+    else:
+        monkeypatch.setattr(portable_fresh,"_LeafLookup",AllocationFailure)
+    operation = portable_fresh._Operation()
+    journal = operation.lifecycle(world.ledger.path)
     try:
-        r14_assert_quarantined(world,path)
+        if caller == "stored":
+            with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+                journal.load()
+        else:
+            origin = tmp_path / "origin.json"
+            origin.write_bytes(b"{}")
+            brief = portable_fresh.Brief(_operation=operation)
+            brief.evidence(ref(Path(path)), ref(origin))
+            assert [row["kind"] for row in brief.sections["Evidence references"]] == ["unverified_evidence"]
+        with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+            operation.verify()
         assert descriptors
         for descriptor in set(descriptors):
-            with pytest.raises(OSError) as error: os.fstat(descriptor)
-            assert error.value.errno==errno.EBADF
+            assert_public_handle_closed(descriptor)
     finally:
         for descriptor in set(descriptors):
-            try: os.close(descriptor)
-            except OSError: pass
+            close_public_test_handle(descriptor)
 
 
 def test_round14_final_leaf_lookup_requires_a_live_proved_token():
@@ -1047,7 +3305,7 @@ def test_round14_argon_resolved_directory_rechecked_before_errno_suppression(tmp
     monkeypatch.setattr(portable_fresh,"_reference_descriptors",lambda:backend=="native")
     container=tmp_path/"container"; target=container/"target_dir"; target.mkdir(parents=True)
     linked.unlink(); symlink_or_skip(target,linked,target_is_directory=True)
-    original,checked=portable_fresh._LinkLookupFailure,portable_fresh._reference_check
+    original,checked=portable_fresh._final_leaf_lookup,portable_fresh._reference_check
     changed=Event()
     mutations,acknowledgments=Queue(),Queue()
     reached=[]
@@ -1071,15 +3329,13 @@ def test_round14_argon_resolved_directory_rechecked_before_errno_suppression(tmp
             else: alternate.rename(value)
             changed.set()
             acknowledgments.put(True)
-    class InterruptedProof(original):
-        def proved(self,guard):
-            assert self.error.errno==errno.EACCES
-            if not changed.is_set():
-                mutations.put(True)
-                assert acknowledgments.get(timeout=10),"directory replacement did not complete"
-                reached.append(True)
-            return super().proved(guard)
-    monkeypatch.setattr(portable_fresh,"_LinkLookupFailure",InterruptedProof)
+    def lookup(proof):
+        if proof.leaf == target / "note.md" and not changed.is_set():
+            mutations.put(True)
+            assert acknowledgments.get(timeout=10),"directory replacement did not complete"
+            reached.append(True)
+        return original(proof)
+    monkeypatch.setattr(portable_fresh,"_final_leaf_lookup",lookup)
     monkeypatch.setattr(portable_fresh,"_reference_check",check)
     target.chmod(0)
     try:
@@ -1112,412 +3368,240 @@ def test_round14_final_leaf_absence_keeps_ec27eebf_bytes(tmp_path,seam,planned,b
 R14_FINAL_GOLDENS = {('check', False, 'native', 'enoent'): (2,
                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
                                         b''),
- ('check', False, 'native', 'enotdir'): (2,
-                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                         b''),
+ ('check', False, 'native', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('check', False, 'portable', 'enoent'): (2,
                                           b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
                                           b''),
- ('check', False, 'portable', 'enotdir'): (2,
-                                           b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                           b''),
+ ('check', False, 'portable', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('check', True, 'native', 'enoent'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('check', True, 'native', 'enotdir'): (2,
-                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                        b''),
+ ('check', True, 'native', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('check', True, 'portable', 'enoent'): (2,
                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
                                          b''),
- ('check', True, 'portable', 'enotdir'): (2,
-                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                          b''),
- ('disposition', False, 'native', 'enoent'): (0,
-                                              b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "u'
-                                              b'nknown": {"first": "lifecycle row UNKNOWN at event fault-event: '
-                                              b'symlink paths are not supported: {CASE}/ordinary"}}}\n',
-                                              b''),
- ('disposition', False, 'native', 'enotdir'): (0,
-                                               b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "u'
-                                               b'nknown": {"first": "lifecycle row UNKNOWN at event fault-event: '
-                                               b'symlink paths are not supported: {CASE}/ordinary"}}}\n',
-                                               b''),
- ('disposition', False, 'portable', 'enoent'): (0,
-                                                b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "u'
-                                                b'nknown": {"first": "lifecycle row UNKNOWN at event fault-event: '
-                                                b'symlink paths are not supported: {CASE}/ordinary"}}}\n',
-                                                b''),
- ('disposition', False, 'portable', 'enotdir'): (0,
-                                                 b'{"result": {"refusals": {}, "requests": ["first", "healthy"]'
-                                                 b', "unknown": {"first": "lifecycle row UNKNOWN at event fault'
-                                                 b'-event: symlink paths are not supported: {CASE}/ordinary"}}}\n',
-                                                 b''),
- ('disposition', True, 'native', 'enoent'): (0,
-                                             b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "u'
-                                             b'nknown": {"first": "lifecycle row UNKNOWN at event fault-event: '
-                                             b'symlink paths are not supported: {CASE}/ordinary"}}}\n',
-                                             b''),
- ('disposition', True, 'native', 'enotdir'): (0,
-                                              b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "u'
-                                              b'nknown": {"first": "lifecycle row UNKNOWN at event fault-event: '
-                                              b'symlink paths are not supported: {CASE}/ordinary"}}}\n',
-                                              b''),
- ('disposition', True, 'portable', 'enoent'): (0,
-                                               b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "u'
-                                               b'nknown": {"first": "lifecycle row UNKNOWN at event fault-event: '
-                                               b'symlink paths are not supported: {CASE}/ordinary"}}}\n',
-                                               b''),
- ('disposition', True, 'portable', 'enotdir'): (0,
-                                                b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "u'
-                                                b'nknown": {"first": "lifecycle row UNKNOWN at event fault-event: '
-                                                b'symlink paths are not supported: {CASE}/ordinary"}}}\n',
-                                                b''),
+ ('check', True, 'portable', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', False, 'native', 'enoent'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', False, 'native', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', False, 'portable', 'enoent'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', False, 'portable', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', True, 'native', 'enoent'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', True, 'native', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', True, 'portable', 'enoent'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', True, 'portable', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('exists', False, 'native', 'enoent'): (2,
                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
                                          b''),
- ('exists', False, 'native', 'enotdir'): (2,
-                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                          b''),
+ ('exists', False, 'native', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('exists', False, 'portable', 'enoent'): (2,
                                            b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
                                            b''),
- ('exists', False, 'portable', 'enotdir'): (2,
-                                            b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                            b''),
+ ('exists', False, 'portable', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('exists', True, 'native', 'enoent'): (2,
                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
                                         b''),
- ('exists', True, 'native', 'enotdir'): (2,
-                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                         b''),
+ ('exists', True, 'native', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('exists', True, 'portable', 'enoent'): (2,
                                           b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
                                           b''),
- ('exists', True, 'portable', 'enotdir'): (2,
-                                           b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                           b''),
+ ('exists', True, 'portable', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('members', False, 'native', 'enoent'): (2,
                                           b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
                                           b''),
- ('members', False, 'native', 'enotdir'): (2,
-                                           b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                           b''),
+ ('members', False, 'native', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('members', False, 'portable', 'enoent'): (2,
                                             b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
                                             b''),
- ('members', False, 'portable', 'enotdir'): (2,
-                                             b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                             b''),
+ ('members', False, 'portable', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('members', True, 'native', 'enoent'): (2,
                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
                                          b''),
- ('members', True, 'native', 'enotdir'): (2,
-                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                          b''),
+ ('members', True, 'native', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('members', True, 'portable', 'enoent'): (2,
                                            b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
                                            b''),
- ('members', True, 'portable', 'enotdir'): (2,
-                                            b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                            b''),
- ('paths', False, 'native', 'enoent'): (2,
-                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                        b''),
- ('paths', False, 'native', 'enotdir'): (2,
-                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                         b''),
- ('paths', False, 'portable', 'enoent'): (2,
-                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                          b''),
- ('paths', False, 'portable', 'enotdir'): (2,
-                                           b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                           b''),
- ('paths', True, 'native', 'enoent'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('paths', True, 'native', 'enotdir'): (2,
-                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                        b''),
- ('paths', True, 'portable', 'enoent'): (2,
-                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                         b''),
- ('paths', True, 'portable', 'enotdir'): (2,
-                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                          b''),
+ ('members', True, 'portable', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', False, 'native', 'enoent'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', False, 'native', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', False, 'portable', 'enoent'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', False, 'portable', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', True, 'native', 'enoent'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', True, 'native', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', True, 'portable', 'enoent'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', True, 'portable', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('read', False, 'native', 'enoent'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('read', False, 'native', 'enotdir'): (2,
-                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                        b''),
+ ('read', False, 'native', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('read', False, 'portable', 'enoent'): (2,
                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
                                          b''),
- ('read', False, 'portable', 'enotdir'): (2,
-                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                          b''),
+ ('read', False, 'portable', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('read', True, 'native', 'enoent'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('read', True, 'native', 'enotdir'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('read', True, 'native', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('read', True, 'portable', 'enoent'): (2,
                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
                                         b''),
- ('read', True, 'portable', 'enotdir'): (2,
-                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                         b''),
- ('resolve', False, 'native', 'enoent'): (0,
-                                          b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unkno'
-                                          b'wn": {"first": "lifecycle row UNKNOWN at event fault-event: symlink '
-                                          b'paths are not supported: {CASE}/ordinary"}}}\n',
-                                          b''),
- ('resolve', False, 'native', 'enotdir'): (0,
-                                           b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unkno'
-                                           b'wn": {"first": "lifecycle row UNKNOWN at event fault-event: symlink '
-                                           b'paths are not supported: {CASE}/ordinary"}}}\n',
-                                           b''),
- ('resolve', False, 'portable', 'enoent'): (0,
-                                            b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unkno'
-                                            b'wn": {"first": "lifecycle row UNKNOWN at event fault-event: symlink '
-                                            b'paths are not supported: {CASE}/ordinary"}}}\n',
-                                            b''),
- ('resolve', False, 'portable', 'enotdir'): (0,
-                                             b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "u'
-                                             b'nknown": {"first": "lifecycle row UNKNOWN at event fault-event: '
-                                             b'symlink paths are not supported: {CASE}/ordinary"}}}\n',
-                                             b''),
- ('resolve', True, 'native', 'enoent'): (0,
-                                         b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unkno'
-                                         b'wn": {"first": "lifecycle row UNKNOWN at event fault-event: symlink '
-                                         b'paths are not supported: {CASE}/ordinary"}}}\n',
-                                         b''),
- ('resolve', True, 'native', 'enotdir'): (0,
-                                          b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unkno'
-                                          b'wn": {"first": "lifecycle row UNKNOWN at event fault-event: symlink '
-                                          b'paths are not supported: {CASE}/ordinary"}}}\n',
-                                          b''),
- ('resolve', True, 'portable', 'enoent'): (0,
-                                           b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unkno'
-                                           b'wn": {"first": "lifecycle row UNKNOWN at event fault-event: symlink '
-                                           b'paths are not supported: {CASE}/ordinary"}}}\n',
-                                           b''),
- ('resolve', True, 'portable', 'enotdir'): (0,
-                                            b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unkno'
-                                            b'wn": {"first": "lifecycle row UNKNOWN at event fault-event: symlink '
-                                            b'paths are not supported: {CASE}/ordinary"}}}\n',
-                                            b''),
+ ('read', True, 'portable', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', False, 'native', 'enoent'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', False, 'native', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', False, 'portable', 'enoent'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', False, 'portable', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', True, 'native', 'enoent'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', True, 'native', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', True, 'portable', 'enoent'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', True, 'portable', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('scan_workspace', False, 'native', 'enoent'): (2,
                                                  b'{"error": "symlink paths are not supported: {CASE}/ordinary"'
                                                  b'}\n',
                                                  b''),
- ('scan_workspace', False, 'native', 'enotdir'): (2,
-                                                  b'{"error": "symlink paths are not supported: {CASE}/ordinary"'
-                                                  b'}\n',
-                                                  b''),
+ ('scan_workspace', False, 'native', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('scan_workspace', False, 'portable', 'enoent'): (2,
                                                    b'{"error": "symlink paths are not supported: {CASE}/ordinary"'
                                                    b'}\n',
                                                    b''),
- ('scan_workspace', False, 'portable', 'enotdir'): (2,
-                                                    b'{"error": "symlink paths are not supported: {CASE}/ordinary"'
-                                                    b'}\n',
-                                                    b''),
+ ('scan_workspace', False, 'portable', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('scan_workspace', True, 'native', 'enoent'): (2,
                                                 b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
                                                 b''),
- ('scan_workspace', True, 'native', 'enotdir'): (2,
-                                                 b'{"error": "symlink paths are not supported: {CASE}/ordinary"'
-                                                 b'}\n',
-                                                 b''),
+ ('scan_workspace', True, 'native', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('scan_workspace', True, 'portable', 'enoent'): (2,
                                                   b'{"error": "symlink paths are not supported: {CASE}/ordinary"'
                                                   b'}\n',
                                                   b''),
- ('scan_workspace', True, 'portable', 'enotdir'): (2,
-                                                   b'{"error": "symlink paths are not supported: {CASE}/ordinary"'
-                                                   b'}\n',
-                                                   b''),
- ('scope', False, 'native', 'enoent'): (2,
-                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                        b''),
- ('scope', False, 'native', 'enotdir'): (2,
-                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                         b''),
- ('scope', False, 'portable', 'enoent'): (2,
-                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                          b''),
- ('scope', False, 'portable', 'enotdir'): (2,
-                                           b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                           b''),
- ('scope', True, 'native', 'enoent'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('scope', True, 'native', 'enotdir'): (2,
-                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                        b''),
- ('scope', True, 'portable', 'enoent'): (2,
-                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                         b''),
- ('scope', True, 'portable', 'enotdir'): (2,
-                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                          b''),
+ ('scan_workspace', True, 'portable', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', False, 'native', 'enoent'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', False, 'native', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', False, 'portable', 'enoent'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', False, 'portable', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', True, 'native', 'enoent'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', True, 'native', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', True, 'portable', 'enoent'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', True, 'portable', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('shared-disposition', False, 'native', 'enoent'): (0,
                                                      b'{"result": {"refusals": {}, "requests": ["first", "healt'
                                                      b'hy", "hostile"], "unknown": {}}}\n',
                                                      b''),
- ('shared-disposition', False, 'native', 'enotdir'): (0,
-                                                      b'{"result": {"refusals": {}, "requests": ["first", "healt'
-                                                      b'hy", "hostile"], "unknown": {}}}\n',
-                                                      b''),
+ ('shared-disposition', False, 'native', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('shared-disposition', False, 'portable', 'enoent'): (0,
                                                        b'{"result": {"refusals": {}, "requests": ["first", "healt'
                                                        b'hy", "hostile"], "unknown": {}}}\n',
                                                        b''),
- ('shared-disposition', False, 'portable', 'enotdir'): (0,
-                                                        b'{"result": {"refusals": {}, "requests": ["first", "healt'
-                                                        b'hy", "hostile"], "unknown": {}}}\n',
+ ('shared-disposition', False, 'portable', 'enotdir'): (2,
+                                                        b'{"error": "reference parent changed while opening"}\n',
                                                         b''),
  ('shared-disposition', True, 'native', 'enoent'): (0,
                                                     b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
                                                     b' "hostile"], "unknown": {}}}\n',
                                                     b''),
- ('shared-disposition', True, 'native', 'enotdir'): (0,
-                                                     b'{"result": {"refusals": {}, "requests": ["first", "healt'
-                                                     b'hy", "hostile"], "unknown": {}}}\n',
-                                                     b''),
+ ('shared-disposition', True, 'native', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('shared-disposition', True, 'portable', 'enoent'): (0,
                                                       b'{"result": {"refusals": {}, "requests": ["first", "healt'
                                                       b'hy", "hostile"], "unknown": {}}}\n',
                                                       b''),
- ('shared-disposition', True, 'portable', 'enotdir'): (0,
-                                                       b'{"result": {"refusals": {}, "requests": ["first", "healt'
-                                                       b'hy", "hostile"], "unknown": {}}}\n',
-                                                       b''),
+ ('shared-disposition', True, 'portable', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('shared-resolve', False, 'native', 'enoent'): (0,
                                                  b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
                                                  b' "hostile"], "unknown": {}}}\n',
                                                  b''),
- ('shared-resolve', False, 'native', 'enotdir'): (0,
-                                                  b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
-                                                  b' "hostile"], "unknown": {}}}\n',
-                                                  b''),
+ ('shared-resolve', False, 'native', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('shared-resolve', False, 'portable', 'enoent'): (0,
                                                    b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
                                                    b' "hostile"], "unknown": {}}}\n',
                                                    b''),
- ('shared-resolve', False, 'portable', 'enotdir'): (0,
-                                                    b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
-                                                    b' "hostile"], "unknown": {}}}\n',
-                                                    b''),
+ ('shared-resolve', False, 'portable', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('shared-resolve', True, 'native', 'enoent'): (0,
                                                 b'{"result": {"refusals": {}, "requests": ["first", "healthy", "ho'
                                                 b'stile"], "unknown": {}}}\n',
                                                 b''),
- ('shared-resolve', True, 'native', 'enotdir'): (0,
-                                                 b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
-                                                 b' "hostile"], "unknown": {}}}\n',
-                                                 b''),
+ ('shared-resolve', True, 'native', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('shared-resolve', True, 'portable', 'enoent'): (0,
                                                   b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
                                                   b' "hostile"], "unknown": {}}}\n',
                                                   b''),
- ('shared-resolve', True, 'portable', 'enotdir'): (0,
-                                                   b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
-                                                   b' "hostile"], "unknown": {}}}\n',
-                                                   b''),
+ ('shared-resolve', True, 'portable', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('worktree', False, 'native', 'enoent'): (2,
                                            b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
                                            b''),
- ('worktree', False, 'native', 'enotdir'): (2,
-                                            b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                            b''),
+ ('worktree', False, 'native', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('worktree', False, 'portable', 'enoent'): (2,
                                              b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
                                              b''),
- ('worktree', False, 'portable', 'enotdir'): (2,
-                                              b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                              b''),
+ ('worktree', False, 'portable', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('worktree', True, 'native', 'enoent'): (2,
                                           b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
                                           b''),
- ('worktree', True, 'native', 'enotdir'): (2,
-                                           b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                           b''),
+ ('worktree', True, 'native', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('worktree', True, 'portable', 'enoent'): (2,
                                             b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
                                             b''),
- ('worktree', True, 'portable', 'enotdir'): (2,
-                                             b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
-                                             b'')}
+ ('worktree', True, 'portable', 'enotdir'): (2, b'{"error": "reference parent changed while opening"}\n', b'')}
 
 
 # Filled from an ec27eebf tools snapshot by the round-13 baseline capture.
-R13_CONSUMER_GOLDENS = {('attachment', False, 'inputs'): (0,
-                                   b'{"healthy_capture": "e21a21f88e72fedf876c98e7e2492391ae5643f37ce4687f310efd73b79'
-                                   b'f1e8d", "unverified": "[Errno 13] Permission denied: \'{CASE}/inputs/note.md\''
-                                   b'"}\n',
-                                   b''),
+R13_CONSUMER_GOLDENS = {('attachment', False, 'inputs'): (2,
+                                                          b'{"error": "reference parent changed while opening"}\n',
+                                                          b''),
  ('closing-report', False, 'inputs'): (0,
-                                       b'{"held": {}, "report_error": "[Errno 13] Permission denied: \'{CASE}/inputs/n'
-                                       b'ote.md\'", "requests": null, "routed": ["damaged", "healthy"]}\n',
+                                       b'{"held": {}, "report_error": "reference parent changed while opening", "requ'
+                                       b'ests": null, "routed": ["damaged", "healthy"]}\n',
                                        b''),
  ('deliver', False, 'mailbox'): (0,
-                                 b'{"delivered": false, "failure": {"detail": "[Errno 13] Permission denied: \'{CASE'
-                                 b'}/engine/mailbox/.write.lock\'", "reason": "delivery_error"}}\n',
+                                 b'{"delivered": false, "failure": {"detail": "reference parent changed while opening",'
+                                 b' "reason": "delivery_error"}}\n',
                                  b''),
- ('evidence', False, 'inputs'): (0,
-                                 b'{"healthy_capture": "e21a21f88e72fedf876c98e7e2492391ae5643f37ce4687f310efd73b79f1e8'
-                                 b'd", "kinds": ["unverified_evidence"]}\n',
-                                 b''),
+ ('evidence', False, 'inputs'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('loop-once', True, 'plan'): (3,
-                               b'{"reports": [{"holds": [{"detail": "[Errno 13] Permission denied: \'{CASE}/inputs/not'
-                               b'e.md\'", "kind": "planning_exclusions_unavailable", "step": "dispatch"}, {"detail": "'
-                               b'[Errno 13] Permission denied: \'{CASE}/inputs/note.md\'", "kind": "planning_exclusions'
-                               b'_unavailable", "step": "dispatch"}], "pass_id": 1, "steps": [{"exit": 0, "state": "o'
-                               b'k", "step": "router_status"}, {"state": "skipped", "step": "route"}, {"exit": 2, "st'
-                               b'ate": "hold", "step": "dispatch"}, {"state": "skipped", "step": "sweep"}, {"exit": 0'
-                               b', "state": "ok", "step": "run_open"}]}], "run_open_calls": 1}\n',
+                               b'{"reports": [{"holds": [{"detail": "reference parent changed while opening", "kind":'
+                               b' "planning_exclusions_unavailable", "step": "dispatch"}, {"detail": "reference paren'
+                               b't changed while opening", "kind": "planning_exclusions_unavailable", "step": "dispat'
+                               b'ch"}], "pass_id": 1, "steps": [{"exit": 0, "state": "ok", "step": "router_status"}, '
+                               b'{"state": "skipped", "step": "route"}, {"exit": 2, "state": "hold", "step": "dispatc'
+                               b'h"}, {"state": "skipped", "step": "sweep"}, {"exit": 0, "state": "ok", "step": "run_'
+                               b'open"}]}], "run_open_calls": 1}\n',
                                b''),
  ('loop-once', True, 'request'): (3,
-                                  b'{"reports": [{"holds": [{"detail": "[Errno 13] Permission denied: \'{CASE}/inputs'
-                                  b'/note.md\'", "kind": "planning_exclusions_unavailable", "step": "dispatch"}], "pa'
-                                  b'ss_id": 1, "steps": [{"exit": 0, "state": "ok", "step": "router_status"}, {"stat'
-                                  b'e": "skipped", "step": "route"}, {"state": "skipped", "step": "sweep"}, {"exit":'
-                                  b' 0, "state": "ok", "step": "run_open"}]}], "run_open_calls": 1}\n',
+                                  b'{"reports": [{"holds": [{"detail": "reference parent changed while opening", "ki'
+                                  b'nd": "planning_exclusions_unavailable", "step": "dispatch"}], "pass_id": 1, "ste'
+                                  b'ps": [{"exit": 0, "state": "ok", "step": "router_status"}, {"state": "skipped", '
+                                  b'"step": "route"}, {"state": "skipped", "step": "sweep"}, {"exit": 0, "state": "o'
+                                  b'k", "step": "run_open"}]}], "run_open_calls": 1}\n',
                                   b''),
  ('loop-run', True, 'plan'): (3,
-                              b'{"reports": [{"holds": [{"detail": "[Errno 13] Permission denied: \'{CASE}/inputs/not'
-                              b'e.md\'", "kind": "planning_exclusions_unavailable", "step": "dispatch"}, {"detail": "'
-                              b'[Errno 13] Permission denied: \'{CASE}/inputs/note.md\'", "kind": "planning_exclusions'
-                              b'_unavailable", "step": "dispatch"}], "pass_id": 1, "steps": [{"exit": 0, "state": "o'
-                              b'k", "step": "router_status"}, {"state": "skipped", "step": "route"}, {"exit": 2, "st'
-                              b'ate": "hold", "step": "dispatch"}, {"state": "skipped", "step": "sweep"}, {"exit": 0'
-                              b', "state": "ok", "step": "run_open"}]}, {"holds": [{"detail": "[Errno 13] Permission'
-                              b' denied: \'{CASE}/inputs/note.md\'", "kind": "planning_exclusions_unavailable", "step"'
-                              b': "dispatch"}, {"detail": "[Errno 13] Permission denied: \'{CASE}/inputs/note.md\'", "'
-                              b'kind": "planning_exclusions_unavailable", "step": "dispatch"}], "pass_id": 2, "steps'
-                              b'": [{"exit": 0, "state": "ok", "step": "router_status"}, {"state": "skipped", "step"'
-                              b': "route"}, {"exit": 2, "state": "hold", "step": "dispatch"}, {"state": "skipped", "'
-                              b'step": "sweep"}, {"exit": 0, "state": "ok", "step": "run_open"}]}], "run_open_calls"'
-                              b': 2}\n',
+                              b'{"reports": [{"holds": [{"detail": "reference parent changed while opening", "kind":'
+                              b' "planning_exclusions_unavailable", "step": "dispatch"}, {"detail": "reference paren'
+                              b't changed while opening", "kind": "planning_exclusions_unavailable", "step": "dispat'
+                              b'ch"}], "pass_id": 1, "steps": [{"exit": 0, "state": "ok", "step": "router_status"}, '
+                              b'{"state": "skipped", "step": "route"}, {"exit": 2, "state": "hold", "step": "dispatc'
+                              b'h"}, {"state": "skipped", "step": "sweep"}, {"exit": 0, "state": "ok", "step": "run_'
+                              b'open"}]}, {"holds": [{"detail": "reference parent changed while opening", "kind": "p'
+                              b'lanning_exclusions_unavailable", "step": "dispatch"}, {"detail": "reference parent c'
+                              b'hanged while opening", "kind": "planning_exclusions_unavailable", "step": "dispatch"'
+                              b'}], "pass_id": 2, "steps": [{"exit": 0, "state": "ok", "step": "router_status"}, {"s'
+                              b'tate": "skipped", "step": "route"}, {"exit": 2, "state": "hold", "step": "dispatch"}'
+                              b', {"state": "skipped", "step": "sweep"}, {"exit": 0, "state": "ok", "step": "run_ope'
+                              b'n"}]}], "run_open_calls": 2}\n',
                               b''),
  ('loop-run', True, 'request'): (3,
-                                 b'{"reports": [{"holds": [{"detail": "[Errno 13] Permission denied: \'{CASE}/inputs'
-                                 b'/note.md\'", "kind": "planning_exclusions_unavailable", "step": "dispatch"}], "pa'
-                                 b'ss_id": 1, "steps": [{"exit": 0, "state": "ok", "step": "router_status"}, {"state": '
-                                 b'"skipped", "step": "route"}, {"state": "skipped", "step": "sweep"}, {"exit": 0, "sta'
-                                 b'te": "ok", "step": "run_open"}]}, {"holds": [{"detail": "[Errno 13] Permission denie'
-                                 b'd: \'{CASE}/inputs/note.md\'", "kind": "planning_exclusions_unavailable", "step": '
-                                 b'"dispatch"}], "pass_id": 2, "steps": [{"exit": 0, "state": "ok", "step": "router_sta'
-                                 b'tus"}, {"state": "skipped", "step": "route"}, {"state": "skipped", "step": "sweep"},'
-                                 b' {"exit": 0, "state": "ok", "step": "run_open"}]}], "run_open_calls": 2}\n',
+                                 b'{"reports": [{"holds": [{"detail": "reference parent changed while opening", "kind":'
+                                 b' "planning_exclusions_unavailable", "step": "dispatch"}], "pass_id": 1, "steps": [{"'
+                                 b'exit": 0, "state": "ok", "step": "router_status"}, {"state": "skipped", "step": "rou'
+                                 b'te"}, {"state": "skipped", "step": "sweep"}, {"exit": 0, "state": "ok", "step": "run'
+                                 b'_open"}]}, {"holds": [{"detail": "reference parent changed while opening", "kind": "'
+                                 b'planning_exclusions_unavailable", "step": "dispatch"}], "pass_id": 2, "steps": [{"ex'
+                                 b'it": 0, "state": "ok", "step": "router_status"}, {"state": "skipped", "step": "route'
+                                 b'"}, {"state": "skipped", "step": "sweep"}, {"exit": 0, "state": "ok", "step": "run_o'
+                                 b'pen"}]}], "run_open_calls": 2}\n',
                                  b''),
  ('receipts', False, 'inputs'): (0,
                                  b'{"healthy_capture": "e21a21f88e72fedf876c98e7e2492391ae5643f37ce4687f310efd73b79f1e8'
-                                 b'd", "refused": "[Errno 13] Permission denied: \'{CASE}/delivery/delivered/engine/'
-                                 b'orchestrator\'"}\n',
+                                 b'd", "refused": "reference parent changed while opening"}\n',
                                  b''),
  ('route', False, 'across'): (0,
-                              b'{"requests": [{"detail": "[Errno 13] Permission denied: \'{CASE}/engine/mailbox/acros'
-                              b's/front-door\'", "reason": "team_mailbox_unreadable", "request_id": "damaged", "state'
-                              b'": "held"}, {"request_id": "healthy", "state": "routed"}], "routed": ["healthy"]}\n',
+                              b'{"requests": [{"detail": "reference parent changed while opening", "reason": "team_m'
+                              b'ailbox_unreadable", "request_id": "damaged", "state": "held"}, {"request_id": "healt'
+                              b'hy", "state": "routed"}], "routed": ["healthy"]}\n',
                               b''),
  ('route', False, 'bindings'): (0,
-                                b'{"requests": [{"detail": "[Errno 13] Permission denied: \'{CASE}/engine/mailbox/bindi'
-                                b'ngs/engine/router\'", "reason": "team_mailbox_unreadable", "request_id": "damaged", "'
-                                b'state": "held"}, {"request_id": "healthy", "state": "routed"}], "routed": ["healthy"'
-                                b']}\n',
+                                b'{"requests": [{"detail": "reference parent changed while opening", "reason": "team_m'
+                                b'ailbox_unreadable", "request_id": "damaged", "state": "held"}, {"request_id": "healt'
+                                b'hy", "state": "routed"}], "routed": ["healthy"]}\n',
                                 b''),
  ('route', False, 'mailbox'): (0,
                                b'{"requests": [{"detail": "symlink paths are not supported: {CASE}/engine/mailbox", "'
@@ -1525,20 +3609,19 @@ R13_CONSUMER_GOLDENS = {('attachment', False, 'inputs'): (0,
                                b'uest_id": "healthy", "state": "routed"}], "routed": ["healthy"]}\n',
                                b''),
  ('route', False, 'team'): (0,
-                            b'{"requests": [{"detail": "[Errno 13] Permission denied: \'{CASE}/engine/mailbox/engine/fr'
-                            b'ont-door\'", "reason": "team_mailbox_unreadable", "request_id": "damaged", "state": "held'
-                            b'"}, {"request_id": "healthy", "state": "routed"}], "routed": ["healthy"]}\n',
+                            b'{"requests": [{"detail": "reference parent changed while opening", "reason": "team_mailb'
+                            b'ox_unreadable", "request_id": "damaged", "state": "held"}, {"request_id": "healthy", "st'
+                            b'ate": "routed"}], "routed": ["healthy"]}\n',
                             b''),
  ('route', True, 'across'): (0,
-                             b'{"requests": [{"detail": "[Errno 13] Permission denied: \'{CASE}/engine/mailbox/acros'
-                             b's/front-door\'", "reason": "team_mailbox_unreadable", "request_id": "damaged", "state'
-                             b'": "held"}, {"request_id": "healthy", "state": "routed"}], "routed": ["healthy"]}\n',
+                             b'{"requests": [{"detail": "reference parent changed while opening", "reason": "team_mailb'
+                             b'ox_unreadable", "request_id": "damaged", "state": "held"}, {"request_id": "healthy", "st'
+                             b'ate": "routed"}], "routed": ["healthy"]}\n',
                              b''),
  ('route', True, 'bindings'): (0,
-                               b'{"requests": [{"detail": "[Errno 13] Permission denied: \'{CASE}/engine/mailbox/bindi'
-                               b'ngs/engine/router\'", "reason": "team_mailbox_unreadable", "request_id": "damaged", "'
-                               b'state": "held"}, {"request_id": "healthy", "state": "routed"}], "routed": ["healthy"'
-                               b']}\n',
+                               b'{"requests": [{"detail": "reference parent changed while opening", "reason": "team_m'
+                               b'ailbox_unreadable", "request_id": "damaged", "state": "held"}, {"request_id": "healt'
+                               b'hy", "state": "routed"}], "routed": ["healthy"]}\n',
                                b''),
  ('route', True, 'mailbox'): (0,
                               b'{"requests": [{"detail": "symlink paths are not supported: {CASE}/engine/mailbox", "'
@@ -1546,29 +3629,27 @@ R13_CONSUMER_GOLDENS = {('attachment', False, 'inputs'): (0,
                               b'uest_id": "healthy", "state": "routed"}], "routed": ["healthy"]}\n',
                               b''),
  ('route', True, 'team'): (0,
-                           b'{"requests": [{"detail": "[Errno 13] Permission denied: \'{CASE}/engine/mailbox/engine/fr'
-                           b'ont-door\'", "reason": "team_mailbox_unreadable", "request_id": "damaged", "state": "held'
-                           b'"}, {"request_id": "healthy", "state": "routed"}], "routed": ["healthy"]}\n',
+                           b'{"requests": [{"detail": "reference parent changed while opening", "reason": "team_mailb'
+                           b'ox_unreadable", "request_id": "damaged", "state": "held"}, {"request_id": "healthy", "st'
+                           b'ate": "routed"}], "routed": ["healthy"]}\n',
                            b''),
  ('row', False, 'inputs'): (0,
-                            b'{"small_changes": [{"detail": "[Errno 13] Permission denied: \'{CASE}/inputs/note.md\''
-                            b'", "reason": "small_change_configuration", "request_id": "engine-partial", "state": "hel'
-                            b'd"}]}\n',
+                            b'{"small_changes": [{"detail": "reference parent changed while opening", "reason": "small'
+                            b'_change_configuration", "request_id": "engine-partial", "state": "held"}]}\n',
                             b''),
  ('row', True, 'inputs'): (0,
-                           b'{"small_changes": [{"detail": "[Errno 13] Permission denied: \'{CASE}/inputs/note.md\'", "'
-                           b'reason": "small_change_configuration", "request_id": "engine-partial", "state": "held"}]'
-                           b'}\n',
+                           b'{"small_changes": [{"detail": "reference parent changed while opening", "reason": "small'
+                           b'_change_configuration", "request_id": "engine-partial", "state": "held"}]}\n',
                            b''),
  ('status', False, 'across'): (0,
-                               b'{"requests": [{"detail": "[Errno 13] Permission denied: \'{CASE}/engine/mailbox/acros'
-                               b's/front-door\'", "reason": "team_mailbox_unreadable", "request_id": "damaged", "state'
-                               b'": "held"}, {"request_id": "healthy", "state": "ready"}]}\n',
+                               b'{"requests": [{"detail": "reference parent changed while opening", "reason": "team_m'
+                               b'ailbox_unreadable", "request_id": "damaged", "state": "held"}, {"request_id": "healt'
+                               b'hy", "state": "ready"}]}\n',
                                b''),
  ('status', False, 'bindings'): (0,
-                                 b'{"requests": [{"detail": "[Errno 13] Permission denied: \'{CASE}/engine/mailbox/b'
-                                 b'indings/engine/router\'", "reason": "team_mailbox_unreadable", "request_id": "dam'
-                                 b'aged", "state": "held"}, {"request_id": "healthy", "state": "ready"}]}\n',
+                                 b'{"requests": [{"detail": "reference parent changed while opening", "reason": "team_m'
+                                 b'ailbox_unreadable", "request_id": "damaged", "state": "held"}, {"request_id": "healt'
+                                 b'hy", "state": "ready"}]}\n',
                                  b''),
  ('status', False, 'mailbox'): (0,
                                 b'{"requests": [{"detail": "symlink paths are not supported: {CASE}/engine/mailbox", "'
@@ -1576,19 +3657,19 @@ R13_CONSUMER_GOLDENS = {('attachment', False, 'inputs'): (0,
                                 b'uest_id": "healthy", "state": "ready"}]}\n',
                                 b''),
  ('status', False, 'team'): (0,
-                             b'{"requests": [{"detail": "[Errno 13] Permission denied: \'{CASE}/engine/mailbox/engin'
-                             b'e/front-door\'", "reason": "team_mailbox_unreadable", "request_id": "damaged", "state'
-                             b'": "held"}, {"request_id": "healthy", "state": "ready"}]}\n',
+                             b'{"requests": [{"detail": "reference parent changed while opening", "reason": "team_mailb'
+                             b'ox_unreadable", "request_id": "damaged", "state": "held"}, {"request_id": "healthy", "st'
+                             b'ate": "ready"}]}\n',
                              b''),
  ('status', True, 'across'): (0,
-                              b'{"requests": [{"detail": "[Errno 13] Permission denied: \'{CASE}/engine/mailbox/acros'
-                              b's/front-door\'", "reason": "team_mailbox_unreadable", "request_id": "damaged", "state'
-                              b'": "held"}, {"request_id": "healthy", "state": "ready"}]}\n',
+                              b'{"requests": [{"detail": "reference parent changed while opening", "reason": "team_m'
+                              b'ailbox_unreadable", "request_id": "damaged", "state": "held"}, {"request_id": "healt'
+                              b'hy", "state": "ready"}]}\n',
                               b''),
  ('status', True, 'bindings'): (0,
-                                b'{"requests": [{"detail": "[Errno 13] Permission denied: \'{CASE}/engine/mailbox/bindi'
-                                b'ngs/engine/router\'", "reason": "team_mailbox_unreadable", "request_id": "damaged", "'
-                                b'state": "held"}, {"request_id": "healthy", "state": "ready"}]}\n',
+                                b'{"requests": [{"detail": "reference parent changed while opening", "reason": "team_m'
+                                b'ailbox_unreadable", "request_id": "damaged", "state": "held"}, {"request_id": "healt'
+                                b'hy", "state": "ready"}]}\n',
                                 b''),
  ('status', True, 'mailbox'): (0,
                                b'{"requests": [{"detail": "symlink paths are not supported: {CASE}/engine/mailbox", "'
@@ -1596,9 +3677,9 @@ R13_CONSUMER_GOLDENS = {('attachment', False, 'inputs'): (0,
                                b'uest_id": "healthy", "state": "ready"}]}\n',
                                b''),
  ('status', True, 'team'): (0,
-                            b'{"requests": [{"detail": "[Errno 13] Permission denied: \'{CASE}/engine/mailbox/engine/fr'
-                            b'ont-door\'", "reason": "team_mailbox_unreadable", "request_id": "damaged", "state": "held'
-                            b'"}, {"request_id": "healthy", "state": "ready"}]}\n',
+                            b'{"requests": [{"detail": "reference parent changed while opening", "reason": "team_mailb'
+                            b'ox_unreadable", "request_id": "damaged", "state": "held"}, {"request_id": "healthy", "st'
+                            b'ate": "ready"}]}\n',
                             b'')}
 R13_CONSUMER_PROBE = r'''
 import contextlib, io, json, os, sys
@@ -1777,216 +3858,219 @@ def test_round13_optional_and_receipt_target_errors_match_baseline(tmp_path,seam
     assert r13_consumer_probe(tmp_path,seam)==R13_CONSUMER_GOLDENS[(seam,False,"inputs")]
 
 
-# Recorded from ec27eebf outside this checkout. Tests consume data, never Git history.
+# Unaffected rows retain ec27eebf bytes. OWNER RULING D-bg replaces acquisition
+# failures with latched refusals. Tests consume literal data, never Git history.
 # CLI cases retain native capabilities; portable API cases exercise the reference
 # fallback. Unsupported secure locking has its own refusal/probe test below.
-R9_PUBLIC_GOLDENS = {('check', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('check', 'denied', False, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('check', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('check', 'denied', True, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+R9_PUBLIC_GOLDENS = {('check', 'denied', False, 'native'): (2,
+                                                            b'{"error": "reference parent changed while opening"}\n',
+                                                            b''),
+ ('check', 'denied', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('check', 'denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('check', 'denied', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('check', 'missing', False, 'native'): (0, b'{"result": false}\n', b''),
  ('check', 'missing', False, 'portable'): (0, b'{"result": false}\n', b''),
  ('check', 'missing', True, 'native'): (0, b'{"result": false}\n', b''),
  ('check', 'missing', True, 'portable'): (0, b'{"result": false}\n', b''),
- ('check', 'not-directory', False, 'native'): (0, b'{"result": false}\n', b''),
- ('check', 'not-directory', False, 'portable'): (0, b'{"result": false}\n', b''),
- ('check', 'not-directory', True, 'native'): (0, b'{"result": false}\n', b''),
- ('check', 'not-directory', True, 'portable'): (0, b'{"result": false}\n', b''),
+ ('check', 'not-directory', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('check', 'not-directory', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('check', 'not-directory', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('check', 'not-directory', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('check', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('check', 'symlink', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('check', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('check', 'symlink', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('compose-file', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/manifest.json\'"}\n', b''),
- ('compose-file', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/manifest.json\'"}\n', b''),
+ ('compose-file', 'denied', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('compose-file', 'denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('compose-file', 'missing', False, 'native'): (2, b'{"error": "[Errno 2] No such file or directory: \'ordinary\'"}\n', b''),
  ('compose-file', 'missing', True, 'native'): (2, b'{"error": "[Errno 2] No such file or directory: \'ordinary\'"}\n', b''),
- ('compose-file', 'not-directory', False, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'{CASE}/ordinary/manifest.json\'"}\n', b''),
- ('compose-file', 'not-directory', True, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'{CASE}/ordinary/manifest.json\'"}\n', b''),
+ ('compose-file', 'not-directory', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('compose-file', 'not-directory', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('compose-file', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('compose-file', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('compose:--delivery-dir', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('compose:--delivery-dir', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('compose:--delivery-dir', 'denied', False, 'native'): (2,
+                                                         b'{"error": "reference parent changed while opening"}\n',
+                                                         b''),
+ ('compose:--delivery-dir', 'denied', True, 'native'): (2,
+                                                        b'{"error": "reference parent changed while opening"}\n',
+                                                        b''),
  ('compose:--delivery-dir', 'missing', False, 'native'): (2, b'{"error": "lifecycle directory unavailable: {CASE}/missing-journal"}\n', b''),
  ('compose:--delivery-dir', 'missing', True, 'native'): (2, b'{"error": "lifecycle directory unavailable: {CASE}/missing-journal"}\n', b''),
- ('compose:--delivery-dir', 'not-directory', False, 'native'): (2, b'{"error": "lifecycle directory unavailable: {CASE}/missing-journal"}\n', b''),
- ('compose:--delivery-dir', 'not-directory', True, 'native'): (2, b'{"error": "lifecycle directory unavailable: {CASE}/missing-journal"}\n', b''),
+ ('compose:--delivery-dir', 'not-directory', False, 'native'): (2,
+                                                                b'{"error": "reference parent changed while opening"}\n',
+                                                                b''),
+ ('compose:--delivery-dir', 'not-directory', True, 'native'): (2,
+                                                               b'{"error": "reference parent changed while opening"}\n',
+                                                               b''),
  ('compose:--delivery-dir', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('compose:--delivery-dir', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('compose:--lifecycle', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('compose:--lifecycle', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('compose:--lifecycle', 'denied', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('compose:--lifecycle', 'denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('compose:--lifecycle', 'missing', False, 'native'): (2, b'{"error": "lifecycle directory unavailable: {CASE}/ordinary/note.md"}\n', b''),
  ('compose:--lifecycle', 'missing', True, 'native'): (2, b'{"error": "lifecycle directory unavailable: {CASE}/ordinary/note.md"}\n', b''),
- ('compose:--lifecycle', 'not-directory', False, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('compose:--lifecycle', 'not-directory', True, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('compose:--lifecycle', 'not-directory', False, 'native'): (2,
+                                                             b'{"error": "reference parent changed while opening"}\n',
+                                                             b''),
+ ('compose:--lifecycle', 'not-directory', True, 'native'): (2,
+                                                            b'{"error": "reference parent changed while opening"}\n',
+                                                            b''),
  ('compose:--lifecycle', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('compose:--lifecycle', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('compose:--root', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('compose:--root', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('compose:--root', 'denied', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('compose:--root', 'denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('compose:--root', 'missing', False, 'native'): (2, b'{"error": "[Errno 2] No such file or directory: \'ordinary\'"}\n', b''),
  ('compose:--root', 'missing', True, 'native'): (2, b'{"error": "[Errno 2] No such file or directory: \'ordinary\'"}\n', b''),
- ('compose:--root', 'not-directory', False, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'{CASE}/ordinary/note.md/manifest.json\'"}\n', b''),
- ('compose:--root', 'not-directory', True, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'{CASE}/ordinary/note.md/manifest.json\'"}\n', b''),
+ ('compose:--root', 'not-directory', False, 'native'): (2,
+                                                        b'{"error": "reference parent changed while opening"}\n',
+                                                        b''),
+ ('compose:--root', 'not-directory', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('compose:--root', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('compose:--root', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('disposition', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('disposition', 'denied', False, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('disposition', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('disposition', 'denied', True, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('disposition', 'denied', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', 'denied', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', 'denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', 'denied', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('disposition', 'missing', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
  ('disposition', 'missing', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
  ('disposition', 'missing', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
  ('disposition', 'missing', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('disposition', 'not-directory', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('disposition', 'not-directory', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('disposition', 'not-directory', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('disposition', 'not-directory', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('disposition', 'symlink', False, 'native'): (0,
-                                               b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "lifecycle row UNKNOWN at'
-                                               b' event fault-event: symlink paths are not supported: {CASE}/ordinary"}}}\n',
-                                               b''),
- ('disposition', 'symlink', False, 'portable'): (0,
-                                                 b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "lifecycle row UNKNOWN at'
-                                                 b' event fault-event: symlink paths are not supported: {CASE}/ordinary"}}}\n',
-                                                 b''),
- ('disposition', 'symlink', True, 'native'): (0,
-                                              b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "lifecycle row UNKNOWN at'
-                                              b' event fault-event: symlink paths are not supported: {CASE}/ordinary"}}}\n',
-                                              b''),
- ('disposition', 'symlink', True, 'portable'): (0,
-                                                b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "lifecycle row UNKNOWN at'
-                                                b' event fault-event: symlink paths are not supported: {CASE}/ordinary"}}}\n',
-                                                b''),
- ('exists', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('exists', 'denied', False, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('exists', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('exists', 'denied', True, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('disposition', 'not-directory', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', 'not-directory', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', 'not-directory', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', 'not-directory', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', 'symlink', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', 'symlink', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', 'symlink', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', 'symlink', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('exists', 'denied', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('exists', 'denied', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('exists', 'denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('exists', 'denied', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('exists', 'missing', False, 'native'): (0, b'{"result": false}\n', b''),
  ('exists', 'missing', False, 'portable'): (0, b'{"result": false}\n', b''),
  ('exists', 'missing', True, 'native'): (0, b'{"result": false}\n', b''),
  ('exists', 'missing', True, 'portable'): (0, b'{"result": false}\n', b''),
- ('exists', 'not-directory', False, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('exists', 'not-directory', False, 'portable'): (2, b'{"error": "[Errno 20] Not a directory: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('exists', 'not-directory', True, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('exists', 'not-directory', True, 'portable'): (2, b'{"error": "[Errno 20] Not a directory: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('exists', 'not-directory', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('exists', 'not-directory', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('exists', 'not-directory', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('exists', 'not-directory', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('exists', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('exists', 'symlink', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('exists', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('exists', 'symlink', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('loop:--lifecycle', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('loop:--lifecycle', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('loop:--lifecycle', 'denied', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--lifecycle', 'denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('loop:--lifecycle', 'missing', False, 'native'): (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
  ('loop:--lifecycle', 'missing', True, 'native'): (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
- ('loop:--lifecycle', 'not-directory', False, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'{CASE}/ordinary/note.md.loop.lock\'"}\n', b''),
- ('loop:--lifecycle', 'not-directory', True, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'{CASE}/ordinary/note.md.loop.lock\'"}\n', b''),
+ ('loop:--lifecycle', 'not-directory', False, 'native'): (2,
+                                                          b'{"error": "reference parent changed while opening"}\n',
+                                                          b''),
+ ('loop:--lifecycle', 'not-directory', True, 'native'): (2,
+                                                         b'{"error": "reference parent changed while opening"}\n',
+                                                         b''),
  ('loop:--lifecycle', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('loop:--lifecycle', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('loop:--recipes', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('loop:--recipes', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('loop:--recipes', 'denied', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--recipes', 'denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('loop:--recipes', 'missing', False, 'native'): (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
  ('loop:--recipes', 'missing', True, 'native'): (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
- ('loop:--recipes', 'not-directory', False, 'native'): (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
- ('loop:--recipes', 'not-directory', True, 'native'): (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
+ ('loop:--recipes', 'not-directory', False, 'native'): (2,
+                                                        b'{"error": "reference parent changed while opening"}\n',
+                                                        b''),
+ ('loop:--recipes', 'not-directory', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('loop:--recipes', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('loop:--recipes', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('loop:--state-dir', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('loop:--state-dir', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('loop:--state-dir', 'denied', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--state-dir', 'denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('loop:--state-dir', 'missing', False, 'native'): (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
  ('loop:--state-dir', 'missing', True, 'native'): (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
- ('loop:--state-dir', 'not-directory', False, 'native'): (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
- ('loop:--state-dir', 'not-directory', True, 'native'): (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
+ ('loop:--state-dir', 'not-directory', False, 'native'): (2,
+                                                          b'{"error": "reference parent changed while opening"}\n',
+                                                          b''),
+ ('loop:--state-dir', 'not-directory', True, 'native'): (2,
+                                                         b'{"error": "reference parent changed while opening"}\n',
+                                                         b''),
  ('loop:--state-dir', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('loop:--state-dir', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('loop:--store', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('loop:--store', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('loop:--store', 'denied', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--store', 'denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('loop:--store', 'missing', False, 'native'): (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
  ('loop:--store', 'missing', True, 'native'): (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
- ('loop:--store', 'not-directory', False, 'native'): (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
- ('loop:--store', 'not-directory', True, 'native'): (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
+ ('loop:--store', 'not-directory', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--store', 'not-directory', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('loop:--store', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('loop:--store', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('members', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('members', 'denied', False, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('members', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('members', 'denied', True, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('members', 'denied', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('members', 'denied', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('members', 'denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('members', 'denied', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('members', 'missing', False, 'native'): (2, b'{"error": "[Errno 2] No such file or directory: \'ordinary\'"}\n', b''),
  ('members', 'missing', False, 'portable'): (2, b'{"error": "[Errno 2] No such file or directory: \'{CASE}/ordinary\'"}\n', b''),
  ('members', 'missing', True, 'native'): (2, b'{"error": "[Errno 2] No such file or directory: \'ordinary\'"}\n', b''),
  ('members', 'missing', True, 'portable'): (2, b'{"error": "[Errno 2] No such file or directory: \'{CASE}/ordinary\'"}\n', b''),
- ('members', 'not-directory', False, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'ordinary\'"}\n', b''),
- ('members', 'not-directory', False, 'portable'): (2, b'{"error": "reference parent must be a directory: {CASE}/ordinary"}\n', b''),
- ('members', 'not-directory', True, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'ordinary\'"}\n', b''),
- ('members', 'not-directory', True, 'portable'): (2, b'{"error": "reference parent must be a directory: {CASE}/ordinary"}\n', b''),
+ ('members', 'not-directory', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('members', 'not-directory', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('members', 'not-directory', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('members', 'not-directory', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('members', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('members', 'symlink', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('members', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('members', 'symlink', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('paths', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('paths', 'denied', False, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('paths', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('paths', 'denied', True, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('paths', 'denied', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', 'denied', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', 'denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', 'denied', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('paths', 'missing', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
  ('paths', 'missing', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
  ('paths', 'missing', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
  ('paths', 'missing', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
- ('paths', 'not-directory', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
- ('paths', 'not-directory', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
- ('paths', 'not-directory', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
- ('paths', 'not-directory', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
- ('paths', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('paths', 'symlink', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('paths', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('paths', 'symlink', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('read', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('read', 'denied', False, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('read', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('read', 'denied', True, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('paths', 'not-directory', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', 'not-directory', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', 'not-directory', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', 'not-directory', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', 'symlink', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', 'symlink', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', 'symlink', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', 'symlink', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('read', 'denied', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('read', 'denied', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('read', 'denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('read', 'denied', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('read', 'missing', False, 'native'): (2, b'{"error": "[Errno 2] No such file or directory: \'ordinary\'"}\n', b''),
- ('read', 'missing', False, 'portable'): (2, b'{"error": "[Errno 2] No such file or directory: \'{CASE}/ordinary\'"}\n', b''),
+ ('read', 'missing', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('read', 'missing', True, 'native'): (2, b'{"error": "[Errno 2] No such file or directory: \'ordinary\'"}\n', b''),
- ('read', 'missing', True, 'portable'): (2, b'{"error": "[Errno 2] No such file or directory: \'{CASE}/ordinary\'"}\n', b''),
- ('read', 'not-directory', False, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'ordinary\'"}\n', b''),
- ('read', 'not-directory', False, 'portable'): (2, b'{"error": "reference parent must be a directory: {CASE}/ordinary"}\n', b''),
- ('read', 'not-directory', True, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'ordinary\'"}\n', b''),
- ('read', 'not-directory', True, 'portable'): (2, b'{"error": "reference parent must be a directory: {CASE}/ordinary"}\n', b''),
+ ('read', 'missing', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('read', 'not-directory', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('read', 'not-directory', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('read', 'not-directory', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('read', 'not-directory', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('read', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('read', 'symlink', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('read', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('read', 'symlink', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('resolve', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('resolve', 'denied', False, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('resolve', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('resolve', 'denied', True, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('resolve', 'denied', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', 'denied', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', 'denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', 'denied', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('resolve', 'missing', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
  ('resolve', 'missing', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
  ('resolve', 'missing', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
  ('resolve', 'missing', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('resolve', 'not-directory', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('resolve', 'not-directory', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('resolve', 'not-directory', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('resolve', 'not-directory', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('resolve', 'symlink', False, 'native'): (0,
-                                           b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "lifecycle row UNKNOWN at eve'
-                                           b'nt fault-event: symlink paths are not supported: {CASE}/ordinary"}}}\n',
-                                           b''),
- ('resolve', 'symlink', False, 'portable'): (0,
-                                             b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "lifecycle row UNKNOWN at eve'
-                                             b'nt fault-event: symlink paths are not supported: {CASE}/ordinary"}}}\n',
-                                             b''),
- ('resolve', 'symlink', True, 'native'): (0,
-                                          b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "lifecycle row UNKNOWN at eve'
-                                          b'nt fault-event: symlink paths are not supported: {CASE}/ordinary"}}}\n',
-                                          b''),
- ('resolve', 'symlink', True, 'portable'): (0,
-                                            b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "lifecycle row UNKNOWN at eve'
-                                            b'nt fault-event: symlink paths are not supported: {CASE}/ordinary"}}}\n',
-                                            b''),
+ ('resolve', 'not-directory', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', 'not-directory', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', 'not-directory', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', 'not-directory', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', 'symlink', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', 'symlink', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', 'symlink', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', 'symlink', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('router:--lifecycle', 'denied', False, 'native'): (2,
-                                                     b'{"error":"[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'","execution_enabled":false,"source'
-                                                     b'":"arguments","state":"hold"}\n',
+                                                     b'{"error":"reference parent changed while opening","execution_ena'
+                                                     b'bled":false,"source":"arguments","state":"hold"}\n',
                                                      b''),
  ('router:--lifecycle', 'denied', True, 'native'): (2,
-                                                    b'{"error":"[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'","execution_enabled":false,"source'
-                                                    b'":"arguments","state":"hold"}\n',
+                                                    b'{"error":"reference parent changed while opening","execution_ena'
+                                                    b'bled":false,"source":"arguments","state":"hold"}\n',
                                                     b''),
  ('router:--lifecycle', 'missing', False, 'native'): (2,
                                                       b'{"error":"[Errno 2] No such file or directory: \'{CASE}/ordinary/note.md/.write.lock\'","execution_ena'
@@ -1997,12 +4081,12 @@ R9_PUBLIC_GOLDENS = {('check', 'denied', False, 'native'): (2, b'{"error": "[Err
                                                      b'bled":false,"source":"journal","state":"hold"}\n',
                                                      b''),
  ('router:--lifecycle', 'not-directory', False, 'native'): (2,
-                                                            b'{"error":"[Errno 20] Not a directory: \'{CASE}/ordinary/note.md/.write.lock\'","execution_enab'
-                                                            b'led":false,"source":"journal","state":"hold"}\n',
+                                                            b'{"error":"[Errno 20] Not a directory: \'{CASE}/ordinary/note.md/.write.lock\'","ex'
+                                                            b'ecution_enabled":false,"source":"journal","state":"hold"}\n',
                                                             b''),
  ('router:--lifecycle', 'not-directory', True, 'native'): (2,
-                                                           b'{"error":"[Errno 20] Not a directory: \'{CASE}/ordinary/note.md/.write.lock\'","execution_enabled"'
-                                                           b':false,"source":"journal","state":"hold"}\n',
+                                                           b'{"error":"[Errno 20] Not a directory: \'{CASE}/ordinary/note.md/.write.lock\'","ex'
+                                                           b'ecution_enabled":false,"source":"journal","state":"hold"}\n',
                                                            b''),
  ('router:--lifecycle', 'symlink', False, 'native'): (2,
                                                       b'{"error":"symlink paths are not supported: {CASE}/ordinary","execution_enabled":false,"source":"argu'
@@ -2013,12 +4097,12 @@ R9_PUBLIC_GOLDENS = {('check', 'denied', False, 'native'): (2, b'{"error": "[Err
                                                      b's","state":"hold"}\n',
                                                      b''),
  ('router:--recipes', 'denied', False, 'native'): (2,
-                                                   b'{"error":"[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'","execution_enabled":false,"source":"a'
-                                                   b'rguments","state":"hold"}\n',
+                                                   b'{"error":"reference parent changed while opening","execution_ena'
+                                                   b'bled":false,"source":"arguments","state":"hold"}\n',
                                                    b''),
  ('router:--recipes', 'denied', True, 'native'): (2,
-                                                  b'{"error":"[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'","execution_enabled":false,"source":"a'
-                                                  b'rguments","state":"hold"}\n',
+                                                  b'{"error":"reference parent changed while opening","execution_ena'
+                                                  b'bled":false,"source":"arguments","state":"hold"}\n',
                                                   b''),
  ('router:--recipes', 'missing', False, 'native'): (0,
                                                     b'{"authenticated":false,"escalations":[],"execution_enabled":false,"identity":"configured","requests":[],'
@@ -2028,13 +4112,13 @@ R9_PUBLIC_GOLDENS = {('check', 'denied', False, 'native'): (2, b'{"error": "[Err
                                                    b'{"authenticated":false,"escalations":[],"execution_enabled":false,"identity":"configured","requests":[],'
                                                    b'"router":"router-1","schema":"aegis.router-status/v1"}\n',
                                                    b''),
- ('router:--recipes', 'not-directory', False, 'native'): (0,
-                                                          b'{"authenticated":false,"escalations":[],"execution_enabled":false,"identity":"configured","reque'
-                                                          b'sts":[],"router":"router-1","schema":"aegis.router-status/v1"}\n',
+ ('router:--recipes', 'not-directory', False, 'native'): (2,
+                                                          b'{"error":"reference parent changed while opening","execu'
+                                                          b'tion_enabled":false,"source":"arguments","state":"hold"}\n',
                                                           b''),
- ('router:--recipes', 'not-directory', True, 'native'): (0,
-                                                         b'{"authenticated":false,"escalations":[],"execution_enabled":false,"identity":"configured","requests"'
-                                                         b':[],"router":"router-1","schema":"aegis.router-status/v1"}\n',
+ ('router:--recipes', 'not-directory', True, 'native'): (2,
+                                                         b'{"error":"reference parent changed while opening","execution'
+                                                         b'_enabled":false,"source":"arguments","state":"hold"}\n',
                                                          b''),
  ('router:--recipes', 'symlink', False, 'native'): (2,
                                                     b'{"error":"symlink paths are not supported: {CASE}/ordinary","execution_enabled":false,"source":"argument'
@@ -2045,28 +4129,28 @@ R9_PUBLIC_GOLDENS = {('check', 'denied', False, 'native'): (2, b'{"error": "[Err
                                                    b's","state":"hold"}\n',
                                                    b''),
  ('router:--store', 'denied', False, 'native'): (2,
-                                                 b'{"error":"[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'","execution_enabled":false,"source":"a'
-                                                 b'rguments","state":"hold"}\n',
+                                                 b'{"error":"reference parent changed while opening","execution_enabled'
+                                                 b'":false,"source":"arguments","state":"hold"}\n',
                                                  b''),
  ('router:--store', 'denied', True, 'native'): (2,
-                                                b'{"error":"[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'","execution_enabled":false,"source":"a'
-                                                b'rguments","state":"hold"}\n',
+                                                b'{"error":"reference parent changed while opening","execution_enabled'
+                                                b'":false,"source":"arguments","state":"hold"}\n',
                                                 b''),
  ('router:--store', 'missing', False, 'native'): (2,
-                                                  b'{"error":"captured directory disappeared: {CASE}/ordinary/note.md/events","execution_enabled":false,"sou'
-                                                  b'rce":"store","state":"hold"}\n',
+                                                  b'{"error":"captured directory disappeared: {CASE}/ordinary/note.md/events","execu'
+                                                  b'tion_enabled":false,"source":"store","state":"hold"}\n',
                                                   b''),
  ('router:--store', 'missing', True, 'native'): (2,
-                                                 b'{"error":"captured directory disappeared: {CASE}/ordinary/note.md/events","execution_enabled":false,"source"'
-                                                 b':"store","state":"hold"}\n',
+                                                 b'{"error":"captured directory disappeared: {CASE}/ordinary/note.md/events","execu'
+                                                 b'tion_enabled":false,"source":"store","state":"hold"}\n',
                                                  b''),
  ('router:--store', 'not-directory', False, 'native'): (2,
-                                                        b'{"error":"workspace store is not initialized","execution_enabled":false,"source":"store","state":"ho'
-                                                        b'ld"}\n',
+                                                        b'{"error":"reference parent changed while opening","execution'
+                                                        b'_enabled":false,"source":"arguments","state":"hold"}\n',
                                                         b''),
  ('router:--store', 'not-directory', True, 'native'): (2,
-                                                       b'{"error":"workspace store is not initialized","execution_enabled":false,"source":"store","state":"ho'
-                                                       b'ld"}\n',
+                                                       b'{"error":"reference parent changed while opening","execution'
+                                                       b'_enabled":false,"source":"arguments","state":"hold"}\n',
                                                        b''),
  ('router:--store', 'symlink', False, 'native'): (2,
                                                   b'{"error":"symlink paths are not supported: {CASE}/ordinary","execution_enabled":false,"source":"argument'
@@ -2076,112 +4160,145 @@ R9_PUBLIC_GOLDENS = {('check', 'denied', False, 'native'): (2, b'{"error": "[Err
                                                  b'{"error":"symlink paths are not supported: {CASE}/ordinary","execution_enabled":false,"source":"arguments","'
                                                  b'state":"hold"}\n',
                                                  b''),
- ('scan_workspace', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('scan_workspace', 'denied', False, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('scan_workspace', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('scan_workspace', 'denied', True, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('scan_workspace', 'denied', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scan_workspace', 'denied', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scan_workspace', 'denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scan_workspace', 'denied', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('scan_workspace', 'missing', False, 'native'): (2, b'{"error": "scan workspace does not match lane worktree"}\n', b''),
  ('scan_workspace', 'missing', False, 'portable'): (2, b'{"error": "scan workspace does not match lane worktree"}\n', b''),
  ('scan_workspace', 'missing', True, 'native'): (2, b'{"error": "scan workspace does not match lane worktree"}\n', b''),
  ('scan_workspace', 'missing', True, 'portable'): (2, b'{"error": "scan workspace does not match lane worktree"}\n', b''),
- ('scan_workspace', 'not-directory', False, 'native'): (2, b'{"error": "scan workspace does not match lane worktree"}\n', b''),
- ('scan_workspace', 'not-directory', False, 'portable'): (2, b'{"error": "scan workspace does not match lane worktree"}\n', b''),
- ('scan_workspace', 'not-directory', True, 'native'): (2, b'{"error": "scan workspace does not match lane worktree"}\n', b''),
- ('scan_workspace', 'not-directory', True, 'portable'): (2, b'{"error": "scan workspace does not match lane worktree"}\n', b''),
+ ('scan_workspace', 'not-directory', False, 'native'): (2,
+                                                        b'{"error": "reference parent changed while opening"}\n',
+                                                        b''),
+ ('scan_workspace', 'not-directory', False, 'portable'): (2,
+                                                          b'{"error": "reference parent changed while opening"}\n',
+                                                          b''),
+ ('scan_workspace', 'not-directory', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scan_workspace', 'not-directory', True, 'portable'): (2,
+                                                         b'{"error": "reference parent changed while opening"}\n',
+                                                         b''),
  ('scan_workspace', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('scan_workspace', 'symlink', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('scan_workspace', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('scan_workspace', 'symlink', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('scope', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('scope', 'denied', False, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('scope', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('scope', 'denied', True, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('scope', 'denied', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', 'denied', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', 'denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', 'denied', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('scope', 'missing', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
  ('scope', 'missing', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
  ('scope', 'missing', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
  ('scope', 'missing', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
- ('scope', 'not-directory', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
- ('scope', 'not-directory', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
- ('scope', 'not-directory', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
- ('scope', 'not-directory', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
- ('scope', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('scope', 'symlink', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('scope', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('scope', 'symlink', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('shared-disposition', 'denied', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-disposition', 'denied', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-disposition', 'denied', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-disposition', 'denied', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('scope', 'not-directory', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', 'not-directory', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', 'not-directory', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', 'not-directory', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', 'symlink', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', 'symlink', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', 'symlink', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', 'symlink', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-disposition', 'denied', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-disposition', 'denied', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-disposition', 'denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-disposition', 'denied', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('shared-disposition', 'missing', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
  ('shared-disposition', 'missing', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
  ('shared-disposition', 'missing', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
  ('shared-disposition', 'missing', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-disposition', 'not-directory', False, 'native'): (0,
-                                                            b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n',
+ ('shared-disposition', 'not-directory', False, 'native'): (2,
+                                                            b'{"error": "reference parent changed while opening"}\n',
                                                             b''),
- ('shared-disposition', 'not-directory', False, 'portable'): (0,
-                                                              b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n',
+ ('shared-disposition', 'not-directory', False, 'portable'): (2,
+                                                              b'{"error": "reference parent changed while opening"}\n',
                                                               b''),
- ('shared-disposition', 'not-directory', True, 'native'): (0,
-                                                           b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n',
+ ('shared-disposition', 'not-directory', True, 'native'): (2,
+                                                           b'{"error": "reference parent changed while opening"}\n',
                                                            b''),
- ('shared-disposition', 'not-directory', True, 'portable'): (0,
-                                                             b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n',
+ ('shared-disposition', 'not-directory', True, 'portable'): (2,
+                                                             b'{"error": "reference parent changed while opening"}\n',
                                                              b''),
- ('shared-disposition', 'symlink', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-disposition', 'symlink', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-disposition', 'symlink', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-disposition', 'symlink', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-resolve', 'denied', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-resolve', 'denied', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-resolve', 'denied', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-resolve', 'denied', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-disposition', 'symlink', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-disposition', 'symlink', False, 'portable'): (2,
+                                                        b'{"error": "reference parent changed while opening"}\n',
+                                                        b''),
+ ('shared-disposition', 'symlink', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-disposition', 'symlink', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-resolve', 'denied', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-resolve', 'denied', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-resolve', 'denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-resolve', 'denied', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('shared-resolve', 'missing', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
  ('shared-resolve', 'missing', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
  ('shared-resolve', 'missing', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
  ('shared-resolve', 'missing', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-resolve', 'not-directory', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-resolve', 'not-directory', False, 'portable'): (0,
-                                                          b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n',
+ ('shared-resolve', 'not-directory', False, 'native'): (2,
+                                                        b'{"error": "reference parent changed while opening"}\n',
+                                                        b''),
+ ('shared-resolve', 'not-directory', False, 'portable'): (2,
+                                                          b'{"error": "reference parent changed while opening"}\n',
                                                           b''),
- ('shared-resolve', 'not-directory', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-resolve', 'not-directory', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-resolve', 'symlink', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-resolve', 'symlink', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-resolve', 'symlink', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-resolve', 'symlink', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('verify:--path', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('verify:--path', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('shared-resolve', 'not-directory', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-resolve', 'not-directory', True, 'portable'): (2,
+                                                         b'{"error": "reference parent changed while opening"}\n',
+                                                         b''),
+ ('shared-resolve', 'symlink', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-resolve', 'symlink', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-resolve', 'symlink', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-resolve', 'symlink', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('verify:--path', 'denied', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('verify:--path', 'denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('verify:--path', 'missing', False, 'native'): (2, b'{"error": "[Errno 2] No such file or directory: \'ordinary\'"}\n', b''),
  ('verify:--path', 'missing', True, 'native'): (2, b'{"error": "[Errno 2] No such file or directory: \'ordinary\'"}\n', b''),
- ('verify:--path', 'not-directory', False, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'ordinary\'"}\n', b''),
- ('verify:--path', 'not-directory', True, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'ordinary\'"}\n', b''),
+ ('verify:--path', 'not-directory', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('verify:--path', 'not-directory', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('verify:--path', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('verify:--path', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('worktree', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('worktree', 'denied', False, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('worktree', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
- ('worktree', 'denied', True, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('worktree', 'denied', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('worktree', 'denied', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('worktree', 'denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('worktree', 'denied', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('worktree', 'missing', False, 'native'): (0, b'{"result": {"refusals": []}}\n', b''),
  ('worktree', 'missing', False, 'portable'): (0, b'{"result": {"refusals": []}}\n', b''),
  ('worktree', 'missing', True, 'native'): (0, b'{"result": {"refusals": []}}\n', b''),
  ('worktree', 'missing', True, 'portable'): (0, b'{"result": {"refusals": []}}\n', b''),
- ('worktree', 'not-directory', False, 'native'): (0, b'{"result": {"refusals": []}}\n', b''),
- ('worktree', 'not-directory', False, 'portable'): (0, b'{"result": {"refusals": []}}\n', b''),
- ('worktree', 'not-directory', True, 'native'): (0, b'{"result": {"refusals": []}}\n', b''),
- ('worktree', 'not-directory', True, 'portable'): (0, b'{"result": {"refusals": []}}\n', b''),
+ ('worktree', 'not-directory', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('worktree', 'not-directory', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('worktree', 'not-directory', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('worktree', 'not-directory', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('worktree', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('worktree', 'symlink', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('worktree', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('worktree', 'symlink', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b'')}
-R9_WITNESS_GOLDENS = {('members', 'not-directory', 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'ordinary\'", "type": "CaptureChanged"}\n', b''),
- ('members', 'not-directory', 'portable'): (2, b'{"error": "reference parent must be a directory: {CASE}/ordinary", "type": "CaptureChanged"}\n', b''),
- ('members', 'symlink', 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'ordinary\'", "type": "CaptureChanged"}\n', b''),
- ('members', 'symlink', 'portable'): (2, b'{"error": "reference parent must be a directory: {CASE}/ordinary", "type": "CaptureChanged"}\n', b''),
- ('read', 'not-directory', 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'ordinary\'", "type": "CaptureChanged"}\n', b''),
- ('read', 'not-directory', 'portable'): (2, b'{"error": "reference parent must be a directory: {CASE}/ordinary", "type": "CaptureChanged"}\n', b''),
- ('read', 'symlink', 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'ordinary\'", "type": "CaptureChanged"}\n', b''),
- ('read', 'symlink', 'portable'): (2, b'{"error": "reference parent must be a directory: {CASE}/ordinary", "type": "CaptureChanged"}\n', b'')}
+R9_WITNESS_GOLDENS = {('members', 'not-directory', 'native'): (2,
+                                                               b'{"error": "reference parent changed while opening", '
+                                                               b'"type": "CaptureChanged"}\n',
+                                                               b''),
+ ('members', 'not-directory', 'portable'): (2,
+                                            b'{"error": "reference parent changed while opening", "type": "CaptureChan'
+                                            b'ged"}\n',
+                                            b''),
+ ('members', 'symlink', 'native'): (2,
+                                    b'{"error": "reference parent changed while opening", "type": "CaptureChanged"}\n',
+                                    b''),
+ ('members', 'symlink', 'portable'): (2,
+                                      b'{"error": "reference parent changed while opening", "type": "CaptureChanged"'
+                                      b'}\n',
+                                      b''),
+ ('read', 'not-directory', 'native'): (2,
+                                       b'{"error": "reference parent changed while opening", "type": "CaptureChanged"'
+                                       b'}\n',
+                                       b''),
+ ('read', 'not-directory', 'portable'): (2,
+                                         b'{"error": "reference parent changed while opening", "type": "CaptureChanged"'
+                                         b'}\n',
+                                         b''),
+ ('read', 'symlink', 'native'): (2,
+                                 b'{"error": "reference parent changed while opening", "type": "CaptureChanged"}\n',
+                                 b''),
+ ('read', 'symlink', 'portable'): (2,
+                                   b'{"error": "reference parent changed while opening", "type": "CaptureChanged"}\n',
+                                   b'')}
 R9_WITNESS_PROBE = "\nimport json, os, sys\nfrom pathlib import Path\ntools, fallback, case, action, fault, backend = sys.argv[1:]\nsys.path[:0] = [tools, fallback]\nimport hierarchy_fresh_brief as fresh\nif backend == 'portable': fresh._reference_descriptors = lambda: False\ncase = Path(case); case.mkdir(parents=True, exist_ok=True)\nparent = case/'ordinary'; parent.mkdir()\nnote = parent/'note.md'; note.write_bytes(b'public note')\noperation = fresh._Operation()\nif action == 'read': operation.read(note)\nelse: operation.entries(parent)\nparent.rename(case/'original')\nif fault == 'symlink': parent.symlink_to(case/'original', target_is_directory=True)\nelse: parent.write_text('ordinary file')\ntry:\n    operation.verify()\nexcept (ValueError,OSError) as error:\n    print(json.dumps({'error':str(error),'type':type(error).__name__},sort_keys=True))\n    sys.exit(2)\nprint('{}')\n"
 
 R9_PUBLIC_SEAMS = (
@@ -2200,6 +4317,13 @@ import hierarchy_fresh_brief as fresh
 import hierarchy_mailbox as protocol
 if backend == 'portable':
     fresh._reference_descriptors = lambda: False
+elif backend == 'search-only':
+    from types import SimpleNamespace
+    namespace = SimpleNamespace(**{**vars(os)})
+    if hasattr(namespace, 'O_PATH'): del namespace.O_PATH
+    if hasattr(namespace, 'O_SEARCH'): del namespace.O_SEARCH
+    if hasattr(namespace, 'O_EXEC'): del namespace.O_EXEC
+    fresh.os = namespace
 root = Path(root)
 target = root / 'ordinary' / 'note.md'
 try:
@@ -2294,12 +4418,14 @@ def r9_public_probe(tmp_path, seam, fault, planned, backend, *, tools=None, _pro
                 resolution={"kind": "next", "request": raw_request(bad), "evidence": evidence}, **ledger.target(first))
         else:
             ledger.publish(bad)
-    if fault in {"symlink", "link-to-denied", "link-to-io"}:
+    if fault in {"symlink", "link-to-denied", "link-to-io", "linked-execute-only"}:
         public = tmp_path / "public"
         ordinary.rename(public)
         symlink_or_skip(public, ordinary, target_is_directory=True)
         if fault == "link-to-denied":
             public.chmod(0)
+        elif fault == "linked-execute-only":
+            public.chmod(0o111)
     elif fault == "not-directory":
         (ordinary / "note.md").unlink()
         ordinary.rmdir()
@@ -2307,6 +4433,8 @@ def r9_public_probe(tmp_path, seam, fault, planned, backend, *, tools=None, _pro
     elif fault == "missing":
         (ordinary / "note.md").unlink()
         ordinary.rmdir()
+    elif fault == "execute-only":
+        ordinary.chmod(0o111)
     else:
         assert fault == "denied"
         ordinary.chmod(0)
@@ -2316,9 +4444,533 @@ def r9_public_probe(tmp_path, seam, fault, planned, backend, *, tools=None, _pro
             *([fault] if _probe is not None else [])],
             capture_output=True, timeout=30)
     finally:
-        if fault == "denied": ordinary.chmod(0o700)
-        if fault == "link-to-denied": public.chmod(0o700)
+        if fault in {"denied", "execute-only"}: ordinary.chmod(0o700)
+        if fault in {"link-to-denied", "linked-execute-only"}: public.chmod(0o700)
     return result.returncode, result.stdout.replace(os.fsencode(tmp_path), b"{CASE}"), result.stderr.replace(os.fsencode(tmp_path), b"{CASE}")
+
+
+SEARCH_ONLY_PUBLIC_GOLDENS = {
+    'check': (0, b'{"result": true}\n', b''),
+    'exists': (0, b'{"result": true}\n', b''),
+    'read': (2, b'{"error": "[Errno 13] Permission denied: \'ordinary\'"}\n', b''),
+    'members': (2, b'{"error": "[Errno 13] Permission denied: \'ordinary\'"}\n', b''),
+    'paths': (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
+    'scope': (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
+    'disposition': (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+    'resolve': (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+    'shared-disposition': (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+    'shared-resolve': (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+    'worktree': (0, b'{"result": {"refusals": []}}\n', b''),
+    'scan_workspace': (2, b'{"error": "scan workspace does not match lane worktree"}\n', b''),
+    'compose-file': (2, b'{"error": "[Errno 13] Permission denied: \'ordinary\'"}\n', b''),
+    'router:--lifecycle': (2, b'{"error":"[Errno 20] Not a directory: \'{CASE}/ordinary/note.md/.write.lock\'","execution_enabled":false,"source":"journal","state":"hold"}\n', b''),
+    'router:--store': (2, b'{"error":"[Errno 13] Permission denied: \'ordinary\'","execution_enabled":false,"source":"store","state":"hold"}\n', b''),
+    'router:--recipes': (0, b'{"authenticated":false,"escalations":[],"execution_enabled":false,"identity":"configured","requests":[],"router":"router-1","schema":"aegis.router-status/v1"}\n', b''),
+    'compose:--root': (2, b'{"error": "[Errno 20] Not a directory: \'{CASE}/ordinary/note.md/manifest.json\'"}\n', b''),
+    'compose:--lifecycle': (2, b'{"error": "[Errno 13] Permission denied: \'ordinary\'"}\n', b''),
+    'compose:--delivery-dir': (2, b'{"error": "lifecycle directory unavailable: {CASE}/missing-journal"}\n', b''),
+    'verify:--path': (2, b'{"error": "[Errno 13] Permission denied: \'ordinary\'"}\n', b''),
+    'loop:--lifecycle': (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
+    'loop:--store': (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
+    'loop:--recipes': (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
+    'loop:--state-dir': (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
+}
+
+
+
+
+# Static no-search platform records; only the case directory is normalized.
+SEARCH_ONLY_NEGATIVE_GOLDENS = {('check', 'denied', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('check', 'denied', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('check', 'missing', False): (0, b'{"result": false}\n', b''),
+ ('check', 'missing', True): (0, b'{"result": false}\n', b''),
+ ('check', 'not-directory', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('check', 'not-directory', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('check', 'symlink', False): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('check', 'symlink', True): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('compose-file', 'denied', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('compose-file', 'denied', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('compose-file', 'missing', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('compose-file', 'missing', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('compose-file', 'not-directory', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('compose-file', 'not-directory', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('compose-file', 'symlink', False): (2,
+                                      b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                      b''),
+ ('compose-file', 'symlink', True): (2,
+                                     b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                     b''),
+ ('compose:--delivery-dir', 'denied', False): (2,
+                                               b'{"error": "reference parent changed while opening"}\n',
+                                               b''),
+ ('compose:--delivery-dir', 'denied', True): (2,
+                                              b'{"error": "reference parent changed while opening"}\n',
+                                              b''),
+ ('compose:--delivery-dir', 'missing', False): (2,
+                                                b'{"error": "lifecycle directory unavailable: {CASE}/missi'
+                                                b'ng-journal"}\n',
+                                                b''),
+ ('compose:--delivery-dir', 'missing', True): (2,
+                                               b'{"error": "lifecycle directory unavailable: {CASE}/missing-j'
+                                               b'ournal"}\n',
+                                               b''),
+ ('compose:--delivery-dir', 'not-directory', False): (2,
+                                                      b'{"error": "reference parent changed while opening"}\n',
+                                                      b''),
+ ('compose:--delivery-dir', 'not-directory', True): (2,
+                                                     b'{"error": "reference parent changed while opening"}\n',
+                                                     b''),
+ ('compose:--delivery-dir', 'symlink', False): (2,
+                                                b'{"error": "symlink paths are not supported: {CASE}/ordin'
+                                                b'ary"}\n',
+                                                b''),
+ ('compose:--delivery-dir', 'symlink', True): (2,
+                                               b'{"error": "symlink paths are not supported: {CASE}/ordinary"'
+                                               b'}\n',
+                                               b''),
+ ('compose:--lifecycle', 'denied', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('compose:--lifecycle', 'denied', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('compose:--lifecycle', 'missing', False): (2,
+                                             b'{"error": "lifecycle directory unavailable: {CASE}/ordinary/'
+                                             b'note.md"}\n',
+                                             b''),
+ ('compose:--lifecycle', 'missing', True): (2,
+                                            b'{"error": "lifecycle directory unavailable: {CASE}/ordinary/'
+                                            b'note.md"}\n',
+                                            b''),
+ ('compose:--lifecycle', 'not-directory', False): (2,
+                                                   b'{"error": "reference parent changed while opening"}\n',
+                                                   b''),
+ ('compose:--lifecycle', 'not-directory', True): (2,
+                                                  b'{"error": "reference parent changed while opening"}\n',
+                                                  b''),
+ ('compose:--lifecycle', 'symlink', False): (2,
+                                             b'{"error": "symlink paths are not supported: {CASE}/ordinary"'
+                                             b'}\n',
+                                             b''),
+ ('compose:--lifecycle', 'symlink', True): (2,
+                                            b'{"error": "symlink paths are not supported: {CASE}/ordinary"'
+                                            b'}\n',
+                                            b''),
+ ('compose:--root', 'denied', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('compose:--root', 'denied', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('compose:--root', 'missing', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('compose:--root', 'missing', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('compose:--root', 'not-directory', False): (2,
+                                              b'{"error": "reference parent changed while opening"}\n',
+                                              b''),
+ ('compose:--root', 'not-directory', True): (2,
+                                             b'{"error": "reference parent changed while opening"}\n',
+                                             b''),
+ ('compose:--root', 'symlink', False): (2,
+                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                        b''),
+ ('compose:--root', 'symlink', True): (2,
+                                       b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                       b''),
+ ('disposition', 'denied', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', 'denied', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', 'missing', False): (0,
+                                     b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostil'
+                                     b'e"], "unknown": {}}}\n',
+                                     b''),
+ ('disposition', 'missing', True): (0,
+                                    b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostil'
+                                    b'e"], "unknown": {}}}\n',
+                                    b''),
+ ('disposition', 'not-directory', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', 'not-directory', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', 'symlink', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', 'symlink', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('exists', 'denied', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('exists', 'denied', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('exists', 'missing', False): (0, b'{"result": false}\n', b''),
+ ('exists', 'missing', True): (0, b'{"result": false}\n', b''),
+ ('exists', 'not-directory', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('exists', 'not-directory', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('exists', 'symlink', False): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('exists', 'symlink', True): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('loop:--lifecycle', 'denied', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--lifecycle', 'denied', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--lifecycle', 'missing', False): (3,
+                                          b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_r'
+                                          b'unning"}\n',
+                                          b''),
+ ('loop:--lifecycle', 'missing', True): (3,
+                                         b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_r'
+                                         b'unning"}\n',
+                                         b''),
+ ('loop:--lifecycle', 'not-directory', False): (2,
+                                                b'{"error": "reference parent changed while opening"}\n',
+                                                b''),
+ ('loop:--lifecycle', 'not-directory', True): (2,
+                                               b'{"error": "reference parent changed while opening"}\n',
+                                               b''),
+ ('loop:--lifecycle', 'symlink', False): (2,
+                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                          b''),
+ ('loop:--lifecycle', 'symlink', True): (2,
+                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                         b''),
+ ('loop:--recipes', 'denied', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--recipes', 'denied', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--recipes', 'missing', False): (3,
+                                        b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_r'
+                                        b'unning"}\n',
+                                        b''),
+ ('loop:--recipes', 'missing', True): (3,
+                                       b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_runni'
+                                       b'ng"}\n',
+                                       b''),
+ ('loop:--recipes', 'not-directory', False): (2,
+                                              b'{"error": "reference parent changed while opening"}\n',
+                                              b''),
+ ('loop:--recipes', 'not-directory', True): (2,
+                                             b'{"error": "reference parent changed while opening"}\n',
+                                             b''),
+ ('loop:--recipes', 'symlink', False): (2,
+                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                        b''),
+ ('loop:--recipes', 'symlink', True): (2,
+                                       b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                       b''),
+ ('loop:--state-dir', 'denied', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--state-dir', 'denied', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--state-dir', 'missing', False): (3,
+                                          b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_r'
+                                          b'unning"}\n',
+                                          b''),
+ ('loop:--state-dir', 'missing', True): (3,
+                                         b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_r'
+                                         b'unning"}\n',
+                                         b''),
+ ('loop:--state-dir', 'not-directory', False): (2,
+                                                b'{"error": "reference parent changed while opening"}\n',
+                                                b''),
+ ('loop:--state-dir', 'not-directory', True): (2,
+                                               b'{"error": "reference parent changed while opening"}\n',
+                                               b''),
+ ('loop:--state-dir', 'symlink', False): (2,
+                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                          b''),
+ ('loop:--state-dir', 'symlink', True): (2,
+                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                         b''),
+ ('loop:--store', 'denied', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--store', 'denied', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--store', 'missing', False): (3,
+                                      b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_runni'
+                                      b'ng"}\n',
+                                      b''),
+ ('loop:--store', 'missing', True): (3,
+                                     b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_runni'
+                                     b'ng"}\n',
+                                     b''),
+ ('loop:--store', 'not-directory', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--store', 'not-directory', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--store', 'symlink', False): (2,
+                                      b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                      b''),
+ ('loop:--store', 'symlink', True): (2,
+                                     b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                     b''),
+ ('members', 'denied', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('members', 'denied', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('members', 'missing', False): (2, b'{"error": "[Errno 2] No such file or directory: \'ordinary\'"}\n', b''),
+ ('members', 'missing', True): (2, b'{"error": "[Errno 2] No such file or directory: \'ordinary\'"}\n', b''),
+ ('members', 'not-directory', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('members', 'not-directory', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('members', 'symlink', False): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('members', 'symlink', True): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('paths', 'denied', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', 'denied', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', 'missing', False): (0,
+                               b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {'
+                               b'}}}\n',
+                               b''),
+ ('paths', 'missing', True): (0,
+                              b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {'
+                              b'}}}\n',
+                              b''),
+ ('paths', 'not-directory', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', 'not-directory', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', 'symlink', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', 'symlink', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('read', 'denied', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('read', 'denied', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('read', 'missing', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('read', 'missing', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('read', 'not-directory', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('read', 'not-directory', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('read', 'symlink', False): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('read', 'symlink', True): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('resolve', 'denied', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', 'denied', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', 'missing', False): (0,
+                                 b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"],'
+                                 b' "unknown": {}}}\n',
+                                 b''),
+ ('resolve', 'missing', True): (0,
+                                b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"],'
+                                b' "unknown": {}}}\n',
+                                b''),
+ ('resolve', 'not-directory', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', 'not-directory', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', 'symlink', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', 'symlink', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('router:--lifecycle', 'denied', False): (2,
+                                           b'{"error":"reference parent changed while opening","execution_ena'
+                                           b'bled":false,"source":"arguments","state":"hold"}\n',
+                                           b''),
+ ('router:--lifecycle', 'denied', True): (2,
+                                          b'{"error":"reference parent changed while opening","execution_ena'
+                                          b'bled":false,"source":"arguments","state":"hold"}\n',
+                                          b''),
+ ('router:--lifecycle', 'missing', False): (2,
+                                            b'{"error":"reference parent changed while opening","execution'
+                                            b'_enabled":false,"source":"journal","state":"hold"}\n',
+                                            b''),
+ ('router:--lifecycle', 'missing', True): (2,
+                                           b'{"error":"reference parent changed while opening","execution_ena'
+                                           b'bled":false,"source":"journal","state":"hold"}\n',
+                                           b''),
+ ('router:--lifecycle', 'not-directory', False): (2,
+                                                  b'{"error":"reference parent changed while opening","execu'
+                                                  b'tion_enabled":false,"source":"arguments","state":"hold"}'
+                                                  b'\n',
+                                                  b''),
+ ('router:--lifecycle', 'not-directory', True): (2,
+                                                 b'{"error":"reference parent changed while opening","execu'
+                                                 b'tion_enabled":false,"source":"arguments","state":"hold"}'
+                                                 b'\n',
+                                                 b''),
+ ('router:--lifecycle', 'symlink', False): (2,
+                                            b'{"error":"symlink paths are not supported: {CASE}/ordinary",'
+                                            b'"execution_enabled":false,"source":"arguments","state":"hold'
+                                            b'"}\n',
+                                            b''),
+ ('router:--lifecycle', 'symlink', True): (2,
+                                           b'{"error":"symlink paths are not supported: {CASE}/ordinary","exe'
+                                           b'cution_enabled":false,"source":"arguments","state":"hold"}\n',
+                                           b''),
+ ('router:--recipes', 'denied', False): (2,
+                                         b'{"error":"reference parent changed while opening","execution_ena'
+                                         b'bled":false,"source":"arguments","state":"hold"}\n',
+                                         b''),
+ ('router:--recipes', 'denied', True): (2,
+                                        b'{"error":"reference parent changed while opening","execution_ena'
+                                        b'bled":false,"source":"arguments","state":"hold"}\n',
+                                        b''),
+ ('router:--recipes', 'missing', False): (0,
+                                          b'{"authenticated":false,"escalations":[],"execution_enabled":fals'
+                                          b'e,"identity":"configured","requests":[],"router":"router-1","sch'
+                                          b'ema":"aegis.router-status/v1"}\n',
+                                          b''),
+ ('router:--recipes', 'missing', True): (0,
+                                         b'{"authenticated":false,"escalations":[],"execution_enabled":fals'
+                                         b'e,"identity":"configured","requests":[],"router":"router-1","sch'
+                                         b'ema":"aegis.router-status/v1"}\n',
+                                         b''),
+ ('router:--recipes', 'not-directory', False): (2,
+                                                b'{"error":"reference parent changed while opening","execu'
+                                                b'tion_enabled":false,"source":"arguments","state":"hold"}\n',
+                                                b''),
+ ('router:--recipes', 'not-directory', True): (2,
+                                               b'{"error":"reference parent changed while opening","execution'
+                                               b'_enabled":false,"source":"arguments","state":"hold"}\n',
+                                               b''),
+ ('router:--recipes', 'symlink', False): (2,
+                                          b'{"error":"symlink paths are not supported: {CASE}/ordinary","exe'
+                                          b'cution_enabled":false,"source":"arguments","state":"hold"}\n',
+                                          b''),
+ ('router:--recipes', 'symlink', True): (2,
+                                         b'{"error":"symlink paths are not supported: {CASE}/ordinary","exe'
+                                         b'cution_enabled":false,"source":"arguments","state":"hold"}\n',
+                                         b''),
+ ('router:--store', 'denied', False): (2,
+                                       b'{"error":"reference parent changed while opening","execution_enabled'
+                                       b'":false,"source":"arguments","state":"hold"}\n',
+                                       b''),
+ ('router:--store', 'denied', True): (2,
+                                      b'{"error":"reference parent changed while opening","execution_enabled'
+                                      b'":false,"source":"arguments","state":"hold"}\n',
+                                      b''),
+ ('router:--store', 'missing', False): (2,
+                                        b'{"error":"captured directory disappeared: {CASE}/ordinary/note.md/events","execu'
+                                        b'tion_enabled":false,"source":"store","state":"hold"}\n',
+                                        b''),
+ ('router:--store', 'missing', True): (2,
+                                       b'{"error":"captured directory disappeared: {CASE}/ordinary/note.md/events","execu'
+                                       b'tion_enabled":false,"source":"store","state":"hold"}\n',
+                                       b''),
+ ('router:--store', 'not-directory', False): (2,
+                                              b'{"error":"reference parent changed while opening","execution'
+                                              b'_enabled":false,"source":"arguments","state":"hold"}\n',
+                                              b''),
+ ('router:--store', 'not-directory', True): (2,
+                                             b'{"error":"reference parent changed while opening","execution'
+                                             b'_enabled":false,"source":"arguments","state":"hold"}\n',
+                                             b''),
+ ('router:--store', 'symlink', False): (2,
+                                        b'{"error":"symlink paths are not supported: {CASE}/ordinary","exe'
+                                        b'cution_enabled":false,"source":"arguments","state":"hold"}\n',
+                                        b''),
+ ('router:--store', 'symlink', True): (2,
+                                       b'{"error":"symlink paths are not supported: {CASE}/ordinary","executi'
+                                       b'on_enabled":false,"source":"arguments","state":"hold"}\n',
+                                       b''),
+ ('scan_workspace', 'denied', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scan_workspace', 'denied', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scan_workspace', 'missing', False): (2,
+                                        b'{"error": "scan workspace does not match lane worktree"}\n',
+                                        b''),
+ ('scan_workspace', 'missing', True): (2, b'{"error": "scan workspace does not match lane worktree"}\n', b''),
+ ('scan_workspace', 'not-directory', False): (2,
+                                              b'{"error": "reference parent changed while opening"}\n',
+                                              b''),
+ ('scan_workspace', 'not-directory', True): (2,
+                                             b'{"error": "reference parent changed while opening"}\n',
+                                             b''),
+ ('scan_workspace', 'symlink', False): (2,
+                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                        b''),
+ ('scan_workspace', 'symlink', True): (2,
+                                       b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                       b''),
+ ('scope', 'denied', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', 'denied', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', 'missing', False): (0,
+                               b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {'
+                               b'}}}\n',
+                               b''),
+ ('scope', 'missing', True): (0,
+                              b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {'
+                              b'}}}\n',
+                              b''),
+ ('scope', 'not-directory', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', 'not-directory', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', 'symlink', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', 'symlink', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-disposition', 'denied', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-disposition', 'denied', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-disposition', 'missing', False): (0,
+                                            b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
+                                            b' "hostile"], "unknown": {}}}\n',
+                                            b''),
+ ('shared-disposition', 'missing', True): (0,
+                                           b'{"result": {"refusals": {}, "requests": ["first", "healthy", "ho'
+                                           b'stile"], "unknown": {}}}\n',
+                                           b''),
+ ('shared-disposition', 'not-directory', False): (2,
+                                                  b'{"error": "reference parent changed while opening"}\n',
+                                                  b''),
+ ('shared-disposition', 'not-directory', True): (2,
+                                                 b'{"error": "reference parent changed while opening"}\n',
+                                                 b''),
+ ('shared-disposition', 'symlink', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-disposition', 'symlink', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-resolve', 'denied', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-resolve', 'denied', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-resolve', 'missing', False): (0,
+                                        b'{"result": {"refusals": {}, "requests": ["first", "healthy", "ho'
+                                        b'stile"], "unknown": {}}}\n',
+                                        b''),
+ ('shared-resolve', 'missing', True): (0,
+                                       b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostil'
+                                       b'e"], "unknown": {}}}\n',
+                                       b''),
+ ('shared-resolve', 'not-directory', False): (2,
+                                              b'{"error": "reference parent changed while opening"}\n',
+                                              b''),
+ ('shared-resolve', 'not-directory', True): (2,
+                                             b'{"error": "reference parent changed while opening"}\n',
+                                             b''),
+ ('shared-resolve', 'symlink', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-resolve', 'symlink', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('verify:--path', 'denied', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('verify:--path', 'denied', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('verify:--path', 'missing', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('verify:--path', 'missing', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('verify:--path', 'not-directory', False): (2,
+                                             b'{"error": "reference parent changed while opening"}\n',
+                                             b''),
+ ('verify:--path', 'not-directory', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('verify:--path', 'symlink', False): (2,
+                                       b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                       b''),
+ ('verify:--path', 'symlink', True): (2,
+                                      b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                      b''),
+ ('worktree', 'denied', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('worktree', 'denied', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('worktree', 'missing', False): (0, b'{"result": {"refusals": []}}\n', b''),
+ ('worktree', 'missing', True): (0, b'{"result": {"refusals": []}}\n', b''),
+ ('worktree', 'not-directory', False): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('worktree', 'not-directory', True): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('worktree', 'symlink', False): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('worktree', 'symlink', True): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b'')}
+
+
+def reference_negative_golden(seam, fault, planned, backend="native"):
+    if backend == "search-only":
+        if seam == "router:--lifecycle" and fault == "not-directory":
+            # Measured lane-base bytes for the lifecycle lock's non-directory parent.
+            return (2,
+                    b'{"error":"[Errno 20] Not a directory: \'{CASE}/ordinary/note.md/.write.lock\'",'
+                    b'"execution_enabled":false,"source":"journal","state":"hold"}\n',
+                    b'')
+        return SEARCH_ONLY_NEGATIVE_GOLDENS[(seam, fault, planned)]
+    return R9_PUBLIC_GOLDENS[(seam, fault, planned, backend)]
+
+
+@lifecycle_only
+@pytest.mark.parametrize("seam", tuple(SEARCH_ONLY_PUBLIC_GOLDENS))
+@pytest.mark.parametrize("fault", ["denied", "missing", "not-directory", "symlink"])
+@pytest.mark.parametrize("planned", [False, True])
+def test_search_only_negative_entry_point_goldens(tmp_path, seam, fault, planned):
+    if not portable_fresh._descriptor_capabilities() or os.geteuid() == 0:
+        pytest.skip("negative public witness requires unprivileged POSIX directory support")
+    assert r9_public_probe(tmp_path, seam, fault, planned, "search-only") == reference_negative_golden(seam, fault, planned, "search-only")
+
+
+@lifecycle_only
+@pytest.mark.parametrize("seam", tuple(SEARCH_ONLY_PUBLIC_GOLDENS))
+@pytest.mark.parametrize("planned", [False, True])
+def test_search_only_public_entry_point_goldens(tmp_path, seam, planned):
+    if not portable_fresh._descriptor_capabilities() or os.geteuid() == 0:
+        pytest.skip("execute-only public witness requires unprivileged POSIX directory support")
+    expected = reference_negative_golden(seam, "denied", planned, "search-only")
+    assert r9_public_probe(tmp_path, seam, "execute-only", planned, "search-only") == expected
+
+
+SEARCH_ONLY_LINKED_GOLDENS = {
+    "check": (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+    "paths": (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+    "scope": (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+    "disposition": (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "lifecycle row UNKNOWN at event fault-event: symlink paths are not supported: {CASE}/ordinary"}}}\n', b''),
+    "resolve": (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "lifecycle row UNKNOWN at event fault-event: symlink paths are not supported: {CASE}/ordinary"}}}\n', b''),
+    "shared-disposition": (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+    "shared-resolve": (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+}
+
+
+SEARCH_ONLY_LINKED_REFUSALS = {'check': (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ 'disposition': (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ 'paths': (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ 'resolve': (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ 'scope': (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ 'shared-disposition': (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ 'shared-resolve': (2, b'{"error": "reference parent changed while opening"}\n', b'')}
+
+
+@lifecycle_only
+@pytest.mark.parametrize("seam", tuple(SEARCH_ONLY_LINKED_GOLDENS))
+@pytest.mark.parametrize("planned", [False, True])
+def test_search_only_linked_execute_only_goldens(tmp_path, seam, planned):
+    if not portable_fresh._descriptor_capabilities() or os.geteuid() == 0:
+        pytest.skip("execute-only link witness requires unprivileged POSIX directory support")
+    expected = SEARCH_ONLY_LINKED_REFUSALS[seam]
+    assert r9_public_probe(tmp_path, seam, "linked-execute-only", planned, "search-only") == expected
 
 
 @lifecycle_only
@@ -2329,7 +4981,7 @@ def test_round9_public_path_differential_goldens(tmp_path, seam, fault, planned,
     import hierarchy_fresh_brief as fresh
     if backend == "native" and not fresh._reference_descriptors(): pytest.skip("directory descriptors unavailable")
     if fault == "denied" and os.geteuid() == 0: pytest.skip("mode-000 witness requires an unprivileged runner")
-    expected = R9_PUBLIC_GOLDENS[(seam, fault, planned, backend)]
+    expected = reference_negative_golden(seam, fault, planned, backend)
     assert r9_public_probe(tmp_path, seam, fault, planned, backend) == expected
 
 
@@ -2381,7 +5033,7 @@ def test_round9_private_link_chain_quarantines_only_its_row(tmp_path, monkeypatc
         symlink_or_skip(private, tmp_path / "second", target_is_directory=True)
     destination = {"home-suffix": home, "alias-target": platform_alias, "two-hop": tmp_path / "second"}[spelling]
     symlink_or_skip(destination, linked, target_is_directory=True)
-    identity, real_os, descriptors, accesses = private.stat(), fresh.os, {}, []
+    identity, real_os, descriptors, accesses = private.stat(), fresh.os, _DescriptorPaths(), []
     def actual(path, kwargs):
         return Path(path) if Path(path).is_absolute() else descriptors[kwargs["dir_fd"]] / path
     def observe(kind, value):
@@ -2404,12 +5056,14 @@ def test_round9_private_link_chain_quarantines_only_its_row(tmp_path, monkeypatc
     def closed(descriptor):
         descriptors.pop(descriptor, None)
         return real_os.close(descriptor)
-    monkeypatch.setattr("hierarchy_router._owner_home", lambda: home)
-    monkeypatch.setattr("hierarchy_router._home_declarations", lambda: (("ROUND9_HOME", ".codex"),))
-    monkeypatch.setattr("hierarchy_router.os", SimpleNamespace(**{**vars(real_os), "stat": stated,
+    def lstated(value, *args, **kwargs):
+        return stated(value, *args, **{**kwargs, "follow_symlinks": False})
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: home)
+    monkeypatch.setattr(alias_router, "_home_declarations", lambda: (("ROUND9_HOME", ".codex"),))
+    monkeypatch.setattr(alias_router, "os", SimpleNamespace(**{**vars(real_os), "stat": stated, "lstat": lstated,
         "environ": {**os.environ, "ROUND9_HOME": str(private)}}))
-    monkeypatch.setattr("hierarchy_fresh_brief.os", SimpleNamespace(**{**vars(real_os),
-        "stat": stated, "open": opened, "close": closed}))
+    monkeypatch.setattr(portable_fresh, "os", SimpleNamespace(**{**vars(real_os),
+        "stat": stated, "lstat": lstated, "open": opened, "close": closed}))
     owners = []
     def probe():
         operation = fresh._Operation()
@@ -2426,40 +5080,21 @@ def test_round9_private_link_chain_quarantines_only_its_row(tmp_path, monkeypatc
         for future in (pool.submit(probe), pool.submit(probe)): future.result(timeout=30)
     from tests.integration.test_hierarchy_small_change_dispatch import assert_private_root_probes
     assert_private_root_probes([private], accesses)
-    assert not descriptors
+    assert descriptors.closed()
 
 
 # Exact ec27eebf records; only the case directory prefix is normalized.
 R10_PUBLIC_GOLDENS = {('check', 'link-to-denied', False, 'native'): (2,
-                                                b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
-                                                b'd\'"}\n',
-                                                b''),
- ('check', 'link-to-denied', False, 'portable'): (2,
-                                                  b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
-                                                  b'd\'"}\n',
-                                                  b''),
- ('check', 'link-to-denied', True, 'native'): (2,
-                                               b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}'
-                                               b'\n',
-                                               b''),
- ('check', 'link-to-denied', True, 'portable'): (2,
-                                                 b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
-                                                 b'd\'"}\n',
-                                                 b''),
- ('check', 'link-to-io', False, 'native'): (2,
-                                            b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}\n',
-                                            b''),
- ('check', 'link-to-io', False, 'portable'): (2,
-                                              b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
-                                              b'\n',
-                                              b''),
- ('check', 'link-to-io', True, 'native'): (2,
-                                           b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}\n',
-                                           b''),
- ('check', 'link-to-io', True, 'portable'): (2,
-                                             b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
-                                             b'\n',
-                                             b''),
+                                                                     b'{"error": "reference parent changed while openin'
+                                                                     b'g"}\n',
+                                                                     b''),
+ ('check', 'link-to-denied', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('check', 'link-to-denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('check', 'link-to-denied', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('check', 'link-to-io', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('check', 'link-to-io', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('check', 'link-to-io', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('check', 'link-to-io', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('compose-file', 'link-to-denied', False, 'native'): (2,
                                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"'
                                                        b'}\n',
@@ -2475,537 +5110,245 @@ R10_PUBLIC_GOLDENS = {('check', 'link-to-denied', False, 'native'): (2,
                                                   b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
                                                   b''),
  ('compose:--delivery-dir', 'link-to-denied', False, 'native'): (2,
-                                                                 b'{"error": "[Errno 13] Permission denied: \'{CASE}'
-                                                                 b'/ordinary/note.md\'"}\n',
+                                                                 b'{"error": "reference parent changed while openin'
+                                                                 b'g"}\n',
                                                                  b''),
  ('compose:--delivery-dir', 'link-to-denied', True, 'native'): (2,
-                                                                b'{"error": "[Errno 13] Permission denied: \'{CASE}/ord'
-                                                                b'inary/note.md\'"}\n',
+                                                                b'{"error": "reference parent changed while opening"}\n',
                                                                 b''),
  ('compose:--delivery-dir', 'link-to-io', False, 'native'): (2,
-                                                             b'{"error": "[Errno 5] Input/output error: \'{CASE}/ord'
-                                                             b'inary/note.md\'"}\n',
+                                                             b'{"error": "reference parent changed while opening"}\n',
                                                              b''),
  ('compose:--delivery-dir', 'link-to-io', True, 'native'): (2,
-                                                            b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinar'
-                                                            b'y/note.md\'"}\n',
+                                                            b'{"error": "reference parent changed while opening"}\n',
                                                             b''),
  ('compose:--lifecycle', 'link-to-denied', False, 'native'): (2,
-                                                              b'{"error": "[Errno 13] Permission denied: \'{CASE}/ord'
-                                                              b'inary/note.md\'"}\n',
+                                                              b'{"error": "reference parent changed while opening"}\n',
                                                               b''),
  ('compose:--lifecycle', 'link-to-denied', True, 'native'): (2,
-                                                             b'{"error": "[Errno 13] Permission denied: \'{CASE}/ord'
-                                                             b'inary/note.md\'"}\n',
+                                                             b'{"error": "reference parent changed while opening"}\n',
                                                              b''),
  ('compose:--lifecycle', 'link-to-io', False, 'native'): (2,
-                                                          b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinar'
-                                                          b'y/note.md\'"}\n',
+                                                          b'{"error": "reference parent changed while opening"}\n',
                                                           b''),
  ('compose:--lifecycle', 'link-to-io', True, 'native'): (2,
-                                                         b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinar'
-                                                         b'y/note.md\'"}\n',
+                                                         b'{"error": "reference parent changed while opening"}\n',
                                                          b''),
  ('compose:--root', 'link-to-denied', False, 'native'): (2,
-                                                         b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinar'
-                                                         b'y/note.md\'"}\n',
+                                                         b'{"error": "reference parent changed while opening"}\n',
                                                          b''),
  ('compose:--root', 'link-to-denied', True, 'native'): (2,
-                                                        b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
-                                                        b'te.md\'"}\n',
+                                                        b'{"error": "reference parent changed while opening"}\n',
                                                         b''),
- ('compose:--root', 'link-to-io', False, 'native'): (2,
-                                                     b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/no'
-                                                     b'te.md\'"}\n',
-                                                     b''),
- ('compose:--root', 'link-to-io', True, 'native'): (2,
-                                                    b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
-                                                    b'd\'"}\n',
-                                                    b''),
- ('disposition', 'link-to-denied', False, 'native'): (2,
-                                                      b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
-                                                      b'te.md\'"}\n',
-                                                      b''),
+ ('compose:--root', 'link-to-io', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('compose:--root', 'link-to-io', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', 'link-to-denied', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('disposition', 'link-to-denied', False, 'portable'): (2,
-                                                        b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
-                                                        b'te.md\'"}\n',
+                                                        b'{"error": "reference parent changed while opening"}\n',
                                                         b''),
- ('disposition', 'link-to-denied', True, 'native'): (2,
-                                                     b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
-                                                     b'te.md\'"}\n',
-                                                     b''),
- ('disposition', 'link-to-denied', True, 'portable'): (2,
-                                                       b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
-                                                       b'te.md\'"}\n',
-                                                       b''),
- ('disposition', 'link-to-io', False, 'native'): (2,
-                                                  b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
-                                                  b'd\'"}\n',
-                                                  b''),
- ('disposition', 'link-to-io', False, 'portable'): (2,
-                                                    b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
-                                                    b'd\'"}\n',
-                                                    b''),
- ('disposition', 'link-to-io', True, 'native'): (2,
-                                                 b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
-                                                 b'd\'"}\n',
-                                                 b''),
- ('disposition', 'link-to-io', True, 'portable'): (2,
-                                                   b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
-                                                   b'd\'"}\n',
-                                                   b''),
- ('exists', 'link-to-denied', False, 'native'): (2,
-                                                 b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
-                                                 b'd\'"}\n',
-                                                 b''),
- ('exists', 'link-to-denied', False, 'portable'): (2,
-                                                   b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
-                                                   b'd\'"}\n',
-                                                   b''),
- ('exists', 'link-to-denied', True, 'native'): (2,
-                                                b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
-                                                b'd\'"}\n',
-                                                b''),
- ('exists', 'link-to-denied', True, 'portable'): (2,
-                                                  b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
-                                                  b'd\'"}\n',
-                                                  b''),
- ('exists', 'link-to-io', False, 'native'): (2,
-                                             b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
-                                             b'\n',
-                                             b''),
- ('exists', 'link-to-io', False, 'portable'): (2,
-                                               b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
-                                               b'\n',
-                                               b''),
- ('exists', 'link-to-io', True, 'native'): (2,
-                                            b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}\n',
-                                            b''),
- ('exists', 'link-to-io', True, 'portable'): (2,
-                                              b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
-                                              b'\n',
-                                              b''),
+ ('disposition', 'link-to-denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', 'link-to-denied', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', 'link-to-io', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', 'link-to-io', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', 'link-to-io', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', 'link-to-io', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('exists', 'link-to-denied', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('exists', 'link-to-denied', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('exists', 'link-to-denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('exists', 'link-to-denied', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('exists', 'link-to-io', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('exists', 'link-to-io', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('exists', 'link-to-io', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('exists', 'link-to-io', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('loop:--lifecycle', 'link-to-denied', False, 'native'): (2,
-                                                           b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinar'
-                                                           b'y/note.md\'"}\n',
+                                                           b'{"error": "reference parent changed while opening"}\n',
                                                            b''),
  ('loop:--lifecycle', 'link-to-denied', True, 'native'): (2,
-                                                          b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinar'
-                                                          b'y/note.md\'"}\n',
+                                                          b'{"error": "reference parent changed while opening"}\n',
                                                           b''),
- ('loop:--lifecycle', 'link-to-io', False, 'native'): (2,
-                                                       b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/no'
-                                                       b'te.md\'"}\n',
-                                                       b''),
- ('loop:--lifecycle', 'link-to-io', True, 'native'): (2,
-                                                      b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/no'
-                                                      b'te.md\'"}\n',
-                                                      b''),
+ ('loop:--lifecycle', 'link-to-io', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--lifecycle', 'link-to-io', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('loop:--recipes', 'link-to-denied', False, 'native'): (2,
-                                                         b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinar'
-                                                         b'y/note.md\'"}\n',
+                                                         b'{"error": "reference parent changed while opening"}\n',
                                                          b''),
  ('loop:--recipes', 'link-to-denied', True, 'native'): (2,
-                                                        b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
-                                                        b'te.md\'"}\n',
+                                                        b'{"error": "reference parent changed while opening"}\n',
                                                         b''),
- ('loop:--recipes', 'link-to-io', False, 'native'): (2,
-                                                     b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/no'
-                                                     b'te.md\'"}\n',
-                                                     b''),
- ('loop:--recipes', 'link-to-io', True, 'native'): (2,
-                                                    b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
-                                                    b'd\'"}\n',
-                                                    b''),
+ ('loop:--recipes', 'link-to-io', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--recipes', 'link-to-io', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('loop:--state-dir', 'link-to-denied', False, 'native'): (2,
-                                                           b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinar'
-                                                           b'y/note.md\'"}\n',
+                                                           b'{"error": "reference parent changed while opening"}\n',
                                                            b''),
  ('loop:--state-dir', 'link-to-denied', True, 'native'): (2,
-                                                          b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinar'
-                                                          b'y/note.md\'"}\n',
+                                                          b'{"error": "reference parent changed while opening"}\n',
                                                           b''),
- ('loop:--state-dir', 'link-to-io', False, 'native'): (2,
-                                                       b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/no'
-                                                       b'te.md\'"}\n',
-                                                       b''),
- ('loop:--state-dir', 'link-to-io', True, 'native'): (2,
-                                                      b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/no'
-                                                      b'te.md\'"}\n',
-                                                      b''),
- ('loop:--store', 'link-to-denied', False, 'native'): (2,
-                                                       b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
-                                                       b'te.md\'"}\n',
-                                                       b''),
- ('loop:--store', 'link-to-denied', True, 'native'): (2,
-                                                      b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
-                                                      b'te.md\'"}\n',
-                                                      b''),
- ('loop:--store', 'link-to-io', False, 'native'): (2,
-                                                   b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
-                                                   b'd\'"}\n',
-                                                   b''),
- ('loop:--store', 'link-to-io', True, 'native'): (2,
-                                                  b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
-                                                  b'd\'"}\n',
-                                                  b''),
- ('members', 'link-to-denied', False, 'native'): (2,
-                                                  b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
-                                                  b'd\'"}\n',
-                                                  b''),
- ('members', 'link-to-denied', False, 'portable'): (2,
-                                                    b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
-                                                    b'd\'"}\n',
-                                                    b''),
- ('members', 'link-to-denied', True, 'native'): (2,
-                                                 b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
-                                                 b'd\'"}\n',
-                                                 b''),
- ('members', 'link-to-denied', True, 'portable'): (2,
-                                                   b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
-                                                   b'd\'"}\n',
-                                                   b''),
- ('members', 'link-to-io', False, 'native'): (2,
-                                              b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
-                                              b'\n',
-                                              b''),
- ('members', 'link-to-io', False, 'portable'): (2,
-                                                b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
-                                                b'd\'"}\n',
-                                                b''),
- ('members', 'link-to-io', True, 'native'): (2,
-                                             b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
-                                             b'\n',
-                                             b''),
- ('members', 'link-to-io', True, 'portable'): (2,
-                                               b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
-                                               b'\n',
-                                               b''),
- ('paths', 'link-to-denied', False, 'native'): (2,
-                                                b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
-                                                b'd\'"}\n',
-                                                b''),
- ('paths', 'link-to-denied', False, 'portable'): (2,
-                                                  b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
-                                                  b'd\'"}\n',
-                                                  b''),
- ('paths', 'link-to-denied', True, 'native'): (2,
-                                               b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}'
-                                               b'\n',
-                                               b''),
- ('paths', 'link-to-denied', True, 'portable'): (2,
-                                                 b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
-                                                 b'd\'"}\n',
-                                                 b''),
- ('paths', 'link-to-io', False, 'native'): (2,
-                                            b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}\n',
-                                            b''),
- ('paths', 'link-to-io', False, 'portable'): (2,
-                                              b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
-                                              b'\n',
-                                              b''),
- ('paths', 'link-to-io', True, 'native'): (2,
-                                           b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}\n',
-                                           b''),
- ('paths', 'link-to-io', True, 'portable'): (2,
-                                             b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
-                                             b'\n',
-                                             b''),
- ('read', 'link-to-denied', False, 'native'): (2,
-                                               b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}'
-                                               b'\n',
-                                               b''),
- ('read', 'link-to-denied', False, 'portable'): (2,
-                                                 b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
-                                                 b'd\'"}\n',
-                                                 b''),
- ('read', 'link-to-denied', True, 'native'): (2,
-                                              b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}'
-                                              b'\n',
-                                              b''),
- ('read', 'link-to-denied', True, 'portable'): (2,
-                                                b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
-                                                b'd\'"}\n',
-                                                b''),
- ('read', 'link-to-io', False, 'native'): (2,
-                                           b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}\n',
-                                           b''),
- ('read', 'link-to-io', False, 'portable'): (2,
-                                             b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
-                                             b'\n',
-                                             b''),
- ('read', 'link-to-io', True, 'native'): (2,
-                                          b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}\n',
-                                          b''),
- ('read', 'link-to-io', True, 'portable'): (2,
-                                            b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}\n',
-                                            b''),
- ('resolve', 'link-to-denied', False, 'native'): (2,
-                                                  b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
-                                                  b'd\'"}\n',
-                                                  b''),
- ('resolve', 'link-to-denied', False, 'portable'): (2,
-                                                    b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
-                                                    b'd\'"}\n',
-                                                    b''),
- ('resolve', 'link-to-denied', True, 'native'): (2,
-                                                 b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
-                                                 b'd\'"}\n',
-                                                 b''),
- ('resolve', 'link-to-denied', True, 'portable'): (2,
-                                                   b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
-                                                   b'd\'"}\n',
-                                                   b''),
- ('resolve', 'link-to-io', False, 'native'): (2,
-                                              b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
-                                              b'\n',
-                                              b''),
- ('resolve', 'link-to-io', False, 'portable'): (2,
-                                                b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
-                                                b'd\'"}\n',
-                                                b''),
- ('resolve', 'link-to-io', True, 'native'): (2,
-                                             b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
-                                             b'\n',
-                                             b''),
- ('resolve', 'link-to-io', True, 'portable'): (2,
-                                               b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
-                                               b'\n',
-                                               b''),
+ ('loop:--state-dir', 'link-to-io', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--state-dir', 'link-to-io', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--store', 'link-to-denied', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--store', 'link-to-denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--store', 'link-to-io', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('loop:--store', 'link-to-io', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('members', 'link-to-denied', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('members', 'link-to-denied', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('members', 'link-to-denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('members', 'link-to-denied', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('members', 'link-to-io', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('members', 'link-to-io', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('members', 'link-to-io', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('members', 'link-to-io', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', 'link-to-denied', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', 'link-to-denied', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', 'link-to-denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', 'link-to-denied', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', 'link-to-io', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', 'link-to-io', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', 'link-to-io', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', 'link-to-io', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('read', 'link-to-denied', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('read', 'link-to-denied', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('read', 'link-to-denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('read', 'link-to-denied', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('read', 'link-to-io', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('read', 'link-to-io', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('read', 'link-to-io', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('read', 'link-to-io', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', 'link-to-denied', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', 'link-to-denied', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', 'link-to-denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', 'link-to-denied', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', 'link-to-io', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', 'link-to-io', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', 'link-to-io', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', 'link-to-io', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('router:--lifecycle', 'link-to-denied', False, 'native'): (2,
-                                                             b'{"error":"[Errno 13] Permission denied: \'{CASE}/ordi'
-                                                             b'nary/note.md\'","execution_enabled":false,"source":"a'
-                                                             b'rguments","state":"hold"}\n',
+                                                             b'{"error":"reference parent changed while opening","execu'
+                                                             b'tion_enabled":false,"source":"arguments","state":"hold"}'
+                                                             b'\n',
                                                              b''),
  ('router:--lifecycle', 'link-to-denied', True, 'native'): (2,
-                                                            b'{"error":"[Errno 13] Permission denied: \'{CASE}/ordinary'
-                                                            b'/note.md\'","execution_enabled":false,"source":"arguments'
-                                                            b'","state":"hold"}\n',
+                                                            b'{"error":"reference parent changed while opening","execu'
+                                                            b'tion_enabled":false,"source":"arguments","state":"hold"}'
+                                                            b'\n',
                                                             b''),
  ('router:--lifecycle', 'link-to-io', False, 'native'): (2,
-                                                         b'{"error":"[Errno 5] Input/output error: \'{CASE}/ordinary'
-                                                         b'/note.md\'","execution_enabled":false,"source":"arguments'
-                                                         b'","state":"hold"}\n',
+                                                         b'{"error":"reference parent changed while opening","execution'
+                                                         b'_enabled":false,"source":"arguments","state":"hold"}\n',
                                                          b''),
  ('router:--lifecycle', 'link-to-io', True, 'native'): (2,
-                                                        b'{"error":"[Errno 5] Input/output error: \'{CASE}/ordinary/not'
-                                                        b'e.md\'","execution_enabled":false,"source":"arguments","state'
-                                                        b'":"hold"}\n',
+                                                        b'{"error":"reference parent changed while opening","execution'
+                                                        b'_enabled":false,"source":"arguments","state":"hold"}\n',
                                                         b''),
  ('router:--recipes', 'link-to-denied', False, 'native'): (2,
-                                                           b'{"error":"[Errno 13] Permission denied: \'{CASE}/ordinary'
-                                                           b'/note.md\'","execution_enabled":false,"source":"arguments'
-                                                           b'","state":"hold"}\n',
+                                                           b'{"error":"reference parent changed while opening","execu'
+                                                           b'tion_enabled":false,"source":"arguments","state":"hold"}'
+                                                           b'\n',
                                                            b''),
  ('router:--recipes', 'link-to-denied', True, 'native'): (2,
-                                                          b'{"error":"[Errno 13] Permission denied: \'{CASE}/ordinary'
-                                                          b'/note.md\'","execution_enabled":false,"source":"arguments'
-                                                          b'","state":"hold"}\n',
+                                                          b'{"error":"reference parent changed while opening","execu'
+                                                          b'tion_enabled":false,"source":"arguments","state":"hold"}\n',
                                                           b''),
  ('router:--recipes', 'link-to-io', False, 'native'): (2,
-                                                       b'{"error":"[Errno 5] Input/output error: \'{CASE}/ordinary/not'
-                                                       b'e.md\'","execution_enabled":false,"source":"arguments","state'
-                                                       b'":"hold"}\n',
+                                                       b'{"error":"reference parent changed while opening","execution'
+                                                       b'_enabled":false,"source":"arguments","state":"hold"}\n',
                                                        b''),
  ('router:--recipes', 'link-to-io', True, 'native'): (2,
-                                                      b'{"error":"[Errno 5] Input/output error: \'{CASE}/ordinary/not'
-                                                      b'e.md\'","execution_enabled":false,"source":"arguments","state'
-                                                      b'":"hold"}\n',
+                                                      b'{"error":"reference parent changed while opening","execution'
+                                                      b'_enabled":false,"source":"arguments","state":"hold"}\n',
                                                       b''),
  ('router:--store', 'link-to-denied', False, 'native'): (2,
-                                                         b'{"error":"[Errno 13] Permission denied: \'{CASE}/ordinary'
-                                                         b'/note.md\'","execution_enabled":false,"source":"arguments'
-                                                         b'","state":"hold"}\n',
+                                                         b'{"error":"reference parent changed while opening","execution'
+                                                         b'_enabled":false,"source":"arguments","state":"hold"}\n',
                                                          b''),
  ('router:--store', 'link-to-denied', True, 'native'): (2,
-                                                        b'{"error":"[Errno 13] Permission denied: \'{CASE}/ordinary/not'
-                                                        b'e.md\'","execution_enabled":false,"source":"arguments","state'
-                                                        b'":"hold"}\n',
+                                                        b'{"error":"reference parent changed while opening","execution'
+                                                        b'_enabled":false,"source":"arguments","state":"hold"}\n',
                                                         b''),
  ('router:--store', 'link-to-io', False, 'native'): (2,
-                                                     b'{"error":"[Errno 5] Input/output error: \'{CASE}/ordinary/not'
-                                                     b'e.md\'","execution_enabled":false,"source":"arguments","state'
-                                                     b'":"hold"}\n',
+                                                     b'{"error":"reference parent changed while opening","execution_ena'
+                                                     b'bled":false,"source":"arguments","state":"hold"}\n',
                                                      b''),
  ('router:--store', 'link-to-io', True, 'native'): (2,
-                                                    b'{"error":"[Errno 5] Input/output error: \'{CASE}/ordinary/note.md'
-                                                    b'\'","execution_enabled":false,"source":"arguments","state":"hold"'
-                                                    b'}\n',
+                                                    b'{"error":"reference parent changed while opening","execution_ena'
+                                                    b'bled":false,"source":"arguments","state":"hold"}\n',
                                                     b''),
  ('scan_workspace', 'link-to-denied', False, 'native'): (2,
-                                                         b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinar'
-                                                         b'y/note.md\'"}\n',
+                                                         b'{"error": "reference parent changed while opening"}\n',
                                                          b''),
  ('scan_workspace', 'link-to-denied', False, 'portable'): (2,
-                                                           b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinar'
-                                                           b'y/note.md\'"}\n',
+                                                           b'{"error": "reference parent changed while opening"}\n',
                                                            b''),
  ('scan_workspace', 'link-to-denied', True, 'native'): (2,
-                                                        b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
-                                                        b'te.md\'"}\n',
+                                                        b'{"error": "reference parent changed while opening"}\n',
                                                         b''),
  ('scan_workspace', 'link-to-denied', True, 'portable'): (2,
-                                                          b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinar'
-                                                          b'y/note.md\'"}\n',
+                                                          b'{"error": "reference parent changed while opening"}\n',
                                                           b''),
- ('scan_workspace', 'link-to-io', False, 'native'): (2,
-                                                     b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/no'
-                                                     b'te.md\'"}\n',
-                                                     b''),
- ('scan_workspace', 'link-to-io', False, 'portable'): (2,
-                                                       b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/no'
-                                                       b'te.md\'"}\n',
-                                                       b''),
- ('scan_workspace', 'link-to-io', True, 'native'): (2,
-                                                    b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
-                                                    b'd\'"}\n',
-                                                    b''),
- ('scan_workspace', 'link-to-io', True, 'portable'): (2,
-                                                      b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/no'
-                                                      b'te.md\'"}\n',
-                                                      b''),
- ('scope', 'link-to-denied', False, 'native'): (2,
-                                                b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
-                                                b'd\'"}\n',
-                                                b''),
- ('scope', 'link-to-denied', False, 'portable'): (2,
-                                                  b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
-                                                  b'd\'"}\n',
-                                                  b''),
- ('scope', 'link-to-denied', True, 'native'): (2,
-                                               b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}'
-                                               b'\n',
-                                               b''),
- ('scope', 'link-to-denied', True, 'portable'): (2,
-                                                 b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
-                                                 b'd\'"}\n',
-                                                 b''),
- ('scope', 'link-to-io', False, 'native'): (2,
-                                            b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}\n',
-                                            b''),
- ('scope', 'link-to-io', False, 'portable'): (2,
-                                              b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
-                                              b'\n',
-                                              b''),
- ('scope', 'link-to-io', True, 'native'): (2,
-                                           b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}\n',
-                                           b''),
- ('scope', 'link-to-io', True, 'portable'): (2,
-                                             b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
-                                             b'\n',
-                                             b''),
- ('shared-disposition', 'link-to-denied', False, 'native'): (0,
-                                                             b'{"result": {"refusals": {}, "requests": ["first", "healt'
-                                                             b'hy", "hostile"], "unknown": {}}}\n',
+ ('scan_workspace', 'link-to-io', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scan_workspace', 'link-to-io', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scan_workspace', 'link-to-io', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scan_workspace', 'link-to-io', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', 'link-to-denied', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', 'link-to-denied', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', 'link-to-denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', 'link-to-denied', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', 'link-to-io', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', 'link-to-io', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', 'link-to-io', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', 'link-to-io', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-disposition', 'link-to-denied', False, 'native'): (2,
+                                                             b'{"error": "reference parent changed while opening"}\n',
                                                              b''),
- ('shared-disposition', 'link-to-denied', False, 'portable'): (0,
-                                                               b'{"result": {"refusals": {}, "requests": ["first", "h'
-                                                               b'ealthy", "hostile"], "unknown": {}}}\n',
+ ('shared-disposition', 'link-to-denied', False, 'portable'): (2,
+                                                               b'{"error": "reference parent changed while opening"}\n',
                                                                b''),
- ('shared-disposition', 'link-to-denied', True, 'native'): (0,
-                                                            b'{"result": {"refusals": {}, "requests": ["first", "healt'
-                                                            b'hy", "hostile"], "unknown": {}}}\n',
+ ('shared-disposition', 'link-to-denied', True, 'native'): (2,
+                                                            b'{"error": "reference parent changed while opening"}\n',
                                                             b''),
- ('shared-disposition', 'link-to-denied', True, 'portable'): (0,
-                                                              b'{"result": {"refusals": {}, "requests": ["first", "h'
-                                                              b'ealthy", "hostile"], "unknown": {}}}\n',
+ ('shared-disposition', 'link-to-denied', True, 'portable'): (2,
+                                                              b'{"error": "reference parent changed while opening"}\n',
                                                               b''),
- ('shared-disposition', 'link-to-io', False, 'native'): (0,
-                                                         b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
-                                                         b' "hostile"], "unknown": {}}}\n',
+ ('shared-disposition', 'link-to-io', False, 'native'): (2,
+                                                         b'{"error": "reference parent changed while opening"}\n',
                                                          b''),
- ('shared-disposition', 'link-to-io', False, 'portable'): (0,
-                                                           b'{"result": {"refusals": {}, "requests": ["first", "healt'
-                                                           b'hy", "hostile"], "unknown": {}}}\n',
+ ('shared-disposition', 'link-to-io', False, 'portable'): (2,
+                                                           b'{"error": "reference parent changed while opening"}\n',
                                                            b''),
- ('shared-disposition', 'link-to-io', True, 'native'): (0,
-                                                        b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
-                                                        b' "hostile"], "unknown": {}}}\n',
+ ('shared-disposition', 'link-to-io', True, 'native'): (2,
+                                                        b'{"error": "reference parent changed while opening"}\n',
                                                         b''),
- ('shared-disposition', 'link-to-io', True, 'portable'): (0,
-                                                          b'{"result": {"refusals": {}, "requests": ["first", "healt'
-                                                          b'hy", "hostile"], "unknown": {}}}\n',
+ ('shared-disposition', 'link-to-io', True, 'portable'): (2,
+                                                          b'{"error": "reference parent changed while opening"}\n',
                                                           b''),
- ('shared-resolve', 'link-to-denied', False, 'native'): (0,
-                                                         b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
-                                                         b' "hostile"], "unknown": {}}}\n',
+ ('shared-resolve', 'link-to-denied', False, 'native'): (2,
+                                                         b'{"error": "reference parent changed while opening"}\n',
                                                          b''),
- ('shared-resolve', 'link-to-denied', False, 'portable'): (0,
-                                                           b'{"result": {"refusals": {}, "requests": ["first", "healt'
-                                                           b'hy", "hostile"], "unknown": {}}}\n',
+ ('shared-resolve', 'link-to-denied', False, 'portable'): (2,
+                                                           b'{"error": "reference parent changed while opening"}\n',
                                                            b''),
- ('shared-resolve', 'link-to-denied', True, 'native'): (0,
-                                                        b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
-                                                        b' "hostile"], "unknown": {}}}\n',
+ ('shared-resolve', 'link-to-denied', True, 'native'): (2,
+                                                        b'{"error": "reference parent changed while opening"}\n',
                                                         b''),
- ('shared-resolve', 'link-to-denied', True, 'portable'): (0,
-                                                          b'{"result": {"refusals": {}, "requests": ["first", "healt'
-                                                          b'hy", "hostile"], "unknown": {}}}\n',
+ ('shared-resolve', 'link-to-denied', True, 'portable'): (2,
+                                                          b'{"error": "reference parent changed while opening"}\n',
                                                           b''),
- ('shared-resolve', 'link-to-io', False, 'native'): (0,
-                                                     b'{"result": {"refusals": {}, "requests": ["first", "healthy", "ho'
-                                                     b'stile"], "unknown": {}}}\n',
-                                                     b''),
- ('shared-resolve', 'link-to-io', False, 'portable'): (0,
-                                                       b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
-                                                       b' "hostile"], "unknown": {}}}\n',
-                                                       b''),
- ('shared-resolve', 'link-to-io', True, 'native'): (0,
-                                                    b'{"result": {"refusals": {}, "requests": ["first", "healthy", "ho'
-                                                    b'stile"], "unknown": {}}}\n',
-                                                    b''),
- ('shared-resolve', 'link-to-io', True, 'portable'): (0,
-                                                      b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
-                                                      b' "hostile"], "unknown": {}}}\n',
-                                                      b''),
+ ('shared-resolve', 'link-to-io', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-resolve', 'link-to-io', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-resolve', 'link-to-io', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-resolve', 'link-to-io', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
  ('verify:--path', 'link-to-denied', False, 'native'): (2,
-                                                        b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
-                                                        b'te.md\'"}\n',
+                                                        b'{"error": "reference parent changed while opening"}\n',
                                                         b''),
- ('verify:--path', 'link-to-denied', True, 'native'): (2,
-                                                       b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
-                                                       b'te.md\'"}\n',
-                                                       b''),
- ('verify:--path', 'link-to-io', False, 'native'): (2,
-                                                    b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
-                                                    b'd\'"}\n',
-                                                    b''),
- ('verify:--path', 'link-to-io', True, 'native'): (2,
-                                                   b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
-                                                   b'd\'"}\n',
-                                                   b''),
- ('worktree', 'link-to-denied', False, 'native'): (2,
-                                                   b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
-                                                   b'd\'"}\n',
-                                                   b''),
- ('worktree', 'link-to-denied', False, 'portable'): (2,
-                                                     b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
-                                                     b'te.md\'"}\n',
-                                                     b''),
- ('worktree', 'link-to-denied', True, 'native'): (2,
-                                                  b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
-                                                  b'd\'"}\n',
-                                                  b''),
- ('worktree', 'link-to-denied', True, 'portable'): (2,
-                                                    b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
-                                                    b'd\'"}\n',
-                                                    b''),
- ('worktree', 'link-to-io', False, 'native'): (2,
-                                               b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
-                                               b'\n',
-                                               b''),
- ('worktree', 'link-to-io', False, 'portable'): (2,
-                                                 b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
-                                                 b'd\'"}\n',
-                                                 b''),
- ('worktree', 'link-to-io', True, 'native'): (2,
-                                              b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
-                                              b'\n',
-                                              b''),
- ('worktree', 'link-to-io', True, 'portable'): (2,
-                                                b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
-                                                b'd\'"}\n',
-                                                b'')}
+ ('verify:--path', 'link-to-denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('verify:--path', 'link-to-io', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('verify:--path', 'link-to-io', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('worktree', 'link-to-denied', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('worktree', 'link-to-denied', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('worktree', 'link-to-denied', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('worktree', 'link-to-denied', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('worktree', 'link-to-io', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('worktree', 'link-to-io', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('worktree', 'link-to-io', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('worktree', 'link-to-io', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b'')}
 
 
 @lifecycle_only
@@ -3053,8 +5396,8 @@ def test_round9_link_parent_traversal_resolves_before_normalizing(tmp_path, monk
     monkeypatch.setattr("hierarchy_router._owner_home", lambda: home)
     operation = fresh._Operation()
     journal = operation.lifecycle(ledger.path)
-    # Round 14 also quarantines a missing/non-directory traversal proof.
-    if pivot_kind in {"private-link", "missing", "not-directory"}:
+    # Q1 isolates only the stable private observation. Unproved walks latch.
+    if pivot_kind == "private-link":
         _policy, state = journal.load()
         assert set(state["requests"]) == {"healthy", "hostile"}
         assert journal.refusals_for("hostile")
@@ -3063,11 +5406,9 @@ def test_round9_link_parent_traversal_resolves_before_normalizing(tmp_path, monk
         operation.verify()
         assert not operation.failed_validation
     else:
-        expected = "symlink paths are not supported: " + str(linked)
         for attempt in (journal.load, operation.verify):
-            with pytest.raises(alias_router.SymlinkPathError) as caught:
+            with pytest.raises(ValueError,match="^reference parent changed while opening$"):
                 attempt()
-            assert str(caught.value).encode() == expected.encode()
         assert operation.failed_validation
 
 
@@ -3088,7 +5429,7 @@ def test_round9_optional_evidence_parent_replacement_uses_owning_guard(tmp_path,
     reference = ref(linked / "note.md")
     destination = private if destination_kind == "private" else public
     monkeypatch.setattr("hierarchy_router._owner_home", lambda: home)
-    real_os, descriptors, observations = fresh.os, {}, []
+    real_os, descriptors, observations = fresh.os, _DescriptorPaths(), []
     def actual(path, kwargs):
         return Path(path) if Path(path).is_absolute() else descriptors[kwargs["dir_fd"]] / path
     def stated(path, *args, **kwargs):
@@ -3112,17 +5453,22 @@ def test_round9_optional_evidence_parent_replacement_uses_owning_guard(tmp_path,
     monkeypatch.setattr("hierarchy_fresh_brief.os", SimpleNamespace(**{**vars(real_os),
         "stat": stated, "open": opened, "close": closed}))
     brief = fresh.Brief()
-    brief.evidence(reference, reference)
+    if destination_kind == "private":
+        with pytest.raises(alias_router.PrivatePathError):
+            brief.evidence(reference, reference)
+    else:
+        brief.evidence(reference, reference)
+        assert [row["kind"] for row in brief.sections["Evidence references"]] == ["unverified_evidence"]
     assert len(observations) >= 2
-    assert [row["kind"] for row in brief.sections["Evidence references"]] == ["unverified_evidence"]
     if destination_kind == "private":
         with pytest.raises(alias_router.PrivatePathError):
             brief.operation.verify()
         assert brief.operation.failed_validation
     else:
-        brief.operation.verify()
-        assert not brief.operation.failed_validation
-    assert not descriptors
+        with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+            brief.operation.verify()
+        assert brief.operation.failed_validation
+    assert descriptors.closed()
 
 
 @lifecycle_only
@@ -3233,14 +5579,14 @@ def test_round10_unproved_link_chains_are_bounded_and_quarantined(tmp_path, monk
             path = linked if index == 0 else tmp_path / ("hop-%d" % index)
             target = private if index == 40 else tmp_path / ("hop-%d" % (index + 1))
             symlink_or_skip(target, path, target_is_directory=True)
-    real_os, live, sizes = fresh.os, set(), []
+    real_os, live, sizes = fresh.os, _DescriptorPaths(), []
     def opened(path, *args, **kwargs):
         assert Path(path).name != private.name, "private target opened"
         descriptor = real_os.open(path, *args, **kwargs)
-        live.add(descriptor)
+        live[descriptor] = None
         return descriptor
     def closed(descriptor):
-        live.remove(descriptor)
+        live.pop(descriptor, None)
         return real_os.close(descriptor)
     def read(directory, name, size):
         sizes.append(size)
@@ -3255,14 +5601,10 @@ def test_round10_unproved_link_chains_are_bounded_and_quarantined(tmp_path, monk
     monkeypatch.setattr("hierarchy_fresh_brief._symlink_reader", lambda: read)
     operation = fresh._Operation()
     journal = operation.lifecycle(ledger.path)
-    expected = "symlink paths are not supported: " + str(linked)
-    _policy, state = journal.load()
-    assert set(state["requests"]) == {"healthy", "hostile"}
-    assert journal.refusals_for("hostile") == [(str(linked / "auth.json"), expected)]
-    assert journal.refusals_for("healthy") == []
+    with pytest.raises(ValueError,match="^reference parent changed while opening$"): journal.load()
     assert 0 < len(sizes) <= 40
-    assert not live and not operation.failed_validation
-    operation.verify()
+    assert live.closed() and operation.failed_validation
+    with pytest.raises(ValueError,match="^reference parent changed while opening$"): operation.verify()
 
 
 @lifecycle_only
@@ -3418,16 +5760,8 @@ def test_round8_stored_public_symlink_stays_global(tmp_path, monkeypatch, field,
     def probe():
         operation = fresh._Operation()
         journal = operation.lifecycle(ledger.path)
-        if field in {"disposition", "resolve"}:
-            _policy, state = journal.load()
-            assert set(state["requests"]) == {"first", "healthy"}
-            assert journal.unknown_rows == {"first": "lifecycle row UNKNOWN at event event-%d: %s" % (ledger.counter, expected)}
-            assert journal.private_refusals == {}
-            operation.verify()
-            return operation
-        with pytest.raises(alias_router.SymlinkPathError) as caught:
-            journal.load()
-        assert str(caught.value).encode() == expected.encode()
+        with pytest.raises(ValueError,match="^reference parent changed while opening$"): journal.load()
+        assert operation.failed_validation
         return operation
     owners = [probe()]
     from concurrent.futures import ThreadPoolExecutor
@@ -3436,12 +5770,7 @@ def test_round8_stored_public_symlink_stays_global(tmp_path, monkeypatch, field,
     linked.unlink()
     linked.mkdir()
     for operation in owners:
-        if field in {"disposition", "resolve"}:
-            operation.verify()
-            continue
-        with pytest.raises(alias_router.SymlinkPathError) as caught:
-            operation.verify()
-        assert str(caught.value).encode() == expected.encode()
+        with pytest.raises(ValueError,match="^reference parent changed while opening$"): operation.verify()
 
 
 @lifecycle_only
@@ -3457,7 +5786,7 @@ def test_round10_unproved_private_link_is_quarantined_and_closes_descriptors(tmp
     ledger.publish(request("hostile", paths=[str(linked / "file.py")]))
     linked.rmdir()
     symlink_or_skip(private, linked, target_is_directory=True)
-    real_os, live, reads = fresh.os, {}, []
+    real_os, live, reads = fresh.os, _DescriptorPaths(), []
     native_read = fresh._symlink_reader()
     if fault == "lost-inode" and native_read is None: pytest.skip("bounded readlinkat unavailable")
     def actual(path, kwargs):
@@ -3491,23 +5820,21 @@ def test_round10_unproved_private_link_is_quarantined_and_closes_descriptors(tmp
         if fault in {"oversize", "zero-size", "zero-inode"}:
             raise AssertionError("reader reached before declared-size refusal")
         return None if fault == "unavailable" else read
-    monkeypatch.setattr("hierarchy_router._owner_home", lambda: tmp_path / "owner")
-    monkeypatch.setattr("hierarchy_router._home_declarations", lambda: (("ROUND8_HOME", ".private"),))
-    monkeypatch.setattr("hierarchy_router.os", SimpleNamespace(**{**vars(os),
+    def lstated(value, *args, **kwargs):
+        return stated(value, *args, **{**kwargs, "follow_symlinks": False})
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: tmp_path / "owner")
+    monkeypatch.setattr(alias_router, "_home_declarations", lambda: (("ROUND8_HOME", ".private"),))
+    monkeypatch.setattr(alias_router, "os", SimpleNamespace(**{**vars(os),
         "environ": {**os.environ, "ROUND8_HOME": str(private)}}))
-    monkeypatch.setattr("hierarchy_fresh_brief.os", SimpleNamespace(**{**vars(real_os),
-        "stat": stated, "open": opened, "close": closed}))
-    monkeypatch.setattr("hierarchy_fresh_brief._symlink_reader", reader)
+    monkeypatch.setattr(portable_fresh, "os", SimpleNamespace(**{**vars(real_os),
+        "stat": stated, "lstat": lstated, "open": opened, "close": closed}))
+    monkeypatch.setattr(portable_fresh, "_symlink_reader", reader)
     operation = fresh._Operation()
     journal = operation.lifecycle(ledger.path)
-    expected = "symlink paths are not supported: " + str(linked)
-    _policy, state = journal.load()
-    assert set(state["requests"]) == {"healthy", "hostile"}
-    assert journal.refusals_for("hostile") == [(str(linked / "file.py"), expected)]
-    assert journal.refusals_for("healthy") == []
-    operation.verify()
-    assert not operation.failed_validation
-    assert not live
+    with pytest.raises(ValueError,match="^reference parent changed while opening$"): journal.load()
+    with pytest.raises(ValueError,match="^reference parent changed while opening$"): operation.verify()
+    assert operation.failed_validation
+    assert live.closed()
     assert reads == ([] if fault in {"oversize", "zero-size", "zero-inode", "unavailable"} else [len(os.fsencode(private))])
 
 
@@ -3537,7 +5864,7 @@ def test_round10_link_classification_quarantines_concurrent_replacement(tmp_path
     entered, release = threading.Event(), threading.Event()
     def read(directory, name, size):
         raw = native_read(directory, name, size)
-        if changed == "inner-link" and name != "second": return raw
+        if changed == "inner-link" and Path(name).name != "second": return raw
         entered.set()
         assert release.wait(10), "link replacement was not released"
         return raw
@@ -3548,7 +5875,9 @@ def test_round10_link_classification_quarantines_concurrent_replacement(tmp_path
     monkeypatch.setattr("hierarchy_fresh_brief._symlink_reader", lambda: read)
     operation = fresh._Operation()
     journal = operation.lifecycle(ledger.path)
-    expected = "symlink paths are not supported: " + str(linked)
+    refused = alias_router.PrivatePathError if changed == "link" else ValueError
+    refusal = ("owner-private host directory is not an input" if changed == "link"
+               else "reference parent changed while opening")
     with ThreadPoolExecutor(max_workers=1) as pool:
         pending = pool.submit(journal.load)
         try:
@@ -3565,12 +5894,25 @@ def test_round10_link_classification_quarantines_concurrent_replacement(tmp_path
                 symlink_or_skip(public, linked, target_is_directory=True)
         finally:
             release.set()
-        _policy, state = pending.result(timeout=30)
-        assert set(state["requests"]) == {"healthy", "hostile"}
-    assert journal.refusals_for("hostile") == [(str(linked / "file.py"), expected)]
+        with pytest.raises(refused,match="^"+refusal+"$"): pending.result(timeout=30)
+    assert operation.failed_validation
+    failure = operation.validation_failure
+    with pytest.raises(type(failure)) as caught:
+        operation.verify()
+    assert caught.value is failure
+    linked.unlink()
+    symlink_or_skip(private, linked, target_is_directory=True)
+    with pytest.raises(type(failure)) as caught:
+        operation.verify()
+    assert caught.value is failure
+    independent = fresh._Operation()
+    journal = independent.lifecycle(ledger.path)
+    _policy, state = journal.load()
+    assert set(state["requests"]) == {"healthy", "hostile"}
+    assert journal.refusals_for("hostile")
     assert journal.refusals_for("healthy") == []
-    assert not operation.failed_validation
-    operation.verify()
+    independent.verify()
+    assert not independent.failed_validation
 
 
 @lifecycle_only
@@ -3606,7 +5948,7 @@ def test_round7_shared_evidence_path_does_not_exempt_successor_scope(tmp_path, m
         alias.rmdir()
         target = private if spelling == "absolute-symlink" else os.path.relpath(private, alias.parent)
         symlink_or_skip(target, alias, target_is_directory=True)
-    real_os, mark, descriptors = fresh.os, private.stat(), {}
+    real_os, mark, descriptors = fresh.os, private.stat(), _DescriptorPaths()
     def actual(path, kwargs):
         value = Path(path)
         return descriptors[kwargs["dir_fd"]] / value if not value.is_absolute() and kwargs.get("dir_fd") is not None else value
@@ -3646,11 +5988,7 @@ def test_round7_shared_evidence_path_does_not_exempt_successor_scope(tmp_path, m
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=2) as pool:
         for future in [pool.submit(probe), pool.submit(probe)]: future.result(timeout=30)
-    if descriptors:
-        # FLAKE-FRESH-BRIEF-FD quarantine (owner 2026-11-18): this test's own descriptor tracking races
-        # across the two concurrent probes under xdist load; every other assertion above stays active.
-        # Remove when DISP-MACOS-OPATH lands its deterministic descriptor accounting.
-        pytest.xfail("FLAKE-FRESH-BRIEF-FD: descriptor accounting under concurrent probes; quarantined until DISP-MACOS-OPATH lands")
+    assert descriptors.closed()
 
 
 @lifecycle_only
@@ -3696,29 +6034,12 @@ def test_round7_stored_walk_refusal_stays_with_its_row(tmp_path, monkeypatch, fi
     def probe():
         operation = fresh._Operation()
         journal = operation.lifecycle(ledger.path)
-        if failure == "denied" or failure == "changed" and field not in {"disposition", "resolve"}:
-            expected_type = PermissionError if failure == "denied" else ValueError
-            expected = (str(PermissionError(errno.EACCES, os.strerror(errno.EACCES), bad["paths"][0]))
-                        if failure == "denied" else "reference parent changed while opening")
-            with pytest.raises(expected_type) as caught:
-                journal.load()
-            assert str(caught.value) == expected
-            with pytest.raises(expected_type) as caught:
-                operation.verify()
-            assert str(caught.value) == expected
-            return
-        _policy, state = journal.load()
-        if failure == "changed":
-            assert set(state["requests"]) == {"first", "healthy"}
-            assert journal.unknown_rows
-            assert journal.private_refusals == {}
+        # OWNER RULING D-bg supersedes the former per-caller stable-error bytes.
+        with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+            journal.load()
+        assert operation.failed_validation
+        with pytest.raises(ValueError, match="^reference parent changed while opening$"):
             operation.verify()
-            return
-        assert {target["id"], "healthy"} <= state["requests"].keys()
-        assert target["id"] not in journal.unknown_rows
-        for _ in range(2): assert journal.refusals_for(target["id"], consume=True) == []
-        assert journal.refusals_for("healthy") == []
-        operation.verify()
     probe()
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -3756,7 +6077,7 @@ def test_round7_consumed_evidence_failure_latches_its_publishing_parent(tmp_path
         refusals = journal.refusals_for("hostile", consume=True)
         assert refusals and operation.failed_validation
         if first_failure is None:
-            first_failure = ("captured attachment identity/content metadata changed: " + str(artifact)
+            first_failure = ("reference parent changed while opening"
                              if failure == "witness" else refusals[0][1])
         with pytest.raises(FileNotFoundError if failure == "missing" else ValueError) as caught:
             operation.verify()
@@ -3818,10 +6139,12 @@ def test_round7_successor_policy_failure_is_global(tmp_path, monkeypatch):
     def stated(path, *args, **kwargs):
         if Path(path).name == "blocked": environment["ROUND7_HOME"] = str(tmp_path / "changed-home")
         return real_os.stat(path, *args, **kwargs)
-    monkeypatch.setattr("hierarchy_router._owner_home", lambda: tmp_path / "owner")
-    monkeypatch.setattr("hierarchy_router._home_declarations", lambda: (("ROUND7_HOME", ".private"),))
-    monkeypatch.setattr("hierarchy_router.os", SimpleNamespace(**{**vars(os), "environ": environment}))
-    monkeypatch.setattr("hierarchy_fresh_brief.os", SimpleNamespace(**{**vars(real_os), "stat": stated}))
+    def lstated(value, *args, **kwargs):
+        return stated(value, *args, **{**kwargs, "follow_symlinks": False})
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: tmp_path / "owner")
+    monkeypatch.setattr(alias_router, "_home_declarations", lambda: (("ROUND7_HOME", ".private"),))
+    monkeypatch.setattr(alias_router, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    monkeypatch.setattr(portable_fresh, "os", SimpleNamespace(**{**vars(real_os), "stat": stated, "lstat": lstated}))
     operation = fresh._Operation()
     journal = operation.lifecycle(ledger.path)
     with pytest.raises(alias_router.CapturedPolicyError, match="^host-home configuration changed during capture$"):
@@ -3856,6 +6179,7 @@ def test_round6_failed_captured_constructor_latches_before_witnesses(tmp_path, m
     fresh._Operation().verify()
 
 
+@secure_reference
 @pytest.mark.parametrize("entry", ["inspect", "locate", "evidence"])
 def test_round6_standalone_inspect_has_one_owning_snapshot(tmp_path, pilot, monkeypatch, entry):  # noqa: F811
     import hierarchy_fresh_brief as fresh
@@ -3885,6 +6209,7 @@ def test_round6_standalone_inspect_has_one_owning_snapshot(tmp_path, pilot, monk
         assert calls == [private], calls
 
 
+@secure_reference
 @pytest.mark.parametrize("failed", [False, True])
 def test_round6_concurrent_proofs_keep_request_identity_and_failure_local(tmp_path, monkeypatch, failed):
     from concurrent.futures import ThreadPoolExecutor
@@ -3947,7 +6272,10 @@ def test_round6_no_plan_optional_public_symlink_remains_unverified(tmp_path):
     brief.evidence({"path": str(linked), "sha256": hashlib.sha256(target.read_bytes()).hexdigest()},
                    {"path": str(target), "sha256": hashlib.sha256(target.read_bytes()).hexdigest()})
     assert [row["kind"] for row in brief.sections["Evidence references"]] == ["unverified_evidence"]
-    brief.operation.verify()
+    if fresh._descriptor_capabilities():
+        brief.operation.verify()
+    else:
+        with pytest.raises(fresh._ProofPathError): brief.operation.verify()
 
 
 @lifecycle_only
@@ -3995,7 +6323,7 @@ def test_round6_stored_lifecycle_alias_is_row_local(tmp_path, monkeypatch, spell
     monkeypatch.setattr("hierarchy_router._owner_home", lambda: tmp_path / "owner")
     monkeypatch.setattr("hierarchy_router._home_declarations", lambda: (("ROUND6_HOME", ".private"),))
     real_os, private_mark = fresh.os, private.stat()
-    below, descriptors = [], {}
+    below, descriptors = [], _DescriptorPaths()
     def actual(path, kwargs):
         value = Path(path)
         return descriptors[kwargs["dir_fd"]] / value if not value.is_absolute() and kwargs.get("dir_fd") is not None else value
@@ -4038,10 +6366,10 @@ def test_round6_stored_lifecycle_alias_is_row_local(tmp_path, monkeypatch, spell
         else:
             operation.verify()
     assert below == []
-    assert descriptors == {}
+    assert descriptors.closed()
 
 
-PRIVACY_ACCESS_DRIVER = r'''
+PRIVACY_ACCESS_DRIVER = OWNED_DESCRIPTOR_DRIVER + r'''
 import json, os, sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
@@ -4053,13 +6381,14 @@ router._owner_home = lambda: root/'owner'
 router._home_declarations = lambda: (('ALIAS_TEST_HOME', '.private'),)
 os.environ['ALIAS_TEST_HOME'] = str(private)
 native = fresh._reference_descriptors()
-if backend == 'descriptor' and not native:
+if not native and (backend == 'descriptor' or action in {'optional-evidence', 'verify-absence', 'members', 'identity-only'}):
     print(json.dumps({'unsupported': True})); sys.exit(0)
 fresh._reference_descriptors = lambda: backend == 'descriptor'
 identity = private.stat()
 original_stat, original_lstat, original_fstat = os.stat, os.lstat, os.fstat
 original_open, original_close, original_read, original_write = os.open, os.close, os.read, os.write
 descriptors, accesses = {}, []
+fd_owner = _OwnedDescriptors()
 injected = False
 active = action not in {'recheck', 'verify', 'verify-absence', 'read-swap'}
 synthetic = action not in {'symlink-parent', 'race-parent', 'read-swap'}
@@ -4097,7 +6426,7 @@ def opened(path, *args, **kwargs):
         injected = True
         alias.rename(alias.with_name('previous-alias'))
         alias.symlink_to(private, target_is_directory=True)
-    descriptor = original_open(path, *args, **kwargs)
+    descriptor = fd_owner.open(path, *args, **kwargs)
     if active and not synthetic:
         info = original_fstat(descriptor)
         if (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino):
@@ -4106,7 +6435,7 @@ def opened(path, *args, **kwargs):
     return descriptor
 def closed(descriptor):
     descriptors.pop(descriptor, None)
-    return original_close(descriptor)
+    return fd_owner.close(descriptor)
 def consumed(descriptor, amount):
     global active, injected
     observe('read', descriptor)
@@ -4131,6 +6460,7 @@ def written(descriptor, raw):
     return original_write(descriptor, raw)
 os.stat, os.lstat, os.fstat, os.open, os.close, os.read = stated, lstated, fstated, opened, closed, consumed
 os.write = written
+os.fdopen = fd_owner.fdopen
 def path_stat(path, *args, **kwargs): return stated(path, *args, **kwargs)
 def path_lstat(path, *args, **kwargs): return lstated(path, *args, **kwargs)
 # This child owns its pathlib classes; cover Python 3.9's cached accessor functions too.
@@ -4205,7 +6535,7 @@ if action == 'read-swap':
     alias.unlink()
     alias.with_name('previous-alias').rename(alias)
     answer['repaired_sha256'] = fresh._Operation().read(target)[0]['sha256']
-answer.update(accesses=accesses, live_descriptors=len(descriptors), parent_failed=operation.failed_validation)
+answer.update(accesses=accesses, live_descriptors=sum(not receipt.closed for receipt in fd_owner.receipts), parent_failed=operation.failed_validation)
 print(json.dumps(answer))
 '''
 
@@ -4237,6 +6567,7 @@ def test_privacy_case_alias_preflight_uses_the_mailbox_operation_snapshot(pilot,
     assert calls == [private]
 
 
+@secure_reference
 def test_privacy_windows_anchor_quarantines_only_its_message(pilot, monkeypatch):  # noqa: F811
     root, _ = pilot
     invoke(root, "publish", message(identifier="windows-private", body=r"\\server\share\private"))
@@ -4274,6 +6605,7 @@ def test_privacy_windows_anchor_quarantines_only_its_lifecycle_row(tmp_path, mon
     operation.verify()
 
 
+@secure_reference
 @pytest.mark.parametrize("action", ["verify", "retry"])
 @pytest.mark.parametrize("replacement", [True, False], ids=["replaced", "missing"])
 def test_privacy_exists_retains_its_successful_identity_witness(tmp_path, action, replacement):
@@ -4283,9 +6615,9 @@ def test_privacy_exists_retains_its_successful_identity_witness(tmp_path, action
     assert operation.exists(target) is True
     target.rename(target.with_name("previous"))
     if replacement: target.write_bytes(b"replacement")
-    with pytest.raises(ValueError, match="captured existing input changed"):
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"):
         operation.verify() if action == "verify" else operation.exists(target)
-    with pytest.raises(ValueError, match="captured existing input changed"):
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"):
         operation.verify()
 
 
@@ -4322,7 +6654,8 @@ def test_privacy_before_every_alias_touch(tmp_path, backend, action):
         assert answer["error"] == "owner-private host directory is not an input", answer
     if action == "verify": assert answer.get("privacy") and answer["parent_failed"], answer
     if action.startswith("optional"):
-        assert answer["parent_failed"] and not answer.get("unverified", False), answer
+        assert answer["parent_failed"] == (action == "optional-attachment"), answer
+        assert not answer.get("unverified", False), answer
 
 
 @pytest.mark.parametrize("backend", ["descriptor", "portable"])
@@ -4469,6 +6802,7 @@ def test_private_alias_reference_refuses_identity_before_content(tmp_path, ancho
                    for row in answer["accesses"]), answer
 
 
+@secure_reference
 @pytest.mark.parametrize("anchored", [False, True], ids=["portable", "descriptor"])
 def test_private_alias_root_metadata_is_lazy_and_once_per_operation(tmp_path, monkeypatch, anchored):
     if anchored and not alias_fresh._reference_descriptors():
@@ -4503,6 +6837,7 @@ def test_private_alias_root_metadata_is_lazy_and_once_per_operation(tmp_path, mo
     assert calls == [private, private]
 
 
+@secure_reference
 @pytest.mark.parametrize("failure", ["denied", "zero-inode"])
 def test_private_alias_root_metadata_failure_is_a_fixed_cli_refusal(tmp_path, monkeypatch, capsys, failure):
     tmp_path = tmp_path.resolve()
@@ -4945,7 +7280,9 @@ def observe(frame, event, value):
     if (event == 'return' and frame.f_code.co_filename == dispatch.fresh.__file__
             and frame.f_code.co_name == 'verify'):
         operation = frame.f_locals.get('self')
-        if isinstance(getattr(operation, 'validation_failure', None), dispatch.fresh.CaptureChanged):
+        failure = getattr(operation, 'validation_failure', None)
+        if (isinstance(failure, dispatch.fresh.CaptureChanged)
+                or getattr(getattr(failure, '_acquisition_outcome', None), 'kind', None) == 'CHANGED'):
             observed['capture_changed'] = True
 previous = sys.getprofile()
 try:
@@ -6249,6 +8586,7 @@ def test_contract_matches_role_kind_and_host_family(pilot, endpoint):  # noqa: F
     assert any(row["ref"] == ref(root.parent / "host-plan.json") for row in rows["Evidence references"])
 
 
+@secure_reference
 @pytest.mark.parametrize("flags,error", [
     ({"endpoint": "b/front-door"}, "endpoint is outside initiative a"),
     ({"lifecycle": "missing"}, "lifecycle directory unavailable"),
@@ -6340,6 +8678,7 @@ def test_malformed_cli_answers_as_json(argv):
     assert "required" in cli(*argv, expect=2)["error"]
 
 
+@secure_reference
 def test_malformed_structured_packet_refuses_instead_of_dropping_dependencies(tmp_path):
     root, _, _ = receipt_fixture(tmp_path)
     packet = tmp_path / "broken-packet.md"
@@ -6596,22 +8935,24 @@ def test_publication_directory_swap_never_writes_into_a_store(pilot, boundary): 
     before = files(store)
     code, answer = faulted_cli(root, driver)
     assert files(store) == before, "publication followed the swapped symlink into a store"
-    assert code == 2 and "publication directory changed" in answer["error"]
+    assert code == 2 and "reference parent changed while opening" in answer["error"]
     assert list(held.iterdir()) == []
 
 
 def test_unsupported_dir_fd_refuses_cleanly_before_creating_any_output(pilot):  # noqa: F811
     root, _ = pilot
-    driver = ("import os,runpy,sys\n"
-              "tool,root=sys.argv[1:]\nos.supports_dir_fd=set()\n"
-              "sys.argv=[tool,'compose','--root',root,'--initiative','a','--endpoint','a/lane/f2']\n"
-              "runpy.run_path(tool,run_name='__main__')\n")
+    driver = ("import sys\nfrom pathlib import Path\n"
+              "tool,root=sys.argv[1:]\nsys.path.insert(0,str(Path(tool).parent))\n"
+              "import hierarchy_fresh_brief as fresh\n"
+              "fresh._descriptor_capabilities=lambda:False\n"
+              "raise SystemExit(fresh.main(['compose','--root',root,'--initiative','a','--endpoint','a/lane/f2']))\n")
     before = files(root.parent)
     code, answer = faulted_cli(root, driver)
-    assert code == 2 and answer["error"] == "secure brief publication requires directory descriptor support"
+    assert code == 2 and answer["error"] == "secure scope proof requires directory descriptor support"
     assert files(root.parent) == before and not (root.parent / "briefs").exists()
 
 
+@secure_reference
 def test_byte_limit_refuses_without_writing(pilot):  # noqa: F811
     root, _ = pilot
     source = root.parent / "source"
@@ -6737,7 +9078,7 @@ def test_returned_path_must_identify_the_written_inode_after_an_ancestor_moves(p
               "sys.argv=[tool,'compose','--root',root,'--initiative','a','--endpoint','a/lane/f2']\n"
               "runpy.run_path(tool,run_name='__main__')\n")
     code, answer = faulted_cli(root, driver)
-    assert code == 3 and "published brief pathname no longer identifies written file" in answer["error"]
+    assert code == 2 and answer["error"] == "reference parent changed while opening"
     assert list(base.iterdir()) == [] and list((moved / "briefs").iterdir()) == []
 
 
@@ -6829,6 +9170,7 @@ def test_expiry_decisions_are_reproducible_from_explicit_as_of(pilot, tmp_path):
     assert "2026-11-07T11:59:59" in body and "validate expiry live" in body
 
 
+@secure_reference
 @pytest.mark.parametrize("value", ["yesterday", "2026-11-07T12:00:00-05:00"])
 def test_as_of_requires_rfc3339_utc_without_writes(pilot, value):  # noqa: F811
     root, _ = pilot
@@ -6933,8 +9275,7 @@ def test_directory_eacces_is_a_permission_refusal(pilot, accessor):  # noqa: F81
                   "builtins.__import__=importing\n") + driver
     before = files(root.parent)
     code, answer = faulted_cli(root, driver)
-    assert code == 2 and "publication directory permission denied" in answer["error"]
-    assert "changed" not in answer["error"]
+    assert code == 2 and answer["error"] == "reference parent changed while opening"
     assert files(root.parent) == before
 
 
@@ -6954,6 +9295,7 @@ def structured_job(tmp_path, changes=None, missing=None):
     return root, path, value
 
 
+@secure_reference
 @pytest.mark.parametrize("changes,missing,field", [
     ({}, "after", "after"),
     ({"commit": {"transcript": "DO_NOT_INLINE_PACKET_TRANSCRIPT"}}, None, "commit"),
@@ -6982,6 +9324,7 @@ def test_malformed_structured_packets_refuse_before_extracting_fields(tmp_path, 
     assert files(tmp_path) == before and not (tmp_path / "briefs").exists()
 
 
+@secure_reference
 @pytest.mark.parametrize("changes,missing,field", [
     ({}, "after", "after"),
     ({"commit": {"transcript": "DO_NOT_INLINE_PACKET_TRANSCRIPT"}}, None, "commit"),
@@ -7007,6 +9350,7 @@ def test_packet_rejection_agrees_with_the_runners_admission_checks(tmp_path, cha
     assert field in compose(root, "a/orchestrator", expect=2)["error"]
 
 
+@secure_reference
 @pytest.mark.parametrize("after", [None, []])
 def test_non_object_dependency_names_the_after_field(tmp_path, after):
     root, path, _ = structured_job(tmp_path, {"after": after})
@@ -7129,10 +9473,10 @@ def test_unreadable_output_parent_cannot_report_durable_success(pilot):  # noqa:
     mode = stat.S_IMODE(base.stat().st_mode)
     base.chmod(0o111)
     try:
-        error = compose(root, as_of=AS_OF, expect=3)["error"]
+        error = compose(root, as_of=AS_OF, expect=2)["error"]
     finally:
         base.chmod(mode)
-    assert "brief publication failed" in error and "Permission denied" in error
+    assert error == "reference parent changed while opening"
 
 
 @secure_publication
@@ -7248,16 +9592,16 @@ sys.exit(fresh.main(['verify', '--path', str(note), '--sha256', sha]))
 '''
 
 # Actual ec27eebf capture: all sixteen parameter rows have these same bytes.
-R9_MESSAGE_ONLY_WALK_GOLDEN = (2, b'{"error": "modelled directory unavailable"}\n', b'')
+R9_MESSAGE_ONLY_WALK_GOLDEN = (2, b'{"error": "reference parent changed while opening"}\n', b'')
 R9_FILENAMELESS_WALK_GOLDENS = {
     "generic": R9_MESSAGE_ONLY_WALK_GOLDEN,
     "missing": R9_MESSAGE_ONLY_WALK_GOLDEN,
     "not-directory": R9_MESSAGE_ONLY_WALK_GOLDEN,
     "denied": R9_MESSAGE_ONLY_WALK_GOLDEN,
-    "generic-errno": (2, b'{"error": "[Errno 5] modelled directory unavailable"}\n', b''),
-    "missing-errno": (2, b'{"error": "[Errno 2] modelled directory unavailable"}\n', b''),
-    "not-directory-errno": (2, b'{"error": "[Errno 20] modelled directory unavailable"}\n', b''),
-    "denied-errno": (2, b'{"error": "[Errno 13] modelled directory unavailable"}\n', b''),
+    "generic-errno": (2, b'{"error": "reference parent changed while opening"}\n', b''),
+    "missing-errno": (2, b'{"error": "reference parent changed while opening"}\n', b''),
+    "not-directory-errno": (2, b'{"error": "reference parent changed while opening"}\n', b''),
+    "denied-errno": (2, b'{"error": "reference parent changed while opening"}\n', b''),
 }
 
 
@@ -7336,86 +9680,30 @@ R10_PUBLIC_PROBE = R9_PUBLIC_PROBE.replace(
     "root = Path(root)\n", "root = Path(root)\n" + R10_LINK_IO_SETUP)
 
 
-R13_LEAF_GOLDENS = {('disposition', False, 'native'): (0,
-                                    b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first'
-                                    b'": "lifecycle row UNKNOWN at event fault-event: symlink paths are not supported:'
-                                    b' {CASE}/ordinary/note.md"}}}\n',
-                                    b''),
- ('disposition', False, 'portable'): (0,
-                                      b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"f'
-                                      b'irst": "lifecycle row UNKNOWN at event fault-event: symlink paths are not su'
-                                      b'pported: {CASE}/ordinary/note.md"}}}\n',
-                                      b''),
- ('disposition', True, 'native'): (0,
-                                   b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first'
-                                   b'": "lifecycle row UNKNOWN at event fault-event: symlink paths are not supported:'
-                                   b' {CASE}/ordinary/note.md"}}}\n',
-                                   b''),
- ('disposition', True, 'portable'): (0,
-                                     b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first'
-                                     b'": "lifecycle row UNKNOWN at event fault-event: symlink paths are not supported:'
-                                     b' {CASE}/ordinary/note.md"}}}\n',
-                                     b''),
- ('paths', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary/note.md"}\n', b''),
- ('paths', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary/note.md"}\n', b''),
- ('paths', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary/note.md"}\n', b''),
- ('paths', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary/note.md"}\n', b''),
- ('resolve', False, 'native'): (0,
-                                b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "'
-                                b'lifecycle row UNKNOWN at event fault-event: symlink paths are not supported: {CASE}/'
-                                b'ordinary/note.md"}}}\n',
-                                b''),
- ('resolve', False, 'portable'): (0,
-                                  b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first'
-                                  b'": "lifecycle row UNKNOWN at event fault-event: symlink paths are not supported:'
-                                  b' {CASE}/ordinary/note.md"}}}\n',
-                                  b''),
- ('resolve', True, 'native'): (0,
-                               b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "'
-                               b'lifecycle row UNKNOWN at event fault-event: symlink paths are not supported: {CASE}/'
-                               b'ordinary/note.md"}}}\n',
-                               b''),
- ('resolve', True, 'portable'): (0,
-                                 b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "'
-                                 b'lifecycle row UNKNOWN at event fault-event: symlink paths are not supported: {CASE}/'
-                                 b'ordinary/note.md"}}}\n',
-                                 b''),
- ('scope', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary/note.md"}\n', b''),
- ('scope', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary/note.md"}\n', b''),
- ('scope', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary/note.md"}\n', b''),
- ('scope', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary/note.md"}\n', b''),
- ('shared-disposition', False, 'native'): (0,
-                                           b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"],'
-                                           b' "unknown": {}}}\n',
-                                           b''),
- ('shared-disposition', False, 'portable'): (0,
-                                             b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"],'
-                                             b' "unknown": {}}}\n',
-                                             b''),
- ('shared-disposition', True, 'native'): (0,
-                                          b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"],'
-                                          b' "unknown": {}}}\n',
-                                          b''),
- ('shared-disposition', True, 'portable'): (0,
-                                            b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"],'
-                                            b' "unknown": {}}}\n',
-                                            b''),
- ('shared-resolve', False, 'native'): (0,
-                                       b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "un'
-                                       b'known": {}}}\n',
-                                       b''),
- ('shared-resolve', False, 'portable'): (0,
-                                         b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "un'
-                                         b'known": {}}}\n',
-                                         b''),
- ('shared-resolve', True, 'native'): (0,
-                                      b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "un'
-                                      b'known": {}}}\n',
-                                      b''),
- ('shared-resolve', True, 'portable'): (0,
-                                        b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "un'
-                                        b'known": {}}}\n',
-                                        b'')}
+R13_LEAF_GOLDENS = {('disposition', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('disposition', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('paths', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('resolve', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('scope', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-disposition', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-disposition', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-disposition', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-disposition', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-resolve', False, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-resolve', False, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-resolve', True, 'native'): (2, b'{"error": "reference parent changed while opening"}\n', b''),
+ ('shared-resolve', True, 'portable'): (2, b'{"error": "reference parent changed while opening"}\n', b'')}
 R13_LEAF_PROBE = R10_PUBLIC_PROBE.replace("target = root / 'ordinary' / 'note.md'", """
 (root / 'ordinary').unlink()
 (root / 'ordinary').mkdir()
@@ -7446,11 +9734,7 @@ def test_round13_unproved_leaf_destination_cannot_be_inert_scope(tmp_path,seam,p
     probe=R13_LEAF_PROBE.replace(".symlink_to(root / 'public' / 'note.md')",
                                ".symlink_to(root / 'public' / 'unproved' / 'note.md')")
     code,out,error=r9_public_probe(tmp_path,seam,"link-to-denied",planned,backend,_probe=probe)
-    assert code==0 and error==b""
-    state=json.loads(out)["result"]
-    assert "healthy" in state["requests"]
-    assert state["refusals"]["hostile"]
-    assert "healthy" not in state["refusals"]
+    assert (code,out,error)==(2,b'{"error": "reference parent changed while opening"}\n',b"")
 
 
 @lifecycle_only
@@ -7488,14 +9772,23 @@ def test_round10_unavailable_link_primitives_quarantine_without_descriptor_calls
     observed_read.__kwdefaults__ = original_read.__kwdefaults__
     monkeypatch.setattr(portable_fresh, "_read_reference", observed_read)
     operation = portable_fresh._Operation()
-    journal = operation.lifecycle(ledger.path)
-    _policy, state = journal.load()
-    assert set(state["requests"]) == {"healthy", "following"}
-    assert journal.refusals_for("following")
-    assert journal.refusals_for("healthy") == []
-    operation.verify()
-    assert not operation.failed_validation
-    assert opened_paths
+    # Rule m refuses an ordinary load before any descriptor-less path proof.
+    refusal = "secure scope proof requires directory descriptor support"
+    with pytest.raises(portable_fresh._ProofPathError) as caught:
+        operation.lifecycle(ledger.path)
+    assert str(caught.value) == refusal
+    with pytest.raises(portable_fresh._ProofPathError) as retained:
+        operation.verify()
+    assert retained.value is caught.value and operation.failed_validation
+    # A declaration still quarantines the same unprovable alias without IO.
+    brief = portable_fresh.Brief()
+    declared = {"path": str(linked / "note.md"), "sha256": "0" * 64}
+    brief.evidence(declared, ledger.evidence[0])
+    assert [row["kind"] for row in brief.sections["Evidence references"]] == ["unverified_evidence"]
+    with pytest.raises(portable_fresh._ProofPathError) as unavailable:
+        brief.operation.verify()
+    assert str(unavailable.value) == refusal
+    assert opened_paths == []
     assert portable_fresh.os is real_os
 
 
@@ -7546,7 +9839,7 @@ def test_round10_anchor_chain_is_quarantined_before_scope_publication(tmp_path, 
     spell = lambda value, count: "/" * count + str(value).lstrip("/")
     symlink_or_skip(spell(second_link, anchors[0]), first_link, target_is_directory=True)
     symlink_or_skip(spell(home, anchors[1]), second_link, target_is_directory=True)
-    real_os, descriptors, accesses = fresh.os, {}, []
+    real_os, descriptors, accesses = fresh.os, _DescriptorPaths(), []
     def actual(value, kwargs):
         value = Path(value)
         return descriptors[kwargs["dir_fd"]] / value if not value.is_absolute() else value
@@ -7593,7 +9886,7 @@ def test_round10_anchor_chain_is_quarantined_before_scope_publication(tmp_path, 
     assert next(row for row in rows if row["request_id"] == "healthy")["state"] == "ready"
     from tests.integration.test_hierarchy_small_change_dispatch import assert_private_root_probes
     assert_private_root_probes([private], accesses)
-    assert not descriptors
+    assert descriptors.closed()
 
 
 @lifecycle_only
@@ -7644,7 +9937,7 @@ def test_round13_proof_failures_and_repointed_inert_scope_are_row_local(tmp_path
         value=Path(value)
         assert value!=private and private not in value.parents
         descriptor,marks=original_parent(value,*args,**kwargs)
-        descriptors.append(descriptor)
+        descriptors.append(capture_public_test_handle(descriptor))
         return descriptor,marks
     def snapshot(*args,**kwargs):
         result=original_snapshot(*args,**kwargs)
@@ -7656,7 +9949,7 @@ def test_round13_proof_failures_and_repointed_inert_scope_are_row_local(tmp_path
         value=Path(value)
         assert value!=private and private not in value.parents
         descriptor,marks=original_proof_parent(value,*args,**kwargs)
-        descriptors.append(descriptor)
+        descriptors.append(capture_public_test_handle(descriptor))
         return descriptor,marks
     def checked(value,*args,**kwargs):
         if Path(value)==linked:
@@ -7700,25 +9993,21 @@ def test_round13_proof_failures_and_repointed_inert_scope_are_row_local(tmp_path
             operation=portable_fresh._Operation()
             journal=operation.lifecycle(world.ledger.path)
             try:
-                _policy,state=journal.load()
-                assert {"healthy","following"}<=set(state["requests"])
-                assert journal.refusals_for("following")
-                assert journal.refusals_for("healthy")==[]
-                brief=portable_fresh.Brief(_operation=operation)
-                portable_fresh.lifecycle_records(brief,world.ledger.path,portable_fresh.parse_time("2030-01-01T00:00:00Z"))
-                assert path not in json.dumps(brief.sections["Approved scope"])
-                assert journal.refusals_for("following",consume=True)
-                assert journal.refusals_for("following",consume=True)
-                operation.verify()
-                assert not operation.failed_validation and operation.path_guard._global_failure is None
+                expected = alias_router.PrivatePathError if fault in {"disposition","resolve"} else ValueError
+                message = ("owner-private host directory is not an input" if fault in {"disposition","resolve"}
+                           else "reference parent changed while opening")
+                with pytest.raises(expected,match="^"+message+"$"): journal.load()
+                assert operation.failed_validation
+                for _ in range(2):
+                    with pytest.raises(expected,match="^"+message+"$"): operation.verify()
+                assert operation.path_guard._global_failure is None
                 healthy=tmp_path/"healthy-after-refusal.md"
                 healthy.write_bytes(b"independent healthy capture")
                 retry=portable_fresh._Operation()
                 assert retry.read(healthy)[1]==b"independent healthy capture"
                 retry.verify()
                 for descriptor in set(descriptors):
-                    with pytest.raises(OSError) as closed: os.fstat(descriptor)
-                    assert closed.value.errno==errno.EBADF
+                    assert_public_handle_closed(descriptor)
             finally:
                 if mutation is not None:
                     changed.set()
@@ -7769,19 +10058,13 @@ def test_round13_denied_hop_target_is_unproved_and_never_approved(tmp_path,monke
     denied.chmod(0)
     try:
         operation=portable_fresh._Operation(); journal=operation.lifecycle(world.ledger.path)
-        _policy,state=journal.load()
-        assert "healthy" in state["requests"]
-        assert journal.refusals_for("following")
-        assert journal.refusals_for("healthy")==[]
+        with pytest.raises(ValueError,match="^reference parent changed while opening$"): journal.load()
+        assert operation.failed_validation
         for _ in range(2):
-            assert journal.refusals_for("following",consume=True)
-            brief=portable_fresh.Brief(_operation=operation)
-            portable_fresh.lifecycle_records(brief,world.ledger.path,portable_fresh.parse_time("2030-01-01T00:00:00Z"))
-            assert path not in json.dumps(brief.sections["Approved scope"])
-        operation.verify()
-        assert not operation.failed_validation and operation.path_guard._global_failure is None
+            with pytest.raises(ValueError,match="^reference parent changed while opening$"): operation.verify()
+        assert operation.path_guard._global_failure is None
     finally: denied.chmod(0o700)
-    assert journal.refusals_for("following",consume=True)
+    with pytest.raises(ValueError,match="^reference parent changed while opening$"): operation.verify()
     retry=portable_fresh._Operation().lifecycle(world.ledger.path)
     retry.load()
     assert retry.refusals_for("following",consume=True)
@@ -7792,6 +10075,8 @@ def test_round13_denied_hop_target_is_unproved_and_never_approved(tmp_path,monke
 @pytest.mark.parametrize("phase",["preflight","classify"])
 @pytest.mark.parametrize("prior",["symlink","policy"])
 def test_round13_directory_cleanup_cannot_downgrade_proof_or_policy(tmp_path,monkeypatch,phase,prior):
+    if portable_fresh._search_directory_flag() is None:
+        pytest.skip("requires search-only proof handles; no-search refusal has dedicated regression coverage")
     from tests.integration.test_hierarchy_router import Loop
     if not portable_fresh._reference_descriptors() or portable_fresh._symlink_reader() is None:
         pytest.skip("bounded descriptor-relative link reader unavailable")
@@ -7820,9 +10105,10 @@ def test_round13_directory_cleanup_cannot_downgrade_proof_or_policy(tmp_path,mon
         info=real_os.fstat(descriptor)
         selected=(armed[0] and (info.st_dev,info.st_ino)==public_identity
                   and (prior!="policy" or policy_seen[0]))
+        receipt = capture_public_test_handle(descriptor)
         real_os.close(descriptor)
         if selected:
-            closed.append(descriptor)
+            closed.append(receipt)
             raise OSError(errno.EIO,"controlled proof-directory cleanup failure")
     def metadata(*args,**kwargs):
         if armed[0] and prior=="policy" and args[0]==("sub" if phase=="classify" else "note.md"):
@@ -7854,26 +10140,20 @@ def test_round13_directory_cleanup_cannot_downgrade_proof_or_policy(tmp_path,mon
         with pytest.raises(alias_router.CapturedPolicyError,match="controlled proof policy failure"): journal.load()
         assert operation.path_guard._global_failure is not None
     else:
-        journal.load()
-        assert journal.refusals_for("following",consume=True)
-        assert journal.refusals_for("healthy")==[]
-        brief=portable_fresh.Brief(_operation=operation)
-        portable_fresh.lifecycle_records(brief,world.ledger.path,portable_fresh.parse_time("2030-01-01T00:00:00Z"))
-        assert path not in json.dumps(brief.sections["Approved scope"])
-        operation.verify()
+        with pytest.raises(ValueError,match="^reference parent changed while opening$"): journal.load()
+        with pytest.raises(ValueError,match="^reference parent changed while opening$"): operation.verify()
+        assert operation.failed_validation
         assert operation.path_guard._global_failure is None
     assert closed
     for descriptor in set(closed):
-        with pytest.raises(OSError) as error: real_os.fstat(descriptor)
-        assert error.value.errno==errno.EBADF
+        assert_public_handle_closed(descriptor)
 
 
 @lifecycle_only
 def test_round13_cached_target_errno_quarantines_a_failed_proof_close(tmp_path,monkeypatch):
     from tests.integration.test_hierarchy_router import Loop
-    if not portable_fresh._reference_descriptors() or portable_fresh._symlink_reader() is None:
+    if not portable_fresh._descriptor_capabilities() or portable_fresh._symlink_reader() is None:
         pytest.skip("bounded descriptor-relative link reader unavailable")
-    if os.geteuid()==0: pytest.skip("mode-000 witness requires an unprivileged runner")
     world=Loop(tmp_path); world.team("engine"); world.team("docs")
     world.approved(request("healthy",team="docs"))
     linked,denied=tmp_path/"linked",tmp_path/"denied"
@@ -7885,34 +10165,3283 @@ def test_round13_cached_target_errno_quarantines_a_failed_proof_close(tmp_path,m
         "evidence":[{"path":path,"sha256":"0"*64}]},**world.ledger.target(first))
     world.ledger.approve(following)
     linked.rmdir(); symlink_or_skip(denied,linked,target_is_directory=True)
-    stable,disposition=portable_fresh._stable_link,portable_fresh._disposition
+    stable,lookup=portable_fresh._stable_link,portable_fresh._final_leaf_lookup
     real_os=portable_fresh.os
     consuming,closed=[False],[]
     def close(descriptor):
-        real_os.close(descriptor); closed.append(descriptor)
+        receipt = capture_public_test_handle(descriptor)
+        real_os.close(descriptor); closed.append(receipt)
         raise OSError(errno.EIO,"controlled proof-close failure")
     failing=FunctionType(stable.__code__,{**stable.__globals__,
         "os":SimpleNamespace(**{**vars(real_os),"close":close})},stable.__name__,stable.__defaults__,stable.__closure__)
     failing.__kwdefaults__=stable.__kwdefaults__
-    def checked(error,*args,**kwargs):
-        if kwargs.get("seam")=="scope": consuming[0]=True
-        return disposition(error,*args,**kwargs)
+    def checked(proof):
+        result=lookup(proof)
+        if proof.leaf == denied / "auth.json" and getattr(result,"kind",None)=="absent":
+            consuming[0]=True
+        return result
     def rechecked(*args,**kwargs):
         return failing(*args,**kwargs) if consuming[0] else stable(*args,**kwargs)
-    monkeypatch.setattr(portable_fresh,"_disposition",checked)
+    monkeypatch.setattr(portable_fresh,"_final_leaf_lookup",checked)
     monkeypatch.setattr(portable_fresh,"_stable_link",rechecked)
-    denied.chmod(0)
     try:
         operation=portable_fresh._Operation(); journal=operation.lifecycle(world.ledger.path)
-        _policy,state=journal.load()
-        assert {"following","healthy"}<=set(state["requests"])
-        assert journal.refusals_for("following") and journal.refusals_for("healthy")==[]
-        brief=portable_fresh.Brief(_operation=operation)
-        portable_fresh.lifecycle_records(brief,world.ledger.path,portable_fresh.parse_time("2030-01-01T00:00:00Z"))
-        assert path not in json.dumps(brief.sections["Approved scope"])
-        operation.verify()
-        assert closed and operation.path_guard._global_failure is None and not operation.failed_validation
+        with pytest.raises(ValueError,match="^reference parent changed while opening$"): journal.load()
+        with pytest.raises(ValueError,match="^reference parent changed while opening$"): operation.verify()
+        assert closed and operation.path_guard._global_failure is None and operation.failed_validation
         for descriptor in set(closed):
-            with pytest.raises(OSError) as error: os.fstat(descriptor)
-            assert error.value.errno==errno.EBADF
+            assert_public_handle_closed(descriptor)
     finally: denied.chmod(0o700)
+
+
+@secure_reference
+def test_dbg_no_search_reader_kind_refusal_latches_at_detection(tmp_path, monkeypatch):
+    blocked = tmp_path / "file-parent"
+    blocked.write_bytes(b"public fixture")
+    live, _opened = search_only_platform(monkeypatch)
+    operation = portable_fresh._Operation()
+    with operation.active():
+        with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+            portable_fresh.file_ref(blocked / "note.md")
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+        operation.verify()
+    assert live.closed()
+
+
+def test_dbg_directory_open_denial_latches_before_diagnostics(tmp_path, monkeypatch):
+    if os.name != "posix" or not portable_fresh._reference_descriptors():
+        pytest.skip("directory-open denial requires POSIX descriptor acquisition")
+    if os.geteuid() == 0:
+        pytest.skip("directory-open denial requires an unprivileged runner")
+    public = tmp_path / "public"
+    public.mkdir()
+    target = public / "note.md"
+    target.write_bytes(b"public fixture")
+    live, _opened = search_only_platform(monkeypatch)
+    operation = portable_fresh._Operation()
+    public.chmod(0o111)
+    try:
+        with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+            operation.read(target)
+    finally:
+        public.chmod(0o700)
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+        operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+def test_dbg_optional_directory_absence_keeps_a_complete_negative_witness(tmp_path):
+    operation = portable_fresh._Operation()
+    missing = tmp_path / "absent"
+    assert operation.entries(missing, optional=True) == []
+    operation.verify()
+    assert missing in operation.absences
+
+
+@secure_reference
+def test_dbg_non_directory_ancestor_is_changed_not_absent(tmp_path):
+    parent = tmp_path / "regular-file"
+    parent.write_bytes(b"public fixture")
+    operation = portable_fresh._Operation()
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+        operation.path_guard.check(parent / "child", scope=True)
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+        operation.verify()
+
+
+@secure_reference
+@pytest.mark.parametrize("window", ["before-read", "after-read"])
+def test_dbg_declaration_leaf_permission_failure_latches_parent(tmp_path, monkeypatch, window):
+    if os.name != "posix" or os.geteuid() == 0:
+        pytest.skip("physical leaf permission failure requires an unprivileged POSIX runner")
+    public, detached = tmp_path / "public", tmp_path / "detached"
+    public.mkdir()
+    target = public / "note.md"
+    target.write_bytes(b"public fixture")
+    reference = ref(target)
+    origin = tmp_path / "origin.json"
+    origin.write_bytes(b"{}")
+    home = tmp_path / "owner"
+    private = home / ".codex"
+    private.mkdir(parents=True)
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: home)
+    changed = []
+    def replace():
+        if not changed:
+            public.rename(detached)
+            symlink_or_skip(private, public, target_is_directory=True)
+            detached.chmod(0)
+            changed.append(True)
+    parent, stream = portable_fresh._reference_parent, portable_fresh._stream_reference
+    def acquired(path, *args, **kwargs):
+        result = parent(path, *args, **kwargs)
+        if window == "before-read" and Path(path) == public:
+            replace()
+        return result
+    def consumed(*args, **kwargs):
+        result = stream(*args, **kwargs)
+        if window == "after-read" and Path(args[2]) == target:
+            replace()
+        return result
+    monkeypatch.setattr(portable_fresh, "_reference_parent", acquired)
+    monkeypatch.setattr(portable_fresh, "_stream_reference", consumed)
+    operation = portable_fresh._Operation()
+    try:
+        portable_fresh.Brief(_operation=operation).evidence(reference, ref(origin))
+        assert changed
+    finally:
+        if detached.exists():
+            detached.chmod(0o700)
+            public.unlink()
+            detached.rename(public)
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+        operation.verify()
+
+
+@secure_reference
+@pytest.mark.parametrize("window", ["after-read", "verify"])
+def test_dbg_late_private_symlink_keeps_typed_parent_failure(tmp_path, monkeypatch, window):
+    if os.name != "posix" or portable_fresh._symlink_reader() is None:
+        pytest.skip("private link replacement requires bounded descriptor-relative link reads")
+    target = tmp_path / "note.md"
+    target.write_bytes(b"public fixture")
+    reference = ref(target)
+    home = tmp_path / "owner"
+    private = home / ".codex"
+    private.mkdir(parents=True)
+    secret = private / "secret.md"
+    secret.write_bytes(b"controlled private fixture")
+    origin = tmp_path / "origin.json"
+    origin.write_bytes(b"{}")
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: home)
+    stream = portable_fresh._stream_reference
+    changed = []
+    def replace():
+        target.unlink()
+        symlink_or_skip(secret, target)
+        changed.append(True)
+    def consumed(*args, **kwargs):
+        result = stream(*args, **kwargs)
+        if Path(args[2]) == target and not changed:
+            replace()
+        return result
+    operation = portable_fresh._Operation()
+    if window == "after-read":
+        monkeypatch.setattr(portable_fresh, "_stream_reference", consumed)
+        with pytest.raises(alias_router.PrivatePathError):
+            portable_fresh.Brief(_operation=operation).evidence(reference, ref(origin))
+    else:
+        operation.read(target)
+        replace()
+        with pytest.raises(alias_router.PrivatePathError):
+            operation.verify()
+    assert changed
+    target.unlink()
+    target.write_bytes(b"public fixture")
+    with pytest.raises(alias_router.PrivatePathError):
+        operation.verify()
+
+
+@secure_reference
+@pytest.mark.parametrize("earlier_failure", [False, True])
+def test_dbg_private_chain_failure_rechecks_every_captured_link(tmp_path, monkeypatch, earlier_failure):
+    if os.name != "posix" or portable_fresh._symlink_reader() is None:
+        pytest.skip("private chain witnesses require bounded descriptor-relative link reads")
+    home = tmp_path / "owner"
+    private = home / ".codex"
+    private.mkdir(parents=True)
+    first, second = private / "first.md", private / "second.md"
+    first.write_bytes(b"controlled private fixture")
+    second.write_bytes(b"controlled private fixture")
+    a, b = tmp_path / "a.md", tmp_path / "b.md"
+    symlink_or_skip(b, a)
+    symlink_or_skip(first, b)
+    origin = tmp_path / "origin.json"
+    origin.write_bytes(b"{}")
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: home)
+    snapshot = portable_fresh._link_snapshot
+    changed = []
+    def captured(guard, path, *args, **kwargs):
+        result = snapshot(guard, path, *args, **kwargs)
+        if Path(path) == b and not changed:
+            b.unlink()
+            b.symlink_to(second)
+            if earlier_failure:
+                a.unlink()
+                a.write_bytes(b"public replacement")
+            changed.append(True)
+        return result
+    monkeypatch.setattr(portable_fresh, "_link_snapshot", captured)
+    operation = portable_fresh._Operation()
+    with pytest.raises(alias_router.PrivatePathError):
+        portable_fresh.Brief(_operation=operation).evidence(
+            {"path": str(a), "sha256": "0" * 64}, ref(origin))
+    assert changed
+    a.unlink()
+    a.symlink_to(b)
+    b.unlink()
+    b.symlink_to(first)
+    with pytest.raises(alias_router.PrivatePathError):
+        operation.verify()
+
+
+@secure_reference
+def test_dbg_absent_optional_evidence_does_not_latch_parent(tmp_path):
+    origin = tmp_path / "origin.json"
+    origin.write_bytes(b"{}")
+    operation = portable_fresh._Operation()
+    brief = portable_fresh.Brief(_operation=operation)
+    brief.evidence({"path": str(tmp_path / "absent.md"), "sha256": "0" * 64}, ref(origin))
+    assert [row["kind"] for row in brief.sections["Evidence references"]] == ["unverified_evidence"]
+    operation.verify()
+
+
+@secure_reference
+@pytest.mark.parametrize("window", ["before-classification", "after-private-target"])
+def test_dbg_observed_private_symlink_cannot_rebase_to_absence(tmp_path, monkeypatch, window):
+    if os.name != "posix" or portable_fresh._symlink_reader() is None:
+        pytest.skip("observed links require bounded descriptor-relative link reads")
+    home = tmp_path / "owner"
+    private = home / ".codex"
+    private.mkdir(parents=True)
+    linked = tmp_path / "linked"
+    symlink_or_skip(private, linked, target_is_directory=True)
+    target = linked / "absent.md"
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: home)
+    disposition = portable_fresh._disposition
+    private_target = portable_fresh._private_symlink_target
+    changed = []
+    def replace():
+        linked.unlink()
+        linked.mkdir()
+        changed.append(True)
+    def classify(error, *args, **kwargs):
+        if (window == "before-classification" and isinstance(error, alias_router.SymlinkPathError)
+                and error.path == linked and not changed):
+            replace()
+        return disposition(error, *args, **kwargs)
+    def resolved(guard, path, candidate, **kwargs):
+        result = private_target(guard, path, candidate, **kwargs)
+        if window == "after-private-target" and Path(path) == linked and not changed:
+            replace()
+        return result
+    monkeypatch.setattr(portable_fresh, "_disposition", classify)
+    monkeypatch.setattr(portable_fresh, "_private_symlink_target", resolved)
+    operation = portable_fresh._Operation()
+    expected = alias_router.PrivatePathError if window == "after-private-target" else ValueError
+    pattern = "^owner-private host directory is not an input$" if window == "after-private-target" else "^reference parent changed while opening$"
+    with operation.active():
+        with pytest.raises(expected, match=pattern):
+            portable_fresh._stored_reference_check(target, operation.path_guard, inert=True)
+    assert changed
+    linked.rmdir()
+    linked.symlink_to(private, target_is_directory=True)
+    with pytest.raises(expected, match=pattern):
+        operation.verify()
+
+
+@secure_reference
+@pytest.mark.parametrize("capability", ["none", "O_PATH"])
+@pytest.mark.parametrize("replacement", ["public", "private"])
+def test_dbg_incomplete_prefix_revalidation_latches_parent(tmp_path, monkeypatch, capability, replacement):
+    if os.name != "posix" or os.geteuid() == 0:
+        pytest.skip("physical failed revalidation requires an unprivileged POSIX runner")
+    outer = tmp_path / "outer"
+    public = outer / "public"
+    detached, alternate = tmp_path / "detached", tmp_path / "alternate"
+    (public / "sub").mkdir(parents=True)
+    (alternate / "sub").mkdir(parents=True)
+    target = public / "sub" / "note.md"
+    target.write_bytes(b"public fixture")
+    reference = ref(target)
+    origin = tmp_path / "origin.json"
+    origin.write_bytes(b"{}")
+    home = tmp_path / "owner"
+    private = home / ".codex"
+    private.mkdir(parents=True)
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: home)
+    live, _opened = search_only_platform(monkeypatch, capability)
+    parent = portable_fresh._proof_parent
+    changed = []
+    def acquire(path, *args, **kwargs):
+        if Path(path) == target.parent and kwargs.get("_revalidating") and not changed:
+            public.rename(detached)
+            if replacement == "private":
+                symlink_or_skip(private, public, target_is_directory=True)
+                outer.chmod(0)
+            else:
+                alternate.rename(public)
+                (public / "sub").chmod(0)
+            changed.append(True)
+        return parent(path, *args, **kwargs)
+    monkeypatch.setattr(portable_fresh, "_proof_parent", acquire)
+    operation = portable_fresh._Operation()
+    try:
+        portable_fresh.Brief(_operation=operation).evidence(reference, ref(origin))
+        assert changed
+    finally:
+        outer.chmod(0o700)
+        if changed:
+            if replacement == "private":
+                public.unlink()
+            else:
+                (public / "sub").chmod(0o700)
+                public.rename(alternate)
+            detached.rename(public)
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+        operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@pytest.mark.parametrize("fault", ["ancestor-open", "existing-fstat", "existing-fdopen", "new-fdopen",
+                                   "existing-fdopen-policy", "new-fdopen-policy"])
+def test_dbg_publication_acquisition_failure_closes_owned_descriptors(tmp_path, monkeypatch, fault):
+    from hierarchy_router import CapturedPolicyError
+    base = tmp_path / "output"
+    base.mkdir()
+    folder = base / "briefs"
+    folder.mkdir()
+    target = folder / "note.md"
+    raw = b"public fixture"
+    if fault.startswith("existing"):
+        target.write_bytes(raw)
+    opened, live = [], _DescriptorPaths()
+    def opening(path, flags, *args, **kwargs):
+        if fault == "ancestor-open" and path == base.name and kwargs.get("dir_fd") is not None:
+            raise OSError(errno.EIO, "controlled ancestor open failure")
+        descriptor = os.open(path, flags, *args, **kwargs)
+        opened.append(capture_public_test_handle(descriptor))
+        live[descriptor] = None
+        return descriptor
+    def closing(descriptor):
+        os.close(descriptor)
+        live.pop(descriptor, None)
+    def metadata(descriptor):
+        info = os.fstat(descriptor)
+        if fault == "existing-fstat" and stat.S_ISREG(info.st_mode):
+            raise OSError(errno.EIO, "controlled publication metadata failure")
+        return info
+    def fdopen(descriptor, *args, **kwargs):
+        if fault.endswith("fdopen-policy"):
+            raise CapturedPolicyError("controlled publication policy failure")
+        if fault.endswith("fdopen"):
+            raise OSError(errno.EIO, "controlled fdopen failure")
+        return os.fdopen(descriptor, *args, **kwargs)
+    monkeypatch.setattr(portable_fresh, "os", SimpleNamespace(**{**vars(os),
+        "open": opening, "close": closing, "fstat": metadata, "fdopen": fdopen}))
+    try:
+        expected_type = CapturedPolicyError if fault.endswith("fdopen-policy") else ValueError
+        expected_message = ("controlled publication policy failure" if fault.endswith("fdopen-policy")
+                            else "reference parent changed while opening")
+        with pytest.raises(expected_type, match="^" + expected_message + "$"):
+            portable_fresh.publish(raw, {"path": str(target), "sha256": hashlib.sha256(raw).hexdigest()})
+        assert opened
+        for descriptor in set(opened):
+            assert_public_handle_closed(descriptor)
+    finally:
+        # Keep the RED reproduction from leaking its deliberately exposed handle.
+        for handle in opened:
+            close_public_test_handle(handle)
+
+
+@secure_publication
+def test_dbg_publication_acquisition_failure_returns_the_refusal_code(pilot, monkeypatch, capsys):
+    root, _reference = pilot
+    def fdopen(*args, **kwargs):
+        raise OSError(errno.EIO, "controlled fdopen failure")
+    monkeypatch.setattr(portable_fresh, "os", SimpleNamespace(**{**vars(os), "fdopen": fdopen}))
+    code = portable_fresh.main(["compose", "--root", str(root), "--initiative", "a",
+                               "--endpoint", ENDPOINT, "--as-of", AS_OF])
+    answer = capsys.readouterr()
+    assert code == 2
+    assert not answer.err
+    assert json.loads(answer.out) == {"error": "reference parent changed while opening"}
+
+
+@secure_reference
+def test_dbg_staging_new_brief_accepts_a_verified_missing_output_directory(pilot):
+    root, _reference = pilot
+    raw = b"public staged fixture"
+    target = root.parent / "briefs" / "new.md"
+    operation = portable_fresh._Operation()
+    mailbox = portable_fresh._CapturedMailbox(root, _operation=operation)
+    mailbox.stage(raw, {"path": str(target), "sha256": hashlib.sha256(raw).hexdigest()})
+    assert target.read_bytes() == raw
+    operation.verify()
+
+
+@secure_reference
+@pytest.mark.parametrize("capability", ["none", "O_PATH"])
+def test_dbg_public_link_permission_error_keeps_its_changed_outcome(tmp_path, monkeypatch, capability):
+    if os.name != "posix" or os.geteuid() == 0 or portable_fresh._symlink_reader() is None:
+        pytest.skip("physical public link denial requires an unprivileged descriptor-relative reader")
+    linked, denied = tmp_path / "linked", tmp_path / "denied"
+    linked.mkdir()
+    denied.mkdir()
+    target = linked / "note.md"
+    target.write_bytes(b"public fixture")
+    (denied / target.name).write_bytes(b"public fixture")
+    ledger = Ledger(tmp_path)
+    ledger.publish(request("hostile", paths=[str(target)]))
+    target.unlink()
+    linked.rmdir()
+    symlink_or_skip(denied, linked, target_is_directory=True)
+    live, _opened = search_only_platform(monkeypatch, capability)
+    operation = portable_fresh._Operation()
+    journal = operation.lifecycle(ledger.path)
+    denied.chmod(0)
+    try:
+        with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+            journal.load()
+    finally:
+        denied.chmod(0o700)
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+        operation.verify()
+    assert live.closed()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("capability", ["none", "O_PATH"])
+@pytest.mark.parametrize("seam", ["disposition", "resolve"])
+@pytest.mark.parametrize("outcome", ["absent", "present", "rebased"])
+def test_dbg_inert_public_link_requires_verified_leaf_absence(tmp_path, monkeypatch, capability, seam, outcome):
+    if not portable_fresh._descriptor_capabilities() or portable_fresh._symlink_reader() is None:
+        pytest.skip("public negative link witnesses require directory descriptors and bounded link reads")
+    namespace = tmp_path / "namespace"
+    namespace.mkdir()
+    linked, public = namespace / "linked", tmp_path / "public"
+    linked.mkdir()
+    public.mkdir()
+    target = linked / "note.md"
+    ledger = Ledger(tmp_path)
+    first = request("first")
+    following = request("following", paths=[str(target)])
+    ledger.publish(first)
+    extra = {"status": "FINAL"}
+    if seam == "resolve":
+        ledger.event("disposition", status="HOLD", resolution={"kind": "blocked", "owner": "engine/coordinator",
+            "next_decision": "review", "condition": "reviewed", "evidence": ledger.evidence}, **ledger.target(first))
+        extra = {"blocker_sha256": portable_fresh.digest(ledger.status()["requests"]["first"]["resolution"])}
+    ledger.event(seam, **extra, resolution={"kind": "next", "request": raw_request(following),
+        "evidence": [{"path": str(target), "sha256": "0" * 64}]}, **ledger.target(first))
+    if outcome == "present":
+        (public / target.name).write_bytes(b"public fixture")
+    linked.rmdir()
+    if outcome == "rebased":
+        home = tmp_path / "owner"
+        private = home / ".codex"
+        private.mkdir(parents=True)
+        monkeypatch.setattr(alias_router, "_owner_home", lambda: home)
+        symlink_or_skip(private, linked, target_is_directory=True)
+        replacement, held = tmp_path / "replacement", tmp_path / "held"
+        replacement.mkdir()
+        symlink_or_skip(public, replacement / linked.name, target_is_directory=True)
+        private_target, proof_operation = portable_fresh._private_symlink_target, portable_fresh._proof_operation
+        def substitute():
+            namespace.rename(held)
+            replacement.rename(namespace)
+        def restore():
+            namespace.rename(replacement)
+            held.rename(namespace)
+        def resolved(guard, path, candidate, **kwargs):
+            selected = Path(path) == linked and Path(candidate) == target and not held.exists()
+            if selected:
+                substitute()
+            try:
+                return private_target(guard, path, candidate, **kwargs)
+            finally:
+                if selected:
+                    restore()
+        def rechecked(guard, stage, action, *args, **kwargs):
+            selected = (stage == "recheck" and args and getattr(args[0], "original", None) == target
+                        and not held.exists())
+            if selected:
+                substitute()
+            try:
+                return proof_operation(guard, stage, action, *args, **kwargs)
+            finally:
+                if selected:
+                    restore()
+        monkeypatch.setattr(portable_fresh, "_private_symlink_target", resolved)
+        monkeypatch.setattr(portable_fresh, "_proof_operation", rechecked)
+    else:
+        symlink_or_skip(public, linked, target_is_directory=True)
+    live, _opened = search_only_platform(monkeypatch, capability)
+    operation = portable_fresh._Operation()
+    journal = operation.lifecycle(ledger.path)
+    if outcome == "absent":
+        _policy, state = journal.load()
+        assert "following" in state["requests"] and journal.private_refusals == {}
+        operation.verify()
+    else:
+        with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+            journal.load()
+        with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+            operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("backend", ["descriptor", "portable"])
+@pytest.mark.parametrize("fault", ["missing-leaf", "missing-parent", "replaced-leaf", "replaced-parent"])
+def test_dbg_cached_read_refuses_a_lost_captured_witness(tmp_path, monkeypatch, capability, backend, fault):
+    public, held = tmp_path / "public", tmp_path / "held"
+    parent = public / "sub"
+    parent.mkdir(parents=True)
+    target = parent / "note.md"
+    target.write_bytes(b"old")
+    live, _opened = search_only_platform(monkeypatch, capability)
+    if backend == "portable":
+        monkeypatch.setattr(portable_fresh, "_reference_descriptors", lambda: False)
+    operation = portable_fresh._Operation()
+    assert operation.read(target)[1] == b"old"
+    if fault.endswith("leaf"):
+        target.rename(held)
+        if fault == "replaced-leaf":
+            target.write_bytes(b"new")
+    else:
+        parent.rename(held)
+        if fault == "replaced-parent":
+            parent.mkdir()
+            (held / target.name).rename(target)
+    try:
+        with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+            operation.read(target)
+        assert operation.failed_validation
+    finally:
+        if fault.endswith("leaf"):
+            if target.exists():
+                target.unlink()
+            held.rename(target)
+        else:
+            if fault == "replaced-parent":
+                target.rename(held / target.name)
+                parent.rmdir()
+            held.rename(parent)
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+        operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@secure_publication
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("ancestor", ["base", "briefs"])
+@pytest.mark.parametrize("replacement", ["missing", "relinked"])
+def test_dbg_post_rename_parent_loss_rolls_back_only_the_owned_entry(tmp_path, monkeypatch, capability, ancestor, replacement):
+    base, held = tmp_path / "output", tmp_path / "held"
+    folder = base / "briefs"
+    folder.mkdir(parents=True)
+    target = folder / "note.md"
+    raw = b"published brief"
+    live, _opened = search_only_platform(monkeypatch, capability)
+    moved = []
+    def replace(*args, **kwargs):
+        os.replace(*args, **kwargs)
+        (base if ancestor == "base" else folder).rename(held)
+        moved.append(True)
+        if replacement == "relinked":
+            folder.mkdir(parents=True)
+            original = held / "briefs" if ancestor == "base" else held
+            os.link(original / target.name, target)
+    def fdopen(descriptor, *args, **kwargs):
+        stream = os.fdopen(descriptor, *args, **kwargs)
+        del live[descriptor]  # The real stream now owns and closes this handle.
+        return stream
+    monkeypatch.setattr(portable_fresh, "os", SimpleNamespace(**{
+        **vars(portable_fresh.os), "replace": replace, "fdopen": fdopen}))
+    operation = portable_fresh._Operation()
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+        portable_fresh.publish(raw, {"path": str(target), "sha256": hashlib.sha256(raw).hexdigest()},
+                               _operation=operation)
+    assert moved and operation.failed_validation
+    original = held / "briefs" if ancestor == "base" else held
+    assert list(original.iterdir()) == []
+    if replacement == "relinked":
+        assert target.read_bytes() == raw
+    else:
+        assert not target.exists()
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+        operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("backend", ["descriptor", "portable"])
+def test_dbg_cached_read_rechecks_namespace_after_leaf_lookup(tmp_path, monkeypatch, capability, backend):
+    public, held = tmp_path / "public", tmp_path / "held"
+    (public / "sub").mkdir(parents=True)
+    target = public / "sub" / "note.md"
+    target.write_bytes(b"old")
+    armed, changed = [], []
+    def returned(value, info, kwargs):
+        actual = live.get(kwargs.get("dir_fd"), Path(".")) / value
+        if armed and actual == target and not changed:
+            public.rename(held)
+            changed.append(True)
+        return info
+    def stat_call(value, *args, **kwargs):
+        return returned(value, os.stat(value, *args, **kwargs), kwargs)
+    def lstat(value, *args, **kwargs):
+        return returned(value, os.lstat(value, *args, **kwargs), kwargs)
+    live, _opened = search_only_platform(monkeypatch, capability, stat_call=stat_call, lstat=lstat)
+    if backend == "portable":
+        monkeypatch.setattr(portable_fresh, "_reference_descriptors", lambda: False)
+    operation = portable_fresh._Operation()
+    assert operation.read(target)[1] == b"old"
+    armed.append(True)
+    try:
+        with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+            operation.read(target)
+        assert changed and operation.failed_validation
+    finally:
+        if changed:
+            held.rename(public)
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+        operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@secure_publication
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("ancestor", ["base", "briefs"])
+def test_dbg_held_output_parent_disappearance_is_not_a_new_absence(tmp_path, monkeypatch, capability, ancestor):
+    base, held = tmp_path / "output", tmp_path / "held"
+    folder = base / "briefs"
+    folder.mkdir(parents=True)
+    target = folder / "note.md"
+    live, _opened = search_only_platform(monkeypatch, capability)
+    original = portable_fresh._check_output_ancestor
+    moved = []
+    def recheck(path, directory_fd, **kwargs):
+        if not moved:
+            (base if ancestor == "base" else folder).rename(held)
+            moved.append(True)
+        return original(path, directory_fd, **kwargs)
+    monkeypatch.setattr(portable_fresh, "_check_output_ancestor", recheck)
+    operation = portable_fresh._Operation()
+    raw = b"published brief"
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+        portable_fresh.publish(raw, {"path": str(target), "sha256": hashlib.sha256(raw).hexdigest()},
+                               _operation=operation)
+    assert moved and operation.failed_validation
+    original_folder = held / "briefs" if ancestor == "base" else held
+    assert list(original_folder.iterdir()) == []
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+        operation.verify()
+    assert live.closed()
+
+
+def _round15_publication_platform(monkeypatch, capability, after_replace):
+    live, _opened = search_only_platform(monkeypatch, capability)
+    def replace(*args, **kwargs):
+        os.replace(*args, **kwargs)
+        after_replace()
+    def fdopen(descriptor, *args, **kwargs):
+        stream = os.fdopen(descriptor, *args, **kwargs)
+        del live[descriptor]
+        return stream
+    monkeypatch.setattr(portable_fresh, "os", SimpleNamespace(**{
+        **vars(portable_fresh.os), "replace": replace, "fdopen": fdopen}))
+    return live
+
+
+@secure_reference
+@secure_publication
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("ancestor", ["base", "briefs"])
+@pytest.mark.parametrize("replacement", ["public-link", "private-link", "directory", "file"])
+def test_round15_held_parent_substitution_latches_before_propagation(tmp_path, monkeypatch, capability, ancestor, replacement):
+    base, held, public = tmp_path / "output", tmp_path / "held", tmp_path / "public"
+    folder = base / "briefs"
+    folder.mkdir(parents=True)
+    public.mkdir()
+    home = tmp_path / "owner"
+    private = home / ".codex"
+    private.mkdir(parents=True)
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: home)
+    target = folder / "note.md"
+    captured = base if ancestor == "base" else folder
+    original = portable_fresh._check_output_ancestor
+    changed = []
+    def check(path, directory_fd, **kwargs):
+        if not changed:
+            captured.rename(held)
+            changed.append(True)
+            if replacement.endswith("link"):
+                symlink_or_skip(private if replacement == "private-link" else public,
+                                captured, target_is_directory=True)
+            elif replacement == "directory":
+                folder.mkdir(parents=True)
+            else:
+                captured.write_bytes(b"not a directory")
+        return original(path, directory_fd, **kwargs)
+    monkeypatch.setattr(portable_fresh, "_check_output_ancestor", check)
+    live = _round15_publication_platform(monkeypatch, capability, lambda: None)
+    operation = portable_fresh._Operation()
+    expected = alias_router.PrivatePathError if replacement == "private-link" else ValueError
+    pattern = "^owner-private host directory is not an input$" if replacement == "private-link" else "^reference parent changed while opening$"
+    try:
+        with pytest.raises(expected, match=pattern):
+            portable_fresh.publish(b"new", {"path": str(target), "sha256": hashlib.sha256(b"new").hexdigest()},
+                                   _operation=operation)
+        assert changed and operation.failed_validation
+    finally:
+        if changed:
+            if replacement == "directory":
+                if ancestor == "base":
+                    folder.rmdir()
+                captured.rmdir()
+            else:
+                captured.unlink()
+            held.rename(captured)
+    with pytest.raises(expected, match=pattern):
+        operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@secure_publication
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("source", ["prior-brief", "sibling-input"])
+@pytest.mark.parametrize("fault", ["moved-output", "input-only"])
+def test_round15_output_mismatch_rolls_back_before_input_verification(tmp_path, monkeypatch, capability, source, fault):
+    base, held = tmp_path / "output", tmp_path / "held"
+    folder = base / "briefs"
+    folder.mkdir(parents=True)
+    prior = folder / "prior.md" if source == "prior-brief" else base / "source.json"
+    prior.write_bytes(b"prior")
+    target = folder / "note.md"
+    moved = folder if source == "prior-brief" else base
+    changed = []
+    def committed():
+        if fault == "moved-output":
+            moved.rename(held)
+        else:
+            prior.write_bytes(b"changed")
+        changed.append(True)
+    live = _round15_publication_platform(monkeypatch, capability, committed)
+    operation = portable_fresh._Operation()
+    operation.read(prior)
+    raw = b"new"
+    expected = ValueError if fault == "moved-output" else portable_fresh.PublicationRefused
+    pattern = "^reference parent changed while opening$" if fault == "moved-output" else "requires reconciliation"
+    with pytest.raises(expected, match=pattern):
+        portable_fresh.publish(raw, {"path": str(target), "sha256": hashlib.sha256(raw).hexdigest()},
+                               _operation=operation)
+    assert changed and operation.failed_validation
+    if fault == "moved-output":
+        original_folder = held if source == "prior-brief" else held / "briefs"
+        assert not (original_folder / target.name).exists()
+        if source == "prior-brief":
+            assert (original_folder / prior.name).read_bytes() == b"prior"
+    else:
+        assert target.read_bytes() == raw
+    assert live.closed()
+
+
+@secure_reference
+@secure_publication
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("cleanup", ["missing", "denied", "peer"])
+def test_round15_private_refusal_survives_rollback_cleanup(tmp_path, monkeypatch, capability, cleanup):
+    if cleanup == "denied" and (os.name != "posix" or os.geteuid() == 0):
+        pytest.skip("physical cleanup denial requires an unprivileged POSIX runner")
+    base, held = tmp_path / "output", tmp_path / "held"
+    folder = base / "briefs"
+    folder.mkdir(parents=True)
+    target = folder / "note.md"
+    home = tmp_path / "owner"
+    private = home / ".codex"
+    private.mkdir(parents=True)
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: home)
+    def committed():
+        if cleanup == "missing":
+            target.unlink()
+        elif cleanup == "peer":
+            target.rename(folder / "owned-before-peer.md")
+            target.write_bytes(b"peer publication")
+        folder.rename(held)
+        symlink_or_skip(private, folder, target_is_directory=True)
+        if cleanup == "denied":
+            held.chmod(0)
+    live = _round15_publication_platform(monkeypatch, capability, committed)
+    operation = portable_fresh._Operation()
+    try:
+        with pytest.raises(alias_router.PrivatePathError, match="^owner-private host directory is not an input$") as caught:
+            portable_fresh.publish(b"new", {"path": str(target), "sha256": hashlib.sha256(b"new").hexdigest()},
+                                   _operation=operation)
+        assert operation.failed_validation and caught.value is operation.validation_failure
+    finally:
+        if held.exists():
+            held.chmod(0o700)
+    if cleanup == "peer":
+        assert (held / target.name).read_bytes() == b"peer publication"
+    with pytest.raises(alias_router.PrivatePathError):
+        operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("backend", ["descriptor", "portable"])
+@pytest.mark.parametrize("replacement", ["missing", "public-link", "private-link"])
+def test_round15_absent_reference_keeps_its_captured_parent(tmp_path, monkeypatch, capability, backend, replacement):
+    public, held, alternate = tmp_path / "public", tmp_path / "held", tmp_path / "alternate"
+    sub = public / "sub"
+    sub.mkdir(parents=True)
+    alternate.mkdir()
+    target = sub / "note.md"
+    home = tmp_path / "owner"
+    private = home / ".codex"
+    private.mkdir(parents=True)
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: home)
+    live, _opened = search_only_platform(monkeypatch, capability)
+    if backend == "portable":
+        monkeypatch.setattr(portable_fresh, "_reference_descriptors", lambda: False)
+    original = portable_fresh._ordinary_reference_check
+    changed = []
+    def checked(path, guard):
+        result = original(path, guard)
+        if Path(path) == target and not changed:
+            sub.rename(held)
+            changed.append(True)
+            if replacement != "missing":
+                symlink_or_skip(private if replacement == "private-link" else alternate,
+                                sub, target_is_directory=True)
+        return result
+    monkeypatch.setattr(portable_fresh, "_ordinary_reference_check", checked)
+    operation = portable_fresh._Operation()
+    expected = alias_router.PrivatePathError if replacement == "private-link" else ValueError
+    pattern = "^owner-private host directory is not an input$" if replacement == "private-link" else "^reference parent changed while opening$"
+    try:
+        with operation.active():
+            with pytest.raises(expected, match=pattern):
+                portable_fresh.file_ref(target)
+        assert changed and operation.failed_validation
+    finally:
+        if changed:
+            if replacement != "missing":
+                sub.unlink()
+            held.rename(sub)
+    with pytest.raises(expected, match=pattern):
+        operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("backend", ["descriptor", "portable"])
+@pytest.mark.parametrize("accessor,fault", [
+    ("json", "missing"), ("json", "replacement"), ("entries", "missing"),
+    ("entries", "replacement"), ("entries", "membership"),
+    ("identity-only", "missing"), ("promote", "missing")])
+def test_round15_cached_accessors_revalidate_captured_witnesses(tmp_path, monkeypatch, capability, backend, accessor, fault):
+    parent, held = tmp_path / "public" / "sub", tmp_path / "held"
+    parent.mkdir(parents=True)
+    target = parent / "note.json"
+    target.write_bytes(b"{}")
+    live, _opened = search_only_platform(monkeypatch, capability)
+    if backend == "portable":
+        monkeypatch.setattr(portable_fresh, "_reference_descriptors", lambda: False)
+    operation = portable_fresh._Operation()
+    if accessor == "json":
+        assert operation.json(target) == {}
+        assert operation.json(target) == {}
+    else:
+        identity_only = accessor in {"identity-only", "promote"}
+        first = operation.entries(parent, identity_only=identity_only)
+        assert operation.entries(parent, identity_only=identity_only) == first
+    changed = target if accessor == "json" else parent
+    if fault == "membership":
+        (parent / "extra.txt").write_bytes(b"new")
+    else:
+        changed.rename(held)
+        if fault == "replacement":
+            if accessor == "json":
+                target.write_bytes(b"{}")
+            else:
+                parent.mkdir()
+    try:
+        with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+            if accessor == "json":
+                operation.json(target)
+            else:
+                operation.entries(parent, identity_only=accessor == "identity-only")
+        assert operation.failed_validation
+    finally:
+        if fault == "membership":
+            (parent / "extra.txt").unlink()
+        else:
+            if fault == "replacement":
+                if accessor == "json":
+                    target.unlink()
+                else:
+                    parent.rmdir()
+            held.rename(changed)
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+        operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("backend", ["descriptor", "portable"])
+def test_round15_cached_json_enforces_the_new_limit(tmp_path, monkeypatch, capability, backend):
+    target = tmp_path / "note.json"
+    target.write_bytes(b"{}")
+    live, _opened = search_only_platform(monkeypatch, capability)
+    if backend == "portable":
+        monkeypatch.setattr(portable_fresh, "_reference_descriptors", lambda: False)
+    operation = portable_fresh._Operation()
+    assert operation.json(target) == {}
+    assert operation.json(target) == {}
+    with pytest.raises(ValueError, match="^input exceeds 1 bytes$"):
+        operation.json(target, limit=1)
+    assert live.closed()
+
+
+@secure_reference
+@lifecycle_only
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("view", ["mailbox", "journal"])
+def test_round15_cached_views_revalidate_their_files(tmp_path, pilot, monkeypatch, capability, view):  # noqa: F811
+    root, _reference = pilot
+    if view == "mailbox":
+        invoke(root, "publish", message(identifier="round15"))
+    else:
+        ledger = Ledger(tmp_path)
+        ledger.publish(request("cached"))
+    live, _opened = search_only_platform(monkeypatch, capability)
+    operation = portable_fresh._Operation()
+    if view == "mailbox":
+        mailbox = portable_fresh._CapturedMailbox(root, _operation=operation)
+        records = mailbox.messages()
+        target = Path(records["round15"]["path"])
+        consume = mailbox.messages
+    else:
+        journal = operation.lifecycle(ledger.path)
+        journal.load()
+        target = ledger.path / "events" / "000001.json"
+        consume = journal.load
+    first = consume()
+    assert consume() == first
+    held = tmp_path / "held"
+    target.rename(held)
+    if view == "journal":
+        target.write_bytes(held.read_bytes())
+    try:
+        with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+            consume()
+        assert operation.failed_validation
+    finally:
+        if target.exists():
+            target.unlink()
+        held.rename(target)
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+        operation.verify()
+    assert live.closed()
+
+
+def _round16_substitute(path, held, replacement, public, private):
+    candidate = held.with_name(held.name + "-replacement")
+    if replacement == "directory":
+        candidate.mkdir()
+    elif replacement == "file":
+        candidate.write_bytes(b"public replacement")
+    else:
+        symlink_or_skip(private if replacement == "private-link" else public,
+                        candidate, target_is_directory=True)
+    path.rename(held)
+    candidate.rename(path)
+    def restore():
+        if replacement == "directory":
+            path.rmdir()
+        else:
+            path.unlink()
+        held.rename(path)
+    return restore
+
+
+@secure_reference
+@secure_publication
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("boundary", ["initial", "before-rename", "after-rename", "reuse"])
+@pytest.mark.parametrize("replacement", ["directory", "file", "public-link", "private-link"])
+def test_round16_directory_checks_latch_the_publication_owner(tmp_path, monkeypatch, capability, boundary, replacement):
+    folder, held, public = tmp_path / "output" / "briefs", tmp_path / "held", tmp_path / "public"
+    folder.mkdir(parents=True)
+    public.mkdir()
+    private = tmp_path / "owner" / ".codex"
+    private.mkdir(parents=True)
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: private.parent)
+    target = folder / "note.md"
+    raw = b"public brief"
+    if boundary == "reuse":
+        target.write_bytes(raw)
+    live = _round15_publication_platform(monkeypatch, capability, lambda: None)
+    original = portable_fresh.check_directory
+    calls, restoration = [], []
+    selected = {"initial": 1, "before-rename": 2, "after-rename": 3, "reuse": 2}[boundary]
+    def check(*args, **kwargs):
+        calls.append(True)
+        if len(calls) == selected:
+            restoration.append(_round16_substitute(folder, held, replacement, public, private))
+        return original(*args, **kwargs)
+    monkeypatch.setattr(portable_fresh, "check_directory", check)
+    operation = portable_fresh._Operation()
+    expected = alias_router.PrivatePathError if replacement == "private-link" else ValueError
+    pattern = "^owner-private host directory is not an input$" if replacement == "private-link" else "^reference parent changed while opening$"
+    try:
+        with pytest.raises(expected, match=pattern):
+            portable_fresh.publish(raw, {"path": str(target), "sha256": hashlib.sha256(raw).hexdigest()},
+                                   _operation=operation)
+        assert restoration and operation.failed_validation
+    finally:
+        if restoration:
+            restoration[0]()
+    with pytest.raises(expected, match=pattern):
+        operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@secure_publication
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("code", [errno.ENOENT, errno.ENOTDIR, errno.ELOOP], ids=["enoent", "not-directory", "loop"])
+@pytest.mark.parametrize("replacement", ["missing", "public-link", "private-link"])
+def test_round16_mkdir_refusal_latches_the_active_owner(tmp_path, monkeypatch, capability, code, replacement):
+    base, public = tmp_path / "output", tmp_path / "public"
+    base.mkdir()
+    public.mkdir()
+    private = tmp_path / "owner" / ".codex"
+    private.mkdir(parents=True)
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: private.parent)
+    folder = base / "briefs"
+    target = folder / "note.md"
+    live = _round15_publication_platform(monkeypatch, capability, lambda: None)
+    calls = []
+    def mkdir(name, *args, **kwargs):
+        assert name == folder.name and live[kwargs["dir_fd"]] == base
+        calls.append(True)
+        if replacement != "missing":
+            symlink_or_skip(private if replacement == "private-link" else public,
+                            folder, target_is_directory=True)
+        raise OSError(code, "controlled mkdir refusal")
+    monkeypatch.setattr(portable_fresh, "os", SimpleNamespace(**{**vars(portable_fresh.os), "mkdir": mkdir}))
+    operation = portable_fresh._Operation()
+    expected = alias_router.PrivatePathError if replacement == "private-link" else ValueError
+    pattern = "^owner-private host directory is not an input$" if replacement == "private-link" else "^reference parent changed while opening$"
+    with pytest.raises(expected, match=pattern):
+        portable_fresh.publish(b"public", {"path": str(target), "sha256": hashlib.sha256(b"public").hexdigest()},
+                               _operation=operation)
+    assert calls and operation.failed_validation
+    if replacement != "missing":
+        folder.unlink()
+    with pytest.raises(expected, match=pattern):
+        operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@secure_publication
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+def test_round16_real_unlinked_mkdir_parent_latches_the_owner(tmp_path, monkeypatch, capability):
+    base = tmp_path / "output"
+    base.mkdir()
+    target = base / "briefs" / "note.md"
+    live = _round15_publication_platform(monkeypatch, capability, lambda: None)
+    removed = []
+    def mkdir(name, *args, **kwargs):
+        base.rmdir()
+        removed.append(True)
+        return os.mkdir(name, *args, **kwargs)
+    monkeypatch.setattr(portable_fresh, "os", SimpleNamespace(**{**vars(portable_fresh.os), "mkdir": mkdir}))
+    operation = portable_fresh._Operation()
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+        portable_fresh.publish(b"public", {"path": str(target), "sha256": hashlib.sha256(b"public").hexdigest()},
+                               _operation=operation)
+    assert removed and operation.failed_validation
+    base.mkdir()
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+        operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@secure_publication
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("replacement", ["directory", "private-link"])
+def test_round16_mailbox_stage_keeps_the_callers_operation(pilot, tmp_path, monkeypatch, capability, replacement):  # noqa: F811
+    root, _reference = pilot
+    folder, held, public = root.parent / "briefs", tmp_path / "held", tmp_path / "public"
+    folder.mkdir()
+    public.mkdir()
+    private = tmp_path / "owner" / ".codex"
+    private.mkdir(parents=True)
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: private.parent)
+    live = _round15_publication_platform(monkeypatch, capability, lambda: None)
+    operation = portable_fresh._Operation()
+    mailbox = portable_fresh._CapturedMailbox(root, _operation=operation)
+    target = folder / "new.md"
+    original = portable_fresh._check_output_ancestor
+    changed = []
+    def check(*args, **kwargs):
+        restore = _round16_substitute(folder, held, replacement, public, private)
+        changed.append(True)
+        try:
+            return original(*args, **kwargs)
+        finally:
+            restore()
+    monkeypatch.setattr(portable_fresh, "_check_output_ancestor", check)
+    expected = alias_router.PrivatePathError if replacement == "private-link" else ValueError
+    pattern = "^owner-private host directory is not an input$" if replacement == "private-link" else "^reference parent changed while opening$"
+    with pytest.raises(expected, match=pattern):
+        mailbox.stage(b"public", {"path": str(target), "sha256": hashlib.sha256(b"public").hexdigest()})
+    assert changed and operation.failed_validation
+    with pytest.raises(expected, match=pattern):
+        operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@secure_publication
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("publication_api", ["canonical", "package"])
+def test_round16_implicit_publication_reuses_the_active_operation(tmp_path, monkeypatch, capability, publication_api):
+    folder = tmp_path / "output" / "briefs"
+    folder.mkdir(parents=True)
+    target = folder / "note.md"
+    source = tmp_path / "source.md"
+    source.write_bytes(b"original")
+    live = _round15_publication_platform(monkeypatch, capability, lambda: None)
+    operation = portable_fresh._Operation()
+    operation.read(source)
+    source.write_bytes(b"changed")
+    publication = portable_fresh.publish if publication_api == "canonical" else alias_fresh.publish
+    with operation.active():
+        with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+            publication(b"public", {"path": str(target), "sha256": hashlib.sha256(b"public").hexdigest()})
+    assert operation.failed_validation and not target.exists()
+    with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+        operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("backend", ["descriptor", "portable"])
+@pytest.mark.parametrize("surface", ["file-ref", "optional-evidence"])
+@pytest.mark.parametrize("replacement", ["directory", "file", "public-link", "private-link"])
+def test_round16_negative_edge_cannot_move_to_a_deeper_component(tmp_path, monkeypatch, capability, backend, surface, replacement):
+    public, alternate = tmp_path / "public", tmp_path / "alternate"
+    public.mkdir()
+    alternate.mkdir()
+    edge = public / "a"
+    target = edge / "b" / "note.md"
+    origin = tmp_path / "origin.json"
+    origin.write_bytes(b"{}")
+    private = tmp_path / "owner" / ".codex"
+    private.mkdir(parents=True)
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: private.parent)
+    live, _opened = search_only_platform(monkeypatch, capability)
+    if backend == "portable":
+        monkeypatch.setattr(portable_fresh, "_reference_descriptors", lambda: False)
+    original = portable_fresh._ordinary_reference_check
+    changed = []
+    def checked(path, guard):
+        result = original(path, guard)
+        if Path(path) == target and not changed:
+            if replacement == "directory":
+                edge.mkdir()
+            elif replacement == "file":
+                edge.write_bytes(b"public replacement")
+            else:
+                symlink_or_skip(private if replacement == "private-link" else alternate,
+                                edge, target_is_directory=True)
+            changed.append(True)
+        return result
+    monkeypatch.setattr(portable_fresh, "_ordinary_reference_check", checked)
+    operation = portable_fresh._Operation()
+    if surface == "file-ref" and (backend == "portable" or capability == "none"):
+        # These ordinary-reader branches already refuse the initial missing
+        # parent; they cannot reach the check-to-use replacement window.
+        with operation.active():
+            with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+                portable_fresh.file_ref(target)
+        assert not changed and operation.failed_validation
+        with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+            operation.verify()
+        assert live.closed()
+        return
+    expected = alias_router.PrivatePathError if replacement == "private-link" else ValueError
+    pattern = "^owner-private host directory is not an input$" if replacement == "private-link" else "^reference parent changed while opening$"
+    try:
+        if surface == "file-ref":
+            with operation.active():
+                with pytest.raises(expected, match=pattern):
+                    portable_fresh.file_ref(target)
+        else:
+            brief = portable_fresh.Brief(_operation=operation)
+            if replacement == "private-link":
+                with pytest.raises(expected, match=pattern):
+                    brief.evidence({"path": str(target), "sha256": "0" * 64}, ref(origin))
+            else:
+                brief.evidence({"path": str(target), "sha256": "0" * 64}, ref(origin))
+                assert [r["kind"] for r in brief.sections["Evidence references"]] == ["unverified_evidence"]
+        assert changed and operation.failed_validation
+    finally:
+        if changed:
+            if replacement == "directory":
+                edge.rmdir()
+            else:
+                edge.unlink()
+    with pytest.raises(expected, match=pattern):
+        operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("surface", ["file-ref", "optional-evidence"])
+def test_round16_unchanged_negative_edge_stays_absent(tmp_path, monkeypatch, capability, surface):
+    public = tmp_path / "public"
+    public.mkdir()
+    target = public / "a" / "b" / "note.md"
+    origin = tmp_path / "origin.json"
+    origin.write_bytes(b"{}")
+    live, _opened = search_only_platform(monkeypatch, capability)
+    operation = portable_fresh._Operation()
+    if surface == "file-ref":
+        if capability == "none":
+            with operation.active():
+                with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+                    portable_fresh.file_ref(target)
+            with pytest.raises(ValueError, match="^reference parent changed while opening$"):
+                operation.verify()
+            assert operation.failed_validation and live.closed()
+            return
+        with operation.active():
+            with pytest.raises(FileNotFoundError) as missing:
+                portable_fresh.file_ref(target)
+        assert missing.value.errno == errno.ENOENT
+    else:
+        brief = portable_fresh.Brief(_operation=operation)
+        brief.evidence({"path": str(target), "sha256": "0" * 64}, ref(origin))
+        assert [r["kind"] for r in brief.sections["Evidence references"]] == ["unverified_evidence"]
+    assert not operation.failed_validation
+    operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@lifecycle_only
+@pytest.mark.parametrize("replacement", ["directory", "private-link"])
+def test_round16_staging_failure_reports_draft_error_instead_of_hold(tmp_path, monkeypatch, capsys, replacement):
+    from tests.integration.test_hierarchy_small_change_dispatch import DispatchWorld
+    world = DispatchWorld(tmp_path)
+    folder, held, public = world.root.parent / "briefs", tmp_path / "held", tmp_path / "public"
+    folder.mkdir(exist_ok=True)
+    public.mkdir()
+    private = tmp_path / "owner" / ".codex"
+    private.mkdir(parents=True)
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: private.parent)
+    original = portable_fresh._check_output_ancestor
+    changed = []
+    def check(path, *args, **kwargs):
+        if Path(path).parent == folder and not changed:
+            restore = _round16_substitute(folder, held, replacement, public, private)
+            changed.append(True)
+            try:
+                return original(path, *args, **kwargs)
+            finally:
+                restore()
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(portable_fresh, "_check_output_ancestor", check)
+    code = alias_router.main(["--lifecycle", str(world.ledger.path), "--store", str(world.workspace.store),
+                              "dispatch", "--recipes", str(world.recipes_path), "--wait", "0.1", "--evidence-only"])
+    output = capsys.readouterr()
+    assert code == 0 and not output.err
+    row = json.loads(output.out)["small_changes"][0]
+    assert changed and row["drafts"] == [] and "draft_error" in row
+    expected = "owner-private host directory is not an input" if replacement == "private-link" else "reference parent changed while opening"
+    assert row["draft_error"] == expected
+
+
+
+
+
+
+
+
+
+
+
+
+@pytest.mark.parametrize("replacement", ["same-file", "other-file"])
+@pytest.mark.parametrize("owner", ["parent", "child"])
+def test_round12s_descriptor_reuse_is_not_a_test_leak(tmp_path, replacement, owner):
+    script = OWNED_DESCRIPTOR_DRIVER + r'''
+import os, sys
+from pathlib import Path
+from threading import Event, Thread
+sys.path.insert(0, sys.argv[1])
+from tests.integration.test_hierarchy_fresh_brief import _OwnedDescriptors as ParentOwner, assert_public_handle_closed
+folder, replacement, owner = Path(sys.argv[2]), sys.argv[3], sys.argv[4]
+original, other = folder / 'original', folder / 'other'
+original.write_bytes(b'owned'); other.write_bytes(b'borrowed')
+ledger = ParentOwner() if owner == 'parent' else _OwnedDescriptors()
+descriptor = ledger.open(original, os.O_RDONLY)
+receipt = ledger.capture(descriptor)
+ledger.close(descriptor)
+ready, release = Event(), Event()
+borrowed = []
+def reuse():
+    fd = os.open(original if replacement == 'same-file' else other, os.O_RDONLY)
+    borrowed.append(fd); ready.set()
+    try:
+        assert release.wait(10), 'reuse check did not finish'
+    finally:
+        os.close(fd)
+thread = Thread(target=reuse)
+thread.start()
+try:
+    assert ready.wait(10), 'reuse thread did not open a descriptor'
+    assert borrowed == [descriptor], 'isolated child did not reuse the released descriptor'
+    assert_public_handle_closed(receipt)
+    ledger.assert_closed()
+finally:
+    release.set(); thread.join(timeout=10)
+    assert not thread.is_alive()
+'''
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(ROOT), str(tmp_path), replacement, owner],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0 and not result.stderr, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("transfer", [False, True], ids=["raw", "fdopen"])
+def test_round12s_real_descriptor_leak_is_detected(tmp_path, transfer, owned_descriptors):
+    target = tmp_path / "owned"
+    target.write_bytes(b"owned")
+    ledger = owned_descriptors
+    descriptor = ledger.open(target, os.O_RDONLY)
+    receipt = ledger.capture(descriptor)
+    paths = _DescriptorPaths()
+    paths[descriptor] = target
+    stream = ledger.fdopen(descriptor, "rb") if transfer else None
+    try:
+        with pytest.raises((AssertionError, pytest.fail.Exception)):
+            assert_public_handle_closed(receipt)
+        with pytest.raises(AssertionError, match="^test-owned descriptor was not closed$"):
+            ledger.assert_closed()
+        assert not paths.closed()
+    finally:
+        if stream is not None:
+            stream.close()
+        else:
+            ledger.close(descriptor)
+    assert_public_handle_closed(receipt)
+    assert paths.closed()
+    ledger.assert_closed()
+
+
+@pytest.mark.parametrize("transfer", ["raw", "fdopen", "nonowning"])
+def test_round12s_child_real_descriptor_leak_is_detected(tmp_path, transfer):
+    script = OWNED_DESCRIPTOR_DRIVER + r'''
+import os, sys
+from pathlib import Path
+path, transfer = Path(sys.argv[1]), sys.argv[2]
+path.write_bytes(b'owned')
+ledger = _OwnedDescriptors()
+fd = ledger.open(path, os.O_RDONLY)
+stream = ledger.fdopen(fd, 'rb', closefd=transfer != 'nonowning') if transfer != 'raw' else None
+try:
+    if transfer == 'nonowning': stream.close()
+    try:
+        ledger.assert_closed()
+    except AssertionError as error:
+        assert str(error) == 'test-owned descriptor was not closed'
+    else:
+        raise AssertionError('real child leak was lost')
+finally:
+    if stream is not None: stream.close()
+    ledger.cleanup()
+ledger.assert_closed()
+'''
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(tmp_path / "owned"), transfer],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0 and not result.stderr, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("owner", ["parent", "child"])
+def test_round12s_close_cannot_erase_a_reused_open_lifetime(tmp_path, owner):
+    script = OWNED_DESCRIPTOR_DRIVER + r'''
+import os, sys
+from pathlib import Path
+from threading import Event, Thread
+sys.path.insert(0, sys.argv[1])
+from tests.integration.test_hierarchy_fresh_brief import _OwnedDescriptors as ParentOwner
+path, owner = Path(sys.argv[2]), sys.argv[3]
+path.write_bytes(b'owned')
+ledger = ParentOwner() if owner == 'parent' else _OwnedDescriptors()
+fd = ledger.open(path, os.O_RDONLY)
+first = ledger.capture(fd)
+native, armed = ledger.native, [True]
+ready, reused, release = Event(), Event(), Event()
+next_receipt = []
+def close(descriptor):
+    native.close(descriptor)
+    if armed[0]:
+        armed[0] = False
+        ready.set()
+        assert reused.wait(10), 'reuse did not reach the close window'
+ledger.native = SimpleNamespace(**{**vars(native), 'close':close})
+def reopen():
+    assert ready.wait(10), 'close did not reach the reuse window'
+    again = ledger.open(path, os.O_RDONLY)
+    next_receipt.append(ledger.capture(again))
+    reused.set()
+    try:
+        assert release.wait(10), 'receipt assertion did not finish'
+    finally:
+        ledger.close(again)
+thread = Thread(target=reopen)
+thread.start()
+try:
+    ledger.close(fd)
+    assert first.closed and next_receipt[0] is not first
+    assert next_receipt[0].descriptor == fd and ledger.capture(fd) is next_receipt[0]
+    try:
+        ledger.assert_closed()
+    except AssertionError as error:
+        assert str(error) == 'test-owned descriptor was not closed'
+    else:
+        raise AssertionError('reused open lifetime was erased')
+finally:
+    release.set(); thread.join(timeout=10)
+    assert not thread.is_alive()
+    ledger.cleanup()
+ledger.assert_closed()
+'''
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(ROOT), str(tmp_path / "owned"), owner],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0 and not result.stderr, result.stdout + result.stderr
+
+
+@secure_reference
+@pytest.mark.parametrize("backend", ["descriptor", "portable"])
+def test_round12s_cached_mailbox_rechecks_share_parent_walks(pilot, monkeypatch, backend):  # noqa: F811
+    root, _reference = pilot
+    monkeypatch.setattr(portable_fresh, "_reference_descriptors", lambda: backend == "descriptor")
+    baseline, costs = portable_fresh.os, []
+    for number in range(12):
+        invoke(root, "publish", message(identifier="batch-%d" % number))
+        if number not in {0, 11}:
+            continue
+        mailbox = portable_fresh._CapturedMailbox(root)
+        records = mailbox.messages()
+        folder = Path(records["batch-0"]["path"]).parent
+        identity = folder.stat()
+        calls = []
+        def opening(*args, **kwargs):
+            descriptor = baseline.open(*args, **kwargs)
+            info = baseline.fstat(descriptor)
+            if backend == "descriptor" and (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino):
+                calls.append(True)
+            return descriptor
+        def lstated(path, *args, **kwargs):
+            if backend == "portable" and Path(path) == Path(Path(path).anchor):
+                calls.append(True)
+            return baseline.lstat(path, *args, **kwargs)
+        monkeypatch.setattr(portable_fresh, "os", SimpleNamespace(**{**vars(baseline), "open": opening, "lstat": lstated}))
+        try:
+            assert mailbox.messages() == records
+        finally:
+            monkeypatch.setattr(portable_fresh, "os", baseline)
+        costs.append(len(calls))
+    assert costs[0] > 0 and costs[1] == costs[0], costs
+
+
+
+
+@secure_reference
+@pytest.mark.parametrize("missing_identity,timing", [("leaf", "before"), ("ancestor", "before"),
+    ("leaf", "after"), ("ancestor", "after"), ("ancestor", "final")])
+def test_round12s_captured_path_without_identity_does_not_certify_a_proof(tmp_path, monkeypatch, missing_identity, timing):
+    path = tmp_path / "captured.json"
+    path.write_bytes(b"{}")
+    baseline = portable_fresh.os
+    target = baseline.stat(path if missing_identity == "leaf" else path.parent)
+    operation = portable_fresh._Operation()
+    if timing != "before":
+        operation.read(path)
+    masked, walks = [timing != "final"], []
+    def mask(info):
+        if not masked[0] or (info.st_dev, info.st_ino) != (target.st_dev, target.st_ino):
+            return info
+        return SimpleNamespace(st_dev=info.st_dev, st_ino=0, st_mode=info.st_mode, st_size=info.st_size,
+                               st_mtime_ns=info.st_mtime_ns, st_ctime_ns=info.st_ctime_ns)
+    def stated(*args, **kwargs):
+        return mask(baseline.stat(*args, **kwargs))
+    def fstated(*args, **kwargs):
+        return mask(baseline.fstat(*args, **kwargs))
+    def opened(value, *args, **kwargs):
+        if timing == "final" and value == path.anchor:
+            walks.append(True)
+            if len(walks) == 2:
+                masked[0] = True
+        return baseline.open(value, *args, **kwargs)
+    monkeypatch.setattr(portable_fresh, "os", SimpleNamespace(**{**vars(baseline), "stat": stated, "fstat": fstated, "open": opened}))
+    if timing == "before":
+        operation.read(path)
+    with operation.active(), pytest.raises(ValueError, match="^reference parent changed while opening$"):
+        operation.path_guard.check(path, scope=True)
+    assert operation.failed_validation
+
+
+@secure_reference
+@lifecycle_only
+@pytest.mark.parametrize("backend", ["descriptor", "portable"])
+@pytest.mark.parametrize("surface", ["mailbox", "journal", "guard"])
+@pytest.mark.parametrize("replacement", ["missing", "private-link"])
+@pytest.mark.parametrize("cleanup_failure", [False, "errno", "policy"])
+def test_round12s_cached_view_rechecks_prefix_after_leaf_lookup(pilot, tmp_path, monkeypatch, backend, surface, replacement, cleanup_failure):  # noqa: F811
+    root, _reference = pilot
+    private = tmp_path / "owner" / ".codex"
+    private.mkdir(parents=True)
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: private.parent)
+    monkeypatch.setattr(portable_fresh, "_reference_descriptors", lambda: backend == "descriptor")
+    operation = portable_fresh._Operation()
+    if surface in {"mailbox", "guard"}:
+        invoke(root, "publish", message(identifier="late-cache"))
+        view = portable_fresh._CapturedMailbox(root, _operation=operation)
+        records = view.messages()
+        target = Path(records["late-cache"]["path"])
+        consume = view.messages
+        if surface == "guard":
+            def consume():
+                with operation.active():
+                    return operation.path_guard.check(target)
+    else:
+        ledger = Ledger(tmp_path)
+        ledger.publish(request("cached"))
+        view = operation.lifecycle(ledger.path)
+        view.load()
+        target = ledger.path / "events" / "000001.json"
+        consume = view.load
+    parent, held = target.parent, tmp_path / "held-cache"
+    candidate = tmp_path / "replacement-cache"
+    if replacement == "private-link":
+        symlink_or_skip(private, candidate, target_is_directory=True)
+    original, changed, close_failed = portable_fresh.os, [], []
+    identity = parent.stat()
+    def observe(function, path, *args, **kwargs):
+        info = function(path, *args, **kwargs)
+        selected = Path(path) == target
+        if kwargs.get("dir_fd") is not None and Path(path).name == target.name:
+            actual = original.fstat(kwargs["dir_fd"])
+            selected = (actual.st_dev, actual.st_ino) == (identity.st_dev, identity.st_ino)
+        if selected and not changed:
+            parent.rename(held)
+            if replacement == "private-link":
+                candidate.rename(parent)
+            changed.append(True)
+        return info
+    def stated(*args, **kwargs):
+        return observe(original.stat, *args, **kwargs)
+    def lstated(*args, **kwargs):
+        return observe(original.lstat, *args, **kwargs)
+    def closing(descriptor):
+        info = original.fstat(descriptor)
+        selected = (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino)
+        original.close(descriptor)
+        if cleanup_failure and selected and operation.failed_validation and not close_failed:
+            close_failed.append(True)
+            if cleanup_failure == "policy":
+                raise alias_router.CapturedPolicyError("controlled recheck close policy failure")
+            raise OSError(errno.EIO, "controlled recheck close failure")
+    monkeypatch.setattr(portable_fresh, "os", SimpleNamespace(**{**vars(original), "stat": stated, "lstat": lstated, "close": closing}))
+    expected = alias_router.PrivatePathError if replacement == "private-link" else ValueError
+    pattern = "^owner-private host directory is not an input$" if replacement == "private-link" else "^reference parent changed while opening$"
+    if cleanup_failure == "policy" and (backend == "descriptor" or surface == "guard"):
+        expected, pattern = alias_router.CapturedPolicyError, "^controlled recheck close policy failure$"
+    try:
+        with pytest.raises(expected, match=pattern):
+            consume()
+        assert changed and operation.failed_validation
+        if cleanup_failure and (backend == "descriptor" or surface == "guard"):
+            assert close_failed
+    finally:
+        if changed:
+            if replacement == "private-link":
+                parent.unlink()
+            held.rename(parent)
+    with pytest.raises(expected, match=pattern):
+        operation.verify()
+
+
+@secure_reference
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("backend", ["descriptor", "portable"])
+@pytest.mark.parametrize("appearance", ["ancestor", "populated-directory"])
+def test_round12t_optional_entries_keeps_first_negative_edge(tmp_path, monkeypatch, capability, backend, appearance):
+    live, _opened = search_only_platform(monkeypatch, capability)
+    public = tmp_path / "public"
+    public.mkdir()
+    target = public / "a" / "b"
+    monkeypatch.setattr(portable_fresh, "_reference_descriptors", lambda: backend == "descriptor")
+    operation = portable_fresh._Operation()
+    original, changed = portable_fresh._reference_check, []
+    def checking(path, **kwargs):
+        result = original(path, **kwargs)
+        if Path(path) == target and result is None and not changed:
+            target.parent.mkdir()
+            if appearance == "populated-directory":
+                target.mkdir()
+                (target / "entry.json").write_text("{}")
+            changed.append(True)
+        return result
+    monkeypatch.setattr(portable_fresh, "_reference_check", checking)
+    with pytest.raises(ValueError, match="reference parent changed while opening"):
+        operation.entries(target, optional=True)
+    assert changed and operation.failed_validation
+    shutil.rmtree(target.parent)
+    with pytest.raises(ValueError, match="reference parent changed while opening"):
+        operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("backend", ["descriptor", "portable"])
+def test_round12t_repeated_exists_keeps_captured_parent(tmp_path, monkeypatch, capability, backend):
+    live, _opened = search_only_platform(monkeypatch, capability)
+    public, held = tmp_path / "public", tmp_path / "held"
+    public.mkdir()
+    target = public / "note.md"
+    monkeypatch.setattr(portable_fresh, "_reference_descriptors", lambda: backend == "descriptor")
+    operation = portable_fresh._Operation()
+    assert operation.exists(target) is False
+    previous = dict(operation.absences)
+    public.rename(held)
+    public.mkdir()
+    try:
+        with pytest.raises(ValueError, match="reference parent changed while opening"):
+            operation.exists(target)
+        assert operation.failed_validation and operation.absences == previous
+    finally:
+        public.rmdir()
+        held.rename(public)
+    with pytest.raises(ValueError, match="reference parent changed while opening"):
+        operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@secure_publication
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("boundary", ["directory-open", "leaf-open", "staging-lstat"])
+def test_round12t_publication_negative_cannot_shorten_a_captured_prefix(pilot, tmp_path, monkeypatch, capability, boundary):  # noqa: F811
+    live, _opened = search_only_platform(monkeypatch, capability)
+    root, _reference = pilot
+    folder, held = root.parent / "briefs", tmp_path / "held"
+    folder.mkdir()
+    target, raw = folder / "new.md", b"public"
+    reference = {"path": str(target), "sha256": hashlib.sha256(raw).hexdigest()}
+    operation = portable_fresh._Operation()
+    operation.entries(folder, identity_only=True)
+    mailbox = portable_fresh._CapturedMailbox(root, _operation=operation)
+    original, changed = portable_fresh._acquire, []
+    def acquiring(kind, *args, **kwargs):
+        selected = (boundary == "directory-open" and kind == "open" and args[0] == folder.name
+                    or boundary == "leaf-open" and kind == "open" and args[0] == target.name
+                    or boundary == "staging-lstat" and kind == "proof"
+                    and args[0] is portable_fresh._scope_reference_info and Path(args[1][0]) == target)
+        if selected and not changed:
+            folder.rename(held)
+            changed.append(True)
+            try:
+                return original(kind, *args, **kwargs)
+            finally:
+                held.rename(folder)
+        return original(kind, *args, **kwargs)
+    monkeypatch.setattr(portable_fresh, "_acquire", acquiring)
+    with pytest.raises(ValueError, match="reference parent changed while opening"):
+        if boundary == "staging-lstat":
+            mailbox.stage(raw, reference)
+        else:
+            portable_fresh.publish(raw, reference, _operation=operation)
+    assert changed and operation.failed_validation and not target.exists()
+    with pytest.raises(ValueError, match="reference parent changed while opening"):
+        operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("backend", ["descriptor", "portable"])
+@pytest.mark.parametrize("surface", ["file", "directory-identity", "directory-listing"])
+@pytest.mark.parametrize("replacement", ["missing", "private-link"])
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_round12t_final_verify_requires_attached_namespace(tmp_path, monkeypatch, capability, backend, surface, replacement, cleanup_failure):
+    live, _opened = search_only_platform(monkeypatch, capability)
+    parent, held = tmp_path / "public", tmp_path / "held"
+    parent.mkdir()
+    target = parent / "note.md"
+    target.write_bytes(b"public")
+    private = tmp_path / "owner" / ".codex"
+    private.mkdir(parents=True)
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: private.parent)
+    monkeypatch.setattr(portable_fresh, "_reference_descriptors", lambda: backend == "descriptor")
+    operation = portable_fresh._Operation()
+    if surface == "file":
+        operation.read(target)
+    else:
+        operation.entries(parent, identity_only=surface == "directory-identity")
+    candidate = tmp_path / "candidate"
+    if replacement == "private-link":
+        symlink_or_skip(private, candidate, target_is_directory=True)
+    native, acquire, names = portable_fresh.os, portable_fresh._acquire, portable_fresh._directory_names
+    identity, changed, close_failed = parent.stat(), [], []
+    def replace():
+        if not changed:
+            parent.rename(held)
+            if replacement == "private-link":
+                candidate.rename(parent)
+            changed.append(True)
+    def acquiring(kind, *args, **kwargs):
+        value = acquire(kind, *args, **kwargs)
+        caller = sys._getframe(1).f_code.co_name
+        if caller == "verify":
+            if surface == "file" and kind in {"stat", "lstat"} and Path(args[0]).name == target.name:
+                replace()
+            if surface == "directory-identity" and kind in {"fstat", "lstat"}:
+                info = value
+                if (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino):
+                    replace()
+        return value
+    def listing(value):
+        result = names(value)
+        if surface == "directory-listing" and sys._getframe(1).f_code.co_name == "verify":
+            replace()
+        return result
+    def closing(descriptor):
+        native.close(descriptor)
+        frame = sys._getframe(1)
+        selected = frame.f_code.co_name == "_close_rechecked_reference" and frame.f_back.f_code.co_name == "_close_witness_stack"
+        if cleanup_failure and selected and not close_failed:
+            close_failed.append(True)
+            raise OSError(errno.EIO, "controlled witness cleanup failure")
+    monkeypatch.setattr(portable_fresh, "_acquire", acquiring)
+    monkeypatch.setattr(portable_fresh, "_directory_names", listing)
+    monkeypatch.setattr(portable_fresh, "os", SimpleNamespace(**{**vars(native), "close": closing}))
+    expected = alias_router.PrivatePathError if replacement == "private-link" else ValueError
+    pattern = "owner-private host directory is not an input" if replacement == "private-link" else "reference parent changed while opening"
+    try:
+        with pytest.raises(expected, match=pattern):
+            operation.prove(lambda: None)
+        assert changed and operation.failed_validation
+        assert bool(close_failed) == (cleanup_failure and backend == "descriptor")
+    finally:
+        if changed:
+            if replacement == "private-link":
+                parent.unlink()
+            held.rename(parent)
+    with pytest.raises(expected, match=pattern):
+        operation.verify()
+    assert live.closed()
+
+
+def test_round12t_acquisition_census_uses_one_boundary():
+    acquisitions = {"open", "stat", "lstat", "fstat", "fdopen", "read", "scandir", "listdir", "readlink"}
+    rediscovery = {"exists", "is_dir", "is_file", "is_symlink", "resolve", "glob", "rglob",
+                   "open", "stat", "lstat", "read_text", "read_bytes", "readlink", "iterdir"}
+    def census(source):
+        violations = []
+        for function in (node for node in ast.walk(ast.parse(source)) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))):
+            if function.name == "_acquire":
+                continue
+            for node in ast.walk(function):
+                if not isinstance(node, ast.Call):
+                    continue
+                if isinstance(node.func, ast.Name) and node.func.id == "open":
+                    violations.append((function.name, node.lineno, "builtin open"))
+                if isinstance(node.func, ast.Attribute):
+                    direct_os = isinstance(node.func.value, ast.Name) and node.func.value.id == "os"
+                    receiver = ast.unparse(node.func.value)
+                    operation_check = node.func.attr == "exists" and receiver in {
+                        "operation", "brief.operation", "mailbox.operation", "self.operation"}
+                    if direct_os and node.func.attr in acquisitions or node.func.attr in rediscovery and not operation_check:
+                        violations.append((function.name, node.lineno, node.func.attr))
+                if isinstance(node.func, ast.Call) and isinstance(node.func.func, ast.Name) and node.func.func.id == "getattr":
+                    target = node.func.args[0]
+                    if isinstance(target, ast.Name) and target.id == "os":
+                        violations.append((function.name, node.lineno, "indirect OS call"))
+        return violations
+    assert census(TOOL.read_text()) == []
+    for mutation in ("os.open(path, 0)", "open(path, 'rb')", "path.stat()", "path.exists()", "Path(path).read_bytes()",
+                     "getattr(os, 'stat')(path)"):
+        assert census("def untrusted():\n    " + mutation)
+
+
+def test_round12t_unsupported_descriptor_probe_keeps_portable_witnesses(tmp_path, monkeypatch):
+    parent, held = tmp_path / "public", tmp_path / "held"
+    parent.mkdir()
+    target = parent / "note.md"
+    target.write_bytes(b"public")
+    monkeypatch.setattr(portable_fresh, "_descriptor_capabilities", lambda: False)
+    monkeypatch.setattr(portable_fresh, "_reference_descriptors", lambda: False)
+    operation = portable_fresh._Operation()
+    assert operation.read(target)[1] == b"public"
+    operation.verify()
+    parent.rename(held)
+    parent.mkdir()
+    try:
+        with pytest.raises(ValueError, match="reference parent changed while opening"):
+            operation.verify()
+        assert operation.failed_validation
+    finally:
+        parent.rmdir()
+        held.rename(parent)
+
+
+@secure_reference
+@secure_publication
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+def test_round12t_publication_retains_original_negative_after_its_own_effect(pilot, monkeypatch, capability):  # noqa: F811
+    root, _reference = pilot
+    live, _opened = search_only_platform(monkeypatch, capability)
+    target, raw = root.parent / "briefs" / "new.md", b"public"
+    operation = portable_fresh._Operation()
+    mailbox = portable_fresh._CapturedMailbox(root, _operation=operation)
+    mailbox.stage(raw, {"path": str(target), "sha256": hashlib.sha256(raw).hexdigest()})
+    original = operation.witnesses.negatives[target]
+    assert original.path == target.parent
+    assert operation.witnesses.output_negatives[target].path == target
+    assert operation.witnesses.effects[target] == portable_fresh.file_identity(target.stat())
+    operation.verify()
+    assert operation.witnesses.negatives[target] is original
+    assert target.read_bytes() == raw and not operation.failed_validation
+    assert live.closed()
+
+
+@secure_reference
+@secure_publication
+def test_round12t_input_negative_cannot_be_reclassified_as_an_output(tmp_path):
+    folder = tmp_path / "briefs"
+    folder.mkdir()
+    target, raw = folder / "note.md", b"public"
+    operation = portable_fresh._Operation()
+    assert operation.exists(target) is False
+    original = operation.witnesses.negatives[target]
+    with pytest.raises(ValueError, match="reference parent changed while opening"):
+        portable_fresh.publish(raw, {"path": str(target), "sha256": hashlib.sha256(raw).hexdigest()}, _operation=operation)
+    assert operation.failed_validation and not target.exists()
+    assert operation.witnesses.negatives[target] is original
+
+
+@secure_reference
+@secure_publication
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+def test_round12t_output_directory_intent_precedes_metadata_capture(pilot, monkeypatch, capability):  # noqa: F811
+    root, _reference = pilot
+    live, _opened = search_only_platform(monkeypatch, capability)
+    directory = root.parent / "briefs"
+    operation = portable_fresh._Operation()
+    assert operation.output_directory(directory) == directory
+    with operation.active():
+        assert operation.path_guard.check(directory) is None
+    original = operation.witnesses.negatives[directory]
+    mailbox = portable_fresh._CapturedMailbox(root, _operation=operation)
+    raw, target = b"public", directory / "new.md"
+    mailbox.stage(raw, {"path": str(target), "sha256": hashlib.sha256(raw).hexdigest()})
+    operation.verify()
+    assert operation.witnesses.negatives[directory] is original and original.path == directory
+    assert target.read_bytes() == raw and not operation.failed_validation
+    assert live.closed()
+
+
+@secure_reference
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("timing", ["between-fields", "during-field"])
+@pytest.mark.parametrize("required", ["none", "directory", "file"])
+def test_round12u_stored_readiness_fields_keep_independent_metadata_witnesses(pilot, tmp_path, monkeypatch, capability, timing, required):  # noqa: F811
+    root, _reference = pilot
+    alias, held = tmp_path / "alias", tmp_path / "held"
+    alias.mkdir()
+    if required == "file":
+        alias.rmdir()
+        alias.write_bytes(b"required public witness")
+    private = tmp_path / "owner" / ".codex"
+    private.mkdir(parents=True)
+    candidate = tmp_path / "candidate"
+    symlink_or_skip(private, candidate, target_is_directory=True)
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: private.parent)
+    live, _opened = search_only_platform(monkeypatch, capability)
+    operation = portable_fresh._Operation()
+    if required == "directory":
+        operation.entries(alias, identity_only=True)
+    elif required == "file":
+        assert operation.exists(alias)
+    mailbox = portable_fresh._CapturedMailbox(root, _operation=operation)
+    mailbox._stored_message_paths, mailbox._stored_message_refusals = set(), []
+    readiness = {"worktree": str(alias), "branch": "candidate", "base_revision": "a" * 40,
+        "lease_ref": "refs/aegis/lanes/one", "lease_oid": "b" * 40,
+        "lease_expires_at": "2100-01-01T00:00:00Z", "owned_paths": ["app.py"],
+        "scan_workspace": str(alias), "scan_evidence": "recorded", "hook_evidence": "recorded",
+        "enforcement_tier": "advisory"}
+    native, check = portable_fresh.os, portable_fresh._reference_check
+    changes, field_checks = [], []
+    identity = alias.parent.stat()
+    def substitute():
+        alias.rename(held)
+        candidate.rename(alias)
+        changes.append(True)
+    def checking(path, **kwargs):
+        if Path(path) == alias and kwargs.get("_scope"):
+            field_checks.append(True)
+            if timing == "between-fields" and len(field_checks) == 2:
+                substitute()
+        return check(path, **kwargs)
+    def stated(path, *args, **kwargs):
+        info = native.stat(path, *args, **kwargs)
+        selected = Path(path) == alias
+        if kwargs.get("dir_fd") is not None and Path(path).name == alias.name:
+            parent = native.fstat(kwargs["dir_fd"])
+            selected = (parent.st_dev, parent.st_ino) == (identity.st_dev, identity.st_ino)
+        if timing == "during-field" and selected and not changes:
+            substitute()
+        return info
+    monkeypatch.setattr(portable_fresh, "_reference_check", checking)
+    monkeypatch.setattr(portable_fresh, "os", SimpleNamespace(**{**vars(native), "stat": stated}))
+    try:
+        if timing == "between-fields" and required == "none":
+            assert mailbox.readiness(readiness, observe=False) is None
+            assert len(field_checks) == 2 and not operation.failed_validation
+            assert mailbox._stored_message_paths == {alias}
+            assert mailbox._stored_message_refusals == ["symlink paths are not supported: " + str(alias)]
+            operation.verify()
+        else:
+            with pytest.raises(alias_router.PrivatePathError, match="owner-private host directory is not an input"):
+                mailbox.readiness(readiness, observe=False)
+            assert operation.failed_validation
+        assert changes
+    finally:
+        if changes:
+            alias.unlink()
+            held.rename(alias)
+    if timing == "between-fields" and required == "none":
+        operation.verify()
+    else:
+        with pytest.raises(alias_router.PrivatePathError, match="owner-private host directory is not an input"):
+            operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@secure_publication
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("intent", ["before", "after"])
+def test_round12u_output_namespace_intent_is_recorded_at_leaf_capture(pilot, monkeypatch, capability, intent):  # noqa: F811
+    root, _reference = pilot
+    live, _opened = search_only_platform(monkeypatch, capability)
+    directory = root.parent / "briefs"
+    directory.mkdir()
+    target, raw = directory / "check.md", b"public generated check packet"
+    reference = {"path": str(target), "sha256": hashlib.sha256(raw).hexdigest()}
+    operation = portable_fresh._Operation()
+    mailbox = portable_fresh._CapturedMailbox(root, _operation=operation)
+    if intent == "before":
+        operation.output_directory(directory)
+    mailbox.brief(reference, verify=False)
+    original = operation.witnesses.negatives[target]
+    if intent == "after":
+        operation.output_directory(directory)
+        mailbox.brief(reference, verify=False)
+        with pytest.raises(ValueError, match="reference parent changed while opening"):
+            mailbox.stage(raw, reference)
+        assert operation.failed_validation and not target.exists()
+    else:
+        mailbox.stage(raw, reference)
+        assert target.read_bytes() == raw and not operation.failed_validation
+        operation.verify()
+    assert operation.witnesses.negatives[target] is original
+    assert live.closed()
+
+
+@secure_reference
+@secure_publication
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("replacement", ["leaf-regular", "leaf-public", "leaf-private", "parent-private"])
+def test_round12u_output_namespace_never_authorizes_foreign_entries(pilot, tmp_path, monkeypatch, capability, replacement):  # noqa: F811
+    root, _reference = pilot
+    live, _opened = search_only_platform(monkeypatch, capability)
+    private = tmp_path / "owner" / ".codex"
+    private.mkdir(parents=True)
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: private.parent)
+    directory = root.parent / "briefs"
+    directory.mkdir()
+    raw, target = b"public generated packet", directory / "check.md"
+    public = tmp_path / "public.md"
+    public.write_bytes(raw)
+    candidate = tmp_path / "candidate"
+    destination = public if replacement == "leaf-public" else private
+    if replacement == "leaf-regular":
+        candidate.write_bytes(raw)
+    else:
+        symlink_or_skip(destination, candidate, target_is_directory=replacement != "leaf-public")
+    operation = portable_fresh._Operation()
+    mailbox = portable_fresh._CapturedMailbox(root, _operation=operation)
+    operation.output_directory(directory)
+    reference = {"path": str(target), "sha256": hashlib.sha256(raw).hexdigest()}
+    mailbox.brief(reference, verify=False)
+    held = tmp_path / "held"
+    if replacement == "parent-private":
+        directory.rename(held)
+        candidate.rename(directory)
+    else:
+        candidate.rename(target)
+    public_replacement = replacement in {"leaf-regular", "leaf-public"}
+    expected = ValueError if public_replacement else alias_router.PrivatePathError
+    pattern = "reference parent changed while opening" if public_replacement else "owner-private host directory is not an input"
+    try:
+        with pytest.raises(expected, match=pattern):
+            mailbox.stage(raw, reference)
+        assert operation.failed_validation
+    finally:
+        if replacement == "parent-private":
+            directory.unlink()
+            held.rename(directory)
+        else:
+            target.unlink()
+    with pytest.raises(expected, match=pattern):
+        operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@secure_publication
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("replacement", ["regular", "private"])
+@pytest.mark.parametrize("surface", ["metadata", "stored-readiness"])
+def test_round12u_output_effect_identity_is_compared_at_acquisition(pilot, tmp_path, monkeypatch, capability, replacement, surface):  # noqa: F811
+    root, _reference = pilot
+    live, _opened = search_only_platform(monkeypatch, capability)
+    private = tmp_path / "owner" / ".codex"
+    private.mkdir(parents=True)
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: private.parent)
+    directory, raw = root.parent / "briefs", b"public generated packet"
+    target = directory / "check.md"
+    reference = {"path": str(target), "sha256": hashlib.sha256(raw).hexdigest()}
+    operation = portable_fresh._Operation()
+    mailbox = portable_fresh._CapturedMailbox(root, _operation=operation)
+    operation.output_directory(directory)
+    mailbox.brief(reference, verify=False)
+    original = operation.witnesses.negatives[target]
+    assert original.path == directory
+    mailbox.stage(raw, reference)
+    effect = operation.witnesses.effects[target]
+    candidate, held = tmp_path / "candidate", tmp_path / "held.md"
+    if replacement == "regular":
+        candidate.write_bytes(raw)
+    else:
+        symlink_or_skip(private, candidate, target_is_directory=True)
+    target.rename(held)
+    candidate.rename(target)
+    readiness = {"worktree": str(target), "branch": "candidate", "base_revision": "a" * 40,
+        "lease_ref": "refs/aegis/lanes/one", "lease_oid": "b" * 40,
+        "lease_expires_at": "2100-01-01T00:00:00Z", "owned_paths": ["app.py"],
+        "scan_workspace": str(tmp_path), "scan_evidence": "recorded", "hook_evidence": "recorded",
+        "enforcement_tier": "advisory"}
+    expected = ValueError if replacement == "regular" else alias_router.PrivatePathError
+    pattern = ("reference parent changed while opening" if replacement == "regular"
+        else "owner-private host directory is not an input")
+    try:
+        with pytest.raises(expected, match=pattern):
+            if surface == "metadata":
+                mailbox.brief(reference, verify=False)
+            else:
+                mailbox._stored_message_paths, mailbox._stored_message_refusals = set(), []
+                mailbox.readiness(readiness, observe=False)
+        assert operation.failed_validation
+    finally:
+        target.unlink()
+        held.rename(target)
+    assert operation.witnesses.negatives[target] is original
+    assert operation.witnesses.effects[target] == effect
+    with pytest.raises(expected, match=pattern):
+        operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@secure_publication
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("component", ["job", "ancestor"])
+@pytest.mark.parametrize("planned", [False, True], ids=["legacy", "planned"])
+def test_round12v_job_directory_kind_keeps_legacy_and_planned_error_bytes(tmp_path, monkeypatch, capability, component, planned):
+    from tools import hierarchy_jobs as jobs
+
+    live, _opened = search_only_platform(monkeypatch, capability)
+    monkeypatch.setattr("tools.hierarchy_jobs.os", SimpleNamespace(**{**vars(jobs.os), "close": portable_fresh.os.close}))
+    job_type = jobs.PlannedJob if planned else jobs.Job
+    job = job_type(tmp_path / "store", {"id": "pilot", "mailbox_root": str(tmp_path / "mailbox")},
+                   {"message_id": "job-0"})
+    job.folder.mkdir(parents=True)
+    job.result_path.write_bytes(b"{}")
+    node = job.folder if component == "job" else job.folder.parent
+    held = tmp_path / "retained-directory"
+    original, replaced = portable_fresh.open_directory, []
+    def opening(path):
+        node.rename(held)
+        node.write_bytes(b"not a directory")
+        replaced.append(True)
+        return original(path)
+    monkeypatch.setattr(portable_fresh, "open_directory", opening)
+    for _ in range(2):
+        expected_type = ValueError if planned else NotADirectoryError
+        try:
+            with pytest.raises(expected_type) as caught:
+                job.result()
+        finally:
+            if held.exists():
+                node.unlink()
+                held.rename(node)
+        expected = (("job directory is not a directory" if component == "job" else "job directory unavailable")
+                    if planned else str(NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR),
+                                                          str(job.result_path))))
+        assert type(caught.value) is expected_type
+        assert str(caught.value).encode("utf-8") == expected.encode("utf-8")
+        assert job.result_path.read_bytes() == b"{}"
+    assert replaced == [True, True] and live.closed()
+
+
+@secure_reference
+@secure_publication
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("component", ["directory", "ancestor"])
+def test_round12v_publication_directory_kind_keeps_core_refusal_bytes(tmp_path, monkeypatch, capability, component):
+    live, _opened = search_only_platform(monkeypatch, capability)
+    blocked = tmp_path / "blocked"
+    blocked.write_bytes(b"not a directory")
+    directory = blocked if component == "directory" else blocked / "briefs"
+    target, raw = directory / "note.md", b"public"
+    operation = portable_fresh._Operation()
+    with pytest.raises(ValueError) as caught:
+        portable_fresh.publish(raw, {"path": str(target), "sha256": hashlib.sha256(raw).hexdigest()},
+                               _operation=operation)
+    assert str(caught.value).encode("utf-8") == b"reference parent changed while opening"
+    assert operation.failed_validation
+    blocked.unlink()
+    directory.mkdir(parents=True)
+    with pytest.raises(ValueError, match="reference parent changed while opening"):
+        operation.verify()
+    assert not target.exists() and live.closed()
+
+
+@secure_reference
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("surface", ["evidence", "attachment"])
+@pytest.mark.parametrize("observation", ["absent-leaf", "ancestor", "semantic-hash"])
+def test_round12w_declarations_inherit_the_complete_parent_ledger(pilot, tmp_path, monkeypatch, capability, surface, observation):  # noqa: F811
+    live, _opened = search_only_platform(monkeypatch, capability)
+    root, _reference = pilot
+    public, held = tmp_path / "public", tmp_path / "held"
+    public.mkdir()
+    target = public / "note.md"
+    if observation == "semantic-hash":
+        target.write_bytes(b"stable mismatched public text")
+    operation = portable_fresh._Operation()
+    captured = public / "sibling-absence" if observation == "ancestor" else target
+    assert operation.exists(captured) == (observation == "semantic-hash")
+    reference = {"path": str(target), "sha256": hashlib.sha256(b"declared bytes").hexdigest()}
+    original, changed = portable_fresh._declaration_operation, []
+    def declaring(parent, **kwargs):
+        if kwargs.get("_proof", True) and not changed and observation != "semantic-hash":
+            if observation == "ancestor":
+                public.rename(held)
+                public.mkdir()
+            target.write_bytes(b"foreign mismatched public text")
+            changed.append(True)
+        return original(parent, **kwargs)
+    monkeypatch.setattr(portable_fresh, "_declaration_operation", declaring)
+    try:
+        if surface == "evidence":
+            brief = portable_fresh.Brief(_operation=operation)
+            brief.evidence(reference, {"path": "durable-origin", "sha256": "a" * 64})
+            assert brief.sections["Evidence references"][0]["kind"] == "unverified_evidence"
+        else:
+            mailbox = portable_fresh._CapturedMailbox(root, _operation=operation)
+            with pytest.raises(ValueError):
+                portable_fresh._unread_attachment(mailbox, reference)
+        assert operation.failed_validation == (observation != "semantic-hash")
+    finally:
+        if changed:
+            target.unlink()
+            if observation == "ancestor":
+                public.rmdir()
+                held.rename(public)
+    if observation == "semantic-hash":
+        operation.verify()
+    else:
+        assert changed
+        with pytest.raises(ValueError, match="reference parent changed while opening"):
+            operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@secure_publication
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("appearance", ["regular", "directory", "fifo"])
+def test_round12w_publication_compares_success_before_classification(pilot, tmp_path, monkeypatch, capability, appearance):  # noqa: F811
+    if appearance == "fifo" and (os.name != "posix" or not hasattr(os, "mkfifo")):
+        pytest.skip("FIFO substitution requires POSIX")
+    live, _opened = search_only_platform(monkeypatch, capability)
+    root, _reference = pilot
+    folder = root.parent / "briefs"
+    folder.mkdir()
+    target, raw = folder / "new.md", b"public generated bytes"
+    reference = {"path": str(target), "sha256": hashlib.sha256(raw).hexdigest()}
+    operation = portable_fresh._Operation()
+    mailbox = portable_fresh._CapturedMailbox(root, _operation=operation)
+    original, changed, reads = portable_fresh._acquire, [], []
+    def acquiring(kind, *args, **kwargs):
+        if kind == "open" and kwargs.get("_negative", (None,))[0] == target and not changed:
+            if appearance == "regular":
+                target.write_bytes(b"foreign bytes")
+            elif appearance == "directory":
+                target.mkdir()
+            else:
+                os.mkfifo(target)
+            changed.append(True)
+        if changed and kind in {"fdopen", "read", "stream-read"}:
+            reads.append(kind)
+        return original(kind, *args, **kwargs)
+    monkeypatch.setattr(portable_fresh, "_acquire", acquiring)
+    try:
+        with pytest.raises(ValueError) as caught:
+            mailbox.stage(raw, reference)
+        assert str(caught.value) == "reference parent changed while opening"
+        assert operation.failed_validation and not reads
+    finally:
+        if changed:
+            target.rmdir() if appearance == "directory" else target.unlink()
+    assert changed
+    with pytest.raises(ValueError, match="reference parent changed while opening"):
+        operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("kind", ["open", "stat", "lstat", "fstat", "read", "fdopen", "names", "link", "stream-read", "identify"])
+def test_round12w_each_acquisition_compares_a_captured_negative(tmp_path, monkeypatch, capability, kind):
+    live, _opened = search_only_platform(monkeypatch, capability)
+    parent = tmp_path / "public"
+    parent.mkdir()
+    target = parent / "note"
+    operation = portable_fresh._Operation()
+    assert operation.exists(target) is False
+    descriptor = directory = None
+    receipt = None
+    if kind in {"names", "identify"}:
+        target.mkdir()
+    elif kind == "link":
+        reader = portable_fresh._symlink_reader()
+        if reader is None:
+            pytest.skip("bounded descriptor readlink is unsupported")
+        destination = parent / "public-target"
+        destination.write_bytes(b"public")
+        symlink_or_skip(destination, target)
+        with operation.active():
+            directory = portable_fresh.open_directory(parent)
+    else:
+        target.write_bytes(b"foreign")
+        if kind in {"fstat", "read", "fdopen", "stream-read"}:
+            descriptor = portable_fresh.os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
+            receipt = capture_public_test_handle(descriptor)
+    if kind == "identify":
+        descriptor = portable_fresh.os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        receipt = capture_public_test_handle(descriptor)
+    delivered = []
+    def acquiring():
+        with operation.active():
+            if kind == "open":
+                opened = portable_fresh._acquire(kind, target, os.O_RDONLY | os.O_NOFOLLOW, _path=target)
+                delivered.append(True)
+                os.close(opened)
+                return None
+            if kind in {"stat", "lstat", "names"}:
+                value = portable_fresh._acquire(kind, target, _path=target)
+                delivered.append(True)
+                return value
+            if kind == "link":
+                value = reader(directory, target.name, len(os.fsencode(destination)))
+                delivered.append(True)
+                return value
+            if kind == "read":
+                value = portable_fresh._acquire(kind, descriptor, 7, _path=target)
+                delivered.append(True)
+                return value
+            if kind == "stream-read":
+                with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                    value = portable_fresh._acquire(kind, stream, 7, _path=target)
+                    delivered.append(True)
+                    return value
+            if kind == "fdopen":
+                stream = portable_fresh._acquire(kind, descriptor, "rb", _path=target)
+                delivered.append(True)
+                stream.close()
+                return None
+            value = portable_fresh._acquire(kind, descriptor, _path=target)
+            delivered.append(True)
+            return value
+    try:
+        with pytest.raises(ValueError, match="reference parent changed while opening"):
+            operation.prove(acquiring)
+        assert operation.failed_validation and not delivered
+    finally:
+        if directory is not None:
+            portable_fresh.os.close(directory)
+        if descriptor is not None and not receipt.closed:
+            portable_fresh.os.close(descriptor)
+        target.rmdir() if kind in {"names", "identify"} else target.unlink()
+    with pytest.raises(ValueError, match="reference parent changed while opening"):
+        operation.verify()
+    assert live.closed()
+
+
+def test_round12w_structural_census_reviews_every_acquisition_boundary():
+    acquisitions = {"open", "stat", "lstat", "fstat", "fdopen", "read", "scandir", "listdir", "readlink",
+                    "exists", "is_dir", "is_file", "is_symlink", "resolve", "glob", "rglob",
+                    "read_text", "read_bytes", "iterdir", "readlinkat", "mkdir", "walk", "fwalk",
+                    "readinto", "pread", "readv", "link", "rename", "replace", "unlink", "remove", "rmdir"}
+    source = TOOL.read_text()
+    tree = ast.parse(source)
+    declarations = [node for node in tree.body if isinstance(node, ast.Assign)
+                    and any(isinstance(target, ast.Name) and target.id == "_ACQUISITION_CALL_ALLOWLIST"
+                            for target in node.targets)]
+    assert len(declarations) == 1, "acquisition exemptions need an explicit reviewed in-file allowlist"
+    allowlist = ast.literal_eval(declarations[0].value)
+    assert allowlist and all(type(key) is str and type(reason) is str and len(reason) >= 30
+                             for key, reason in allowlist.items())
+    def census(raw):
+        violations, owners, aliases = [], [], {}
+        class Calls(ast.NodeVisitor):
+            def visit_Import(self, node):
+                for item in node.names:
+                    aliases[item.asname or item.name] = item.name
+            def visit_ImportFrom(self, node):
+                for item in node.names:
+                    aliases[item.asname or item.name] = (node.module or "") + "." + item.name
+            def visit_FunctionDef(self, node):
+                previous = dict(aliases)
+                owners.append(node.name)
+                self.generic_visit(node)
+                owners.pop()
+                aliases.clear()
+                aliases.update(previous)
+            visit_AsyncFunctionDef = visit_FunctionDef
+            def visit_ClassDef(self, node):
+                owners.append(node.name)
+                self.generic_visit(node)
+                owners.pop()
+            def visit_Assign(self, node):
+                if isinstance(node.value, (ast.Name, ast.Attribute)):
+                    value = ast.unparse(node.value)
+                    first, separator, rest = value.partition(".")
+                    value = aliases.get(first, first) + (separator + rest if separator else "")
+                    if value.rsplit(".", 1)[-1] in acquisitions:
+                        for target in node.targets:
+                            if isinstance(target, ast.Name):
+                                aliases[target.id] = value
+                self.generic_visit(node)
+            def visit_Call(self, node):
+                if owners != ["_acquire"]:
+                    name = ast.unparse(node.func)
+                    if isinstance(node.func, ast.Name):
+                        name = aliases.get(name, name)
+                    if isinstance(node.func, ast.Call) and isinstance(node.func.func, ast.Name) and node.func.func.id == "getattr":
+                        name = "getattr-filesystem-call"
+                    tail = name.rsplit(".", 1)[-1]
+                    captured = (name in allowlist and (name != "self.read" or owners[:1] == ["_Operation"])
+                                and (name != "read" or owners == ["_link_snapshot"]))
+                    if not captured and (tail in acquisitions or name == "getattr-filesystem-call"):
+                        violations.append((tuple(owners), node.lineno, name))
+                self.generic_visit(node)
+        Calls().visit(ast.parse(raw))
+        return violations
+    assert census(source) == []
+    mutations = ["os.open(path, 0)", "open(path, 'rb')", "path.stat()", "path.exists()",
+                 "Path(path).read_bytes()", "os.readlink(path)", "os.listdir(path)", "os.scandir(path)",
+                 "os.fstat(fd)", "getattr(os, 'stat')(path)", "stream.read(1)",
+                 "os.link(src, dst)", "os.rename(src, dst)", "os.replace(src, dst)", "os.unlink(path)"]
+    for mutation in mutations:
+        assert census(source + "\ndef bypass():\n    " + mutation + "\n")
+        assert census(source + "\n" + mutation + "\n")
+    assert census(source + "\ndef bypass():\n    observe = os.stat\n    observe(path)\n")
+    assert census(source + "\nfrom os import stat as observe\ndef bypass():\n    observe(path)\n")
+
+
+@secure_reference
+@secure_publication
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("failure", ["ordinary", "interrupted"])
+def test_round12w_fdopen_owns_its_descriptor_on_every_failure(pilot, monkeypatch, capability, failure):  # noqa: F811
+    live, _opened = search_only_platform(monkeypatch, capability)
+    root, _reference = pilot
+    class Interrupted(BaseException):
+        pass
+    error = RuntimeError("modelled fdopen unavailable") if failure == "ordinary" else Interrupted()
+    native, attempted = portable_fresh.os, []
+    def refusing(descriptor, *args, **kwargs):
+        attempted.append(capture_public_test_handle(descriptor))
+        raise error
+    monkeypatch.setattr(portable_fresh, "os", SimpleNamespace(**{**vars(native), "fdopen": refusing}))
+    target, raw = root.parent / "briefs" / "new.md", b"public"
+    reference = {"path": str(target), "sha256": hashlib.sha256(raw).hexdigest()}
+    operation = portable_fresh._Operation()
+    try:
+        with pytest.raises(ValueError if failure == "ordinary" else Interrupted):
+            portable_fresh.publish(raw, reference, _operation=operation)
+        assert attempted and all(receipt.closed for receipt in attempted)
+    finally:
+        for receipt in attempted:
+            if not receipt.closed:
+                native.close(receipt.descriptor)
+    assert not target.exists() and live.closed()
+
+
+@secure_reference
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("observation", ["positive", "negative"])
+def test_round12w_owned_allocations_compare_the_same_input_witnesses(tmp_path, monkeypatch, capability, observation):
+    live, _opened = search_only_platform(monkeypatch, capability)
+    parent, held = tmp_path / "outputs", tmp_path / "retained"
+    parent.mkdir()
+    target = parent / "temporary"
+    if observation == "positive":
+        target.write_bytes(b"captured input")
+    operation = portable_fresh._Operation()
+    operation.output_directory(parent)
+    assert operation.exists(target) == (observation == "positive")
+    if observation == "positive":
+        target.rename(held)
+    delivered = []
+    def allocate():
+        with operation.active():
+            descriptor = portable_fresh._acquire("open", target,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, _path=target)
+            delivered.append(True)
+            portable_fresh.os.close(descriptor)
+    try:
+        with pytest.raises(ValueError, match="reference parent changed while opening"):
+            operation.prove(allocate)
+        assert operation.failed_validation and not delivered
+    finally:
+        if target.exists():
+            target.unlink()
+        if held.exists():
+            held.rename(target)
+    with pytest.raises(ValueError, match="reference parent changed while opening"):
+        operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("backend", ["descriptor", "portable"])
+@pytest.mark.parametrize("observation", ["stable", "leaf", "ancestor", "private"])
+def test_round12w_stream_reader_binds_borrowed_descriptors(tmp_path, monkeypatch, capability, backend, observation):
+    parent, held = tmp_path / "public", tmp_path / "held"
+    parent.mkdir()
+    target, raw = parent / "note", b"public bytes"
+    if observation == "private":
+        private = tmp_path / "private-file"
+        private.write_bytes(b"private fixture")
+        os.link(private, target)
+        monkeypatch.setattr(alias_router, "_owner_home", lambda: tmp_path / "owner")
+        monkeypatch.setattr(alias_router, "_home_declarations", lambda: (("ROUND12W_HOME", ".private"),))
+        monkeypatch.setattr(alias_router, "os", SimpleNamespace(**{**vars(os),
+            "environ": {**os.environ, "ROUND12W_HOME": str(private)}}))
+    else:
+        target.write_bytes(raw)
+    before = target.stat()
+    descriptor = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
+    live, _opened = search_only_platform(monkeypatch, capability)
+    monkeypatch.setattr(portable_fresh, "_reference_descriptors", lambda: backend == "descriptor")
+    operation = portable_fresh._Operation()
+    if observation == "ancestor":
+        operation.entries(parent, identity_only=True)
+        parent.rename(held)
+        parent.mkdir()
+        target.write_bytes(raw)
+    elif observation == "leaf":
+        target.rename(held)
+        target.write_bytes(raw)
+    chunks = []
+    def consume():
+        return portable_fresh._stream_reference(descriptor, before, target, chunks.append)
+    expected = alias_router.PrivatePathError if observation == "private" else ValueError
+    try:
+        if observation == "stable":
+            assert operation.prove(consume) is not None
+            assert b"".join(chunks) == raw and not operation.failed_validation
+            operation.verify()
+        else:
+            with pytest.raises(expected):
+                operation.prove(consume)
+            assert chunks == []
+    finally:
+        os.close(descriptor)
+        if observation == "ancestor":
+            target.unlink()
+            parent.rmdir()
+            held.rename(parent)
+        elif observation == "leaf":
+            target.unlink()
+            held.rename(target)
+    if observation == "stable":
+        parent.rename(held)
+        parent.mkdir()
+        target.write_bytes(raw)
+        try:
+            with pytest.raises(ValueError, match="reference parent changed while opening"):
+                operation.verify()
+        finally:
+            target.unlink()
+            parent.rmdir()
+            held.rename(parent)
+    if observation != "private":
+        with pytest.raises(ValueError, match="reference parent changed while opening"):
+            operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("kind", ["stat", "lstat"])
+def test_round12w_first_observation_requires_a_complete_parent_prefix(tmp_path, monkeypatch, capability, kind):
+    live, _opened = search_only_platform(monkeypatch, capability)
+    target = tmp_path / "public"
+    target.write_bytes(b"public")
+    operation = portable_fresh._Operation()
+    delivered = []
+    def observe():
+        value = portable_fresh._acquire(kind, target, _guard=operation.path_guard)
+        delivered.append(value)
+    with pytest.raises(ValueError, match="reference parent changed while opening"):
+        operation.prove(observe)
+    assert not delivered and operation.failed_validation
+    with pytest.raises(ValueError, match="reference parent changed while opening"):
+        operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("observation", ["stable", "reused", "ancestor", "unknown"])
+def test_round12w_directory_reader_binds_borrowed_descriptors(tmp_path, monkeypatch, capability, observation):
+    live, _opened = search_only_platform(monkeypatch, capability)
+    original, parent, held = tmp_path / "original", tmp_path / "public", tmp_path / "held"
+    original.mkdir()
+    parent.mkdir()
+    (parent / "note").write_bytes(b"public")
+    operation = portable_fresh._Operation()
+    operation.entries(original, identity_only=True)
+    if observation != "unknown":
+        operation.entries(parent, identity_only=True)
+    borrowed = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    descriptor, owned = borrowed, False
+    delivered = []
+    def enumerate_names():
+        value = portable_fresh._directory_names(descriptor)
+        delivered.append(value)
+        return value
+    try:
+        if observation == "reused":
+            with operation.active():
+                descriptor = portable_fresh._acquire("open", original,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, _path=original)
+            owned = True
+            # Both slots remain test-owned while dup2 replaces this open description.
+            os.dup2(borrowed, descriptor)
+        elif observation == "ancestor":
+            parent.rename(held)
+            parent.mkdir()
+            (parent / "replacement").write_bytes(b"foreign")
+        if observation in {"stable", "reused"}:
+            operation.prove(enumerate_names)
+            assert delivered == [("note",)]
+            assert not operation.failed_validation
+            operation.verify()
+        else:
+            with pytest.raises(ValueError, match="reference parent changed while opening"):
+                operation.prove(enumerate_names)
+            assert not delivered and operation.failed_validation
+    finally:
+        try:
+            if owned:
+                portable_fresh.os.close(descriptor)
+        finally:
+            os.close(borrowed)
+        if observation == "ancestor" and held.exists():
+            (parent / "replacement").unlink()
+            parent.rmdir()
+            held.rename(parent)
+    if observation in {"ancestor", "unknown"}:
+        with pytest.raises(ValueError, match="reference parent changed while opening"):
+            operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@secure_publication
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("replacement", ["stable", "directory", "private-link"])
+def test_round12w_creation_records_the_observed_birth_identity(tmp_path, monkeypatch, capability, replacement):
+    target, held = tmp_path / "briefs" / "note.md", tmp_path / "held"
+    created, swapped = [], []
+    private = tmp_path / "private"
+    if replacement == "private-link":
+        private.mkdir()
+        monkeypatch.setattr(alias_router, "_owner_home", lambda: tmp_path / "owner")
+        monkeypatch.setattr(alias_router, "_home_declarations", lambda: (("ROUND12W_HOME", ".private"),))
+        monkeypatch.setattr(alias_router, "os", SimpleNamespace(**{**vars(os),
+            "environ": {**os.environ, "ROUND12W_HOME": str(private)}}))
+    def opening(path, flags, *args, **kwargs):
+        if created and not swapped and Path(path).name == target.parent.name and flags & os.O_DIRECTORY:
+            if replacement == "stable":
+                return
+            target.parent.rename(held)
+            if replacement == "directory":
+                target.parent.mkdir()
+            else:
+                symlink_or_skip(private, target.parent)
+            swapped.append(True)
+    live, _opened = search_only_platform(monkeypatch, capability, opening=opening)
+    namespace = portable_fresh.os
+    def making(path, *args, **kwargs):
+        value = namespace.mkdir(path, *args, **kwargs)
+        if Path(path).name == target.parent.name:
+            created.append(True)
+        return value
+    monkeypatch.setattr(portable_fresh, "os", SimpleNamespace(**{**vars(namespace), "mkdir": making}))
+    operation, raw = portable_fresh._Operation(), b"public"
+    reference = {"path": str(target), "sha256": hashlib.sha256(raw).hexdigest()}
+    expected = alias_router.PrivatePathError if replacement == "private-link" else ValueError
+    try:
+        if replacement == "stable":
+            portable_fresh.publish(raw, reference, _operation=operation)
+            assert target.read_bytes() == raw and not operation.failed_validation
+            operation.verify()
+        else:
+            with pytest.raises(expected):
+                portable_fresh.publish(raw, reference, _operation=operation)
+            assert swapped and not target.exists() and operation.failed_validation
+    finally:
+        if swapped:
+            if target.parent.is_symlink():
+                target.parent.unlink()
+            else:
+                if target.exists():
+                    target.unlink()
+                target.parent.rmdir()
+            held.rename(target.parent)
+    if replacement != "stable":
+        with pytest.raises(expected):
+            operation.verify()
+    assert created == [True] and live.closed()
+
+
+@secure_reference
+@secure_publication
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("boundary", ["mkdir", "open"])
+@pytest.mark.parametrize("peer", ["empty", "protocol", "symlink", "regular", "foreign-entry",
+                                  "foreign-owner", "foreign-parent-owner", "wrong-mode", "protocol-link", "protocol-mode", "private-symlink"])
+def test_round12y_peer_directory_transition_validates_before_publication(tmp_path, monkeypatch, capability, boundary, peer):
+    base = tmp_path / "public"
+    base.mkdir()
+    folder, raw = base / "briefs", b"public generated brief"
+    target = folder / ("fresh-" + hashlib.sha256(raw).hexdigest() + ".md")
+    candidate = tmp_path / "peer-target"
+    candidate.mkdir(mode=0o700)
+    if peer == "private-symlink":
+        monkeypatch.setattr(alias_router, "_owner_home", lambda: tmp_path / "owner")
+        monkeypatch.setattr(alias_router, "_home_declarations", lambda: (("ROUND12Y_HOME", ".private"),))
+        monkeypatch.setattr(alias_router, "os", SimpleNamespace(**{**vars(os),
+            "environ": {**os.environ, "ROUND12Y_HOME": str(candidate)}}))
+    introduced, owners, armed = [], [], []
+    def introduce():
+        if peer in {"symlink", "private-symlink"}:
+            symlink_or_skip(candidate, folder, target_is_directory=True)
+        elif peer == "regular":
+            folder.write_bytes(b"not a directory")
+        else:
+            folder.mkdir(mode=0o700)
+            if peer == "wrong-mode":
+                folder.chmod(0o755)
+            if peer == "foreign-entry":
+                (folder / "foreign.txt").write_bytes(b"foreign")
+            if peer in {"protocol", "protocol-link", "protocol-mode"}:
+                for prefix in ["fresh-", "check-", ".fresh-"]:
+                    content = ("peer " + prefix).encode()
+                    name = (prefix + "a" * 32 if prefix == ".fresh-" else
+                            prefix + hashlib.sha256(content).hexdigest() + ".md")
+                    entry = folder / name
+                    if peer == "protocol-link" and prefix == "fresh-":
+                        symlink_or_skip(candidate, entry, target_is_directory=True)
+                    else:
+                        entry.write_bytes(content)
+                        entry.chmod(0o644 if peer == "protocol-mode" else 0o600)
+            if peer in {"foreign-owner", "foreign-parent-owner"}:
+                info = folder.stat()
+                owners.append((info.st_dev, info.st_ino))
+                if peer == "foreign-parent-owner":
+                    parent_info = base.stat()
+                    owners.append((parent_info.st_dev, parent_info.st_ino))
+        introduced.append(True)
+    def opening(path, flags, *args, **kwargs):
+        if armed and boundary == "open" and Path(path).name == folder.name and flags & os.O_DIRECTORY and not introduced:
+            introduce()
+    live, _opened = search_only_platform(monkeypatch, capability, opening=opening)
+    native = portable_fresh.os
+    def making(path, *args, **kwargs):
+        if armed and boundary == "mkdir" and Path(path).name == folder.name and not introduced:
+            introduce()
+        return native.mkdir(path, *args, **kwargs)
+    def owner(info):
+        if (info.st_dev, info.st_ino) in owners:
+            return SimpleNamespace(st_mode=info.st_mode, st_ino=info.st_ino, st_dev=info.st_dev,
+                st_nlink=info.st_nlink, st_uid=info.st_uid + 1, st_gid=info.st_gid, st_size=info.st_size,
+                st_atime=info.st_atime, st_mtime=info.st_mtime, st_ctime=info.st_ctime,
+                st_atime_ns=info.st_atime_ns, st_mtime_ns=info.st_mtime_ns, st_ctime_ns=info.st_ctime_ns)
+        return info
+    def stated(path, *args, **kwargs):
+        return owner(native.stat(path, *args, **kwargs))
+    def fstated(descriptor):
+        return owner(native.fstat(descriptor))
+    monkeypatch.setattr(portable_fresh, "os", SimpleNamespace(**{**vars(native),
+        "mkdir": making, "stat": stated, "fstat": fstated}))
+    operation = portable_fresh._Operation()
+    operation.output_directory(folder)
+    with operation.active():
+        assert operation.path_guard.check(folder) is None
+    original = operation.witnesses.negative_edges[folder]
+    armed.append(True)
+    reference = {"path": str(target), "sha256": hashlib.sha256(raw).hexdigest()}
+    if peer in {"empty", "protocol"}:
+        portable_fresh.publish(raw, reference, _operation=operation)
+        assert target.read_bytes() == raw and not operation.failed_validation
+        operation.verify()
+        assert operation.witnesses.effects[folder] == portable_fresh.file_identity(folder.stat())
+    else:
+        expected = alias_router.PrivatePathError if peer == "private-symlink" else ValueError
+        pattern = ("owner-private host directory is not an input" if peer == "private-symlink"
+                   else "reference parent changed while opening")
+        with pytest.raises(expected, match=pattern):
+            portable_fresh.publish(raw, reference, _operation=operation)
+        assert operation.failed_validation and not target.exists()
+        with pytest.raises(expected, match=pattern):
+            operation.verify()
+    assert introduced == [True]
+    assert operation.witnesses.negative_edges[folder] is original
+    assert live.closed()
+
+
+@secure_reference
+@secure_publication
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+def test_round12y_peer_admission_never_replaces_an_existing_directory(tmp_path, monkeypatch, capability):
+    base = tmp_path / "public"
+    base.mkdir()
+    folder, held, raw = base / "briefs", base / "held", b"public"
+    folder.mkdir(mode=0o700)
+    target = folder / ("fresh-" + hashlib.sha256(raw).hexdigest() + ".md")
+    armed, changed = [], []
+    def opening(path, flags, *args, **kwargs):
+        if armed and Path(path).name == folder.name and flags & os.O_DIRECTORY and not changed:
+            folder.rename(held)
+            folder.mkdir(mode=0o700)
+            changed.append(True)
+    live, _opened = search_only_platform(monkeypatch, capability, opening=opening)
+    operation = portable_fresh._Operation()
+    operation.output_directory(folder)
+    assert operation.exists(target) is False
+    previous = operation.witnesses.positive[folder]
+    armed.append(True)
+    with pytest.raises(ValueError, match="reference parent changed while opening"):
+        portable_fresh.publish(raw, {"path": str(target), "sha256": hashlib.sha256(raw).hexdigest()}, _operation=operation)
+    assert changed and operation.failed_validation and not target.exists()
+    assert operation.witnesses.positive[folder] == previous
+    with pytest.raises(ValueError, match="reference parent changed while opening"):
+        operation.verify()
+    assert live.closed()
+
+
+def test_round12y_peer_publication_refuses_unsupported_platform_probe(tmp_path, monkeypatch):
+    monkeypatch.setattr(portable_fresh, "_descriptor_capabilities", lambda: False)
+    monkeypatch.setattr(portable_fresh, "os", SimpleNamespace(**{**vars(os), "supports_dir_fd": set()}))
+    path, raw = tmp_path / "briefs" / "note.md", b"public"
+    with pytest.raises(ValueError, match="secure brief publication requires directory descriptor support"):
+        portable_fresh.publish(raw, {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest()})
+    assert not path.parent.exists()
+
+
+@secure_reference
+@secure_publication
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("changed_component", ["directory", "ancestor"])
+@pytest.mark.parametrize("seam", ["stat-open", "open-enumerate"])
+def test_round12y_peer_validation_keeps_every_existing_prefix(tmp_path, monkeypatch, capability, changed_component, seam):
+    base, retained = tmp_path / "public", tmp_path / "retained"
+    base.mkdir()
+    folder, raw = base / "briefs", b"public"
+    target = folder / ("fresh-" + hashlib.sha256(raw).hexdigest() + ".md")
+    created, changed = [], []
+    def substitute():
+        (folder if changed_component == "directory" else base).rename(retained)
+        if changed_component == "ancestor":
+            base.mkdir()
+        folder.mkdir(mode=0o700)
+        changed.append(True)
+    def opening(path, flags, *args, **kwargs):
+        if seam == "stat-open" and created and not changed and Path(path).name == folder.name and flags & os.O_DIRECTORY:
+            substitute()
+    live, _opened = search_only_platform(monkeypatch, capability, opening=opening)
+    native = portable_fresh.os
+    def making(path, *args, **kwargs):
+        if Path(path).name == folder.name and not created:
+            folder.mkdir(mode=0o700)
+            created.append(True)
+        return native.mkdir(path, *args, **kwargs)
+    def scanning(descriptor):
+        result = native.scandir(descriptor)
+        if seam == "open-enumerate" and created and not changed:
+            substitute()
+        return result
+    monkeypatch.setattr(portable_fresh, "os", SimpleNamespace(**{**vars(native),
+        "mkdir": making, "scandir": scanning}))
+    operation = portable_fresh._Operation()
+    operation.output_directory(folder)
+    assert operation.exists(target) is False
+    with pytest.raises(ValueError, match="reference parent changed while opening"):
+        portable_fresh.publish(raw, {"path": str(target), "sha256": hashlib.sha256(raw).hexdigest()}, _operation=operation)
+    assert created == [True] and changed == [True] and operation.failed_validation
+    assert folder not in operation.witnesses.effects and not target.exists()
+    with pytest.raises(ValueError, match="reference parent changed while opening"):
+        operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@secure_publication
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("failure", ["close", "private-close", "interrupt"])
+def test_round12y_peer_validation_closes_every_owned_handle(tmp_path, monkeypatch, capability, failure):
+    base = tmp_path / "public"
+    base.mkdir()
+    folder, raw = base / "briefs", b"public"
+    target = folder / ("fresh-" + hashlib.sha256(raw).hexdigest() + ".md")
+    private = tmp_path / "private"
+    if failure == "private-close":
+        private.mkdir()
+        monkeypatch.setattr(alias_router, "_owner_home", lambda: tmp_path / "owner")
+        monkeypatch.setattr(alias_router, "_home_declarations", lambda: (("ROUND12Y_CLOSE_HOME", ".private"),))
+        monkeypatch.setattr(alias_router, "os", SimpleNamespace(**{**vars(os),
+            "environ": {**os.environ, "ROUND12Y_CLOSE_HOME": str(private)}}))
+    created, interrupted = [], []
+    def closing(path):
+        frame = sys._getframe()
+        while frame is not None and frame.f_code.co_name != "_peer_publication_directory":
+            frame = frame.f_back
+        if failure != "interrupt" and created and not interrupted and path == base and frame is not None:
+            interrupted.append(True)
+            raise OSError("modelled peer parent close failure")
+    live, _opened = search_only_platform(monkeypatch, capability, closing=closing)
+    native = portable_fresh.os
+    def making(path, *args, **kwargs):
+        if Path(path).name == folder.name and not created:
+            if failure == "private-close":
+                symlink_or_skip(private, folder, target_is_directory=True)
+            else:
+                folder.mkdir(mode=0o700)
+            created.append(True)
+        return native.mkdir(path, *args, **kwargs)
+    def scanning(descriptor):
+        if failure == "interrupt" and created and live.get(descriptor) == folder:
+            interrupted.append(True)
+            raise KeyboardInterrupt("modelled peer listing interruption")
+        return native.scandir(descriptor)
+    monkeypatch.setattr(portable_fresh, "os", SimpleNamespace(**{**vars(native),
+        "mkdir": making, "scandir": scanning}))
+    operation = portable_fresh._Operation()
+    operation.output_directory(folder)
+    assert operation.exists(target) is False
+    expected = (KeyboardInterrupt if failure == "interrupt" else
+                alias_router.PrivatePathError if failure == "private-close" else ValueError)
+    pattern = ("modelled peer listing interruption" if failure == "interrupt" else
+               "owner-private host directory is not an input" if failure == "private-close" else
+               "reference parent changed while opening")
+    try:
+        with pytest.raises(expected, match=pattern):
+            portable_fresh.publish(raw, {"path": str(target), "sha256": hashlib.sha256(raw).hexdigest()}, _operation=operation)
+        assert created == [True] and interrupted == [True] and not target.exists()
+        if failure != "interrupt":
+            assert operation.failed_validation
+            with pytest.raises(expected, match=pattern):
+                operation.verify()
+        assert live.closed()
+    finally:
+        # A failing ownership control must not leave its intentionally exposed leak.
+        for descriptor in list(live):
+            portable_fresh.os.close(descriptor)
+
+
+def test_round12y_peer_publication_refuses_missing_owner_probe(tmp_path, monkeypatch):
+    monkeypatch.setattr(portable_fresh, "os", SimpleNamespace(**{**vars(os), "geteuid": None}))
+    path, raw = tmp_path / "briefs" / "note.md", b"public"
+    with pytest.raises(ValueError, match="secure brief publication requires directory descriptor support"):
+        portable_fresh.publish(raw, {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest()})
+    assert not path.parent.exists()
+
+
+@secure_reference
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("component", ["directory", "ancestor"])
+def test_round12z_borrowed_directory_rechecks_a_cached_binding_before_delivery(tmp_path, monkeypatch, capability, component):
+    live, _opened = search_only_platform(monkeypatch, capability)
+    base, held = tmp_path / "public", tmp_path / "held"
+    parent = base / "input"
+    parent.mkdir(parents=True)
+    (parent / "note").write_bytes(b"public")
+    operation = portable_fresh._Operation()
+    operation.entries(parent, identity_only=True)
+    borrowed = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    delivered = []
+    def enumerate_names():
+        names = portable_fresh._directory_names(borrowed)
+        delivered.append(names)
+        return names
+    try:
+        operation.prove(enumerate_names)
+        assert delivered == [("note",)]
+        delivered.clear()
+        (parent if component == "directory" else base).rename(held)
+        parent.mkdir(parents=True)
+        (parent / "replacement").write_bytes(b"foreign")
+        with pytest.raises(ValueError, match="reference parent changed while opening"):
+            operation.prove(enumerate_names)
+        assert not delivered and operation.failed_validation
+    finally:
+        os.close(borrowed)
+        if held.exists():
+            (parent / "replacement").unlink()
+            parent.rmdir()
+            if component == "ancestor":
+                base.rmdir()
+            held.rename(parent if component == "directory" else base)
+    with pytest.raises(ValueError, match="reference parent changed while opening"):
+        operation.verify()
+    assert live.closed()
+
+
+
+def round12za_after_acquisition(action, kind, substitute):
+    def acquiring(*args, **kwargs):
+        result = action(*args, **kwargs)
+        caller = sys._getframe(1)
+        if caller.f_code.co_name == "_acquire" and caller.f_locals.get("kind") == kind:
+            substitute()
+        return result
+    return acquiring
+
+
+@secure_reference
+@secure_publication
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("variant", ["wrong-mode", "foreign-entry", "foreign-owner"])
+def test_round12za_successful_mkdir_admits_the_first_observation(tmp_path, monkeypatch, capability, variant):
+    base, held = tmp_path / "public", tmp_path / "retained"
+    base.mkdir()
+    directory, raw = base / "briefs", b"public"
+    target = directory / ("fresh-" + hashlib.sha256(raw).hexdigest() + ".md")
+    live, _opened = search_only_platform(monkeypatch, capability)
+    native, swapped, foreign = portable_fresh.os, [], []
+    def making(path, *args, **kwargs):
+        result = native.mkdir(path, *args, **kwargs)
+        if Path(path).name == directory.name and not swapped:
+            directory.rename(held)
+            directory.mkdir(mode=0o700)
+            if variant == "wrong-mode":
+                directory.chmod(0o755)
+            elif variant == "foreign-entry":
+                (directory / "foreign.txt").write_bytes(b"foreign")
+            else:
+                foreign.append(portable_fresh.file_identity(directory.stat()))
+            swapped.append(True)
+        return result
+    def owner(info):
+        if portable_fresh.file_identity(info) in foreign:
+            return SimpleNamespace(st_mode=info.st_mode, st_ino=info.st_ino, st_dev=info.st_dev,
+                st_nlink=info.st_nlink, st_uid=info.st_uid + 1, st_gid=info.st_gid, st_size=info.st_size,
+                st_atime=info.st_atime, st_mtime=info.st_mtime, st_ctime=info.st_ctime,
+                st_atime_ns=info.st_atime_ns, st_mtime_ns=info.st_mtime_ns, st_ctime_ns=info.st_ctime_ns)
+        return info
+    def stated(*args, **kwargs):
+        return owner(native.stat(*args, **kwargs))
+    def fstated(*args, **kwargs):
+        return owner(native.fstat(*args, **kwargs))
+    monkeypatch.setattr(portable_fresh, "os", SimpleNamespace(**{**vars(native),
+        "mkdir": making, "stat": stated, "fstat": fstated}))
+    operation = portable_fresh._Operation()
+    operation.output_directory(directory)
+    assert operation.exists(target) is False
+    with pytest.raises(ValueError, match="reference parent changed while opening"):
+        portable_fresh.publish(raw, {"path": str(target), "sha256": hashlib.sha256(raw).hexdigest()}, _operation=operation)
+    assert swapped and operation.failed_validation and directory not in operation.witnesses.effects
+    assert not target.exists() and live.closed()
+    with pytest.raises(ValueError, match="reference parent changed while opening"):
+        operation.verify()
+
+
+@secure_reference
+@secure_publication
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("invalid,failure_errno", [("symlink", errno.ELOOP), ("symlink", errno.ENOTDIR), ("regular", errno.ENOTDIR)])
+def test_round12za_transient_invalid_directory_never_recovers_as_peer(tmp_path, monkeypatch, capability, invalid, failure_errno):
+    base = tmp_path / "public"
+    base.mkdir()
+    directory, candidate, raw = base / "briefs", tmp_path / "candidate", b"public"
+    candidate.mkdir(mode=0o700)
+    target = directory / ("fresh-" + hashlib.sha256(raw).hexdigest() + ".md")
+    armed, observed, errors = [], [], []
+    def opening(path, flags, *args, **kwargs):
+        if armed and not observed and Path(path).name == directory.name and flags & os.O_DIRECTORY:
+            if invalid == "symlink":
+                symlink_or_skip(candidate, directory, target_is_directory=True)
+            else:
+                directory.write_bytes(b"foreign")
+            observed.append(True)
+    live, _opened = search_only_platform(monkeypatch, capability, opening=opening)
+    native = portable_fresh.os
+    def opened(path, flags, *args, **kwargs):
+        try:
+            return native.open(path, flags, *args, **kwargs)
+        except OSError as error:
+            if observed and not errors and Path(path).name == directory.name and flags & os.O_DIRECTORY:
+                errors.append(failure_errno)
+                directory.unlink()
+                directory.mkdir(mode=0o700)
+                raise OSError(failure_errno, "modelled no-follow directory refusal") from error
+            raise
+    monkeypatch.setattr(portable_fresh, "os", SimpleNamespace(**{**vars(native), "open": opened}))
+    operation = portable_fresh._Operation()
+    operation.output_directory(directory)
+    assert operation.exists(target) is False
+    armed.append(True)
+    with pytest.raises(ValueError, match="reference parent changed while opening"):
+        portable_fresh.publish(raw, {"path": str(target), "sha256": hashlib.sha256(raw).hexdigest()}, _operation=operation)
+    assert observed and errors and errors == [failure_errno]
+    assert operation.failed_validation and directory not in operation.witnesses.effects
+    assert not target.exists() and live.closed()
+    with pytest.raises(ValueError, match="reference parent changed while opening"):
+        operation.verify()
+
+
+@secure_reference
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("kind", ["stat", "lstat", "fstat", "open", "identify", "names", "read", "fdopen", "stream-read", "link"])
+def test_round12za_acquisition_rechecks_attachments_after_return(tmp_path, monkeypatch, capability, kind):
+    base, held = tmp_path / "public", tmp_path / "retained"
+    directory = base / "input"
+    directory.mkdir(parents=True)
+    target = directory / "note"
+    target.write_bytes(b"public")
+    if kind == "link":
+        target.unlink()
+        symlink_or_skip("destination", target)
+    live, _opened = search_only_platform(monkeypatch, capability)
+    operation = portable_fresh._Operation()
+    operation.entries(directory, identity_only=True)
+    if kind != "link":
+        operation.read(target)
+    else:
+        with operation.active():
+            descriptor, _marks = portable_fresh._reference_parent(directory, _guard=operation.path_guard)
+            try:
+                portable_fresh._acquire("stat", target.name, dir_fd=descriptor, follow_symlinks=False)
+            finally:
+                portable_fresh.os.close(descriptor)
+    native, changed, delivered = portable_fresh.os, [], []
+    leaf = directory if kind in {"identify", "names"} else target
+    borrowed = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW) if kind in {"identify", "names", "fstat", "read", "fdopen", "stream-read"} else None
+    receipt = capture_public_test_handle(borrowed) if borrowed is not None else None
+    if borrowed is not None:
+        with operation.active():
+            portable_fresh._bind_descriptor(borrowed, os.fstat(borrowed), leaf, operation.path_guard)
+    stream_context = os.fdopen(borrowed, "rb", closefd=False) if kind == "stream-read" else None
+    stream = stream_context.__enter__() if stream_context is not None else None
+    def substitute():
+        if not changed:
+            base.rename(held)
+            changed.append(True)
+    monkeypatch.setattr(portable_fresh, "os", SimpleNamespace(**{**vars(native),
+        "stat": round12za_after_acquisition(native.stat, kind, substitute),
+        "lstat": round12za_after_acquisition(native.lstat, kind, substitute),
+        "fstat": round12za_after_acquisition(native.fstat, kind, substitute),
+        "open": round12za_after_acquisition(native.open, kind, substitute),
+        "scandir": round12za_after_acquisition(native.scandir, kind, substitute),
+        "read": round12za_after_acquisition(native.read, kind, substitute),
+        "fdopen": round12za_after_acquisition(native.fdopen, kind, substitute)}))
+    def acquiring():
+        if kind in {"fstat", "identify", "names", "read", "fdopen"}:
+            args = (borrowed, 6) if kind == "read" else (borrowed, "rb") if kind == "fdopen" else (borrowed,)
+            value = portable_fresh._acquire(kind, *args, _path=leaf)
+        elif kind == "stream-read":
+            class Reading:
+                def fileno(self):
+                    return stream.fileno()
+                def read(self, *args):
+                    result = stream.read(*args)
+                    substitute()
+                    return result
+            value = portable_fresh._acquire(kind, Reading(), 6, _path=leaf)
+        elif kind == "link":
+            def reader(_directory, _name, buffer, size):
+                import ctypes
+                raw = os.fsencode(native.readlink(target.name, dir_fd=_directory))
+                ctypes.memmove(buffer, raw, len(raw))
+                substitute()
+                return len(raw)
+            parent, _marks = portable_fresh._reference_parent(directory, _guard=operation.path_guard)
+            try:
+                value = portable_fresh._acquire(kind, parent, target.name, len(b"destination"), _reader=reader, _path=target)
+            finally:
+                portable_fresh.os.close(parent)
+        else:
+            args = (target, os.O_RDONLY | os.O_NOFOLLOW) if kind == "open" else (target,)
+            kwargs = {"follow_symlinks": False} if kind == "stat" else {}
+            value = portable_fresh._acquire(kind, *args, _path=leaf, **kwargs)
+        delivered.append(value)
+    try:
+        with pytest.raises(ValueError, match="reference parent changed while opening"):
+            operation.prove(acquiring)
+        assert changed and not delivered and operation.failed_validation
+    finally:
+        # These descriptors belong to the test; fdopen transfers its input on success.
+        if delivered and kind == "open":
+            portable_fresh.os.close(delivered[0])
+        elif delivered and kind == "fdopen":
+            delivered[0].close()
+        if stream_context is not None:
+            stream_context.close()
+        if receipt is not None and not receipt.closed:
+            os.close(borrowed)
+        if held.exists():
+            held.rename(base)
+    with pytest.raises(ValueError, match="reference parent changed while opening"):
+        operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@secure_publication
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("kind", ["replace", "rename", "unlink"])
+def test_round12za_mutation_rechecks_attachments_before_effect(tmp_path, monkeypatch, capability, kind):
+    base, held = tmp_path / "public", tmp_path / "retained"
+    directory = base / "briefs"
+    directory.mkdir(parents=True, mode=0o700)
+    target, pending = directory / "result.md", ".fresh-" + "b" * 32
+    live, _opened = search_only_platform(monkeypatch, capability)
+    operation = portable_fresh._Operation()
+    operation.output_directory(directory)
+    if kind == "unlink":
+        target.write_bytes(b"public")
+        operation.read(target)
+    else:
+        assert operation.exists(target) is False
+    with operation.active():
+        if kind != "unlink":
+            portable_fresh._acquire("witness", "output", target)
+        parent = portable_fresh.open_directory(directory)
+        if kind != "unlink":
+            descriptor = portable_fresh._acquire("open", pending,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+            portable_fresh.os.close(descriptor)
+    native, changed, delivered = portable_fresh.os, [], []
+    action = native.unlink if kind == "unlink" else native.replace if kind == "replace" else native.rename
+    def mutate(*args, **kwargs):
+        value = action(*args, **kwargs)
+        base.rename(held)
+        changed.append(True)
+        return value
+    monkeypatch.setattr(portable_fresh, "os", SimpleNamespace(**{**vars(native), "replace": mutate, "rename": mutate, "unlink": mutate}))
+    def changing():
+        if kind == "unlink":
+            portable_fresh._acquire(kind, target.name, dir_fd=parent)
+        else:
+            portable_fresh._acquire(kind, pending, target.name, src_dir_fd=parent, dst_dir_fd=parent)
+        delivered.append(True)
+    try:
+        with pytest.raises(ValueError, match="reference parent changed while opening"):
+            operation.prove(changing)
+        assert changed and not delivered and operation.failed_validation
+        if kind != "unlink":
+            assert target not in operation.witnesses.effects
+    finally:
+        portable_fresh.os.close(parent)
+        if held.exists():
+            held.rename(base)
+    with pytest.raises(ValueError, match="reference parent changed while opening"):
+        operation.verify()
+    assert live.closed()
+
+
+@secure_reference
+@pytest.mark.parametrize("capability", ["none", "O_PATH", "O_SEARCH", "O_EXEC"])
+@pytest.mark.parametrize("surface", ["names", "stream"])
+def test_round12za_binding_rechecks_after_parent_acquisition(tmp_path, monkeypatch, capability, surface):
+    base, held = tmp_path / "public", tmp_path / "retained"
+    directory = base / "input"
+    directory.mkdir(parents=True)
+    target = directory / "note"
+    target.write_bytes(b"public")
+    live, _opened = search_only_platform(monkeypatch, capability)
+    operation = portable_fresh._Operation()
+    operation.entries(directory, identity_only=True)
+    operation.read(target)
+    path = directory if surface == "names" else target
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    native, changed, delivered = portable_fresh._reference_parent, [], []
+    def parent(*args, **kwargs):
+        result = native(*args, **kwargs)
+        if not changed and sys._getframe(1).f_code.co_name == "_bind_descriptor":
+            base.rename(held)
+            changed.append(True)
+        return result
+    monkeypatch.setattr(portable_fresh, "_reference_parent", parent)
+    def consuming():
+        if surface == "names":
+            delivered.append(portable_fresh._directory_names(descriptor))
+        else:
+            portable_fresh._stream_reference(descriptor, os.fstat(descriptor), target, delivered.append)
+    try:
+        with pytest.raises(ValueError, match="reference parent changed while opening"):
+            operation.prove(consuming)
+        assert changed and not delivered and operation.failed_validation
+    finally:
+        os.close(descriptor)
+        if held.exists():
+            held.rename(base)
+    with pytest.raises(ValueError, match="reference parent changed while opening"):
+        operation.verify()
+    assert live.closed()
