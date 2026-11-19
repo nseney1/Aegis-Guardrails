@@ -22,6 +22,7 @@ import aegis_core.scan as scan_service
 import aegis_core.rules as rule_schema
 import aegis_core.gitsafe as git_service
 import aegis_core.rule_inventory as inventory_module
+import aegis_core.workspace.confinement as confinement
 from tests import helpers_humangate as hg
 from tests.helpers_guidance_corpus import guidance_corpus, repository_guidance_corpus
 
@@ -1322,19 +1323,102 @@ def test_lint_documentation_does_not_block_supported_source_hit_counts(tmp_path)
 
 
 def test_lint_git_storage_does_not_consume_the_source_entry_quota(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
     root = lint_root(tmp_path)
     (root / LINT_PATH).write_bytes(lint_bytes(extra="forbid_ast:\n  calls: [eval]\n"))
     (root / "src").mkdir()
     (root / "src/a.py").write_bytes(b"eval('1')\n")
     monkeypatch.setattr(lint, "MAX_ENTRIES", 2)
+    for index in range(4):
+        objects = root / ".git" / "objects" / str(index)
+        objects.mkdir(parents=True)
+        for item in range(8):
+            (objects / str(item)).write_bytes(b"not source")
+    walked = {}
 
-    def files(*args, **kwargs):
-        for index in range(3):
-            yield root / ".git" / str(index), None
-        yield root / "src/a.py", None
+    def counted_walk(*args, **kwargs):
+        for folder, dirs, files in os.walk(*args, **kwargs):
+            walked[Path(folder).relative_to(root).as_posix()] = len(files)
+            yield folder, dirs, files
 
-    monkeypatch.setattr(lint, "iter_confined_files", files)
+    monkeypatch.setattr(confinement, "os", SimpleNamespace(walk=counted_walk))
     assert lint.lint_workspace(root)[0].gate_hits == 1
+    assert lint.lint_workspace(root)[0].gate_hits == 1
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(lint.lint_workspace, [root] * 3, timeout=15))
+    assert all(result[0].gate_hits == 1 for result in results)
+    assert set(walked) == {".", ".aegis", ".aegis/rules", ".aegis/rules/traps", "src"}
+    assert sum(walked.values()) == 2
+
+
+@pytest.mark.parametrize("kind", ["directory", "file", "directory_symlink", "file_symlink", "broken_symlink"])
+def test_confined_walk_git_pruning_is_opt_in_and_root_only(tmp_path, kind):
+    from tests.conftest import symlink_or_skip
+
+    root = tmp_path / "workspace"
+    nested = root / "src" / ".git" / "keep.md"
+    nested.parent.mkdir(parents=True)
+    nested.write_bytes(b"nested source")
+    git = root / ".git"
+    if kind == "directory":
+        git.mkdir()
+        (git / "object.md").write_bytes(b"git object")
+    elif kind == "file":
+        git.write_bytes(b"gitdir: elsewhere")
+    else:
+        target = tmp_path / "outside"
+        if kind == "directory_symlink":
+            target.mkdir()
+        elif kind == "file_symlink":
+            target.write_bytes(b"outside")
+        symlink_or_skip(target, git, target_is_directory=kind == "directory_symlink")
+    default = list(confinement.iter_confined_files(root, root, suffix=""))
+    assert any(path == git or git in path.parents for path, _ in default)
+    assert list(confinement.iter_confined_files(root, root, suffix="", skip_root_git=False)) == default
+    for _ in range(2):
+        assert list(confinement.iter_confined_files(root, root, suffix="", skip_root_git=True)) == [(nested, None)]
+    assert list(confinement.iter_confined_files(root, root / "src", skip_root_git=True)) == [(nested, None)]
+
+
+def test_lint_git_pruning_keeps_listing_refusal_and_retry(tmp_path, monkeypatch):
+    root = lint_root(tmp_path)
+    (root / LINT_PATH).write_bytes(lint_bytes(extra="forbid_ast:\n  calls: [eval]\n"))
+    (root / ".git").mkdir()
+    failed = []
+
+    def failing_walk(*args, **kwargs):
+        yield from os.walk(*args, **kwargs)
+        if not failed:
+            failed.append(True)
+            kwargs["onerror"](PermissionError(13, "UNTRUSTED-DETAIL", str(root / "src")))
+
+    monkeypatch.setattr(confinement, "os", SimpleNamespace(walk=failing_walk))
+    result = lint.lint_workspace(root)[0]
+    assert result.ok and result.gate_hits is None
+    assert "source_unavailable" in lint_codes(result)
+    assert "UNTRUSTED" not in repr(result)
+    assert lint.lint_workspace(root)[0].gate_hits == 0
+
+
+def test_confined_walk_prunes_git_replaced_after_listing(tmp_path, monkeypatch):
+    root = tmp_path / "workspace"
+    (root / ".git").mkdir(parents=True)
+    (root / "source.md").write_bytes(b"source")
+    walked = []
+
+    def replacing_walk(*args, **kwargs):
+        for folder, dirs, files in os.walk(*args, **kwargs):
+            walked.append(Path(folder))
+            if Path(folder) == root:
+                (root / ".git").rename(tmp_path / "retired-git")
+                (root / ".git").mkdir()
+                (root / ".git" / "object.md").write_bytes(b"replacement object")
+            yield folder, dirs, files
+
+    monkeypatch.setattr(confinement, "os", SimpleNamespace(walk=replacing_walk))
+    assert list(confinement.iter_confined_files(root, root, skip_root_git=True)) == [(root / "source.md", None)]
+    assert walked == [root]
 
 
 def test_lint_source_capture_refusal_is_single_ordered_and_retains_limit_code(tmp_path, monkeypatch):

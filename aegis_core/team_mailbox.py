@@ -17,6 +17,7 @@ from threading import local
 from types import MappingProxyType
 
 from aegis_core.team_mailbox_primitives import (
+    render_mailbox_refusal,
     MAX_BYTES, MAX_RECORDS, MAX_HISTORY_BYTES, MAX_DIRTY_ENTRIES, MAX_DELIVERY_IDS,
     MAX_RECENT_ACKNOWLEDGMENTS, MESSAGE_TYPES, STAGES, TERMINAL_JOB_STATES,
     VERIFICATION, SHA256, GIT_ID, SLUG,
@@ -81,7 +82,7 @@ class Mailbox(MailboxDelivery):
         try:
             return port(*args)
         except MailboxRefusal as error:
-            raise error from None
+            render_mailbox_refusal(error, reraise=True)
         except (OSError, TimeoutError, ValueError):
             raise MailboxRefusal("host_unavailable") from None
 
@@ -228,6 +229,10 @@ class Mailbox(MailboxDelivery):
                          "checkpoint", "checkpoint_sha256"})
         integer(binding["generation"], "binding generation")
         history = self.bindings(binding["endpoint"])
+        return self._ready(binding, history)
+
+    def _ready(self, binding, history):
+        """Inspect readiness using history already validated in this operation."""
         require(binding["generation"] <= len(history))
         stored = history[binding["generation"] - 1]
         require(all(binding[key] == value for key, value in stored.items()))
@@ -249,18 +254,22 @@ class Mailbox(MailboxDelivery):
         Callers hold self.store.lock(root), so a rebinding cannot land between this check and the write. The sender is
         configuration, so this refuses a stale or unacknowledged session; it does not authenticate one."""
         require(type(sender) is dict)
-        binding = self.current_binding(sender["from"])
+        binding, history = self._current_binding(sender["from"])
         expected = {"host": binding["host"], "session": binding["session"], "binding_generation": binding["generation"]}
         require(all(type(sender.get(key)) is type(value) and sender.get(key) == value for key, value in expected.items()),
                 "stale or mismatched sender binding")
-        require(not ready or self.ready(binding), "handoff checkpoint has not been acknowledged")
+        require(not ready or self._ready(binding, history), "handoff checkpoint has not been acknowledged")
         return binding
 
     @operation(write=False)
     def current_binding(self, endpoint):
+        binding, _history = self._current_binding(endpoint)
+        return binding
+
+    def _current_binding(self, endpoint):
         history = self.bindings(endpoint)
         require(bool(history), "endpoint has no session binding: " + endpoint)
-        return history[-1]
+        return history[-1], history
 
     @operation(write=False)
     def validate_message(self, message, *, stored=False):
@@ -346,8 +355,8 @@ class Mailbox(MailboxDelivery):
                     require(destination == folder, "message is in the wrong routing folder")
                     require(message["message_id"] not in records, "duplicate message_id in history")
                     records[message["message_id"]] = {"path": str(path), "message": message}
-                except MailboxRefusal:
-                    raise
+                except MailboxRefusal as error:
+                    render_mailbox_refusal(error, reraise=True)
                 except (ValueError, KeyError):
                     raise MailboxRefusal("invalid_record") from None
         for record in records.values():
@@ -632,9 +641,9 @@ class Mailbox(MailboxDelivery):
         require(request["message_id"] not in records, "message_id already exists: " + request["message_id"])
         require(len(records) < MAX_RECORDS, "mailbox history limit reached")
         self.fence(request)
-        recipient = self.current_binding(request["to"])
+        recipient, history = self._current_binding(request["to"])
         if request["type"] == "dispatch":
-            require(self.ready(recipient), "recipient has not acknowledged its handoff checkpoint")
+            require(self._ready(recipient, history), "recipient has not acknowledged its handoff checkpoint")
         original = self.reply(request, records) if "in_reply_to" in request else None
         if request["type"] == "job_receipt":
             require(original["type"] == "job_request", "job receipt must reply to a job request")
@@ -694,7 +703,7 @@ class Mailbox(MailboxDelivery):
         bindings = {}
         for endpoint in self.manifest["endpoints"]:
             history = self.bindings(endpoint)
-            bindings[endpoint] = {**history[-1], "ready": self.ready(history[-1])} if history else None
+            bindings[endpoint] = {**history[-1], "ready": self._ready(history[-1], history)} if history else None
         counts = {"by_host": {}, "by_endpoint": {}}
         for record in records.values():
             message = record["message"]
@@ -731,7 +740,7 @@ class Mailbox(MailboxDelivery):
                 if brief is not None:
                     record["brief_text"] = self.brief(brief).decode("utf-8")
         history = self.bindings(endpoint)
-        binding = {**history[-1], "ready": self.ready(history[-1])} if history else None
+        binding = {**history[-1], "ready": self._ready(history[-1], history)} if history else None
         checkpoint_briefs = []
         if include_briefs and binding is not None and binding["checkpoint"] is not None:
             for brief in binding["checkpoint"]["briefs"]:
@@ -751,7 +760,7 @@ class Mailbox(MailboxDelivery):
         self.endpoint(endpoint)
         total = sum(1 for record in self.messages().values() if record["message"]["to"] == endpoint)
         history = self.bindings(endpoint)
-        binding = {**history[-1], "ready": self.ready(history[-1])} if history else None
+        binding = {**history[-1], "ready": self._ready(history[-1], history)} if history else None
         briefs = []
         for brief in binding["checkpoint"]["briefs"] if binding is not None and binding["checkpoint"] is not None else ():
             try:
