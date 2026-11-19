@@ -22,6 +22,7 @@ import aegis_core.scan as scan_service
 import aegis_core.rules as rule_schema
 import aegis_core.gitsafe as git_service
 import aegis_core.rule_inventory as inventory_module
+import aegis_core.workspace.confinement as confinement
 from tests import helpers_humangate as hg
 from tests.helpers_guidance_corpus import guidance_corpus, repository_guidance_corpus
 
@@ -692,6 +693,319 @@ def test_lint_paper_gates_refuse_but_unchanged_amendment_only_warns(extra):
     assert not lint_rule(data, path, original=changed).ok
 
 
+_LOADER_BASE = "final accepted bytes or destination fail the rule loader"
+_EXPIRED_REPAIR = "clear expired_at so an expired rule can be accepted"
+_LEGACY_REPAIR = "remove derived or retired keys before acceptance"
+_ID_REPAIR = "set id to the file name without .md"
+_TYPE_REPAIR = "set type to the canonical rule type for the directory"
+_PAPER_BASE = "gate requires a valid non-empty forbid_ast specification"
+_MISSING_SPEC = "add a non-empty forbid_ast specification"
+_EMPTY_SPEC = "add at least one imports, calls or decorators pattern"
+_INVALID_SPEC = "replace forbid_ast with a valid non-empty specification of imports, calls or decorators"
+
+
+def _loader_message(result):
+    finding = next(item for item in result.findings if item.code == "loader")
+    assert finding.check == 1 and finding.severity == "error" and finding.suggestions == ()
+    assert "\n" not in finding.message and "\r" not in finding.message
+    return finding.message
+
+
+def test_lint_repair_reasons_distinguish_loader_failures():
+    """Expiry, legacy keys and id or type mismatch keep the loader code and name the repair."""
+    from aegis_core.rule_lint import lint_rule
+
+    cases = [
+        (lint_bytes(extra="expired_at: 2000-01-01\n"), LINT_PATH, _LOADER_BASE + ": " + _EXPIRED_REPAIR, ("2000", "01")),
+        (lint_bytes(extra="triggers: 42\n"), LINT_PATH, _LOADER_BASE + ": " + _LEGACY_REPAIR, ("triggers", "42")),
+        (lint_bytes(extra='enforcement_artifact: "rm -rf /"\n'), LINT_PATH, _LOADER_BASE + ": " + _LEGACY_REPAIR, ("rm", "enforcement_artifact")),
+        (lint_bytes(extra="expired_at: 2000-01-01\ntriggers: 42\n"), LINT_PATH,
+         _LOADER_BASE + ": " + _EXPIRED_REPAIR + "; " + _LEGACY_REPAIR, ("2000", "triggers", "42")),
+        (lint_bytes(), ".aegis/rules/traps/other.md", _LOADER_BASE + ": " + _ID_REPAIR, ("other", "sample")),
+        (lint_bytes(), ".aegis/rules/invariants/sample.md", _LOADER_BASE + ": " + _TYPE_REPAIR, ("invariant", "trap")),
+        (lint_bytes(), ".aegis/rules/invariants/other.md",
+         _LOADER_BASE + ": " + _ID_REPAIR + "; " + _TYPE_REPAIR, ("other", "invariant", "trap", "sample")),
+        (lint_bytes(extra="paths: [src/**]\n"), LINT_PATH, _LOADER_BASE, ("paths", "target_paths")),
+        (lint_bytes(extra="paths: [src/**]\nexpired_at: 2000-01-01\n"), LINT_PATH,
+         _LOADER_BASE + ": " + _EXPIRED_REPAIR, ("paths", "target_paths", "2000")),
+        (b"", LINT_PATH, _LOADER_BASE, ()),
+        (b"\xff", LINT_PATH, _LOADER_BASE, ("utf-8", "0xff")),
+        (b"---\nid: sample\n", LINT_PATH, _LOADER_BASE, ("unterminated",)),
+        (b"---\nid: other\n---\n", LINT_PATH, _LOADER_BASE + ": " + _ID_REPAIR, ("other",)),
+        (b"---\nid: sample\n---\n", LINT_PATH, _LOADER_BASE + ": " + _TYPE_REPAIR, ()),
+    ]
+    secret = "SECOND-LINE-SECRET"
+    multiline = lint_bytes(extra="expired_at: |\n  2000-01-01\n  " + secret + "\n")
+    cases.append((multiline, LINT_PATH, _LOADER_BASE + ": " + _EXPIRED_REPAIR, (secret, "2000")))
+    for data, path, expected, hidden in cases:
+        result = lint_rule(data, path)
+        assert not result.ok and lint_codes(result) == {"loader"}
+        message = _loader_message(result)
+        assert message == expected
+        for token in hidden:
+            assert token not in message
+    assert lint_rule(lint_bytes(), LINT_PATH).ok
+
+
+def test_lint_repair_reasons_are_shared_on_retry_and_concurrency(tmp_path):
+    """lint_rule and lint_workspace share one repair, and a fixed file lints cleanly."""
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.rule_lint import lint_rule, lint_workspace
+
+    data = lint_bytes(extra="expired_at: 2000-01-01\ntriggers: 42\n")
+    expected = _LOADER_BASE + ": " + _EXPIRED_REPAIR + "; " + _LEGACY_REPAIR
+    first = lint_rule(data, LINT_PATH)
+    assert _loader_message(first) == expected
+
+    def retry(_):
+        return lint_rule(data, LINT_PATH)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(retry, range(3), timeout=15)) == [first, first, first]
+    assert lint_rule(lint_bytes(), LINT_PATH).ok
+
+    root = lint_root(tmp_path)
+    path = root / LINT_PATH
+    path.write_bytes(data)
+    before = path.read_bytes()
+    workspace = lint_workspace(root, [LINT_PATH])[0]
+    assert path.read_bytes() == before
+    assert not workspace.ok and _loader_message(workspace) == _loader_message(first)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        again = list(pool.map(lambda _: lint_workspace(root, [LINT_PATH])[0], range(3), timeout=15))
+    assert again == [workspace, workspace, workspace]
+    path.write_bytes(lint_bytes())
+    repaired = lint_workspace(root, [LINT_PATH])[0]
+    assert repaired.ok and "loader" not in lint_codes(repaired)
+    assert lint_rule(path.read_bytes(), LINT_PATH).ok
+
+
+def test_lint_repair_paper_gate_names_the_spec_gap():
+    """A missing or unusable forbid_ast keeps paper_gate and names a fixed repair."""
+    from aegis_core.rule_lint import lint_rule
+    from aegis_core.rules import Rule
+
+    path = ".aegis/rules/invariants/sample.md"
+    cases = [
+        ("", _MISSING_SPEC, ()),
+        ("forbid_ast: {}\n", _EMPTY_SPEC, ()),
+        ("forbid_ast:\n  calls: []\n", _EMPTY_SPEC, ()),
+        ("forbid_ast:\n  typo: [eval]\n", _INVALID_SPEC, ("typo", "eval")),
+        ("forbid_ast:\n  calls: 'eval'\n", _INVALID_SPEC, ("eval",)),
+    ]
+    for extra, repair, hidden in cases:
+        data = lint_bytes(extra=extra).replace(b"type: trap", b"type: invariant").replace(
+            b"enforcement: advisory", b"enforcement: gate")
+        result = lint_rule(data, path)
+        assert not result.ok
+        finding = next(item for item in result.findings if item.code == "paper_gate")
+        assert finding.check == 5 and finding.severity == "error" and finding.suggestions == ()
+        assert finding.message == _PAPER_BASE + ": " + repair
+        assert "\n" not in finding.message and "\r" not in finding.message
+        for token in hidden:
+            assert token not in finding.message
+        meta, _body = parse_rule_frontmatter(data.decode())
+        original = Rule("sample", path, "invariant", meta, "", "old-digest")
+        amended = lint_rule(data, path, original=original)
+        warned = next(item for item in amended.findings if item.code == "paper_gate")
+        assert amended.ok and warned.severity == "warning" and warned.message == finding.message
+    valid = lint_bytes(extra="forbid_ast:\n  calls: [eval]\n").replace(b"type: trap", b"type: invariant").replace(
+        b"enforcement: advisory", b"enforcement: gate")
+    assert "paper_gate" not in lint_codes(lint_rule(valid, path))
+
+
+def test_lint_repair_exception_text_is_not_echoed(monkeypatch):
+    """A loader exception stays the fixed loader refusal, then a retry accepts the same bytes."""
+    from aegis_core.rule_lint import lint_rule
+
+    original = lint.load_rules
+
+    def boom(*_args, **_kwargs):
+        raise ValueError("UNTRUSTED\nline two `rm -rf`")
+
+    monkeypatch.setattr(lint, "load_rules", boom)
+    refused = lint_rule(lint_bytes(), LINT_PATH)
+    assert not refused.ok and _loader_message(refused) == _LOADER_BASE
+    assert "UNTRUSTED" not in refused.findings[0].message and "rm" not in refused.findings[0].message
+    monkeypatch.setattr(lint, "load_rules", original)
+    assert lint_rule(lint_bytes(), LINT_PATH).ok
+
+
+def _frontmatter_parts(data):
+    text = data.decode("utf-8")
+    marker = text.index("\n---\n", 4)
+    return text[:marker + 1], text[marker + 1:]
+
+
+def _rewrite_frontmatter_key(data, key, replacement):
+    """Replace one top-level key and its indented block. None drops the key."""
+    head, tail = _frontmatter_parts(data)
+    lines = head.split("\n")
+    out = []
+    index = 0
+    found = False
+    prefix = key + ":"
+    while index < len(lines):
+        line = lines[index]
+        if line.startswith(prefix):
+            found = True
+            index += 1
+            while index < len(lines) and lines[index][:1] in (" ", "\t"):
+                index += 1
+            if replacement is not None:
+                out.extend(replacement.split("\n"))
+            continue
+        out.append(line)
+        index += 1
+    if replacement is not None and not found:
+        pieces = replacement.split("\n")
+        if out and out[-1] == "":
+            out[-1:-1] = pieces
+        else:
+            out.extend(pieces)
+    rebuilt = "\n".join(out)
+    if not rebuilt.endswith("\n"):
+        rebuilt += "\n"
+    return (rebuilt + tail).encode("utf-8")
+
+
+def _set_key(data, key, value):
+    return _rewrite_frontmatter_key(data, key, key + ": " + value)
+
+
+def _drop_key(data, key):
+    return _rewrite_frontmatter_key(data, key, None)
+
+
+def _destination_identity(path):
+    from aegis_core.packs import parse_pack_path
+
+    prefix = ".aegis/rules/"
+    assert path.startswith(prefix)
+    return parse_pack_path(path[len(prefix):])
+
+
+def _gate_bytes(extra=""):
+    return lint_bytes(extra=extra).replace(b"type: trap", b"type: invariant").replace(
+        b"enforcement: advisory", b"enforcement: gate")
+
+
+_VALID_FORBID = "forbid_ast:\n  calls: [eval]"
+
+
+def test_lint_repair_effect_clears_each_named_finding():
+    """Each allowlisted repair, applied to the failing bytes, removes that finding."""
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.rule_lint import lint_rule
+
+    traps_other = ".aegis/rules/traps/other.md"
+    invariants = ".aegis/rules/invariants/sample.md"
+    other = _destination_identity(traps_other)
+    sample = _destination_identity(LINT_PATH)
+    canonical = _destination_identity(invariants)
+    assert (other.id, other.type, other.directory) == ("other", "trap", "traps")
+    assert (sample.id, sample.type, sample.directory) == ("sample", "trap", "traps")
+    assert (canonical.id, canonical.type, canonical.directory) == ("sample", "invariant", "invariants")
+    secret = "SECOND-LINE-SECRET"
+    expired = lint_bytes(extra="expired_at: 2000-01-01\n")
+    block = lint_bytes(extra="expired_at: |\n  2000-01-01\n  " + secret + "\n")
+    legacy = lint_bytes(extra="triggers: 42\n")
+    artifact = lint_bytes(extra='enforcement_artifact: "rm -rf /"\n')
+    combined = lint_bytes(extra="expired_at: 2000-01-01\ntriggers: 42\n")
+    misplaced = lint_bytes()
+    wrong_id = _set_key(lint_bytes(), "id", "wrong")
+    # A valid spec keeps the mandatory invariant from growing a second finding after the type repair.
+    typed = lint_bytes(extra="forbid_ast:\n  calls: [eval]\n")
+    wrong_type = lint_bytes().replace(b"type: trap", b"type: boundary")
+    # (bytes, path, code, repairs, repaired bytes, bytes that must still fail, hidden)
+    cases = [
+        (expired, LINT_PATH, "loader", (_EXPIRED_REPAIR,), _drop_key(expired, "expired_at"), None, ("2000",)),
+        (block, LINT_PATH, "loader", (_EXPIRED_REPAIR,), _drop_key(block, "expired_at"), None, (secret, "2000")),
+        (legacy, LINT_PATH, "loader", (_LEGACY_REPAIR,), _drop_key(legacy, "triggers"), None, ("triggers", "42")),
+        (artifact, LINT_PATH, "loader", (_LEGACY_REPAIR,), _drop_key(artifact, "enforcement_artifact"), None, ("rm", "enforcement_artifact")),
+        (combined, LINT_PATH, "loader", (_EXPIRED_REPAIR, _LEGACY_REPAIR),
+         _drop_key(_drop_key(combined, "expired_at"), "triggers"), _drop_key(combined, "expired_at"), ("triggers", "2000")),
+        (misplaced, traps_other, "loader", (_ID_REPAIR,), _set_key(misplaced, "id", other.id),
+         _set_key(misplaced, "id", other.id + ".md"), (other.id, other.id + ".md", "sample")),
+        (wrong_id, LINT_PATH, "loader", (_ID_REPAIR,), _set_key(wrong_id, "id", sample.id),
+         _set_key(wrong_id, "id", sample.id + ".md"), ("wrong", sample.id + ".md")),
+        (typed, invariants, "loader", (_TYPE_REPAIR,), _set_key(typed, "type", canonical.type),
+         _set_key(typed, "type", canonical.directory), (canonical.type, canonical.directory, "trap")),
+        (wrong_type, LINT_PATH, "loader", (_TYPE_REPAIR,), _set_key(wrong_type, "type", sample.type),
+         _set_key(wrong_type, "type", sample.directory), ("boundary", sample.type, sample.directory)),
+        (_gate_bytes(), invariants, "paper_gate", (_MISSING_SPEC,),
+         _rewrite_frontmatter_key(_gate_bytes(), "forbid_ast", _VALID_FORBID), None, ()),
+        (_gate_bytes("forbid_ast: {}\n"), invariants, "paper_gate", (_EMPTY_SPEC,),
+         _rewrite_frontmatter_key(_gate_bytes("forbid_ast: {}\n"), "forbid_ast", _VALID_FORBID), None, ()),
+        (_gate_bytes("forbid_ast:\n  calls: []\n"), invariants, "paper_gate", (_EMPTY_SPEC,),
+         _rewrite_frontmatter_key(_gate_bytes("forbid_ast:\n  calls: []\n"), "forbid_ast", _VALID_FORBID), None, ()),
+        (_gate_bytes("forbid_ast:\n  typo: [eval]\n"), invariants, "paper_gate", (_INVALID_SPEC,),
+         _rewrite_frontmatter_key(_gate_bytes("forbid_ast:\n  typo: [eval]\n"), "forbid_ast", _VALID_FORBID), None, ("typo", "eval")),
+        (_gate_bytes("forbid_ast:\n  calls: 'eval'\n"), invariants, "paper_gate", (_INVALID_SPEC,),
+         _rewrite_frontmatter_key(_gate_bytes("forbid_ast:\n  calls: 'eval'\n"), "forbid_ast", _VALID_FORBID), None, ("eval",)),
+    ]
+    for data, path, code, repairs, repaired, still_failing, hidden in cases:
+        refused = lint_rule(data, path)
+        assert not refused.ok and code in lint_codes(refused)
+        finding = next(item for item in refused.findings if item.code == code)
+        assert finding.severity == "error" and finding.suggestions == ()
+        assert "\n" not in finding.message and "\r" not in finding.message
+        base = _LOADER_BASE if code == "loader" else _PAPER_BASE
+        assert finding.message == base + ": " + "; ".join(repairs)
+        for token in hidden:
+            assert token not in finding.message
+        if still_failing is not None:
+            assert code in lint_codes(lint_rule(still_failing, path))
+        cleared = lint_rule(repaired, path)
+        assert code not in lint_codes(cleared) and cleared.ok
+
+        def retry(payload, rule_path=path):
+            return lint_rule(payload, rule_path)
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            again = list(pool.map(retry, (repaired, repaired, repaired), timeout=15))
+        assert again == [cleared, cleared, cleared]
+
+
+def test_lint_repair_effect_workspace_retries_the_precise_rewrite(tmp_path):
+    """A refusal leaves the file untouched; the precise id or type rewrite then lints clean."""
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.rule_lint import lint_workspace
+
+    root = lint_root(tmp_path)
+    (root / LINT_PATH).unlink()
+    relative = ".aegis/rules/invariants/sample.md"
+    target = root / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    data = lint_bytes(extra="forbid_ast:\n  calls: [eval]\n")
+    target.write_bytes(data)
+
+    def once(selection):
+        return lint_workspace(root, [selection])[0]
+
+    refused = once(relative)
+    assert target.read_bytes() == data
+    assert _loader_message(refused).endswith(_TYPE_REPAIR)
+    target.write_bytes(_set_key(data, "type", "invariants"))
+    assert "loader" in lint_codes(once(relative))
+    target.write_bytes(_set_key(data, "type", "invariant"))
+    cleared = once(relative)
+    assert cleared.ok and "loader" not in lint_codes(cleared)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(lambda _: once(relative), range(3), timeout=15)) == [cleared, cleared, cleared]
+    other_rel = ".aegis/rules/traps/other.md"
+    other = root / other_rel
+    other.write_bytes(data)
+    assert other.read_bytes() == data
+    assert _loader_message(once(other_rel)).endswith(_ID_REPAIR)
+    other.write_bytes(_set_key(data, "id", "other.md"))
+    assert "loader" in lint_codes(once(other_rel))
+    other.write_bytes(_set_key(data, "id", "other"))
+    fixed = once(other_rel)
+    assert fixed.ok and "loader" not in lint_codes(fixed)
+    assert once(other_rel) == fixed
+
+
 def test_lint_target_paths_are_warning_only_and_simulation_needs_context():
     from aegis_core.rule_lint import lint_rule
 
@@ -1322,19 +1636,102 @@ def test_lint_documentation_does_not_block_supported_source_hit_counts(tmp_path)
 
 
 def test_lint_git_storage_does_not_consume_the_source_entry_quota(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
     root = lint_root(tmp_path)
     (root / LINT_PATH).write_bytes(lint_bytes(extra="forbid_ast:\n  calls: [eval]\n"))
     (root / "src").mkdir()
     (root / "src/a.py").write_bytes(b"eval('1')\n")
     monkeypatch.setattr(lint, "MAX_ENTRIES", 2)
+    for index in range(4):
+        objects = root / ".git" / "objects" / str(index)
+        objects.mkdir(parents=True)
+        for item in range(8):
+            (objects / str(item)).write_bytes(b"not source")
+    walked = {}
 
-    def files(*args, **kwargs):
-        for index in range(3):
-            yield root / ".git" / str(index), None
-        yield root / "src/a.py", None
+    def counted_walk(*args, **kwargs):
+        for folder, dirs, files in os.walk(*args, **kwargs):
+            walked[Path(folder).relative_to(root).as_posix()] = len(files)
+            yield folder, dirs, files
 
-    monkeypatch.setattr(lint, "iter_confined_files", files)
+    monkeypatch.setattr(confinement, "os", SimpleNamespace(walk=counted_walk))
     assert lint.lint_workspace(root)[0].gate_hits == 1
+    assert lint.lint_workspace(root)[0].gate_hits == 1
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(lint.lint_workspace, [root] * 3, timeout=15))
+    assert all(result[0].gate_hits == 1 for result in results)
+    assert set(walked) == {".", ".aegis", ".aegis/rules", ".aegis/rules/traps", "src"}
+    assert sum(walked.values()) == 2
+
+
+@pytest.mark.parametrize("kind", ["directory", "file", "directory_symlink", "file_symlink", "broken_symlink"])
+def test_confined_walk_git_pruning_is_opt_in_and_root_only(tmp_path, kind):
+    from tests.conftest import symlink_or_skip
+
+    root = tmp_path / "workspace"
+    nested = root / "src" / ".git" / "keep.md"
+    nested.parent.mkdir(parents=True)
+    nested.write_bytes(b"nested source")
+    git = root / ".git"
+    if kind == "directory":
+        git.mkdir()
+        (git / "object.md").write_bytes(b"git object")
+    elif kind == "file":
+        git.write_bytes(b"gitdir: elsewhere")
+    else:
+        target = tmp_path / "outside"
+        if kind == "directory_symlink":
+            target.mkdir()
+        elif kind == "file_symlink":
+            target.write_bytes(b"outside")
+        symlink_or_skip(target, git, target_is_directory=kind == "directory_symlink")
+    default = list(confinement.iter_confined_files(root, root, suffix=""))
+    assert any(path == git or git in path.parents for path, _ in default)
+    assert list(confinement.iter_confined_files(root, root, suffix="", skip_root_git=False)) == default
+    for _ in range(2):
+        assert list(confinement.iter_confined_files(root, root, suffix="", skip_root_git=True)) == [(nested, None)]
+    assert list(confinement.iter_confined_files(root, root / "src", skip_root_git=True)) == [(nested, None)]
+
+
+def test_lint_git_pruning_keeps_listing_refusal_and_retry(tmp_path, monkeypatch):
+    root = lint_root(tmp_path)
+    (root / LINT_PATH).write_bytes(lint_bytes(extra="forbid_ast:\n  calls: [eval]\n"))
+    (root / ".git").mkdir()
+    failed = []
+
+    def failing_walk(*args, **kwargs):
+        yield from os.walk(*args, **kwargs)
+        if not failed:
+            failed.append(True)
+            kwargs["onerror"](PermissionError(13, "UNTRUSTED-DETAIL", str(root / "src")))
+
+    monkeypatch.setattr(confinement, "os", SimpleNamespace(walk=failing_walk))
+    result = lint.lint_workspace(root)[0]
+    assert result.ok and result.gate_hits is None
+    assert "source_unavailable" in lint_codes(result)
+    assert "UNTRUSTED" not in repr(result)
+    assert lint.lint_workspace(root)[0].gate_hits == 0
+
+
+def test_confined_walk_prunes_git_replaced_after_listing(tmp_path, monkeypatch):
+    root = tmp_path / "workspace"
+    (root / ".git").mkdir(parents=True)
+    (root / "source.md").write_bytes(b"source")
+    walked = []
+
+    def replacing_walk(*args, **kwargs):
+        for folder, dirs, files in os.walk(*args, **kwargs):
+            walked.append(Path(folder))
+            if Path(folder) == root:
+                (root / ".git").rename(tmp_path / "retired-git")
+                (root / ".git").mkdir()
+                (root / ".git" / "object.md").write_bytes(b"replacement object")
+            yield folder, dirs, files
+
+    monkeypatch.setattr(confinement, "os", SimpleNamespace(walk=replacing_walk))
+    assert list(confinement.iter_confined_files(root, root, skip_root_git=True)) == [(root / "source.md", None)]
+    assert walked == [root]
 
 
 def test_lint_source_capture_refusal_is_single_ordered_and_retains_limit_code(tmp_path, monkeypatch):

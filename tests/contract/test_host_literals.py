@@ -2,7 +2,7 @@
 
 Count case-sensitive spellings in every product file, including prompt templates,
 comments and docstrings. Identifier neighbors are excluded by ASCII boundaries.
-The two host registries own host-home spelling; interpreter paths have no exemption.
+The host registries own host-home spelling; interpreter paths have no exemption.
 No Git history or platform-specific filesystem capabilities are required.
 
     python3 tests/contract/test_host_literals.py --write
@@ -22,7 +22,8 @@ HOST_LITERALS = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", ".claude", ".codex")
 INTERPRETER = "/usr/bin/python3"
 LITERALS = (*HOST_LITERALS, INTERPRETER)
 PACKAGES = ("aegis_core", "aegis_cli", "aegis_mcp", "tools")
-REGISTRIES = frozenset({"tools/hierarchy_hosts.py", "aegis_core/hosts.py"})
+REGISTRIES = frozenset({"tools/hierarchy_hosts.py", "aegis_core/hosts.py",
+                        "aegis_core/team_host_registry.py"})
 # No binary assets exist in the scanned product directories today.
 BINARY_SUFFIXES = frozenset()
 PATTERNS = {

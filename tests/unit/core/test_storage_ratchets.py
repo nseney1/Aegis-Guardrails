@@ -359,7 +359,8 @@ AUDIT_READ_ONLY_OPERATIONS = {
     ("aegis_core/manager_store.py", "ManagerStore._read", "aegis_core.manager_store.ManagerStore._audit"): "passes O_RDONLY to the generic audit opener; no append/create flags",
     ("aegis_core/manager_store.py", "ManagerStore.read", "aegis_core.manager_store.ManagerStore._anchor"): "bind directory descriptors for the separate manager audit store; any mutation belongs to the deeper registered writer/storage frame",
     ("aegis_core/message_codec_store.py", "Store._read_bytes", "aegis_core.message_codec_store.Store._open"): "passes O_RDONLY to Store._open; never requests record creation",
-    ("aegis_core/migrate.py", "<module>", "aegis_core.workspace.confinement.read_confined_bytes"): "read-only bounded existing config or migration source bytes; this approved call requests read-only inspection",
+    ("aegis_core/migrate.py", "<module>", "aegis_core.rule_inventory.read_rule_file"): "FRONTMATTER-BOUNDED-READ: partial binding of the shared bounded read-only rule facade.",
+    ("aegis_core/migrate.py", "apply", "aegis_core.workspace.confinement.read_confined_bytes"): "FRONTMATTER-BOUNDED-READ: separate bounded read-only config check with MAX_CONFIG_BYTES.",
     ("aegis_core/migrate.py", "_plan_rules", "aegis_core.migrate._input"): "bounded migration rule and target reads through the declared partial; this approved call requests read-only inspection",
     ("aegis_core/model_select.py", "_check_log_generation", "aegis_core.model_select._open_log"): "read-only anchored decision log generation check before atomic publication; closes the inspected stream without mutation",
     ("aegis_core/model_select.py", "_input", "aegis_core.model_select._open_regular"): "read-only bounded decision input config inspection; this approved call requests read-only inspection",
@@ -370,6 +371,7 @@ AUDIT_READ_ONLY_OPERATIONS = {
     ("aegis_core/model_select.py", "select_and_append", "aegis_core.model_select._publish"): "atomic publication of the caller-selected decision log; any mutation belongs to the deeper registered writer/storage frame",
     ("aegis_core/packaging.py", "_is_ours", "aegis_core.storage.read_json_dict"): "read the existing export manifest through the storage boundary; this approved call requests read-only inspection",
     ("aegis_core/rule_inventory.py", "inventory_rules", "aegis_core.rule_inventory._read_stable_file"): "read-only bounded stable rule inventory bytes; this approved call requests read-only inspection",
+    ("aegis_core/rule_inventory.py", "read_rule_file", "aegis_core.rule_inventory._read_stable_file"): "FRONTMATTER-BOUNDED-READ: one bounded read-only delegate to the existing stable inventory kernel.",
     ("aegis_core/scan_compliance.py", "_tail", "aegis_core.storage.read_tail_bytes"): "read bounded compliance evidence through the storage boundary; this approved call requests read-only inspection",
     ("aegis_core/scan_compliance.py", "report", "aegis_core.storage.read_jsonl"): "read stored scan activity through the storage boundary; this approved call requests read-only inspection",
     ("aegis_core/sync.py", "read_derived", "aegis_core.storage.read_json_dict"): "read derived metadata through the storage boundary; this approved call requests read-only inspection",
@@ -377,6 +379,8 @@ AUDIT_READ_ONLY_OPERATIONS = {
     ("aegis_core/team_gitops.py", "_effect_held", "os.open"): "GM-4b: O_RDONLY|O_NOFOLLOW|O_NONBLOCK probe of an existing effect name below a held directory; flock probe grants no execution and fd always closes",
     ("aegis_core/telemetry_engine/ledger.py", "_unread", "aegis_core.atomicio.open_regular"): "read-only regular-file descriptor for bounded ledger or SARIF inspection; this approved call requests read-only inspection",
     ("aegis_core/telemetry_engine/ledger.py", "_unread", "aegis_core.credit_memo.filesystem_now"): "sample the held lock file's filesystem clock for ledger evidence; any mutation belongs to the deeper registered writer/storage frame",
+    ("aegis_core/team_host_registry.py", "_open_home", "os.open"): "Read-only trusted-root/ancestor discovery (TA-4a); no create flags; descriptors close on completion and failure.",
+    ("aegis_core/team_host_registry.py", "_transcript_walk", "os.open"): "Read-only held-parent directory discovery (TA-4a); no create flags; descriptor closes in finally.",
     ("aegis_core/team_lease_custody.py", "_child", "os.open"): "BL-16d: read-only child-directory open below an anchored parent; mkdir belongs to separately classified descriptor-binding scope",
     ("aegis_core/team_lease_custody.py", "_record", "os.open"): "BL-16d: bounded read-only .git/HEAD/commondir record; never creates or truncates a file",
     ("aegis_core/team_mailbox_records.py", "_RecordCodec.Store", "aegis_core.message_codec_store.Store.__init__"): "TA-1c: Store constructor binds and checks existing directories only; no file or directory mutation",
@@ -387,7 +391,7 @@ AUDIT_READ_ONLY_OPERATIONS = {
     ("aegis_core/team_mailbox_records.py", "_reference_store", "aegis_core.team_mailbox_records.record_store"): "TA-1c: read mode only; write defaults to False, no state supplied",
     ("aegis_core/team_mailbox_records.py", "_root_identity", "aegis_core.team_mailbox_records._directory"): "TA-1c: read-only identity binding",
     ("aegis_core/team_mailbox_records.py", "_root_token", "os.open"): "TA-1c: read-only exact-size identity marker",
-    ("aegis_core/team_mailbox_store.py", "Store.__init__", "os.open"): "TA-1a: bind existing mailbox root only; no mutation.",
+    ("aegis_core/team_mailbox_store.py", "Store._initialize", "os.open"): "STORE-PARENT-ANCHOR: bind an existing mailbox root read-only under its held parent; selected-parent construction reuses the separately reviewed absolute walker; no mutation.",
     ("aegis_core/team_mailbox_store.py", "Store.read", "os.open"): "TA-1a: bounded read of regular singly linked file; no mutation.",
     ("aegis_core/team_mailbox_store.py", "_open_absolute", "os.open"): "TA-1a: root/ancestor directory binding only; no mutation.",
     ("aegis_core/team_supervisor.py", "_open_leaf", "os.open"): "BL-16e: read-only no-follow leaf open of the supervisor state file relative to its held parent descriptor; owner-only regular file required; no mutation.",
@@ -434,6 +438,7 @@ AUDIT_READ_ONLY_OPERATIONS = {
     ("aegis_core/verification/scanners.py", "_SarifLineCache.fill", "os.open"): "read-only SARIF root directory descriptor; this approved call requests read-only inspection",
     ("aegis_core/verification/scanners.py", "_sarif_open_artifact", "os.open"): "read-only confined SARIF artifact directory walk and file inspection; this approved call requests read-only inspection",
     ("aegis_core/workspace/confinement.py", "read_confined_bytes", "os.open"): "read-only bounded confined file inspection; this approved call requests read-only inspection",
+    ("aegis_core/yaml_engine/frontmatter.py", "_read_rule_text", "aegis_core.rule_inventory.read_rule_file"): "FRONTMATTER-BOUNDED-READ: one bounded read-only rule snapshot before text decoding/parsing.",
 }
 
 # These atomicio wrappers expose its descriptor opener transitively. Other
@@ -442,6 +447,7 @@ _ATOMIC_WRAPPERS = {
     "aegis_core.atomicio.open_regular", "aegis_core.atomicio.create_private_file",
     "aegis_core.atomicio.atomic_write_bytes", "aegis_core.atomicio.atomic_write_text",
     "aegis_core.atomicio.atomic_write_and_unlink",
+    "aegis_core.rule_inventory.read_rule_file",
 }
 # Opener -> flags position in a function/bound-method call; None means no flags
 # parameter. Fixed-flag readers may remain declared so their calls stay reviewed.
@@ -486,7 +492,7 @@ FORWARDING_OPENERS = dict.fromkeys(_ATOMIC_WRAPPERS, None) | {
     "aegis_core.workspace.confinement.read_confined_bytes": None,
 }
 _PARTIAL_OPENERS = {
-    "aegis_core.migrate._input": "aegis_core.workspace.confinement.read_confined_bytes",
+    "aegis_core.migrate._input": "aegis_core.rule_inventory.read_rule_file",
 }
 CAPABILITY_REFERENCES = {
     ("aegis_core/model_select.py", "<module>", "os.open"): "probe directory-descriptor support before any decision-log I/O",
@@ -574,7 +580,8 @@ REVIEWED_DESCRIPTOR_OPERATIONS = {
     ("aegis_core/message_codec_store.py", "Store._read_bytes", "aegis_core.message_codec_store.Store._open"): (1, "read or exclusively create a message record in the bound private store"),
     ("aegis_core/message_codec_store.py", "Store.write", "aegis_core.message_codec_store.Store._open"): (1, "read or exclusively create a message record in the bound private store"),
     ("aegis_core/message_codec_store.py", "Store.write", "os.link"): (1, "publish a content-addressed message record within the bound private message store"),
-    ("aegis_core/migrate.py", "<module>", "aegis_core.workspace.confinement.read_confined_bytes"): (1, "read-only bounded existing config or migration source bytes"),
+    ("aegis_core/migrate.py", "<module>", "aegis_core.rule_inventory.read_rule_file"): (1, "FRONTMATTER-BOUNDED-READ: partial binding of the shared bounded read-only rule facade."),
+    ("aegis_core/migrate.py", "apply", "aegis_core.workspace.confinement.read_confined_bytes"): (1, "FRONTMATTER-BOUNDED-READ: separate bounded read-only config check with MAX_CONFIG_BYTES."),
     ("aegis_core/migrate.py", "_plan_rules", "aegis_core.migrate._input"): (2, "bounded migration rule and target reads through the declared partial"),
     ("aegis_core/migrate.py", "apply", "aegis_core.migrate._input"): (2, "bounded config and unchanged-input reads through the declared partial"),
     ("aegis_core/model_select.py", "_check_log_generation", "aegis_core.model_select._open_log"): (1, "read-only anchored decision log generation check before atomic publication"),
@@ -587,11 +594,14 @@ REVIEWED_DESCRIPTOR_OPERATIONS = {
     ("aegis_core/model_select.py", "select_and_append", "aegis_core.model_select._publish"): (1, "atomic publication of the caller-selected decision log"),
     ("aegis_core/packaging.py", "_is_ours", "aegis_core.storage.read_json_dict"): (1, "read the existing export manifest through the storage boundary"),
     ("aegis_core/rule_inventory.py", "inventory_rules", "aegis_core.rule_inventory._read_stable_file"): (1, "read-only bounded stable rule inventory bytes"),
+    ("aegis_core/rule_inventory.py", "read_rule_file", "aegis_core.rule_inventory._read_stable_file"): (1, "FRONTMATTER-BOUNDED-READ: one bounded read-only delegate to the existing stable inventory kernel."),
     ("aegis_core/scan_compliance.py", "_tail", "aegis_core.storage.read_tail_bytes"): (1, "read bounded compliance evidence through the storage boundary"),
     ("aegis_core/scan_compliance.py", "report", "aegis_core.storage.read_jsonl"): (1, "read stored scan activity through the storage boundary"),
     ("aegis_core/sync.py", "read_derived", "aegis_core.storage.read_json_dict"): (1, "read derived metadata through the storage boundary"),
     ("aegis_core/telemetry_engine/ledger.py", "_unread", "aegis_core.atomicio.open_regular"): (1, "read-only regular-file descriptor for bounded ledger or SARIF inspection"),
     ("aegis_core/telemetry_engine/ledger.py", "_unread", "aegis_core.credit_memo.filesystem_now"): (1, "sample the held lock file's filesystem clock for ledger evidence"),
+    ("aegis_core/team_host_registry.py", "_open_home", "os.open"): (2, "TA-4a read-only absolute root and ancestor opens, O_RDONLY|O_DIRECTORY|O_NOFOLLOW (|O_CLOEXEC); no mutation, descriptors closed"),
+    ("aegis_core/team_host_registry.py", "_transcript_walk", "os.open"): (1, "TA-4a read-only no-follow child directories from held parents, closed in finally"),
     ("aegis_core/team_lease_custody.py", "_child", "os.open"): (1, "BL-16d: O_RDONLY O_DIRECTORY O_NOFOLLOW child-directory open relative to a held parent fd; ExitStack owns every successful open"),
     ("aegis_core/team_lease_custody.py", "_record", "os.open"): (1, "BL-16d: Windows fallback bounded read-only metadata record; fstat size/type/identity before read, closed in finally, no fdopen handoff"),
     ("aegis_core/team_mailbox_records.py", "_RecordCodec.Store", "aegis_core.message_codec_store.Store.__init__"): (1, "TA-1c: closed codec factory binds the existing anchored Store; callers retain existing ExitStack close and identity checks"),
@@ -612,7 +622,7 @@ REVIEWED_DESCRIPTOR_OPERATIONS = {
     ("aegis_core/team_mailbox_records.py", "record_store", "aegis_core.team_mailbox_records._directory"): (1, "TA-1c: anchored record storage; closes owned descriptors"),
     ("aegis_core/team_mailbox_records.py", "record_store", "os.link"): (1, "TA-1c: anchored record storage; closes owned descriptors"),
     ("aegis_core/team_mailbox_records.py", "record_store", "os.open"): (4, "TA-1c: anchored record storage; closes owned descriptors"),
-    ("aegis_core/team_mailbox_store.py", "Store.__init__", "os.open"): (1, "TA-1a: read-only no-follow mailbox root under held parent; closed on constructor failure or context/finalizer."),
+    ("aegis_core/team_mailbox_store.py", "Store._initialize", "os.open"): (1, "STORE-PARENT-ANCHOR: read-only no-follow mailbox root under held parent; shared constructor closes both descriptors on failure or context/finalizer."),
     ("aegis_core/team_mailbox_store.py", "Store.directory", "os.open"): (1, "TA-1a: read-only no-follow child directory relative to held root/parent; closed on every path."),
     ("aegis_core/team_mailbox_store.py", "Store.lock", "os.open"): (1, "TA-1a: exclusive no-follow 0600 lock under held parent; raw descriptor closed before yield; unlink on exit."),
     ("aegis_core/team_mailbox_store.py", "Store.publish", "os.link"): (1, "TA-1a: same-held-parent no-replace publication; temporary removed."),
@@ -695,6 +705,7 @@ REVIEWED_DESCRIPTOR_OPERATIONS = {
     ("aegis_core/verification/scanners.py", "_SarifLineCache.fill", "os.open"): (1, "read-only SARIF root directory descriptor"),
     ("aegis_core/verification/scanners.py", "_sarif_open_artifact", "os.open"): (2, "read-only confined SARIF artifact directory walk and file inspection"),
     ("aegis_core/workspace/confinement.py", "read_confined_bytes", "os.open"): (1, "read-only bounded confined file inspection"),
+    ("aegis_core/yaml_engine/frontmatter.py", "_read_rule_text", "aegis_core.rule_inventory.read_rule_file"): (1, "FRONTMATTER-BOUNDED-READ: one bounded read-only rule snapshot before text decoding/parsing."),
 }
 
 
