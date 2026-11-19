@@ -57,6 +57,10 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 - Codex roles start with `multi_agent_v2` disabled as well as `multi_agent`, because the live M1 sessions were offered the v2 sub-agent tools. `hierarchy_native.py multi-agent` and a per-role `multi_agent` row in the native probe report whether sub-agent tools were offered, and an offer fails the probe. Whether Codex honours either flag under managed settings is unverified.
 - Restart maintenance now rejects a resumed turn without its matching profile context, bounds explicitly disposable provider subprocesses with retained cancellation evidence, and displays historical job results while unknown process scope keeps settlement held. The reviewed six-team cutover and rollback plan preserves native qualification and owner activation gates.
 
+### Security
+
+- **Review stored proposals, insights and gate command logs for exposed key bodies.** In `.aegis/proposals/` and `~/.aegis/insights/*.jsonl` written by 4.5.x, carriage-return (CR), next-line (NEL), vertical-tab (VT) and form-feed (FF) splits may appear as a space between a key prefix and its body, rather than the original control. CSI escapes may remain in stored text (`\u001b` in insight JSON). Review proposal files on disk and in history, including CSI escape sequences and any joined keys in cleaned proposal text, and rotate any exposed key found there or in insights. The 5.0 insight/proposal redaction joins ignored C0/C1 controls (including CR, NEL, VT, FF and NUL) and complete CSI sequences on its detection views before matching secret patterns. Space, TAB, LF, U+2028, U+2029 and other separators those views keep remain unprotected; do not rely on redaction for those splits. In both 4.5.x and 5.0, `.aegis/state/gate_events.jsonl` can still retain control-split key bodies in logged commands because command redaction does not use the deleted view; review this log and rotate any exposed key.
+
 ## [4.5.0] - 2026-11-02
 
 ### Added
