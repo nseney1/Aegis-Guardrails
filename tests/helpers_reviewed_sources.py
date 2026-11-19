@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from importlib.machinery import FileFinder
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -135,13 +136,16 @@ def census_guard(root, *, module_file=None, absolute_labels=False):
     history = _AUTHORITY["history"].get(module_key, ())
     assert not history, history[0] if history else ""
     state = {"root": root_key, "violations": violations, "expected": None,
-             "module": module_key, "checked": False}
+             "module": module_key, "checked": False, "pending": 0}
     _ACTIVE_CENSUSES.append(state)
     normal_exit = False
     try:
         if module_key is not None:
             root = Path(root_key)
-            state["expected"] = reviewed_source_rows(root, reviewed_python_paths(root), absolute_labels=absolute_labels)
+            state["expected"] = tuple(
+                (label, hashlib.sha256(text.encode("utf-8", "surrogatepass")).digest())
+                for label, text in reviewed_source_rows(
+                    root, reviewed_python_paths(root), absolute_labels=absolute_labels))
         yield
         normal_exit = True
     finally:
@@ -155,27 +159,45 @@ def census_guard(root, *, module_file=None, absolute_labels=False):
             assert state["checked"], "census did not check its source rows"
 
 
-def reviewed_source_rows(root: Path, paths, *, absolute_labels=False) -> tuple:
-    """The canonical immutable rows for this census attempt, including source text."""
-    return tuple((root / name if absolute_labels else name, (root / name).read_text(encoding="utf-8"))
-                 for name in paths)
+def reviewed_source_rows(root: Path, paths, *, absolute_labels=False):
+    """Read canonical rows one at a time from frozen membership."""
+    return ((root / name if absolute_labels else name, (root / name).read_text(encoding="utf-8"))
+            for name in paths)
 
 
 def check_census_rows(rows):
-    """Validate the sink's actual input against the pre-body canonical snapshot.
+    """Yield rows validated against the pre-body label and source-digest snapshot.
 
     Sources passed or rebound by a caller cannot turn this off. Standalone scan
     fixtures outside a live census retain their ordinary synthetic inputs.
     """
     for state in reversed(_ACTIVE_CENSUSES):
-        expected = state["expected"]
-        if expected is not None:
-            if rows is not expected and rows != expected:
-                failure = AssertionError("census rows must equal the frozen inventory")
-                state["violations"].append(failure)
-                raise failure
-            state["checked"] = True
-            return
+        if state["expected"] is not None:
+            state["checked"] = False
+            state["pending"] += 1
+            return _checked_census_rows(rows, state)
+    return iter(rows)
+
+
+def _checked_census_rows(rows, state):
+    """Keep this iterator bound to its creating census across interleaved scans."""
+    expected = state["expected"]
+    count = 0
+    for row in rows:
+        if (count >= len(expected) or not isinstance(row, tuple) or len(row) != 2
+                or row[0] != expected[count][0] or not isinstance(row[1], str)
+                or hashlib.sha256(row[1].encode("utf-8", "surrogatepass")).digest() != expected[count][1]):
+            failure = AssertionError("census rows must equal the frozen inventory")
+            state["violations"].append(failure)
+            raise failure
+        count += 1
+        yield row
+    if count != len(expected):
+        failure = AssertionError("census rows must equal the frozen inventory")
+        state["violations"].append(failure)
+        raise failure
+    state["pending"] -= 1
+    state["checked"] = state["pending"] == 0
 
 
 def freeze_fixture_sources(root: Path, rows) -> tuple:

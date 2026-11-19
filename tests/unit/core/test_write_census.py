@@ -117,7 +117,8 @@ if _original_configure_node is not None:
     (package / "__init__.py").write_text("", encoding="utf-8")
     (package / "subject.py").write_text(textwrap.dedent(body), encoding="utf-8")
     for name in ("aegis_cli/__init__.py", "aegis_core/_version.py",
-                 "aegis_core/primitives.py", "aegis_core/redaction.py"):
+                 "aegis_core/primitives.py", "aegis_core/redaction.py",
+                 "aegis_core/redaction_patterns.py"):
         target = suite / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text((ROOT / name).read_text(encoding="utf-8"), encoding="utf-8")

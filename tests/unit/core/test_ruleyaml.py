@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+import os
+import traceback
 import pytest
 
 from conftest import symlink_or_skip
@@ -18,6 +21,162 @@ from aegis_core.yaml_engine.parser import (
 )
 from aegis_core.yaml_engine.serializer import dump_frontmatter
 from aegis_core.workspace.base import Workspace
+from aegis_core.errors import RuleParseError
+from aegis_sdk import parse_rule_file
+import aegis_core.yaml_engine.frontmatter as frontmatter_engine
+
+
+@pytest.mark.parametrize("yaml", [
+    "private_payload: 1\nprivate_payload: 2",
+    "value: {private_payload: 1, private_payload: 2}",
+    "value: [] private_payload",
+    "value: !private_payload",
+    "value:\n  - private_payload:part: value",
+    "value: ['private_payload' x]",
+    "value: {key: 'private_payload' x}",
+    "value: [\"private_payload\"suffix]",
+    'value: "\\UFFFFFFFF"',
+    'value: "\\u0000"',
+    '"' + "private_payload" * 250 + '": 1\n"' + "private_payload" * 250 + '": 2',
+], ids=["block-key", "flow-key", "flow-suffix", "unsupported", "ambiguous-item",
+        "sequence-delimiter", "mapping-delimiter", "quoted-scalar", "unicode-range",
+        "nul-escape", "long-key"])
+def test_sdk_rule_parse_diagnostics_never_echo_content(tmp_path, yaml):
+    path = tmp_path / "rule.md"
+    original = "---\n" + yaml + "\n---\nprivate_body\n"
+    path.write_text(original, encoding="utf-8")
+    expected = f"Error parsing rule {path}: Invalid YAML frontmatter"
+
+    def refuse(_):
+        with pytest.raises(RuleParseError) as raised:
+            parse_rule_file(str(path))
+        error = raised.value
+        assert type(error) is RuleParseError
+        assert error.code == "ERR_AEGIS"
+        assert str(error) == error.message == expected
+        assert error.__cause__ is None
+        assert error.__suppress_context__
+        formatted = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+        assert "private_payload" not in formatted
+        assert "private_body" not in formatted
+        assert "Duplicate key" not in formatted
+        return str(error)
+
+    refuse(None)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(refuse, range(3), timeout=15)) == [expected] * 3
+    assert path.read_text(encoding="utf-8") == original
+    path.write_text("---\nid: repaired\n---\nbody", encoding="utf-8")
+    assert parse_rule_file(str(path)) == ({"id": "repaired"}, "body")
+
+
+def test_sdk_rule_decode_diagnostic_never_echoes_bytes(tmp_path):
+    path = tmp_path / "rule.md"
+    path.write_bytes(b"---\nid: \xffprivate_payload\n---\n")
+    with pytest.raises(RuleParseError) as raised:
+        parse_rule_file(path)
+    assert str(raised.value) == f"Error parsing rule {path}: Invalid YAML frontmatter"
+    assert raised.value.code == "ERR_AEGIS"
+    assert raised.value.__cause__ is None
+    assert raised.value.__suppress_context__
+
+
+@pytest.mark.parametrize("diagnostic", ["private_payload", "private_payload" * 10000], ids=["short", "long"])
+def test_sdk_rule_unknown_diagnostic_is_omitted(tmp_path, monkeypatch, diagnostic):
+    path = tmp_path / "rule.md"
+    path.write_text("---\nid: rule\n---\n", encoding="utf-8")
+
+    class UnprintableError(ValueError):
+        def __str__(self):
+            pytest.fail("untrusted exception text was formatted")
+
+    def fail(_):
+        raise UnprintableError(diagnostic)
+
+    monkeypatch.setattr(frontmatter_engine, "parse_yaml_subset", fail)
+    with pytest.raises(RuleParseError) as raised:
+        parse_rule_file(path)
+    assert str(raised.value) == f"Error parsing rule {path}: Invalid YAML frontmatter"
+    assert raised.value.code == "ERR_AEGIS"
+
+
+@pytest.mark.parametrize("exists", [False, True], ids=["missing", "malformed"])
+def test_sdk_rule_error_path_redacts_before_clipping(monkeypatch, exists):
+    from aegis_core.errors import RuleNotFoundError
+    from types import SimpleNamespace
+
+    # Exercise a credential across the display cut without depending on the
+    # host's path length limit. Patch only this module's filesystem boundary.
+    path = "/".join(["a" * 100] * 3 + ["b" * 80 + "-ghp_" + "A" * 40, "rule.md"])
+    monkeypatch.setattr(frontmatter_engine, "os", SimpleNamespace(path=SimpleNamespace(isfile=lambda _: exists)))
+    monkeypatch.setattr(frontmatter_engine, "read_rule_file", lambda *a, **kw: b"---\nvalue: !private_payload\n---\n")
+    error_type = RuleParseError if exists else RuleNotFoundError
+    with pytest.raises(error_type) as raised:
+        parse_rule_file(path)
+    prefix = "Error parsing rule " if exists else "Rule file not found: "
+    suffix = ": Invalid YAML frontmatter" if exists else ""
+    shown_path = str(raised.value)[len(prefix):]
+    if suffix:
+        assert shown_path.endswith(suffix)
+        shown_path = shown_path[:-len(suffix)]
+    assert "ghp_" not in shown_path
+    assert "A" * 8 not in shown_path
+    assert len(shown_path) <= 400
+    assert raised.value.code == "ERR_AEGIS"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX control characters in filenames")
+def test_sdk_rule_error_path_canonicalizes_before_redaction(tmp_path):
+    path = tmp_path / ("ghp_" + "A" * 10 + "\x1b[31m" + "A" * 30 + "\nrule.md")
+    path.write_text("---\nvalue: !private_payload\n---\n", encoding="utf-8")
+    with pytest.raises(RuleParseError) as raised:
+        parse_rule_file(path)
+    message = str(raised.value)
+    assert message.startswith("Error parsing rule ")
+    assert message.endswith(": Invalid YAML frontmatter")
+    assert "ghp_" not in message
+    assert "A" * 8 not in message
+    assert "\x1b" not in message
+    assert "\n" not in message
+
+
+def test_sdk_rule_disappeared_path_refusal_redacts_and_retries(tmp_path, monkeypatch):
+    from aegis_core.errors import RuleNotFoundError
+
+    path = tmp_path / ("ghp_" + "A" * 40 + ".md")
+    path.write_text("---\nid: repaired\n---\nbody", encoding="utf-8")
+    reader = frontmatter_engine.read_rule_file
+
+    def disappeared(*args, **kwargs):
+        raise FileNotFoundError("private_payload")
+
+    monkeypatch.setattr(frontmatter_engine, "read_rule_file", disappeared)
+    with pytest.raises(RuleNotFoundError) as raised:
+        parse_rule_file(path)
+    assert str(raised.value).startswith("Rule file not found: ")
+    assert "ghp_" not in str(raised.value)
+    assert "A" * 8 not in str(raised.value)
+    assert raised.value.code == "ERR_AEGIS"
+    assert raised.value.__cause__ is None
+    assert raised.value.__suppress_context__
+    monkeypatch.setattr(frontmatter_engine, "read_rule_file", reader)
+    assert parse_rule_file(path) == ({"id": "repaired"}, "body")
+
+
+@pytest.mark.parametrize("content,diagnostic", [
+    ("private_payload", "No frontmatter delimiter"),
+    ("---\nid: private_payload", "Unclosed frontmatter"),
+], ids=["no-delimiter", "unclosed"])
+def test_sdk_rule_delimiter_diagnostics_keep_public_contract(tmp_path, content, diagnostic):
+    path = tmp_path / "rule.md"
+    path.write_text(content, encoding="utf-8")
+    with pytest.raises(RuleParseError) as raised:
+        parse_rule_file(path)
+    assert type(raised.value) is RuleParseError
+    assert str(raised.value) == f"Error parsing rule {path}: {diagnostic}"
+    assert raised.value.code == "ERR_AEGIS"
+    assert raised.value.__cause__ is None
+    assert raised.value.__suppress_context__
 
 
 class TestAegisYAMLCoreParsing:
