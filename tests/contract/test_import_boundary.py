@@ -132,6 +132,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_mailbox_service": 1,
     "aegis_core.team_mailbox_store": 0,
     "aegis_core.team_metrics": 1,
+    "aegis_core.team_native_rollout": 0,
     "aegis_core.team_paths": 1,
     "aegis_core.team_profile": 1,
     "aegis_core.team_profile_display": 0,
