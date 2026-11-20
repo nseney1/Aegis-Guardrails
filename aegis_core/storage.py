@@ -315,6 +315,7 @@ def _state_dir_at(layout, directory):
 def message_store(workspace: Any, *, write: bool = False):
     """Default message store, admitted by anchored descriptors before any record I/O."""
     from . import message_codec as codec
+    from .storage_confined import ConfinedFileError, open_directory
 
     capabilities = {function.__name__ for function in os.supports_dir_fd}
     nofollow = {function.__name__ for function in os.supports_follow_symlinks}
@@ -323,16 +324,12 @@ def message_store(workspace: Any, *, write: bool = False):
     layout = workspace.layout
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     message_path = layout.state_dir / "messages"
+    held = None
     try:
         with ExitStack() as stack:
-            parent = None
-            for component in (layout.root.anchor, *layout.root.parts[1:], layout.aegis_dir.name):
-                try:
-                    fd = os.open(component, flags, **({"dir_fd": parent} if parent is not None else {}))
-                except FileNotFoundError:
-                    raise codec.CodecError("E_AUTH", detail="workspace") from None
-                stack.callback(os.close, fd)
-                parent = fd
+            held = stack.enter_context(open_directory(os.open, layout.aegis_dir, retain_ancestors=True,
+                                                      close_fd=os.close, stat_fd=os.fstat, stat_entry=os.stat))
+            parent = held.fd
             for directory in (layout.state_dir, message_path):
                 if write:
                     try:
@@ -352,10 +349,18 @@ def message_store(workspace: Any, *, write: bool = False):
             expected, actual = os.fstat(parent), os.fstat(store.fd)
             codec.require((expected.st_dev, expected.st_ino) == (actual.st_dev, actual.st_ino), "E_AUTH")
             yield store
-    except OSError as error:
+    except (OSError, ConfinedFileError) as error:
+        if isinstance(error, ConfinedFileError):
+            if error.directory_anchor is not held:
+                raise
+            if error.reason == "missing" and error.directory_stage in ("open_root", "open"):
+                raise codec.CodecError("E_AUTH", detail="workspace") from None
+            if error.os_error is None:
+                raise codec.CodecError("E_AUTH") from None
+            error = error.os_error
         if error.errno in (errno.ELOOP, errno.ENOTDIR, errno.ENOENT):
             raise codec.CodecError("E_AUTH") from None
-        raise
+        raise error from None
 
 
 # ── Shared state: one directory for every worktree of a repository ───────────

@@ -16,6 +16,7 @@ import sys
 
 from aegis_core.redaction import SECRET_REPLACEMENTS
 from aegis_core.storage import LockTimeoutError, file_generation, file_lock
+from aegis_core.storage_confined import ConfinedFileError, open_directory
 
 __all__ = ["MAX_LINE_BYTES", "MAX_INPUT_BYTES", "MAX_HISTORY_BYTES", "MAX_HISTORY_RECORDS",
            "ModelSelectionError", "validate_bindings", "select_model", "select_and_append",
@@ -624,13 +625,8 @@ def _open_regular(path, error, cap=None):
     _safe_path(path, error)
     before = path.lstat()
     cursor, descriptor = None, None
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     try:
-        cursor = os.open(path.anchor, flags)
-        for component in path.parent.parts[1:]:
-            child = os.open(component, flags, dir_fd=cursor)
-            previous, cursor = cursor, child
-            os.close(previous)
+        cursor = open_directory(os.open, path.parent, close_fd=os.close, stat_fd=os.fstat, stat_entry=os.stat).detach()
         descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK |
                              getattr(os, "O_CLOEXEC", 0), dir_fd=cursor)
         opened = os.fstat(descriptor)
@@ -780,30 +776,16 @@ def _decision_directory(path):
     except RuntimeError as exc:
         raise ModelSelectionError("unsafe_decision_path") from exc
     _require(parent == given.parent, "unsafe_decision_path")
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-    cursor, directory = None, None
-    try:
-        cursor = _path_call(os.open, parent.anchor, flags, missing=True)
-        for component in parent.parts[1:]:
-            child = _path_call(os.open, component, flags, dir_fd=cursor)
-            previous, cursor = cursor, child
-            os.close(previous)
-        leaf = given.name or "."
-        directory = _path_call(os.open, leaf, flags, dir_fd=cursor)
-        info = os.fstat(directory)
+    def private(info):
         _require(info.st_uid == os.getuid() and not info.st_mode & 0o022, "unsafe_decision_directory")
-        visible = _path_call(os.stat, leaf, dir_fd=cursor, follow_symlinks=False)
-        _require(stat.S_ISDIR(visible.st_mode) and (visible.st_dev, visible.st_ino) ==
-                 (info.st_dev, info.st_ino) == (expected.st_dev, expected.st_ino), "unsafe_decision_path")
-        previous, cursor = cursor, None
-        os.close(previous)
-        result, directory = directory, None
-        return result
-    finally:
-        if directory is not None:
-            os.close(directory)
-        if cursor is not None:
-            os.close(cursor)
+
+    try:
+        with open_directory(os.open, given, policy=private, close_fd=os.close,
+                            stat_fd=os.fstat, stat_entry=os.stat) as held:
+            _require(held.identity == (expected.st_dev, expected.st_ino), "unsafe_decision_path")
+            return held.detach()
+    except ConfinedFileError as exc:
+        raise ModelSelectionError("unsafe_decision_path") from exc
 
 
 def _open_log(name, directory):
