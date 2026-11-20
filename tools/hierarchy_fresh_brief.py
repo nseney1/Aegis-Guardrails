@@ -747,7 +747,7 @@ def _inert_evidence_reducer(*, _guard):
         try:
             _guard.check(path, scope=True)
         except (ValueError, OSError) as exc:
-            outcome = _disposition(exc, guard=_guard, seam="scope", path=path, inert=path in inert_paths)
+            outcome = _disposition(exc, guard=_guard, seam="scope", path=path)
             if outcome == ABSENT:
                 return path
             if refusals is None or outcome != QUARANTINE:

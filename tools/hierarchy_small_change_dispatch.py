@@ -561,19 +561,16 @@ class _RetainedJob:
         result, record, claim = self.result, self.process, self.claim
         require(claim is not None and claim.get("job") == self.id and claim.get("process_scope") == jobs.process_scope(),
                 "job process scope is unknown: " + self.id)
-        if result["steps"] and result.get("process_stopped_confirmed") is not True:
-            require(record is not None and type(record.get("step")) is int and record["step"] == len(result["steps"])
-                    and type(record.get("group")) is int and record["group"] > 0,
-                    "executed steps lack process stop evidence: " + self.id)
         group = (record or {}).get("group")
         require(record is None or (type(group) is int and group > 0), "invalid job process group")
+        require(len(result["steps"]) <= jobs.MAX_STEPS, "completed job step count exceeds retained limit")
+        require(record is not None and type(record.get("step")) is int
+                and record["step"] == len(result["steps"]),
+                "completed job process step differs from retained result")
+        logs = {name for name in self.entries if name.startswith("step-") and name.endswith(".log")}
+        require(logs == {"step-%d.log" % number for number in range(1, len(result["steps"]) + 1)},
+                "completed job log artifacts differ from retained result")
         require(not (group and jobs.group_members(group)), "job process group is still running: " + str(group))
-        numbers = [int(n[5:-4]) for n in self.entries if n.startswith("step-") and n.endswith(".log") and n[5:-4].isdigit()]
-        latest = max(numbers, default=0)
-        unrecorded = latest and (record is None or not isinstance(record.get("step"), int)
-                                or record["step"] < latest or (record["step"] == latest and not record.get("group")))
-        require(not unrecorded or result.get("process_stopped_confirmed") is True,
-                "job has an unrecorded process effect: " + self.id)
 
 
 class _RunnerClaim(_RetainedJob):
