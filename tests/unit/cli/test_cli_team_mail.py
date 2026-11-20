@@ -15,6 +15,7 @@ from aegis_cli.cli import main
 from aegis_cli import team_mail
 from aegis_core import team_mailbox_store as storage
 from aegis_core import team_profile
+from aegis_core.model_select import MAX_INPUT_BYTES
 from aegis_core.team_mailbox_primitives import MAX_BYTES, OWNER_EVIDENCE_LOCK
 from tools import hierarchy_mailbox as legacy
 
@@ -128,6 +129,183 @@ def test_usage_does_not_echo_input(tmp_path, capsys, verb, options):
     assert "SECRET" not in captured.out + captured.err
     result = json.loads(captured.out)
     assert result["reason"] == "invalid_arguments" and result["next_action"]
+
+
+def assert_mail_board_usage(captured):
+    assert captured.err == ""
+    assert len(captured.out.splitlines()) == 1
+    assert json.loads(captured.out) == {
+        "status": "refused", "reason": "invalid_arguments", "exit_code": 2,
+        "next_action": "Use aegis team mail or board --help and supply the required options.",
+    }
+
+
+@pytest.mark.parametrize("verb", ["send", "read", "doctor"])
+@pytest.mark.parametrize("where", ["root", "team", "command", "verb", "option-value", "separator",
+                                   "with-msg", "with-model", "with-queue", "with-all"])
+def test_mail_invocation_usage_at_each_parser_level(capsys, verb, where):
+    argv = ["team", "mail", verb, "--root", "/unused"]
+    if verb == "send":
+        argv += ["--request", "-"]
+    elif verb == "read":
+        argv += ["--endpoint", "a/orchestrator"]
+    if where == "option-value":
+        argv = ["--workspace", "team", "PRIVATE_SENTINEL", "--workspace", "mail", *argv[2:]]
+    elif where == "separator":
+        argv[:0] = ["--", "--unknown=PRIVATE_SENTINEL"]
+    elif where == "root":
+        argv.insert(0, "--json=PRIVATE_SENTINEL")
+    elif where.startswith("with-"):
+        argv.append("--unknown=PRIVATE_SENTINEL")
+        for value in (("msg", "model", "queue") if where == "with-all" else (where[5:],)):
+            argv += ["--workspace", value]
+    else:
+        argv.insert({"team": 1, "command": 2, "verb": 3}[where], "--unknown=PRIVATE_SENTINEL")
+    with pytest.raises(SystemExit) as caught:
+        main(argv)
+    assert caught.value.code == 2
+    assert_mail_board_usage(capsys.readouterr())
+
+
+@pytest.mark.parametrize("scope", ["mail", "board"])
+@pytest.mark.parametrize("overlap", ["msg", "model", "queue", "all", "model-action", "queue-action", "removed"])
+def test_mail_board_invocation_usage_owns_overlapping_parse_failures(capsys, scope, overlap):
+    if overlap == "model-action":
+        argv = ["team", "model", "--subject", scope, "--host-kind", "x" * 129]
+    elif overlap == "queue-action":
+        argv = ["team", "queue", "list", "--capability", scope, "--view", "PRIVATE_SENTINEL"]
+    elif overlap == "removed":
+        argv = ["audit", "--workspace", "team", "--workspace", scope]
+    else:
+        argv = ["--json=PRIVATE_SENTINEL", "team", scope]
+        argv.extend(["msg", "queue", "model"] if overlap == "all" else [overlap])
+    with pytest.raises(SystemExit) as caught:
+        main(argv)
+    assert caught.value.code == 2
+    assert_mail_board_usage(capsys.readouterr())
+
+
+@pytest.mark.parametrize("scope", ["mail", "board"])
+def test_successful_retry_keeps_model_and_queue_policy_composition(capsys, scope):
+    argv = ["team", "claim", "model", "--paths", scope, "--owner", "queue"]
+    with pytest.raises(SystemExit) as caught:
+        main(["--json=PRIVATE_SENTINEL", *argv])
+    assert caught.value.code == 2
+    assert_mail_board_usage(capsys.readouterr())
+
+    assert main(argv) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out) == {"error": "invalid_model_arguments"}
+
+
+@pytest.mark.parametrize("scope", ["mail", "board"])
+def test_successful_parse_with_scope_as_option_value_dispatches(capsys, tmp_path, scope):
+    (tmp_path / ".aegis" / "rules").mkdir(parents=True)
+    argv = ["team", "--workspace", scope, "config", "presets", "--workspace", str(tmp_path), "--json"]
+    with pytest.raises(SystemExit) as caught:
+        main([*argv, "--unknown=PRIVATE_SENTINEL"])
+    assert caught.value.code == 2
+    assert_mail_board_usage(capsys.readouterr())
+
+    assert main(argv) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out)["schema"] == "aegis.team.config.presets/v1"
+
+
+@pytest.mark.parametrize("scope", ["mail", "board"])
+@pytest.mark.parametrize("unknown", [False, True])
+def test_hook_syntax_failure_uses_mail_board_refusal(capsys, scope, unknown):
+    argv = ["hook", "run", "team", scope]
+    if unknown:
+        argv.append("--unknown=PRIVATE_SENTINEL")
+    with pytest.raises(SystemExit) as caught:
+        main(argv)
+    assert caught.value.code == 2
+    assert_mail_board_usage(capsys.readouterr())
+    assert main(["hook", "run", "team", "other", *argv[4:]]) == 0
+    assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.parametrize("scope", ["mail", "board"])
+@pytest.mark.parametrize("failure", ["queue-workspace", "model-workspace", "model-size"])
+def test_delegated_validation_uses_mail_board_refusal(capsys, scope, failure):
+    if failure == "queue-workspace":
+        argv = ["--workspace=../PRIVATE_SENTINEL", "team", "queue", "list", "--capability", scope]
+    else:
+        argv = ["team", "model", "--subject", scope, "--host-kind", "codex-cli", "--task-kind", "T1",
+                "--role-kind", "orchestrator", "--bindings", "bindings.json", "--policy", "policy.json",
+                "--history", "history.jsonl"]
+        if failure == "model-workspace":
+            argv += ["--workspace", "/" * 257]
+        else:
+            argv += ["--intent", "x" * (MAX_INPUT_BYTES + 1)]
+    with pytest.raises(SystemExit) as caught:
+        main(argv)
+    assert caught.value.code == 2
+    assert_mail_board_usage(capsys.readouterr())
+
+
+@pytest.mark.parametrize("scope", ["model", "mail-model", "queue"])
+def test_mixed_cli_policies_leave_concurrent_streams_available(capsys, scope):
+    entered, resume = Event(), Event()
+
+    class PausedOption(str):
+        def __getitem__(self, index):
+            if index == 0:
+                entered.set()
+                assert resume.wait(10)
+            return super().__getitem__(index)
+
+    def refuse(argv):
+        try:
+            return main(argv)
+        except SystemExit as error:
+            return error.code
+
+    names = {"model": ["model"], "mail-model": ["mail", "model"], "queue": ["queue", "list"]}
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(refuse, [PausedOption("--json=PRIVATE_SENTINEL"), "team", *names[scope]])
+        try:
+            assert entered.wait(10)
+            assert refuse(["--json=PRIVATE_SENTINEL", "team", "board"]) == 2
+            assert_mail_board_usage(capsys.readouterr())
+            assert refuse(["--json=ORDINARY_SENTINEL", "team", "list"]) == 2
+            captured = capsys.readouterr()
+            assert captured.out == "" and "ORDINARY_SENTINEL" in captured.err
+        finally:
+            resume.set()
+        assert pending.result(timeout=10) == 2
+
+    captured = capsys.readouterr()
+    if scope == "mail-model":
+        assert_mail_board_usage(captured)
+    elif scope == "model":
+        assert captured.err == "" and json.loads(captured.out) == {"error": "invalid_model_arguments"}
+    else:
+        assert captured.err == "" and json.loads(captured.out)["schema"] == "aegis.team.queue.usage/v1"
+
+
+def test_mail_board_invocation_policy_is_local_to_each_parse(capsys):
+    def parse(scope):
+        with pytest.raises(SystemExit) as caught:
+            main(["--json=PRIVATE_SENTINEL", "team", scope])
+        return caught.value.code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        codes = list(pool.map(parse, ("mail", "board"), timeout=10))
+    assert codes == [2, 2]
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    first, second = captured.out.splitlines()
+    assert first == second
+    assert json.loads(first)["reason"] == "invalid_arguments"
+
+    with pytest.raises(SystemExit) as caught:
+        main(["--json=ORDINARY_SENTINEL", "team", "list"])
+    assert caught.value.code == 2
+    assert "ORDINARY_SENTINEL" in capsys.readouterr().err
 
 
 def test_profile_timeout_is_fixed_and_has_no_effect(mailbox, capsys, monkeypatch):

@@ -12,7 +12,6 @@ Renew refuses ``lease_branch_missing`` or ``liveness_unknown``. GC may warn ``ex
 from __future__ import annotations
 
 import argparse
-from contextlib import redirect_stderr, redirect_stdout
 import json
 import sys
 import time
@@ -169,19 +168,6 @@ class ModelHostKinds(argparse.Action):
         setattr(namespace, self.dest, previous + [value])
 
 
-class _SilentModelOutput:
-    """Discard incidental text without retaining or parsing untrusted output."""
-
-    def write(self, text):
-        return len(text)
-
-    def flush(self):
-        pass
-
-    def isatty(self):
-        return False
-
-
 class ModelErrorPolicy:
     """Own the complete raw model invocation and publish one structured result."""
 
@@ -198,13 +184,12 @@ class ModelErrorPolicy:
     def run(self, operation):
         if not self.model_invocation:
             return operation()
-        with redirect_stdout(_SilentModelOutput()), redirect_stderr(_SilentModelOutput()):
-            try:
-                code = operation()
-            except (SystemExit, ModelArgumentError):
-                code = self.output({"error": "invalid_model_arguments"})
-            except (KeyboardInterrupt, Exception):
-                code = self.operation_error()
+        try:
+            code = operation()
+        except (SystemExit, ModelArgumentError):
+            code = self.output({"error": "invalid_model_arguments"})
+        except (KeyboardInterrupt, Exception):
+            code = self.operation_error()
         if self.queue_payload is not None:
             _emit(self.queue_payload)
             return code
@@ -258,10 +243,10 @@ class ModelErrorPolicy:
             if not is_model:
                 return args
             values = {key: getattr(args, key) for key in MODEL_REQUIRED + MODEL_OPTIONAL}
-            if model_argument_refusal(values) is not None:
-                raise ModelArgumentError()
             raw = args.workspace
-            if raw is not None and (len(raw) > MAX_INPUT_BYTES or raw.count("/") + raw.count("\\") > 256):
+            if (model_argument_refusal(values) is not None or
+                    (raw is not None and (len(raw) > MAX_INPUT_BYTES or raw.count("/") + raw.count("\\") > 256))):
+                parser.refuse_scoped_usage()
                 raise ModelArgumentError()
             # main attaches the workspace through the shared upward resolver;
             # model_result then checks that the resolved root is initialized.

@@ -19,7 +19,8 @@ from aegis_core.team_mailbox_primitives import (
     require, safe_path, strict_json, validate_warnings,
 )
 
-__all__ = ["configure_parser", "run_mail", "workspace_refusal", "options", "request", "emit", "parser_factory", "cli_line"]
+__all__ = ["MailBoardErrorPolicy", "configure_parser", "run_mail", "workspace_refusal", "options",
+           "request", "emit", "parser_factory", "cli_line"]
 
 
 def now_utc():
@@ -86,6 +87,43 @@ def usage():
             "next_action": "Use aegis team mail or board --help and supply the required options.", "exit_code": 2}
 
 
+class _MailBoardParseRefusal(BaseException):
+    """Carry a fixed refusal past policies that handle Exception and SystemExit."""
+
+
+class MailBoardErrorPolicy:
+    """Own parse failures in the raw mail and board scopes."""
+
+    guards_usage = True
+
+    def __init__(self, fallback, parser_errors):
+        self.fallback = fallback
+        self.parser_errors = parser_errors
+
+    def __getattr__(self, name):
+        return getattr(self.fallback, name)
+
+    def __call__(self):
+        raise _MailBoardParseRefusal()
+
+    def removed_pointer(self, argv, lookup):
+        # Let the parser establish the command before selecting a diagnostic.
+        return None
+
+    def run(self, operation):
+        try:
+            return self.fallback.run(operation)
+        except _MailBoardParseRefusal:
+            emit(usage())
+            raise SystemExit(2) from None
+
+    def parse_cli_args(self, parse, args, namespace):
+        try:
+            return parse(args=args, namespace=namespace)
+        except self.parser_errors:
+            raise _MailBoardParseRefusal() from None
+
+
 def workspace_refusal(args, error):
     emit({"status": "refused", "reason": "workspace_unavailable",
           "next_action": "Select an available trusted workspace and retry.", "exit_code": 1})
@@ -96,6 +134,9 @@ def parser_factory(parent):
     """Keep argument errors local to the new verbs, with no argv-derived output."""
     class MailParser(type(parent)):
         def error(self, message):
+            policy = getattr(self, "_error_policy", None)
+            if isinstance(policy, MailBoardErrorPolicy):
+                policy()
             emit(usage())
             self.exit(2)
 
