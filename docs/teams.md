@@ -20,16 +20,20 @@ These surfaces are in the tree. This page is the entry; the linked pages are the
 | Model selection | `aegis team model` and the `aegis_team_model` tool; a choice requires an admitted binding | [Model selection](model-selection.md) |
 | Team profile | `aegis team config`, `aegis team doctor` and `aegis team hosts` | [Team profiles](teams-profile.md) |
 | Message codec | `aegis msg` plus `aegis_msg_read` and `aegis_msg_write` | [Delivery over MCP](how-it-works.md#delivery-over-mcp) |
-| Product mailbox | `aegis team mail send`, `aegis team mail read` and `aegis team mail doctor` over `aegis_core.team_mailbox` | [Mail and board](#mail-and-board) |
-| Team board | `aegis team board` configures, reads and inspects the board | [Mail and board](#mail-and-board) |
+| Product mailbox | `aegis team mail send` and `aegis team mail read` over `aegis_core.team_mailbox`; `aegis team mail doctor` over `aegis_core.team_mailbox_doctor` | [Mail and board](#mail-and-board) |
+| Team board | `aegis team board` configures, reads and inspects the board over `aegis_core.team_board` | [Mail and board](#mail-and-board) |
 | Session wake | `aegis_core.team_session_wake` validates the profile binding and attempts a turn for unread mail | [Session wakes](#session-wakes) |
+| Codex stdio wire | `aegis_core.team_native_wire.ProtocolClient` launches no process; the caller owns and reaps the process and transfers both pipe streams to the client, which closes them on `close()` or a terminal protocol error; cancel through `client.close()` and never close or reuse the streams directly | [Architecture](architecture.md#where-to-read-next) |
+| Workspace ledger | `aegis_core.team_workspace_store` and `aegis_core.team_workspace_display`; `tools/hierarchy_workspace.py` stays outside the wheel | [Architecture](architecture.md#where-to-read-next) |
+| Session stop | `aegis_core.team_session_stop`, `team_session_census` and `team_session_custody`; a stop signals only a process proven to belong to the recorded session | [Security](../SECURITY.md#teams-trust-model) |
+| Served identity | `aegis_core.model_served.observe_served` records host, model, level, family and a fallback reason; it adds no command | [Model selection](model-selection.md) |
 | Job recipes and packets | `aegis_core.team_jobs_recipes`; validation includes typed `unknown_recipe` and `invalid_packet` refusals and grants no execution authority | [Architecture](architecture.md#where-to-read-next) |
 | Hierarchy runs | `tools/hierarchy_team.py`, outside the installed wheel | [Runtime guide](agent-hierarchies.md) and [prerequisites](hierarchy-team.md#prerequisites) |
 | Git delivery | snapshot, plans, compare-and-swap publish, qualification and the publisher, as libraries | [Architecture](architecture.md#git-delivery) |
 | Proposals and lint | proposal records, including source `mine`; `aegis rule lint` reports and exits 0 | [Proposals and rule lint](how-it-works.md#proposals-and-rule-lint) |
 | Supervisor | profile-driven pauses and backoff | [Supervisor profile](teams-supervisor.md) |
 
-`aegis_core.merge_queue.MergeQueue` checks qualification for the exact landing tree. Automatic landing remains separate work. `tools/hierarchy_templates/` is outside the wheel. The wheel includes `job-recipes.json` and `role-registry.json` under `aegis_core/team_templates/`. `team_roles.registry` reads the role registry. [Absorption](teams-absorption.md) describes the package boundary for templates that are not moved yet.
+`aegis_core.merge_queue.MergeQueue` checks qualification for the exact landing tree. Automatic landing remains separate work. `revalidate` refuses `issued_unresolved` while an issued record or cleanup is set. `check_issued` refuses `issued_unresolved` when that issued checkpoint conflicts or results remain. `tools/hierarchy_templates/` is outside the wheel. The wheel includes `job-recipes.json` and `role-registry.json` under `aegis_core/team_templates/`. `team_roles.registry` reads the role registry. [Absorption](teams-absorption.md) describes the package boundary for templates that are not moved yet.
 
 Snapshots refuse `unsupported_platform` unless `descriptor_support` is true: `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `stat` and `readlink`. The work queue refuses `unsupported_platform`, and the proposal store refuses `unsupported`, unless `storage.confined_descriptor_supported` is true: `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `mkdir`, `link`, `rename`, `unlink` and `stat`. That function does not use `readlink`. Both probes are false when `os.name` is not `posix`, so Windows fails them. Neither function tests for macOS.
 
@@ -51,7 +55,13 @@ authority and no native Teams enforcement. Follow the
 **Runtime team tools** are a source-checkout prototype; `tools/hierarchy_team.py`
 is outside the installed wheel. Team runs need Linux, Python 3.9+, Git, `bwrap`,
 the selected host CLI and a dedicated host login. They set up runs, start and stop
-supported CLI sessions, and inspect run status. Start with the
+supported CLI sessions, and inspect run status. Fixed start failures are
+recorded as `failed_to_start` or `start_incomplete`, with the reasons in the
+[runtime guide](agent-hierarchies.md#start-resume-and-stop-sessions). The job
+runner calls `check_settlement_processes` on settlement and recovery before it
+treats a stopped job as finished, and refuses while the recorded process group
+still has members. The small-change dispatcher calls `check_stopped` before it
+accepts a completed retained job. Start with the
 [runtime guide](agent-hierarchies.md) and the
 [team-run prerequisites and configuration](hierarchy-team.md#prerequisites).
 
@@ -59,8 +69,10 @@ supported CLI sessions, and inspect run status. Start with the
 
 `aegis team mail send` publishes a request, `aegis team mail read` reads a
 bounded page, and `aegis team mail doctor` inspects mailbox health without
-writes. `aegis team doctor` checks the team profile. `aegis team board` can
-configure channels and access, read pages and inspect board health. See the
+writes. The doctor is `aegis_core.team_mailbox_doctor`, folded into that command;
+it is not a separate tool. `aegis team doctor` checks the team profile. `aegis team board` can
+configure channels and access, read pages and inspect board health through
+`aegis_core.team_board`. See the
 [mail](reference.md#aegis-team-mail) and [board](reference.md#aegis-team-board)
 command sections for arguments.
 
