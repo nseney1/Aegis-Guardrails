@@ -21,125 +21,31 @@ from __future__ import annotations
 
 from dataclasses import replace
 from functools import wraps
-from hashlib import sha256
-import re
 from threading import RLock
 import time
 
-from aegis_core import gitsafe, human_gate, team_git, team_qualify
+from aegis_core import gitsafe, merge_queue_model as model, team_git, team_qualify
 from aegis_core.errors import AegisError
-from aegis_core.merge_queue_types import (
-    Completion, HostedResult, IssuedRecord, Landing, QueueEntry, QueueState, QueueStorage, Review,
+from aegis_core.merge_queue_model import (
+    MAX_ENTRIES,
+    MAX_PARENTS as MAX_PARENTS,
+    MAX_REPLAY_RESULTS as MAX_REPLAY_RESULTS,
+    MAX_RESULTS,
+    MAX_REVIEWS as MAX_REVIEWS,
+    MAX_STATE_BYTES as MAX_STATE_BYTES,
+    REFUSALS, REQUIRED_LEGS, Completion, HostedResult, IssuedRecord, Landing, QueueEntry,
+    QueueRefused, QueueState, QueueStorage, Review,
 )
-from aegis_core.primitives import sanitize_display
-from aegis_core.redaction import redact_command_secrets
 
 __all__ = ["MergeQueue", "QueueEntry", "Review", "Landing", "QueueRefused", "REFUSALS",
            "REQUIRED_LEGS", "descriptor_supported", "QueueStorage", "QueueState",
            "HostedResult", "IssuedRecord", "Completion"]
 
-REQUIRED_LEGS = ("linux-3.12", "linux-3.9")
-MAX_ENTRIES = 1024
-MAX_RESULTS = 32
-MAX_STATE_BYTES = 32 * 1024 * 1024
-MAX_REPLAY_RESULTS = MAX_STATE_BYTES // 64
-MAX_REVIEWS = 32
-MAX_PARENTS = 32
 MAX_COMMIT_BYTES = 128 * 1024
-REFUSALS = {
-    "state_unavailable": "durable queue state is unavailable; reload before any effect",
-    "state_capacity": "bounded queue state capacity reached; reconcile retained observations",
-    "state_conflict": "authenticated queue observations conflict; reconcile without publishing",
-    "issued_unresolved": "an issued publication needs settled reconciliation before any new effect",
-    "target_red": "target is RED; only a qualified repair may publish",
-    "policy_refused": "effective target policy refuses ordinary publication",
-    "deadline_passed": "issued lane deadline passed; reconcile without publication",
-    "invalid_request": "merge queue request is malformed or oversized",
-    "unsupported_platform": "merge queue requires descriptor-relative custody support",
-    "store_mismatch": "merge queue belongs to a different trusted repository",
-    "not_reviewed": "lane requires two independent helpers-off ACCEPTs on its exact commit and tree",
-    "not_qualified": "lane head tree lacks its required entry PASS",
-    "request_conflict": "lane already has a different immutable queue entry",
-    "queue_full": "merge queue capacity reached",
-    "parent_cycle": "stack parents form a dependency cycle",
-    "observation_failed": "trusted target or policy observation is unavailable or invalid",
-    "git_failed": "merge queue Git operation failed",
-    "tip_moved": "target moved during planning; rebuild and requalify the landing tree",
-    "stale_candidate": "candidate no longer matches the serial queue head and target",
-    "landing_unconfirmed": "exact candidate landing is unconfirmed; observe without retrying the effect",
-    "already_integrated": "lane head is already an ancestor of the target; use a fresh pick lane to re-land reverted work",
-}
-_OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
-_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
-_LANE = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}\Z")
-
-
-class QueueRefused(ValueError):
-    """Fixed input-free diagnostic; no transport or hostile text is echoed."""
-
-    def __init__(self, code):
-        super().__init__(REFUSALS[code])
-        self.code = code
-        self.next_action = {"actor": "custodian", "command": REFUSALS[code]}
 
 
 def descriptor_supported():
     return team_git.descriptor_support() and team_qualify.descriptor_supported()
-
-
-def _oid(value):
-    return type(value) is str and len(value) in (40, 64) and _OID.fullmatch(value) is not None
-
-
-def _text(value, pattern, limit):
-    if type(value) is not str or not 1 <= len(value) <= limit or not pattern.fullmatch(value):
-        return False
-    canonical = sanitize_display(value, max_len=None)
-    return canonical == value and redact_command_secrets(canonical) == canonical
-
-
-def _lane(value):
-    return _text(value, _LANE, 63)
-
-
-def _ready(value):
-    return (type(value) is Landing and type(value.status) is str and value.status == "ready"
-            and _lane(value.lane) and _oid(value.tip) and _oid(value.commit) and _oid(value.tree)
-            and len(value.tip) == len(value.commit) == len(value.tree)
-            and type(value.issuance) is int and 0 <= value.issuance < 2**63
-            and type(value.missing_legs) is tuple and len(value.missing_legs) == 0)
-
-
-def _legs(values):
-    if type(values) is not tuple or not 1 <= len(values) <= team_qualify.MAX_LEGS:
-        raise QueueRefused("invalid_request")
-    for leg in values:
-        team_qualify.qualification_ref("0" * 40, leg)
-    if len(set(values)) != len(values):
-        raise QueueRefused("invalid_request")
-    return values
-
-
-def _entry(item):
-    if (type(item) is not QueueEntry or not _lane(item.lane)
-            or not _text(item.author, _LABEL, 128) or not _oid(item.head)
-            or type(item.repair) is not bool or type(item.parents) is not tuple
-            or len(item.parents) > MAX_PARENTS
-            or any(not _lane(parent) or parent == item.lane for parent in item.parents)
-            or len(set(item.parents)) != len(item.parents)
-            or (item.deadline is not None and (type(item.deadline) is not int
-                or not 0 <= item.deadline <= 2**63 - 1))):
-        raise QueueRefused("invalid_request")
-    if type(item.reviews) is not tuple or not 2 <= len(item.reviews) <= MAX_REVIEWS:
-        raise QueueRefused("not_reviewed")
-    for review in item.reviews:
-        if (type(review) is not Review or not _text(review.session, _LABEL, 128)
-                or review.session == item.author or review.helpers_off is not True
-                or type(review.verdict) is not str or review.verdict != "ACCEPT"
-                or not _oid(review.commit) or not _oid(review.tree)):
-            raise QueueRefused("not_reviewed")
-    if len({review.session for review in item.reviews}) != len(item.reviews):
-        raise QueueRefused("not_reviewed")
 
 
 def _tree(store, commit):
@@ -151,7 +57,7 @@ def _tree(store, commit):
     if not separator or len(trees) != 1:
         raise QueueRefused("git_failed")
     tree = trees[0].decode("ascii")
-    if not _oid(tree) or len(tree) != len(commit):
+    if not model.valid_oid(tree) or len(tree) != len(commit):
         raise QueueRefused("git_failed")
     store.object(tree, "tree")
     return tree
@@ -177,125 +83,12 @@ def _read(callback, *args):
         raise QueueRefused("observation_failed") from None
 
 
-
-def _result(value):
-    return (type(value) is HostedResult and _oid(value.commit) and type(value.passed) is bool
-            and type(value.attempt) is int and 0 <= value.attempt < 2**63)
-
-
-def _merged_result(old, new):
-    if old is None or new.attempt > old.attempt:
-        return new
-    if old.attempt > new.attempt or old.passed is False:
-        return old
-    return new
-
-
 def _storage_call(function, *args):
     try:
         return function(*args)
     except Exception:
         # This is the external authenticated storage boundary, not a retry.
         raise QueueRefused("state_unavailable") from None
-
-
-def _completion(value, target):
-    if value is None:
-        return None
-    if (type(value) is not Completion or type(value.target) is not str or value.target != target
-            or not _ready(value.landing) or value.landing.issuance == 0
-            or type(value.entry) is not QueueEntry or value.entry.lane != value.landing.lane
-            or (value.result is not None and
-                (not _result(value.result) or value.result.commit != value.landing.commit))):
-        raise QueueRefused("state_unavailable")
-    try:
-        _entry(value.entry)
-    except ValueError:
-        raise QueueRefused("state_unavailable") from None
-    return value
-
-
-def _pin_ref(target, candidate):
-    target = sha256(target.encode("utf-8")).hexdigest()
-    return "refs/aegis/merge-queue/%s/%d-%s" % (target, candidate.issuance, candidate.commit)
-
-
-def _record(value, target):
-    if (type(value) is not IssuedRecord or type(value.ref) is not str or len(value.ref) > 240
-            or not _oid(value.expected)):
-        raise QueueRefused("state_unavailable")
-    row = _completion(Completion(target, value.entry, value.landing, value.result), target)
-    if value.ref != _pin_ref(target, row.landing) or value.expected != row.landing.commit:
-        raise QueueRefused("state_unavailable")
-    return row
-
-
-def _validate_state(state, target, required, entry_legs, capacity):
-    if (type(state) is not QueueState or type(state.target) is not str or state.target != target
-            or type(state.required_legs) is not tuple or state.required_legs != required
-            or type(state.entry_legs) is not tuple or state.entry_legs != entry_legs
-            or type(state.entries) is not tuple or len(state.entries) > capacity
-            or type(state.results) is not tuple
-            or type(state.red) is not bool or type(state.reconciliation_required) is not bool):
-        raise QueueRefused("state_unavailable")
-    # Hard recovery bounds precede validation sets/dicts; nominal admission
-    # capacity must never make authenticated recovery checkpoints unloadable.
-    if len(state.results) > MAX_REPLAY_RESULTS:
-        raise QueueRefused("state_capacity")
-    numbers = (state.health_order, state.red_order, state.green_order, state.serial, state.generation)
-    if any(type(n) is not int or not 0 <= n < 2**63 for n in numbers):
-        raise QueueRefused("state_unavailable")
-    if max(numbers[:3]) > state.serial:
-        raise QueueRefused("state_unavailable")
-    if state.red_order > state.green_order and not state.red:
-        raise QueueRefused("state_unavailable")
-    try:
-        for item in state.entries:
-            _entry(item)
-    except ValueError:
-        raise QueueRefused("state_unavailable") from None
-    if len({item.lane for item in state.entries}) != len(state.entries):
-        raise QueueRefused("state_unavailable")
-    if (any(not _result(item) for item in state.results)
-            or len({item.commit for item in state.results}) != len(state.results)):
-        raise QueueRefused("state_unavailable")
-    if state.health_commit is not None and not _oid(state.health_commit):
-        raise QueueRefused("state_unavailable")
-    if state.health_result is not None and (
-            not _result(state.health_result) or state.health_result.commit != state.health_commit):
-        raise QueueRefused("state_unavailable")
-    if (state.health_commit is not None and state.health_order == 0
-            or state.health_result is not None and not state.health_result.passed
-            and state.health_order >= state.green_order and not state.red):
-        raise QueueRefused("state_unavailable")
-    for record, cleanup in ((state.issued, False), (state.cleanup, True)):
-        if record is None:
-            continue
-        row = _record(record, target)
-        if row.landing.issuance > state.serial:
-            raise QueueRefused("state_unavailable")
-        if not cleanup and (record.resolution is not None or row.entry not in state.entries):
-            raise QueueRefused("state_unavailable")
-        if cleanup and (state.issued is not None or type(record.resolution) is not str
-                or record.resolution not in ("issuing", "aborted", "done", "not_applied", "released")):
-            raise QueueRefused("state_unavailable")
-    return replace(state, reconciliation_required=True) if len(state.results) > MAX_RESULTS else state
-
-
-def _apply_result(state, result, order):
-    red, bad, good = state.red, state.red_order, state.green_order
-    health = state.health_result
-    if state.health_commit == result.commit:
-        health = _merged_result(health, result)
-        result = health
-    if result.passed and state.health_commit == result.commit:
-        good = max(good, order)
-        red, bad = False, min(bad, good)
-    elif not result.passed and order >= good:
-        bad, red = max(bad, order), True
-    if health is not None and not health.passed:
-        red = True
-    return replace(state, red=red, red_order=bad, green_order=good, health_result=health)
 
 
 def _operation(function):
@@ -325,21 +118,8 @@ class MergeQueue:
 
     def __init__(self, target, *, required_legs=REQUIRED_LEGS,
                  entry_legs=("linux-3.12",), capacity=MAX_ENTRIES, storage=None):
-        if (type(target) is not str or not 1 <= len(target) <= 255
-                or not human_gate.is_branch_name(target)
-                or redact_command_secrets(sanitize_display(target, max_len=None)) != target
-                or type(capacity) is not int or not 1 <= capacity <= MAX_ENTRIES):
-            raise QueueRefused("invalid_request")
-        try:
-            self.required_legs, self.entry_legs = _legs(required_legs), _legs(entry_legs)
-        except ValueError:
-            raise QueueRefused("invalid_request") from None
-        if not set(REQUIRED_LEGS) <= set(required_legs) or not set(entry_legs) <= set(required_legs):
-            raise QueueRefused("invalid_request")
-        if storage is not None and (type(storage) is not QueueStorage or
-                any(not callable(f) for f in (storage.load, storage.save, storage.lane,
-                                              storage.commit, storage.begin, storage.health))):
-            raise QueueRefused("state_unavailable")
+        self.required_legs, self.entry_legs = model.validate_configuration(
+            target, required_legs, entry_legs, capacity, MAX_ENTRIES, storage)
         self.target, self.capacity, self._storage = target, capacity, storage
         self._lock = RLock()
         self._repo = self._candidate = self._uncertain = None
@@ -350,7 +130,7 @@ class MergeQueue:
         if storage is not None:
             saved = _storage_call(storage.load, target)
             if saved is not None:
-                self._state = _validate_state(saved, target, required_legs, entry_legs, capacity)
+                self._state = model.validate_state(saved, target, required_legs, entry_legs, capacity)
                 for item in self._state.entries:
                     if self._lane_done(item.lane) is not None:
                         raise QueueRefused("state_unavailable")
@@ -395,7 +175,7 @@ class MergeQueue:
 
     def _archive(self, function, key, kind, observation=None):
         try:
-            row = _completion(_storage_call(function, self.target, key), self.target)
+            row = model.validate_completion(_storage_call(function, self.target, key), self.target)
             if row is not None and key != (row.entry.lane if kind == "lane" else row.landing.commit):
                 raise QueueRefused("state_unavailable")
             return row
@@ -413,20 +193,7 @@ class MergeQueue:
     def _retained(self, commit, observation=None, done=None):
         try:
             result = _storage_call(self._storage.health, self.target, commit)
-            if result is not None and (not _result(result) or result.commit != commit):
-                raise QueueRefused("state_unavailable")
-            sources = [observation, done.result if done is not None else None]
-            if self._state.health_commit == commit:
-                sources.append(self._state.health_result)
-            if self._state.issued is not None and self._state.issued.landing.commit == commit:
-                sources.append(self._state.issued.result)
-            if self._state.cleanup is not None and self._state.cleanup.landing.commit == commit:
-                sources.append(self._state.cleanup.result)
-            sources.extend(row for row in self._state.results if row.commit == commit)
-            for source in sources:
-                if source is not None:
-                    result = _merged_result(result, source)
-            return result
+            return model.retained_result(self._state, commit, result, observation, done)
         except QueueRefused:
             self._begin()
             self._faulted = True
@@ -436,25 +203,11 @@ class MergeQueue:
         return {item.lane: item for item in self._state.entries}
 
     def _observed_health(self, state, tip):
-        result = self._retained(tip)
-        if state.health_commit != tip:
-            state = replace(state, health_commit=tip, health_order=state.serial + 1,
-                            serial=state.serial + 1)
-        state = replace(state, health_result=result,
-                        reconciliation_required=len(state.results) > MAX_RESULTS)
-        return _apply_result(state, result, state.health_order) if result is not None else state
+        return model.apply_observed_health(state, tip, self._retained(tip))
 
     def _candidate_red(self, commit):
         result = self._retained(commit, done=self._commit_done(commit))
         return result is not None and not result.passed
-
-    def _result_capacity(self, commit):
-        state = self._state
-        if (len(state.results) >= MAX_RESULTS and commit != state.health_commit
-                and (state.issued is None or commit != state.issued.landing.commit)
-                and (state.cleanup is None or commit != state.cleanup.landing.commit)
-                and not any(row.commit == commit for row in state.results)):
-            raise QueueRefused("state_capacity")
 
     def _retire(self, store, state, record, resolution, completion=None):
         self._save(replace(state, issued=None, cleanup=replace(record, resolution=resolution)), completion)
@@ -488,7 +241,7 @@ class MergeQueue:
     @_operation
     def enqueue(self, store, item):
         """Admit bounded pending work; archived IDs remain immutable and reserved."""
-        _entry(item)
+        model.validate_entry(item)
         entries = self._entries()
         done = self._lane_done(item.lane)
         previous = entries.get(item.lane) or (done.entry if done is not None else None)
@@ -498,7 +251,7 @@ class MergeQueue:
             return "already"
         if len(entries) >= self.capacity:
             raise QueueRefused("queue_full")
-        self._acyclic(item, entries)
+        model.check_acyclic(item, entries)
         tree = _tree(store, item.head)
         equivalent = {item.head}
         for review in item.reviews:
@@ -515,20 +268,9 @@ class MergeQueue:
         self._repo, self._candidate = store.repo, None
         return "queued"
 
-    def _acyclic(self, item, entries):
-        pending, visited = list(item.parents), set()
-        while pending:
-            lane = pending.pop()
-            if lane == item.lane:
-                raise QueueRefused("parent_cycle")
-            if lane not in visited:
-                visited.add(lane)
-                if lane in entries:
-                    pending.extend(entries[lane].parents)
-
     def withdraw(self, lane, *, expected_head, store=None, read_target=None, read_outcome=None):
         """Issued work needs settled non-publication proof and an ancestry check."""
-        if not _lane(lane) or not _oid(expected_head):
+        if not model.valid_lane(lane) or not model.valid_oid(expected_head):
             raise QueueRefused("invalid_request")
         with self._lock:
             self._available()
@@ -593,7 +335,7 @@ class MergeQueue:
 
     def _tip(self, callback):
         tip = _read(callback, self.target)
-        if not _oid(tip):
+        if not model.valid_oid(tip):
             raise QueueRefused("observation_failed")
         return tip
 
@@ -613,7 +355,7 @@ class MergeQueue:
         merged = team_git.plan_merge(store, tip, item.head)
         if merged.status == "conflict":
             return Landing("conflict", item.lane, tip)
-        if merged.status != "clean" or not _oid(merged.tree):
+        if merged.status != "clean" or not model.valid_oid(merged.tree):
             raise QueueRefused("git_failed")
         commit = team_git.commit_tested(store, merged.tree, (tip, item.head),
                                        "Merge qualified queue lane\n", identity)
@@ -677,7 +419,7 @@ class MergeQueue:
         """
         if self._state.issued is not None or self._state.cleanup is not None:
             raise QueueRefused("issued_unresolved")
-        if not _ready(candidate) or candidate.issuance != 0:
+        if not model.ready_landing(candidate) or candidate.issuance != 0:
             raise QueueRefused("stale_candidate")
         if self._candidate_red(candidate.commit):
             raise QueueRefused("target_red")
@@ -691,7 +433,7 @@ class MergeQueue:
         issued = replace(candidate, issuance=self._state.serial + 1)
         item = self._entries()[candidate.lane]
         record = IssuedRecord(item, issued, resolution="issuing",
-                              ref=_pin_ref(self.target, issued), expected=issued.commit)
+                              ref=model.pin_ref(self.target, issued), expected=issued.commit)
         self._save(replace(self._state, cleanup=record, serial=issued.issuance))
         self._begin()
         team_git.cas_fast_forward(store, record.ref, None, record.expected)
@@ -707,11 +449,12 @@ class MergeQueue:
         True never authorizes retrying a pending/unknown publication intent.
         """
         record, state = self._state.issued, self._state
-        if not _ready(candidate) or record is None or record.landing != candidate:
+        if not model.ready_landing(candidate) or record is None or record.landing != candidate:
             raise QueueRefused("stale_candidate")
         try:
-            checkpoint = _validate_state(_storage_call(self._storage.load, self.target), self.target,
-                                         self.required_legs, self.entry_legs, self.capacity)
+            checkpoint = model.validate_state(
+                _storage_call(self._storage.load, self.target), self.target,
+                self.required_legs, self.entry_legs, self.capacity)
         except QueueRefused:
             self._begin()
             self._faulted = True
@@ -746,7 +489,7 @@ class MergeQueue:
     @_operation
     def observe_landed(self, store, candidate, *, read_target):
         """Reconcile a receipt; scheduling then needs fresh target authentication."""
-        if not _ready(candidate) or candidate.issuance == 0:
+        if not model.ready_landing(candidate) or candidate.issuance == 0:
             raise QueueRefused("stale_candidate")
         if self._state.cleanup is not None and self._state.cleanup.landing == candidate:
             if self._state.cleanup.resolution != "done":
@@ -779,7 +522,7 @@ class MergeQueue:
         state = replace(self._state, entries=tuple(entries.values()), issued=None)
         state = self._observed_health(state, tip)
         if result is not None:
-            state = _apply_result(state, result, candidate.issuance)
+            state = model.apply_result(state, result, candidate.issuance)
         self._target_checked = False
         self._retire(store, state, record, "done", Completion(self.target, record.entry, candidate, result))
         return "done"
@@ -787,7 +530,7 @@ class MergeQueue:
     @_operation
     def reconcile_not_landed(self, store, candidate, *, read_target, read_outcome):
         """Require the publisher's authenticated settled not-applied result, never tip alone."""
-        if not _ready(candidate) or candidate.issuance == 0:
+        if not model.ready_landing(candidate) or candidate.issuance == 0:
             raise QueueRefused("stale_candidate")
         if self._state.cleanup is not None and self._state.cleanup.landing == candidate:
             if self._state.cleanup.resolution in ("issuing", "aborted"):
@@ -819,13 +562,13 @@ class MergeQueue:
         Only higher-attempt same-revision GREEN clears RED. Unknown subjects block.
         """
         result = HostedResult(commit, passed, attempt)
-        if not _result(result):
+        if not model.valid_result(result):
             raise QueueRefused("invalid_request")
         with self._lock:
             self._available()
             done = self._commit_done(commit, result)
             if done is None:
-                self._result_capacity(commit)
+                model.check_result_capacity(self._state, commit)
             self._begin(result)
             state = self._state
             chosen = self._retained(commit, result, done)
@@ -835,17 +578,17 @@ class MergeQueue:
                 field = "issued" if state.issued is not None else "cleanup"
                 state = replace(state, **{field: replace(record, result=chosen)})
                 if state.health_commit == commit:
-                    state = _apply_result(state, chosen, state.health_order)
+                    state = model.apply_result(state, chosen, state.health_order)
                 self._save(state, replace(done, result=chosen) if done is not None else None)
                 return "pending"
             if done is not None:
-                state = _apply_result(state, chosen, done.landing.issuance)
+                state = model.apply_result(state, chosen, done.landing.issuance)
                 self._save(state, replace(done, result=chosen))
                 if (not self._state.red and commit != self._state.health_commit
                         and done.landing.issuance < self._state.green_order):
                     return "stale"
             elif state.health_commit == commit:
-                self._save(_apply_result(state, chosen, state.health_order))
+                self._save(model.apply_result(state, chosen, state.health_order))
             else:
                 pending = {row.commit: row for row in state.results}
                 pending[commit] = chosen
@@ -856,7 +599,7 @@ class MergeQueue:
     @_operation
     def restore_target(self, store, observation, *, read_target):
         """Restore the authenticated actual target; fresh queues start unobserved."""
-        if not _result(observation):
+        if not model.valid_result(observation):
             raise QueueRefused("invalid_request")
         try:
             tip = self._tip(read_target)
@@ -864,7 +607,7 @@ class MergeQueue:
             self._begin(observation)
             raise
         if tip != observation.commit:
-            self._result_capacity(observation.commit)
+            model.check_result_capacity(self._state, observation.commit)
             self._begin(observation)
             raise QueueRefused("observation_failed")
         self._begin(observation)
@@ -882,7 +625,7 @@ class MergeQueue:
         remaining = []
         for result in state.results:
             if result.commit == commit:
-                chosen = _merged_result(chosen, result)
+                chosen = model.merge_result(chosen, result)
             elif not _ancestor(store, result.commit, commit):
                 remaining.append(result)
         issued = state.issued
@@ -891,7 +634,7 @@ class MergeQueue:
         state = replace(state, issued=issued, results=tuple(remaining), health_commit=commit,
                         health_result=chosen, health_order=order, serial=max(state.serial, order),
                         reconciliation_required=len(remaining) > MAX_RESULTS)
-        state = _apply_result(state, chosen, order)
+        state = model.apply_result(state, chosen, order)
         self._save(state, replace(done, result=chosen) if done is not None else None)
         self._abort_intent(store)
         self._target_checked = True
@@ -901,7 +644,7 @@ class MergeQueue:
     @_operation
     def reconcile_result(self, store, commit, *, read_outcome, read_target):
         """Resolve an unrelated result only with authenticated settled non-publication proof."""
-        if not _oid(commit):
+        if not model.valid_oid(commit):
             raise QueueRefused("invalid_request")
         rows = {row.commit: row for row in self._state.results}
         if commit not in rows:

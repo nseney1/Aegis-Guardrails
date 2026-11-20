@@ -60,7 +60,7 @@ REVIEWED_REDACTION_IMPORTERS = frozenset({
     "aegis_core/insights/__init__.py",
     "aegis_core/insights/capture.py",
     "aegis_core/insights/review.py",
-    "aegis_core/merge_queue.py",
+    "aegis_core/merge_queue_model.py",
     "aegis_core/model_select.py",
     "aegis_core/pathlookup_gitcache.py",
     "aegis_core/proposals/model.py",

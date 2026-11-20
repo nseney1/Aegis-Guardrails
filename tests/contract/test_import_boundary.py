@@ -45,6 +45,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.errors": 0,
     "aegis_core.taxonomy": 0,
     "aegis_core.merge_queue": 2,
+    "aegis_core.merge_queue_model": 1,
     "aegis_core.merge_queue_types": 0,
     # Canonical message records and untrusted views (stdlib only).
     "aegis_core.message_codec": 0,
@@ -135,7 +136,10 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_mailbox_records": 1,
     "aegis_core.team_mailbox_service": 1,
     "aegis_core.team_mailbox_store": 0,
+    "aegis_core.team_meter": 0,
     "aegis_core.team_metrics": 1,
+    "aegis_core.team_native_authority": 1,
+    "aegis_core.team_native_keys": 0,
     "aegis_core.team_native_rollout": 0,
     "aegis_core.team_native_wire": 0,
     "aegis_core.team_paths": 1,
@@ -221,6 +225,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_session_custody": 1,
     "aegis_core.team_session_stop": 1,
     "aegis_core.team_session_wake": 1,
+    "aegis_core.team_source": 0,
     # Read-only lane status report over lease declarations and the existing tip gate.
     "aegis_core.team_status": 3,
     # Rule packs (rule export/import): the loader, migrate's stripper, the lifecycle's id checks and events.

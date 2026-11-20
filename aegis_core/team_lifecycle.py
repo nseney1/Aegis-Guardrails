@@ -4,7 +4,7 @@ Native authority is injected; this module never discovers plans or imports tools
 """
 from __future__ import annotations
 from contextlib import contextmanager
-from functools import wraps
+from functools import partial, wraps
 import copy
 import errno
 import hashlib
@@ -23,7 +23,7 @@ __all__ = [
     'delegated_decision', 'digest', 'encoded', 'evidence', 'fields', 'initial_key', 'initial_state', 'inspect_request',
     'matching', 'parse_time', 'policy_field', 'provider_handle', 'raw_value', 'reduce_event', 'require', 'resolve_row',
     'safe_path', 'small_change_approval', 'small_change_event', 'small_change_execution', 'small_change_participant', 'small_change_participants', 'small_change_review', 'small_change_started',
-    'source', 'strict_json', 'target', 'unknown_effect', 'validate_association', 'validate_observation', 'validate_policy', 'validate_request',
+    'source', 'strict_json', 'target', 'unknown_effect', 'validate_association', 'validate_mapping', 'validate_observation', 'validate_policy', 'validate_request',
 ]
 
 class LifecycleRefusal(ValueError):
@@ -51,14 +51,25 @@ def require(condition, message=''):
         error.continuation_reason = message if message in _CONTINUATION_REASONS else error.reason
         raise error
 
-def boundary(function):
-    """Translate only documented data/storage failures, without input text."""
+_DECORATOR = object()
+
+def boundary(function=_DECORATOR, *, checks=None):
+    """Translate documented failures and apply the entry point's explicit validators."""
+    require(checks is None or (type(checks) is dict and bool(checks)
+                               and all(type(name) is str and callable(check) for name, check in checks.items())))
+    if function is _DECORATOR:
+        require(checks is not None)
+        return partial(boundary, checks=checks)
     require(callable(function))
 
     @wraps(function)
     def call(*args, **kwargs):
         try:
-            _check_inputs(function, args, kwargs)
+            values = _bind_arguments(function, args, kwargs)
+            if checks is not None:
+                for name, value in values.items():
+                    if name in checks:
+                        checks[name](value)
             return function(*args, **kwargs)
         except MailboxRefusal as error:
             raise LifecycleRefusal(render_mailbox_refusal(error)["reason"]) from None
@@ -71,8 +82,6 @@ def boundary(function):
             raise LifecycleRefusal() from None
     return call
 
-_DICT_INPUTS = frozenset({'policy', 'state', 'row', 'envelope', 'event', 'mark', 'raw', 'binding', 'participants', 'resolution', 'record', 'plan'})
-_STRING_INPUTS = frozenset({'cid', 'publisher', 'expected', 'name', 'role', 'at'})
 _MAP_FIELDS = frozenset({'event', 'custody', 'continuation', 'profile', 'actors', 'current', 'successors', 'requests', 'consumed', 'receipts', 'meters', 'request', 'intent', 'start', 'terminal', 'admission', 'association', 'initial_bootstrap', 'genesis', 'creations', 'small_change', 'registration', 'envelope', 'value', 'cancellation', 'resolution', 'provider_handle'})
 _NULL_MAPS = frozenset({'intent', 'start', 'terminal', 'admission', 'association', 'cancellation', 'resolution', 'provider_handle'})
 _LIST_FIELDS = frozenset({'decisions', 'delegated_decisions', 'observations', 'results', 'dispositions', 'successions', 'reservations', 'writing_lanes'})
@@ -116,7 +125,7 @@ def _shape(value):
                     require(type(child) in (int, float) and math.isfinite(child))
                 pending.append((child, key))
 
-def _check_inputs(function, args, kwargs):
+def _bind_arguments(function, args, kwargs):
     code = function.__code__
     names = code.co_varnames[:code.co_argcount + code.co_kwonlyargcount]
     require(len(args) <= code.co_argcount and kwargs.keys() <= set(names))
@@ -126,21 +135,17 @@ def _check_inputs(function, args, kwargs):
     required = names[:code.co_argcount - len(function.__defaults__ or ())]
     required += tuple(name for name in names[code.co_argcount:] if name not in (function.__kwdefaults__ or {}))
     require(all(name in values for name in required))
-    if 'self' in values:
-        owner = function.__globals__.get(function.__qualname__.split('.')[0])
-        require(isinstance(owner, type) and isinstance(values['self'], owner))
-    for name, value in values.items():
-        if (name in _DICT_INPUTS
-                and not (name == 'raw' and function.__name__ == 'strict_json')
-                and not (name == 'policy' and function.__name__ == 'initialize')):
-            require(type(value) is dict)
-            _shape(value)
-        if name in _STRING_INPUTS:
-            require(type(value) is str)
-        if name in {'root_fd', 'events_fd'} or name == 'parent' and value is not None:
-            require(type(value) is int and value >= 0)
-        if name == 'write':
-            require(type(value) is bool)
+    return values
+
+def _mapping(value):
+    """Validate a bounded lifecycle mapping before copies or nested access."""
+    require(type(value) is dict)
+    _shape(value)
+
+validate_mapping = boundary(_mapping)
+
+def _string(value):
+    require(type(value) is str)
 
 def _path_value(value, *, posix=False):
     """Keep legacy pathlib semantics for trusted in-process path objects."""
@@ -224,16 +229,18 @@ PERMISSIONS = {'publish': {'coordinator', 'router'}, 'read': {'router', 'coordin
 GATES = {'source', 'capability', 'lease', 'capacity', 'observer', 'job'}
 PROVIDER_STATES = {'not_started', 'running', 'disconnected', 'ambiguous', 'cancel_requested', 'cancelled', 'passed', 'failed', 'unknown'}
 
-@boundary
-def provider_handle(row):
+# The reducer calls the private implementations with data already checked at
+# its boundary. The public wrappers also accept independent caller input.
+def _provider_handle(row):
     for observation in row.get('observations', []):
         handle = observation['value']['provider_handle']
         if handle is not None:
             return handle
     return None
 
-@boundary
-def validate_observation(row, value):
+provider_handle = boundary(_provider_handle, checks={'row': _mapping})
+
+def _validate_observation(row, value):
     fields(value, {'association_sha256', 'provider_state', 'provider_handle', 'exit_code', 'evidence', 'quiescent'})
     require(value['association_sha256'] == row['association']['sha256'])
     require(isinstance(value['provider_state'], str) and value['provider_state'] in PROVIDER_STATES)
@@ -244,7 +251,7 @@ def validate_observation(row, value):
         for name in handle:
             text(handle[name], 'provider ' + name, 256)
         require(handle['thread_id'] == row['association']['value']['thread_id'])
-        known = provider_handle(row)
+        known = _provider_handle(row)
         require(known is None or known == handle)
     state, code = (value['provider_state'], value['exit_code'])
     if state in {'passed', 'failed', 'cancelled'}:
@@ -255,8 +262,9 @@ def validate_observation(row, value):
     evidence(value['evidence'])
     return value
 
-@boundary
-def validate_association(policy, state, row, value, cid, at):
+validate_observation = boundary(_validate_observation, checks={'row': _mapping})
+
+def _validate_association(policy, state, row, value, cid, at):
     require('small_change' not in row)
     fields(value, {'schema', 'request_id', 'request_sha256', 'intent_id', 'source', 'authority', 'authority_sha256', 'decision_sha256', 'admission_sha256', 'original_actor', 'original_generation', 'original_cap_seconds', 'authority_expires_at', 'provider', 'endpoint_id', 'thread_id', 'client_id', 'deadline'})
     require(value['schema'] == 'aegis.provider-association/v1')
@@ -274,8 +282,10 @@ def validate_association(policy, state, row, value, cid, at):
     for name, limit in (('provider', 128), ('endpoint_id', 128), ('thread_id', 256), ('client_id', 256)):
         text(value[name], 'provider ' + name, limit)
     require(parse_time(at) < parse_time(value['deadline']) <= parse_time(value['authority_expires_at']))
-    require((parse_time(value['deadline']) - parse_time(at)).total_seconds() <= policy['actors'][cid]['cap_seconds'] - active_seconds(state, cid, at))
+    require((parse_time(value['deadline']) - parse_time(at)).total_seconds() <= policy['actors'][cid]['cap_seconds'] - _active_seconds(state, cid, at))
     return value
+
+validate_association = boundary(_validate_association, checks={'policy': _mapping, 'state': _mapping, 'row': _mapping, 'cid': _string, 'at': _string})
 
 @boundary
 def evidence(value):
@@ -302,8 +312,7 @@ def raw_value(value):
     require(hashlib.sha256(raw).hexdigest() == value['sha256'])
     return parsed
 
-@boundary
-def validate_request(raw):
+def _validate_request(raw):
     value = raw_value(raw)
     fields(value, {'schema', 'id', 'version', 'team', 'owner', 'next_decision', 'phase', 'operation', 'source', 'paths', 'prerequisites', 'authority', 'continuation'})
     require(value['schema'] == REQUEST)
@@ -335,6 +344,8 @@ def validate_request(raw):
         known.add(member['id'])
     require(value['authority'] == value['id'] or not scope['members'])
     return value
+
+validate_request = boundary(_validate_request, checks={'raw': _mapping})
 
 @boundary
 def inspect_request(value):
@@ -450,22 +461,23 @@ def validate_policy(value):
             require(before['profile'] == after['profile'] and before['cap_seconds'] == after['cap_seconds'])
     return value
 
-@boundary
+@boundary(checks={'policy': _mapping})
 def initial_state(policy):
     return {'sequence': 0, 'head': ZERO, 'current': copy.deepcopy(policy['current']), 'requests': {}, 'decisions': [], 'consumed': {}, 'receipts': {}, 'meters': {cid: {'active_seconds': 0, 'open_since': None} for cid in policy['actors']}, 'successions': []}
 
-@boundary
-def active_seconds(state, cid, at):
+def _active_seconds(state, cid, at):
     meter = state['meters'][cid]
     elapsed = max(0.0, (parse_time(at) - parse_time(meter['open_since'])).total_seconds()) if meter['open_since'] else 0
     return meter['active_seconds'] + elapsed
 
-@boundary
-def checkpoint(policy, state):
+active_seconds = boundary(_active_seconds, checks={'state': _mapping, 'cid': _string, 'at': _string})
+
+def _checkpoint(policy, state):
     body = {'schema': 'aegis.lifecycle-checkpoint/v1', 'policy_sha256': digest(policy), 'policy': policy, 'state': state, 'execution_enabled': False, 'native_enforcement': 'unqualified'}
     return {**body, 'sha256': digest(body)}
 
-@boundary
+checkpoint = boundary(_checkpoint, checks={'policy': _mapping, 'state': _mapping})
+
 def _initial_process(value):
     fields(value, {'boot_id', 'pid_namespace', 'pid', 'start_ticks'})
     boot = value['boot_id']
@@ -474,7 +486,6 @@ def _initial_process(value):
     for name in ('pid_namespace', 'start_ticks'):
         integer(value[name], 'bootstrap ' + name, maximum=UINT64)
 
-@boundary
 def _initial_channel(value):
     fields(value, {'schema', 'runtime_instance', 'appserver_instance', 'control_peer_instance', 'read_pipe_inode', 'write_pipe_inode', 'epoch', 'deployment_sha256', 'runtime_executable_sha256', 'host_source_closure_sha256', 'role_ceiling_sha256'})
     require(value['schema'] == 'aegis.host-channel-witness/v1')
@@ -486,11 +497,11 @@ def _initial_channel(value):
     for name in ('deployment_sha256', 'runtime_executable_sha256', 'host_source_closure_sha256', 'role_ceiling_sha256'):
         matching(value[name], SHA256, 'bootstrap ' + name)
 
-@boundary
-def initial_key(policy, cid):
+def _initial_key(policy, cid):
     return 'initial-' + digest({'schema': 'aegis.initial-creation-key/v1', 'policy_sha256': digest(policy), 'actor_cid': cid})[:40]
 
-@boundary
+initial_key = boundary(_initial_key, checks={'policy': _mapping, 'cid': _string})
+
 def _reduce_initial(policy, state, envelope):
     """Validate inert bootstrap journal evidence, without authenticating a host."""
     fields(envelope, {'schema', 'id', 'event'})
@@ -542,11 +553,10 @@ def _reduce_initial(policy, state, envelope):
     require(row is not None)
     expected = {name: row[name] for name in ('actor_cid', 'role', 'generation', 'profile_sha256', 'cap_seconds', 'channel_instance_sha256', 'approved_plan_sha256')}
     expected.update(type='initial_creation', genesis_event_sha256=digest(bootstrap['genesis']['envelope']), reservation_set_sha256=digest(bootstrap['reservations']), reservation_witness_sha256=digest(row))
-    require(event == expected and envelope['id'] == initial_key(policy, cid))
+    require(event == expected and envelope['id'] == _initial_key(policy, cid))
     bootstrap['creations'][cid] = {'actor_cid': cid, 'envelope': copy.deepcopy(envelope)}
 
-@boundary
-def actor_for(policy, state, envelope):
+def _actor_for(policy, state, envelope):
     fields(envelope, {'id', 'actor', 'generation', 'custody', 'event'})
     matching(envelope['id'], SLUG, 'event id')
     cid = envelope['actor']
@@ -565,9 +575,10 @@ def actor_for(policy, state, envelope):
         require(state['current'].get(actor['role']) == cid)
     return (cid, actor, event)
 
-@boundary
-def add_request(state, raw, publisher):
-    value = validate_request(raw)
+actor_for = boundary(_actor_for, checks={'policy': _mapping, 'state': _mapping, 'envelope': _mapping})
+
+def _add_request(state, raw, publisher):
+    value = _validate_request(raw)
     existing = state['requests'].get(value['id'])
     if existing:
         require(existing['raw'] == raw)
@@ -577,15 +588,17 @@ def add_request(state, raw, publisher):
     state['requests'][value['id']] = row
     return row
 
-@boundary
-def target(state, event):
+add_request = boundary(_add_request, checks={'state': _mapping, 'raw': _mapping, 'publisher': _string})
+
+def _target(state, event):
     require(event['request_id'] in state['requests'])
     row = state['requests'][event['request_id']]
     require(event['request_sha256'] == row['raw']['sha256'])
     return row
 
-@boundary
-def approved_authority(state, row, at):
+target = boundary(_target, checks={'state': _mapping, 'event': _mapping})
+
+def _approved_authority(state, row, at):
     value = row['request']
     parent = state['requests'].get(value['authority'])
     decisions = [d for d in state['decisions'] if d['request_id'] == value['authority']]
@@ -602,6 +615,8 @@ def approved_authority(state, row, at):
         require(prior is not None and prior['resolution'] is not None and (prior['resolution']['kind'] == 'complete'), 'prerequisite lacks accepted delivery')
     return value['authority']
 
+approved_authority = boundary(_approved_authority, checks={'state': _mapping, 'row': _mapping, 'at': _string})
+
 @boundary
 def covered(scope, path):
     require(type(scope) in (list, tuple))
@@ -610,8 +625,7 @@ def covered(scope, path):
     grants = (_path_value(granted, posix=True).parts for granted in scope)
     return any(parts[:len(granted)] == granted for granted in grants)
 
-@boundary
-def small_change_participant(policy, state, binding, expected, name, role):
+def _small_change_participant(policy, state, binding, expected, name, role):
     """Check one configured identity/generation, never host authentication."""
     fields(binding, {'cid', 'generation'})
     require(binding['cid'] == expected)
@@ -621,17 +635,19 @@ def small_change_participant(policy, state, binding, expected, name, role):
     require(binding['generation'] == actor['generation'], 'small-change participant generation mismatch')
     require(state['current'][role] == binding['cid'], 'small-change participant is no longer current')
 
-@boundary
-def small_change_participants(policy, state, row, plan, participants):
+small_change_participant = boundary(_small_change_participant, checks={'policy': _mapping, 'state': _mapping, 'binding': _mapping, 'expected': _string, 'name': _string, 'role': _string})
+
+def _small_change_participants(policy, state, row, plan, participants):
     """Check configured identity/generation only. This is not host authentication."""
     fields(participants, {'writer', 'reviewer'})
     expected = {'writer': plan['writing_lanes'][0]['writer'], 'reviewer': plan['reviewer']}
     for name, role in (('writer', 'operator'), ('reviewer', 'reviewer')):
-        small_change_participant(policy, state, participants[name], expected[name], name, role)
+        _small_change_participant(policy, state, participants[name], expected[name], name, role)
     require(participants['reviewer']['cid'] not in {row['publisher'], participants['writer']['cid']}, 'small-change reviewer must be independent')
 
-@boundary
-def small_change_approval(state, row):
+small_change_participants = boundary(_small_change_participants, checks={'policy': _mapping, 'state': _mapping, 'row': _mapping, 'plan': _mapping, 'participants': _mapping})
+
+def _small_change_approval(state, row):
     """Keep plan approval/admission separate from permission to start work."""
     value, change = (row['request'], row['small_change'])
     canonical = [d for d in state['decisions'] if d['request_id'] == value['id']]
@@ -641,15 +657,16 @@ def small_change_approval(state, row):
     require(change['admission'] is not None, 'small-change plan lacks admission')
     return change['registration']
 
-@boundary
-def small_change_execution(policy, state, row, at):
+small_change_approval = boundary(_small_change_approval, checks={'state': _mapping, 'row': _mapping})
+
+def _small_change_execution(policy, state, row, at):
     """Validate the admitted plan's scope and bindings before new work."""
     value = row['request']
-    registration = small_change_approval(state, row)
+    registration = _small_change_approval(state, row)
     require(parse_time(at) < parse_time(value['continuation']['expires_at']), 'bounded authority expired')
     plan = raw_value(registration['proposal'])['plan']
-    require(type(plan) is dict)
-    small_change_participants(policy, state, row, plan, registration['participants'])
+    _mapping(plan)
+    _small_change_participants(policy, state, row, plan, registration['participants'])
     if row['intent'] is None:
         require(state['consumed'].get(value['authority'], 0) < value['continuation']['max_starts'], 'bounded authority exhausted')
     for prerequisite in value['prerequisites']:
@@ -657,25 +674,28 @@ def small_change_execution(policy, state, row, at):
         require(prior is not None and prior['resolution'] is not None and (prior['resolution']['kind'] == 'complete'), 'prerequisite lacks accepted delivery')
     return plan
 
-@boundary
-def small_change_started(row):
+small_change_execution = boundary(_small_change_execution, checks={'policy': _mapping, 'state': _mapping, 'row': _mapping, 'at': _string})
+
+def _small_change_started(row):
     """Terminal evidence and review require the same recorded start."""
     intent, start = (row['intent'], row['start'])
     require(intent is not None and start is not None and (start['intent_id'] == intent['id']))
     return start
 
-@boundary
-def small_change_review(policy, state, row, cid):
+small_change_started = boundary(_small_change_started, checks={'row': _mapping})
+
+def _small_change_review(policy, state, row, cid):
     """Review finished evidence without renewing expiry or the writer binding."""
-    registration = small_change_approval(state, row)
-    small_change_started(row)
+    registration = _small_change_approval(state, row)
+    _small_change_started(row)
     plan = raw_value(registration['proposal'])['plan']
     require(type(plan) is dict)
-    small_change_participant(policy, state, registration['participants']['reviewer'], plan['reviewer'], 'reviewer', 'reviewer')
+    _small_change_participant(policy, state, registration['participants']['reviewer'], plan['reviewer'], 'reviewer', 'reviewer')
     require(cid == plan['reviewer'])
 
-@boundary
-def small_change_event(policy, state, row, event, mark, at):
+small_change_review = boundary(_small_change_review, checks={'policy': _mapping, 'state': _mapping, 'row': _mapping, 'cid': _string})
+
+def _small_change_event(policy, state, row, event, mark, at):
     """Durable pre-dispatch evidence, deliberately separate from v1 work authority."""
     kind = event['type']
     value = row['request']
@@ -687,7 +707,8 @@ def small_change_event(policy, state, row, event, mark, at):
         require(inspection['classification'] == 'declared_eligible')
         require(proposal['request'] == row['raw'])
         require(value['authority'] == value['id'] and (not value['continuation']['members']) and (value['continuation']['max_starts'] == 1) and (value['operation'] != 'delegate-merge'))
-        small_change_participants(policy, state, row, proposal['plan'], event['participants'])
+        _mapping(proposal['plan'])
+        _small_change_participants(policy, state, row, proposal['plan'], event['participants'])
         row['small_change'] = {'registration': {**mark, 'proposal': event['proposal'], 'participants': event['participants']}, 'decisions': [], 'admission': None}
         return
     change = row.get('small_change')
@@ -705,7 +726,8 @@ def small_change_event(policy, state, row, event, mark, at):
         if event['decision'] == 'approve':
             require(parse_time(at) < parse_time(value['continuation']['expires_at']), 'bounded authority expired')
             proposal = raw_value(registration['proposal'])
-            small_change_participants(policy, state, row, proposal['plan'], registration['participants'])
+            _mapping(proposal['plan'])
+            _small_change_participants(policy, state, row, proposal['plan'], registration['participants'])
         decisions.append({**mark, **event})
         return
     decisions = change['decisions']
@@ -714,7 +736,8 @@ def small_change_event(policy, state, row, event, mark, at):
     require(event['source'] == value['source'])
     require(event['participants'] == registration['participants'])
     proposal = raw_value(registration['proposal'])
-    small_change_participants(policy, state, row, proposal['plan'], registration['participants'])
+    _mapping(proposal['plan'])
+    _small_change_participants(policy, state, row, proposal['plan'], registration['participants'])
     require(mark['actor'] == registration['participants']['writer']['cid'])
     require(parse_time(at) < parse_time(value['continuation']['expires_at']), 'bounded authority expired')
     for prerequisite in value['prerequisites']:
@@ -737,8 +760,9 @@ def small_change_event(policy, state, row, event, mark, at):
     require(change['admission'] is None)
     change['admission'] = {**mark, **event}
 
-@boundary
-def delegated_decision(state, row, event, mark):
+small_change_event = boundary(_small_change_event, checks={'policy': _mapping, 'state': _mapping, 'row': _mapping, 'event': _mapping, 'mark': _mapping, 'at': _string})
+
+def _delegated_decision(state, row, event, mark):
     """Record the Decider's approve or escalate. It is non-admitting: it never touches decisions,
     consumed or approved_authority, so nothing it records makes a request admissible."""
     value, cid, at = (row['request'], mark['actor'], mark['at'])
@@ -770,12 +794,14 @@ def delegated_decision(state, row, event, mark):
         require(cid != row['publisher'])
     state['delegated_decisions'] = recorded + [{**mark, **event}]
 
-@boundary
-def unknown_effect(row):
+delegated_decision = boundary(_delegated_decision, checks={'state': _mapping, 'row': _mapping, 'event': _mapping, 'mark': _mapping})
+
+def _unknown_effect(row):
     return row['intent'] is not None and (row['terminal'] is None or row['terminal']['value']['outcome'] == 'unknown')
 
-@boundary
-def resolve_row(state, row, resolution, cid):
+unknown_effect = boundary(_unknown_effect, checks={'row': _mapping})
+
+def _resolve_row(state, row, resolution, cid):
     require(isinstance(resolution, dict))
     kind = resolution.get('kind')
     require(kind in {'complete', 'next', 'blocked'})
@@ -783,39 +809,40 @@ def resolve_row(state, row, resolution, cid):
     fields(resolution, {'kind', 'evidence'} | optional)
     evidence(resolution['evidence'])
     if kind != 'blocked':
-        require(not unknown_effect(row))
+        require(not _unknown_effect(row))
     if kind == 'complete':
         require(row['terminal'] is not None and row['terminal']['value']['outcome'] == 'passed' and (row['review'] is not None) and (row['review']['verdict'] == 'accept') and (row['review']['result_sha256'] == row['terminal']['sha256']) and (row['delivery'] is not None))
     elif kind == 'next':
-        following = validate_request(resolution['request'])
+        following = _validate_request(resolution['request'])
         require(following['id'] != row['request']['id'])
         require(following['id'] not in state['requests'])
-        add_request(state, resolution['request'], cid)
+        _add_request(state, resolution['request'], cid)
         resolution = {'kind': kind, 'request_id': following['id'], 'request_sha256': resolution['request']['sha256'], 'owner': following['owner'], 'next_decision': following['next_decision'], 'evidence': resolution['evidence']}
     else:
         for key in ('owner', 'next_decision', 'condition'):
             text(resolution[key], key)
     row['resolution'] = resolution
 
-@boundary
+resolve_row = boundary(_resolve_row, checks={'state': _mapping, 'row': _mapping, 'resolution': _mapping, 'cid': _string})
+
 def _reduce_event(policy, state, envelope, at):
     if isinstance(envelope, dict) and envelope.get('schema') == INITIAL_ENVELOPE:
         return _reduce_initial(policy, state, envelope)
-    cid, actor, event = actor_for(policy, state, envelope)
+    cid, actor, event = _actor_for(policy, state, envelope)
     kind = event['type']
     if kind not in {'meter', 'succeed', 'terminal', 'observe'}:
-        require(active_seconds(state, cid, at) < actor['cap_seconds'], 'actor cumulative active cap reached')
+        require(_active_seconds(state, cid, at) < actor['cap_seconds'], 'actor cumulative active cap reached')
     mark = {'actor': cid, 'generation': actor['generation'], 'at': at}
     if kind == 'publish':
         fields(event, {'type', 'request'})
-        add_request(state, event['request'], cid)
+        _add_request(state, event['request'], cid)
         return
     if kind == 'meter':
         fields(event, {'type', 'subject', 'active_seconds', 'open_since'})
         subject = event['subject']
         require(subject in policy['actors'])
         seconds = event['active_seconds']
-        require(type(seconds) in (int, float) and math.isfinite(seconds) and (seconds >= active_seconds(state, subject, at)))
+        require(type(seconds) in (int, float) and math.isfinite(seconds) and (seconds >= _active_seconds(state, subject, at)))
         if event['open_since'] is not None:
             require(parse_time(event['open_since']) <= parse_time(at))
         state['meters'][subject] = {'active_seconds': seconds, 'open_since': event['open_since']}
@@ -824,14 +851,14 @@ def _reduce_event(policy, state, envelope, at):
         fields(event, {'type', 'predecessor', 'checkpoint_sha256'})
         old = event['predecessor']
         require(policy['successors'].get(old) == cid and state['current'].get(actor['role']) == old)
-        require(event['checkpoint_sha256'] == checkpoint(policy, state)['sha256'])
+        require(event['checkpoint_sha256'] == _checkpoint(policy, state)['sha256'])
         state['current'][actor['role']] = cid
         state['successions'].append({**mark, **event})
         return
     common = {'type', 'request_id', 'request_sha256'}
     extra = {'decision': {'decision', 'reason'}, 'read': set(), 'route': {'to'}, 'admit': {'source', 'gates'}, 'wait': {'reason'}, 'intent': {'intent_id'}, 'start': {'intent_id'}, 'terminal': {'result'}, 'review': {'result_sha256', 'source', 'verdict', 'evidence'}, 'delivery': {'evidence'}, 'disposition': {'status', 'resolution'}, 'resolve': {'blocker_sha256', 'resolution'}, 'associate': {'association'}, 'observe': {'intent_id', 'association_sha256', 'observation'}, 'cancel_attempt': {'intent_id', 'association_sha256', 'reason'}, 'delegated_decision': {'delegation_id', 'delegation_sha256', 'commit', 'review', 'decision', 'reason'}, 'small_change_plan': {'proposal', 'participants'}, 'small_change_decision': {'plan_sha256', 'decision', 'reason'}, 'small_change_admit': {'plan_sha256', 'decision_sha256', 'source', 'participants', 'checks', 'gates'}}
     fields(event, common | extra[kind])
-    row = target(state, event)
+    row = _target(state, event)
     value = row['request']
     if row['resolution'] and row['resolution']['kind'] in {'complete', 'next'}:
         require(kind in {'read', 'route', 'decision'})
@@ -839,9 +866,9 @@ def _reduce_event(policy, state, envelope, at):
 
 def _request_effect(policy, state, row, event, mark, at, cid, actor, kind, value):
     if kind in {'small_change_plan', 'small_change_decision', 'small_change_admit'}:
-        small_change_event(policy, state, row, event, mark, at)
+        _small_change_event(policy, state, row, event, mark, at)
     elif kind == 'associate':
-        binding = validate_association(policy, state, row, event['association'], cid, at)
+        binding = _validate_association(policy, state, row, event['association'], cid, at)
         row['association'] = {**mark, 'value': binding, 'sha256': digest(binding)}
         row['observations'], row['cancellation'] = ([], None)
     elif kind in {'observe', 'cancel_attempt'}:
@@ -849,11 +876,11 @@ def _request_effect(policy, state, row, event, mark, at, cid, actor, kind, value
         require(event['intent_id'] == row['intent']['id'] and event['association_sha256'] == row['association']['sha256'])
         require(row['terminal'] is None or row['terminal']['value']['outcome'] == 'unknown')
         if kind == 'observe':
-            value = validate_observation(row, event['observation'])
+            value = _validate_observation(row, event['observation'])
             row['observations'].append({**mark, 'value': value})
         else:
             require(row.get('cancellation') is None)
-            require(provider_handle(row) is not None)
+            require(_provider_handle(row) is not None)
             text(event['reason'], 'cancellation reason', 1024)
             row['cancellation'] = {**mark, 'reason': event['reason']}
     elif kind == 'decision':
@@ -864,12 +891,12 @@ def _request_effect(policy, state, row, event, mark, at, cid, actor, kind, value
         require(not prior or (prior[-1]['decision'] == 'approve' and event['decision'] == 'deny'))
         state['decisions'].append({**mark, **event})
     elif kind == 'delegated_decision':
-        delegated_decision(state, row, event, mark)
+        _delegated_decision(state, row, event, mark)
     elif kind == 'read':
         row['read'] = mark
     elif kind == 'route':
         if 'small_change' in row:
-            plan = small_change_execution(policy, state, row, at)
+            plan = _small_change_execution(policy, state, row, at)
             require(event['to'] == value['team'] + '/lane/' + plan['writing_lanes'][0]['lane'])
         text(event['to'], 'route recipient')
         row['routed'] = {**mark, 'to': event['to']}
@@ -879,11 +906,11 @@ def _request_effect(policy, state, row, event, mark, at, cid, actor, kind, value
         require(row['intent'] is None)
         require(row['resolution'] is None)
         if 'small_change' in row:
-            plan = small_change_execution(policy, state, row, at)
+            plan = _small_change_execution(policy, state, row, at)
             require(cid == plan['writing_lanes'][0]['writer'])
             authority = value['authority']
         else:
-            authority = approved_authority(state, row, at)
+            authority = _approved_authority(state, row, at)
         if kind == 'admit':
             require(event['source'] == value['source'])
             fields(event['gates'], GATES)
@@ -910,7 +937,7 @@ def _request_completion(policy, state, row, event, mark, at, cid, actor, kind, v
             state['meters'][cid]['open_since'] = at
     elif kind == 'start':
         if 'small_change' in row:
-            plan = small_change_execution(policy, state, row, at)
+            plan = _small_change_execution(policy, state, row, at)
             require(cid == plan['writing_lanes'][0]['writer'])
         require(row['intent'] is not None and row['intent']['id'] == event['intent_id'])
         require(row['intent']['actor'] == cid and row['start'] is None and (row['terminal'] is None))
@@ -921,7 +948,7 @@ def _request_completion(policy, state, row, event, mark, at, cid, actor, kind, v
         row['start'] = {**mark, 'intent_id': event['intent_id']}
     elif kind == 'terminal':
         if 'small_change' in row:
-            start = small_change_started(row)
+            start = _small_change_started(row)
             require((cid, actor['generation']) == (start['actor'], start['generation']))
         result = raw_value(event['result'])
         fields(result, {'request_sha256', 'intent_id', 'outcome', 'exit_code', 'source', 'evidence'})
@@ -938,7 +965,7 @@ def _request_completion(policy, state, row, event, mark, at, cid, actor, kind, v
         row['review'], row['delivery'] = (None, None)
     elif kind == 'review':
         if 'small_change' in row:
-            small_change_review(policy, state, row, cid)
+            _small_change_review(policy, state, row, cid)
         require(row['terminal'] is not None and event['result_sha256'] == row['terminal']['sha256'])
         require(event['source'] == value['source'])
         require(cid != row['publisher'] and cid != row['intent']['actor'])
@@ -959,13 +986,12 @@ def _request_completion(policy, state, row, event, mark, at, cid, actor, kind, v
             require(event['blocker_sha256'] == digest(row['resolution']))
             require(isinstance(event['resolution'], dict))
             require(event['resolution'].get('kind') != 'blocked')
-        resolve_row(state, row, event['resolution'], cid)
+        _resolve_row(state, row, event['resolution'], cid)
         row['dispositions'].append({**mark, **event})
 
-@boundary
+@boundary(checks={'policy': _mapping, 'state': _mapping, 'envelope': _mapping, 'at': _string})
 def reduce_event(policy, state, envelope, at):
     bounded_tree(envelope, limit=MAX_BYTES)
-    bounded_tree(state, limit=67108864)
     candidate = copy.deepcopy(state)
     result = _reduce_event(policy, candidate, envelope, at)
     bounded_tree(candidate, limit=67108864, ascii_strings=True)

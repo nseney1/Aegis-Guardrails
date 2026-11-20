@@ -1,15 +1,19 @@
 """Serial queue contracts using test-owned history and real qualification records."""
+import ast
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
-from dataclasses import replace
+from dataclasses import asdict, replace
+from inspect import getsource
 from itertools import permutations, product
+import json
+import pickle
 import shutil
 from threading import Barrier
 from types import SimpleNamespace
 
 import pytest
 
-from aegis_core import gitsafe_run, merge_queue as mq, team_gitops, team_qualify as qual
+from aegis_core import gitsafe_run, merge_queue as mq, merge_queue_types, team_gitops, team_qualify as qual
 from tests.helpers_team_git import IDENTITY, commit, git, make_store, shared_bytes
 
 
@@ -204,6 +208,289 @@ def refused(code, action):
     assert caught.value.code == code
     assert str(caught.value) == mq.REFUSALS[code]
     assert caught.value.next_action
+
+
+@pytest.mark.parametrize("name", merge_queue_types.__all__)
+def test_model_and_queue_export_the_existing_record_type(name):
+    from aegis_core import merge_queue_model as model
+
+    legacy = getattr(merge_queue_types, name)
+    assert getattr(mq, name) is getattr(model, name) is legacy
+    assert legacy.__module__ == "aegis_core.merge_queue_types"
+    assert pickle.loads(pickle.dumps(legacy, protocol=4)) is legacy
+
+
+def test_model_checkpoint_json_fields_load_through_queue():
+    from aegis_core import merge_queue_model as model
+
+    commit = "a" * 40
+    recorded = mq.QueueState("integration", mq.REQUIRED_LEGS, ("linux-3.12",),
+                             health_commit=commit, health_result=mq.HostedResult(commit, True),
+                             health_order=1, green_order=1, serial=1)
+    fields = json.loads(json.dumps(asdict(recorded)))
+    for field in ("required_legs", "entry_legs", "entries", "results"):
+        fields[field] = tuple(fields[field])
+    fields["health_result"] = model.HostedResult(**fields["health_result"])
+    recovered = model.QueueState(**fields)
+    assert recovered == recorded
+    assert isinstance(recovered, mq.QueueState)
+
+    backend = StateBackend()
+    backend.state = recovered
+    queue = mq.MergeQueue("integration", storage=backend.port())
+    assert queue.hosted_result(commit, passed=False, attempt=1) == "target-red"
+    assert backend.state.health_result == model.HostedResult(commit, False, 1)
+    assert backend.state.generation == 1
+
+
+def json_round_trip_backend(backend):
+    from aegis_core import merge_queue_model as model
+
+    def entry_record(row):
+        return model.QueueEntry(**{**row, "parents": tuple(row["parents"]),
+                                   "reviews": tuple(model.Review(**review) for review in row["reviews"])})
+
+    def landing_record(row):
+        return model.Landing(**{**row, "missing_legs": tuple(row["missing_legs"])})
+
+    def result_record(row):
+        return None if row is None else model.HostedResult(**row)
+
+    def issued_record(row):
+        if row is None:
+            return None
+        return model.IssuedRecord(**{**row, "entry": entry_record(row["entry"]),
+                                     "landing": landing_record(row["landing"]),
+                                     "result": result_record(row["result"])})
+
+    def completion_record(row):
+        return model.Completion(**{**row, "entry": entry_record(row["entry"]),
+                                   "landing": landing_record(row["landing"]),
+                                   "result": result_record(row["result"])})
+
+    fields, lanes, commits, healths, pending, dirty = json.loads(json.dumps([
+        asdict(backend.state),
+        {key: asdict(row) for key, row in backend.lanes.items()},
+        {key: asdict(row) for key, row in backend.commits.items()},
+        {key: asdict(row) for key, row in backend.healths.items()},
+        {key: asdict(row) for key, row in backend.pending.items()},
+        backend.dirty,
+    ]))
+    recovered = StateBackend()
+    recovered.state = model.QueueState(**{
+        **fields, "required_legs": tuple(fields["required_legs"]), "entry_legs": tuple(fields["entry_legs"]),
+        "entries": tuple(entry_record(row) for row in fields["entries"]),
+        "results": tuple(result_record(row) for row in fields["results"]),
+        "health_result": result_record(fields["health_result"]),
+        "issued": issued_record(fields["issued"]), "cleanup": issued_record(fields["cleanup"]),
+    })
+    recovered.lanes = {key: completion_record(row) for key, row in lanes.items()}
+    recovered.commits = {key: completion_record(row) for key, row in commits.items()}
+    recovered.healths = {key: result_record(row) for key, row in healths.items()}
+    recovered.pending = {key: result_record(row) for key, row in pending.items()}
+    recovered.dirty = dirty
+    return recovered
+
+
+def test_model_json_checkpoint_reopens_queued_entry_with_parent(rig):
+    original = queue(rig, parents=("parent",))
+    backend = rig.backends[original]
+    recovered = json_round_trip_backend(backend)
+    restarted = fresh_queue(rig, backend=recovered, initialize=False)
+    assert recovered.state == backend.state
+    assert restarted.enqueue(rig.store, entry(rig, parents=("parent",))) == "already"
+    assert prepare(restarted, rig).status == "blocked-by-parent"
+
+
+@pytest.mark.parametrize("disposition", ["pending", "replayed"])
+def test_model_json_checkpoint_recovers_unapplied_results(rig, disposition):
+    original = queue(rig)
+    backend = rig.backends[original]
+    result = mq.HostedResult(rig.other, False, 4)
+    if disposition == "pending":
+        assert original.hosted_result(result.commit, passed=result.passed, attempt=result.attempt) == "unapplied"
+    else:
+        backend.fail = "before"
+        refused("state_unavailable", lambda: original.hosted_result(
+            result.commit, passed=result.passed, attempt=result.attempt))
+
+    recovered = json_round_trip_backend(backend)
+    restarted = fresh_queue(rig, backend=recovered, initialize=False)
+    assert recovered.state == backend.state
+    assert recovered.pending == backend.pending
+    assert prepare(restarted, rig).status == "unapplied-results"
+    assert restarted.restore_target(rig.store, mq.HostedResult(rig.base, True), read_target=lambda _: rig.base) == "green"
+    observed = []
+
+    def not_applied(row):
+        observed.append(row)
+        return "not_applied"
+
+    assert restarted.reconcile_result(rig.store, result.commit, read_outcome=not_applied,
+                                      read_target=lambda _: rig.base) == "not_applied"
+    assert restarted.reconcile_result(rig.store, result.commit, read_outcome=not_applied,
+                                      read_target=lambda _: rig.base) == "already"
+    assert observed == [result]
+    assert prepare(restarted, rig).status == "pending"
+
+
+@pytest.mark.parametrize("phase", ["issued", "completed"])
+@pytest.mark.parametrize("has_result", [False, True], ids=["without-result", "with-result"])
+def test_model_json_checkpoint_reopens_receipts_and_archive(rig, phase, has_result):
+    original = queue(rig)
+    backend = rig.backends[original]
+    passing(rig)
+    receipt = issue(original, rig, prepare(original, rig))
+    if has_result:
+        assert original.hosted_result(receipt.commit, passed=True, attempt=3) == "pending"
+
+    def acknowledge(active):
+        return active.observe_landed(rig.store, receipt, read_target=lambda _: receipt.commit)
+
+    if phase == "completed":
+        assert acknowledge(original) == "done"
+
+    recovered = json_round_trip_backend(backend)
+    restarted = fresh_queue(rig, backend=recovered, initialize=False)
+    assert recovered.state == backend.state
+    assert recovered.lanes == backend.lanes
+    assert recovered.commits == backend.commits
+    if phase == "issued":
+        assert restarted.issued == receipt
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert sorted(pool.map(acknowledge, (restarted, restarted))) == ["already", "done"]
+    assert restarted.issued is None
+    assert acknowledge(restarted) == "already"
+    assert restarted.hosted_result(receipt.commit, passed=False, attempt=2) == (
+        "green" if has_result else "target-red")
+    assert restarted.hosted_result(receipt.commit, passed=False, attempt=3) == "target-red"
+
+    descendant = git(rig.repo, "commit-tree", receipt.tree, "-p", receipt.commit,
+                     data=b"next target after the archived landing\n").decode().strip()
+    assert restarted.restore_target(rig.store, mq.HostedResult(descendant, True),
+                                    read_target=lambda _: descendant) == "green"
+    assert restarted.hosted_result(receipt.commit, passed=True, attempt=4) == "stale"
+
+
+def model_cleanup_resolutions():
+    from aegis_core import merge_queue_model as model
+
+    # The accepted values are inline in the model validator. Require the source
+    # predicate so a change to its shape cannot silently empty the test matrix.
+    predicate, = (
+        node for node in ast.walk(ast.parse(getsource(model.validate_state)))
+        if isinstance(node, ast.Compare) and len(node.ops) == 1
+        and isinstance(node.ops[0], ast.NotIn) and ast.unparse(node.left) == "record.resolution"
+    )
+    values = ast.literal_eval(predicate.comparators[0])
+    assert values
+    return values
+
+
+@pytest.mark.parametrize("resolution", model_cleanup_resolutions())
+@pytest.mark.parametrize("has_result", [False, True], ids=["without-result", "with-result"])
+def test_model_json_checkpoint_recovers_every_cleanup_resolution(rig, resolution, has_result):
+    original = queue(rig)
+    backend = rig.backends[original]
+    passing(rig)
+    candidate = prepare(original, rig)
+    if resolution in ("issuing", "aborted"):
+        backend.fail = "issue-before"
+        refused("state_unavailable", lambda: issue(original, rig, candidate))
+        backend.fail = None
+        original = fresh_queue(rig, backend=backend, initialize=False)
+    else:
+        issue(original, rig, candidate)
+    receipt = original.issued
+    observed = []
+
+    def settled(row):
+        observed.append(row)
+        return "not_applied"
+
+    def reconcile(active, read_outcome=settled):
+        return active.reconcile_not_landed(rig.store, receipt, read_target=lambda _: receipt.tip,
+                                           read_outcome=read_outcome)
+
+    def withdraw(active):
+        return active.withdraw(receipt.lane, expected_head=rig.head, store=rig.store,
+                               read_target=lambda _: receipt.tip, read_outcome=settled)
+
+    def acknowledge(active):
+        return active.observe_landed(rig.store, receipt, read_target=lambda _: receipt.commit)
+
+    recover, expected = {
+        "issuing": (reconcile, "not_applied"),
+        "aborted": (reconcile, "not_applied"),
+        "done": (acknowledge, "already"),
+        "not_applied": (reconcile, "not_applied"),
+        "released": (withdraw, "released"),
+    }[resolution]
+    if resolution != "issuing":
+        backend.fail = "cleanup-before"
+        refused("state_unavailable", lambda: recover(original))
+        backend.fail = None
+    if has_result:
+        observer = fresh_queue(rig, backend=backend, initialize=False)
+        assert observer.hosted_result(receipt.commit, passed=True, attempt=3) == "pending"
+    assert backend.state.cleanup.resolution == resolution
+    assert backend.state.cleanup.result == (mq.HostedResult(receipt.commit, True, 3) if has_result else None)
+
+    recovered = json_round_trip_backend(backend)
+    checkpoint = recovered.state
+    restarted = fresh_queue(rig, backend=recovered, initialize=False)
+    assert restarted.issued == receipt
+    observed.clear()
+    if resolution in ("issuing", "aborted"):
+        refused("landing_unconfirmed", lambda: reconcile(restarted, lambda _: "pending"))
+        assert restarted.issued == receipt
+    assert recover(restarted) == expected
+    assert observed == ([receipt] if resolution in ("issuing", "aborted") else [])
+    assert restarted.issued is None
+    assert checkpoint == backend.state
+    assert recovered.lanes == backend.lanes
+    assert recovered.commits == backend.commits
+    if expected == "not_applied":
+        refused("stale_candidate", lambda: recover(restarted))
+    else:
+        assert recover(restarted) == "already"
+    assert git(rig.repo, "for-each-ref", "--format=%(objectname)", "refs/aegis/merge-queue/") == b""
+
+
+@pytest.mark.parametrize("phase", ["empty", "queued", "issued", "cleanup", "completed"])
+def test_pickled_model_checkpoint_and_archive_reopen_through_queue(rig, phase):
+    from aegis_core import merge_queue_model as model
+
+    original = fresh_queue(rig) if phase == "empty" else queue(rig)
+    backend = rig.backends[original]
+    receipt = None
+    if phase in ("issued", "cleanup", "completed"):
+        passing(rig)
+        receipt = issue(original, rig, prepare(original, rig))
+        assert isinstance(receipt, model.Landing)
+        if phase == "cleanup":
+            backend.fail = "cleanup-before"
+            refused("state_unavailable", lambda: original.observe_landed(
+                rig.store, receipt, read_target=lambda _: receipt.commit))
+            backend.fail = None
+        elif phase == "completed":
+            assert original.observe_landed(rig.store, receipt, read_target=lambda _: receipt.commit) == "done"
+
+    state = backend.state
+    backend.state, backend.lanes, backend.commits = pickle.loads(
+        pickle.dumps((state, backend.lanes, backend.commits), protocol=4))
+    assert backend.state == state
+    assert isinstance(backend.state, model.QueueState)
+    restarted = fresh_queue(rig, backend=backend, initialize=False)
+    if phase in ("issued", "cleanup"):
+        assert restarted.issued == receipt
+    else:
+        assert restarted.issued is None
+    if phase in ("cleanup", "completed"):
+        assert isinstance(backend.commits[receipt.commit], model.Completion)
+        assert restarted.observe_landed(rig.store, receipt, read_target=lambda _: receipt.commit) == "already"
+    if phase == "queued":
+        assert restarted.enqueue(rig.store, entry(rig)) == "already"
 
 
 @pytest.mark.parametrize("field", ["session", "commit", "tree", "verdict", "helpers_off"])
