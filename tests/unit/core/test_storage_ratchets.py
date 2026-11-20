@@ -109,7 +109,7 @@ AUDIT_WRITERS = {
     ("aegis_core/lifecycle/selection.py", "_park"): "existing mkdir, replace; source lines 87, 93",
     ("aegis_core/manager_config.py", "initialize.create"): "existing mkdir; source lines 110, 116",
     ("aegis_core/manager_config.py", "verify_owner"): "existing TemporaryDirectory; source lines 144",
-    ("aegis_core/manager_store.py", "ManagerStore._anchor"): "existing mkdir; source lines 138",
+    ("aegis_core/manager_store.py", "ManagerStore._anchor.missing"): "RF-32: mkdir mode 0700 relative to the held parent, after _anchor_check of the already opened prefix; fsync parent; concurrent creator is reopened without following links",
     ("aegis_core/manager_store.py", "ManagerStore._append"): "existing _audit; source lines 257",
     ("aegis_core/manager_store.py", "ManagerStore._check"): "existing mkdir; source lines 82",
     ("aegis_core/migrate.py", "apply"): "existing mkdtemp, chmod; source lines 250, 251",
@@ -122,6 +122,7 @@ AUDIT_WRITERS = {
     ("aegis_core/sync.py", "_commit"): "existing TemporaryDirectory; source lines 450",
     ("aegis_core/sync.py", "_restore"): "existing , rmdir; source lines 423, 426, 432",
     ("aegis_core/sync.py", "_write_examples"): "existing mkdir; source lines 265",
+    ("aegis_core/team_board.py", "Board._reap_stale_pending"): "BOARD-PARITY-1b: under the held board write lock, unlink events names that fullmatch the exact staging pattern through the held events directory descriptor before the entry census.",
     ("aegis_core/team_board.py", "Board.move_position"): "TA-1d: replace the validated endpoint/channel cursor by descriptor within the held positions directory; remove only this attempt's unpublished pending file on replacement failure.",
     ("aegis_core/team_board.py", "Board.tombstone"): "TA-1d: descriptor-relative unlink of the selected tombstoned content file under board exclusion and a held content directory; missing content is an idempotent retry, other deletion failure rolls back this attempt's event.",
     ("aegis_core/team_gitops.py", "GitOpsJournal._transaction"): "GM-4: open the private no-follow journal under its descriptor-relative writer lock and enforce file mode 0600",
@@ -351,7 +352,7 @@ AUDIT_READ_ONLY_OPERATIONS = {
     ("aegis_core/config.py", "update_repo_config", "aegis_core.config._read_json"): "read-only bounded repository or user config inspection; this approved call requests read-only inspection",
     ("aegis_core/checkrun.py", "record", "aegis_core.storage.read_jsonl"): "read earlier check records through the storage boundary; this approved call requests read-only inspection",
     ("aegis_core/credit.py", "_read_ledger_events_with_report", "aegis_core.storage.read_jsonl"): "read credit ledger events through the storage boundary; this approved call requests read-only inspection",
-    ("aegis_core/credit_memo.py", "_snapshot", "aegis_core.atomicio._open_regular"): "O_RDONLY ancestor walk and regular-file snapshot",
+    ("aegis_core/credit_memo.py", "_snapshot", "aegis_core.atomicio.open_regular"): "RF-32: public delegate receives O_RDONLY for optional snapshot evidence; no creation or publication",
     ("aegis_core/credit_memo.py", "before_read", "aegis_core.credit_memo.filesystem_now"): "sample the held lock file's filesystem clock for ledger evidence; any mutation belongs to the deeper registered writer/storage frame",
     ("aegis_core/credit_memo.py", "contains", "aegis_core.credit_memo._snapshot"): "read-only persisted-ledger generation snapshot; this approved call requests read-only inspection",
     ("aegis_core/credit_memo.py", "remember", "aegis_core.credit_memo._snapshot"): "read-only persisted-ledger generation snapshot; this approved call requests read-only inspection",
@@ -371,6 +372,7 @@ AUDIT_READ_ONLY_OPERATIONS = {
     ("aegis_core/lane_gate.py", "check_lane", "aegis_core.team.load_team"): "read-only team policy for lane admission; this approved call requests read-only inspection",
     ("aegis_core/manager_config.py", "initialize", "aegis_core.manager_config.public_file"): "read-only bounded public signer or private manager config inspection; this approved call requests read-only inspection",
     ("aegis_core/manager_config.py", "load_config", "aegis_core.manager_config.public_file"): "read-only bounded public signer or private manager config inspection; this approved call requests read-only inspection",
+    ("aegis_core/manager_store.py", "ManagerStore._anchor", "os.open"): "RF-32: fixed read-only directory callback; mutation belongs to separately registered ManagerStore._anchor.missing",
     ("aegis_core/manager_store.py", "ManagerStore._locked", "aegis_core.manager_store.ManagerStore._anchor"): "bind directory descriptors for the separate manager audit store; any mutation belongs to the deeper registered writer/storage frame",
     ("aegis_core/manager_store.py", "ManagerStore._read", "aegis_core.manager_store.ManagerStore._audit"): "passes O_RDONLY to the generic audit opener; no append/create flags",
     ("aegis_core/manager_store.py", "ManagerStore.read", "aegis_core.manager_store.ManagerStore._anchor"): "bind directory descriptors for the separate manager audit store; any mutation belongs to the deeper registered writer/storage frame",
@@ -412,6 +414,7 @@ AUDIT_READ_ONLY_OPERATIONS = {
     ("aegis_core/team_mailbox_store.py", "Store._initialize", "os.open"): "STORE-PARENT-ANCHOR: bind an existing mailbox root read-only under its held parent; selected-parent construction reuses the separately reviewed absolute walker; no mutation.",
     ("aegis_core/team_mailbox_store.py", "Store.read", "os.open"): "TA-1a: bounded read of regular singly linked file; no mutation.",
     ("aegis_core/team_mailbox_store.py", "_open_absolute", "os.open"): "TA-1a: root/ancestor directory binding only; no mutation.",
+    ("aegis_core/team_native_rollout.py", "rollout_records", "os.open"): "TA-3f: existing diagnostic rollout read only; no create, write, publication or execution; anchored directory and leaf released on every exit.",
     ("aegis_core/team_session_census.py", "SessionCensus.launch_directory", "os.open"): "TA-2d round-1c handoff: verified O_RDONLY|O_NOFOLLOW opens (coordinator AST check 15:2xZ)",
     ("aegis_core/team_session_custody.py", "CustodyRuntime.custody_namespace", "os.open"): "TA-2d round-1c handoff: verified O_RDONLY|O_NOFOLLOW opens (coordinator AST check 15:2xZ)",
     ("aegis_core/team_session_custody.py", "CustodyRuntime.read_launch_record", "os.open"): "TA-2d round-1c handoff: verified O_RDONLY|O_NOFOLLOW opens (coordinator AST check 15:2xZ)",
@@ -529,8 +532,26 @@ _CAPABILITY_PROBE = ast.dump(ast.parse(
     mode="eval",
 ).body)
 CALLBACK_EXCEPTIONS = {
-    ("aegis_core/model_select.py", "_decision_directory", "os.open", "_path_call"): (
-        3, "O_RDONLY|O_DIRECTORY|O_NOFOLLOW directory walk through the reviewed path-error boundary",
+    ("aegis_core/credit_memo.py", "_snapshot", "os.open", "open_directory"): (
+        1, "RF-32: trusted opener receives fixed read-only no-follow directory flags from storage_confined",
+    ),
+    ("aegis_core/credit_memo.py", "filesystem_now", "os.open", "open_directory"): (
+        1, "RF-32: trusted opener receives fixed read-only no-follow directory flags from storage_confined",
+    ),
+    ("aegis_core/manager_store.py", "ManagerStore._anchor", "os.open", "open_directory"): (
+        1, "RF-32: trusted opener receives fixed read-only no-follow directory flags; creation is separately classified",
+    ),
+    ("aegis_core/message_codec_store.py", "Store.__init__", "os.open", "open_directory"): (
+        1, "RF-32: trusted opener receives fixed read-only no-follow directory flags; caller retains ownership instrumentation",
+    ),
+    ("aegis_core/model_select.py", "_decision_directory", "os.open", "open_directory"): (
+        1, "RF-32: trusted opener receives fixed read-only no-follow directory flags; caller retains refusal mapping",
+    ),
+    ("aegis_core/model_select.py", "_open_regular", "os.open", "open_directory"): (
+        1, "RF-32: trusted opener receives fixed read-only no-follow directory flags for configuration-parent binding",
+    ),
+    ("aegis_core/storage.py", "message_store", "os.open", "open_directory"): (
+        1, "RF-32: trusted opener receives fixed read-only no-follow directory flags for workspace binding",
     ),
     ("aegis_core/model_select.py", "_open_log", "os.open", "_path_call"): (
         1, "reviewed decision-log reader opens O_RDONLY|O_NOFOLLOW|O_NONBLOCK through the path-error boundary",
@@ -570,7 +591,7 @@ REVIEWED_DESCRIPTOR_OPERATIONS = {
     ("aegis_core/config.py", "update_repo_config", "aegis_core.config._read_json"): (1, "read-only bounded repository or user config inspection"),
     ("aegis_core/checkrun.py", "record", "aegis_core.storage.read_jsonl"): (1, "read earlier check records through the storage boundary"),
     ("aegis_core/credit.py", "_read_ledger_events_with_report", "aegis_core.storage.read_jsonl"): (1, "read credit ledger events through the storage boundary"),
-    ("aegis_core/credit_memo.py", "_snapshot", "aegis_core.atomicio._open_regular"): (1, "shared L0 regular-file descriptor delegate; caller supplies the reviewed read or private-create flags"),
+    ("aegis_core/credit_memo.py", "_snapshot", "aegis_core.atomicio.open_regular"): (1, "RF-32: public O_RDONLY regular-file delegate for the unchanged portable snapshot branch"),
     ("aegis_core/credit_memo.py", "before_read", "aegis_core.credit_memo.filesystem_now"): (1, "sample the held lock file's filesystem clock for ledger evidence"),
     ("aegis_core/credit_memo.py", "contains", "aegis_core.credit_memo._snapshot"): (1, "read-only persisted-ledger generation snapshot"),
     ("aegis_core/credit_memo.py", "remember", "aegis_core.credit_memo._snapshot"): (1, "read-only persisted-ledger generation snapshot"),
@@ -658,6 +679,7 @@ REVIEWED_DESCRIPTOR_OPERATIONS = {
     ("aegis_core/team_mailbox_store.py", "Store.read", "os.open"): (1, "TA-1a: nonblocking no-follow regular single-link leaf; fstat size before read; always closed."),
     ("aegis_core/team_mailbox_store.py", "_open_absolute", "os.open"): (2, "TA-1a: read-only no-follow root/ancestor walk; all descriptors closed."),
     ("aegis_core/team_mailbox_store.py", "initialize_store", "os.open"): (3, "TA-1a: no-follow created root, relative child directories and exclusive private manifest; descriptors close on success/failure."),
+    ("aegis_core/team_native_rollout.py", "rollout_records", "os.open"): (1, "TA-3f: read-only O_NOFOLLOW|O_NONBLOCK leaf relative to a Store-held directory; regular singly linked file and byte ceiling checked before stream allocation; raw descriptor closed in finally including fdopen failure."),
     ("aegis_core/team_queue.py", "_publish", "aegis_core.atomicio.atomic_write_bytes"): (1, "BL-16a fixed owner-managed queue-state publication through the reviewed atomic storage boundary"),
     ("aegis_core/team_session_census.py", "SessionCensus.directory_descriptor", "os.open"): (2, "TA-2d no-follow trusted-root directory/file descriptor; bounded reads and explicit closure"),
     ("aegis_core/team_session_census.py", "SessionCensus.launch_directory", "os.open"): (2, "TA-2d no-follow trusted-root directory/file descriptor; bounded reads and explicit closure"),
@@ -709,23 +731,23 @@ REVIEWED_DESCRIPTOR_OPERATIONS = {
     ("aegis_core/atomicio.py", "atomic_write_bytes", "os.open"): (1, "shared L0 temporary-file writer re-exported by storage"),
     ("aegis_core/atomicio.py", "fsync_dir", "os.open"): (1, "read-only directory descriptor for storage's durability primitive"),
     ("aegis_core/config.py", "_read_json", "os.open"): (1, "read-only bounded config inspection"),
-    ("aegis_core/credit_memo.py", "_snapshot", "os.open"): (3, "read-only ancestor walk and credit memo snapshot"),
-    ("aegis_core/credit_memo.py", "filesystem_now", "os.open"): (3, "read-only ancestor walk and file timestamp inspection"),
+    ("aegis_core/credit_memo.py", "_snapshot", "os.open"): (2, "RF-32: one read-only directory-opener callback and one anchored regular-leaf open"),
+    ("aegis_core/credit_memo.py", "filesystem_now", "os.open"): (2, "RF-32: one read-only directory-opener callback and one anchored clock-file open; utime ownership remains explicit"),
     ("aegis_core/insights/keys.py", "_ensure_private_dir", "os.open"): (1, "read-only directory descriptor for permission checks"),
     ("aegis_core/insights/keys.py", "create_link_key", "os.open"): (1, "read-only verification of the key created through storage"),
     ("aegis_core/insights/keys.py", "read_link_key", "os.open"): (1, "read-only link key inspection"),
     ("aegis_core/language_runtime.py", "read_runtime_report", "os.open"): (1, "read-only bounded runtime report inspection"),
     ("aegis_core/lifecycle/selection.py", "_park", "os.replace"): (1, "existing rule archival moves a rule into its archive; no new content is authored"),
     ("aegis_core/manager_config.py", "public_file", "os.open"): (1, "read-only public manager config inspection"),
-    ("aegis_core/manager_store.py", "ManagerStore._anchor", "os.open"): (3, "read-only directory walk for the separate manager audit store"),
+    ("aegis_core/manager_store.py", "ManagerStore._anchor", "os.open"): (1, "RF-32: shared read-only directory-opener callback; directory creation belongs to the missing callback"),
     ("aegis_core/manager_store.py", "ManagerStore._audit", "os.open"): (1, "manager audit log outside repository worktrees; read/append flags supplied by callers"),
     ("aegis_core/manager_store.py", "_sync_directory", "os.open"): (1, "read-only directory descriptor for audit durability"),
-    ("aegis_core/message_codec_store.py", "Store.__init__", "os.open"): (3, "read-only directory walk binding the message store root"),
+    ("aegis_core/message_codec_store.py", "Store.__init__", "os.open"): (1, "RF-32: shared read-only directory-opener callback with caller-specific privacy policy"),
     ("aegis_core/message_codec_store.py", "Store._open", "os.open"): (1, "MC-1 stdlib-only message store opener used by its reviewed writer and readers"),
     ("aegis_core/message_codec_store.py", "Store._resolve", "os.open"): (1, "read-only directory descriptor for message reference lookup"),
-    ("aegis_core/model_select.py", "_decision_directory", "os.open"): (3, "read-only directory walk binding the caller's decision log directory"),
+    ("aegis_core/model_select.py", "_decision_directory", "os.open"): (1, "RF-32: shared read-only directory-opener callback with decision-directory policy"),
     ("aegis_core/model_select.py", "_open_log", "os.open"): (1, "read-only decision log inspection"),
-    ("aegis_core/model_select.py", "_open_regular", "os.open"): (3, "read-only ancestor walk and decision config inspection"),
+    ("aegis_core/model_select.py", "_open_regular", "os.open"): (2, "RF-32: one read-only directory-opener callback and one anchored configuration-leaf open"),
     ("aegis_core/model_select.py", "_publish", "os.open"): (1, "descriptor-confined temporary decision log in a caller-selected directory"),
     ("aegis_core/model_select.py", "_publish", "os.rename"): (1, "publish the decision log within the same bound directory"),
     ("aegis_core/pathlookup_fence.py", "open_directory", "os.open"): (1, "GITSAFE-ORDINARY-OUTSIDE r6 (coordinator-applied, writer proposal): read-only no-follow directory open from an absolute root or held parent; fixed O_PATH/O_SEARCH/read-only flags; descriptor closed on every path."),
@@ -1181,10 +1203,13 @@ def test_aliases_and_noncall_os_references_are_refused(monkeypatch, operation, f
 
 def test_reviewed_callbacks_are_allowed_and_still_counted_as_operations():
     visitor = _Writes("aegis_core/model_select.py")
-    visitor.visit(ast.parse("def _decision_directory():\n" + "    _path_call(os.open, path, flags)\n" * 3))
+    visitor.visit(ast.parse("def _decision_directory():\n"
+                            "    open_directory(os.open, path)\n"
+                            "    os.open(path, os.O_RDONLY)\n"
+                            "    os.open(path, os.O_RDONLY)\n"))
     assert visitor.errors == []
     assert visitor.found == [("_decision_directory", line, "os.open") for line in (2, 3, 4)]
-    key = ("aegis_core/model_select.py", "_decision_directory", "os.open", "_path_call")
+    key = ("aegis_core/model_select.py", "_decision_directory", "os.open", "open_directory")
     assert _callback_errors(visitor.callbacks, {key: CALLBACK_EXCEPTIONS[key]}) == []
 
 
@@ -1215,8 +1240,8 @@ def test_deferred_cleanup_callback_refuses_other_contexts_and_counts(scope, wrap
 @pytest.mark.parametrize("rel,scope,operation,callee,count,reason", [
     ("aegis_core/model_select.py", "new_scope", "os.open", "_path_call", 1, "unreviewed OS callback"),
     ("aegis_core/new.py", "_decision_directory", "os.open", "_path_call", 3, "unreviewed OS callback"),
-    ("aegis_core/model_select.py", "_decision_directory", "os.open", "_path_call", 4, "reviewed callback count 3 -> 4"),
-    ("aegis_core/model_select.py", "_decision_directory", "os.open", "_path_call", 2, "reviewed callback count 3 -> 2"),
+    ("aegis_core/model_select.py", "_decision_directory", "os.open", "open_directory", 4, "reviewed callback count 1 -> 4"),
+    ("aegis_core/model_select.py", "_decision_directory", "os.open", "open_directory", 2, "reviewed callback count 1 -> 2"),
     ("aegis_core/model_select.py", "_publish", "os.rename", "_other_helper", 1, "unreviewed OS callback"),
 ])
 def test_callback_exceptions_refuse_other_sites_callees_and_counts(monkeypatch, rel, scope, operation, callee, count, reason):
