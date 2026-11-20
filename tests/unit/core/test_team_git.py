@@ -20,8 +20,96 @@ from aegis_core import team, team_lease_custody
 from tests.helpers_team_git import (IDENTITY, LANE_MODULES, commit, filter_git_env, git,
                                     make_store, new_store, shared_bytes, strict_program,
                                     strict_program_guard)
+from tools import hierarchy_git as legacy_git
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+
+
+@pytest.mark.parametrize("inherit", [False, True])
+def test_object_read_policy_overrides_cannot_enable_effects(inherit):
+    overrides = {"GIT_NO_REPLACE_OBJECTS": "0", "GIT_NO_LAZY_FETCH": "0", "GIT_ALLOW_PROTOCOL": "all",
+                 "GIT_PROTOCOL_FROM_USER": "1", "GIT_OPTIONAL_LOCKS": "1", "GIT_TERMINAL_PROMPT": "1"}
+    environment = tg.object_read_env(overrides, inherit_config=inherit)
+    assert environment["GIT_NO_REPLACE_OBJECTS"] == "1"
+    assert environment["GIT_NO_LAZY_FETCH"] == "1"
+    assert environment["GIT_ALLOW_PROTOCOL"] == ""
+    assert environment["GIT_PROTOCOL_FROM_USER"] == "0"
+    assert environment["GIT_OPTIONAL_LOCKS"] == "0"
+    assert environment["GIT_TERMINAL_PROMPT"] == "0"
+    if not inherit:
+        assert environment["GIT_CONFIG_GLOBAL"] == os.devnull
+        assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert overrides["GIT_ALLOW_PROTOCOL"] == "all"
+
+
+def test_object_read_argv_adds_object_only_hardening():
+    argv = tg.object_read_argv("cat-file", "-t", "0" * 40)
+    legacy_argv = legacy_git.object_read_argv("cat-file", "-t", "0" * 40)
+    assert legacy_argv[0] == "git"
+    assert legacy_argv[1:] == argv
+    assert "--no-optional-locks" in argv and "--no-replace-objects" in argv
+    assert "core.fsmonitor=false" in argv
+    assert "protocol.allow=never" in argv
+    assert argv[-3:] == ["cat-file", "-t", "0" * 40]
+
+
+def test_object_read_environment_is_bounded_and_retries(monkeypatch):
+    monkeypatch.setattr(tg, "os", SimpleNamespace(**{**vars(os), "environ": {}}))
+    with pytest.raises(tg.GitRefusal) as caught:
+        tg.object_read_env({"X": "x" * 65537})
+    assert caught.value.code == "invalid_environment"
+    assert caught.value.next_action
+    environment = tg.object_read_env({"X": "ok"})
+    assert "X" not in environment and environment["GIT_ALLOW_PROTOCOL"] == ""
+
+
+def test_object_read_env_discards_repository_selectors_from_both_layers(monkeypatch):
+    names = gitsafe_policy.LOCAL_ENV | {"GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"}
+    ambient = {**dict.fromkeys(names, "fixture"), "VISIBLE": "ambient"}
+    overrides = {**dict.fromkeys((key.lower() for key in names), "fixture"), "VISIBLE": "override"}
+    monkeypatch.setattr(tg, "os", SimpleNamespace(**{**vars(os), "environ": ambient}))
+
+    environment = tg.object_read_env(overrides)
+    assert {key for key in environment if key.upper() in names} == {"GIT_NO_REPLACE_OBJECTS"}
+    assert environment["GIT_NO_REPLACE_OBJECTS"] == "1"
+    assert environment["GIT_CONFIG_GLOBAL"] == os.devnull and environment["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert "VISIBLE" not in environment
+
+
+@pytest.mark.parametrize("oversized_layer", ["ambient", "overrides"])
+def test_object_read_env_reserves_fixed_policy_outside_input_budget(monkeypatch, oversized_layer):
+    ambient = dict.fromkeys((f"INPUT_{i}" for i in range(512)), "ok")
+    platform = SimpleNamespace(**{**vars(os), "environ": ambient})
+    monkeypatch.setattr(tg, "os", platform)
+
+    oversized = {**ambient, "GIT_ALLOW_PROTOCOL": "discard"}
+    if oversized_layer == "ambient":
+        platform.environ = oversized
+    with pytest.raises(tg.GitRefusal) as caught:
+        tg.object_read_env(oversized if oversized_layer == "overrides" else {})
+    assert caught.value.code == "invalid_environment" and caught.value.next_action
+    platform.environ = ambient
+    environment = tg.object_read_env({"GIT_ALLOW_PROTOCOL": "discard", "GIT_DIR": "discard", "EXTRA": "discard"})
+    assert not (ambient.keys() | {"GIT_DIR", "EXTRA"}) & environment.keys()
+    assert environment["GIT_ALLOW_PROTOCOL"] == "" and environment["GIT_NO_REPLACE_OBJECTS"] == "1"
+
+
+@pytest.mark.parametrize("platform", ["posix", "nt"])
+@pytest.mark.parametrize("inherit", [False, True])
+def test_object_read_env_accepts_only_platform_keys_and_fixed_policy(monkeypatch, platform, inherit):
+    startup = {"SYSTEMROOT": "system", "WINDIR": "windows", "TEMP": "temp", "TMP": "tmp"}
+    denied = {"PATH", "HOME", "USERPROFILE", "TMPDIR", "GIT_TRACE", "GIT_TRACE2_EVENT", "GIT_TRACE_SETUP"}
+    fixed = dict(gitsafe_policy.BASE_ENV, GIT_PROTOCOL_FROM_USER="0")
+    isolated = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    ambient = {**startup, **dict.fromkeys(denied, "ambient")}
+    overrides = dict.fromkeys((key.lower() for key in {*fixed, *isolated, *denied}), "override")
+    overrides["Temp"] = "replacement"
+    monkeypatch.setattr(tg, "os", SimpleNamespace(**{**vars(os), "name": platform, "environ": ambient}))
+
+    expected = fixed if inherit else {**fixed, **isolated}
+    if platform == "nt":
+        expected = {**expected, **startup, "TEMP": "replacement"}
+    assert tg.object_read_env(overrides, inherit_config=inherit) == expected
 
 
 ENV_REDIRECTS = ("GIT_TRACE", "GIT_TRACE2", "GIT_TRACE2_EVENT", "GIT_TRACE2_PERF",
