@@ -419,24 +419,6 @@ def _proposal_render(value):
 
 
 # Display parity and redaction share boundaries even when legacy output keeps a kind byte.
-@pytest.mark.parametrize("prefix", [
-    pytest.param("\x1bP", id="dcs"),
-    pytest.param("\x1bP\x1b[31m", id="dcs-csi"),
-    pytest.param("note\x1b]\x1bP", id="osc-dcs"),
-    pytest.param("note\x1b]0;title\x1b7", id="osc-title-esc7"),
-    pytest.param("\x1bP\x9b31m", id="dcs-c1-csi"),
-    pytest.param("\x1bP$q", id="dcs-intermediate-header"),
-    pytest.param("\x1bP1;2q", id="dcs-parameter-header"),
-    pytest.param("\x901;2q", id="c1-dcs-parameter-header"),
-    pytest.param("\x1b(B", id="escape-intermediate-header"),
-    *[pytest.param("note\x1b" + kind, id="esc-" + kind) for kind in "NOM78c"],
-    pytest.param("\x1bX", id="sos"),
-    pytest.param("\x1b^", id="pm"),
-    pytest.param("\x1b_", id="apc"),
-    pytest.param("note\x1b?", id="unknown-escape"),
-    pytest.param("note\x1b[12;\x00", id="abandoned-csi"),
-])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
 def test_display_escape_boundaries_mask_secrets_on_every_surface(prefix, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -452,7 +434,6 @@ def test_display_escape_boundaries_mask_secrets_on_every_surface(prefix, surface
         assert "REDACTED" in shown
 
 
-@pytest.mark.parametrize("code", [code for code in (*range(32), *range(127, 160)) if code != 27])
 def test_display_removed_controls_preserve_secret_boundaries(code):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -494,7 +475,6 @@ def test_display_boundaries_are_local_to_parallel_calls_and_retries():
     assert [primitives.sanitize_display(value, max_len=None) for value in values] == expected
 
 
-@pytest.mark.parametrize("tail", ["", "safe", "secret"])
 def test_display_ten_million_removed_controls_do_not_build_per_control_state(tail):
     import tracemalloc
 
@@ -513,15 +493,6 @@ def test_display_ten_million_removed_controls_do_not_build_per_control_state(tai
     assert peak < 2_000_000
 
 
-@pytest.mark.parametrize("value, payload", [
-    ("AS" + "IA" + "A" * 16, "A" * 16),
-    ("gh" + "p_" + "a" * 36, "a" * 36),
-    ("sk" + "-proj-" + "Ab1" * 12, "Ab1" * 12),
-    ("token=" + "test-value-123456", "test-value-123456"),
-    ("Bearer " + "a" * 20, "a" * 20),
-    ("https://user:" + "test-value-123456" + "@example.test", "test-value-123456"),
-    ("-----BEGIN " + "PRIVATE KEY-----body", "body"),
-])
 def test_display_boundary_detection_uses_shared_secret_families(value, payload):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -550,19 +521,6 @@ def test_display_preserves_url_context_and_masks_overlapping_secret_rules():
     assert key not in shown and "REDACTED" in shown
 
 
-@pytest.mark.parametrize("prefix", [
-    pytest.param("\x1b(0", id="esc-numeric-final"),
-    pytest.param("\x1b[1:2m", id="csi-colon-final"),
-    pytest.param("\x1b[1$m", id="csi-intermediate-final"),
-    pytest.param("\x1bP1", id="dcs-parameters"),
-    pytest.param("\x1b]\x1bP1", id="nested-dcs-parameters"),
-    pytest.param("\x901", id="c1-dcs-parameters"),
-    pytest.param("\x9b1", id="c1-csi-parameters"),
-    pytest.param("\x1b[1:2", id="unsupported-csi-parameters"),
-    pytest.param("\x1b]1", id="osc-parameters"),
-    pytest.param("\x9d1", id="c1-osc-parameters"),
-])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
 def test_display_provenance_masks_low_entropy_keys_after_every_header(prefix, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -578,8 +536,6 @@ def test_display_provenance_masks_low_entropy_keys_after_every_header(prefix, su
         assert "REDACTED" in shown
 
 
-@pytest.mark.parametrize("family", ["aws", "github"])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
 def test_display_provenance_masks_overlaps_inside_an_ordinary_match(family, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -600,10 +556,6 @@ def test_display_provenance_masks_overlaps_inside_an_ordinary_match(family, surf
         assert "REDACTED" in shown
 
 
-@pytest.mark.parametrize("introducer", ["\x1bP", "\x1b]", "\x1bX", "\x1b^", "\x1b_",
-                                         "\x90", "\x98", "\x9d", "\x9e", "\x9f"])
-@pytest.mark.parametrize("header", ["1", "1:2", "1 $"])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
 def test_display_provenance_covers_every_string_form_and_header(introducer, header, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -618,7 +570,6 @@ def test_display_provenance_covers_every_string_form_and_header(introducer, head
     assert "REDACTED" in shown
 
 
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
 def test_display_provenance_overlaps_and_headers_are_independent_in_threads(surface):
     from concurrent.futures import ThreadPoolExecutor
 
@@ -640,9 +591,6 @@ def test_display_provenance_overlaps_and_headers_are_independent_in_threads(surf
     assert render("missing\x1b]FORGED") == render("missing]FORGED")
 
 
-@pytest.mark.parametrize("prefix", ["\x1b[", "\x1b[1"])
-@pytest.mark.parametrize("family", ["aws", "github"])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
 def test_display_source_view_masks_credentials_partly_consumed_by_csi(prefix, family, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -659,17 +607,6 @@ def test_display_source_view_masks_credentials_partly_consumed_by_csi(prefix, fa
     assert shown == render("[REDACTED_AWS]" if family == "aws" else "[REDACTED_VCS_TOKEN]")
 
 
-@pytest.mark.parametrize("prefix", [
-    *[pytest.param(introducer + "1\x002", id=name) for name, introducer in (
-        ("dcs", "\x1bP"), ("osc", "\x1b]"), ("sos", "\x1bX"), ("pm", "\x1b^"), ("apc", "\x1b_"),
-        ("c1-dcs", "\x90"), ("c1-osc", "\x9d"), ("c1-sos", "\x98"), ("c1-pm", "\x9e"), ("c1-apc", "\x9f"))],
-    pytest.param("\x1b(\x000", id="esc-intermediate"),
-    pytest.param("\x1b[1:\x002m", id="csi-subparameter"),
-    pytest.param("\x9b1:\x002m", id="c1-csi-subparameter"),
-    pytest.param("\x1b[1\x002m", id="csi-parameter"),
-])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
-@pytest.mark.parametrize("control", ["\x00", "\x08", "\x0b", "\r", "\x11", "\x19", "\x7f", "\x85", "\x91", "\x99"])
 def test_display_source_view_keeps_header_state_across_ignored_controls(prefix, surface, control):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -701,7 +638,6 @@ def test_display_source_view_bounds_repeated_unterminated_pem_work():
     assert result.stdout == "bounded\n"
 
 
-@pytest.mark.parametrize("value, expected", [("\n", " "), ("\t\r\x00", " "), ("\r\x00", "")])
 def test_display_source_view_accepts_control_only_nonsecret_text(value, expected):
     assert primitives.sanitize_display(value, max_len=None) == expected
 
@@ -715,12 +651,6 @@ def test_display_source_view_masks_only_surviving_characters_and_preserves_conte
     assert primitives.sanitize_display(value, max_len=None) == "[REDACTED_PEM][REDACTED_AWS]"
 
 
-@pytest.mark.parametrize("prefix", [pytest.param("\x1b[", id="csi"), pytest.param("\x1b[1", id="csi-parameter")])
-@pytest.mark.parametrize("inner", [pytest.param("\r", id="cr"), pytest.param("\x00", id="nul"),
-                                  pytest.param("\x7f", id="del"), pytest.param("\x85", id="c1"),
-                                  pytest.param("\x1b[31m", id="supported-csi")])
-@pytest.mark.parametrize("family", ["aws", "github"])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
 def test_display_deleted_view_masks_consumed_prefix_with_internal_control(prefix, inner, family, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -734,15 +664,6 @@ def test_display_deleted_view_masks_consumed_prefix_with_internal_control(prefix
     assert shown == render("[REDACTED_AWS]" if family == "aws" else "[REDACTED_VCS_TOKEN]")
 
 
-@pytest.mark.parametrize("prefix", [
-    pytest.param("\x1b[?\x07:m", id="csi"), pytest.param("\x9b?\x07:m", id="c1-csi"),
-    pytest.param("\x1b(\x07B", id="esc-intermediate"),
-    *[pytest.param(introducer + "1\x072", id=name) for name, introducer in (
-        ("sos", "\x1bX"), ("pm", "\x1b^"), ("apc", "\x1b_"),
-        ("c1-sos", "\x98"), ("c1-pm", "\x9e"), ("c1-apc", "\x9f"),
-        ("c1-dcs", "\x90"), ("c1-osc", "\x9d"))],
-])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
 def test_display_deleted_view_keeps_bel_transparent_in_nonterminating_headers(prefix, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -757,17 +678,12 @@ def test_display_deleted_view_keeps_bel_transparent_in_nonterminating_headers(pr
     assert "REDACTED" in shown
 
 
-@pytest.mark.parametrize("introducer", ["\x1b]", "\x1bP"])
 def test_display_deleted_view_preserves_bel_termination_and_nonsecret_parity(introducer):
     key = "AK" + "IA" + "A" * 16
     assert primitives.sanitize_display("before" + introducer + key + "\x07after", max_len=None) == "beforeafter"
     assert primitives.sanitize_display("before" + introducer + "1\x072safe", max_len=None) == "before2safe"
 
 
-@pytest.mark.parametrize("control", [pytest.param("\x07", id="bel"), pytest.param("\t", id="tab"),
-                                    pytest.param("\n", id="lf")])
-@pytest.mark.parametrize("header", ["\x1b[", "\x9b", "\x1b("])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
 def test_display_renderer_provenance_keeps_control_interrupted_headers(control, header, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -782,7 +698,6 @@ def test_display_renderer_provenance_keeps_control_interrupted_headers(control, 
     assert "REDACTED" in shown
 
 
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
 def test_display_renderer_provenance_recovers_consumed_credential_label(surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -796,8 +711,6 @@ def test_display_renderer_provenance_recovers_consumed_credential_label(surface)
     assert "REDACTED" in shown
 
 
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
-@pytest.mark.parametrize("label", ["EC", "OPENSSH"])
 def test_display_pem_extents_cover_differently_labelled_nested_body(surface, label):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -815,11 +728,6 @@ def test_display_pem_extents_cover_differently_labelled_nested_body(surface, lab
     assert "REDACTED" in shown
 
 
-@pytest.mark.parametrize("introducer", [pytest.param("\x1b]", id="osc"), pytest.param("\x1bP", id="dcs")])
-@pytest.mark.parametrize("terminator", [pytest.param("\x07", id="bel"), pytest.param("\x1b\\", id="st")])
-@pytest.mark.parametrize("hidden, tail", [("token=", "after"), ("Bearer", "after_sixteen_chars"),
-                                         ("-----BEGIN " + "PRIVATE KEY-----", "after")])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
 def test_display_source_segments_seal_suppressed_strings(introducer, terminator, hidden, tail, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -835,10 +743,6 @@ def test_display_source_segments_seal_suppressed_strings(introducer, terminator,
     assert render("before" + introducer + "0;" + hidden + terminator + tail) == expected
 
 
-@pytest.mark.parametrize("control", [pytest.param("\x00", id="nul"), pytest.param("\r", id="cr"),
-                                    pytest.param("\x7f", id="del"), pytest.param("\x85", id="c1")])
-@pytest.mark.parametrize("head, tail", [("Bearer", "anything_sixteen_chars"), ("password", "is abcdefgh")])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
 def test_display_source_segments_do_not_invent_credential_whitespace(control, head, tail, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -853,9 +757,6 @@ def test_display_source_segments_do_not_invent_credential_whitespace(control, he
     assert render(head + control + tail) == expected
 
 
-@pytest.mark.parametrize("introducer", [pytest.param("\x1b]", id="osc"), pytest.param("\x1bP", id="dcs")])
-@pytest.mark.parametrize("terminator", [pytest.param("\x07", id="bel"), pytest.param("\x1b\\", id="st")])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
 def test_display_source_segments_do_not_join_visible_context_through_hidden_payload(introducer, terminator, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -868,9 +769,6 @@ def test_display_source_segments_do_not_join_visible_context_through_hidden_payl
     assert render("token=" + introducer + "filler" + terminator + "abc") == expected
 
 
-@pytest.mark.parametrize("introducer", [pytest.param("\x1b]", id="osc"), pytest.param("\x1bP", id="dcs")])
-@pytest.mark.parametrize("terminator", [pytest.param("\x07", id="bel"), pytest.param("\x1b\\", id="st")])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
 def test_display_source_segments_still_mask_visible_secrets_on_both_sides(introducer, terminator, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -885,10 +783,6 @@ def test_display_source_segments_still_mask_visible_secrets_on_both_sides(introd
     assert "REDACTED" in shown
 
 
-@pytest.mark.parametrize("value", ["service_password_name=" + "test-value-123456",
-                                  "https://user:" + "test-value-123456" + "@example.test",
-                                  "://user:" + "test-value-123456" + "@example.test"])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
 def test_display_source_segments_keep_prefixed_secret_context_detectable(value, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -905,9 +799,6 @@ def test_display_source_segments_keep_prefixed_secret_context_detectable(value, 
         assert "REDACTED" in shown
 
 
-@pytest.mark.parametrize("introducer", [pytest.param("\x1b]", id="osc"), pytest.param("\x1bP", id="dcs")])
-@pytest.mark.parametrize("terminator", [pytest.param("\x07", id="bel"), pytest.param("\x1b\\", id="st")])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
 def test_display_rendered_segments_seal_hidden_token_prefix(introducer, terminator, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -920,8 +811,6 @@ def test_display_rendered_segments_seal_hidden_token_prefix(introducer, terminat
     assert render(value) == render("before" + "a" * 20)
 
 
-@pytest.mark.parametrize("control", [pytest.param("\t", id="tab"), pytest.param("\n", id="lf")])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
 def test_display_rendered_segments_preserve_visible_space_inside_nonsecret(control, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -933,9 +822,6 @@ def test_display_rendered_segments_preserve_visible_space_inside_nonsecret(contr
     assert render("AK" + "IA" + control + "A" * 16) == render("AK" + "IA " + "A" * 16)
 
 
-@pytest.mark.parametrize("control", [pytest.param("\x00", id="nul"), pytest.param("\r", id="cr"),
-                                    pytest.param("\x7f", id="del"), pytest.param("\x85", id="c1")])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
 def test_display_rendered_segments_still_join_fully_removed_controls(control, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -949,9 +835,6 @@ def test_display_rendered_segments_still_join_fully_removed_controls(control, su
     assert "REDACTED" in shown
 
 
-@pytest.mark.parametrize("prefix", [pytest.param("\x1b[", id="csi"), pytest.param("\x1b[1", id="csi-parameter")])
-@pytest.mark.parametrize("control", [pytest.param("\t", id="tab"), pytest.param("\n", id="lf")])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
 def test_display_rendered_segments_keep_visible_credential_whitespace(prefix, control, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -965,10 +848,6 @@ def test_display_rendered_segments_keep_visible_credential_whitespace(prefix, co
     assert "REDACTED" in shown
 
 
-@pytest.mark.parametrize("family", ["aws", "github"])
-@pytest.mark.parametrize("removed", [pytest.param("\x1b[31m", id="sgr"), pytest.param("\r", id="cr"),
-                                    pytest.param("\x00", id="nul")])
-@pytest.mark.parametrize("prefix", [pytest.param("", id="plain"), pytest.param("\x1b[31m", id="color")])
 def test_display_reassembled_tokens_use_markers_before_caller_redaction(family, removed, prefix):
     from aegis_core.redaction import redact_command_secrets
 
@@ -980,7 +859,6 @@ def test_display_reassembled_tokens_use_markers_before_caller_redaction(family, 
     assert _proposal_render(prefix + key[:2] + removed + key[2:]) == marker
 
 
-@pytest.mark.parametrize("family", ["aws", "github"])
 def test_display_unions_canonical_and_source_only_masks(family):
     from aegis_core.redaction import redact_command_secrets
 
@@ -993,7 +871,6 @@ def test_display_unions_canonical_and_source_only_masks(family):
     assert _proposal_render(value) == "normal " + marker + "; P1" + marker
 
 
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
 def test_display_does_not_orphan_value_after_guarding_secret_key_context(surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -1009,8 +886,6 @@ def test_display_does_not_orphan_value_after_guarding_secret_key_context(surface
     assert "REDACTED" in shown
 
 
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
-@pytest.mark.parametrize("case", ["changed-boundary", "ordered-coverage", "finite-clip"])
 def test_display_restored_union_masks_before_boundary_changes_or_clipping(case, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -1030,7 +905,6 @@ def test_display_restored_union_masks_before_boundary_changes_or_clipping(case, 
     assert "REDACTED" in shown
 
 
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
 def test_display_source_guard_cannot_complete_a_new_credential_or_tear_a_mask(surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -1088,31 +962,11 @@ def test_display_attribution_gate_keeps_inputs_without_suppressed_finals_identic
     assert primitives.sanitize_display(value, max_len=None) == expected
 
 
-@pytest.mark.parametrize("suffix", ["", "\x1b[31m"])
 def test_display_attribution_preserves_ordinary_left_boundary(suffix):
     key = "AK" + "IA" + "A" * 16
     assert primitives.sanitize_display("x" + key + suffix, max_len=None) == "x" + key
 
 
-@pytest.mark.parametrize("value, payload", [
-    ("AS" + "IA" + "A" * 16, "A" * 16),
-    ("AR" + "OA" + "A" * 16, "A" * 16),
-    ("gh" + "o_" + "a" * 36, "a" * 36),
-    ("git" + "hub_pat_" + "a" * 24, "a" * 24),
-    ("gl" + "pat-" + "a" * 24, "a" * 24),
-    ("sk" + "_live_" + "a" * 24, "a" * 24),
-    ("sk" + "-proj-" + "a" * 24, "a" * 24),
-    ("AI" + "za" + "a" * 30, "a" * 30),
-    ("xo" + "xb-" + "a" * 24, "a" * 24),
-    ("npm" + "_" + "a" * 24, "a" * 24),
-    ("py" + "pi-" + "a" * 24, "a" * 24),
-    ("ey" + "J" + "a" * 12 + "." + "b" * 8 + "." + "c" * 8, "c" * 8),
-    ("Bearer " + "a" * 24, "a" * 24),
-    ("password=" + "test-value-123456", "test-value-123456"),
-    ("password is " + "test-value-123456", "test-value-123456"),
-    ("https://user:" + "test-value-123456" + "@example.test", "test-value-123456"),
-])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
 def test_display_attribution_covers_shared_rule_families(value, payload, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -1157,7 +1011,6 @@ def test_display_attribution_exhaustion_masks_only_candidate_between_sealed_stri
     assert render(value) == render("before[REDACTED]after")
 
 
-@pytest.mark.parametrize("count", [1, 3, 6])
 def test_display_attribution_long_benign_colour_runs_keep_parity(count):
     part = "x" * 5001
     value = (part + "\x1b[31m") * count + part
@@ -1230,10 +1083,6 @@ def test_display_attribution_widths_and_unknown_grammars_fail_conservatively():
     assert may_match_visible(compile_possible([re.compile("abc")]), "safe", runs, lambda amount: False)
 
 
-@pytest.mark.parametrize("count", [5000, 50000])
-@pytest.mark.parametrize("control", [pytest.param("\x00", id="nul"), pytest.param("\r", id="cr"),
-                                     pytest.param("\x7f", id="del"), pytest.param("\x85", id="c1")])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
 def test_display_attribution_detection_windows_span_removed_control_gaps(count, control, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -1313,8 +1162,6 @@ def test_display_attribution_detection_window_geometry_keeps_source_budget(count
     assert stats["coverage"] == ("possible" if count == 50000 else "complete")
 
 
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
-@pytest.mark.parametrize("family", ["jwt", "vcs"])
 def test_display_attribution_masks_overlapping_ordinary_credentials(surface, family):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -1335,9 +1182,6 @@ def test_display_attribution_masks_overlapping_ordinary_credentials(surface, fam
     assert shown == render(marker)
 
 
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
-@pytest.mark.parametrize("plain", [pytest.param("xAK" + "IA" + "A" * 16, id="ascii-aws"),
-                                  pytest.param("\u212aBearer " + "a" * 24, id="unicode-bearer")])
 def test_display_attribution_fallback_preserves_ordinary_boundary_and_flags(surface, plain):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -1349,7 +1193,6 @@ def test_display_attribution_fallback_preserves_ordinary_boundary_and_flags(surf
     assert render(plain + "\x1b[31m" * 128) == render(plain)
 
 
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
 def test_display_attribution_fallback_keeps_carried_starts(surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -2625,3 +2468,86 @@ def test_round8_entropy_and_privacy_scan_every_display_view(tmp_path, control, v
     for _ in range(2):
         add_insight(workspace, source, paths=[], home=tmp_path / "home")
     assert all(body not in row["text"] for row in read_insight_rows(workspace, home=tmp_path / "home"))
+
+
+# Bind after all definitions: the shared table imports these callables for replay,
+# and either test module must also be importable first. Only layout/label metadata
+# lives beside the table; every original argument comes from CORPUS_CASES.
+from tests.unit.core.test_display_attribution_dense import parametrize_original
+
+test_display_escape_boundaries_mask_secrets_on_every_surface = parametrize_original(
+    test_display_escape_boundaries_mask_secrets_on_every_surface)
+test_display_removed_controls_preserve_secret_boundaries = parametrize_original(
+    test_display_removed_controls_preserve_secret_boundaries)
+test_display_ten_million_removed_controls_do_not_build_per_control_state = parametrize_original(
+    test_display_ten_million_removed_controls_do_not_build_per_control_state)
+test_display_boundary_detection_uses_shared_secret_families = parametrize_original(
+    test_display_boundary_detection_uses_shared_secret_families)
+test_display_provenance_masks_low_entropy_keys_after_every_header = parametrize_original(
+    test_display_provenance_masks_low_entropy_keys_after_every_header)
+test_display_provenance_masks_overlaps_inside_an_ordinary_match = parametrize_original(
+    test_display_provenance_masks_overlaps_inside_an_ordinary_match)
+test_display_provenance_covers_every_string_form_and_header = parametrize_original(
+    test_display_provenance_covers_every_string_form_and_header)
+test_display_provenance_overlaps_and_headers_are_independent_in_threads = parametrize_original(
+    test_display_provenance_overlaps_and_headers_are_independent_in_threads)
+test_display_source_view_masks_credentials_partly_consumed_by_csi = parametrize_original(
+    test_display_source_view_masks_credentials_partly_consumed_by_csi)
+test_display_source_view_keeps_header_state_across_ignored_controls = parametrize_original(
+    test_display_source_view_keeps_header_state_across_ignored_controls)
+test_display_source_view_accepts_control_only_nonsecret_text = parametrize_original(
+    test_display_source_view_accepts_control_only_nonsecret_text)
+test_display_deleted_view_masks_consumed_prefix_with_internal_control = parametrize_original(
+    test_display_deleted_view_masks_consumed_prefix_with_internal_control)
+test_display_deleted_view_keeps_bel_transparent_in_nonterminating_headers = parametrize_original(
+    test_display_deleted_view_keeps_bel_transparent_in_nonterminating_headers)
+test_display_deleted_view_preserves_bel_termination_and_nonsecret_parity = parametrize_original(
+    test_display_deleted_view_preserves_bel_termination_and_nonsecret_parity)
+test_display_renderer_provenance_keeps_control_interrupted_headers = parametrize_original(
+    test_display_renderer_provenance_keeps_control_interrupted_headers)
+test_display_renderer_provenance_recovers_consumed_credential_label = parametrize_original(
+    test_display_renderer_provenance_recovers_consumed_credential_label)
+test_display_pem_extents_cover_differently_labelled_nested_body = parametrize_original(
+    test_display_pem_extents_cover_differently_labelled_nested_body)
+test_display_source_segments_seal_suppressed_strings = parametrize_original(
+    test_display_source_segments_seal_suppressed_strings)
+test_display_source_segments_do_not_invent_credential_whitespace = parametrize_original(
+    test_display_source_segments_do_not_invent_credential_whitespace)
+test_display_source_segments_do_not_join_visible_context_through_hidden_payload = parametrize_original(
+    test_display_source_segments_do_not_join_visible_context_through_hidden_payload)
+test_display_source_segments_still_mask_visible_secrets_on_both_sides = parametrize_original(
+    test_display_source_segments_still_mask_visible_secrets_on_both_sides)
+test_display_source_segments_keep_prefixed_secret_context_detectable = parametrize_original(
+    test_display_source_segments_keep_prefixed_secret_context_detectable)
+test_display_rendered_segments_seal_hidden_token_prefix = parametrize_original(
+    test_display_rendered_segments_seal_hidden_token_prefix)
+test_display_rendered_segments_preserve_visible_space_inside_nonsecret = parametrize_original(
+    test_display_rendered_segments_preserve_visible_space_inside_nonsecret)
+test_display_rendered_segments_still_join_fully_removed_controls = parametrize_original(
+    test_display_rendered_segments_still_join_fully_removed_controls)
+test_display_rendered_segments_keep_visible_credential_whitespace = parametrize_original(
+    test_display_rendered_segments_keep_visible_credential_whitespace)
+test_display_reassembled_tokens_use_markers_before_caller_redaction = parametrize_original(
+    test_display_reassembled_tokens_use_markers_before_caller_redaction)
+test_display_unions_canonical_and_source_only_masks = parametrize_original(
+    test_display_unions_canonical_and_source_only_masks)
+test_display_does_not_orphan_value_after_guarding_secret_key_context = parametrize_original(
+    test_display_does_not_orphan_value_after_guarding_secret_key_context)
+test_display_restored_union_masks_before_boundary_changes_or_clipping = parametrize_original(
+    test_display_restored_union_masks_before_boundary_changes_or_clipping)
+test_display_source_guard_cannot_complete_a_new_credential_or_tear_a_mask = parametrize_original(
+    test_display_source_guard_cannot_complete_a_new_credential_or_tear_a_mask)
+test_display_attribution_preserves_ordinary_left_boundary = parametrize_original(
+    test_display_attribution_preserves_ordinary_left_boundary)
+test_display_attribution_covers_shared_rule_families = parametrize_original(
+    test_display_attribution_covers_shared_rule_families)
+test_display_attribution_long_benign_colour_runs_keep_parity = parametrize_original(
+    test_display_attribution_long_benign_colour_runs_keep_parity)
+test_display_attribution_detection_windows_span_removed_control_gaps = parametrize_original(
+    test_display_attribution_detection_windows_span_removed_control_gaps)
+test_display_attribution_masks_overlapping_ordinary_credentials = parametrize_original(
+    test_display_attribution_masks_overlapping_ordinary_credentials)
+test_display_attribution_fallback_preserves_ordinary_boundary_and_flags = parametrize_original(
+    test_display_attribution_fallback_preserves_ordinary_boundary_and_flags)
+test_display_attribution_fallback_keeps_carried_starts = parametrize_original(
+    test_display_attribution_fallback_keeps_carried_starts)
