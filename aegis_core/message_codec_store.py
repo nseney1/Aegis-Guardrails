@@ -238,6 +238,7 @@ class Store:
                 pass
             name, temporary = rid + ".json", ".msg-" + uuid.uuid4().hex
             fd = self._open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, rootfd)
+            staged = True
             try:
                 try:
                     stream = os.fdopen(fd, "wb", closefd=False)
@@ -257,10 +258,15 @@ class Store:
                 except FileExistsError:
                     pass  # Existing bytes receive exactly the same verification.
                 require(self._read_bytes(rid, rootfd, expected_size=len(data))[0] == data, "E_HASH")
+                os.unlink(temporary, **_at(rootfd))
+                staged = False
+                # Persist the final name and the removal of the staging name together.
                 os.fsync(rootfd)
-            finally:
+            except BaseException:
+                if staged:
+                    with suppress(OSError):
+                        os.unlink(temporary, **_at(rootfd))
                 with suppress(OSError):  # Cleanup never replaces the original refusal.
-                    os.unlink(temporary, **_at(rootfd))
-                with suppress(OSError):
                     os.fsync(rootfd)
+                raise
         return rid
