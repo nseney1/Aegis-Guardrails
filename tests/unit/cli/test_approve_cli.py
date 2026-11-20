@@ -23,8 +23,7 @@ def _policy_environment(tmp_path, monkeypatch):
     home = hg.Home(tmp_path / "home")
     for name, value in home.env.items():
         monkeypatch.setenv(name, value)
-    for name in ("GITHUB_EVENT_PATH", "GITHUB_EVENT_NAME", "GITHUB_BASE_REF", "GITHUB_REF_NAME", "GIT_CONFIG_GLOBAL"):
-        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("GIT_CONFIG_GLOBAL", raising=False)
 
 
 @needs_git
