@@ -11,8 +11,7 @@ import math
 import os
 import select
 import threading
-import time
-from contextlib import contextmanager
+from contextlib import ExitStack, closing, contextmanager
 
 import pytest
 
@@ -89,13 +88,13 @@ def _pipe():
 
 
 class _LineReader:
-    def __init__(self, fd):
-        self.fd = fd
+    def __init__(self, read):
+        self.read = read
         self.buf = b""
 
     def line(self):
         while b"\n" not in self.buf:
-            chunk = os.read(self.fd, 65536)
+            chunk = self.read(65536)
             if not chunk:
                 data, self.buf = self.buf, b""
                 return data
@@ -113,6 +112,8 @@ class _LineReader:
 class Link:
     """One client and the peer ends of its two anonymous pipes."""
 
+    _DRAIN_TIMEOUT_SECONDS = 5
+
     def __init__(self, timeout=3, maximum=None, implementation=None):
         _posix()
         self.seen = []
@@ -123,6 +124,7 @@ class Link:
         self._client_reader = None
         self._client_writer = None
         self._thread = None
+        self._abort_peer = threading.Event()
         self.client = None
         try:
             self._client_reader, self.to_client = _pipe()
@@ -130,7 +132,7 @@ class Link:
             self.to_peer = self._peer_reader.fileno()
             os.set_inheritable(self.to_client.fileno(), False)
             os.set_inheritable(self.to_peer, False)
-            self.peer = _LineReader(self.to_peer)
+            self.peer = _LineReader(self._peer_reader.read)
             implementation = wire.ProtocolClient if implementation is None else implementation
             self.client = implementation(
                 self._client_reader, self._client_writer, timeout_seconds=timeout,
@@ -150,14 +152,15 @@ class Link:
                 # Close during a blocked write drops the peer's end. That is shutdown.
                 self.error = exc
 
-        self._thread = threading.Thread(target=run, daemon=True)
-        self._thread.start()
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        self._thread = thread
 
     def _emit(self, payload):
         view = memoryview(payload)
         offset = 0
-        while offset < len(payload):
-            wrote = os.write(self.to_client.fileno(), view[offset:])
+        while offset < len(payload) and not self._abort_peer.is_set():
+            wrote = self.to_client.write(view[offset:])
             if wrote <= 0:
                 break
             offset += wrote
@@ -182,15 +185,13 @@ class Link:
         if mode == "torn":
             self._emit(b'{"id":7')
             self.to_client.close()
-            self.to_client = None
             return
         if mode == "eof":
             self.to_client.close()
-            self.to_client = None
             return
         for raw in incoming:
             self._emit(raw)
-        while True:
+        while not self._abort_peer.is_set():
             more = self.peer.line()
             if not more:
                 break
@@ -203,29 +204,32 @@ class Link:
         thread is the observer. Closing its read end before it runs discards
         those bytes, so the read end stays open until the thread finishes.
         """
-        client = self.client
+        thread = self._thread
+        timed_out = False
         try:
-            if client is not None:
-                try:
-                    client.close()
-                except OSError:
-                    pass
+            try:
+                if self.client is not None:
+                    self.client.close()
+            except OSError:
+                pass
         finally:
-            thread = self._thread
-            if thread is not None and thread is not threading.current_thread():
+            try:
+                if thread is not None and thread is not threading.current_thread():
+                    thread.join(self._DRAIN_TIMEOUT_SECONDS)
+                    timed_out = thread.is_alive()
+                    if timed_out:
+                        self._abort_peer.set()
+            finally:
+                # Closing the opposite pipe ends wakes blocked peer reads or writes.
+                for stream in (self._client_writer, self._client_reader,
+                               self.to_client, self._peer_reader):
+                    _close_stream(stream)
+            if timed_out:
                 thread.join(5)
-                if thread.is_alive():
-                    raise AssertionError(
-                        "peer did not reach end-of-stream within 5 seconds; observed %d frames"
-                        % len(self.seen))
-            _close_stream(self._client_reader)
-            self._client_reader = None
-            _close_stream(self._client_writer)
-            self._client_writer = None
-            _close_stream(self.to_client)
-            self.to_client = None
-            _close_stream(self._peer_reader)
-            self._peer_reader = None
+                raise AssertionError(
+                    "peer did not reach end-of-stream within %s seconds; "
+                    "observed %d frames; peer still alive after cleanup: %s"
+                    % (self._DRAIN_TIMEOUT_SECONDS, len(self.seen), thread.is_alive()))
 
     def parsed(self):
         return [json.loads(raw) for raw in self.seen if raw.endswith(b"\n")]
@@ -248,17 +252,63 @@ def _messages(item):
     return item.parsed()
 
 
-class WatchSelect:
-    def __init__(self, fd, writing):
+class _GatedSelect:
+    """Pause a proven unready descriptor before polling it again."""
+
+    def __init__(self, fd, *, writing=False, poll=select.select):
         self.fd = fd
         self.writing = writing
+        self.poll = poll
         self.entered = threading.Event()
+        self.release = threading.Event()
+        self.ready = False
 
     def select(self, readable, writable, exceptional, timeout=None):
         watched = writable if self.writing else readable
-        if self.fd in watched:
+        if self.fd not in watched:
+            return select.select(readable, writable, exceptional, timeout)
+        if not self.entered.is_set():
+            assert select.select(readable, writable, exceptional, 0) == ([], [], [])
             self.entered.set()
-        return select.select(readable, writable, exceptional, timeout)
+            assert self.release.wait(5), "test did not release the select gate"
+        result = self.poll(readable, writable, exceptional, timeout)
+        self.ready = self.fd in result[1 if self.writing else 0]
+        return result
+
+
+class _PollClock:
+    def __init__(self):
+        self.now = 0
+
+    def monotonic(self):
+        return self.now
+
+    def poll(self, readable, writable, exceptional, timeout):
+        self.now += timeout
+        return [], [], []
+
+
+@contextmanager
+def _pending_initialize(client, watch):
+    outcome = []
+
+    def initialize():
+        try:
+            client.initialize()
+        except wire.HostAuthorityError as exc:
+            outcome.append(exc.code)
+        else:
+            outcome.append("initialized")
+
+    worker = threading.Thread(target=initialize, daemon=True)
+    worker.start()
+    try:
+        assert watch.entered.wait(5), "initialize did not reach the select gate"
+        yield outcome
+    finally:
+        watch.release.set()
+        worker.join(5)
+        assert not worker.is_alive()
 
 
 class _Once:
@@ -478,6 +528,43 @@ def test_link_closes_the_first_pipe_when_the_second_open_fails(monkeypatch):
     assert state["reader"] is not None and state["reader"].closed
 
 
+def test_link_timeout_releases_the_peer_closes_streams_and_allows_a_fresh_exchange():
+    entered = threading.Event()
+    abort = threading.Event()
+
+    class GatedLink(Link):
+        _DRAIN_TIMEOUT_SECONDS = 0
+
+        def _serve(self, incoming, mode, payload):
+            entered.set()
+            abort.wait(15)
+
+    item = GatedLink()
+    item._abort_peer = abort
+    streams = (item._client_reader, item._client_writer, item.to_client, item._peer_reader)
+    try:
+        item.start()
+        assert entered.wait(5)
+        with pytest.raises(AssertionError, match="^peer did not reach end-of-stream"):
+            item.close()
+        assert abort.is_set()
+        assert not item._thread.is_alive()
+        assert all(stream.closed for stream in streams)
+        item.close()
+    finally:
+        abort.set()
+        if item._thread is not None:
+            item._thread.join(5)
+        item.close()
+
+    answer = {"success": True, "contentItems": []}
+    with link(frames=[frame(call())]) as fresh:
+        fresh.client.initialize()
+        value = fresh.client.receive_call()
+        fresh.client.reply(value["id"], answer)
+    assert fresh.parsed()[-1] == {"id": 7, "result": answer}
+
+
 def test_fdopen_failure_closes_the_unused_end():
     _posix()
     state = {"closed": []}
@@ -553,7 +640,7 @@ def _legacy_exchange(frames, answer):
 
         def serve():
             try:
-                peer = _LineReader(to_peer_r)
+                peer = _LineReader(lambda size: os.read(to_peer_r, size))
                 first = peer.line()
                 if first:
                     seen.append(first)
@@ -889,121 +976,54 @@ def test_close_is_idempotent_and_a_fresh_client_can_retry():
 
 
 def test_close_during_blocked_write_does_not_write_a_reused_descriptor(tmp_path, monkeypatch):
-    _posix()
-    to_client_r, to_client_w = os.pipe()
-    to_peer_r, to_peer_w = os.pipe()
-    owned = [to_client_w, to_peer_r]
-    reader = writer = None
-    worker = None
-    try:
-        reader = _owned_stream(to_client_r, "rb")
-        writer = _owned_stream(to_peer_w, "wb")
-        client = wire.ProtocolClient(reader, writer, timeout_seconds=3)
-        write_fd = writer.fileno()
+    with closing(Link()) as item, ExitStack() as descriptors:
+        write_fd = item._client_writer.fileno()
         queued = 0
+        fill = b"x" * 65536
         while True:
             try:
-                queued += os.write(write_fd, b"x" * 65536)
+                queued += os.write(write_fd, fill)
             except BlockingIOError:
                 break
-        watch = WatchSelect(write_fd, True)
-        monkeypatch.setattr(wire, "select", watch)
-        errors = []
-
-        def initialize():
-            try:
-                client.initialize()
-            except wire.HostAuthorityError as exc:
-                errors.append(exc.code)
-
-        worker = threading.Thread(target=initialize, daemon=True)
-        worker.start()
         victim_path = tmp_path / "unrelated-file"
         victim = os.open(str(victim_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        owned.append(victim)
-        assert watch.entered.wait(5)
-        time.sleep(0.01)
-        client.close()
-        # The number the client stored now names the unrelated file.
-        os.dup2(victim, write_fd)
-        owned.append(write_fd)
-        os.set_blocking(to_peer_r, False)
-        deadline = time.monotonic() + 5
-        while queued and time.monotonic() < deadline:
-            try:
-                chunk = os.read(to_peer_r, queued)
-            except BlockingIOError:
-                time.sleep(0.01)
-                continue
+        descriptors.callback(os.close, victim)
+        watch = _GatedSelect(write_fd, writing=True)
+        monkeypatch.setattr(wire, "select", watch)
+        with _pending_initialize(item.client, watch) as errors:
+            item.client.close()
+            # The pending select now sees an unrelated, writable file at this number.
+            os.dup2(victim, write_fd)
+            descriptors.callback(os.close, write_fd)
+        os.set_blocking(item.to_peer, False)
+        while queued:
+            chunk = os.read(item.to_peer, min(queued, len(fill)))
             if not chunk:
                 break
             queued -= len(chunk)
-        worker.join(10)
-        assert not worker.is_alive()
+        assert watch.ready
         assert queued == 0
         assert victim_path.read_bytes() == b""
         assert errors == ["HOST_PROTOCOL_ERROR"]
-    finally:
-        if worker is not None and worker.is_alive():
-            worker.join(2)
-        for stream in (reader, writer):
-            if stream is not None:
-                try:
-                    stream.close()
-                except OSError:
-                    pass
-        for fd in owned:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
 
 
 def test_close_during_blocked_read_does_not_read_a_reused_descriptor(monkeypatch):
-    _posix()
-    to_client_r, to_client_w = os.pipe()
-    to_peer_r, to_peer_w = os.pipe()
-    owned = [to_client_w, to_peer_r]
-    reader = writer = None
-    worker = None
-    try:
-        reader = _owned_stream(to_client_r, "rb")
-        writer = _owned_stream(to_peer_w, "wb")
-        client = wire.ProtocolClient(reader, writer, timeout_seconds=3)
-        read_fd = reader.fileno()
-        watch = WatchSelect(read_fd, False)
-        monkeypatch.setattr(wire, "select", watch)
-        outcome = []
-
-        def initialize():
-            try:
-                client.initialize()
-                outcome.append("initialized")
-            except wire.HostAuthorityError as exc:
-                outcome.append(exc.code)
-
-        worker = threading.Thread(target=initialize, daemon=True)
-        worker.start()
+    with closing(Link()) as item, ExitStack() as descriptors:
+        read_fd = item._client_reader.fileno()
         forged = frame({"id": INIT_ID, "result": {
             "codexHome": "forged", "platformFamily": "unix", "platformOs": "linux",
             "userAgent": "forged"}})
-        forged_read, forged_write = os.pipe()
-        owned.extend([forged_read, forged_write])
-        os.write(forged_write, forged)
-        # Keep the old pipe alive so the wake-up write is not EPIPE.
-        held = os.dup(read_fd)
-        owned.append(held)
-        assert watch.entered.wait(5)
-        time.sleep(0.01)
-        client.close()
-        os.dup2(forged_read, read_fd)
-        owned.append(read_fd)
-        try:
-            os.write(to_client_w, b"\n")
-        except OSError:
-            pass
-        worker.join(10)
-        assert not worker.is_alive()
+        forged_reader, forged_writer = _pipe()
+        descriptors.enter_context(forged_reader)
+        descriptors.enter_context(forged_writer)
+        forged_writer.write(forged)
+        watch = _GatedSelect(read_fd)
+        monkeypatch.setattr(wire, "select", watch)
+        with _pending_initialize(item.client, watch) as outcome:
+            item.client.close()
+            os.dup2(forged_reader.fileno(), read_fd)
+            descriptors.callback(os.close, read_fd)
+        assert watch.ready
         assert outcome == ["HOST_PROTOCOL_ERROR"]
         os.set_blocking(read_fd, False)
         try:
@@ -1011,67 +1031,20 @@ def test_close_during_blocked_read_does_not_read_a_reused_descriptor(monkeypatch
         except BlockingIOError:
             unread = b""
         assert unread == forged
-    finally:
-        if worker is not None and worker.is_alive():
-            worker.join(2)
-        for stream in (reader, writer):
-            if stream is not None:
-                try:
-                    stream.close()
-                except OSError:
-                    pass
-        for fd in owned:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
 
 
 def test_close_interrupts_a_blocked_read_before_the_deadline(monkeypatch):
-    _posix()
-    to_client_r, to_client_w = os.pipe()
-    to_peer_r, to_peer_w = os.pipe()
-    owned = [to_client_w, to_peer_r]
-    reader = writer = None
-    worker = None
-    try:
-        reader = _owned_stream(to_client_r, "rb")
-        writer = _owned_stream(to_peer_w, "wb")
-        client = wire.ProtocolClient(reader, writer, timeout_seconds=3)
-        watch = WatchSelect(reader.fileno(), False)
+    timeout = 3
+    clock = _PollClock()
+    monkeypatch.setattr(wire, "time", clock)
+    with closing(Link(timeout=timeout)) as item:
+        watch = _GatedSelect(item._client_reader.fileno(), poll=clock.poll)
         monkeypatch.setattr(wire, "select", watch)
-        finished = []
-
-        def initialize():
-            try:
-                client.initialize()
-            except wire.HostAuthorityError as exc:
-                finished.append((exc.code, time.monotonic()))
-
-        worker = threading.Thread(target=initialize, daemon=True)
-        worker.start()
-        assert watch.entered.wait(5)
-        time.sleep(0.2)
-        closed_at = time.monotonic()
-        client.close()
-        worker.join(10)
-        assert not worker.is_alive()
-        assert [code for code, _stamp in finished] == ["HOST_PROTOCOL_ERROR"]
-        assert finished[0][1] - closed_at < 1.0
-    finally:
-        if worker is not None and worker.is_alive():
-            worker.join(2)
-        for stream in (reader, writer):
-            if stream is not None:
-                try:
-                    stream.close()
-                except OSError:
-                    pass
-        for fd in owned:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+        with _pending_initialize(item.client, watch) as finished:
+            item.client.close()
+        assert finished == ["HOST_PROTOCOL_ERROR"]
+        assert clock.monotonic() < timeout
+        assert clock.monotonic() == wire.REVOCATION_POLL_SECONDS
 
 
 def test_stream_close_error_is_raised_after_both_wrappers_are_closed():
