@@ -150,6 +150,67 @@ def test_unknown_event_is_atomic_and_retry_succeeds(core):
     assert core.add_request(state, raw(request()), "coordinator-1") == state["requests"]["work"]
 
 
+def test_boundary_checks_call_shape_without_inference_from_parameter_names(core):
+    @core.boundary
+    def accept(raw, root_fd, at, write):
+        return raw, root_fd, at, write
+
+    assert accept(b"payload", None, 0, "preview") == (b"payload", None, 0, "preview")
+    for args, kwargs in [((b"payload",), {}), ((b"payload", None, 0, True), {"raw": b"extra"})]:
+        with pytest.raises(core.LifecycleRefusal) as caught:
+            accept(*args, **kwargs)
+        assert caught.value.as_dict() == core.LifecycleRefusal().as_dict()
+
+
+def test_public_reduction_shapes_each_input_once_on_publish_and_retry(core):
+    p = policy()
+    state = core.initial_state(p)
+    publish = event("publish", request=raw(request()))
+
+    def count_shapes(frame, action, arg):
+        if action == "call" and frame.f_code.co_filename == core.__file__ and frame.f_code.co_name == "_shape":
+            shapes.append(id(frame.f_locals["value"]))
+
+    for _ in range(2):
+        shapes = []
+        previous = sys.getprofile()
+        try:
+            sys.setprofile(count_shapes)
+            assert core.reduce_event(p, state, publish, NOW) is None
+        finally:
+            sys.setprofile(previous)
+        assert shapes == [id(p), id(state), id(publish)]
+
+    assert state["requests"]["work"]["raw"] == publish["event"]["request"]
+
+
+def test_concurrent_reductions_keep_fixed_refusals_and_allow_retry(core):
+    p = policy()
+    publish = event("publish", request=raw(request()))
+    bad_inputs = (
+        ({**p, "actors": []}, publish, NOW, "invalid_record"),
+        (p, {**publish, "event": "private-input\nsecond-line"}, NOW, "invalid_record"),
+        (p, {**publish, "extra": "x" * core.MAX_BYTES}, NOW, "too_large"),
+        (p, publish, 0, "invalid_record"),
+    )
+
+    def attempt(bad):
+        state = core.initial_state(p)
+        before = copy.deepcopy(state)
+        bad_policy, bad_event, bad_at, code = bad
+        with pytest.raises(core.LifecycleRefusal) as caught:
+            core.reduce_event(bad_policy, state, bad_event, bad_at)
+        assert caught.value.as_dict() == core.LifecycleRefusal(code).as_dict()
+        assert state == before
+        core.reduce_event(p, state, publish, NOW)
+        return state
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(attempt, bad) for bad in bad_inputs]
+        states = [future.result(timeout=10) for future in futures]
+    assert states == [states[0]] * len(bad_inputs)
+
+
 @pytest.fixture
 def journal(tmp_path, core, owner_plane):
     root = make_store(tmp_path)

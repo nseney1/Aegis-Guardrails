@@ -3838,27 +3838,44 @@ def test_nfa_wrapper_refuses_disagreement_before_the_budget_call():
 
 def test_failed_compile_retries_and_concurrent_callers_share_one_graph(monkeypatch):
     saved = _REAL_TABLES[0]
-    _REAL_TABLES[0] = None
-    attempts = {"n": 0}
+    lock = _TABLES_LOCK
+    callers = 6
+    overlap = threading.Barrier(callers, timeout=5)
+    attempts = []
+
+    class ObservedLock:
+        def __enter__(self):
+            if not lock.acquire(blocking=False):
+                # A caller that found the cache lock held has reached the lookup.
+                overlap.wait()
+                assert lock.acquire(timeout=5), "cache lock did not release"
+
+        def __exit__(self, *exc):
+            lock.release()
 
     def flaky():
-        attempts["n"] += 1
-        if attempts["n"] < 3:
+        if len(attempts) < 2:
+            attempts.append(None)
             raise RuntimeError("attribution graph compile failed")
-        return ("width", "graph", "matcher")
+        # Each caller meets here either inside the compiler or at the held lock.
+        overlap.wait()
+        graph = object()
+        attempts.append(graph)
+        return ("width", graph, "matcher")
 
+    monkeypatch.setattr("tests.unit.core.test_display_attribution_dense._TABLES_LOCK", ObservedLock())
     monkeypatch.setattr("aegis_core.primitives._display_attribution_tables", flaky)
+    _REAL_TABLES[0] = None
     try:
-        with pytest.raises(RuntimeError, match="attribution graph compile failed"):
-            real_attribution_tables()
-        with pytest.raises(RuntimeError, match="attribution graph compile failed"):
-            real_attribution_tables()
-        assert _REAL_TABLES[0] is None
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            results = list(pool.map(lambda _: real_attribution_tables(), range(6)))
-        assert results == [("width", "graph", "matcher")] * 6
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="attribution graph compile failed"):
+                real_attribution_tables()
+            assert _REAL_TABLES[0] is None
+        with ThreadPoolExecutor(max_workers=callers) as pool:
+            results = list(pool.map(lambda _: real_attribution_tables(), range(callers), timeout=15))
+        assert len(attempts) == 3, "expected one successful compile after two failures"
+        assert results == [("width", attempts[-1], "matcher")] * callers
         assert all(result is results[0] for result in results)
-        assert attempts["n"] == 3
     finally:
         _REAL_TABLES[0] = saved
 

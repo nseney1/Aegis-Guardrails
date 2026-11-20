@@ -10,6 +10,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Set, Tuple
 
 from aegis_core import atomicio, storage
 from aegis_core.errors import PathTraversalError
+from aegis_core.storage_confined import ConfinedFileError, open_directory
 
 __all__ = ["before_read", "contains", "reconcile", "remember", "reset", "root_key", "settled",
            "filesystem_clock_supported", "filesystem_now"]
@@ -34,12 +35,9 @@ def filesystem_now(path: Path, device: int) -> Optional[int]:
     flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     try:
         with ExitStack() as owned:
-            parent = os.open(path.anchor, flags | os.O_DIRECTORY)
-            owned.callback(os.close, parent)
-            for component in path.parts[1:-1]:
-                parent = os.open(component, flags | os.O_DIRECTORY, dir_fd=parent)
-                owned.callback(os.close, parent)
-            fd = os.open(path.name, flags | getattr(os, "O_NONBLOCK", 0), dir_fd=parent)
+            parent = owned.enter_context(open_directory(os.open, path.parent, retain_ancestors=True,
+                                                        close_fd=os.close, stat_fd=os.fstat, stat_entry=os.stat))
+            fd = os.open(path.name, flags | getattr(os, "O_NONBLOCK", 0), dir_fd=parent.fd)
             owned.callback(os.close, fd)
             info = os.fstat(fd)
             if info.st_dev != device or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
@@ -47,7 +45,7 @@ def filesystem_now(path: Path, device: int) -> Optional[int]:
             # Assumes filesystem-clock utime(fd, None): local/NFS; sshfs/Linux CIFS send client time.
             os.utime(fd, None)
             return os.fstat(fd).st_mtime_ns
-    except (OSError, NotImplementedError):
+    except (OSError, NotImplementedError, ConfinedFileError):
         return None
 
 
@@ -157,22 +155,15 @@ def _snapshot(path: Path, ancestors: Optional[_Ancestors] = None) -> Optional[_P
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     try:
         with ExitStack() as opened:
-            chain = []
             if anchored:
                 flags |= os.O_NOFOLLOW
-                parent = os.open(path.anchor, flags | os.O_DIRECTORY)
-                opened.callback(os.close, parent)
-                for part in path.parts[1:-1]:
-                    child = os.open(part, flags | os.O_DIRECTORY, dir_fd=parent)
-                    opened.callback(os.close, child)
-                    info = os.fstat(child)
-                    chain.append((parent, part, (info.st_dev, info.st_ino)))
-                    parent = child
+                parent = opened.enter_context(open_directory(os.open, path.parent, retain_ancestors=True,
+                                                             close_fd=os.close, stat_fd=os.fstat, stat_entry=os.stat))
                 fd = os.open(path.name, flags | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0),
-                             dir_fd=parent)
+                             dir_fd=parent.fd)
             else:
                 expected = os.lstat(path)
-                fd = atomicio._open_regular(path, flags | getattr(os, "O_NONBLOCK", 0))
+                fd = atomicio.open_regular(path, flags | getattr(os, "O_NONBLOCK", 0))
             opened.callback(os.close, fd)
             info = os.fstat(fd)
             if not anchored and (expected.st_dev, expected.st_ino) != (info.st_dev, info.st_ino):
@@ -183,11 +174,9 @@ def _snapshot(path: Path, ancestors: Optional[_Ancestors] = None) -> Optional[_P
                 return None
             # Descriptors pin every ancestor. Reject a rename or link substitution
             # as well, so a detached old ledger cannot validate the current site.
-            for directory, part, identity in chain:
-                current = os.stat(part, dir_fd=directory, follow_symlinks=False)
-                if (current.st_dev, current.st_ino) != identity:
-                    return None
-            current = os.stat(path.name, dir_fd=parent, follow_symlinks=False) if anchored else os.lstat(path)
+            if anchored:
+                parent.check()
+            current = os.stat(path.name, dir_fd=parent.fd, follow_symlinks=False) if anchored else os.lstat(path)
             if not anchored and not _same_ancestors(ancestors):
                 return None
             stamps = storage.file_generation(info.st_size, info.st_mtime_ns, info.st_ctime_ns)
@@ -195,7 +184,7 @@ def _snapshot(path: Path, ancestors: Optional[_Ancestors] = None) -> Optional[_P
                     or storage.file_generation(current.st_size, current.st_mtime_ns, current.st_ctime_ns) != stamps):
                 return None
             return _PersistedLedger(path, (info.st_dev, info.st_ino), *stamps)
-    except (OSError, PathTraversalError):
+    except (OSError, PathTraversalError, ConfinedFileError):
         return None
 
 
