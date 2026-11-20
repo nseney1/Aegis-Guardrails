@@ -396,9 +396,13 @@ class MergeQueue:
         candidate = self._plan(store, item, tip, identity)
         if candidate.status == "conflict":
             return candidate
-        if self._commit_done(candidate.commit) is not None:
-            raise QueueRefused("already_integrated")
-        if self._candidate_red(candidate.commit):
+        # One authenticated completion for this preparation. Revalidation and
+        # issuance read the index again; this miss is only for the health check.
+        done = self._commit_done(candidate.commit)
+        if done is not None:
+            raise QueueRefused("archived_completion")
+        result = self._retained(candidate.commit, done=done)
+        if result is not None and not result.passed:
             return replace(candidate, status="target-red")
         missing = tuple(leg for leg in self.required_legs
                         if not team_qualify.qualified(store, candidate.tree, (leg,)))
