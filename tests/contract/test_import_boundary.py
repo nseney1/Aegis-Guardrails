@@ -123,6 +123,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_lifecycle_writers": 1,
     "aegis_core.team_mailbox": 1,
     "aegis_core.team_mailbox_delivery": 1,
+    "aegis_core.team_mailbox_doctor": 1,
     "aegis_core.team_mailbox_guidance": 1,
     "aegis_core.team_mailbox_index": 1,
     "aegis_core.team_mailbox_index_scan": 0,
