@@ -9,10 +9,17 @@ Restart requires target authentication. Completed history uses indexed archives.
 One service owns each repository/target. Native wiring/activation remain separate.
 No direct filesystem writer or exemption carrier is used here. Ancestry reads
 shared full OIDs. Reviews carry through GM-6 equivalence or the queue's clean merge.
+
+Precondition: repair, parents, deadline, reviewer sessions and hosted attempts are
+trusted caller input, authenticated by the owner-side adapter. Passing
+model-controlled values here is a defect in that caller: repair=True bypasses
+the target-red pause; parents control dependency eligibility; deadline controls
+expiry; reviewer sessions establish independence; hosted attempts order health.
+The queue validates their shape, not their provenance.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from functools import wraps
 from hashlib import sha256
 import re
@@ -21,6 +28,9 @@ import time
 
 from aegis_core import gitsafe, human_gate, team_git, team_qualify
 from aegis_core.errors import AegisError
+from aegis_core.merge_queue_types import (
+    Completion, HostedResult, IssuedRecord, Landing, QueueEntry, QueueState, QueueStorage, Review,
+)
 from aegis_core.primitives import sanitize_display
 from aegis_core.redaction import redact_command_secrets
 
@@ -71,37 +81,6 @@ class QueueRefused(ValueError):
         super().__init__(REFUSALS[code])
         self.code = code
         self.next_action = {"actor": "custodian", "command": REFUSALS[code]}
-
-
-@dataclass(frozen=True)
-class Review:
-    session: str
-    commit: str
-    tree: str
-    verdict: str = "ACCEPT"
-    helpers_off: bool = True
-
-
-@dataclass(frozen=True)
-class QueueEntry:
-    lane: str
-    author: str
-    head: str
-    reviews: tuple
-    parents: tuple = ()
-    repair: bool = False
-    deadline: int = None
-
-
-@dataclass(frozen=True)
-class Landing:
-    status: str
-    lane: str = None
-    tip: str = None
-    commit: str = None
-    tree: str = None
-    missing_legs: tuple = ()
-    issuance: int = 0
 
 
 def descriptor_supported():
@@ -197,77 +176,6 @@ def _read(callback, *args):
         # Adapter boundary: no exception payload crosses into the broker.
         raise QueueRefused("observation_failed") from None
 
-
-
-@dataclass(frozen=True)
-class HostedResult:
-    """Authenticated target result; attempt is the adapter's monotonic run revision."""
-    commit: str
-    passed: bool
-    attempt: int = 0
-
-
-@dataclass(frozen=True)
-class IssuedRecord:
-    entry: QueueEntry
-    landing: Landing
-    result: HostedResult = None
-    resolution: str = None
-    ref: str = None
-    expected: str = None
-
-
-@dataclass(frozen=True)
-class Completion:
-    target: str
-    entry: QueueEntry
-    landing: Landing
-    result: HostedResult = None
-
-
-@dataclass(frozen=True)
-class QueueState:
-    target: str
-    required_legs: tuple
-    entry_legs: tuple
-    entries: tuple = ()
-    issued: IssuedRecord = None
-    results: tuple = ()
-    health_commit: str = None
-    health_result: HostedResult = None
-    health_order: int = 0
-    red: bool = False
-    red_order: int = 0
-    green_order: int = 0
-    serial: int = 0
-    generation: int = 0
-    reconciliation_required: bool = False
-    cleanup: IssuedRecord = None
-
-
-@dataclass(frozen=True)
-class QueueStorage:
-    """Owner-only, repository-bound durable port; never constructed from model input.
-
-    load(target) returns authenticated QueueState or None. save(target, generation,
-    state, completion) atomically settles checkpoint/archive/journal: True after
-    durability, False on lost CAS; lost replies raise. Never retry blindly.
-    lane(target, lane)/commit(target, oid) read immutable indexed Completions.
-    Native adapters bound bytes BEFORE decoding and own descriptor/root custody.
-    begin(target, generation, observation, recovering) journals before writes;
-    lookup failures retain inputs too. health(target, oid) is revision-keyed:
-    RED wins equal attempts; only newer same-oid GREEN clears it. No save erases it.
-    Even lost-CAS observations replay into health/effect records/pending rows;
-    unsettled load marks reconciliation_required, including above admission limits.
-    Pin intents name exact refs. Recovery never treats an unavailable journal as
-    empty and requires a marked checkpoint before replacing unsettled intent.
-    """
-    load: object
-    save: object
-    lane: object
-    commit: object
-    begin: object
-    health: object
 
 
 def _result(value):
@@ -696,6 +604,8 @@ class MergeQueue:
         return mode
 
     def _plan(self, store, item, tip, identity):
+        if item.head == tip:
+            raise QueueRefused("already_integrated")
         if _ancestor(store, tip, item.head):
             return Landing("pending", item.lane, tip, item.head, _tree(store, item.head))
         if _ancestor(store, item.head, tip):
@@ -744,6 +654,8 @@ class MergeQueue:
         candidate = self._plan(store, item, tip, identity)
         if candidate.status == "conflict":
             return candidate
+        if self._commit_done(candidate.commit) is not None:
+            raise QueueRefused("already_integrated")
         if self._candidate_red(candidate.commit):
             return replace(candidate, status="target-red")
         missing = tuple(leg for leg in self.required_legs
@@ -833,13 +745,14 @@ class MergeQueue:
 
     @_operation
     def observe_landed(self, store, candidate, *, read_target):
-        """Reconcile an issued receipt independently of current scheduling eligibility."""
+        """Reconcile a receipt; scheduling then needs fresh target authentication."""
         if not _ready(candidate) or candidate.issuance == 0:
             raise QueueRefused("stale_candidate")
         if self._state.cleanup is not None and self._state.cleanup.landing == candidate:
             if self._state.cleanup.resolution != "done":
                 raise QueueRefused("stale_candidate")
             self._finish_cleanup(store)
+            self._target_checked = False
             return "already"
         done = self._lane_done(candidate.lane)
         if done is not None:
@@ -850,6 +763,7 @@ class MergeQueue:
                 if tip != candidate.commit and not _ancestor(store, candidate.commit, tip):
                     raise QueueRefused("landing_unconfirmed")
                 self._save(self._observed_health(self._state, tip))
+            self._target_checked = False
             return "already"
         record = self._state.issued
         if record is None or record.landing != candidate:
@@ -866,6 +780,7 @@ class MergeQueue:
         state = self._observed_health(state, tip)
         if result is not None:
             state = _apply_result(state, result, candidate.issuance)
+        self._target_checked = False
         self._retire(store, state, record, "done", Completion(self.target, record.entry, candidate, result))
         return "done"
 
@@ -926,7 +841,8 @@ class MergeQueue:
             if done is not None:
                 state = _apply_result(state, chosen, done.landing.issuance)
                 self._save(state, replace(done, result=chosen))
-                if done.landing.issuance < self._state.green_order:
+                if (not self._state.red and commit != self._state.health_commit
+                        and done.landing.issuance < self._state.green_order):
                     return "stale"
             elif state.health_commit == commit:
                 self._save(_apply_result(state, chosen, state.health_order))
