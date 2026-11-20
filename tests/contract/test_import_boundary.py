@@ -203,6 +203,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.lifecycle": 2,
     "aegis_core.migrate": 2,
     "aegis_core.metrics": 2,
+    "aegis_core.model_served": 1,
     "aegis_core.outcomes": 2,
     "aegis_core.verification": 2,
     "aegis_core.inference_provider": 2,
