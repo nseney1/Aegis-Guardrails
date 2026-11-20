@@ -1,5 +1,7 @@
 """Public confined-file storage contract, including races and refusal cleanup."""
+import errno
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +20,911 @@ class ModuleOS(SimpleNamespace):
         return getattr(os, name)
 
 
+LIFETIME_ERRNOS = ("EACCES", "EIO", "ENOENT", "ELOOP", "ENOTDIR", "ESTALE", "EEXIST", "ENOSPC")
+LIFETIME_PHASES = {
+    "message": ("open_root", "open", "walk_close", "close", "body", "body_close"),
+    "manager": ("open_root", "open", "walk_close", "close", "mkdir", "fsync", "stat", "body", "body_close"),
+    "codec": ("open_root", "open", "walk_close", "close", "stat", "body"),
+    "clock": ("open_root", "open", "walk_close", "close", "stat", "body"),
+    "memo": ("open_root", "open", "walk_close", "close", "stat", "body"),
+    "config": ("open_root", "open", "walk_close", "close", "stat", "body"),
+    "decisions": ("open_root", "open", "walk_close", "close", "stat", "body"),
+    "confined": ("open_root", "open", "walk_close", "close", "mkdir", "fsync", "stat", "body", "body_close"),
+}
+
+
+class LifetimeFault(ModuleOS):
+    """Caller-owned OS boundary; shared os and builtin I/O remain untouched."""
+
+    def __init__(self, root, caller, phase, number):
+        super().__init__()
+        self.root, self.caller, self.phase, self.number = root, caller, phase, number
+        self.phase = {"open_close_errno": "open_close", "stat_close_errno": "stat_close"}.get(phase, phase)
+        self.cleanup_number = number if phase in ("open_close_errno", "stat_close_errno") else errno.EIO
+        self.file = root / "data"
+        self.fired = False
+        self.cleanup_fired = False
+        self.opened = set()
+
+    def fail(self):
+        self.fired = True
+        raise OSError(self.number, "rf32 lifetime fault")
+
+    def matches(self, fd, path):
+        try:
+            held, named = os.fstat(fd), path.stat()
+        except FileNotFoundError:
+            return False
+        return (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino)
+
+    def open(self, path, flags, *args, **kwargs):
+        if not self.fired and self.phase == "open_root" and path == self.root.anchor:
+            self.fail()
+        fd = os.open(path, flags, *args, **kwargs)
+        self.opened.add(fd)
+        if (not self.fired and self.phase in ("open", "open_close", "reopen")
+                and flags & os.O_DIRECTORY and self.matches(fd, self.root)):
+            os.close(fd)
+            self.fail()
+        return fd
+
+    def close(self, fd):
+        target = self.root.parent if self.phase in ("walk_close", "open_close", "close_both") else self.root
+        if self.caller == "confined" and self.phase in ("close", "body_close", "stat_close"):
+            target = self.root / "made"
+        closing = (not self.fired and self.phase in ("walk_close", "close", "body_close", "close_both")
+                   and self.matches(fd, target))
+        cleanup = not self.cleanup_fired and self.phase in ("open_close", "stat_close") and self.matches(fd, target)
+        if self.phase == "close_both" and not self.cleanup_fired and self.matches(fd, self.root):
+            cleanup = True
+        os.close(fd)
+        if cleanup:
+            self.cleanup_fired = True
+            raise OSError(self.cleanup_number, "rf32 cleanup fault")
+        if closing:
+            self.fail()
+
+    def fstat(self, fd):
+        target = self.file if self.caller in ("clock", "memo", "config") else self.root
+        if self.caller == "confined":
+            target = self.root / "made"
+        if not self.fired and self.phase in ("stat", "stat_close") and self.matches(fd, target):
+            self.fail()
+        return os.fstat(fd)
+
+    def mkdir(self, path, mode=0o777, *, dir_fd=None):
+        if not self.fired and self.phase == "mkdir":
+            if self.number == errno.EEXIST:
+                os.mkdir(path, mode, dir_fd=dir_fd)
+            self.fail()
+        return os.mkdir(path, mode, dir_fd=dir_fd)
+
+    def fsync(self, fd):
+        if not self.fired and self.phase == "fsync":
+            self.fail()
+        return os.fsync(fd)
+
+    def fdopen(self, fd, *args, **kwargs):
+        if not self.fired and self.phase == "body" and self.caller in ("codec", "config", "decisions"):
+            self.fail()
+        return os.fdopen(fd, *args, **kwargs)
+
+    def utime(self, *args, **kwargs):
+        if not self.fired and self.phase == "body" and self.caller == "clock":
+            self.fail()
+        return os.utime(*args, **kwargs)
+
+    def stat(self, path, *args, **kwargs):
+        if not self.fired and self.phase == "body" and self.caller == "memo" and path == self.file.name:
+            self.fail()
+        if not self.fired and kwargs.get("dir_fd") is not None and not kwargs.get("follow_symlinks", True):
+            if ((self.phase == "verify" and path == self.root.name)
+                    or (self.phase == "recheck" and path == self.root.parent.name)):
+                self.fail()
+        return os.stat(path, *args, **kwargs)
+
+    def lstat(self, path, *args, **kwargs):
+        # Model an external temporary store at the OS metadata boundary. This
+        # sandbox places synthetic Git markers in its ancestors. Markers in
+        # the store itself remain real and visible to placement validation.
+        if Path(path).name == ".git" and Path(path).parent in self.root.parents:
+            raise FileNotFoundError(errno.ENOENT, "external store ancestor has no Git marker")
+        return os.lstat(path, *args, **kwargs)
+
+    def directory(self, opener, root, **kwargs):
+        return self.delegate(self.open, root, policy=kwargs.get("policy"),
+                             on_missing=kwargs.get("on_missing"), retain_ancestors=kwargs.get("retain_ancestors", False),
+                             close_fd=self.close, stat_fd=self.fstat, stat_entry=self.stat,
+                             cleanup_fd=kwargs.get("cleanup_fd"))
+
+
+class ManagerParentCloseFault(LifetimeFault):
+    def __init__(self, root, *, release, reuse=None):
+        super().__init__(root, "manager", "walk_close", errno.EIO)
+        self.release, self.reuse = release, reuse
+        self.parent_fd = None
+        self.parent_retries = 0
+        self.cleanup_number = errno.ENOSPC
+
+    def close(self, fd):
+        if fd == self.parent_fd:
+            self.parent_retries += 1
+            return os.close(fd)
+        if not self.fired and self.matches(fd, self.root.parent):
+            self.parent_fd = fd
+            if self.release:
+                os.close(fd)
+                if self.reuse is not None:
+                    # Model another thread taking this number as soon as it is released.
+                    os.dup2(self.reuse, fd)
+            self.fail()
+        if self.fired and not self.cleanup_fired and self.release and self.matches(fd, self.root):
+            os.close(fd)
+            self.cleanup_fired = True
+            raise OSError(self.cleanup_number, "rf32 cleanup fault")
+        os.close(fd)
+
+
+def lifetime_setup(parent, caller, phase, number):
+    root = parent / "bound"
+    root.mkdir(mode=0o700)
+    if caller == "message":
+        root = parent / ".aegis"
+        (root / "state/messages").mkdir(parents=True, mode=0o700)
+    if caller == "manager" and phase in ("mkdir", "fsync", "reopen"):
+        root.rmdir()
+    fault = LifetimeFault(root, caller, phase, number)
+    if caller in ("clock", "memo", "decisions"):
+        fault.file.write_bytes(b"ledger" if caller == "memo" else b"")
+        fault.file.chmod(0o600)
+    if caller == "config":
+        fault.file.write_bytes((Path(__file__).resolve().parents[3] /
+                               "tools/hierarchy_templates/model-bindings.json").read_bytes())
+    return fault
+
+
+def lifetime_invoke(fault, modules):
+    from aegis_core.workspace.base import Workspace
+    module = modules[fault.caller]
+    if fault.caller == "message":
+        with module.message_store(Workspace(fault.root.parent)):
+            if fault.phase in ("body", "body_close"):
+                if fault.phase == "body":
+                    fault.fail()
+                raise ValueError("rf32 body fault")
+        return "ok"
+    if fault.caller == "manager":
+        manager = module.ManagerStore(fault.root)
+        if fault.phase in ("mkdir", "fsync", "reopen"):
+            manager.append({"event": "probe"})
+        elif fault.phase in ("body", "body_close"):
+            def body(rows):
+                if fault.phase == "body":
+                    fault.fail()
+                raise ValueError("rf32 body fault")
+            manager.transaction(body)
+        else:
+            manager.read()
+        return "ok"
+    if fault.caller == "codec":
+        store = module.Store(fault.root)
+        try:
+            if fault.phase == "body":
+                store.write({"schema": "aegis.msg/1", "kind": "text", "meta": {
+                    "from": "test", "host": "test", "session": "test", "created_at": ""},
+                    "fields": {}, "body": "probe", "spans": [], "refs": {}})
+        finally:
+            store.close()
+        return "ok"
+    if fault.caller == "clock":
+        return "none" if module.filesystem_now(fault.file, fault.file.stat().st_dev) is None else "ok"
+    if fault.caller == "memo":
+        module.reset()
+        info = fault.file.stat()
+        size, mtime, ctime = storage.file_generation(info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        identity = (info.st_dev, info.st_ino)
+        before = SimpleNamespace(identity=identity, size=size, mtime_ns=mtime, ctime_ns=ctime,
+                                 started_ns=max(mtime, ctime) + 3_000_000_000, ancestors=())
+        report = storage.FileReport(identity, size, mtime_ns=mtime, ctime_ns=ctime)
+        key = (str(fault.root), "rule", "host", "session", None)
+        try:
+            module.remember(str(fault.root), [key], fault.file, before, [], report)
+            return "hit" if module.contains(str(fault.root), [key], SimpleNamespace(path=fault.file, ancestors=())) else "miss"
+        finally:
+            module.reset()
+    if fault.caller == "config":
+        module.validate_bindings(fault.file, host_kinds=("codex-cli", "claude-code"))
+        return "ok"
+    if fault.caller == "decisions":
+        assert list(module.read_decisions(fault.file)) == []
+        return "ok"
+    with module.confined_file(fault.root, ("made", "data"), create_parents=True) as handle:
+        if fault.phase in ("stat", "stat_close"):
+            handle.parent_stat()
+        if fault.phase == "body":
+            fault.fail()
+        if fault.phase == "body_close":
+            raise ValueError("rf32 body fault")
+    return "ok"
+
+
+def lifetime_surface(fault, modules):
+    from aegis_core.message_codec import CodecError
+    try:
+        return ("ok", None, None, lifetime_invoke(fault, modules), None)
+    except Exception as error:
+        code = error.code if isinstance(error, (storage.ConfinedFileError, CodecError)) else None
+        detail = error.detail if isinstance(error, CodecError) else None
+        return (type(error).__name__, getattr(error, "errno", None), code, str(error), detail)
+
+
+def lifetime_assert_closed(fault):
+    for fd in fault.opened:
+        with pytest.raises(OSError) as closed:
+            os.fstat(fd)
+        assert closed.value.errno == errno.EBADF
+
+
+
+# Recorded against integration tip 27e02ad06cdde9f9dc20501d53e12ddb4a6ad5b9.
+# Rows index the immutable surfaces in errno order LIFETIME_ERRNOS. The recording
+# lives in writer evidence; collection and execution never require Git history.
+TIP_SURFACES = (('PermissionError', 'EACCES', None, '[Errno {errno}] rf32 lifetime fault'),
+ ('OSError', 'EIO', None, '[Errno {errno}] rf32 lifetime fault'),
+ ('CodecError',
+  None,
+  'E_AUTH',
+  'store access refused: unsafe directory or platform lacks anchored file operations; use a supported real directory'),
+ ('OSError', 'ESTALE', None, '[Errno {errno}] rf32 lifetime fault'),
+ ('FileExistsError', 'EEXIST', None, '[Errno {errno}] rf32 lifetime fault'),
+ ('OSError', 'ENOSPC', None, '[Errno {errno}] rf32 lifetime fault'),
+ ('FileNotFoundError', 'ENOENT', None, '[Errno {errno}] rf32 lifetime fault'),
+ ('OSError', 'ELOOP', None, '[Errno {errno}] rf32 lifetime fault'),
+ ('NotADirectoryError', 'ENOTDIR', None, '[Errno {errno}] rf32 lifetime fault'),
+ ('ManagerError', None, None, 'unsafe_store'),
+ ('ok', None, None, 'ok'),
+ ('OSError', 'EBADF', None, '[Errno {errno}] Bad file descriptor'),
+ ('CodecError', None, 'E_AUTH', 'store operation unavailable; check permissions, free space, write access and file descriptor limits'),
+ ('ok', None, None, 'none'),
+ ('ok', None, None, 'miss'),
+ ('ModelSelectionError', None, None, 'invalid_bindings'),
+ ('ModelSelectionError', None, None, 'unsafe_decision_path'),
+ ('ConfinedFileError', None, 'CONFINED_IO', 'confined file I/O failed'),
+ ('ConfinedFileError', None, 'CONFINED_MISSING', 'confined file path missing'),
+ ('ConfinedFileError', None, 'CONFINED_UNSAFE', 'unsafe confined file path; regular file and directories required'),
+ ('ConfinedFileError', None, 'CONFINED_EXISTS', 'confined file already exists'),
+ ('ConfinedFileError', None, 'CONFINED_DURABILITY', 'confined file durability flush failed'),
+ ('OSError', 'EIO', None, '[Errno {errno}] rf32 cleanup fault'),
+ ('PermissionError', 'EACCES', None, '[Errno {errno}] rf32 cleanup fault'),
+ ('OSError', 'ESTALE', None, '[Errno {errno}] rf32 cleanup fault'),
+ ('FileExistsError', 'EEXIST', None, '[Errno {errno}] rf32 cleanup fault'),
+ ('OSError', 'ENOSPC', None, '[Errno {errno}] rf32 cleanup fault'),
+ ('FileNotFoundError', 'ENOENT', None, '[Errno {errno}] rf32 cleanup fault'),
+ ('OSError', 'ELOOP', None, '[Errno {errno}] rf32 cleanup fault'),
+ ('NotADirectoryError', 'ENOTDIR', None, '[Errno {errno}] rf32 cleanup fault'))
+
+TIP_LIFETIME_CASES = {('message', 'open_root'): (0, 1, 2, 2, 2, 3, 4, 5),
+ ('message', 'open'): (0, 1, 2, 2, 2, 3, 4, 5),
+ ('message', 'walk_close'): (0, 1, 2, 2, 2, 3, 4, 5),
+ ('message', 'close'): (0, 1, 2, 2, 2, 3, 4, 5),
+ ('message', 'body'): (0, 1, 2, 2, 2, 3, 4, 5),
+ ('message', 'body_close'): (0, 1, 2, 2, 2, 3, 4, 5),
+ ('manager', 'open_root'): (0, 1, 6, 7, 8, 3, 4, 5),
+ ('manager', 'open'): (9, 9, 10, 9, 9, 9, 9, 9),
+ ('manager', 'walk_close'): (11, 11, 11, 11, 11, 11, 11, 11),
+ ('manager', 'close'): (0, 1, 6, 7, 8, 3, 4, 5),
+ ('manager', 'mkdir'): (0, 1, 6, 7, 8, 3, 10, 5),
+ ('manager', 'fsync'): (0, 1, 6, 7, 8, 3, 10, 5),
+ ('manager', 'stat'): (0, 1, 6, 7, 8, 3, 4, 5),
+ ('manager', 'body'): (0, 1, 6, 7, 8, 3, 4, 5),
+ ('manager', 'body_close'): (0, 1, 6, 7, 8, 3, 4, 5),
+ ('codec', 'open_root'): (12, 12, 2, 2, 2, 2, 12, 12),
+ ('codec', 'open'): (12, 12, 2, 2, 2, 2, 12, 12),
+ ('codec', 'walk_close'): (12, 12, 2, 2, 2, 2, 12, 12),
+ ('codec', 'close'): (10, 10, 10, 10, 10, 10, 10, 10),
+ ('codec', 'stat'): (12, 12, 2, 2, 2, 2, 12, 12),
+ ('codec', 'body'): (12, 12, 2, 2, 2, 2, 12, 12),
+ ('clock', 'open_root'): (13, 13, 13, 13, 13, 13, 13, 13),
+ ('clock', 'open'): (13, 13, 13, 13, 13, 13, 13, 13),
+ ('clock', 'walk_close'): (13, 13, 13, 13, 13, 13, 13, 13),
+ ('clock', 'close'): (13, 13, 13, 13, 13, 13, 13, 13),
+ ('clock', 'stat'): (13, 13, 13, 13, 13, 13, 13, 13),
+ ('clock', 'body'): (13, 13, 13, 13, 13, 13, 13, 13),
+ ('memo', 'open_root'): (14, 14, 14, 14, 14, 14, 14, 14),
+ ('memo', 'open'): (14, 14, 14, 14, 14, 14, 14, 14),
+ ('memo', 'walk_close'): (14, 14, 14, 14, 14, 14, 14, 14),
+ ('memo', 'close'): (14, 14, 14, 14, 14, 14, 14, 14),
+ ('memo', 'stat'): (14, 14, 14, 14, 14, 14, 14, 14),
+ ('memo', 'body'): (14, 14, 14, 14, 14, 14, 14, 14),
+ ('config', 'open_root'): (15, 15, 15, 15, 15, 15, 15, 15),
+ ('config', 'open'): (15, 15, 15, 15, 15, 15, 15, 15),
+ ('config', 'walk_close'): (15, 15, 15, 15, 15, 15, 15, 15),
+ ('config', 'close'): (15, 15, 15, 15, 15, 15, 15, 15),
+ ('config', 'stat'): (15, 15, 15, 15, 15, 15, 15, 15),
+ ('config', 'body'): (15, 15, 15, 15, 15, 15, 15, 15),
+ ('decisions', 'open_root'): (16, 16, 16, 16, 16, 16, 16, 16),
+ ('decisions', 'open'): (16, 16, 16, 16, 16, 16, 16, 16),
+ ('decisions', 'walk_close'): (16, 16, 16, 16, 16, 16, 16, 16),
+ ('decisions', 'close'): (0, 1, 6, 7, 8, 3, 4, 5),
+ ('decisions', 'stat'): (16, 16, 16, 16, 16, 16, 16, 16),
+ ('decisions', 'body'): (0, 1, 10, 7, 8, 3, 4, 5),
+ ('confined', 'open_root'): (17, 17, 18, 19, 19, 17, 20, 17),
+ ('confined', 'open'): (17, 17, 18, 19, 19, 17, 20, 17),
+ ('confined', 'walk_close'): (17, 17, 18, 19, 19, 17, 20, 17),
+ ('confined', 'close'): (17, 17, 18, 19, 19, 17, 20, 17),
+ ('confined', 'mkdir'): (17, 17, 18, 19, 19, 17, 10, 17),
+ ('confined', 'fsync'): (21, 21, 21, 21, 21, 21, 21, 21),
+ ('confined', 'stat'): (17, 17, 18, 19, 19, 17, 20, 17),
+ ('confined', 'body'): (0, 1, 6, 7, 8, 3, 4, 5),
+ ('confined', 'body_close'): (17, 17, 18, 19, 19, 17, 20, 17),
+ ('message', 'open_close'): (22, 22, 22, 22, 22, 22, 22, 22),
+ ('manager', 'open_close'): (22, 22, 22, 22, 22, 22, 22, 22),
+ ('manager', 'stat_close'): (22, 22, 22, 22, 22, 22, 22, 22),
+ ('codec', 'open_close'): (12, 12, 2, 2, 2, 2, 12, 12),
+ ('codec', 'stat_close'): (12, 12, 2, 2, 2, 2, 12, 12),
+ ('clock', 'open_close'): (13, 13, 13, 13, 13, 13, 13, 13),
+ ('clock', 'stat_close'): (13, 13, 13, 13, 13, 13, 13, 13),
+ ('memo', 'open_close'): (14, 14, 14, 14, 14, 14, 14, 14),
+ ('memo', 'stat_close'): (14, 14, 14, 14, 14, 14, 14, 14),
+ ('config', 'open_close'): (15, 15, 15, 15, 15, 15, 15, 15),
+ ('config', 'stat_close'): (15, 15, 15, 15, 15, 15, 15, 15),
+ ('decisions', 'open_close'): (16, 16, 16, 16, 16, 16, 16, 16),
+ ('decisions', 'stat_close'): (16, 16, 16, 16, 16, 16, 16, 16),
+ ('confined', 'open_close'): (17, 17, 17, 17, 17, 17, 17, 17),
+ ('confined', 'stat_close'): (17, 17, 17, 17, 17, 17, 17, 17),
+ ('message', 'open_close_errno'): (23, 22, 2, 2, 2, 24, 25, 26),
+ ('manager', 'open_close_errno'): (23, 22, 27, 28, 29, 24, 25, 26),
+ ('manager', 'stat_close_errno'): (23, 22, 27, 28, 29, 24, 25, 26),
+ ('codec', 'open_close_errno'): (12, 12, 2, 2, 2, 2, 12, 12),
+ ('codec', 'stat_close_errno'): (12, 12, 2, 2, 2, 2, 12, 12),
+ ('clock', 'open_close_errno'): (13, 13, 13, 13, 13, 13, 13, 13),
+ ('clock', 'stat_close_errno'): (13, 13, 13, 13, 13, 13, 13, 13),
+ ('memo', 'open_close_errno'): (14, 14, 14, 14, 14, 14, 14, 14),
+ ('memo', 'stat_close_errno'): (14, 14, 14, 14, 14, 14, 14, 14),
+ ('config', 'open_close_errno'): (15, 15, 15, 15, 15, 15, 15, 15),
+ ('config', 'stat_close_errno'): (15, 15, 15, 15, 15, 15, 15, 15),
+ ('decisions', 'open_close_errno'): (16, 16, 16, 16, 16, 16, 16, 16),
+ ('decisions', 'stat_close_errno'): (16, 16, 16, 16, 16, 16, 16, 16),
+ ('confined', 'open_close_errno'): (17, 17, 18, 19, 19, 17, 20, 17),
+ ('confined', 'stat_close_errno'): (17, 17, 18, 19, 19, 17, 20, 17),
+ ('manager', 'reopen'): (0, 1, 6, 7, 8, 3, 4, 5),
+ ('codec', 'verify'): (12, 12, 2, 2, 2, 2, 12, 12),
+ ('decisions', 'verify'): (16, 16, 16, 16, 16, 16, 16, 16),
+ ('memo', 'recheck'): (14, 14, 14, 14, 14, 14, 14, 14)}
+
+
+LIFETIME_NUMBERS = {"EACCES": errno.EACCES, "EIO": errno.EIO, "ENOENT": errno.ENOENT,
+                    "ELOOP": errno.ELOOP, "ENOTDIR": errno.ENOTDIR, "ESTALE": getattr(errno, "ESTALE", errno.ENOENT),
+                    "EEXIST": errno.EEXIST, "ENOSPC": errno.ENOSPC, "EBADF": errno.EBADF}
+
+
+@pytest.mark.parametrize("caller,phase,injected,expected_index", [
+    (caller, phase, number, expected)
+    for (caller, phase), expectations in TIP_LIFETIME_CASES.items()
+    for number, expected in zip(LIFETIME_ERRNOS, expectations)
+])
+def test_directory_lifetime_matches_tip(tmp_path, monkeypatch, caller, phase, injected, expected_index):
+    from aegis_core import credit_memo, manager_store, message_codec_store, model_select, storage_confined
+    root = make_store(tmp_path)
+    fault = lifetime_setup(root, caller, phase, LIFETIME_NUMBERS[injected])
+    fault.delegate = storage_confined.open_directory
+    modules = {"message": storage, "manager": manager_store, "codec": message_codec_store,
+               "clock": credit_memo, "memo": credit_memo, "config": model_select,
+               "decisions": model_select, "confined": storage_confined}
+    # Owned module references leave shared os untouched; the shared walk uses
+    # injected open/close_fd/stat_fd callables.
+    if caller == "message":
+        monkeypatch.setattr("aegis_core.storage_confined.open_directory", fault.directory)
+    elif caller == "manager":
+        monkeypatch.setattr("aegis_core.manager_store.open_directory", fault.directory)
+        monkeypatch.setattr("aegis_core.manager_store.os", fault)
+    elif caller == "codec":
+        monkeypatch.setattr("aegis_core.message_codec_store.open_directory", fault.directory)
+        monkeypatch.setattr("aegis_core.message_codec_store.os", fault)
+    elif caller in ("clock", "memo"):
+        monkeypatch.setattr("aegis_core.credit_memo.open_directory", fault.directory)
+        monkeypatch.setattr("aegis_core.credit_memo.os", fault)
+    elif caller in ("config", "decisions"):
+        monkeypatch.setattr("aegis_core.model_select.open_directory", fault.directory)
+        monkeypatch.setattr("aegis_core.model_select.os", fault)
+    else:
+        monkeypatch.setattr("aegis_core.storage_confined.os", fault)
+    if (caller, phase) == ("manager", "walk_close"):
+        # Round 1d: safe cleanup cannot repeat the tip's second close of the
+        # released parent. With successful child cleanup, keep the first error.
+        expected_index = TIP_LIFETIME_CASES["manager", "close"][LIFETIME_ERRNOS.index(injected)]
+    kind, number, code, message = TIP_SURFACES[expected_index]
+    expected_errno = LIFETIME_NUMBERS[number] if number is not None else None
+    detail = {2: "", 12: "operation"}.get(expected_index)
+    if caller == "message" and phase in ("open_root", "open") and injected == "ENOENT":
+        detail = "workspace"
+    expected = (kind, expected_errno, code, message.format(errno=expected_errno), detail)
+    try:
+        assert lifetime_surface(fault, modules) == expected
+        assert fault.fired
+        if phase in ("open_close", "stat_close", "open_close_errno", "stat_close_errno"):
+            assert fault.cleanup_fired
+        lifetime_assert_closed(fault)
+        fault.phase = "off"
+        assert lifetime_surface(fault, modules) == ("ok", None, None, "hit" if caller == "memo" else "ok", None)
+        lifetime_assert_closed(fault)
+    finally:
+        for fd in fault.opened:
+            try:
+                os.fstat(fd)
+            except OSError as error:
+                assert error.errno == errno.EBADF
+            else:
+                os.close(fd)
+
+
+def test_message_command_directory_close_preserves_tip_refusal(tmp_path, monkeypatch, capsys):
+    from aegis_cli.cli import main
+    from aegis_core import message_codec, storage_confined
+    root = make_store(tmp_path)
+    fault = lifetime_setup(root, "message", "close", errno.EIO)
+    store = message_codec.Store(fault.root / "state/messages")
+    try:
+        rid = store.write({"schema": "aegis.msg/1", "kind": "text", "meta": {
+            "from": "test", "host": "test", "session": "test", "created_at": ""},
+            "fields": {}, "body": "probe", "spans": [], "refs": {}})
+    finally:
+        store.close()
+    fault.delegate = storage_confined.open_directory
+    monkeypatch.setattr("aegis_core.storage_confined.open_directory", fault.directory)
+    assert main(["--workspace", str(root), "msg", "verify", rid]) == 2
+    captured = capsys.readouterr()
+    # Exact stdout/stderr/exit status recorded against the same integration tip.
+    assert captured.out == ('{"error":{"code":"E_AUTH","message":"store operation unavailable; '
+                            'check permissions, free space, write access and file descriptor limits"}}\n')
+    assert captured.err == ""
+    assert fault.fired
+
+
+def test_manager_operation_directory_close_preserves_tip_oserror(tmp_path, monkeypatch):
+    from aegis_core import manager_store, storage_confined
+    fault = lifetime_setup(make_store(tmp_path), "manager", "close", errno.EIO)
+    fault.delegate = storage_confined.open_directory
+    monkeypatch.setattr("aegis_core.manager_store.open_directory", fault.directory)
+    monkeypatch.setattr("aegis_core.manager_store.os", fault)
+    with pytest.raises(OSError) as refused:
+        manager_store.ManagerStore(fault.root).read()
+    assert type(refused.value) is OSError
+    assert refused.value.errno == errno.EIO
+    assert str(refused.value) == "[Errno {}] rf32 lifetime fault".format(errno.EIO)
+    assert fault.fired
+
+
+def lifetime_message_publish(root):
+    from aegis_core import message_codec as codec
+    from aegis_core.workspace.base import Workspace
+    value = codec.compose("text", b'{"fields":{},"body":"probe","refs":{}}',
+                          {"from": "test", "host": "test", "session": "test", "created_at": ""})
+    return Workspace(root), value, codec.record_id(value)
+
+
+@pytest.mark.parametrize("phase", ["walk_close", "close_both"])
+def test_message_ancestor_close_fails_after_publication(tmp_path, monkeypatch, phase):
+    from aegis_core import storage_confined
+    root = make_store(tmp_path)
+    fault = lifetime_setup(root, "message", phase, errno.EIO)
+    fault.delegate = storage_confined.open_directory
+    monkeypatch.setattr("aegis_core.storage_confined.open_directory", fault.directory)
+    workspace, value, rid = lifetime_message_publish(root)
+    with pytest.raises(OSError) as refused:
+        with storage.message_store(workspace, write=True) as store:
+            assert store.write(value) == rid
+    assert str(refused.value) == "[Errno {}] rf32 lifetime fault".format(errno.EIO)
+    assert fault.fired
+    if phase == "close_both":
+        assert fault.cleanup_fired
+    lifetime_assert_closed(fault)
+    with storage.message_store(workspace, write=True) as store:
+        assert store.read(rid) == value
+        assert store.write(value) == rid
+    lifetime_assert_closed(fault)
+
+
+def test_clock_ancestor_close_fails_after_timestamp_update(tmp_path, monkeypatch):
+    from aegis_core import credit_memo, storage_confined
+    if not credit_memo.filesystem_clock_supported():
+        pytest.skip("requires descriptor-based filesystem clock")
+    fault = lifetime_setup(make_store(tmp_path), "clock", "walk_close", errno.EIO)
+    os.utime(fault.file, ns=(1_000_000_000, 1_000_000_000))
+    before = fault.file.stat()
+    fault.delegate = storage_confined.open_directory
+    monkeypatch.setattr("aegis_core.credit_memo.open_directory", fault.directory)
+    monkeypatch.setattr("aegis_core.credit_memo.os", fault)
+    assert credit_memo.filesystem_now(fault.file, before.st_dev) is None
+    assert fault.file.stat().st_mtime_ns != before.st_mtime_ns
+    assert fault.fired
+    lifetime_assert_closed(fault)
+    assert credit_memo.filesystem_now(fault.file, before.st_dev) == fault.file.stat().st_mtime_ns
+    lifetime_assert_closed(fault)
+
+
+@pytest.mark.parametrize("release", [False, True], ids=["before_release", "after_release"])
+def test_manager_parent_close_does_not_retry_reusable_descriptor(tmp_path, monkeypatch, release):
+    from aegis_core import manager_store, storage_confined
+    root = make_store(tmp_path)
+    target = root / "bound"
+    target.mkdir(mode=0o700)
+    source = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    fault = ManagerParentCloseFault(target, release=release, reuse=source if release else None)
+    fault.delegate = storage_confined.open_directory
+    monkeypatch.setattr("aegis_core.manager_store.open_directory", fault.directory)
+    monkeypatch.setattr("aegis_core.manager_store.os", fault)
+    manager = manager_store.ManagerStore(target)
+    try:
+        with pytest.raises(OSError) as refused:
+            manager.read()
+        expected_number = errno.ENOSPC if release else errno.EIO
+        expected_message = "rf32 cleanup fault" if release else "rf32 lifetime fault"
+        assert type(refused.value) is OSError
+        assert refused.value.errno == expected_number
+        assert str(refused.value) == "[Errno {}] {}".format(expected_number, expected_message)
+        assert fault.parent_retries == 0
+        assert fault.cleanup_fired is release
+        assert fault.matches(fault.parent_fd, root)
+    finally:
+        os.close(source)
+        if fault.parent_fd is not None and not fault.parent_retries:
+            os.close(fault.parent_fd)
+    lifetime_assert_closed(fault)
+    assert manager.read() == []
+    lifetime_assert_closed(fault)
+
+
+@pytest.mark.parametrize("caller", ["manager", "message"])
+@pytest.mark.parametrize("phase", ["open", "close"])
+def test_nested_directory_failure_propagates_unchanged(tmp_path, monkeypatch, caller, phase):
+    from aegis_core import manager_store, storage_confined
+    from aegis_core.workspace.base import Workspace
+    root = make_store(tmp_path)
+    (root / "nested").mkdir()
+    fault = lifetime_setup(root, caller, "off", errno.EIO)
+    nested = LifetimeFault(root / "nested", "nested", phase, errno.ENOENT)
+    nested.delegate = storage_confined.open_directory
+    failures = []
+
+    def body(*args):
+        try:
+            with nested.directory(os.open, nested.root):
+                pass
+        except storage_confined.ConfinedFileError as error:
+            failures.append(error)
+            raise
+
+    if caller == "manager":
+        manager = manager_store.ManagerStore(fault.root)
+        monkeypatch.setattr("aegis_core.manager_store.os", fault)
+    else:
+        workspace = Workspace(root)
+    with pytest.raises(storage_confined.ConfinedFileError) as refused:
+        if caller == "manager":
+            manager.transaction(body)
+        else:
+            with storage.message_store(workspace):
+                body()
+    assert failures == [refused.value]
+    assert refused.value.code == "CONFINED_MISSING"
+    assert refused.value.errno == errno.ENOENT
+    lifetime_assert_closed(nested)
+    if caller == "manager":
+        assert manager.read() == []
+        lifetime_assert_closed(fault)
+    else:
+        with storage.message_store(workspace) as reopened:
+            assert reopened.fd is not None
+
+
+def test_message_command_workspace_detail_preserves_tip_refusal(tmp_path, monkeypatch, capsys):
+    from aegis_cli.cli import main
+    from aegis_core import storage_confined
+    root = make_store(tmp_path)
+    fault = lifetime_setup(root, "message", "open", errno.ENOENT)
+    fault.delegate = storage_confined.open_directory
+    monkeypatch.setattr("aegis_core.storage_confined.open_directory", fault.directory)
+    assert main(["--workspace", str(root), "msg", "verify", "0" * 64]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == '{"error":{"code":"E_AUTH","message":"workspace is not initialized; run aegis init"}}\n'
+    assert captured.err == ""
+    assert fault.fired
+    lifetime_assert_closed(fault)
+
+
+@pytest.mark.parametrize("case", ["ancestor_link", "leaf_link", "owner", "group_write",
+                                  "other_write", "missing"])
+def test_directory_walk_refusals_and_retry(tmp_path, monkeypatch, case):
+    from conftest import symlink_or_skip
+    from aegis_core import storage_confined
+    root = make_store(tmp_path)
+    parent = root / "parent"
+    parent.mkdir()
+    target = parent / "leaf"
+    target.mkdir(mode=0o700)
+    live = set()
+
+    def opened(*args, **kwargs):
+        fd = os.open(*args, **kwargs)
+        live.add(fd)
+        return fd
+
+    def closed(fd):
+        live.remove(fd)
+        os.close(fd)
+
+    def private(info):
+        expected_uid = os.getuid() + (1 if case == "owner" else 0)
+        if info.st_uid != expected_uid or info.st_mode & 0o022:
+            raise storage_confined.ConfinedFileError("unsafe")
+
+    reason = "unsafe"
+    if case == "ancestor_link":
+        parent.rename(root / "original")
+        symlink_or_skip(root / "original", parent, target_is_directory=True)
+    elif case == "leaf_link":
+        target.rename(parent / "original")
+        symlink_or_skip(parent / "original", target, target_is_directory=True)
+    elif case == "missing":
+        target.rmdir()
+        reason = "missing"
+    elif case in ("group_write", "other_write"):
+        target.chmod(0o720 if case == "group_write" else 0o702)
+    monkeypatch.setattr("aegis_core.storage_confined.os", ModuleOS(open=opened, close=closed))
+    for _ in range(2):
+        with pytest.raises(storage_confined.ConfinedFileError) as refused:
+            storage_confined.open_directory(storage_confined.os.open, target, policy=private)
+        assert refused.value.reason == reason
+        assert not live
+    with storage_confined.open_directory(storage_confined.os.open, root) as held:
+        assert held.identity == (root.stat().st_dev, root.stat().st_ino)
+    assert not live
+
+
+def test_directory_walk_unsupported_refuses_before_open(tmp_path, monkeypatch):
+    from aegis_core import storage_confined
+    monkeypatch.setattr("aegis_core.storage_confined.descriptor_supported", lambda: False)
+    monkeypatch.setattr("aegis_core.storage_confined.os", ModuleOS(open=lambda *a, **k: pytest.fail("opened")))
+    with pytest.raises(storage_confined.ConfinedFileError) as refused:
+        storage_confined.open_directory(storage_confined.os.open, tmp_path)
+    assert refused.value.reason == "unsupported"
+
+
+@pytest.mark.parametrize("after_open", [False, True])
+def test_directory_walk_ancestor_swap_is_confined(tmp_path, monkeypatch, after_open):
+    from conftest import symlink_or_skip
+    from aegis_core import storage_confined
+    root = make_store(tmp_path)
+    parent, moved, outside = (root / name for name in ("parent", "moved", "outside"))
+    parent.mkdir()
+    (parent / "leaf").mkdir()
+    outside.mkdir()
+    (outside / "leaf").mkdir()
+    expected = (parent / "leaf").stat()
+
+    def opened(path, flags, *args, **kwargs):
+        if path != "parent":
+            return os.open(path, flags, *args, **kwargs)
+        if after_open:
+            fd = os.open(path, flags, *args, **kwargs)
+        parent.rename(moved)
+        symlink_or_skip(outside, parent, target_is_directory=True)
+        return fd if after_open else os.open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr("aegis_core.storage_confined.os", ModuleOS(open=opened))
+    if not after_open:
+        with pytest.raises(storage_confined.ConfinedFileError) as refused:
+            storage_confined.open_directory(storage_confined.os.open, parent / "leaf")
+        assert refused.value.reason == "unsafe"
+    else:
+        with storage_confined.open_directory(storage_confined.os.open, parent / "leaf", retain_ancestors=True) as held:
+            assert held.identity == (expected.st_dev, expected.st_ino)
+            assert held.observations[-1] == (expected.st_dev, expected.st_ino, expected.st_uid, expected.st_mode)
+            with pytest.raises(storage_confined.ConfinedFileError) as refused:
+                held.check()
+            assert refused.value.reason == "unsafe"
+
+
+@pytest.mark.parametrize("failure", ["open", "fstat", "stat", "policy"])
+def test_directory_walk_failure_closes_descriptors(tmp_path, monkeypatch, failure):
+    from aegis_core import storage_confined
+    root = make_store(tmp_path)
+    live = set()
+
+    def opened(*args, **kwargs):
+        if failure == "open" and live:
+            raise OSError("untrusted token=secret")
+        fd = os.open(*args, **kwargs)
+        live.add(fd)
+        return fd
+
+    def closed(fd):
+        live.remove(fd)
+        os.close(fd)
+
+    def failed(*args, **kwargs):
+        raise OSError("untrusted token=secret")
+
+    replacements = {failure: failed} if failure in ("fstat", "stat") else {}
+    monkeypatch.setattr("aegis_core.storage_confined.os", ModuleOS(open=opened, close=closed, **replacements))
+    with pytest.raises(storage_confined.ConfinedFileError) as refused:
+        storage_confined.open_directory(storage_confined.os.open, root, policy=failed if failure == "policy" else None)
+    assert refused.value.reason == "io"
+    assert str(refused.value) == "confined file I/O failed"
+    assert not live
+
+
+def test_directory_walk_concurrent_creation_reopens_the_winning_directory(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from aegis_core import storage_confined
+    root = make_store(tmp_path)
+    target = root / "created"
+    barrier = Barrier(2, timeout=5)
+
+    def missing(parent, name, observations):
+        info = os.fstat(parent)
+        assert observations[-1] == (info.st_dev, info.st_ino, info.st_uid, info.st_mode)
+        barrier.wait()
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=parent)
+            os.fsync(parent)
+        except FileExistsError:
+            pass
+
+    def bind():
+        with storage_confined.open_directory(os.open, target, on_missing=missing) as held:
+            return held.identity
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(bind) for _ in range(2)]
+        identities = [future.result(timeout=10) for future in futures]
+    info = target.stat()
+    assert identities == [(info.st_dev, info.st_ino)] * 2
+    assert info.st_mode & 0o777 == 0o700
+
+
+def test_directory_walk_missing_callback_failure_closes_and_can_retry(tmp_path):
+    from aegis_core import storage_confined
+    root = make_store(tmp_path)
+    live = set()
+
+    def opened(*args, **kwargs):
+        fd = os.open(*args, **kwargs)
+        live.add(fd)
+        return fd
+
+    def closed(fd):
+        live.remove(fd)
+        os.close(fd)
+
+    def failed(*args):
+        raise OSError("token=secret\nprivate path")
+
+    def create(parent, name, observations):
+        os.mkdir(name, mode=0o700, dir_fd=parent)
+
+    target = root / "missing"
+    for _ in range(2):
+        with pytest.raises(storage_confined.ConfinedFileError) as refused:
+            storage_confined.open_directory(opened, target, on_missing=failed, close_fd=closed)
+        assert refused.value.reason == "io"
+        assert str(refused.value) == "confined file I/O failed"
+        assert not live and not target.exists()
+    with storage_confined.open_directory(opened, target, on_missing=create, close_fd=closed) as held:
+        assert held.fd in live
+    assert not live
+
+
+@pytest.mark.parametrize("operation", ["close", "detach"])
+def test_directory_walk_cleanup_attempts_every_descriptor_on_close_error(tmp_path, operation):
+    from aegis_core import storage_confined
+    root = make_store(tmp_path)
+    live, failures = set(), []
+
+    def opened(*args, **kwargs):
+        fd = os.open(*args, **kwargs)
+        live.add(fd)
+        return fd
+
+    def closed(fd):
+        live.remove(fd)
+        os.close(fd)
+        if not failures:
+            failures.append(fd)
+            raise OSError("token=secret\nclose failed")
+
+    held = storage_confined.open_directory(opened, root, retain_ancestors=True, close_fd=closed)
+    with pytest.raises(storage_confined.ConfinedFileError) as refused:
+        if operation == "close":
+            held.close()
+        else:
+            held.detach()
+    assert refused.value.reason == "io"
+    assert not live
+    held.close()
+    with pytest.raises(storage_confined.ConfinedFileError) as refused:
+        held.check()
+    assert refused.value.reason == "closed"
+
+
+def test_directory_walk_detach_transfers_only_leaf_ownership(tmp_path):
+    from aegis_core import storage_confined
+    root = make_store(tmp_path)
+    with storage_confined.open_directory(os.open, root, retain_ancestors=True) as held:
+        fd = held.detach()
+        assert held.fd is None
+    try:
+        assert (os.fstat(fd).st_dev, os.fstat(fd).st_ino) == held.identity
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize("spelling", ["relative", "/" + "x" * 32768, "/\ud800", b"/bytes"],
+                         ids=["relative", "oversize", "invalid_unicode", "bytes"])
+def test_directory_walk_invalid_root_refuses_before_open(spelling):
+    from aegis_core import storage_confined
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("opened an invalid root")
+
+    with pytest.raises(storage_confined.ConfinedFileError) as refused:
+        storage_confined.open_directory(forbidden, spelling)
+    assert refused.value.reason == "invalid_path"
+    assert str(refused.value) == "invalid confined file path"
+
+
+@pytest.mark.parametrize("number,detail", [(errno.ENOENT, ""), (errno.ENOTDIR, ""),
+    (errno.ELOOP, ""), (getattr(errno, "ESTALE", errno.ENOENT), ""), (errno.EIO, "operation")],
+    ids=["missing", "not_directory", "symlink", "stale", "io"])
+def test_directory_walk_preserves_codec_refusal_mapping(tmp_path, monkeypatch, number, detail):
+    from aegis_core import message_codec as codec
+    root = make_store(tmp_path)
+
+    def failed(*args, **kwargs):
+        raise OSError(number, "token=secret\nprivate path")
+
+    monkeypatch.setattr("aegis_core.message_codec_store.os", ModuleOS(open=failed))
+    with pytest.raises(codec.CodecError) as refused:
+        codec.Store(root)
+    assert refused.value.code == "E_AUTH"
+    assert refused.value.detail == detail
+    assert str(refused.value) == (
+        "store operation unavailable; check permissions, free space, write access and file descriptor limits"
+        if detail else "store access refused: unsafe directory or platform lacks anchored file operations; use a supported real directory")
+
+
+def test_directory_walk_codec_cleanup_preserves_the_policy_refusal(tmp_path, monkeypatch):
+    from aegis_core import message_codec as codec
+    root = make_store(tmp_path)
+    root.chmod(0o777)
+    live, leaves = set(), set()
+
+    def opened(path, *args, **kwargs):
+        fd = os.open(path, *args, **kwargs)
+        live.add(fd)
+        if path == root.name:
+            leaves.add(fd)
+        return fd
+
+    def closed(fd):
+        live.remove(fd)
+        os.close(fd)
+        if fd in leaves:
+            raise OSError(errno.EIO, "token=secret\nclose failed")
+
+    monkeypatch.setattr("aegis_core.message_codec_store.os", ModuleOS(open=opened, close=closed))
+    try:
+        with pytest.raises(codec.CodecError) as refused:
+            codec.Store(root)
+        assert refused.value.code == "E_AUTH"
+        assert str(refused.value) == "store access refused; use a private store directory"
+        assert leaves and not live
+    finally:
+        root.chmod(0o700)
+
+
 def test_boundary_is_loaded_only_when_its_public_api_is_used():
     from pathlib import Path
     import subprocess
@@ -30,6 +937,31 @@ def test_boundary_is_loaded_only_when_its_public_api_is_used():
     result = subprocess.run([sys.executable, "-I", "-c", source, str(Path(__file__).resolve().parents[3])],
                             capture_output=True, timeout=15)
     assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+
+
+def test_parent_fd_is_read_only_borrowed_and_refuses_after_exit(tmp_path):
+    root = make_store(tmp_path)
+    parent = root / "parent"
+    parent.mkdir()
+    with storage.confined_file(root, ("parent", "file")) as handle:
+        handle.publish_bytes(b"held")
+        descriptor = handle.parent_fd
+        info = handle.parent_stat()
+        assert (os.fstat(descriptor).st_dev, os.fstat(descriptor).st_ino) == (info.st_dev, info.st_ino)
+        with pytest.raises(AttributeError):
+            handle.parent_fd = descriptor
+        parent.rename(root / "moved")
+        parent.mkdir()
+        (parent / "file").write_bytes(b"replacement")
+        assert handle.parent_fd == descriptor
+        assert os.stat("file", dir_fd=handle.parent_fd, follow_symlinks=False).st_size == len(b"held")
+    with pytest.raises(storage.ConfinedFileError) as refused:
+        handle.parent_fd
+    assert refused.value.code == "CONFINED_CLOSED"
+    assert str(refused.value) == "confined file context is closed"
+    with pytest.raises(OSError) as closed:
+        os.fstat(descriptor)
+    assert closed.value.errno == errno.EBADF
 
 
 def test_read_publish_and_exclusive_creation(tmp_path):

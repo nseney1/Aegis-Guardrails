@@ -29,7 +29,7 @@ __all__ = [
     "HostRefusal", "MAX_BYTES", "descriptor_supported", "PLAN_SCHEMA", "PLAN_FILE", "PLAN_KEYS",
     "SESSION_SCHEMA", "STAND_IN_SCOPE", "START_MODES", "MAX_PATH_CHARS", "SHA256", "validate_plan",
     "plan_record", "read_plan", "base_plan", "governing_plan", "plan_host", "require_binding",
-    "team_start_mode", "session_record", "session_record_path", "session_recorded",
+    "team_start_mode", "session_record", "session_record_path", "session_recorded", "absolute_path",
 ]
 
 PLAN_SCHEMA = "aegis.hierarchy-host-plan/v1"
@@ -115,7 +115,7 @@ def base_plan(base, hierarchy):
 
 @guarded
 def governing_plan(base, mailbox_root, hierarchy):
-    base, home = _absolute_path(base), _absolute_path(mailbox_root).parent
+    base, home = absolute_path(base), absolute_path(mailbox_root).parent
     plan = base_plan(base, hierarchy)
     if base == home:
         return plan
@@ -179,9 +179,10 @@ def session_record(endpoint, role_kind, host_kind, start_mode, session, generati
             "write_scope": dict(write_scope)}
 
 
-def _absolute_path(base):
+def absolute_path(base, limit=MAX_PATH_CHARS):
+    require(type(limit) is int and 0 < limit <= MAX_PATH_CHARS, reason="unsafe_path")
     spelling = str(base) if isinstance(base, Path) else base
-    require(type(spelling) is str and 0 < len(spelling) <= MAX_PATH_CHARS, reason="unsafe_path")
+    require(type(spelling) is str and 0 < len(spelling) <= limit, reason="unsafe_path")
     require("\x00" not in spelling, reason="unsafe_path")
     path = Path(spelling)
     require(path.is_absolute() and ".." not in path.parts, reason="unsafe_path")
@@ -199,7 +200,7 @@ def session_record_path(base, endpoint, generation):
 
 @guarded
 def session_recorded(path, record):
-    path = _absolute_path(path)
+    path = absolute_path(path)
     bounded_tree(record)
     value = _read_json(path.parent, (path.name,))
     if value is _MISSING:
