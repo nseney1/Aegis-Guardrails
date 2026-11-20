@@ -227,7 +227,7 @@ def issue(issues, code, path, store):
 
 def data_failure(error):
     reason = render_mailbox_refusal(error)["reason"]
-    if reason not in ("invalid_record", "unknown_host"):
+    if reason not in ("invalid_record", "unknown_host", "scope", "binding", "reference", "history"):
         raise error
 
 
