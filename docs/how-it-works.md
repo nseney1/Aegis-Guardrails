@@ -2,7 +2,7 @@
 
 Aegis connects project rules, checks and evidence. This guide explains those concepts and follows a change through them. It describes the development branch; the [changelog](../CHANGELOG.md) identifies released changes.
 
-Start with the [README](../README.md) for installation. The [reference](reference.md) lists every command and schema; [architecture](architecture.md), [hosts and hooks](hosts-and-hooks.md), and [agent teams](teams.md) cover their respective setup and implementation boundaries.
+Start with the [README](../README.md) for installation. The [reference](reference.md) lists every command and schema; [architecture](architecture.md), [hosts and hooks](hosts-and-hooks.md), and [agent teams](teams.md#on-this-branch) cover their respective setup and implementation boundaries. Model admission is in [model selection](model-selection.md).
 
 ## The loop
 
@@ -144,6 +144,8 @@ covers canonical names, parser-recognized comments and evasion bounds.
 | `aegis_team_config` | reads the resolved team profile with per-value layer provenance; same payload as the CLI JSON except token-shaped identifiers in capacity and fallback fields are masked; writes nothing |
 | `aegis_team_model` | previews a model choice and decision record; `record: true` atomically selects and appends through the model-selection core; identical JSON to `aegis team model` |
 | `aegis_team_queue` | lists work items, blockers and lane labels through the same service as `aegis team queue list`; optional capability and completed-item filters; writes nothing |
+
+`aegis msg` reads, writes and verifies the same `aegis.msg/1` records. It does not initialize a workspace. Run `aegis init` first. Errors are fixed JSON and the command exits 2. Reading never acknowledges a message. The command refuses unless directory descriptors support `open`, `mkdir`, `stat`, `link` and `unlink`, `stat` supports `follow_symlinks`, and `O_DIRECTORY`, `O_NOFOLLOW` and `geteuid` exist. The codec module defers Windows support.
 
 **Model selection.** `aegis team model --bindings bindings.json --policy policy.json --history decisions.jsonl --task-kind T9 --role-kind implementer --subject lane-one --host-kind codex-cli --host-kind claude-code --json`
 previews a choice without publishing history. Add `--record` (MCP `record: true`) to select and append under one lock, with a 60-second timeout. Bindings, policy and history paths must stay inside the workspace; absolute paths and parent components are refused. The shared workspace confinement helper validates each path, and the core retains its no-follow descriptor walk over the original spelling. Inputs are bounded regular files, and the history directory must already exist with safe ownership and modes. Missing history in a valid directory means empty history. No host launches or admission grants occur; unprobed and rejected levels refuse with `binding_not_admitted`.
@@ -451,6 +453,18 @@ The commands above record what the prune conditions count in an events log: `<gi
 
 Command event writes are best effort: a recording error becomes a warning and does not undo the command's result. Hook event logging keeps its separate guard so a logging failure does not replace the host decision.
 
+## Proposals and rule lint
+
+`aegis rule lint` reports findings for rule files and does not change them. It exits 0 when a finding is an error and when the workspace is unavailable. `aegis rule lint --json` sets `report_only` to true.
+
+Proposal bytes accept sources `insight`, `mine`, `one` and `lint`. Merging proposals publishes a pending draft whose source is `mine` under `.aegis/proposals/`. That draft does not install a rule, and a later decision in the proposal store is queue state, not acceptance. `aegis rule insight` can still write an insight proposal in the same directory when you ask it to. There is no command that mines repository history into proposals.
+
+## Git delivery
+
+`aegis_core.team_git` is lane Git plumbing with no subcommand. `snapshot_tree` keeps the real index and returns a tree id. `plan_merge`, `plan_pick` and `plan_revert` return a plan and do not publish. `commit_tested` records a commit in the caller-supplied store. Only `cas_fast_forward` publishes objects and updates a ref. `team_qualify.record_pass` and `team_custody.commit` journal that effect first. `aegis_core.team_gitops` stores the intent and the observed result. It runs neither git nor `gh`. `MergeQueue.revalidate` saves its own queue checkpoint, then calls `team_git.cas_fast_forward`. It does not write a team_gitops journal. Qualification records use that compare-and-swap and have no CLI, as [architecture](architecture.md#tree-bound-teams-qualification) describes. `Publisher` requires an owner-supplied `gh` adapter and a qualification reader. Its activation is not wired, and nothing turns on a legacy publisher by default. `aegis_core.merge_queue.MergeQueue` is an in-tree library whose landing wiring is separate work.
+
+`snapshot_tree` refuses `unsupported_platform` unless `descriptor_support` is true: `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `stat` and `readlink`. Plans and commits of an already supplied tree do not use that check. The work queue refuses `unsupported_platform` unless `storage.confined_descriptor_supported` is true: `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `mkdir`, `link`, `rename`, `unlink` and `stat`. That function does not use `readlink`. The proposal store refuses `unsupported` on that same function. Both are false when `os.name` is not `posix`, so Windows fails them. Neither function tests for macOS. Qualification writes call `team_qualify.descriptor_supported` and otherwise refuse `unsupported_platform`. That function is true only when `team_git.descriptor_support` is true, `team_gitops.descriptor_supported` is true (`fcntl` is available and `storage.confined_descriptor_supported` is true), and `gitops_fds.descriptor_supported` is true (`sys.platform` is `linux`, `os.name` is `posix`, and `prctl(37)` returns 0).
+
 ## Cheat sheet
 
 Flags and defaults for every command are in the [reference](reference.md); this table only maps tasks to commands.
@@ -474,6 +488,8 @@ Flags and defaults for every command are in the [reference](reference.md); this 
 | manage the pre-commit hook | `aegis hook install` / `status` / `uninstall` |
 | add or remove a host's pre-tool hook | `aegis hook install --host claude-code` / `aegis hook uninstall --host claude-code` |
 | declare a lane's paths | `aegis team claim LANE --paths 'docs/**'` (`aegis team list` to see leases) |
+| list the team work queue | `aegis team queue list --json` |
+| report rule lint findings | `aegis rule lint` (`aegis rule lint --json` for the report-only payload) |
 | check what a lane changed | `aegis check --lane LANE` (`--base-policy` for the witnessed form) |
 | copy the skills into the repo | `aegis skills sync` (`--dry-run` first) |
 | upgrade a v3 workspace | `aegis migrate`, then `aegis migrate --apply`, `aegis init --host ...` and `aegis doctor --fix` |
