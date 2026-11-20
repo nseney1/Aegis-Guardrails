@@ -87,13 +87,22 @@ class AegisParser(argparse.ArgumentParser):
         kwargs["parser_class"] = partial(factory, error_policy=self._error_policy, scan_state=self._scan_state)
         return super().add_subparsers(**kwargs)
 
+    def _print_message(self, message, file=None):
+        # Raw model invocations publish their own result, including for help and version.
+        if not getattr(self._error_policy, "model_invocation", False):
+            super()._print_message(message, file)
+
+    def refuse_scoped_usage(self):
+        if getattr(self._error_policy, "guards_usage", False):
+            self._error_policy()
+
     def error(self, message: str) -> None:
+        if self._error_policy is not None:
+            self._error_policy()
         if self._scan_state["entered"] or self._scan_state["invocation"]:
             from aegis_core.guidance_projection import project_diagnostic
 
             message = project_diagnostic(message)
-        if self._error_policy is not None:
-            self._error_policy()
         super().error(message)
 
     def parse_known_args(self, args=None, namespace=None):
@@ -119,7 +128,9 @@ class AegisParser(argparse.ArgumentParser):
     def parse_args(self, args=None, namespace=None):
         self._scan_state["entered"] = False
         self._scan_state["invocation"] = False
-        ns = super().parse_args(args=args, namespace=namespace)
+        parse = super().parse_args
+        guard = getattr(self._error_policy, "parse_cli_args", None)
+        ns = parse(args=args, namespace=namespace) if guard is None else guard(parse, args, namespace)
         if not hasattr(ns, "json"):
             ns.json = False
         # `check` and `msg read` have --format; its json value must reach code (and the
@@ -339,6 +350,8 @@ _POLICY_REGISTRY = {
     ("msg",): ("aegis_cli.msg", "MsgErrorPolicy", False),
     ("team", "model"): ("aegis_cli.team", "ModelErrorPolicy", True),
     ("team", "queue"): ("aegis_cli.team_queue", "QueueErrorPolicy", False),
+    ("team", "mail"): ("aegis_cli.team_mail", "MailBoardErrorPolicy", False),
+    ("team", "board"): ("aegis_cli.team_mail", "MailBoardErrorPolicy", False),
 }
 
 
@@ -419,7 +432,13 @@ def _invocation_policy(argv):
         policy = factories[("team", "queue")](policy, active=True, **options)
     if model is not None:
         model.fallback = policy
-        return model
+        policy = model
+    mail_board = factories.get(("team", "mail")) or factories.get(("team", "board"))
+    if mail_board is not None:
+        from aegis_cli.team import ModelArgumentError
+        from aegis_cli.team_queue import QueueArgumentError
+
+        policy = mail_board(policy, (ModelArgumentError, QueueArgumentError))
     return policy
 
 
@@ -448,17 +467,16 @@ def _main(argv: List[str], prog: str, policy=None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="replace")
     argv = list(argv)
-    if argv[:2] == ["hook", "run"] and not {"-h", "--help"} & set(argv[2:]):
-        # What the agent-host hook registrations run, from any cwd ($HOME, a v3 .soma/
-        # directory): the handler resolves its workspace from the payload and fails open,
-        # so it must reach neither _attach_workspace (exit 1) nor a usage error (exit 2,
-        # which Claude Code and Codex read as a block).
-        from aegis_cli.hooks.pretool import run_hook_argv
-
-        return run_hook_argv(argv[2:])
-
     if policy is None:
         policy = _invocation_policy(argv)
+    hook_run = argv[:2] == ["hook", "run"] and not {"-h", "--help"} & set(argv[2:])
+    if hook_run:
+        from aegis_cli.hooks.pretool import run_hook_argv
+
+        # Host hooks resolve their workspace from the payload and ordinarily fail open.
+        if not getattr(policy, "guards_usage", False):
+            return run_hook_argv(argv[2:])
+
     parser = _build_parser(prog=prog, error_policy=policy)
     pointer = policy.removed_pointer(argv, partial(removed_command_pointer, parser=parser))
     if pointer is not None:
@@ -468,6 +486,8 @@ def _main(argv: List[str], prog: str, policy=None) -> int:
     args = policy.parse(parser, argv)
     if isinstance(args, int):
         return args
+    if hook_run:
+        return run_hook_argv(argv[2:])
     args.prog = prog
     if args.command is None:
         parser.print_help()
