@@ -581,8 +581,11 @@ class Launch(Setup):
         return subprocess.Popen(self.argv("start", "--request", str(self.start_request(**request))), stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, env=env)
 
+    def record_folder(self, endpoint=REVIEW):
+        return self.base / "launches" / endpoint.replace("/", "%2F")
+
     def records(self, endpoint=REVIEW):
-        folder = self.base / "launches" / endpoint.replace("/", "%2F")
+        folder = self.record_folder(endpoint)
         return [json.loads(path.read_text()) for path in sorted(folder.glob("*.json"))] if folder.exists() else []
 
     def binding(self, endpoint=REVIEW):
@@ -593,6 +596,17 @@ class Launch(Setup):
         return invoke(self.root, "publish", {"message_id": identifier, "from": "pilot/orchestrator", "to": endpoint,
                                              "host": sender["host"], "session": sender["session"],
                                              "binding_generation": sender["generation"], "type": "info", "body": "UNTRUSTED-BODY"})
+
+
+def assert_launch_record_added(folder, before, answer):
+    """Check the journal of a test-owned launch directory after one attempt."""
+    after = {path.name: path.read_bytes() for path in folder.glob("*.json")}
+    assert before.items() <= after.items(), "a retained launch record was removed, renamed or changed"
+    added = after.keys() - before.keys()
+    assert len(added) == 1
+    [name] = added
+    assert json.loads(after[name]) == {key: value for key, value in answer.items() if key != "log"}
+    return after
 
 
 @pytest.fixture
@@ -927,11 +941,14 @@ def test_a_role_whose_contract_file_is_missing_is_refused_before_anything_runs(t
 
 
 def test_a_bound_endpoint_is_refused_and_the_refusal_is_recorded(launch):
-    launch.start()
+    folder = launch.record_folder()
+    started = launch.start()
+    saved = assert_launch_record_added(folder, {}, started)
     refused = launch.start(expect=2)
     assert refused["error"] == "endpoint is already bound; resume it or hand it off"
     assert refused["state"] == "refused" and refused["session"] is None
-    assert [row["state"] for row in launch.records()] == ["bound", "refused"]
+    assert started["state"] == "bound"
+    assert_launch_record_added(folder, saved, refused)
     assert len(launch.codex_log.read_text().splitlines()) == 1
 
 
@@ -986,12 +1003,22 @@ def test_snapshot4e_launcher_failure_always_records_a_fixed_reason(launch, repor
     assert answer["exit_code"] == exit_code and answer["timed_out"] is False
     assert answer["state"] == ("start_incomplete" if reported == "fixture-session" else "failed_to_start")
     assert answer.get("error") == reason
-    [saved] = launch.records()
-    assert saved["error"] == reason and launch.binding() is None
+    folder = launch.record_folder()
+    saved = assert_launch_record_added(folder, {}, answer)
+    [name] = saved
+    # Model a clock rollback between attempts with a fixture-owned filename.
+    retained = "99991231T235959999999Z-" + name.split("-", 1)[1]
+    (folder / name).rename(folder / retained)
+    saved = {retained: saved[name]}
+    assert launch.binding() is None
     # A refusal releases the start lock, and a later successful start keeps the failure evidence.
     codex.write_text(original, encoding="utf-8")
-    assert launch.start()["state"] == "bound"
-    assert launch.records()[0] == saved
+    retry = launch.start()
+    assert retry["state"] == "bound"
+    records = assert_launch_record_added(folder, saved, retry)
+    assert max(records) == retained
+    status = launch.run("status", "--endpoint", REVIEW)["endpoints"][REVIEW]
+    assert status["records"] == 2 and status["last"] == json.loads(saved[retained])
 
 
 @pytest.mark.parametrize("reported", [None, "fixture-session"])
@@ -1002,16 +1029,18 @@ def test_snapshot4e_launcher_timeout_records_a_fixed_reason(launch, reported):
     assert answer["timed_out"] is True
     assert answer["state"] == ("failed_to_start" if reported is None else "start_incomplete")
     assert answer.get("error") == "the start timed out"
-    [saved] = launch.records()
-    assert saved["error"] == "the start timed out" and launch.binding() is None
-    assert launch.start()["state"] == "bound"
-    assert saved in launch.records()
+    folder = launch.record_folder()
+    saved = assert_launch_record_added(folder, {}, answer)
+    assert launch.binding() is None
+    retry = launch.start()
+    assert retry["state"] == "bound"
+    assert_launch_record_added(folder, saved, retry)
 
 
 @pytest.mark.parametrize("reported", [None, "fixture-session"])
 def test_a_concurrent_start_preserves_the_running_starts_lock_and_reason(launch, reported):
     mode = "silent-hang" if reported is None else "hang"
-    folder = launch.base / "launches" / "pilot%2Flane%2Freview"
+    folder = launch.record_folder()
     lock = folder / ".start.lock"
     # The normal timeout is a hung-fixture ceiling, not a window for the second start.
     with launch.started(mode=mode, thread=reported) as running:
@@ -1125,7 +1154,8 @@ def assert_concurrent_start_preserves_lock_and_reason(launch, reported, folder, 
         assert refused["state"] == "refused"
         assert refused["error"] == "stop custody endpoint is busy: " + REVIEW
         assert lock.read_bytes() == held and running.poll() is None
-        assert launch.records() == [refused] and launch.binding() is None
+        saved = assert_launch_record_added(folder, {}, refused)
+        assert launch.binding() is None
         # Stop the launcher only after the competing start has finished its refusal.
         running.send_signal(signal.SIGTERM)
         out, err = running.communicate(timeout=R2_STOP_TIMEOUT_SECONDS)
@@ -1135,11 +1165,10 @@ def assert_concurrent_start_preserves_lock_and_reason(launch, reported, folder, 
         assert answer["error"] == "the launcher was interrupted" and answer["timed_out"] is False
         assert answer["session"] == reported
         assert not alive(started["pid"]) and not lock.exists() and launch.binding() is None
-        saved = launch.records()
-        # Records sort by start identifier, not by completion order.
-        assert saved == [{key: value for key, value in answer.items() if key != "log"}, refused]
-        assert launch.start()["state"] == "bound"
-        assert launch.records()[:2] == saved
+        saved = assert_launch_record_added(folder, saved, answer)
+        retry = launch.start()
+        assert retry["state"] == "bound"
+        assert_launch_record_added(folder, saved, retry)
     finally:
         if running.poll() is None:
             running.kill()
@@ -1292,6 +1321,9 @@ def test_stop_refuses_a_background_claude_session_and_bad_grace(launch):
 
 def test_status_reads_back_bindings_and_records(launch):
     session = launch.start()["session"]
+    [bound] = launch.record_folder().glob("*.json")
+    # Give the bound record a fixed lower-sorting name for the status test.
+    bound.rename(bound.with_name("00010101T000000000000Z-" + bound.name.split("-", 1)[1]))
     launch.start(expect=2)
     shown = launch.run("status", "--endpoint", REVIEW)
     assert shown["schema"] == "aegis.hierarchy-launch-status/v1"
@@ -1311,16 +1343,19 @@ def test_start_refuses_root_and_records_it(launch):
 
 
 def test_a_held_start_lock_refuses_a_second_start_and_a_start_releases_its_lock(launch):
-    lock = launch.base / "launches" / "pilot%2Flane%2Freview" / ".start.lock"
+    folder = launch.record_folder()
+    lock = folder / ".start.lock"
     lock.parent.mkdir(parents=True)
     lock.write_text('{"pid": 1}')
     refused = launch.start(expect=2)
     assert refused["error"] == "a start is already running for pilot/lane/review; inspect %s if none is" % lock
     assert refused["state"] == "refused" and refused["host"] == "codex-cli"
     assert lock.read_text() == '{"pid": 1}' and not launch.codex_log.exists()
+    saved = assert_launch_record_added(folder, {}, refused)
     lock.unlink()
-    assert launch.start()["state"] == "bound" and not lock.exists()
-    assert [row["state"] for row in launch.records()] == ["refused", "bound"]
+    retry = launch.start()
+    assert retry["state"] == "bound" and not lock.exists()
+    assert_launch_record_added(folder, saved, retry)
 
 
 def test_a_start_that_cannot_spawn_is_recorded_as_failed_to_start(launch):
