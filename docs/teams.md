@@ -20,13 +20,20 @@ These surfaces are in the tree. This page is the entry; the linked pages are the
 | Model selection | `aegis team model` and the `aegis_team_model` tool; a choice requires an admitted binding | [Model selection](model-selection.md) |
 | Team profile | `aegis team config`, `aegis team doctor` and `aegis team hosts` | [Team profiles](teams-profile.md) |
 | Message codec | `aegis msg` plus `aegis_msg_read` and `aegis_msg_write` | [Delivery over MCP](how-it-works.md#delivery-over-mcp) |
-| Product mailbox | `aegis_core.team_mailbox`; there is no mailbox subcommand | [Architecture](architecture.md#where-to-read-next) |
+| Product mailbox | `aegis team mail send`, `aegis team mail read` and `aegis team mail doctor` over `aegis_core.team_mailbox` | [Mail and board](#mail-and-board) |
+| Team board | `aegis team board` configures, reads and inspects the board | [Mail and board](#mail-and-board) |
+| Session wake | `aegis_core.team_session_wake` validates the profile binding and attempts a turn for unread mail | [Session wakes](#session-wakes) |
+| Job recipes and packets | `aegis_core.team_jobs_recipes`; validation includes typed `unknown_recipe` and `invalid_packet` refusals and grants no execution authority | [Architecture](architecture.md#where-to-read-next) |
 | Hierarchy runs | `tools/hierarchy_team.py`, outside the installed wheel | [Runtime guide](agent-hierarchies.md) and [prerequisites](hierarchy-team.md#prerequisites) |
 | Git delivery | snapshot, plans, compare-and-swap publish, qualification and the publisher, as libraries | [Architecture](architecture.md#git-delivery) |
 | Proposals and lint | proposal records, including source `mine`; `aegis rule lint` reports and exits 0 | [Proposals and rule lint](how-it-works.md#proposals-and-rule-lint) |
 | Supervisor | profile-driven pauses and backoff | [Supervisor profile](teams-supervisor.md) |
 
-`aegis_core.merge_queue.MergeQueue` is an in-tree library whose landing wiring is separate work. `tools/hierarchy_templates/` is outside the wheel. The wheel includes `aegis_core/team_templates/role-registry.json`, which `team_roles.registry` reads. [Absorption](teams-absorption.md) describes the package boundary for templates that are not moved yet. Snapshots refuse `unsupported_platform` unless `descriptor_support` is true: `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `stat` and `readlink`. The queue refuses `unsupported_platform`, and the proposal store refuses `unsupported`, unless `storage.confined_descriptor_supported` is true: `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `mkdir`, `link`, `rename`, `unlink` and `stat`. That function does not use `readlink`. Both are false when `os.name` is not `posix`, so Windows fails them. Neither function tests for macOS. Qualification writes call `team_qualify.descriptor_supported` and otherwise refuse `unsupported_platform`. That function is true only when `team_git.descriptor_support` is true, `team_gitops.descriptor_supported` is true (`fcntl` is available and `storage.confined_descriptor_supported` is true), and `gitops_fds.descriptor_supported` is true (`sys.platform` is `linux`, `os.name` is `posix`, and `prctl(37)` returns 0). Publisher activation is not wired. A separate OS principal is not in this branch (`OS-PRINCIPAL-1`). File modes do not isolate another process running as the owner.
+`aegis_core.merge_queue.MergeQueue` checks qualification for the exact landing tree. Automatic landing remains separate work. `tools/hierarchy_templates/` is outside the wheel. The wheel includes `job-recipes.json` and `role-registry.json` under `aegis_core/team_templates/`. `team_roles.registry` reads the role registry. [Absorption](teams-absorption.md) describes the package boundary for templates that are not moved yet.
+
+Snapshots refuse `unsupported_platform` unless `descriptor_support` is true: `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `stat` and `readlink`. The work queue refuses `unsupported_platform`, and the proposal store refuses `unsupported`, unless `storage.confined_descriptor_supported` is true: `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `mkdir`, `link`, `rename`, `unlink` and `stat`. That function does not use `readlink`. Both probes are false when `os.name` is not `posix`, so Windows fails them. Neither function tests for macOS.
+
+Qualification writes call `team_qualify.descriptor_supported` and otherwise refuse `unsupported_platform`. That function is true only when `team_git.descriptor_support` is true, `team_gitops.descriptor_supported` is true (`fcntl` is available and `storage.confined_descriptor_supported` is true), and `gitops_fds.descriptor_supported` confirms Linux subreaper support (`sys.platform` is `linux`, `os.name` is `posix`, and `prctl(37)` returns 0). The merge queue checks the snapshot and qualification probes before preparing a candidate and refuses `unsupported_platform` if either fails. Publisher activation is not wired. A separate OS principal is not in this branch (`OS-PRINCIPAL-1`). File modes do not isolate another process running as the owner.
 
 ## Setup and limits of each surface
 
@@ -47,6 +54,30 @@ the selected host CLI and a dedicated host login. They set up runs, start and st
 supported CLI sessions, and inspect run status. Start with the
 [runtime guide](agent-hierarchies.md) and the
 [team-run prerequisites and configuration](hierarchy-team.md#prerequisites).
+
+### Mail and board
+
+`aegis team mail send` publishes a request, `aegis team mail read` reads a
+bounded page, and `aegis team mail doctor` inspects mailbox health without
+writes. `aegis team doctor` checks the team profile. `aegis team board` can
+configure channels and access, read pages and inspect board health. See the
+[mail](reference.md#aegis-team-mail) and [board](reference.md#aegis-team-board)
+command sections for arguments.
+
+Mail and board require the mailbox store's POSIX descriptor support. This
+includes `O_NOFOLLOW`, `O_DIRECTORY`, descriptor-relative `open`, `mkdir`,
+`link`, `unlink`, `stat` and `rmdir`, and `scandir` on a directory descriptor.
+After successful argument parsing and workspace resolution, missing descriptor
+support yields `unsupported_platform` for mail send, mail read and every board
+command, and `MD_PLATFORM` for mail doctor.
+
+### Session wakes
+
+`aegis_core.team_session_wake.wake` refuses a mismatched profile with
+`binding_mismatch` before starting a turn. With a valid profile, an empty inbox
+returns `nothing_unread` and a dry run with unread mail returns `dry_run`. An
+actual wake with unread mail on a supported platform refuses with `busy` if
+the endpoint is already claimed. See [Security](../SECURITY.md#repository-trust).
 
 ## Claim and finish a lane
 
