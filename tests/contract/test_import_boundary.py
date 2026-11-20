@@ -45,6 +45,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.errors": 0,
     "aegis_core.taxonomy": 0,
     "aegis_core.merge_queue": 2,
+    "aegis_core.merge_queue_types": 0,
     # Canonical message records and untrusted views (stdlib only).
     "aegis_core.message_codec": 0,
     # Shared format primitives and anchored content-addressed storage.
@@ -135,6 +136,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_mailbox_service": 1,
     "aegis_core.team_mailbox_store": 0,
     "aegis_core.team_metrics": 1,
+    "aegis_core.team_native_rollout": 0,
     "aegis_core.team_native_wire": 0,
     "aegis_core.team_paths": 1,
     "aegis_core.team_profile": 1,
@@ -202,6 +204,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.lifecycle": 2,
     "aegis_core.migrate": 2,
     "aegis_core.metrics": 2,
+    "aegis_core.model_served": 1,
     "aegis_core.outcomes": 2,
     "aegis_core.verification": 2,
     "aegis_core.inference_provider": 2,

@@ -173,6 +173,7 @@ Tier A takes the approval out of the agent's reach: a human code owner other tha
 ## What no tier covers
 
 - Teams role sessions, leases, tested-tree custody and delivery receipts do not change the tier. Separate sessions enforce the registry's independence rule, not a separate OS identity; owner-UID processes remain trusted. A publisher permit or a successful local qualification is not a human merge approval or hosted CI confirmation.
+- The merge-queue library relies on the caller's trusted `read_mode` callback to read the effective target policy. Preparation checks the mode for the lane head and, if it proceeds, for the candidate commit. A reported `review` or `signature` returns `awaiting-owner-review` or `awaiting-owner-signature`, respectively. The library reruns preparation before issuing a candidate for the exact landing tree.
 - Hooks fail open. Agent hooks are guardrails, not a security boundary: an Aegis error, a timeout, or an edit made through a shell command passes them. CI on the exact commit is the floor.
 - `refs/remotes/origin/*` is writable by the agent, so tier detection and the approval ancestry test are only as strong as that ref.
 - Aegis does not sandbox processes, and it does not read classic branch protection, only rulesets.
