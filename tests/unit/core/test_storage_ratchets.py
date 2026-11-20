@@ -122,6 +122,7 @@ AUDIT_WRITERS = {
     ("aegis_core/sync.py", "_commit"): "existing TemporaryDirectory; source lines 450",
     ("aegis_core/sync.py", "_restore"): "existing , rmdir; source lines 423, 426, 432",
     ("aegis_core/sync.py", "_write_examples"): "existing mkdir; source lines 265",
+    ("aegis_core/team_board.py", "Board._reap_stale_pending"): "BOARD-PARITY-1b: under the held board write lock, unlink events names that fullmatch the exact staging pattern through the held events directory descriptor before the entry census.",
     ("aegis_core/team_board.py", "Board.move_position"): "TA-1d: replace the validated endpoint/channel cursor by descriptor within the held positions directory; remove only this attempt's unpublished pending file on replacement failure.",
     ("aegis_core/team_board.py", "Board.tombstone"): "TA-1d: descriptor-relative unlink of the selected tombstoned content file under board exclusion and a held content directory; missing content is an idempotent retry, other deletion failure rolls back this attempt's event.",
     ("aegis_core/team_gitops.py", "GitOpsJournal._transaction"): "GM-4: open the private no-follow journal under its descriptor-relative writer lock and enforce file mode 0600",
