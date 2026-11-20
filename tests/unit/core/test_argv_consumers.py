@@ -4,7 +4,9 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import subprocess
 import sys
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +19,39 @@ from tests import helpers_verified as hv
 
 
 CONSUMERS = ("model", "tests", "language", "coverage", "perf", "driver")
+
+
+CI_ENVIRONMENT_NAMES = (
+    "GITHUB_EVENT_PATH", "GITHUB_EVENT_NAME", "GITHUB_REF", "GITHUB_BASE_REF",
+    "GITHUB_STEP_SUMMARY", "GITHUB_REF_NAME",
+    "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
+    "GH_HOST", "GH_REPO", "GITHUB_SHA", "GITHUB_REF_TYPE", "GITHUB_OUTPUT",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT", "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE", "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX",
+    "GIT_SHALLOW_FILE", "GIT_COMMON_DIR", "GIT_NAMESPACE",
+    "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_KEY_0",
+    "GIT_CONFIG_VALUE_0", "GIT_CONFIG_KEY_123456", "GIT_CONFIG_VALUE_123456",
+)
+
+
+def test_ambient_ci_environment_is_isolated(tmp_path):
+    """Plant launcher inputs before collection, independently of the host's environment."""
+    _run_ci_environment_probe(tmp_path, workers=0)
+
+
+def test_explicit_ci_environment_is_restored_after_failure(tmp_path, monkeypatch):
+    _run_ci_environment_probe(tmp_path, workers=0)
+    name = "GITHUB_REF"
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="^test-owned failure$"):
+            with monkeypatch.context() as scoped:
+                scoped.setenv(name, "test-owned value")
+                assert os.environ[name] == "test-owned value"
+                raise RuntimeError("test-owned failure")
+        present = name in os.environ
+        assert not present, name
 
 
 @pytest.fixture(params=("posix", "nt"), ids=("POSIX", "Windows"))
@@ -170,8 +205,7 @@ def malformed_project(tmp_path, monkeypatch):
     repo = hv.make_project(tmp_path, real_tests=True)
     for key, value in repo.home.env.items():
         monkeypatch.setenv(key, value)
-    for key in ("GIT_CONFIG_GLOBAL", "GITHUB_EVENT_PATH", "GITHUB_EVENT_NAME", "GITHUB_BASE_REF"):
-        monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("GIT_CONFIG_GLOBAL", raising=False)
     repo.write("src/app.py", "def app():\n    return 2\n")
     repo.write("tests/test_new.py", "def test_new():\n    assert True\n")
     repo.commit("fix: change app with a regression test")
@@ -263,3 +297,207 @@ def test_public_driver_decoder_retains_runner_path_fallback(commands, platform, 
     _read, program, _root, _calls = commands
     first = {"single": shlex.quote(str(program)), "double": f'"{program}"', "unquoted": str(program)}[quoting]
     assert runner.split_driver_command(first + " --json") == [str(program), "--json"]
+
+
+def _probe_git(root, environment, *arguments):
+    return subprocess.run(
+        ["git", "-c", "user.name=Probe", "-c", "user.email=probe@example.com",
+         "-c", "commit.gpgsign=false", *arguments], cwd=root, env=environment,
+        capture_output=True, text=True, check=True, timeout=30,
+    )
+
+
+def _ci_probe_module(names, observations, fail):
+    # This is a real child test module: its first observation runs at collection.
+    return ("NAMES = " + repr(tuple(names)) + "\nOBSERVATIONS = " + repr(str(observations))
+            + "\nFAIL = " + repr(fail) + "\n" + textwrap.dedent('''
+        import json
+        import os
+        from pathlib import Path
+        import subprocess
+        import pytest
+
+        def snapshot(phase):
+            values = {name: os.environ.get(name) for name in NAMES}
+            worker = os.environ.get("PYTEST_XDIST_WORKER", "main")
+            module = Path(__file__).stem
+            payload = {"values": values, "worker": worker, "module": module, "phase": phase,
+                       "ceiling": os.environ.get("GIT_CEILING_DIRECTORIES"),
+                       "pythonpath": os.environ.get("PYTHONPATH")}
+            path = Path(OBSERVATIONS) / (module + "-" + phase + "-" + worker + ".json")
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+        snapshot("collection")
+
+        @pytest.fixture(scope="session", autouse=True)
+        def session_environment():
+            snapshot("session")
+
+        @pytest.fixture(scope="module")
+        def own_repository(tmp_path_factory):
+            snapshot("module")
+            root = tmp_path_factory.mktemp("own-repository")
+            (root / "owned.txt").write_text("child-owned content", encoding="utf-8")
+            for arguments in (("init", "-q"), ("add", "-A"),
+                              ("commit", "--allow-empty", "-qm", "child commit")):
+                subprocess.run(
+                    ["git", "-c", "user.name=Probe", "-c", "user.email=probe@example.com",
+                     "-c", "commit.gpgsign=false", *arguments], cwd=root,
+                    capture_output=True, text=True, check=True, timeout=30)
+            os.environ["GITHUB_REF"] = "fixture-owned"
+            yield root
+            os.environ.pop("GITHUB_REF", None)
+
+        def test_01_body(own_repository, monkeypatch):
+            snapshot("body")
+            os.environ["GITHUB_EVENT_NAME"] = "test-owned leak"
+            monkeypatch.setenv("GITHUB_EVENT_NAME", "temporary test-owned value")
+
+        def test_02_after_leak(own_repository):
+            snapshot("after-leak")
+
+        def test_03_session_failure(own_repository):
+            snapshot("failure")
+            if FAIL:
+                raise RuntimeError("probe-owned session failure")
+    '''))
+
+
+def _run_ci_environment_probe(tmp_path, workers, clear_pythonpath=False):
+    if not hg.git_ok():
+        pytest.skip("needs git")
+    from pathlib import Path
+
+    repository = Path(__file__).resolve().parents[3]
+    home, external = tmp_path / "home", tmp_path / "external"
+    home.mkdir()
+    external.mkdir()
+    environment = {name: value for name, value in os.environ.items()
+                   if not name.upper().startswith("GIT_")}
+    environment.update(HOME=str(home), USERPROFILE=str(home), GIT_CONFIG_NOSYSTEM="1")
+    _probe_git(external, environment, "init", "-q")
+    (external / "sentinel.txt").write_text("original", encoding="utf-8")
+    _probe_git(external, environment, "add", "-A")
+    _probe_git(external, environment, "commit", "-qm", "external fixture")
+    index = tmp_path / "external-index"
+    original_index = (external / ".git" / "index").read_bytes()
+    index.write_bytes(original_index)
+    (external / "sentinel.txt").write_text("must not be staged", encoding="utf-8")
+    global_config = tmp_path / "global.gitconfig"
+    global_config.write_text("[user]\n\temail = ambient@example.com\n", encoding="utf-8")
+    system_config = tmp_path / "system.gitconfig"
+    system_config.write_text("[user]\n\tname = Ambient System\n", encoding="utf-8")
+    ceiling = tmp_path / "launcher-ceiling"
+    ceiling.mkdir()
+    environment["GIT_CEILING_DIRECTORIES"] = str(ceiling)
+    event = tmp_path / "event.json"
+    event.write_text("{}", encoding="utf-8")
+    hostile = {name: "hostile-ambient-value" for name in CI_ENVIRONMENT_NAMES}
+    hostile.update({
+        "GIT_INDEX_FILE": str(index), "GIT_DIR": str(external / ".git"),
+        "git_dir": str(external / ".git"), "GIT_NAMESPACE": "ambient",
+        "GIT_WORK_TREE": str(external), "GIT_CONFIG_COUNT": "123457",
+        "GIT_CONFIG_KEY_0": "safe.directory", "GIT_CONFIG_VALUE_0": "*",
+        "GIT_CONFIG_KEY_123456": "user.name", "GIT_CONFIG_VALUE_123456": "Ambient Probe",
+        "GIT_CONFIG_GLOBAL": str(global_config), "GITHUB_EVENT_PATH": str(event),
+        "GIT_CONFIG_SYSTEM": str(system_config), "GIT_CONFIG_PARAMETERS": "'core.abbrev'='12'",
+        "GITHUB_REF": "refs/heads/ambient", "GITHUB_EVENT_NAME": "push",
+    })
+    environment.update(hostile)
+    environment.update(PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", PYTEST_ADDOPTS="", PYTEST_PLUGINS="")
+    if clear_pythonpath:
+        environment.pop("PYTHONPATH", None)
+    inherited_pythonpath = environment.get("PYTHONPATH")
+    # Fresh worker interpreters must be able to import tests.conftest.
+    environment["PYTHONPATH"] = os.pathsep.join(filter(None, (str(repository), inherited_pythonpath)))
+    for name in ("PYTEST_XDIST_WORKER", "PYTEST_XDIST_WORKER_COUNT", "PYTEST_XDIST_TESTRUNUID"):
+        environment.pop(name, None)
+    observations = tmp_path / "observations"
+    observations.mkdir()
+    trees = []
+    for attempt in range(2):
+        tree = tmp_path / ("suite-" + str(attempt))
+        tree.mkdir()
+        trees.append(str(tree))
+        for module in ("a", "b"):
+            (tree / ("test_probe_" + str(attempt) + "_" + module + ".py")).write_text(
+                _ci_probe_module(hostile, observations, fail=attempt == 0), encoding="utf-8")
+    error_tree = tmp_path / "collection-error"
+    error_tree.mkdir()
+    (error_tree / "test_collection_error.py").write_text(
+        'raise RuntimeError("probe-owned collection failure")\n', encoding="utf-8")
+    trees.append(str(error_tree))
+    report = tmp_path / "restored.json"
+    launcher = textwrap.dedent('''
+        import json
+        import os
+        from pathlib import Path
+        import sys
+        sys.path.insert(0, sys.argv[1])
+        import pytest
+        roots, names, report, workers = json.loads(sys.argv[2]), json.loads(sys.argv[3]), sys.argv[4], sys.argv[5]
+        results = []
+        for root in roots:
+            code = pytest.main([
+                "-p", "tests.conftest", "-p", "xdist.plugin", "--import-mode=importlib",
+                "--rootdir", root, "--confcutdir", root, "--basetemp", root + "/temporary",
+                "-n", workers, "--dist=loadfile", "-q", root])
+            results.append({"code": int(code), "values": {name: os.environ.get(name) for name in names},
+                            "ceiling": os.environ.get("GIT_CEILING_DIRECTORIES")})
+            Path(report).write_text(json.dumps(results), encoding="utf-8")
+    ''')
+    child = subprocess.run(
+        [sys.executable, "-c", launcher, str(repository), json.dumps(trees),
+         json.dumps(list(hostile)), str(report), str(workers)], cwd=tmp_path,
+        env=environment, capture_output=True, text=True, timeout=180,
+    )
+    records = {path.stem: json.loads(path.read_text(encoding="utf-8"))
+               for path in observations.glob("*.json")}
+    assert records, "child produced no observation records"
+    expected_pythonpath = str(repository)
+    if inherited_pythonpath:
+        expected_pythonpath += os.pathsep + inherited_pythonpath
+    # Assert before inspecting a child failure: RED must identify inherited state.
+    for name, record in sorted(records.items(), key=lambda item: (item[1]["phase"] != "module", item[0])):
+        if record["phase"] == "collection":
+            assert record["ceiling"] == str(ceiling), "launcher ceiling changed before fixtures"
+            pythonpath_matches = record["pythonpath"] == expected_pythonpath
+            assert pythonpath_matches, f"{name} did not receive the probe's Python import path"
+        else:
+            assert str(ceiling) in record["ceiling"].split(os.pathsep), "launcher ceiling was removed"
+        for key, value in record["values"].items():
+            expected = "fixture-owned" if key == "GITHUB_REF" and record["phase"] in (
+                "body", "after-leak", "failure") else None
+            assert value == expected, (name, key, "unexpected CI environment")
+    assert index.read_bytes() == original_index, "external index changed"
+    assert child.returncode == 0, child.stdout + child.stderr
+    restored = json.loads(report.read_text(encoding="utf-8"))
+    collection_failure = 2 if workers == 0 else 1  # xdist reports failed worker collection as TESTS_FAILED.
+    assert [item["code"] for item in restored] == [1, 0, collection_failure]
+    assert all(item["values"] == hostile for item in restored), "launcher environment was not restored"
+    assert all(item["ceiling"] == str(ceiling) for item in restored), "launcher ceiling was not restored"
+    assert "probe-owned session failure" in child.stdout
+    assert "probe-owned collection failure" in child.stdout
+    expected_groups = {
+        ("test_probe_" + str(attempt) + "_" + module, phase)
+        for attempt in range(2) for module in ("a", "b")
+        for phase in ("collection", "session", "module", "body", "after-leak", "failure")
+    }
+    assert {(record["module"], record["phase"]) for record in records.values()} == expected_groups
+    expected_workers = {"main"} if workers == 0 else {"gw0", "gw1"}
+    assert {record["worker"] for record in records.values()} == expected_workers
+    for module, phase in expected_groups:
+        group = [record for record in records.values() if (record["module"], record["phase"]) == (module, phase)]
+        if phase == "collection":
+            assert {record["worker"] for record in group} == expected_workers
+        else:
+            assert len(group) == 1
+
+
+@pytest.mark.parametrize(
+    ("workers", "clear_pythonpath"),
+    [(0, False), (2, False), (2, True)],
+    ids=["serial", "xdist", "xdist-no-pythonpath"],
+)
+def test_ci_environment_is_removed_before_collection_and_restored(tmp_path, workers, clear_pythonpath):
+    _run_ci_environment_probe(tmp_path, workers, clear_pythonpath)
