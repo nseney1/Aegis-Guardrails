@@ -361,7 +361,7 @@ def test_injected_route_policy_and_history_count_refuse_without_writes(tmp_path,
     policy = replace(ROLES, vertical_routes=())
     with mailbox(root, roles=policy) as restricted:
         before = snapshot(root)
-        with refusal("invalid_record"):
+        with refusal("scope"):
             restricted.publish(request("third"))
         assert snapshot(root) == before
     with mailbox(root) as normal:
@@ -987,7 +987,7 @@ def test_binding_history_read_once_per_operation_then_fresh_retry(tmp_path, monk
 
         before = snapshot(root)
         if surface == "fence":
-            with refusal("invalid_record"):
+            with refusal("binding"):
                 observe()
         else:
             assert observe()["ready"] is False
@@ -3912,6 +3912,11 @@ REFUSAL_WIRE_SHA256 = {
     "unknown_host": "d114db378f4f63dcc37d33c9cadbec8554e71d1e23f3af4d8d23b87cca563c7d",
     "unsafe_path": "e0d692d29d99687b605815236109bb78aa9c83f1a63c3c930f993e64ac3378a9",
     "unsupported_platform": "7b81f3db77b03e445c96a5e5c6436185a23d000468222ed546338d80286f864d",
+    # The four Records parity reasons extend the existing byte assertions.
+    "scope": "575cbf2192afb4b8bf96d747caf1221b5c81a8980e00d5b97002eb39fab3f613",
+    "binding": "900c500f2f710e6dba5b9c0efe99928ddcb2e045d424648a7328f22d2827943b",
+    "reference": "2cd7142791bf99fb66dcfb9dc1a91ab5cb46778a387a96d8352b16b4ee451932",
+    "history": "d1e12b3f445e4d1f768cf49eeff68c25de3c9b8ce374c72804e7d23f93ed055f",
 }
 REFUSAL_ROUTES = ["constructor", "stored_constructor", "reflected_constructor",
                   "require", "stored_require", "reflected_require", "subclass"]

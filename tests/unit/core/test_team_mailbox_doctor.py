@@ -1,4 +1,5 @@
 """Read-only product doctor: legacy observations, secure refusal and retry."""
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import errno
 import json
@@ -11,9 +12,10 @@ from types import SimpleNamespace
 import pytest
 
 from conftest import symlink_or_skip
+from aegis_core import team_mailbox as mailbox_module
 from aegis_core import team_mailbox_store as storage
 from aegis_core import team_mailbox_doctor as module
-from aegis_core.team_mailbox_primitives import RoleTables
+from aegis_core.team_mailbox_primitives import MailboxRefusal, RoleTables
 from tools import hierarchy_mailbox as legacy
 from tools import hierarchy_mailbox_doctor as legacy_doctor
 
@@ -609,6 +611,63 @@ def test_r1b_unknown_host_is_a_local_issue_and_keeps_prior_issues(tmp_path, targ
     path.write_bytes(original)
     broken.unlink()
     assert module.inspect_mailbox(root, **OPTIONS)["healthy"]
+
+
+@pytest.mark.parametrize("reason", ["scope", "binding", "reference", "history"])
+def test_parity_refusal_is_local_and_inspection_keeps_collecting_issues(tmp_path, monkeypatch, reason):
+    root = make_store(tmp_path)
+    options = dict(OPTIONS)
+    if reason == "history":
+        reported = root / "bindings/a/front-door"
+        path = reported / "000002.json"
+        clean = None
+        path.write_bytes((reported / "000001.json").read_bytes())
+        monkeypatch.setattr(mailbox_module, "MAX_RECORDS", 1)
+        code = "MD_BINDING"
+    else:
+        original_path = next((root / "a/orchestrator").glob("*.md"))
+        reported = path = original_path.with_name("seed.md")
+        original_path.rename(path)
+        clean = path.read_bytes()
+        header, body = clean[4:].split(b"\n---\n\n", 1)
+        message = json.loads(header)
+        if reason == "reference":
+            message["in_reply_to"] = "missing"
+        else:
+            message["to"] = "b/orchestrator"
+        if reason == "binding":
+            # Inspection does not fence a caller. Exercise the typed refusal
+            # through the injected role policy during stored-message validation.
+            class BindingPolicy(RoleTables):
+                def endpoint_parts(self, endpoint):
+                    if endpoint == "b/orchestrator":
+                        raise MailboxRefusal("binding")
+                    return super().endpoint_parts(endpoint)
+            options["roles"] = BindingPolicy()
+        path.write_bytes(b"---\n" + json.dumps(message).encode() + b"\n---\n\n" + body)
+        code = "MD_MESSAGE"
+
+    lock = root / ".write.lock"
+    lock.write_bytes(b"{}")
+    before = snapshot(root)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        inspections = [pool.submit(module.inspect_mailbox, root, **options) for _ in range(2)]
+        reports = [inspection.result(timeout=10) for inspection in inspections]
+    assert reports[0] == reports[1]
+    report = reports[0]
+    assert not report["healthy"]
+    assert {"code": code, "path": str(reported.relative_to(root.parent))} in report["issues"]
+    assert {"code": "MD_LOCK", "path": str(lock.relative_to(root.parent))} in report["issues"]
+    if reason != "history":
+        assert report["index"] == {"status": "unavailable", "reason": "pinned_reconciliation", "differences": []}
+    assert snapshot(root) == before
+
+    if clean is None:
+        path.unlink()
+    else:
+        path.write_bytes(clean)
+    lock.unlink()
+    assert module.inspect_mailbox(root, **options)["healthy"]
 
 
 @pytest.mark.parametrize("target", ["manifest", "message", "binding", "brief", "lock"])
