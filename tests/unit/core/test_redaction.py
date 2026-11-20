@@ -10,6 +10,7 @@ Tokens are assembled at run time so push protection never sees a literal.
 from __future__ import annotations
 
 import ast
+import io
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ import runpy
 import shutil
 import subprocess
 import sys
+import tokenize
 from types import GeneratorType, SimpleNamespace
 from typing import Dict, Iterable, List, Tuple
 import unicodedata
@@ -38,32 +40,68 @@ from aegis_core.primitives import real_path
 from aegis_core.verification.scanners import TIER_A_PATTERNS, scan_secrets_text
 
 REPO = Path(real_path(__file__)).parents[3]
-# Reviewed parse-cost ratchet: retain headroom for ordinary source additions.
-# Increasing this ceiling requires review; failures list all parsed paths.
-# Coordinator CEILING RULING 2026-11-16T21:22:03Z reviewed these six additions:
-# aegis_core/team_lease_custody.py, tests/helpers_reviewed_sources.py,
-# aegis_core/primitives.py, tests/unit/core/test_primitives.py,
-# aegis_core/pathlookup.py, tests/unit/core/test_gitsafe.py.
-# Coordinator CEILING RULING TA-1a 2026-11-16T22:57:17Z also reviewed:
-# aegis_core/team_mailbox_primitives.py (TA-1a).
-# 78 -> 82 (2026-11-17 coordinator, shared reviewed raise after #617; tip measured 78): aegis_core/workspace/diagnostics.py and
-# tests/unit/core/test_workspace_diagnostics.py (WORKSPACE-RECOVERY-FRAME, public clip_atomic_text), aegis_core/team_board.py (TA-1d),
-# aegis_core/merge_queue.py (GM-9).
-# Coordinator ROUND-5b RULING 2026-11-17T21:18:05Z: measured 83 parsed files; reviewed additions:
-# aegis_core/team_host_qualify_evidence.py, tests/unit/core/test_team_host_qualify_evidence.py.
-# Both were checked: neither imports a private redaction name.
-# PROPOSAL-CLEAN-DELETED-VIEW round 4 reviewed direct importers:
-# aegis_core/redaction_patterns.py (this item), aegis_core/team_jobs_recipes.py
-# (TA-5a) and aegis_core/merge_queue.py (GM-9); count <= ceiling in any landing order.
-# Coordinator ROUND-5: merged census N=84; reviewed ceiling N+4=88.
-# Pending: aegis_core/team_jobs_recipes.py (TA-5a), aegis_core/merge_queue.py (GM-9),
-# aegis_core/team_workspace_display.py (TA-4c),
-# tests/unit/core/test_display_attribution_dense.py (TEST-DISPLAY; text-only mention
-# until REDACTION-CENSUS-IMPORT-PREFILTER removes it), and
-# tests/unit/core/test_ruleyaml.py (RULE-PARSE-ERROR-ECHO; text-only mention
-# until REDACTION-CENSUS-IMPORT-PREFILTER removes it).
-REDACTION_PARSE_CEILING = 89
-
+# Coordinator scope ruling 2026-11-18: review paths, not a numeric ceiling.
+# Round 1b reviews importer syntax, including parent-package and relative forms.
+# This set never selects sources or exempts a token candidate from parsing.
+REVIEWED_REDACTION_IMPORTERS = frozenset({
+    "aegis_cli/check.py",
+    "aegis_cli/doctor_git_report.py",
+    "aegis_cli/formatters/text.py",
+    "aegis_cli/hooks/redaction.py",
+    "aegis_cli/language_capabilities.py",
+    "aegis_cli/status.py",
+    "aegis_cli/team.py",
+    "aegis_cli/ui/theme.py",
+    "aegis_core/approval_policy.py",
+    "aegis_core/diagnostic_messages.py",
+    "aegis_core/gitops_rows.py",
+    "aegis_core/gitsafe_policy.py",
+    "aegis_core/gitsafe_run.py",
+    "aegis_core/guidance_grammar.py",
+    "aegis_core/insights/__init__.py",
+    "aegis_core/insights/capture.py",
+    "aegis_core/insights/review.py",
+    "aegis_core/merge_queue.py",
+    "aegis_core/model_select.py",
+    "aegis_core/pathlookup_gitcache.py",
+    "aegis_core/proposals/model.py",
+    "aegis_core/rule_lint.py",
+    "aegis_core/team_board.py",
+    "aegis_core/team_claims.py",
+    "aegis_core/team_custody_checks.py",
+    "aegis_core/team_git.py",
+    "aegis_core/team_jobs_recipes.py",
+    "aegis_core/team_mailbox_primitives.py",
+    "aegis_core/team_paths.py",
+    "aegis_core/team_profile_display.py",
+    "aegis_core/team_qualify.py",
+    "aegis_core/team_queue.py",
+    "aegis_core/team_session_wake.py",
+    "aegis_core/team_supervisor.py",
+    "aegis_core/team_supervisor_observe.py",
+    "aegis_core/team_writer_binding.py",
+    "aegis_core/verification/scanners.py",
+    "aegis_core/workspace/diagnostics.py",
+    "aegis_mcp/tools.py",
+    "tests/conftest.py",
+    "tests/helpers_reviewed_sources.py",
+    "tests/integration/provider_recovery_admissions.py",
+    "tests/integration/test_hierarchy_launcher.py",
+    "tests/integration/test_hierarchy_workspace.py",
+    "tests/unit/cli/test_check_ci_push.py",
+    "tests/unit/core/test_approval_policy.py",
+    "tests/unit/core/test_gitsafe.py",
+    "tests/unit/core/test_guidance_projection.py",
+    "tests/unit/core/test_insight_redaction_bounds.py",
+    "tests/unit/core/test_insights.py",
+    "tests/unit/core/test_message_codec.py",
+    "tests/unit/core/test_primitives.py",
+    "tests/unit/core/test_proposals_store.py",
+    "tests/unit/core/test_redaction.py",
+    "tests/unit/core/test_team_queue.py",
+    "tests/unit/verification/test_redaction_parity.py",
+    "tests/unit/verification/test_scanners.py",
+})
 
 def assignment_values(statement):
     """Index ordinary annotated and nested tuple/list bindings conservatively."""
@@ -504,7 +542,10 @@ def test_round4_correctness_local_uncached_checkout_import_passes(tmp_path, call
     checkout = tmp_path / "checkout"
     text = "# redaction\n" if caller == "test_redaction.py" else (
         "from aegis_core.insights import " + ", ".join(insight_module.__all__) + "\n")
-    reviewed_helper.freeze_fixture_sources(checkout, [("aegis_core/reviewed.py", text)])
+    rows = [("aegis_core/reviewed.py", text)]
+    if caller == "test_redaction.py":
+        rows.extend((name, "import aegis_core.redaction\n") for name in sorted(REVIEWED_REDACTION_IMPORTERS))
+    reviewed_helper.freeze_fixture_sources(checkout, rows)
     package = checkout / "fixture_uncached" / "nested"
     package.mkdir(parents=True)
     (package.parent / "__init__.py").write_text("", encoding="utf-8")
@@ -1405,12 +1446,49 @@ def test_scanners_defines_no_redaction_table_and_no_redactor():
     assert [name for name in assigned if name.endswith(("REDACTIONS", "REPLACEMENTS"))] == []
 
 
+def redaction_candidate(text: str) -> bool:
+    """Over-select by identifier token; a tokenizer failure also requires parsing.
+
+    Python 3.9's pure-Python tokenizer and 3.12's C tokenizer both emit the
+    identifier naming this module as NAME. NFKC maps its look-alike spellings
+    to redaction regardless of the surrounding import grammar or identifiers.
+    """
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(text).readline):
+            if token.type == tokenize.NAME and unicodedata.normalize("NFKC", token.string) == "redaction":
+                return True
+    except (tokenize.TokenError, SyntaxError):
+        return True
+    return False
+
+
+def is_redaction_importer(tree, label: str) -> bool:
+    """Classify actual imports at every depth, resolving relative package levels."""
+    package = Path(label).parts[:-1]
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(name.name == "aegis_core.redaction" or name.name.startswith("aegis_core.redaction.")
+                   for name in node.names):
+                return True
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if node.level:
+                if node.level > len(package):
+                    continue
+                parent = package[:len(package) - node.level + 1]
+                module = ".".join((*parent, *module.split("."))) if module else ".".join(parent)
+            if module == "aegis_core.redaction" or module.startswith("aegis_core.redaction."):
+                return True
+            if module == "aegis_core" and any(name.name == "redaction" for name in node.names):
+                return True
+    return False
+
+
 def private_imports(sources: Iterable[Tuple[str, str]]) -> List[str]:
     """``label:line: aegis_core.redaction._name`` for each import of an underscore name of the module."""
     found = []
     for label, text in check_census_rows(sources):
-        # Python normalizes identifiers with NFKC before exposing them in the AST.
-        if "redaction" not in text and (text.isascii() or "redaction" not in unicodedata.normalize("NFKC", text)):
+        if not redaction_candidate(text):
             continue
         for node in ast.walk(ast.parse(text, filename=label)):
             if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module == "aegis_core.redaction":
@@ -1432,20 +1510,27 @@ def test_no_module_imports_a_private_name_of_redaction(monkeypatch: pytest.Monke
     real_parse = ast.parse
     parse_count = 0
     parsed = []
+    importers = set()
 
     def counted_parse(text, filename):
         nonlocal parse_count
         parse_count += 1
         parsed.append(filename)
-        return real_parse(text, filename=filename)
+        tree = real_parse(text, filename=filename)
+        if is_redaction_importer(tree, filename):
+            importers.add(filename)
+        return tree
 
     counted_ast = SimpleNamespace(**vars(ast))
     counted_ast.parse = counted_parse
     monkeypatch.setattr(sys.modules[__name__], "ast", counted_ast)
     assert private_imports(_python_sources() if sources is None else sources) == []
-    assert 0 < parse_count <= REDACTION_PARSE_CEILING, (
-        f"redaction parse census: {parse_count} files; reviewed ceiling {REDACTION_PARSE_CEILING}. "
-        "Review source additions before raising the ceiling. Parsed files:\n" + "\n".join(parsed)
+    assert importers == REVIEWED_REDACTION_IMPORTERS, (
+        "redaction parse census: unreviewed importer paths.\nAdded:\n"
+        + "\n".join(sorted(importers - REVIEWED_REDACTION_IMPORTERS))
+        + "\nMissing:\n" + "\n".join(sorted(REVIEWED_REDACTION_IMPORTERS - importers))
+        + "\nParsed files:\n" + "\n".join(parsed)
+        + f"\nMeasured parses: {parse_count}; reviewed paths: {len(REVIEWED_REDACTION_IMPORTERS)}"
     )
 
 
@@ -1514,21 +1599,33 @@ def test_private_import_census_refuses_an_unreadable_index(tmp_path: Path):
             runpy.run_path(str(module))
 
 
-@pytest.mark.parametrize("count", [1, 66, REDACTION_PARSE_CEILING])
-def test_private_import_census_accepts_additions_within_reviewed_ceiling(tmp_path, count):
-    sources = [(f"tests/reviewed_{index}.py", "# redaction\n") for index in range(count)]
+@pytest.mark.parametrize("count", [0, 1, 66])
+def test_private_import_census_accepts_only_reviewed_importers_and_ignores_mentions(tmp_path, count):
+    sources = [(name, "import aegis_core.redaction\n") for name in sorted(REVIEWED_REDACTION_IMPORTERS)]
+    sources.extend((f"tests/mention_{index}.py", "# from aegis_core.redaction import _x\n")
+                   for index in range(count))
     result = run_census_fixture(tmp_path, "test_redaction.py", sources)
     assert result.returncode == 0, result.stderr.decode()
 
 
-def test_private_import_census_ceiling_failure_lists_every_parsed_file(tmp_path):
-    count = REDACTION_PARSE_CEILING + 1
-    sources = [(f"tests/reviewed_{index}.py", "# redaction\n") for index in range(count)]
+@pytest.mark.parametrize("mutation", ["extra", "missing", "replacement"])
+def test_private_import_census_path_set_failure_lists_every_parsed_file(tmp_path, mutation):
+    sources = [(name, "import aegis_core.redaction\n") for name in sorted(REVIEWED_REDACTION_IMPORTERS)]
+    removed = sources[0][0]
+    added = "tests/unreviewed_importer.py"
+    if mutation in {"missing", "replacement"}:
+        sources.pop(0)
+    if mutation in {"extra", "replacement"}:
+        sources.append((added, "from aegis_core.redaction import SECRET_REPLACEMENTS\n"))
     result = run_census_fixture(tmp_path, "test_redaction.py", sources)
     assert result.returncode != 0
     message = result.stderr.decode()
-    assert f"redaction parse census: {count} files; reviewed ceiling {REDACTION_PARSE_CEILING}." in message
+    assert "redaction parse census: unreviewed importer paths." in message
     assert all(label in message for label, _ in sources)
+    if mutation in {"missing", "replacement"}:
+        assert "Missing:\n" + removed in message
+    if mutation in {"extra", "replacement"}:
+        assert "Added:\n" + added in message
 
 
 @pytest.fixture
@@ -1590,7 +1687,232 @@ def test_an_import_of_a_private_redaction_name_is_named_with_its_line():
     assert private_imports([("fixture.py", src)]) == ["fixture.py:2: aegis_core.redaction._x"]
 
 
-@pytest.mark.parametrize("irrelevant", ["invalid syntax (\n", "# \u2500\ninvalid syntax (\n", "# \u00e9\ninvalid syntax (\n"])
+@pytest.mark.parametrize("irrelevant", [
+    "# caller_redaction\n",
+    "case = 'caller_redaction'\n",
+    "# from aegis_core.redaction import _x\n",
+    "case = 'from aegis_core.redaction import _x'\n",
+    'case = """\nfrom aegis_core.redaction import _x\n"""\n',
+    "from aegis_core.redaction_patterns import TOKEN_REDACTIONS\n",
+    "import other.redaction\n",
+])
+def test_private_name_census_ignores_mentions_and_other_modules(irrelevant):
+    for _ in range(2):
+        assert private_imports([("irrelevant.py", irrelevant)]) == []
+
+
+@pytest.mark.parametrize("source", [
+    "from aegis_core.redaction import _x as renamed\n",
+    "from aegis_core.redaction import (\n    SECRET_REPLACEMENTS,\n    _x,\n)\n",
+    "from aegis_core \\\n    . redaction import _x\n",
+    "from aegis_core.redaction \\\n    import _x\n",
+    "from aegis_core.redacti\uff4fn import _x\n",
+    "from \uff41egis_core.redaction import _x\n",
+    "from aegis\uff3fcore.redaction import _x\n",
+    "if True: from aegis_core . redaction import _x\n",
+    "import os; from aegis_core.redaction import _x\n",
+])
+def test_private_name_census_keeps_all_direct_import_forms(source):
+    line = next(node.lineno for node in ast.walk(ast.parse(source)) if isinstance(node, ast.ImportFrom))
+    for _ in range(2):
+        assert private_imports([("caller.py", source)]) == [f"caller.py:{line}: aegis_core.redaction._x"]
+
+
+@pytest.mark.parametrize("source", [
+    "import aegis_core.redaction\n",
+    "import aegis_core.redaction as r\nr._x\n",
+    "import os, aegis_core . redaction as r\n",
+    "import os as system, \\\n    aegis_core.redaction as r\n",
+    "import aegis_core.redacti\uff4fn as r\n",
+    "from aegis_core.redaction import (\n    SECRET_REPLACEMENTS,\n)\n",
+])
+def test_private_name_census_parses_module_and_public_imports(source):
+    for _ in range(2):
+        # Attribute access was never a private-from-import violation, but the
+        # importing file must still reach the parser and expose malformed text.
+        assert private_imports([("caller.py", source)]) == []
+        with pytest.raises(SyntaxError) as error:
+            private_imports([("caller.py", source + "invalid syntax (\n")])
+        assert error.value.filename == "caller.py"
+
+
+def test_private_name_census_rejects_an_unreviewed_importer_path(tmp_path):
+    sources = [("tests/unreviewed_importer.py", "import aegis_core.redaction\n")]
+    result = run_census_fixture(tmp_path, "test_redaction.py", sources)
+    assert result.returncode != 0, "census accepted an importer outside the reviewed path set"
+    assert "redaction parse census: unreviewed importer paths" in result.stderr.decode()
+
+
+@pytest.mark.parametrize("source", [
+    "from aegis_core import redaction as r\n",
+    "import os as प्रणाली, aegis_core.redaction\n",
+    "import प्रणाली, aegis_core.redaction\n",
+])
+def test_private_name_census_selects_parent_and_combining_mark_imports(source):
+    assert redaction_candidate(source), "valid module importer escaped selection"
+
+
+def test_private_name_census_new_parent_importer_requires_review(tmp_path):
+    sources = [(name, "import aegis_core.redaction\n") for name in sorted(REVIEWED_REDACTION_IMPORTERS)]
+    added = "tests/new_parent_importer.py"
+    sources.append((added, "from aegis_core import redaction as r\n"))
+    result = run_census_fixture(tmp_path, "test_redaction.py", sources)
+    assert result.returncode != 0, "parent-package importer bypassed the reviewed path set"
+    assert "Added:\n" + added in result.stderr.decode()
+    # A review is an explicit path-set edit, not a second way to select sources.
+    variant = census_source_variant(
+        "test_redaction.py", "_python_sources() if sources is None else sources",
+        "\nREVIEWED_REDACTION_IMPORTERS = REVIEWED_REDACTION_IMPORTERS | frozenset({" + repr(added) + "})\n")
+    reviewed = run_census_variant(tmp_path, "test_redaction.py", variant, checkout=tmp_path)
+    assert reviewed.returncode == 0, reviewed.stderr.decode()
+
+
+@pytest.mark.parametrize("label,source", [
+    pytest.param("caller.py", "import aegis_core.redaction\n", id="direct"),
+    pytest.param("caller.py", "import aegis_core.redaction.helpers\n", id="deeper"),
+    pytest.param("caller.py", "import aegis_core.redaction as r\n", id="alias"),
+    pytest.param("caller.py", "from aegis_core.redaction import SECRET_REPLACEMENTS\n", id="from-module"),
+    pytest.param("caller.py", "from aegis_core.redaction.helpers import value\n", id="from-deeper"),
+    pytest.param("caller.py", "from aegis_core import redaction\n", id="parent"),
+    pytest.param("caller.py", "from aegis_core import primitives, redaction, errors\n", id="parent-among-names"),
+    pytest.param("caller.py", "from aegis_core import redaction as r\n", id="parent-alias"),
+    pytest.param("caller.py", "from aegis_core import (\n    primitives,\n    redaction as r,\n)\n", id="parenthesized"),
+    pytest.param("caller.py", "from aegis_core import \\\n    redaction as r\n", id="continued"),
+    pytest.param("caller.py", "import os; from aegis_core import redaction\n", id="semicolon"),
+    pytest.param("caller.py", "def f():\n    import aegis_core.redaction\n", id="function"),
+    pytest.param("caller.py", "class C:\n    from aegis_core import redaction\n", id="class"),
+    pytest.param("caller.py", "try:\n    from aegis_core.redaction import SECRET_REPLACEMENTS\nexcept ImportError:\n    pass\n", id="try"),
+    pytest.param("caller.py", "if enabled:\n    from aegis_core import redaction\n", id="if"),
+    pytest.param("caller.py", "import os as प्रणाली, aegis_core.redaction\n", id="combining-alias"),
+    pytest.param("caller.py", "import प्रणाली, aegis_core.redaction\n", id="combining-module"),
+    pytest.param("caller.py", "import other.प्रणाली, aegis_core.redaction\n", id="combining-component"),
+    pytest.param("caller.py", "from aegis_core import प्रणाली, redaction\n", id="combining-parent-name"),
+    pytest.param("caller.py", "from aegis_core import redaction as प्रणाली\n", id="combining-parent-alias"),
+    pytest.param("caller.py", "from aegis_core.redaction import प्रणाली\n", id="combining-from-name"),
+    pytest.param("caller.py", "import aegis_core.redacti\uff4fn\n", id="nfkc-redaction"),
+    pytest.param("caller.py", "from \uff41egis_core import redaction\n", id="nfkc-parent"),
+    pytest.param("caller.py", "from aegis\uff3fcore import redaction\n", id="nfkc-parent-underscore"),
+    pytest.param("aegis_core/caller.py", "from . import redaction\n", id="relative-parent"),
+    pytest.param("aegis_core/caller.py", "from .redaction import SECRET_REPLACEMENTS\n", id="relative-module"),
+    pytest.param("aegis_core/nested/caller.py", "from .. import redaction as r\n", id="relative-up-parent"),
+    pytest.param("aegis_core/nested/caller.py", "from ..redaction import SECRET_REPLACEMENTS\n", id="relative-up-module"),
+    pytest.param("aegis_core/__init__.py", "from . import redaction\n", id="relative-init"),
+])
+def test_private_name_census_import_syntax_matrix(label, source):
+    for _ in range(2):
+        assert redaction_candidate(source)
+        assert is_redaction_importer(ast.parse(source, filename=label), label)
+
+
+@pytest.mark.parametrize("source,candidate", [
+    pytest.param("text = 'redaction'\n", False, id="string"),
+    pytest.param("# redaction\n", False, id="comment"),
+    pytest.param("test_id = 'caller_redaction'\n", False, id="test-id"),
+    pytest.param("redaction = 1\n", True, id="local-variable"),
+    pytest.param("obj.redaction\n", True, id="attribute"),
+    pytest.param("from aegis_core.redaction_patterns import TOKEN_REDACTIONS\n", False, id="different-leaf"),
+    pytest.param("import other.redaction\n", True, id="different-parent"),
+    pytest.param("from other import redaction\n", True, id="different-from-parent"),
+    pytest.param("import other.aegis_core.redaction\n", True, id="different-prefix"),
+    pytest.param("import redaction\n", True, id="unqualified"),
+])
+def test_private_name_census_nonimporter_candidates(source, candidate):
+    assert redaction_candidate(source) is candidate
+    assert not is_redaction_importer(ast.parse(source), "caller.py")
+    assert private_imports([("caller.py", source)]) == []
+
+
+@pytest.mark.parametrize("label,source", [
+    ("caller.py", "from . import redaction\n"),
+    ("other/caller.py", "from . import redaction\n"),
+    ("aegis_core/caller.py", "from .. import redaction\n"),
+    ("aegis_core/nested/caller.py", "from ...redaction import value\n"),
+])
+def test_private_name_census_relative_imports_respect_package_position(label, source):
+    assert redaction_candidate(source)
+    assert not is_redaction_importer(ast.parse(source, filename=label), label)
+
+
+@pytest.mark.parametrize("source", [
+    "invalid syntax (\n", '"""unterminated\n', "if True:\n    pass\n  pass\n",
+])
+def test_private_name_census_tokenizer_failures_are_parsed_and_retry(source):
+    for _ in range(2):
+        assert redaction_candidate(source)
+        with pytest.raises(SyntaxError) as error:
+            private_imports([("broken.py", source)])
+        assert error.value.filename == "broken.py"
+        assert private_imports([("recovered.py", "from aegis_core.redaction import _x\n")]) == [
+            "recovered.py:1: aegis_core.redaction._x"]
+
+
+def test_private_name_census_parses_each_candidate_once_and_skips_literal_mentions():
+    program = (
+        "import pytest\nfrom tests.unit.core.test_redaction import private_imports\n"
+        "rows = [('variable.py', 'redaction = 1\\n'), ('attribute.py', 'obj.redaction\\n'),\n"
+        "        ('other.py', 'import other.redaction\\n'), ('string.py', 'text = \\\"redaction\\\"\\n'),\n"
+        "        ('comment.py', '# redaction\\n'), ('test_id.py', 'test_id = \\\"caller_redaction\\\"\\n')]\n"
+        "counts = {label: 0 for label, _ in rows}\ncounts['broken.py'] = 0\n"
+        "def observe(event, args):\n"
+        "    if event == 'compile' and args[1] in counts:\n        counts[args[1]] += 1\n"
+        "sys.addaudithook(observe)\n"
+        "assert private_imports(rows) == []\n"
+        "with pytest.raises(SyntaxError):\n    private_imports([('broken.py', 'invalid syntax (\\n')])\n"
+        "assert counts == {'variable.py': 1, 'attribute.py': 1, 'other.py': 1, 'string.py': 0,\n"
+        "                  'comment.py': 0, 'test_id.py': 0, 'broken.py': 1}, counts\n"
+    )
+    result = _run_isolated(program)
+    assert result.returncode == 0, result.stderr.decode()
+
+
+def test_private_name_census_never_underselects_frozen_importers():
+    """Independent oracle: parse every frozen source, then expand AST import targets."""
+    from importlib.util import resolve_name
+
+    importers, missed = set(), []
+    for label, text in _python_sources():
+        tree = ast.parse(text, filename=label)
+        package = ".".join(Path(label).parts[:-1])
+        targets = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                targets.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                try:
+                    module = (resolve_name("." * node.level + (node.module or ""), package)
+                              if node.level else node.module or "")
+                except ImportError:
+                    continue  # A relative import beyond its package cannot resolve to this module.
+                targets.add(module)
+                targets.update(module + "." + alias.name for alias in node.names)
+        if any(target == "aegis_core.redaction" or target.startswith("aegis_core.redaction.") for target in targets):
+            importers.add(label)
+            if not redaction_candidate(text):
+                missed.append(label)
+    assert missed == [], "importers escaped token selection: " + ", ".join(missed)
+    assert importers == REVIEWED_REDACTION_IMPORTERS
+
+
+def test_private_name_census_concurrent_failures_and_retries_are_independent():
+    from concurrent.futures import ThreadPoolExecutor
+
+    def scan(index):
+        label = f"caller_{index}.py"
+        for _ in range(2):
+            with pytest.raises(SyntaxError) as error:
+                private_imports([(label, "from aegis_core.redaction import (\n")])
+            assert error.value.filename == label
+            assert private_imports([(label, "# from aegis_core.redaction import _x\ninvalid syntax\n")]) == []
+            assert private_imports([(label, "from aegis_core.redaction import _x\n")]) == [
+                f"{label}:1: aegis_core.redaction._x"]
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        pending = [pool.submit(scan, index) for index in range(6)]
+        for future in pending:
+            future.result(timeout=5)
+
+
+@pytest.mark.parametrize("irrelevant", ["invalid syntax\n", "# \u2500\ninvalid syntax\n", "# \u00e9\ninvalid syntax\n"])
 def test_private_redaction_import_scan_skips_sources_without_the_needle(irrelevant: str):
     sources = [("irrelevant.py", irrelevant),
                ("caller.py", "import os\nfrom aegis_core.redaction import _x\n")]
@@ -1603,7 +1925,11 @@ def test_private_redaction_import_scan_reports_nfkc_normalized_imports():
     assert private_imports([("caller.py", source)]) == ["caller.py:1: aegis_core.redaction._SECRET_REDACTIONS"]
 
 
-@pytest.mark.parametrize("source", ["redaction syntax (\n", "# \uff52edaction\ninvalid syntax (\n"])
+@pytest.mark.parametrize("source", [
+    "from aegis_core.redaction import (\n",
+    "from aegis_core.redacti\uff4fn import (\n",
+    "import aegis_core.redaction\ninvalid syntax (\n",
+])
 def test_private_redaction_import_scan_still_rejects_malformed_candidates(source: str):
     with pytest.raises(SyntaxError):
         private_imports([("caller.py", source)])
