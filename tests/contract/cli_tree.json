@@ -4074,6 +4074,837 @@
           }
         ],
         "commands": {
+          "board": {
+            "aliases": [],
+            "arguments": [
+              {
+                "default": "==SUPPRESS==",
+                "dest": "help",
+                "flags": [
+                  "-h",
+                  "--help"
+                ],
+                "help": "show this help message and exit",
+                "kind": "help",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "json",
+                "flags": [
+                  "--json"
+                ],
+                "help": "Emit machine-readable JSON output",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "plain",
+                "flags": [
+                  "--plain"
+                ],
+                "help": "Strip ANSI styling and emoji",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "default": "==SUPPRESS==",
+                "dest": "workspace",
+                "flags": [
+                  "--workspace"
+                ],
+                "help": "Target workspace root",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false,
+                "type": "str"
+              },
+              {
+                "default": "==SUPPRESS==",
+                "dest": "board",
+                "flags": [
+                  "--board"
+                ],
+                "help": "Absolute board folder; required once before or after the verb",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false
+              },
+              {
+                "default": null,
+                "dest": "board_action",
+                "flags": [],
+                "help": null,
+                "kind": "parsers",
+                "metavar": null,
+                "nargs": "A...",
+                "required": true
+              }
+            ],
+            "commands": {
+              "add-channel": {
+                "aliases": [],
+                "arguments": [
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "help",
+                    "flags": [
+                      "-h",
+                      "--help"
+                    ],
+                    "help": "show this help message and exit",
+                    "kind": "help",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "json",
+                    "flags": [
+                      "--json"
+                    ],
+                    "help": "Emit machine-readable JSON output",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "plain",
+                    "flags": [
+                      "--plain"
+                    ],
+                    "help": "Strip ANSI styling and emoji",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "workspace",
+                    "flags": [
+                      "--workspace"
+                    ],
+                    "help": "Target workspace root",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "str"
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "board",
+                    "flags": [
+                      "--board"
+                    ],
+                    "help": "Absolute board folder; required once before or after the verb",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
+                  },
+                  {
+                    "default": null,
+                    "dest": "request",
+                    "flags": [
+                      "--request"
+                    ],
+                    "help": "Absolute strict JSON request with no symlink components",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": true
+                  }
+                ],
+                "description": null,
+                "help": "Add a channel"
+              },
+              "digest": {
+                "aliases": [],
+                "arguments": [
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "help",
+                    "flags": [
+                      "-h",
+                      "--help"
+                    ],
+                    "help": "show this help message and exit",
+                    "kind": "help",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "json",
+                    "flags": [
+                      "--json"
+                    ],
+                    "help": "Emit machine-readable JSON output",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "plain",
+                    "flags": [
+                      "--plain"
+                    ],
+                    "help": "Strip ANSI styling and emoji",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "workspace",
+                    "flags": [
+                      "--workspace"
+                    ],
+                    "help": "Target workspace root",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "str"
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "board",
+                    "flags": [
+                      "--board"
+                    ],
+                    "help": "Absolute board folder; required once before or after the verb",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
+                  },
+                  {
+                    "default": null,
+                    "dest": "channel",
+                    "flags": [
+                      "--channel"
+                    ],
+                    "help": "Configured channel name",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": true
+                  },
+                  {
+                    "default": null,
+                    "dest": "as_of",
+                    "flags": [
+                      "--as-of"
+                    ],
+                    "help": "UTC expiry observation time; defaults to now",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
+                  }
+                ],
+                "description": null,
+                "help": "List open blockers and recent posts"
+              },
+              "grant": {
+                "aliases": [],
+                "arguments": [
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "help",
+                    "flags": [
+                      "-h",
+                      "--help"
+                    ],
+                    "help": "show this help message and exit",
+                    "kind": "help",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "json",
+                    "flags": [
+                      "--json"
+                    ],
+                    "help": "Emit machine-readable JSON output",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "plain",
+                    "flags": [
+                      "--plain"
+                    ],
+                    "help": "Strip ANSI styling and emoji",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "workspace",
+                    "flags": [
+                      "--workspace"
+                    ],
+                    "help": "Target workspace root",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "str"
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "board",
+                    "flags": [
+                      "--board"
+                    ],
+                    "help": "Absolute board folder; required once before or after the verb",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
+                  },
+                  {
+                    "default": null,
+                    "dest": "request",
+                    "flags": [
+                      "--request"
+                    ],
+                    "help": "Absolute strict JSON request with no symlink components",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": true
+                  }
+                ],
+                "description": null,
+                "help": "Grant channel access"
+              },
+              "init": {
+                "aliases": [],
+                "arguments": [
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "help",
+                    "flags": [
+                      "-h",
+                      "--help"
+                    ],
+                    "help": "show this help message and exit",
+                    "kind": "help",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "json",
+                    "flags": [
+                      "--json"
+                    ],
+                    "help": "Emit machine-readable JSON output",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "plain",
+                    "flags": [
+                      "--plain"
+                    ],
+                    "help": "Strip ANSI styling and emoji",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "workspace",
+                    "flags": [
+                      "--workspace"
+                    ],
+                    "help": "Target workspace root",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "str"
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "board",
+                    "flags": [
+                      "--board"
+                    ],
+                    "help": "Absolute board folder; required once before or after the verb",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
+                  }
+                ],
+                "description": null,
+                "help": "Initialize a board"
+              },
+              "read": {
+                "aliases": [],
+                "arguments": [
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "help",
+                    "flags": [
+                      "-h",
+                      "--help"
+                    ],
+                    "help": "show this help message and exit",
+                    "kind": "help",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "json",
+                    "flags": [
+                      "--json"
+                    ],
+                    "help": "Emit machine-readable JSON output",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "plain",
+                    "flags": [
+                      "--plain"
+                    ],
+                    "help": "Strip ANSI styling and emoji",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "workspace",
+                    "flags": [
+                      "--workspace"
+                    ],
+                    "help": "Target workspace root",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "str"
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "board",
+                    "flags": [
+                      "--board"
+                    ],
+                    "help": "Absolute board folder; required once before or after the verb",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
+                  },
+                  {
+                    "default": null,
+                    "dest": "channel",
+                    "flags": [
+                      "--channel"
+                    ],
+                    "help": "Configured channel name",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": true
+                  },
+                  {
+                    "default": null,
+                    "dest": "after_post",
+                    "flags": [
+                      "--after-post"
+                    ],
+                    "help": "Continue after this post identifier",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
+                  },
+                  {
+                    "default": 20,
+                    "dest": "limit",
+                    "flags": [
+                      "--limit"
+                    ],
+                    "help": "Page size: default 20, maximum 50",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "int"
+                  }
+                ],
+                "description": null,
+                "help": "Read a channel page"
+              },
+              "revoke": {
+                "aliases": [],
+                "arguments": [
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "help",
+                    "flags": [
+                      "-h",
+                      "--help"
+                    ],
+                    "help": "show this help message and exit",
+                    "kind": "help",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "json",
+                    "flags": [
+                      "--json"
+                    ],
+                    "help": "Emit machine-readable JSON output",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "plain",
+                    "flags": [
+                      "--plain"
+                    ],
+                    "help": "Strip ANSI styling and emoji",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "workspace",
+                    "flags": [
+                      "--workspace"
+                    ],
+                    "help": "Target workspace root",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "str"
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "board",
+                    "flags": [
+                      "--board"
+                    ],
+                    "help": "Absolute board folder; required once before or after the verb",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
+                  },
+                  {
+                    "default": null,
+                    "dest": "request",
+                    "flags": [
+                      "--request"
+                    ],
+                    "help": "Absolute strict JSON request with no symlink components",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": true
+                  }
+                ],
+                "description": null,
+                "help": "Revoke channel access"
+              },
+              "status": {
+                "aliases": [],
+                "arguments": [
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "help",
+                    "flags": [
+                      "-h",
+                      "--help"
+                    ],
+                    "help": "show this help message and exit",
+                    "kind": "help",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "json",
+                    "flags": [
+                      "--json"
+                    ],
+                    "help": "Emit machine-readable JSON output",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "plain",
+                    "flags": [
+                      "--plain"
+                    ],
+                    "help": "Strip ANSI styling and emoji",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "workspace",
+                    "flags": [
+                      "--workspace"
+                    ],
+                    "help": "Target workspace root",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "str"
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "board",
+                    "flags": [
+                      "--board"
+                    ],
+                    "help": "Absolute board folder; required once before or after the verb",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
+                  }
+                ],
+                "description": null,
+                "help": "Show board status"
+              },
+              "tombstone": {
+                "aliases": [],
+                "arguments": [
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "help",
+                    "flags": [
+                      "-h",
+                      "--help"
+                    ],
+                    "help": "show this help message and exit",
+                    "kind": "help",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "json",
+                    "flags": [
+                      "--json"
+                    ],
+                    "help": "Emit machine-readable JSON output",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "plain",
+                    "flags": [
+                      "--plain"
+                    ],
+                    "help": "Strip ANSI styling and emoji",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "workspace",
+                    "flags": [
+                      "--workspace"
+                    ],
+                    "help": "Target workspace root",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "str"
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "board",
+                    "flags": [
+                      "--board"
+                    ],
+                    "help": "Absolute board folder; required once before or after the verb",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
+                  },
+                  {
+                    "default": null,
+                    "dest": "request",
+                    "flags": [
+                      "--request"
+                    ],
+                    "help": "Absolute strict JSON request with no symlink components",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": true
+                  }
+                ],
+                "description": null,
+                "help": "Remove a post as owner"
+              },
+              "verify": {
+                "aliases": [],
+                "arguments": [
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "help",
+                    "flags": [
+                      "-h",
+                      "--help"
+                    ],
+                    "help": "show this help message and exit",
+                    "kind": "help",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "json",
+                    "flags": [
+                      "--json"
+                    ],
+                    "help": "Emit machine-readable JSON output",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "plain",
+                    "flags": [
+                      "--plain"
+                    ],
+                    "help": "Strip ANSI styling and emoji",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "workspace",
+                    "flags": [
+                      "--workspace"
+                    ],
+                    "help": "Target workspace root",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "str"
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "board",
+                    "flags": [
+                      "--board"
+                    ],
+                    "help": "Absolute board folder; required once before or after the verb",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
+                  }
+                ],
+                "description": null,
+                "help": "Validate all events and content"
+              }
+            },
+            "description": null,
+            "help": "Configure and inspect the team board"
+          },
           "claim": {
             "aliases": [],
             "arguments": [
@@ -4754,6 +5585,440 @@
             ],
             "description": "A lease is conflict input, not liveness proof: it records which paths a lane declared and until when, not that its agent is still working. The backstops are the post-lane gate (aegis check --lane) and aegis team metrics.",
             "help": "Show leases (conflict input, not liveness proof)"
+          },
+          "mail": {
+            "aliases": [],
+            "arguments": [
+              {
+                "default": "==SUPPRESS==",
+                "dest": "help",
+                "flags": [
+                  "-h",
+                  "--help"
+                ],
+                "help": "show this help message and exit",
+                "kind": "help",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "json",
+                "flags": [
+                  "--json"
+                ],
+                "help": "Emit machine-readable JSON output",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "plain",
+                "flags": [
+                  "--plain"
+                ],
+                "help": "Strip ANSI styling and emoji",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "default": "==SUPPRESS==",
+                "dest": "workspace",
+                "flags": [
+                  "--workspace"
+                ],
+                "help": "Target workspace root",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false,
+                "type": "str"
+              },
+              {
+                "default": "==SUPPRESS==",
+                "dest": "root",
+                "flags": [
+                  "--root"
+                ],
+                "help": "Absolute mailbox root; required once before or after the verb",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false
+              },
+              {
+                "default": null,
+                "dest": "mail_action",
+                "flags": [],
+                "help": null,
+                "kind": "parsers",
+                "metavar": null,
+                "nargs": "A...",
+                "required": true
+              }
+            ],
+            "commands": {
+              "doctor": {
+                "aliases": [],
+                "arguments": [
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "help",
+                    "flags": [
+                      "-h",
+                      "--help"
+                    ],
+                    "help": "show this help message and exit",
+                    "kind": "help",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "json",
+                    "flags": [
+                      "--json"
+                    ],
+                    "help": "Emit machine-readable JSON output",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "plain",
+                    "flags": [
+                      "--plain"
+                    ],
+                    "help": "Strip ANSI styling and emoji",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "workspace",
+                    "flags": [
+                      "--workspace"
+                    ],
+                    "help": "Target workspace root",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "str"
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "root",
+                    "flags": [
+                      "--root"
+                    ],
+                    "help": "Absolute mailbox root; required once before or after the verb",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
+                  }
+                ],
+                "description": null,
+                "help": "Inspect mailbox health without writes"
+              },
+              "read": {
+                "aliases": [],
+                "arguments": [
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "help",
+                    "flags": [
+                      "-h",
+                      "--help"
+                    ],
+                    "help": "show this help message and exit",
+                    "kind": "help",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "json",
+                    "flags": [
+                      "--json"
+                    ],
+                    "help": "Emit machine-readable JSON output",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "plain",
+                    "flags": [
+                      "--plain"
+                    ],
+                    "help": "Strip ANSI styling and emoji",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "workspace",
+                    "flags": [
+                      "--workspace"
+                    ],
+                    "help": "Target workspace root",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "str"
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "root",
+                    "flags": [
+                      "--root"
+                    ],
+                    "help": "Absolute mailbox root; required once before or after the verb",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
+                  },
+                  {
+                    "default": null,
+                    "dest": "endpoint",
+                    "flags": [
+                      "--endpoint"
+                    ],
+                    "help": "Configured recipient endpoint",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": true
+                  },
+                  {
+                    "const": true,
+                    "default": false,
+                    "dest": "include_briefs",
+                    "flags": [
+                      "--include-briefs"
+                    ],
+                    "help": "Include hash-checked brief text",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": false,
+                    "dest": "binding_only",
+                    "flags": [
+                      "--binding-only"
+                    ],
+                    "help": "Read only the binding and message count",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": null,
+                    "dest": "limit",
+                    "flags": [
+                      "--limit"
+                    ],
+                    "help": "Page size: default 20, maximum 100",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "int"
+                  },
+                  {
+                    "default": null,
+                    "dest": "after",
+                    "flags": [
+                      "--after"
+                    ],
+                    "help": "Continue after this received message identifier",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": false,
+                    "dest": "mark_read",
+                    "flags": [
+                      "--mark-read"
+                    ],
+                    "help": "Root only: record this page after stdout flush",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": null,
+                    "dest": "delivery_dir",
+                    "flags": [
+                      "--delivery-dir"
+                    ],
+                    "help": "Existing owner-selected delivery directory for read receipts",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
+                  },
+                  {
+                    "default": null,
+                    "dest": "host",
+                    "flags": [
+                      "--host"
+                    ],
+                    "help": "The reading root's configured host",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
+                  },
+                  {
+                    "default": null,
+                    "dest": "session",
+                    "flags": [
+                      "--session"
+                    ],
+                    "help": "The reading root's own session",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
+                  },
+                  {
+                    "default": null,
+                    "dest": "generation",
+                    "flags": [
+                      "--generation"
+                    ],
+                    "help": "The reading root's binding generation",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "int"
+                  }
+                ],
+                "description": null,
+                "help": "Read a bounded mailbox page"
+              },
+              "send": {
+                "aliases": [],
+                "arguments": [
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "help",
+                    "flags": [
+                      "-h",
+                      "--help"
+                    ],
+                    "help": "show this help message and exit",
+                    "kind": "help",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "json",
+                    "flags": [
+                      "--json"
+                    ],
+                    "help": "Emit machine-readable JSON output",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "plain",
+                    "flags": [
+                      "--plain"
+                    ],
+                    "help": "Strip ANSI styling and emoji",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "workspace",
+                    "flags": [
+                      "--workspace"
+                    ],
+                    "help": "Target workspace root",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "str"
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "root",
+                    "flags": [
+                      "--root"
+                    ],
+                    "help": "Absolute mailbox root; required once before or after the verb",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
+                  },
+                  {
+                    "default": null,
+                    "dest": "request",
+                    "flags": [
+                      "--request",
+                      "--request-file"
+                    ],
+                    "help": "Absolute strict JSON request with no symlink components, or - for bounded stdin",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": true
+                  }
+                ],
+                "description": null,
+                "help": "Publish a strict mailbox request"
+              }
+            },
+            "description": null,
+            "help": "Send, read and diagnose the team mailbox"
           },
           "metrics": {
             "aliases": [],
