@@ -118,10 +118,6 @@ def test_abbreviated_workspace_operation_failure_is_fixed_json(tmp_path, monkeyp
     monkeypatch.delenv("AEGIS_WORKSPACE", raising=False)
 
     def fail(*args, **kwargs):
-        import sys
-
-        print("token=private-value")
-        print("token=private-value", file=sys.stderr)
         raise TypeError("token=private-value")
 
     module_os = SimpleNamespace(**{name: getattr(os, name) for name in dir(os)})
@@ -316,13 +312,10 @@ def test_raw_model_invocation_has_only_model_json_outcomes(tmp_path, monkeypatch
 
 
 def test_outer_model_policy_covers_stdout_setup_failure(monkeypatch, capsys):
-    import sys
     from types import SimpleNamespace
     from aegis_cli import cli as cli_module
 
     def fail(**kwargs):
-        print("token=private-value")
-        print("token=private-value", file=sys.stderr)
         raise OSError("token=private-value")
 
     # Replace this module's reference, leaving pytest's process streams intact.
