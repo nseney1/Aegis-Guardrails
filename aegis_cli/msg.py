@@ -256,14 +256,14 @@ class MsgCommand(AegisCommand):
                         store.resolve(rid)
                     rid = store.write(value)
                     rendered = json.dumps({"id": rid, "ref": rid[:16]}, separators=(",", ":")) + "\n"
+                elif args.msg_action == "verify":
+                    rid = store.resolve(args.ref)
+                    store.read(rid)
+                    rendered = json.dumps({"id": rid, "ref": rid[:16], "verified": True},
+                                          separators=(",", ":")) + "\n"
                 else:
                     value = store.read(args.ref)
-                    if args.msg_action == "verify":
-                        rid = codec.record_id(value)
-                        rendered = json.dumps({"id": rid, "ref": rid[:16], "verified": True},
-                                              separators=(",", ":")) + "\n"
-                    else:
-                        rendered = codec.read_view(value, store=store, **options)
+                    rendered = codec.read_view(value, store=store, **options)
         except codec.CodecError as error:
             detail = "write_ref" if args.msg_action == "write" and error.code == "E_REF" else error.detail
             return emit_error(error, detail=detail)

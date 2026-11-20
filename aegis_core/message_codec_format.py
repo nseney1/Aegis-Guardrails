@@ -222,9 +222,11 @@ class Budget:
 def _number(value):
     if type(value) is int:
         require(-10 ** 63 < value < 10 ** 64, "E_LIMIT", detail="record")
-    if type(value) is float:
-        require(math.isfinite(value))
-    token = json.dumps(value, allow_nan=False)
+        token = int.__repr__(value)
+    else:
+        if type(value) is float:
+            require(math.isfinite(value))
+        token = json.dumps(value, allow_nan=False)
     require(len(token) <= MAX_NUMBER_CHARS, "E_LIMIT", detail="record")
     return token
 
@@ -319,18 +321,29 @@ def neutral_text(text):
     return _DISPLAY.sub(lambda m: escape_char(m[0]), text)
 
 
-def _strings(value, ascii=True, display=False, budget=None):
+def _strings(value, ascii=True, display=False, budget=None, chunk_size=128):
     # ASCII needs at most six bytes per character; supplementary escapes need
     # twelve. Only canonical collection supplies its live remaining budget.
-    if budget is not None and ascii and not display:
+    budgeted = budget is not None and ascii and not display
+    if budgeted:
         worst = (6 if value.isascii() else 12) * len(value) + 2
         if worst <= budget.limit - budget.used:
             yield json.dumps(value, ensure_ascii=True, allow_nan=False)
             return
     yield '"'
-    for start in range(0, len(value), 128):
-        text = json.dumps(value[start:start + 128], ensure_ascii=ascii, allow_nan=False)[1:-1]
-        yield neutral_text(text) if display else text
+    if budgeted:
+        start = 0
+        while start < len(value):
+            # The collector charges each piece before resuming. Reserve the
+            # temporary quotes and allow one character for exact accounting.
+            remaining = budget.limit - budget.used
+            stop = start + max(1, min(8192, (remaining - 2) // 12))
+            yield json.dumps(value[start:stop], ensure_ascii=True, allow_nan=False)[1:-1]
+            start = stop
+    else:
+        for start in range(0, len(value), chunk_size):
+            text = json.dumps(value[start:start + chunk_size], ensure_ascii=ascii, allow_nan=False)[1:-1]
+            yield neutral_text(text) if display else text
     yield '"'
 
 
@@ -339,7 +352,8 @@ def _put(text, position):
     yield text
 
 
-def json_chunks(value, ascii=True, display=False, ranges=None, path=(), position=None, budget=None):
+def json_chunks(value, ascii=True, display=False, ranges=None, path=(), position=None, budget=None, *,
+                chunk_size=128):
     position = [0] if position is None else position
     start = position[0]
     if type(value) is dict:
@@ -348,22 +362,24 @@ def json_chunks(value, ascii=True, display=False, ranges=None, path=(), position
             if index:
                 yield from _put(",", position)
             key_start = position[0]
-            for chunk in _strings(key, ascii, display, budget):
+            for chunk in _strings(key, ascii, display, budget, chunk_size):
                 yield from _put(chunk, position)
             if ranges is not None and path + (KEY_MARKER, key) in ranges:
                 ranges[path + (KEY_MARKER, key)] = (key_start, position[0])
             yield from _put(":", position)
-            yield from json_chunks(value[key], ascii, display, ranges, path + (key,), position, budget)
+            yield from json_chunks(value[key], ascii, display, ranges, path + (key,), position, budget,
+                                   chunk_size=chunk_size)
         yield from _put("}", position)
     elif type(value) is list or isinstance(value, _views.Rows):
         yield from _put("[", position)
         for index, child in enumerate(value):
             if index:
                 yield from _put(",", position)
-            yield from json_chunks(child, ascii, display, ranges, path + (index,), position, budget)
+            yield from json_chunks(child, ascii, display, ranges, path + (index,), position, budget,
+                                   chunk_size=chunk_size)
         yield from _put("]", position)
     else:
-        pieces = _strings(value, ascii, display, budget) if type(value) is str else (
+        pieces = _strings(value, ascii, display, budget, chunk_size) if type(value) is str else (
             ("null" if value is None else "true" if value is True else "false" if value is False
              else _number(value)),)
         for chunk in pieces:
@@ -380,9 +396,11 @@ def _collect(chunks, budget):
     return "".join(result)
 
 
-def canonical(value):
-    """Validate, then encode budgeted strings whole or in bounded scalar chunks."""
-    _validate(value)
+def canonical(value, *, _size_only=False):
+    """Validate the record and return its canonical bytes or their exact size."""
+    _, size = _validate(value)
+    if _size_only:
+        return size
     budget = Budget(MAX_BYTES, detail="record")
     return _collect(json_chunks(value, budget=budget), budget).encode("utf-8")
 
