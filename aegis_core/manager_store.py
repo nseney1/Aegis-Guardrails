@@ -23,6 +23,7 @@ from aegis_core.config import read_capped
 from aegis_core.errors import LockTimeoutError, PathTraversalError
 from aegis_core.manager_policy import ManagerError, canonical
 from aegis_core.primitives import strict_loads
+from aegis_core.storage_confined import ConfinedFileError, open_directory
 
 __all__ = ["MAX_AUDIT_BYTES", "MAX_ROW_BYTES", "ManagerStore", "in_git_worktree", "resolve_placement_path"]
 
@@ -175,38 +176,38 @@ class ManagerStore:
                 return
             yield None, ()
             return
-        flags = os.O_RDONLY | os.O_DIRECTORY | _FLAGS
-        directory = os.open(self.root.anchor, flags)
-        chain = [(Path(self.root.anchor), (os.fstat(directory).st_dev, os.fstat(directory).st_ino))]
-        current = Path(self.root.anchor)
+        paths = list(reversed((self.root, *self.root.parents)))
+
+        def chain_for(observations):
+            return [(path, info[:2]) for path, info in zip(paths, observations)]
+
+        def missing(parent, part, observations):
+            if not create:
+                raise ConfinedFileError("missing")
+            self._anchor_check(chain_for(observations))
+            try:
+                os.mkdir(part, mode=0o700, dir_fd=parent)
+                os.fsync(parent)
+            except FileExistsError:
+                pass
+
+        held = None
         try:
-            for part in self.root.parts[1:]:
-                current = current / part
-                try:
-                    child = os.open(part, flags, dir_fd=directory)
-                except FileNotFoundError:
-                    if not create:
-                        yield None
-                        return
-                    self._anchor_check(chain)
-                    try:
-                        os.mkdir(part, mode=0o700, dir_fd=directory)
-                        os.fsync(directory)
-                    except FileExistsError:
-                        pass
-                    child = os.open(part, flags, dir_fd=directory)
-                except OSError as exc:
-                    raise ManagerError("unsafe_store") from exc
-                os.close(directory)
-                directory = child
-                info = os.fstat(directory)
-                chain.append((current, (info.st_dev, info.st_ino)))
-            _private(os.fstat(directory), directory=True)
-            self._anchor_check(chain)
-            self._entries(directory)
-            yield directory, chain
-        finally:
-            os.close(directory)
+            with open_directory(os.open, self.root, policy=lambda info: _private(info, directory=True),
+                                on_missing=missing, close_fd=os.close, stat_fd=os.fstat, stat_entry=os.stat) as held:
+                directory, chain = held.fd, chain_for(held.observations)
+                self._anchor_check(chain)
+                self._entries(directory)
+                yield directory, chain
+        except ConfinedFileError as exc:
+            if exc.directory_anchor is not held:
+                raise
+            if exc.reason == "missing" and exc.directory_stage == "create" and not create:
+                yield None
+                return
+            if exc.os_error is not None and exc.directory_stage not in ("open", "verify"):
+                raise exc.os_error from None
+            raise ManagerError("unsafe_store") from exc
 
     @contextmanager
     def _lock_at(self, anchor):

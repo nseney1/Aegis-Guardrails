@@ -1,5 +1,6 @@
 """Board public API: legacy wire parity, refusal atomicity and confined storage."""
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import errno
 import hashlib
@@ -62,7 +63,45 @@ def refused(reason):
     return pytest.raises(MailboxRefusal, match="^mailbox refused: " + reason + "$")
 
 
-def test_publish_read_retry_and_legacy_wire_parity(tmp_path, monkeypatch):
+def plant_grant_history(root, target):
+    """Append exact grant events so a cap test does not depend on the publish rate limit."""
+    events = root / "events"
+    names = sorted(path.name for path in events.iterdir() if core.EVENT_NAME.fullmatch(path.name))
+    seq = int(names[-1][:8])
+    raw = (events / names[-1]).read_bytes()
+    previous = hashlib.sha256(raw).hexdigest()
+    while seq < target:
+        seq += 1
+        event = {"schema": core.SCHEMA, "seq": seq, "at": "2026-11-16T12:00:00.000000Z", "kind": "grant",
+                 "data": {"access": "read", "channel": "alpha", "endpoint": "a/lane/e%06d" % seq,
+                          "source": "owner"}, "prev": previous}
+        event["digest"] = core.event_digest(event)
+        raw = core.encoded(event) + b"\n"
+        (events / ("%08d.json" % seq)).write_bytes(raw)
+        previous = hashlib.sha256(raw).hexdigest()
+    return seq
+
+
+class WaitClock:
+    def __init__(self, after_sleep=lambda: None):
+        self.elapsed = 0.0
+        self.after_sleep = after_sleep
+
+    def monotonic(self):
+        return self.elapsed
+
+    def sleep(self, seconds):
+        assert seconds > 0
+        self.elapsed = round(self.elapsed + seconds, 8)
+        self.after_sleep()
+
+    def inject(self, board):
+        board.monotonic = self.monotonic
+        board.sleep = self.sleep
+
+
+@pytest.mark.parametrize("case", ["normal", "contended_writer", "pending_event"])
+def test_publish_read_retry_and_legacy_wire_parity(tmp_path, monkeypatch, case):
     root = make_store(tmp_path)
     monkeypatch.setattr(legacy, "now_utc", lambda: NOW)
     monkeypatch.setattr(legacy, "timestamp", lambda: "2026-11-16T12:00:00.000000Z")
@@ -73,6 +112,17 @@ def test_publish_read_retry_and_legacy_wire_parity(tmp_path, monkeypatch):
         old.append(state, "channel", CHANNEL)
         old.append(state, "grant", GRANT)
     with core.Board(root, **OPTIONS) as board:
+        if case == "contended_writer":
+            lock, old_lock = (path / ".write.lock" for path in (root, old.path))
+            lock.touch()
+            old_lock.touch()
+            timer = WaitClock(lock.unlink)
+            timer.inject(board)
+            monkeypatch.setattr(legacy, "time", WaitClock(old_lock.unlink))
+        elif case == "pending_event":
+            for path in (root, old.path):
+                (path / "events" / (".pending-" + "a0" * 16)).write_bytes(b"unfinished event")
+            assert board.verify() == old.verify() == {"ok": True, "events": 3, "posts": 0}
         for request in (post(), post("two", kind="blocker"), post("reply", thread="post-00000005")):
             assert board.publish("a/lane/one", request) == old.publish("a/lane/one", request)
         before = snapshot(root)
@@ -82,7 +132,14 @@ def test_publish_read_retry_and_legacy_wire_parity(tmp_path, monkeypatch):
             "a/lane/one", {"channel": "alpha"}, legacy.cli_line)
         assert board.verify() == old.verify()
         assert core.digest_text(board, board.load(), "alpha", NOW) == legacy.digest_text(old, old.load(), "alpha", NOW)
-    assert snapshot(root) == snapshot(old.path)
+    core_files = snapshot(root)
+    legacy_files = snapshot(old.path)
+    if case == "pending_event":
+        # Legacy skips an exact staging name. A core write removes it before the census.
+        stale = "events/.pending-" + "a0" * 16
+        assert stale not in core_files
+        assert legacy_files.pop(stale) == b"unfinished event"
+    assert core_files == legacy_files
 
 
 @pytest.mark.parametrize("changes,reason", [
@@ -107,13 +164,63 @@ def test_invalid_publish_has_no_effect_and_retry_works(tmp_path, changes, reason
 def test_busy_is_typed_then_retry_succeeds(tmp_path):
     root = make_store(tmp_path)
     with core.Board(root, **OPTIONS) as board, storage.Store(root) as peer:
+        timer = WaitClock()
+        timer.inject(board)
+        before = snapshot(root)
+        with peer.lock(root):
+            with pytest.raises(BusyError) as caught:
+                board.publish("a/lane/one", post())
+            assert caught.value.reason == "busy"
+            assert timer.elapsed == 5.0
+        assert snapshot(root) == before
+        assert board.publish("a/lane/one", post())["replayed"] is False
+
+
+def test_release_during_final_poll_is_acquired(tmp_path):
+    """A holder that releases as the last poll lands on the deadline is still inside the budget."""
+    root = make_store(tmp_path)
+    with core.Board(root, **OPTIONS) as board, storage.Store(root) as peer:
+        held = peer.lock(root)
+        held.__enter__()
+        released = []
+
+        def release_at_deadline():
+            if timer.elapsed >= core.LOCK_WAIT_SECONDS and not released:
+                held.__exit__(None, None, None)
+                released.append(timer.elapsed)
+
+        timer = WaitClock(release_at_deadline)
+        timer.inject(board)
+        try:
+            result = board.publish("a/lane/one", post())
+        finally:
+            if not released:
+                held.__exit__(None, None, None)
+        assert released == [core.LOCK_WAIT_SECONDS]
+        assert timer.elapsed == core.LOCK_WAIT_SECONDS
+        assert result["seq"] == 4
+        assert result["replayed"] is False
+
+
+def test_busy_at_deadline_raises_without_another_sleep(tmp_path):
+    root = make_store(tmp_path)
+    samples = iter((0.0, core.LOCK_WAIT_SECONDS))
+
+    def monotonic():
+        return next(samples)
+
+    def sleep(seconds):
+        raise AssertionError("slept %r after the deadline" % (seconds,))
+
+    with core.Board(root, **OPTIONS) as board, storage.Store(root) as peer:
+        board.monotonic = monotonic
+        board.sleep = sleep
         before = snapshot(root)
         with peer.lock(root):
             with pytest.raises(BusyError) as caught:
                 board.publish("a/lane/one", post())
             assert caught.value.reason == "busy"
         assert snapshot(root) == before
-        assert board.publish("a/lane/one", post())["replayed"] is False
 
 
 def test_concurrent_same_key_has_one_publication(tmp_path):
@@ -124,8 +231,6 @@ def test_concurrent_same_key_has_one_publication(tmp_path):
         with core.Board(root, **OPTIONS) as board:
             board.writer_guard = guard
             return board.publish("a/lane/one", post())
-
-    from contextlib import contextmanager
 
     @contextmanager
     def guard():
@@ -138,6 +243,7 @@ def test_concurrent_same_key_has_one_publication(tmp_path):
         try:
             assert entered.wait(5)
             with core.Board(root, **OPTIONS) as board, pytest.raises(BusyError):
+                WaitClock().inject(board)
                 board.publish("a/lane/one", post())
         finally:
             release.set()
@@ -145,6 +251,134 @@ def test_concurrent_same_key_has_one_publication(tmp_path):
     with core.Board(root, **OPTIONS) as board:
         assert board.publish("a/lane/one", post())["replayed"] is True
         assert board.verify()["posts"] == 1
+
+
+def test_concurrent_writers_wait_then_publish_in_order(tmp_path):
+    root = make_store(tmp_path)
+    entered, release = Event(), Event()
+
+    @contextmanager
+    def guard():
+        entered.set()
+        assert release.wait(5)
+        yield
+
+    def write():
+        with core.Board(root, **OPTIONS) as board:
+            board.writer_guard = guard
+            return board.publish("a/lane/one", post())
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(write)
+
+        def let_writer_finish():
+            release.set()
+            first.result(timeout=5)
+
+        timer = WaitClock(let_writer_finish)
+        try:
+            assert entered.wait(5)
+            with core.Board(root, **OPTIONS) as board:
+                timer.inject(board)
+                second = board.publish("a/lane/one", post("two"))
+                assert board.verify() == {"ok": True, "events": 5, "posts": 2}
+        finally:
+            release.set()
+        assert 0 < timer.elapsed < 5.0
+        assert second["seq"] == first.result(timeout=5)["seq"] + 1
+
+
+def test_busy_after_acquisition_is_not_retried(tmp_path):
+    root = make_store(tmp_path)
+
+    def blocked_guard():
+        raise BusyError()
+
+    with core.Board(root, **OPTIONS) as board:
+        timer = WaitClock()
+        timer.inject(board)
+        before = snapshot(root)
+        board.writer_guard = blocked_guard
+        with pytest.raises(BusyError):
+            board.publish("a/lane/one", post())
+        assert timer.elapsed == 0
+        assert snapshot(root) == before
+    with core.Board(root, **OPTIONS) as board:
+        assert board.publish("a/lane/one", post())["replayed"] is False
+
+
+@pytest.mark.parametrize("name", [".pending-x", ".pending-" + "A" * 32, ".pending-" + "1" * 33])
+def test_malformed_pending_name_refuses_load_and_write(tmp_path, name):
+    root = make_store(tmp_path)
+    pending = root / "events" / name
+    pending.write_bytes(b"unfinished event")
+    before = snapshot(root)
+    with core.Board(root, **OPTIONS) as board:
+        with refused("invalid_record"):
+            board.verify()
+        with refused("invalid_record"):
+            board.publish("a/lane/one", post())
+        assert snapshot(root) == before
+        pending.unlink()
+        assert board.publish("a/lane/one", post())["seq"] == 4
+
+
+def test_stale_staging_file_does_not_consume_event_cap(tmp_path):
+    """9,999 committed events plus one nlink-1 staging name still accept event 10,000."""
+    assert core.MAX_RECORDS == 10000
+    root = make_store(tmp_path)
+    assert plant_grant_history(root, core.MAX_RECORDS - 1) == core.MAX_RECORDS - 1
+    pending = root / "events" / (".pending-" + "ab" * 16)
+    pending.write_bytes(b"killed before link")
+    assert pending.is_file() and pending.stat().st_nlink == 1
+    with core.Board(root, **OPTIONS) as board:
+        assert board.verify() == {"ok": True, "events": core.MAX_RECORDS - 1, "posts": 0}
+        assert pending.is_file()
+        sent = board.publish("a/lane/one", post())
+        assert sent["seq"] == core.MAX_RECORDS
+        assert sent["replayed"] is False
+        assert not pending.exists()
+        assert (root / "events" / ("%08d.json" % core.MAX_RECORDS)).is_file()
+        assert not list((root / "events").glob(".pending-*"))
+        with refused("too_large"):
+            board.publish("a/lane/one", post("past"))
+        assert board.verify() == {"ok": True, "events": core.MAX_RECORDS, "posts": 1}
+        assert not (root / "events" / ("%08d.json" % (core.MAX_RECORDS + 1))).exists()
+
+
+def test_every_exact_stale_staging_name_is_reaped_on_write(tmp_path):
+    root = make_store(tmp_path)
+    events = root / "events"
+    pending = []
+    for token in ("ab", "cd"):
+        path = events / (".pending-" + token * 16)
+        path.write_bytes(b"killed before link")
+        pending.append(path)
+    with core.Board(root, **OPTIONS) as board:
+        assert board.verify() == {"ok": True, "events": 3, "posts": 0}
+        assert all(path.is_file() for path in pending)
+        assert board.publish("a/lane/one", post())["seq"] == 4
+        assert all(not path.exists() for path in pending)
+
+
+def test_stale_staging_unlink_failure_is_typed(tmp_path):
+    if os.name != "posix":
+        pytest.skip("POSIX permissions required")
+    root = make_store(tmp_path)
+    events = root / "events"
+    pending = events / (".pending-" + "ef" * 16)
+    pending.write_bytes(b"killed before link")
+    events.chmod(0o500)
+    try:
+        with core.Board(root, **OPTIONS) as board:
+            before = snapshot(root)
+            with refused("io") as caught:
+                board.publish("a/lane/one", post())
+            assert pending.name not in str(caught.value)
+            assert snapshot(root) == before
+    finally:
+        events.chmod(0o700)
+    assert pending.is_file()
 
 
 def test_disposition_cursor_tombstone_and_authority(tmp_path):
@@ -709,6 +943,7 @@ def test_ambiguous_or_long_cursor_pair_refuses_before_storage(tmp_path, monkeypa
 def test_committed_operations_report_release_warnings(tmp_path, monkeypatch, owner_plane, lock_name, operation):
     root = make_store(tmp_path)
     with core.Board(root, **OPTIONS) as board:
+        WaitClock().inject(board)
         sent = board.publish("a/lane/one", post(kind="blocker"))
 
         def fail_release(name, *args, **kwargs):
@@ -947,6 +1182,7 @@ def test_cursor_ambiguity_precedes_a_contended_writer_lock(tmp_path):
 def test_secret_retry_after_competing_writer_release(tmp_path, shape):
     root = make_store(tmp_path)
     with core.Board(root, **OPTIONS) as board, storage.Store(root) as peer:
+        WaitClock().inject(board)
         with peer.lock(root):
             before = snapshot(root)
             with pytest.raises(BusyError):
