@@ -7,11 +7,14 @@ Legacy checkout loading and transport registration remain in the adapters.
 from contextlib import contextmanager, ExitStack
 from copy import copy
 import errno
+from functools import partial
 import json
 import os
 from pathlib import Path
 import re
 import stat
+import time
+from typing import NamedTuple, Union
 import uuid
 
 from aegis_core import message_codec as codec_module
@@ -26,10 +29,12 @@ from aegis_core.team_mailbox_primitives import (
 )
 from aegis_core.team_mailbox_guidance import MAX_CHARS, NEXT_ACTIONS
 
-__all__ = ["Records", "RecordRefusal", "tool_specs"]
+__all__ = ["Records", "RecordRefusal", "RecordResult", "tool_specs"]
 tool_specs = guidance.tool_specs
 STUB = re.compile(r"aegis-record/1 sha256=([0-9a-f]{64}) kind=([a-z][a-z0-9.]*)")
 ROOT_MARKER = b"aegis.record-root/1\n"
+LOCK_WAIT_SECONDS = 5.0
+LOCK_POLL_SECONDS = 0.01
 
 
 class _RecordCodec:
@@ -84,16 +89,29 @@ class _PublicationStore:
         return self.commit(path, raw)
 
 
+class RecordResult(NamedTuple):
+    """The payload and received message IDs from one successful operation."""
+    payload: Union[dict, str]
+    returned: tuple[str, ...] = ()
+
+
 class Records:
-    def __init__(self, mailbox, sender, *, inbox=None):
+    def __init__(self, mailbox, sender, *, inbox=None, monotonic=time.monotonic, sleep=time.sleep):
         fields(sender, {"from", "host", "session", "binding_generation"})
         for key in ("from", "host", "session"):
             text(sender[key], key, 256)
         integer(sender["binding_generation"], "binding generation")
         require(inbox is None or callable(inbox))
+        require(callable(monotonic) and callable(sleep))
         self.mailbox, self.sender, self.inbox = mailbox, dict(sender), inbox
+        self._wait = partial(_wait_for_lock, monotonic=monotonic, sleep=sleep)
 
-    def call(self, name, arguments):
+    def call_with_result(self, name, arguments):
+        """Return the payload and IDs together for transport delivery accounting."""
+        return self.call(name, arguments, _with_result=True)
+
+    def call(self, name, arguments, *, _with_result=False):
+        """Return the original tool payload."""
         require(supported(), reason="unsupported_platform")
         require(type(name) is str and name in (
             "mailbox_publish_record", "mailbox_read_record", "mailbox_digest"))
@@ -105,8 +123,13 @@ class Records:
             _arguments(codec, arguments, (), {"message_id", "to", "type", "kind", "content", "brief",
                 "in_reply_to", "acknowledgment", "readiness", "result", "receipt", "ref", "refs", "fields",
                 "outline", "expand", "max_chars", "after_message_id", "limit"})
-            return handlers[name](arguments)
+            result = handlers[name](arguments)
+            return result if _with_result else result.payload
         except MailboxRefusal as error:
+            payload = render_mailbox_refusal(error)
+            pinned = guidance.pinned_record_error(codec, payload["reason"])
+            if pinned is not None:
+                raise RecordRefusal(pinned, name) from None
             render_mailbox_refusal(error, reraise=True)
         except codec.CodecError as error:
             raise RecordRefusal(error, name) from None
@@ -120,26 +143,47 @@ class Records:
     def _publish_record(self, arguments):
         mailbox = self.mailbox
         mailbox.roles.authorize(mailbox.caller_role, "publish")
-        with mailbox.store.lock(mailbox.root):
+        # Acquire the owner reservation once before polling the mailbox reservation.
+        with mailbox.store.evidence_transaction(), self._wait(lambda: mailbox.store.lock(mailbox.root)):
             mailbox.refresh()
             mailbox.fence(self.sender)
-            result = publish(_RecordCodec, mailbox, self.sender, arguments)
+            result = publish(_RecordCodec, mailbox, self.sender, arguments, wait=self._wait)
         warnings = mailbox.store.drain_warnings()
         if warnings:
             result["warnings"] = result.get("warnings", []) + warnings
-        return result
+        return RecordResult(result)
 
     def _read_record(self, arguments):
         self.mailbox.refresh()
         self.mailbox.fence(self.sender, ready=False)
-        result, _returned = read(_RecordCodec, self.mailbox, self.sender, arguments)
-        return result
+        result, returned = read(_RecordCodec, self.mailbox, self.sender, arguments)
+        return RecordResult(result, tuple(returned))
 
     def _digest(self, arguments):
         self.mailbox.refresh()
         self.mailbox.fence(self.sender, ready=False)
-        result, _returned = digest(_RecordCodec, self.mailbox, self.sender, arguments, inbox=self.inbox)
-        return result
+        result, returned = digest(_RecordCodec, self.mailbox, self.sender, arguments, inbox=self.inbox)
+        return RecordResult(result, tuple(returned))
+
+
+@contextmanager
+def _wait_for_lock(lock, *, monotonic=time.monotonic, sleep=time.sleep):
+    """Retry acquisition only, with a fresh deadline for each reservation."""
+    deadline = monotonic() + LOCK_WAIT_SECONDS
+    with ExitStack() as stack:
+        while True:
+            try:
+                lease = stack.enter_context(lock())
+            except BusyError:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise
+                sleep(min(LOCK_POLL_SECONDS, remaining))
+                if monotonic() >= deadline:
+                    raise
+            else:
+                break
+        yield lease
 
 
 def supported():
@@ -150,7 +194,7 @@ def supported():
 
 
 @contextmanager
-def record_store(codec, root, *, write=False, state=None):
+def record_store(codec, root, *, write=False, state=None, wait=_wait_for_lock):
     """Bind safe descriptors; serialize store lifetime and undo our refused initialization."""
     codec.require(supported(), "E_AUTH")
     path = _store_path(codec, root)
@@ -161,7 +205,7 @@ def record_store(codec, root, *, write=False, state=None):
         for component in path.parent.parts[1:]:
             parent = os.open(component, flags, dir_fd=parent)
             stack.callback(os.close, parent)
-        lease = stack.enter_context(_publication_lock(codec, parent, ".records-store.lock")) if write else None
+        lease = stack.enter_context(wait(lambda: _publication_lock(codec, parent, ".records-store.lock"))) if write else None
         created, identity, rootfd = None, None, None
         try:
             if write:
@@ -180,26 +224,29 @@ def record_store(codec, root, *, write=False, state=None):
             stack.callback(store.close)
             actual = os.fstat(store.fd)
             codec.require((expected.st_dev, expected.st_ino) == (actual.st_dev, actual.st_ino), "E_AUTH")
-            if write and state is not None:
-                rootfd = stack.enter_context(_directory(codec, root))
-                pending = ".pending-" + uuid.uuid4().hex
-                if _staged_exists(codec, rootfd, pending):
-                    os.unlink(pending, dir_fd=rootfd)
-                if _root_token(codec, rootfd) is None:
-                    raw = ROOT_MARKER + uuid.uuid4().hex.encode("ascii") + b"\n"
-                    fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=rootfd)
-                    try:
-                        identity = os.fstat(fd)
-                        with os.fdopen(fd, "wb", closefd=False) as stream:
-                            stream.write(raw)
-                            stream.flush()
-                            os.fsync(fd)
-                        os.link(pending, ".root-id", src_dir_fd=rootfd, dst_dir_fd=rootfd, follow_symlinks=False)
-                        os.fsync(rootfd)
-                    finally:
-                        os.close(fd)
+            # Release the inner lease before the rollback can remove a new store.
+            with ExitStack() as publishing:
+                if write and state is not None:
+                    state["publication_lease"] = publishing.enter_context(wait(lambda: _publication_lock(codec, store.fd)))
+                    rootfd = stack.enter_context(_directory(codec, root))
+                    pending = ".pending-" + uuid.uuid4().hex
+                    if _staged_exists(codec, rootfd, pending):
                         os.unlink(pending, dir_fd=rootfd)
-            yield store
+                    if _root_token(codec, rootfd) is None:
+                        raw = ROOT_MARKER + uuid.uuid4().hex.encode("ascii") + b"\n"
+                        fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=rootfd)
+                        try:
+                            identity = os.fstat(fd)
+                            with os.fdopen(fd, "wb", closefd=False) as stream:
+                                stream.write(raw)
+                                stream.flush()
+                                os.fsync(fd)
+                            os.link(pending, ".root-id", src_dir_fd=rootfd, dst_dir_fd=rootfd, follow_symlinks=False)
+                            os.fsync(rootfd)
+                        finally:
+                            os.close(fd)
+                            os.unlink(pending, dir_fd=rootfd)
+                yield store
         finally:
             if state is not None and state["uncertain"]:
                 lease["clean"] = False
@@ -710,7 +757,7 @@ def _link_message(codec, pending, destination, name, state, store, changes):
             raise
 
 
-def _commit_record(codec, mailbox, sender, value, path, raw, state):
+def _commit_record(codec, mailbox, sender, value, path, raw, state, wait):
     """Mailbox publish validates semantics before entering this I/O boundary."""
     codec.require(type(raw) is bytes and len(raw) <= codec.MAX_BYTES, "E_LIMIT")
     codec.require(path.parent == mailbox.route(sender["from"], sender["to"]), "E_AUTH")
@@ -721,8 +768,9 @@ def _commit_record(codec, mailbox, sender, value, path, raw, state):
         # allocating either the shared store or the root's atomic identity.
         options = _options(codec, {})
         _bounded(codec, _value_view(codec, None, sender, value, options, None), MAX_CHARS)
-    with record_store(codec, mailbox.root, write=True, state=state) as store:
-        with _publication_lock(codec, store.fd) as lease, _directory(codec, path.parent) as destination:
+    with record_store(codec, mailbox.root, write=True, state=state, wait=wait) as store:
+        lease = state["publication_lease"]
+        with _directory(codec, path.parent) as destination:
             access = _RecordAccess(codec, store, mailbox.root, sender, rollback=True)
             for reference in set(value["refs"].values()):
                 access.authorize(reference)
@@ -771,7 +819,7 @@ def _commit_record(codec, mailbox, sender, value, path, raw, state):
         return warning or not lease["clean"]
 
 
-def _accepted_publish(codec, mailbox, request, value):
+def _accepted_publish(codec, mailbox, request, value, wait):
     """Reuse the public mailbox validator with a per-call publication port."""
     invoked = warning = False
     state = {"committed": False, "uncertain": False}
@@ -780,7 +828,7 @@ def _accepted_publish(codec, mailbox, request, value):
         codec.require(not invoked)
         invoked = True
         try:
-            warning = _commit_record(codec, mailbox, request, value, path, raw, state)
+            warning = _commit_record(codec, mailbox, request, value, path, raw, state, wait)
         except codec.CodecError as error:
             # Preserve record codes through Mailbox.publish's ValueError normalizer.
             raise RecordRefusal(error, "mailbox_publish_record") from None
@@ -795,7 +843,7 @@ def _accepted_publish(codec, mailbox, request, value):
     return warning, result.get("warnings", []), state["stage"]
 
 
-def publish(codec, mailbox, sender, arguments):
+def publish(codec, mailbox, sender, arguments, *, wait=_wait_for_lock):
     required = {"message_id", "to", "type", "kind", "content"}
     optional = {"brief", "in_reply_to", "acknowledgment", "readiness", "result", "receipt"}
     _arguments(codec, arguments, required, optional)
@@ -822,7 +870,7 @@ def publish(codec, mailbox, sender, arguments):
             codec.require(all(original.get(k) == v for k, v in request.items()) and
                           set(original) - {"schema", "created_at", "authority", "verification"} == set(request))
             return {"id": codec.record_id(value), "message_id": original["message_id"]}
-    warning, warnings, stage = _accepted_publish(codec, mailbox, request, value)
+    warning, warnings, stage = _accepted_publish(codec, mailbox, request, value, wait)
     result = {"id": codec.record_id(value), "message_id": request["message_id"]}
     if warnings:
         result["warnings"] = warnings
