@@ -51,9 +51,10 @@ from aegis_core.rule_inventory import RuleInventory, RuleInventoryError
 from aegis_core.rules import Rule, RuleCache, RuleSet, workspace_root
 from aegis_core.skills.slots import SlotRegistry
 from aegis_core.scan_simulation import (
-    COLD_LIST_LIMIT as _COLD_LIST_LIMIT, COLD_SAMPLE_LIMIT as _COLD_SAMPLE_LIMIT,
-    ColdRule as _ColdRule, SimulationBudget as _SimulationBudget,
-    SimulationCache as _SimulationCache, SimulationHooks,
+    COLD_LIST_LIMIT as _COLD_LIST_LIMIT,
+    ColdRule as _ColdRule, SIMULATION_FAIL_STATUS as _STATUS_FAIL,
+    SimulationBudget as _SimulationBudget,
+    SimulationHooks,
     simulate_rule_selection as simulate_selection,
 )
 from aegis_core.taxonomy import (
@@ -91,7 +92,6 @@ RULE_CACHE = RuleCache()
 
 NO_CHANGES_TEXT = "No changed files detected. Governance guidance will be provided when files are modified."
 NO_MATCH_TEXT = "No governance rules match your current changes."
-_STATUS_FAIL = "FAIL"
 _COLD_OUTPUT_LIMIT = 1024 * 1024
 _COLD_MATCH_BUDGET = 16384
 
@@ -184,8 +184,11 @@ class _ScanResult(GuidanceResult):
 
 
 def _match(rule: Rule, matched: Tuple[str, ...], fitness: Fitness) -> _Match:
-    exact = (any(rule.applies_to(f, exact=True) for f in matched) if isinstance(rule, _ColdRule)
-             else any(normalize_path(p) == normalize_path(f) for p in rule.target_paths for f in matched))
+    rank_exact = getattr(rule, "rank_exact", None)
+    if rank_exact is None:
+        exact = any(normalize_path(p) == normalize_path(f) for p in rule.target_paths for f in matched)
+    else:
+        exact = rank_exact(matched)
     return _Match(rule, matched, exact, fitness)
 
 
@@ -503,13 +506,22 @@ def _scan(workspace: Any, changed_files: Optional[List[str]], budget: Optional[i
     except RuleInventoryError as exc:
         return _failure(f"the rules directory cannot be read safely: {project_display_text(str(exc))}")
     except rule_integrity.IntegrityError as exc:
+        # Simulation is the only capture that carries compare_candidates. A typed
+        # custody cap stays a GitError so the shared mapper can name it; every
+        # other caller still receives the reviewed-base failure result.
+        cause = exc.__cause__
+        if (cache is not None and getattr(cache, "compare_candidates", None) is not None
+                and isinstance(cause, gitsafe.GitError) and cause.code == "git_output_limit"):
+            raise cause from None
         reason = project_display_text(str(exc))
         return _failure(f"the reviewed (base) version of the rules cannot be read, so none is served: {reason}")
     ruleset = view.ruleset
     if ruleset.errors:
         return _broken(ruleset)
-    if isinstance(cache, _SimulationCache):
-        cache.compare_candidates(ruleset)
+    if cache is not None:
+        compare_candidates = getattr(cache, "compare_candidates", None)
+        if compare_candidates is not None:
+            compare_candidates(ruleset)
 
     # Workspace-relative, each file once, as every other surface matches them.
     files = workspace_files(workspace_root(workspace), changed_files if changed_files else _git_changed_files(workspace))
@@ -523,7 +535,7 @@ def _scan(workspace: Any, changed_files: Optional[List[str]], budget: Optional[i
 def simulate_rule_selection(workspace: Any, inventory: RuleInventory, ruleset: RuleSet) -> Dict[str, str]:
     """Simulate lint selection with the current scan seams and request-local limits."""
     hooks = SimulationHooks(_scan, _ScanResult, select_guidance, for_rules, _cold_rules,
-                            _COLD_OUTPUT_LIMIT, _COLD_MATCH_BUDGET)
+                            _COLD_OUTPUT_LIMIT, _COLD_MATCH_BUDGET, _STATUS_FAIL)
     return simulate_selection(workspace, inventory, ruleset, hooks)
 
 
