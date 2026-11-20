@@ -1,6 +1,7 @@
 """Public message CLI contracts; codec output is passed through verbatim."""
 import copy
 from datetime import datetime, timezone
+import hashlib
 import io
 from itertools import combinations
 import json
@@ -650,6 +651,39 @@ def test_verify_checks_bytes_and_reports_full_id(store, workspace, capsys):
     for action in ("verify", "read"):
         assert invoke(store, action, rid) == 2
         assert_error(capsys.readouterr(), "E_HASH")
+
+
+@pytest.mark.parametrize("width", [16, 64])
+def test_rf43_verify_encodes_once_per_call(store, workspace, capsys, width):
+    rid = store.write(GOLDENS[0]["record"])
+    encodes = []
+
+    def count_encodes(frame, event, _arg):
+        if event == "call" and frame.f_code == codec.canonical.__code__:
+            encodes.append(event)
+
+    previous = sys.getprofile()
+    sys.setprofile(count_encodes)
+    try:
+        assert invoke(store, "verify", rid[:width]) == 0
+    finally:
+        sys.setprofile(previous)
+    output = capsys.readouterr()
+    assert not output.err
+    assert json.loads(output.out) == {"id": rid, "ref": rid[:16], "verified": True}
+    assert len(encodes) == 1
+
+
+def test_rf43_verify_refuses_noncanonical_bytes_with_matching_hash(store, workspace, capsys):
+    data = b" " + codec.canonical(GOLDENS[0]["record"])
+    rid = hashlib.sha256(data).hexdigest()
+    path = store.root / (rid + ".json")
+    path.write_bytes(data)
+    assert invoke(store, "verify", rid[:16]) == 2
+    assert_error(capsys.readouterr(), "E_FORMAT")
+    path.unlink()
+    assert invoke(store, "verify", rid[:16]) == 2
+    assert_error(capsys.readouterr(), "E_REF", "resolution")
 
 
 @pytest.mark.parametrize("position", ["global", "group", "action"])
