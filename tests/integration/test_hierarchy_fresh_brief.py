@@ -35,6 +35,91 @@ from tests.conftest import symlink_or_skip
 TOOL = ROOT / "tools" / "hierarchy_fresh_brief.py"
 
 
+@lifecycle_only
+@pytest.mark.parametrize("kind", ["disposition", "resolve"])
+def test_argon_shared_public_evidence_keeps_successor_symlink_checks(tmp_path, kind):
+    if not portable_fresh._reference_descriptors():
+        pytest.skip("secure lifecycle reads require directory descriptors")
+    result = r9_public_probe(tmp_path, "shared-" + kind, "symlink", False, "native")
+    assert result[0] == 0 and result[2] == b"", result
+    answer = json.loads(result[1])["result"]
+    assert "hostile" not in answer["requests"], answer
+    assert "symlink paths are not supported:" in answer["unknown"]["first"], answer
+
+
+@lifecycle_only
+@pytest.mark.parametrize("kind", ["disposition", "resolve"])
+@pytest.mark.parametrize("damage", ["regular", "leaf-link", "parent-link", "evidence-only-link"])
+def test_argon_successor_scope_guard_retries_and_concurrent_reads(tmp_path, kind, damage):
+    from concurrent.futures import ThreadPoolExecutor
+    import hierarchy_lifecycle as life
+    import hierarchy_workspace as workspace
+    from tests.integration.test_hierarchy_mailbox import mailbox_snapshot
+    from tests.integration.test_hierarchy_router import Loop
+    if not portable_fresh._reference_descriptors():
+        pytest.skip("secure lifecycle reads require directory descriptors")
+    world = Loop(tmp_path)
+    root = world.team("engine")
+    world.approved(request("healthy"))
+    folder = root.parent / "scope"
+    folder.mkdir()
+    target = folder / "note.md"
+    target.write_text("public successor scope")
+    evidence = folder / "evidence.md" if damage == "evidence-only-link" else target
+    if evidence != target:
+        evidence.write_text("public evidence-only occurrence")
+    first = request("first")
+    following = request("following", paths=[str(target)])
+    world.ledger.publish(first)
+    extra = {"status": "FINAL"}
+    if kind == "resolve":
+        world.ledger.event("disposition", status="HOLD", resolution={"kind": "blocked",
+            "owner": "engine/coordinator", "next_decision": "review", "condition": "reviewed",
+            "evidence": world.ledger.evidence}, **world.ledger.target(first))
+        blocker = world.ledger.status()["requests"]["first"]["resolution"]
+        extra = {"blocker_sha256": portable_fresh.digest(blocker)}
+    world.ledger.event(kind, resolution={"kind": "next", "request": raw_request(following),
+        "evidence": [ref(evidence)]}, **world.ledger.target(first), **extra)
+    replacement = root.parent / "public.md"
+    replacement.write_text("public successor scope")
+    if damage in {"leaf-link", "evidence-only-link"}:
+        evidence.unlink()
+        symlink_or_skip(replacement, evidence)
+    elif damage == "parent-link":
+        folder.rename(root.parent / "moved-scope")
+        symlink_or_skip(root.parent / "moved-scope", folder, target_is_directory=True)
+    before = world.ledger.files(), mailbox_snapshot(root)
+
+    def probe(refused):
+        result = alias_router.status(life.Lifecycle(world.ledger.path), workspace.Store(world.workspace.store), 5)
+        rows = {row["request_id"]: row for row in result["requests"]}
+        assert rows["healthy"]["state"] == "ready", result
+        if refused:
+            assert "following" not in rows, result
+            assert (rows["first"]["state"], rows["first"].get("reason")) == ("held", "reference_unavailable"), result
+            assert "symlink paths are not supported:" in rows["first"]["detail"], result
+        else:
+            assert rows["following"]["state"] == "awaiting_decision", result
+
+    refused = damage in {"leaf-link", "parent-link"}
+    probe(refused)
+    probe(refused)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for future in [pool.submit(probe, refused), pool.submit(probe, refused)]:
+            future.result(timeout=30)
+    assert (world.ledger.files(), mailbox_snapshot(root)) == before
+    if refused:
+        if damage == "leaf-link":
+            target.unlink()
+            target.write_text("public successor scope")
+        else:
+            folder.unlink()
+            (root.parent / "moved-scope").rename(folder)
+        before = world.ledger.files(), mailbox_snapshot(root)
+        probe(False)
+        assert (world.ledger.files(), mailbox_snapshot(root)) == before
+
+
 R17_CHAIN_SHAPES = ("direct", "target-prefix", "two-nested", "ancestor-suffix")
 R17_LEAF_OUTCOMES = ("absent", "enotdir", "eacces", "eio", "present")
 R17_CHAIN_SETUP = r'''
@@ -221,7 +306,7 @@ def test_round17_nested_leaf_witness_rejects_concurrent_replacement(tmp_path, mo
         with pytest.raises(OSError) as error: os.fstat(descriptor)
         assert error.value.errno == errno.EBADF
     leaf.unlink(); leaf.write_bytes(b"healthy retry")
-    r15_assert_healthy_retry(world)
+    r15_assert_healthy_retry(world, linked, path)
 
 
 def r15_trial(tmp_path,seam,shape):
@@ -236,7 +321,13 @@ def r15_trial(tmp_path,seam,shape):
     return (*result,leaf)
 
 
-def r15_assert_healthy_retry(world):
+def r15_assert_healthy_retry(world, linked, path):
+    # Restore the declared scope to ordinary public objects for the retry.
+    if linked.is_symlink():
+        linked.unlink()
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"healthy retry")
     operation=portable_fresh._Operation()
     journal=operation.lifecycle(world.ledger.path)
     _policy,state=journal.load()
@@ -344,7 +435,7 @@ def test_round15_opened_parent_aba_is_part_of_the_final_witness(tmp_path,monkeyp
         alternate.chmod(0o700)
     flags["enabled"]=False
     leaf.unlink(); leaf.write_bytes(b"healthy retry")
-    r15_assert_healthy_retry(world)
+    r15_assert_healthy_retry(world, linked, path)
 
 
 @lifecycle_only
@@ -411,7 +502,7 @@ def test_round15_leaf_outcome_is_revalidated_before_inert_scope(tmp_path,monkeyp
             commands.put(None); mutation.result(timeout=25)
     flags["enabled"]=False
     reset(); leaf.write_bytes(b"healthy retry")
-    r15_assert_healthy_retry(world)
+    r15_assert_healthy_retry(world, linked, path)
 
 
 @lifecycle_only
@@ -437,7 +528,9 @@ def test_round15_last_hop_destination_uses_the_final_leaf_witness(tmp_path,monke
     monkeypatch.setattr(alias_router,"_owner_home",lambda:home)
     monkeypatch.setattr(portable_fresh,"_reference_descriptors",lambda:backend=="native")
     monkeypatch.setattr(portable_fresh,"_final_leaf_lookup",lookup)
-    r15_assert_healthy_retry(world)
+    with pytest.raises(alias_router.SymlinkPathError, match="^symlink paths are not supported:"):
+        portable_fresh.safe_path(path)
+    r15_assert_healthy_retry(world, linked, path)
     assert reached and all(outcome==("errno",errno.ENOENT) for outcome in reached)
 
 
@@ -945,17 +1038,25 @@ def test_round14_suffix_replacement_after_leaf_lookup_invalidates_the_whole_toke
     monkeypatch.setattr(alias_router,"_owner_home",lambda:home)
     monkeypatch.setattr(portable_fresh,"_reference_descriptors",lambda:backend=="native")
     original=portable_fresh._final_leaf_lookup
-    entered,changed=Event(),Event()
+    entered,changed,stopped=Event(),Event(),Event()
     alternate=tmp_path/"alternate"; (alternate/"priv_link").mkdir(parents=True)
     parked=tmp_path/"parked"
     def replace():
-        assert entered.wait(10),"final lookup did not reach the mutation boundary"
-        (public/"sub").rename(parked)
-        (public/"sub").symlink_to(private if replacement=="private" else alternate,target_is_directory=True)
-        changed.set()
+        while True:
+            assert entered.wait(10),"final lookup did not reach the mutation boundary"
+            entered.clear()
+            if stopped.is_set():
+                return
+            if (public/"sub").is_symlink():
+                (public/"sub").unlink()
+            else:
+                (public/"sub").rename(parked)
+            (public/"sub").symlink_to(private if replacement=="private" else alternate,target_is_directory=True)
+            changed.set()
     def lookup(proof):
         result=original(proof)
-        if proof.leaf==public/"sub"/"priv_link"/"note.md" and not changed.is_set():
+        if proof.leaf in {public/"sub"/"priv_link"/"note.md", alternate/"priv_link"/"note.md"}:
+            changed.clear()
             entered.set(); assert changed.wait(10),"ancestor replacement did not complete"
         return result
     monkeypatch.setattr(portable_fresh,"_final_leaf_lookup",lookup)
@@ -963,6 +1064,7 @@ def test_round14_suffix_replacement_after_leaf_lookup_invalidates_the_whole_toke
         mutation=pool.submit(replace)
         try: operation,journal=r14_assert_quarantined(world,path)
         finally:
+            stopped.set()
             entered.set()
             mutation.result(timeout=15)
     assert journal.refusals_for("following",consume=True)
@@ -1353,69 +1455,85 @@ R14_FINAL_GOLDENS = {('check', False, 'native', 'enoent'): (2,
                                           b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
                                           b''),
  ('shared-disposition', False, 'native', 'enoent'): (0,
-                                                     b'{"result": {"refusals": {}, "requests": ["first", "healt'
-                                                     b'hy", "hostile"], "unknown": {}}}\n',
-                                                     b''),
+                                              b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "u'
+                                              b'nknown": {"first": "lifecycle row UNKNOWN at event fault-event: '
+                                              b'symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                              b''),
  ('shared-disposition', False, 'native', 'enotdir'): (0,
-                                                      b'{"result": {"refusals": {}, "requests": ["first", "healt'
-                                                      b'hy", "hostile"], "unknown": {}}}\n',
-                                                      b''),
+                                               b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "u'
+                                               b'nknown": {"first": "lifecycle row UNKNOWN at event fault-event: '
+                                               b'symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                               b''),
  ('shared-disposition', False, 'portable', 'enoent'): (0,
-                                                       b'{"result": {"refusals": {}, "requests": ["first", "healt'
-                                                       b'hy", "hostile"], "unknown": {}}}\n',
-                                                       b''),
- ('shared-disposition', False, 'portable', 'enotdir'): (0,
-                                                        b'{"result": {"refusals": {}, "requests": ["first", "healt'
-                                                        b'hy", "hostile"], "unknown": {}}}\n',
-                                                        b''),
- ('shared-disposition', True, 'native', 'enoent'): (0,
-                                                    b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
-                                                    b' "hostile"], "unknown": {}}}\n',
-                                                    b''),
- ('shared-disposition', True, 'native', 'enotdir'): (0,
-                                                     b'{"result": {"refusals": {}, "requests": ["first", "healt'
-                                                     b'hy", "hostile"], "unknown": {}}}\n',
-                                                     b''),
- ('shared-disposition', True, 'portable', 'enoent'): (0,
-                                                      b'{"result": {"refusals": {}, "requests": ["first", "healt'
-                                                      b'hy", "hostile"], "unknown": {}}}\n',
-                                                      b''),
- ('shared-disposition', True, 'portable', 'enotdir'): (0,
-                                                       b'{"result": {"refusals": {}, "requests": ["first", "healt'
-                                                       b'hy", "hostile"], "unknown": {}}}\n',
-                                                       b''),
- ('shared-resolve', False, 'native', 'enoent'): (0,
-                                                 b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
-                                                 b' "hostile"], "unknown": {}}}\n',
-                                                 b''),
- ('shared-resolve', False, 'native', 'enotdir'): (0,
-                                                  b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
-                                                  b' "hostile"], "unknown": {}}}\n',
-                                                  b''),
- ('shared-resolve', False, 'portable', 'enoent'): (0,
-                                                   b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
-                                                   b' "hostile"], "unknown": {}}}\n',
-                                                   b''),
- ('shared-resolve', False, 'portable', 'enotdir'): (0,
-                                                    b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
-                                                    b' "hostile"], "unknown": {}}}\n',
-                                                    b''),
- ('shared-resolve', True, 'native', 'enoent'): (0,
-                                                b'{"result": {"refusals": {}, "requests": ["first", "healthy", "ho'
-                                                b'stile"], "unknown": {}}}\n',
+                                                b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "u'
+                                                b'nknown": {"first": "lifecycle row UNKNOWN at event fault-event: '
+                                                b'symlink paths are not supported: {CASE}/ordinary"}}}\n',
                                                 b''),
- ('shared-resolve', True, 'native', 'enotdir'): (0,
-                                                 b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
-                                                 b' "hostile"], "unknown": {}}}\n',
+ ('shared-disposition', False, 'portable', 'enotdir'): (0,
+                                                 b'{"result": {"refusals": {}, "requests": ["first", "healthy"]'
+                                                 b', "unknown": {"first": "lifecycle row UNKNOWN at event fault'
+                                                 b'-event: symlink paths are not supported: {CASE}/ordinary"}}}\n',
                                                  b''),
+ ('shared-disposition', True, 'native', 'enoent'): (0,
+                                             b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "u'
+                                             b'nknown": {"first": "lifecycle row UNKNOWN at event fault-event: '
+                                             b'symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                             b''),
+ ('shared-disposition', True, 'native', 'enotdir'): (0,
+                                              b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "u'
+                                              b'nknown": {"first": "lifecycle row UNKNOWN at event fault-event: '
+                                              b'symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                              b''),
+ ('shared-disposition', True, 'portable', 'enoent'): (0,
+                                               b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "u'
+                                               b'nknown": {"first": "lifecycle row UNKNOWN at event fault-event: '
+                                               b'symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                               b''),
+ ('shared-disposition', True, 'portable', 'enotdir'): (0,
+                                                b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "u'
+                                                b'nknown": {"first": "lifecycle row UNKNOWN at event fault-event: '
+                                                b'symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                                b''),
+ ('shared-resolve', False, 'native', 'enoent'): (0,
+                                          b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unkno'
+                                          b'wn": {"first": "lifecycle row UNKNOWN at event fault-event: symlink '
+                                          b'paths are not supported: {CASE}/ordinary"}}}\n',
+                                          b''),
+ ('shared-resolve', False, 'native', 'enotdir'): (0,
+                                           b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unkno'
+                                           b'wn": {"first": "lifecycle row UNKNOWN at event fault-event: symlink '
+                                           b'paths are not supported: {CASE}/ordinary"}}}\n',
+                                           b''),
+ ('shared-resolve', False, 'portable', 'enoent'): (0,
+                                            b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unkno'
+                                            b'wn": {"first": "lifecycle row UNKNOWN at event fault-event: symlink '
+                                            b'paths are not supported: {CASE}/ordinary"}}}\n',
+                                            b''),
+ ('shared-resolve', False, 'portable', 'enotdir'): (0,
+                                             b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "u'
+                                             b'nknown": {"first": "lifecycle row UNKNOWN at event fault-event: '
+                                             b'symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                             b''),
+ ('shared-resolve', True, 'native', 'enoent'): (0,
+                                         b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unkno'
+                                         b'wn": {"first": "lifecycle row UNKNOWN at event fault-event: symlink '
+                                         b'paths are not supported: {CASE}/ordinary"}}}\n',
+                                         b''),
+ ('shared-resolve', True, 'native', 'enotdir'): (0,
+                                          b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unkno'
+                                          b'wn": {"first": "lifecycle row UNKNOWN at event fault-event: symlink '
+                                          b'paths are not supported: {CASE}/ordinary"}}}\n',
+                                          b''),
  ('shared-resolve', True, 'portable', 'enoent'): (0,
-                                                  b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
-                                                  b' "hostile"], "unknown": {}}}\n',
-                                                  b''),
+                                           b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unkno'
+                                           b'wn": {"first": "lifecycle row UNKNOWN at event fault-event: symlink '
+                                           b'paths are not supported: {CASE}/ordinary"}}}\n',
+                                           b''),
  ('shared-resolve', True, 'portable', 'enotdir'): (0,
-                                                   b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
-                                                   b' "hostile"], "unknown": {}}}\n',
-                                                   b''),
+                                            b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unkno'
+                                            b'wn": {"first": "lifecycle row UNKNOWN at event fault-event: symlink '
+                                            b'paths are not supported: {CASE}/ordinary"}}}\n',
+                                            b''),
  ('worktree', False, 'native', 'enoent'): (2,
                                            b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
                                            b''),
@@ -2108,10 +2226,10 @@ R9_PUBLIC_GOLDENS = {('check', 'denied', False, 'native'): (2, b'{"error": "[Err
  ('scope', 'symlink', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('scope', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
  ('scope', 'symlink', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
- ('shared-disposition', 'denied', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-disposition', 'denied', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-disposition', 'denied', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-disposition', 'denied', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-disposition', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('shared-disposition', 'denied', False, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('shared-disposition', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('shared-disposition', 'denied', True, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
  ('shared-disposition', 'missing', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
  ('shared-disposition', 'missing', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
  ('shared-disposition', 'missing', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
@@ -2128,14 +2246,26 @@ R9_PUBLIC_GOLDENS = {('check', 'denied', False, 'native'): (2, b'{"error": "[Err
  ('shared-disposition', 'not-directory', True, 'portable'): (0,
                                                              b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n',
                                                              b''),
- ('shared-disposition', 'symlink', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-disposition', 'symlink', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-disposition', 'symlink', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-disposition', 'symlink', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-resolve', 'denied', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-resolve', 'denied', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-resolve', 'denied', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-resolve', 'denied', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-disposition', 'symlink', False, 'native'): (0,
+                                               b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "lifecycle row UNKNOWN at'
+                                               b' event fault-event: symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                               b''),
+ ('shared-disposition', 'symlink', False, 'portable'): (0,
+                                                 b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "lifecycle row UNKNOWN at'
+                                                 b' event fault-event: symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                                 b''),
+ ('shared-disposition', 'symlink', True, 'native'): (0,
+                                              b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "lifecycle row UNKNOWN at'
+                                              b' event fault-event: symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                              b''),
+ ('shared-disposition', 'symlink', True, 'portable'): (0,
+                                                b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "lifecycle row UNKNOWN at'
+                                                b' event fault-event: symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                                b''),
+ ('shared-resolve', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('shared-resolve', 'denied', False, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('shared-resolve', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('shared-resolve', 'denied', True, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
  ('shared-resolve', 'missing', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
  ('shared-resolve', 'missing', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
  ('shared-resolve', 'missing', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
@@ -2146,10 +2276,22 @@ R9_PUBLIC_GOLDENS = {('check', 'denied', False, 'native'): (2, b'{"error": "[Err
                                                           b''),
  ('shared-resolve', 'not-directory', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
  ('shared-resolve', 'not-directory', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-resolve', 'symlink', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-resolve', 'symlink', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-resolve', 'symlink', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
- ('shared-resolve', 'symlink', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-resolve', 'symlink', False, 'native'): (0,
+                                           b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "lifecycle row UNKNOWN at eve'
+                                           b'nt fault-event: symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                           b''),
+ ('shared-resolve', 'symlink', False, 'portable'): (0,
+                                             b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "lifecycle row UNKNOWN at eve'
+                                             b'nt fault-event: symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                             b''),
+ ('shared-resolve', 'symlink', True, 'native'): (0,
+                                          b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "lifecycle row UNKNOWN at eve'
+                                          b'nt fault-event: symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                          b''),
+ ('shared-resolve', 'symlink', True, 'portable'): (0,
+                                            b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "lifecycle row UNKNOWN at eve'
+                                            b'nt fault-event: symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                            b''),
  ('verify:--path', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
  ('verify:--path', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
  ('verify:--path', 'missing', False, 'native'): (2, b'{"error": "[Errno 2] No such file or directory: \'ordinary\'"}\n', b''),
@@ -2894,70 +3036,70 @@ R10_PUBLIC_GOLDENS = {('check', 'link-to-denied', False, 'native'): (2,
                                              b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
                                              b'\n',
                                              b''),
- ('shared-disposition', 'link-to-denied', False, 'native'): (0,
-                                                             b'{"result": {"refusals": {}, "requests": ["first", "healt'
-                                                             b'hy", "hostile"], "unknown": {}}}\n',
-                                                             b''),
- ('shared-disposition', 'link-to-denied', False, 'portable'): (0,
-                                                               b'{"result": {"refusals": {}, "requests": ["first", "h'
-                                                               b'ealthy", "hostile"], "unknown": {}}}\n',
-                                                               b''),
- ('shared-disposition', 'link-to-denied', True, 'native'): (0,
-                                                            b'{"result": {"refusals": {}, "requests": ["first", "healt'
-                                                            b'hy", "hostile"], "unknown": {}}}\n',
-                                                            b''),
- ('shared-disposition', 'link-to-denied', True, 'portable'): (0,
-                                                              b'{"result": {"refusals": {}, "requests": ["first", "h'
-                                                              b'ealthy", "hostile"], "unknown": {}}}\n',
-                                                              b''),
- ('shared-disposition', 'link-to-io', False, 'native'): (0,
-                                                         b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
-                                                         b' "hostile"], "unknown": {}}}\n',
-                                                         b''),
- ('shared-disposition', 'link-to-io', False, 'portable'): (0,
-                                                           b'{"result": {"refusals": {}, "requests": ["first", "healt'
-                                                           b'hy", "hostile"], "unknown": {}}}\n',
-                                                           b''),
- ('shared-disposition', 'link-to-io', True, 'native'): (0,
-                                                        b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
-                                                        b' "hostile"], "unknown": {}}}\n',
-                                                        b''),
- ('shared-disposition', 'link-to-io', True, 'portable'): (0,
-                                                          b'{"result": {"refusals": {}, "requests": ["first", "healt'
-                                                          b'hy", "hostile"], "unknown": {}}}\n',
-                                                          b''),
- ('shared-resolve', 'link-to-denied', False, 'native'): (0,
-                                                         b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
-                                                         b' "hostile"], "unknown": {}}}\n',
-                                                         b''),
- ('shared-resolve', 'link-to-denied', False, 'portable'): (0,
-                                                           b'{"result": {"refusals": {}, "requests": ["first", "healt'
-                                                           b'hy", "hostile"], "unknown": {}}}\n',
-                                                           b''),
- ('shared-resolve', 'link-to-denied', True, 'native'): (0,
-                                                        b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
-                                                        b' "hostile"], "unknown": {}}}\n',
-                                                        b''),
- ('shared-resolve', 'link-to-denied', True, 'portable'): (0,
-                                                          b'{"result": {"refusals": {}, "requests": ["first", "healt'
-                                                          b'hy", "hostile"], "unknown": {}}}\n',
-                                                          b''),
- ('shared-resolve', 'link-to-io', False, 'native'): (0,
-                                                     b'{"result": {"refusals": {}, "requests": ["first", "healthy", "ho'
-                                                     b'stile"], "unknown": {}}}\n',
-                                                     b''),
- ('shared-resolve', 'link-to-io', False, 'portable'): (0,
-                                                       b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
-                                                       b' "hostile"], "unknown": {}}}\n',
-                                                       b''),
- ('shared-resolve', 'link-to-io', True, 'native'): (0,
-                                                    b'{"result": {"refusals": {}, "requests": ["first", "healthy", "ho'
-                                                    b'stile"], "unknown": {}}}\n',
-                                                    b''),
- ('shared-resolve', 'link-to-io', True, 'portable'): (0,
-                                                      b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
-                                                      b' "hostile"], "unknown": {}}}\n',
+ ('shared-disposition', 'link-to-denied', False, 'native'): (2,
+                                                      b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
+                                                      b'te.md\'"}\n',
                                                       b''),
+ ('shared-disposition', 'link-to-denied', False, 'portable'): (2,
+                                                        b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
+                                                        b'te.md\'"}\n',
+                                                        b''),
+ ('shared-disposition', 'link-to-denied', True, 'native'): (2,
+                                                     b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
+                                                     b'te.md\'"}\n',
+                                                     b''),
+ ('shared-disposition', 'link-to-denied', True, 'portable'): (2,
+                                                       b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
+                                                       b'te.md\'"}\n',
+                                                       b''),
+ ('shared-disposition', 'link-to-io', False, 'native'): (2,
+                                                  b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
+                                                  b'd\'"}\n',
+                                                  b''),
+ ('shared-disposition', 'link-to-io', False, 'portable'): (2,
+                                                    b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
+                                                    b'd\'"}\n',
+                                                    b''),
+ ('shared-disposition', 'link-to-io', True, 'native'): (2,
+                                                 b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
+                                                 b'd\'"}\n',
+                                                 b''),
+ ('shared-disposition', 'link-to-io', True, 'portable'): (2,
+                                                   b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
+                                                   b'd\'"}\n',
+                                                   b''),
+ ('shared-resolve', 'link-to-denied', False, 'native'): (2,
+                                                  b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                  b'd\'"}\n',
+                                                  b''),
+ ('shared-resolve', 'link-to-denied', False, 'portable'): (2,
+                                                    b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                    b'd\'"}\n',
+                                                    b''),
+ ('shared-resolve', 'link-to-denied', True, 'native'): (2,
+                                                 b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                 b'd\'"}\n',
+                                                 b''),
+ ('shared-resolve', 'link-to-denied', True, 'portable'): (2,
+                                                   b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                   b'd\'"}\n',
+                                                   b''),
+ ('shared-resolve', 'link-to-io', False, 'native'): (2,
+                                              b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
+                                              b'\n',
+                                              b''),
+ ('shared-resolve', 'link-to-io', False, 'portable'): (2,
+                                                b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
+                                                b'd\'"}\n',
+                                                b''),
+ ('shared-resolve', 'link-to-io', True, 'native'): (2,
+                                             b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
+                                             b'\n',
+                                             b''),
+ ('shared-resolve', 'link-to-io', True, 'portable'): (2,
+                                               b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
+                                               b'\n',
+                                               b''),
  ('verify:--path', 'link-to-denied', False, 'native'): (2,
                                                         b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
                                                         b'te.md\'"}\n',
@@ -7385,37 +7527,45 @@ R13_LEAF_GOLDENS = {('disposition', False, 'native'): (0,
  ('scope', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary/note.md"}\n', b''),
  ('scope', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary/note.md"}\n', b''),
  ('shared-disposition', False, 'native'): (0,
-                                           b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"],'
-                                           b' "unknown": {}}}\n',
-                                           b''),
+                                    b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first'
+                                    b'": "lifecycle row UNKNOWN at event fault-event: symlink paths are not supported:'
+                                    b' {CASE}/ordinary/note.md"}}}\n',
+                                    b''),
  ('shared-disposition', False, 'portable'): (0,
-                                             b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"],'
-                                             b' "unknown": {}}}\n',
-                                             b''),
- ('shared-disposition', True, 'native'): (0,
-                                          b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"],'
-                                          b' "unknown": {}}}\n',
-                                          b''),
- ('shared-disposition', True, 'portable'): (0,
-                                            b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"],'
-                                            b' "unknown": {}}}\n',
-                                            b''),
- ('shared-resolve', False, 'native'): (0,
-                                       b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "un'
-                                       b'known": {}}}\n',
-                                       b''),
- ('shared-resolve', False, 'portable'): (0,
-                                         b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "un'
-                                         b'known": {}}}\n',
-                                         b''),
- ('shared-resolve', True, 'native'): (0,
-                                      b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "un'
-                                      b'known": {}}}\n',
+                                      b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"f'
+                                      b'irst": "lifecycle row UNKNOWN at event fault-event: symlink paths are not su'
+                                      b'pported: {CASE}/ordinary/note.md"}}}\n',
                                       b''),
+ ('shared-disposition', True, 'native'): (0,
+                                   b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first'
+                                   b'": "lifecycle row UNKNOWN at event fault-event: symlink paths are not supported:'
+                                   b' {CASE}/ordinary/note.md"}}}\n',
+                                   b''),
+ ('shared-disposition', True, 'portable'): (0,
+                                     b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first'
+                                     b'": "lifecycle row UNKNOWN at event fault-event: symlink paths are not supported:'
+                                     b' {CASE}/ordinary/note.md"}}}\n',
+                                     b''),
+ ('shared-resolve', False, 'native'): (0,
+                                b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "'
+                                b'lifecycle row UNKNOWN at event fault-event: symlink paths are not supported: {CASE}/'
+                                b'ordinary/note.md"}}}\n',
+                                b''),
+ ('shared-resolve', False, 'portable'): (0,
+                                  b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first'
+                                  b'": "lifecycle row UNKNOWN at event fault-event: symlink paths are not supported:'
+                                  b' {CASE}/ordinary/note.md"}}}\n',
+                                  b''),
+ ('shared-resolve', True, 'native'): (0,
+                               b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "'
+                               b'lifecycle row UNKNOWN at event fault-event: symlink paths are not supported: {CASE}/'
+                               b'ordinary/note.md"}}}\n',
+                               b''),
  ('shared-resolve', True, 'portable'): (0,
-                                        b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "un'
-                                        b'known": {}}}\n',
-                                        b'')}
+                                 b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "'
+                                 b'lifecycle row UNKNOWN at event fault-event: symlink paths are not supported: {CASE}/'
+                                 b'ordinary/note.md"}}}\n',
+                                 b'')}
 R13_LEAF_PROBE = R10_PUBLIC_PROBE.replace("target = root / 'ordinary' / 'note.md'", """
 (root / 'ordinary').unlink()
 (root / 'ordinary').mkdir()
