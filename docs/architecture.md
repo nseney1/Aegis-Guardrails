@@ -114,7 +114,7 @@ scratch. Object reads and publication use the GitStore's fenced operations, so a
 Git executable planted inside the editable checkout cannot run in the custodian.
 Required legs come from the trusted caller: the Publisher contract requires the applicable
 local legs and hosted legs for release PRs, but declares no fixed leg identifiers.
-Connecting its `qualified(request)` hook is a separate increment.
+Its `qualified(request)` hook is not connected in this tree.
 
 `approval_equivalent` permits structural carry-over only for a direct empty commit
 with the same tree, the standard approval subject and exactly one printable
@@ -125,6 +125,31 @@ verification; structural equivalence alone grants no approval authority.
 `team_qualify` occupies layer zero in `CORE_LAYERS` in
 `tests/contract/test_import_boundary.py`. Its runtime dependencies are existing
 layer-zero Git, journal, approval-shape, primitive and redaction services.
+
+### Git delivery
+
+`aegis_core.team_git` has no CLI. `snapshot_tree` writes a private index and returns a tree id. `plan_merge`, `plan_pick` and `plan_revert` do not publish. `commit_tested` records a commit inside the store. Only `cas_fast_forward` publishes objects and updates a ref. `team_qualify.record_pass` and `team_custody.commit` journal that effect first through `aegis_core.team_gitops`, which runs neither git nor `gh`. `Publisher` in `aegis_core.team_publish` accepts an effect only with an unused permit, an owner-supplied `gh` adapter and a qualification reader. Activation of that service is not wired.
+
+`aegis_core.merge_queue.MergeQueue` checks every required qualification leg against the exact landing tree. `MergeQueue.revalidate` rechecks the candidate and uses its own queue checkpoint before calling `team_git.cas_fast_forward` to create the candidate pin. It issues a receipt for a separate publisher and does not write a team_gitops journal. Automatic landing remains separate work.
+
+`snapshot_tree` calls `descriptor_support` and refuses `unsupported_platform` unless `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `stat` and `readlink`. `plan_merge`, `plan_pick`, `plan_revert` and `commit_tested` do not use that check. The work queue refuses `unsupported_platform` unless `storage.confined_descriptor_supported` is true: `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `mkdir`, `link`, `rename`, `unlink` and `stat`. That function does not use `readlink`. The proposal store refuses `unsupported` on that same function. Both probes are false when `os.name` is not `posix`, so Windows fails them. Neither function tests for macOS.
+
+Qualification writes call `team_qualify.descriptor_supported` and otherwise refuse `unsupported_platform`. That probe requires `team_git.descriptor_support`, `team_gitops.descriptor_supported` (`fcntl` is available and `storage.confined_descriptor_supported` is true), and Linux subreaper support from `gitops_fds.descriptor_supported` (`sys.platform` is `linux`, `os.name` is `posix`, and `prctl(37)` returns 0). The merge queue checks both the snapshot and qualification probes when preparing or revalidating a candidate. `MergeQueue.prepare` refuses `unsupported_platform` if either fails.
+
+The `CORE_LAYERS` table in `tests/contract/test_import_boundary.py` puts `team_git`, `team_gitops`, `team_qualify`, `team_jobs_recipes` and the message codec in layer 0. It puts `team_mailbox`, `team_session_wake` and `model_select` in layer 1, and `team_queue`, `team_publish`, `proposals`, `rule_lint` and `merge_queue` in layer 2.
+
+### Where to read next
+
+- [Agent teams](teams.md#on-this-branch) indexes lanes, the queue and the other surfaces.
+- [Model selection](model-selection.md) is the admission and history contract. `aegis team model` and `aegis_team_model` call it and launch no host.
+- [Team profiles](teams-profile.md) and the [supervisor profile](teams-supervisor.md) cover layered settings and pauses.
+- [Runtime hierarchy guide](agent-hierarchies.md) and [team-run prerequisites](hierarchy-team.md#prerequisites) describe `tools/hierarchy_team.py`. That tool is outside the wheel.
+- [Mailbox index](hierarchy-mailbox-index.md) covers the source-checkout index. The product mailbox is `aegis_core.team_mailbox`. Its `initialize` validates a manifest before `initialize_store`. `Mailbox` does not import `tools` or launch a process. `aegis team mail` provides send, read and doctor commands, and `aegis team board` provides board configuration, reads and inspection. See [mail and board](teams.md#mail-and-board) for platform requirements and refusal codes.
+- Normal mailbox reads and indexing skip recognized staging entries in the directories they scan. The classifier accepts `.pending-` followed by 32 lowercase hex digits. It also recognizes `.pending-stub` in message folders, `.pending-grants` in the sibling `mailbox-records` directory and `.pending-root-id` at the mailbox root. When an inspection completes, the mailbox doctor reports `MD_PENDING` for each tracked path under the mailbox root with a name that starts with `.pending-`.
+- `aegis_core.team_session_wake` handles bound wakes and `aegis_core.team_jobs_recipes` validates recipes and packets. The source-checkout hierarchy runner still uses the legacy wake and job paths.
+- [Delivery over MCP](how-it-works.md#delivery-over-mcp) names `aegis msg` and the message tools. The codec module defers Windows support. The command refuses unless directory descriptors support `open`, `mkdir`, `stat`, `link` and `unlink`, `stat` supports `follow_symlinks`, and `O_DIRECTORY`, `O_NOFOLLOW` and `geteuid` exist.
+- [Proposals and rule lint](how-it-works.md#proposals-and-rule-lint): `aegis rule lint` reports and exits 0. Proposal merge can record source `mine` and does not install a rule.
+- [Absorption](teams-absorption.md) describes the template boundary. `tools/hierarchy_templates/` is outside the wheel. `aegis_core/team_templates/` packages `job-recipes.json` and `role-registry.json`, and `team_roles.registry` reads the role registry.
 
 Fitness is derived from the ledger; `aegis sync` computes suggestions. Applying a
 suggestion is an explicit action that changes files for review. Host hooks and

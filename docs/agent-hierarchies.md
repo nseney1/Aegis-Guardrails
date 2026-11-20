@@ -595,6 +595,13 @@ and binds each entry in `tools/hierarchy_templates/handoff-spec.json`, reports a
 on one without hiding or blocking the others, and leaves finished entries alone when
 run again. Each successor still acknowledges separately through its own connection.
 
+With a governing host plan, the next checkpoint keeps briefs for open work, the
+last touching brief and `entries[].briefs`, so standing briefs must be relisted
+there or they silently leave the next checkpoint. The last inherited brief is
+kept when none qualifies. A standalone `draft-handoff` preview still lists every
+brief. Under a governing host plan, the preview checkpoint sha differs from
+the bound one when a brief is omitted. Without a plan, briefs carry forward unchanged.
+
 With `delivery_dir`, the draft includes every unread message ID, including messages
 that were woken but not read. The delivery status page's 100-ID display limit does
 not limit the handoff. Pending IDs and checkpoint brief references are deduplicated;
@@ -606,8 +613,12 @@ evidence that its assignment or job finished.
 Ordinary unread messages retain their hash-bound brief references in the inbox.
 The successor reads them with `include_briefs` and follows `next_after` while
 `remaining` is nonzero. Their contents stay pageable instead of accumulating in
-mandatory checkpoint metadata. Active/job, explicit and inherited checkpoint
-briefs retain their existing validation and response limits.
+mandatory checkpoint metadata. Active/job, explicit and still-carried inherited
+checkpoint briefs retain their existing validation and response limits. With a
+governing host plan, an inherited brief is carried only when it is open work,
+the last touching brief, listed in `entries[].briefs`, or the last inherited
+brief when none qualifies. Without a plan, inherited briefs carry forward
+unchanged.
 
 For a mailbox move, current carry briefs retain each open job's original full ID
 and the path and SHA-256 of its original request. Missing terminal receipts can
@@ -1049,6 +1060,17 @@ python3 tools/hierarchy_launcher.py --base /abs/base status
   launcher stops the start's process group and is recorded (`start_incomplete` once a session is known,
   else `failed_to_start`, error "the launcher was interrupted"); during the bind wait it ends the wait
   instead, and the session can still be bound with `add-role`. The start lock is released either way.
+  Other fixed start failure reasons are:
+
+  | Error | State | Operator action |
+  | --- | --- | --- |
+  | "the start reported an invalid session" | `failed_to_start` | Inspect the start logs and repair the host's session report before retrying; the reported value is not a usable binding. |
+  | "the start timed out" | `failed_to_start` without a session, `start_incomplete` with one | Inspect the start logs and host readiness, then retry when ready; adjust `start_timeout_seconds` if the start needs a longer limit. |
+  | "the start process exited unsuccessfully" | `failed_to_start` without a session, `start_incomplete` with one | Inspect the recorded `exit_code` and start logs, fix the host failure, then retry. |
+  | "the start exited without reporting a session" | `failed_to_start` | Inspect the start logs and repair session-event reporting before retrying, even though the process exited successfully. |
+
+  These outcomes leave the endpoint unbound. A session in `start_incomplete` is evidence of a partial
+  start, not a successful bind; inspect it before choosing a retry or an explicit `add-role` recovery.
 - `resume` runs `tools/hierarchy_wake.py` with the current binding's wake profile, unchanged, and
   leaves every timeout to it.
 - `stop` signals the processes whose arguments name the bound session: SIGTERM, then SIGKILL after

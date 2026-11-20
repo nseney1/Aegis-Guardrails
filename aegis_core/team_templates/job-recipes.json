@@ -1,0 +1,208 @@
+{
+  "schema": "aegis.hierarchy-job-recipes/v1",
+  "python": "/REPLACE/WITH/dev-venv/bin/python",
+  "path": [
+    "/REPLACE/WITH/your/home/folder/.cargo/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin"
+  ],
+  "prefix": [
+    "/usr/bin/nice",
+    "-n",
+    "10",
+    "/usr/bin/ionice",
+    "-c",
+    "2",
+    "-n",
+    "7"
+  ],
+  "min_free_gigabytes": 5,
+  "hide": [
+    "/REPLACE/WITH/your/home/folder"
+  ],
+  "ro_binds": [
+    "/REPLACE/WITH/your/home/folder/.cargo",
+    "/REPLACE/WITH/your/home/folder/.rustup"
+  ],
+  "env": {
+    "PYTHONPATH": "$checkout",
+    "CARGO_NET_OFFLINE": "true",
+    "RUSTUP_AUTO_INSTALL": "0",
+    "CARGO_HOME": "/REPLACE/WITH/your/home/folder/.cargo",
+    "RUSTUP_HOME": "/REPLACE/WITH/your/home/folder/.rustup",
+    "CARGO_INCREMENTAL": "0"
+  },
+  "identity": {
+    "name": "Aegis hierarchy root",
+    "email": "root@example.invalid"
+  },
+  "recipes": {
+    "targeted-tests": {
+      "kind": "command",
+      "heavy": true,
+      "sandbox": "bwrap",
+      "timeout_seconds": 1200,
+      "require_clean": true,
+      "expects_tests": true,
+      "keep": [
+        "run/junit.xml"
+      ],
+      "steps": [
+        [
+          "$python",
+          "-B",
+          "-m",
+          "pytest",
+          "-q",
+          "-p",
+          "no:cacheprovider",
+          "--basetemp",
+          "$scratch",
+          "--junitxml",
+          "$scratch/junit.xml",
+          "$paths"
+        ]
+      ]
+    },
+    "full-suite": {
+      "kind": "command",
+      "heavy": true,
+      "sandbox": "bwrap",
+      "timeout_seconds": 1800,
+      "require_clean": true,
+      "expects_tests": true,
+      "keep": [
+        "run/junit.xml"
+      ],
+      "steps": [
+        [
+          "$python",
+          "-B",
+          "-m",
+          "pytest",
+          "tests/",
+          "-q",
+          "-n",
+          "2",
+          "-p",
+          "no:cacheprovider",
+          "--basetemp",
+          "$scratch",
+          "--junitxml",
+          "$scratch/junit.xml"
+        ]
+      ]
+    },
+    "lint": {
+      "kind": "command",
+      "heavy": false,
+      "sandbox": "bwrap",
+      "timeout_seconds": 300,
+      "steps": [
+        [
+          "$python",
+          "-m",
+          "ruff",
+          "check",
+          "--isolated",
+          "--no-cache",
+          "--select",
+          "E9,F63,F7,F82",
+          "aegis_cli",
+          "aegis_core",
+          "aegis_mcp",
+          "aegis_sdk",
+          "tests",
+          ".github/scripts",
+          "tools"
+        ]
+      ]
+    },
+    "aegis-check": {
+      "kind": "command",
+      "heavy": false,
+      "sandbox": "bwrap",
+      "timeout_seconds": 300,
+      "steps": [
+        [
+          "$python",
+          "-B",
+          "-m",
+          "aegis_cli",
+          "check"
+        ]
+      ]
+    },
+    "rust-targeted-tests": {
+      "kind": "command",
+      "heavy": true,
+      "heavy_tests": true,
+      "sandbox": "bwrap",
+      "timeout_seconds": 1800,
+      "require_clean": true,
+      "export_git": true,
+      "expects_tests": true,
+      "keep": [
+        "run/junit.xml"
+      ],
+      "steps": [
+        [
+          "$python",
+          "-I",
+          "-c",
+          "import os, sys; d = sys.argv[1]; os.makedirs(d, exist_ok=True); open(os.path.join(d, 'nextest-aegis.toml'), 'w').write('[store]\\ndir = %r\\n[profile.ci]\\nfail-fast = false\\n[profile.ci.junit]\\npath = %r\\n' % (os.path.join(d, 'nextest'), sys.argv[2]))",
+          "$scratch",
+          "$scratch/junit.xml"
+        ],
+        [
+          "cargo",
+          "nextest",
+          "--config-file",
+          "$scratch/nextest-aegis.toml",
+          "run",
+          "--frozen",
+          "--offline",
+          "--profile",
+          "ci",
+          "-p",
+          "stormheir-sim"
+        ]
+      ]
+    },
+    "rust-lint": {
+      "kind": "command",
+      "heavy": true,
+      "heavy_tests": true,
+      "sandbox": "bwrap",
+      "timeout_seconds": 1800,
+      "require_clean": true,
+      "export_git": true,
+      "steps": [
+        [
+          "cargo",
+          "fmt",
+          "--all",
+          "--check"
+        ],
+        [
+          "cargo",
+          "clippy",
+          "--frozen",
+          "--offline",
+          "-p",
+          "stormheir-sim",
+          "--all-targets",
+          "--",
+          "-D",
+          "warnings"
+        ]
+      ]
+    },
+    "commit-exact": {
+      "kind": "commit",
+      "sandbox": "bwrap",
+      "timeout_seconds": 120
+    }
+  }
+}
