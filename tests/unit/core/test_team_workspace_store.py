@@ -141,6 +141,54 @@ def test_exports_are_exactly_the_owned_public_definitions():
         assert len(module.__all__) == len(expected)
 
 
+def _workspace_transition_sources():
+    store = Path(workspace.__file__)
+    source = store.with_name("team_workspace_events.py")
+    assert source.is_file(), "workspace transitions need a module independent of descriptor storage"
+    return ast.parse(store.read_text(encoding="utf-8")), ast.parse(source.read_text(encoding="utf-8"))
+
+
+def _assert_workspace_transition_wrappers(store, events):
+    wrappers = {node.name: node for node in store.body if isinstance(node, ast.FunctionDef)}
+    implementations = {node.name: node for node in events.body if isinstance(node, ast.FunctionDef)}
+    imports = [alias.asname or alias.name
+               for node in store.body if isinstance(node, ast.ImportFrom) and node.level == 0
+               and node.module == "aegis_core"
+               for alias in node.names if alias.name == "team_workspace_events"]
+    assert len(imports) == 1, "the store must import the workspace events module"
+    events_alias = imports[0]
+    names = {transition.__name__ for transition in workspace.APPLY.values()}
+    names.update(name for name in workspace.__all__ if name.startswith("apply_"))
+    names.add("require_unclaimed_lanes")
+    for name in sorted(names):
+        assert name in wrappers and name in implementations, f"{name} needs a store wrapper and an events implementation"
+        wrapper = wrappers[name]
+        parameters = implementations[name].args
+        assert ast.dump(wrapper.args) == ast.dump(parameters), f"{name} must match its events signature"
+        assert not (parameters.vararg or parameters.kwonlyargs or parameters.kwarg), f"{name} must use positional forwarding"
+        arguments = ", ".join(parameter.arg for parameter in parameters.posonlyargs + parameters.args)
+        expected = ast.parse(f"return {events_alias}.{name}({arguments})").body[0]
+        assert [ast.dump(stmt) for stmt in wrapper.body] == [ast.dump(expected)], (
+            f"{name} must forward its original arguments directly to team_workspace_events.{name}"
+        )
+
+
+def test_workspace_transition_definitions_live_in_events_module():
+    _assert_workspace_transition_wrappers(*_workspace_transition_sources())
+
+
+def test_workspace_transition_guard_rejects_replacement_of_retained_row():
+    store, events = _workspace_transition_sources()
+    release = next(node for node in store.body
+                   if isinstance(node, ast.FunctionDef) and node.name == "apply_release")
+    replacement = ast.parse(
+        'ledger.requests[data["request_id"]] = dict(ledger.request(data["request_id"]))'
+    ).body[0]
+    release.body.insert(0, replacement)
+    with pytest.raises(AssertionError, match=r"^apply_release must forward its original arguments directly"):
+        _assert_workspace_transition_wrappers(store, events)
+
+
 def event(seq, kind, data):
     return {"schema": workspace.EVENT_SCHEMA, "seq": seq, "at": NOW, "kind": kind, "data": data}
 
@@ -151,7 +199,9 @@ def make_store(tmp_path, events=None, name="workspace"):
     root = tmp_path / name
     root.mkdir(mode=0o700)
     (root / "events").mkdir(mode=0o700)
-    for row in events or [event(1, "init", LIMITS)]:
+    if events is None:
+        events = [event(1, "init", LIMITS)]
+    for row in events:
         (root / "events" / ("%08d.json" % row["seq"])).write_bytes(workspace.encoded(row) + b"\n")
     return root
 
@@ -594,6 +644,35 @@ def test_successful_append_preserves_request_references_like_legacy(tmp_path):
         assert workspace.request_view(request) == workspace.request_view(ledger.request(request["request_id"]))
 
 
+def test_release_append_updates_retained_request(tmp_path):
+    data = _request_data()
+    request_id = data["request_id"]
+    root = make_store(tmp_path, [event(1, "init", LIMITS), event(2, "register", INITIATIVE),
+                                 event(3, "request", data), event(4, "grant", {"request_id": request_id})])
+    evidence = {"path": str(root / "evidence"), "sha256": "0" * 64}
+
+    with workspace.WorkspaceStore(root) as store:
+        ledger = store.load()
+        request = ledger.request(request_id)
+        before = ledger_state(ledger)
+        names = sorted((root / "events").iterdir())
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.append(ledger, "release", {"request_id": request_id, "evidence": {**evidence, "sha256": "bad"}})
+        assert_refusal(error, "invalid_record")
+        assert ledger_state(ledger) == before
+        assert ledger.request(request_id) is request
+        assert sorted((root / "events").iterdir()) == names
+
+        appended = store.append(ledger, "release", {"request_id": request_id, "evidence": evidence})
+        assert request["state"] == "released"
+        assert ledger.request(request_id) is request
+        assert request["closed_at"] == appended["at"]
+        assert request["evidence"] == evidence
+
+    with workspace.WorkspaceStore(root) as reader:
+        assert ledger_state(reader.load()) == ledger_state(ledger)
+
+
 def test_evidence_parent_swap_is_confined_and_missing_evidence_can_retry(tmp_path, monkeypatch):
     root = make_store(tmp_path)
     outside = make_store(tmp_path, name="outside")
@@ -624,11 +703,119 @@ def _request_data():
     return {"initiative": "alpha", "request_id": "req-00000003", "kind": "writer", "holder": "one"}
 
 
+def _append_transition_case(kind, tmp_path):
+    queued = {**_request_data(), "request_id": "req-00000005"}
+    granted = {**queued, "request_id": "req-00000006", "holder": "two"}
+    grant_id = {"request_id": granted["request_id"]}
+    queued_id = {"request_id": queued["request_id"]}
+    merge = {"repository": "repo", "branch": "main", "commit": "a" * 40, "source": "owner"}
+    evidence = {"path": str(tmp_path / "evidence"), "sha256": "0" * 64}
+    events = [
+        event(1, "init", LIMITS),
+        event(2, "register", INITIATIVE),
+        event(3, "register", {**INITIATIVE, "id": "beta"}),
+        event(4, "register", {**INITIATIVE, "id": "gamma"}),
+        event(5, "request", queued),
+        event(6, "request", granted),
+        event(7, "grant", grant_id),
+        event(8, "merge", merge),
+    ]
+    data = {
+        "init": LIMITS,
+        "register": {**INITIATIVE, "id": "delta"},
+        "update": {"initiative": "alpha", "source": "owner", "priority": 2},
+        "request": {**queued, "request_id": "req-00000009", "supersedes": queued["request_id"]},
+        "withdraw": {**queued_id, "source": "owner"},
+        "grant": queued_id,
+        "release": {**grant_id, "evidence": evidence},
+        "merge": {**merge, "commit": "b" * 40, "initiative": "alpha"},
+        "clear_base_moved": {"initiative": "alpha", "base_commit": merge["commit"],
+                             "evidence": evidence, "source": "owner"},
+        "set_limits": {"source": "owner", "writer_limit": 4},
+    }
+    assert kind in data, f"add a public append case for {kind}"
+    return make_store(tmp_path, [] if kind == "init" else events), data[kind]
+
+
+def _workspace_rows(ledger):
+    rows = {
+        **{("initiative", identifier): row for identifier, row in ledger.initiatives.items()},
+        **{("request", identifier): row for identifier, row in ledger.requests.items()},
+        ("ledger", "granted_counts"): ledger.granted_counts,
+        ("ledger", "open_holders"): ledger.open_holders,
+    }
+    if ledger.limits is not None:
+        rows["ledger", "limits"] = ledger.limits
+    return rows
+
+
+@pytest.mark.parametrize("kind", sorted(workspace.APPLY))
+def test_append_updates_retained_workspace_rows(tmp_path, kind):
+    root, data = _append_transition_case(kind, tmp_path)
+    events = root / "events"
+    with workspace.WorkspaceStore(root) as store, workspace.WorkspaceStore(root) as other:
+        ledger = workspace.Ledger() if kind == "init" else store.load()
+        seq = ledger.seq
+        retained = _workspace_rows(ledger)
+        before = deepcopy(retained)
+        history = {path.name: path.read_bytes() for path in events.iterdir()}
+
+        with ThreadPoolExecutor(max_workers=1) as pool, other.lock():
+            attempt = pool.submit(store.append, ledger, kind, data)
+            with pytest.raises(WorkspaceRefusal) as error:
+                attempt.result(timeout=5)
+            assert_refusal(error, "busy")
+
+        live = _workspace_rows(ledger)
+        assert ledger.seq == seq
+        assert live == before
+        assert all(live[key] is row for key, row in retained.items())
+        assert {path.name: path.read_bytes() for path in events.iterdir()} == history
+
+        appended = store.append(ledger, kind, data)
+        replayed = other.load()
+        published = _workspace_rows(replayed)
+        live = _workspace_rows(ledger)
+        assert replayed.seq == ledger.seq == appended["seq"] == seq + 1
+        assert live == published
+        for key, row in retained.items():
+            assert row == published[key], f"retained {key} did not reflect the published {kind}"
+            assert row is live[key], f"{kind} replaced retained {key}"
+
+
 def _initialized_ledger():
     ledger = workspace.Ledger()
     ledger.apply(event(1, "init", LIMITS))
     ledger.apply(event(2, "register", INITIATIVE))
     return ledger
+
+
+def test_supersede_refusal_preserves_history_and_retry_matches_fresh_replay(tmp_path):
+    root = make_store(tmp_path, [event(1, "init", LIMITS), event(2, "register", INITIATIVE),
+                                 event(3, "request", _request_data())])
+    events = root / "events"
+    with workspace.WorkspaceStore(root) as store:
+        ledger = store.load()
+        original = ledger.request("req-00000003")
+        before = ledger_state(ledger)
+        history = {path.name: path.read_bytes() for path in events.iterdir()}
+        replacement = {**_request_data(), "request_id": "req-00000004", "supersedes": original["request_id"]}
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.append(ledger, "request", {**replacement, "holder": "different"})
+        assert_refusal(error, "invalid_record")
+        assert ledger_state(ledger) == before
+        assert ledger.request("req-00000003") is original
+        assert {path.name: path.read_bytes() for path in events.iterdir()} == history
+
+        appended = store.append(ledger, "request", replacement)
+        assert appended["schema"] == workspace.SUPERSEDE_EVENT_SCHEMA
+        assert ledger.request("req-00000003") is original
+        assert original["state"] == "withdrawn"
+        assert original["superseded_by"] == "req-00000004"
+        assert ledger.request("req-00000004")["seq"] == original["seq"]
+
+    with workspace.WorkspaceStore(root) as reader:
+        assert ledger_state(reader.load()) == ledger_state(ledger)
 
 
 @pytest.mark.parametrize("field", sorted(_request_data()))

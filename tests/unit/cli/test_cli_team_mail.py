@@ -416,7 +416,7 @@ def test_rotation_during_stdout_flush_refuses_retired_read_receipt(mailbox, caps
     output = capsys.readouterr()
     assert code == 1 and output.err == "" and json.loads(output.out)["binding"]["generation"] == 1
     refusal = json.loads(errors.getvalue())
-    assert refusal["reason"] == "invalid_record" and refusal["next_action"]
+    assert refusal["reason"] == "binding" and refusal["next_action"]
     assert list(delivery.rglob("*.json")) == []
 
 

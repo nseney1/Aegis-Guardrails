@@ -106,6 +106,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.yaml_engine": 1,
     "aegis_core.match": 1,
     "aegis_core.team_workspace_display": 0,
+    "aegis_core.team_workspace_events": 0,
     "aegis_core.team_workspace_store": 0,
     "aegis_core.team_writer_binding": 1,
     "aegis_core.telemetry_engine": 1,
