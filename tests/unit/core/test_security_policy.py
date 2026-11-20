@@ -132,6 +132,8 @@ SPAWN_SITES = {
     "aegis_core/verification/mutation_tester.py": ("`pytest`",),
     "aegis_core/inference_provider.py": ("your model command",),
     "aegis_core/team_supervisor_start.py": ("owner-configured component argv (absolute executable, cwd=/, no shell)",),
+    # Wake turns/control use a caller-selected profile under owner custody; liveness probes start ps.
+    "aegis_core/team_session_wake.py": ("wake profile and control argv",),
     # Install runs the aegis it is about to register once, on an empty payload, in an empty directory.
     "aegis_cli/hooks/registrar.py": ("`aegis`, the hook handler",),
     # `aegis benchmark` starts the same handler under this Python (-I -c) on a fixture payload, in a temp workspace.
