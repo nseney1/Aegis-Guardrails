@@ -83,6 +83,10 @@
     "count": 1,
     "reason": "Explicit user-configured model command boundary."
   },
+  "process:aegis_core/team_native_bridge.py:ProcessBridge._run:subprocess.Popen": {
+    "count": 1,
+    "reason": "TA-3h: explicit owner-configured evidence-only provider argv; bounded correlated I/O, deadline, held cwd and WNOWAIT group cancellation; no native execution qualification."
+  },
   "process:aegis_core/team_session_wake.py:_capture:subprocess.run": {
     "count": 1,
     "reason": "TA-2b: owner host control or fixed process census; fixed timeout, bounded output parsing and no shell."
