@@ -61,7 +61,7 @@ def _read_rule_text(filepath, *, root=None, encoding="utf-8-sig", source=None,
     except RuleInventoryError as exc:
         if exc.code == "RULE_FILE_NOT_FOUND":
             raise RuleFileNotFoundError("Rule file not found") from None
-        raise RuleReadError("Rule file read refused") from None
+        raise RuleReadError(str(exc), code=exc.code) from None
     # Preserve each entry point's original codec and decoding errors, while
     # matching universal newlines only after the bounded byte capture.
     return raw.decode(encoding).replace("\r\n", "\n").replace("\r", "\n")
@@ -104,8 +104,8 @@ def parse_rule_file(filepath: str) -> Tuple[Dict[str, Any], str]:
         return _parse_rule_text(_read_rule_text(filepath))
     except FileNotFoundError:
         raise RuleNotFoundError(f"Rule file not found: {receipt_value(str(filepath), 400, identifier=True)}") from None
-    except RuleReadError:
-        raise RuleParseError("Rule file read refused", code="RULE_FILE_READ_REFUSED") from None
+    except RuleReadError as exc:
+        raise RuleParseError(str(exc), code=exc.code) from None
     except ValueError as exc:
         # Only these source-owned delimiter diagnostics are public verbatim.
         # Parser and decoder errors can contain arbitrary keys, values or bytes;
