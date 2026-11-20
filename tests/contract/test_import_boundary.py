@@ -45,6 +45,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.errors": 0,
     "aegis_core.taxonomy": 0,
     "aegis_core.merge_queue": 2,
+    "aegis_core.merge_queue_types": 0,
     # Canonical message records and untrusted views (stdlib only).
     "aegis_core.message_codec": 0,
     # Shared format primitives and anchored content-addressed storage.
@@ -202,6 +203,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.lifecycle": 2,
     "aegis_core.migrate": 2,
     "aegis_core.metrics": 2,
+    "aegis_core.model_served": 1,
     "aegis_core.outcomes": 2,
     "aegis_core.verification": 2,
     "aegis_core.inference_provider": 2,
@@ -214,6 +216,9 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_qualify": 0,
     "aegis_core.team_queue": 2,
     "aegis_core.team_roles": 0,
+    "aegis_core.team_session_census": 1,
+    "aegis_core.team_session_custody": 1,
+    "aegis_core.team_session_stop": 1,
     "aegis_core.team_session_wake": 1,
     # Read-only lane status report over lease declarations and the existing tip gate.
     "aegis_core.team_status": 3,

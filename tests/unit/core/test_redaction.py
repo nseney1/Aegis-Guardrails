@@ -46,7 +46,6 @@ REPO = Path(real_path(__file__)).parents[3]
 REVIEWED_REDACTION_IMPORTERS = frozenset({
     "aegis_cli/check.py",
     "aegis_cli/doctor_git_report.py",
-    "aegis_cli/formatters/text.py",
     "aegis_cli/hooks/redaction.py",
     "aegis_cli/language_capabilities.py",
     "aegis_cli/status.py",

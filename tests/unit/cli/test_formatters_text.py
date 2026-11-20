@@ -7,6 +7,7 @@ byte-identical to what the report's own text method printed before the move (rec
 from __future__ import annotations
 
 import ast
+from concurrent.futures import ThreadPoolExecutor
 import io
 import json
 from pathlib import Path
@@ -159,6 +160,116 @@ def test_card_could_not_run_details_are_bounded_canonicalized_and_redacted():
     assert all(token[index:index + 4] not in '\n'.join(lines) for index in range(len(token) - 3))
     assert all(len(line[4:]) <= 300 for line in lines[start + 1:start + 21])
     assert '\x1b' not in '\n'.join(lines)
+
+
+@pytest.mark.parametrize('count', [1, 22])
+@pytest.mark.parametrize('blocking', [False, True])
+def test_card_size_advisories_appear_only_in_coverage(count, blocking):
+    paths = [f'bundle{i}.ts' for i in range(count)]
+    failure = 'forbid_ast: cannot load rules: OSError: unavailable'
+    doc = _card(size_advisories=count, layer1={
+        'checked': count, 'passed': count, 'failed': 0, 'pass_rate': 1.0, 'findings': 0,
+        'checks_that_could_not_run': [f'ast_unverified: unverified too_large: {path} exceeds 2 MiB'
+                                    for path in paths] + ([failure] if blocking else []),
+        'not_analyzed': [{'path': path, 'reason': 'size limit (too_large; exceeds 2 MiB)'} for path in paths],
+        'top': [],
+    }).as_dict()
+    before = json.dumps(doc)
+    lines = text.render_card(doc)
+    assert not any('ast_unverified:' in line for line in lines)
+    assert ('  checks that could not run:' in lines) is blocking
+    assert ('    ' + failure in lines) is blocking
+    start = lines.index(f'  AST coverage: {count} file(s) not analyzed:')
+    assert lines[start + 1:start + 1 + min(count, 20)] == [
+        f'    {path}: size limit (too_large; exceeds 2 MiB)' for path in paths[:20]
+    ]
+    assert sum(line == '    ... and 2 more' for line in lines) == (1 if count == 22 else 0)
+    for path in paths[:20]:
+        assert sum(path + ':' in line for line in lines) == 1
+    # Repeated and concurrent rendering of the same document must not mutate JSON.
+    assert text.render_card(doc) == lines
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(text.render_card, [doc] * 6)) == [lines] * 6
+    assert json.dumps(doc) == before
+
+
+@pytest.mark.parametrize('coverage', [None, []])
+def test_card_keeps_size_diagnostics_when_coverage_is_absent(coverage):
+    doc = _card().as_dict()
+    detail = 'ast_unverified: unverified too_large: bundle.ts exceeds 2 MiB'
+    doc['layer1']['checks_that_could_not_run'] = [detail]
+    if coverage is not None:
+        doc['layer1']['not_analyzed'] = coverage
+    lines = text.render_card(doc)
+    start = lines.index('  checks that could not run:')
+    assert lines[start + 1] == '    ' + detail
+    assert not any('AST coverage' in line for line in lines)
+
+
+def test_card_filters_only_the_exact_size_note_tool_prefix():
+    doc = _card().as_dict()
+    details = ['ast_unverified_extra: failed', 'other: ast_unverified: failed', 'forbid_ast: failed']
+    doc['layer1']['checks_that_could_not_run'] = details
+    doc['layer1']['not_analyzed'] = [{'path': 'a.py', 'reason': 'Layer 1 unavailable'}]
+    lines = text.render_card(doc)
+    start = lines.index('  checks that could not run:')
+    assert lines[start + 1:start + 4] == ['    ' + detail for detail in details]
+
+
+@pytest.mark.parametrize('field', ['diagnostic', 'path', 'reason'])
+@pytest.mark.parametrize('size', [65536, 65537])
+def test_card_bounds_diagnostic_inputs_before_processing(field, size):
+    doc = _card().as_dict()
+    value = 'x' * size
+    doc['layer1']['checks_that_could_not_run'] = [value] if field == 'diagnostic' else []
+    if field != 'diagnostic':
+        row = {'path': 'bundle.ts', 'reason': 'size limit (too_large)'}
+        row[field] = value
+        doc['layer1']['not_analyzed'] = [row]
+    lines = text.render_card(doc)
+    assert any('[diagnostic omitted: too_large]' in line for line in lines) is (size > 65536)
+    if size == 65536:
+        assert any('x' * 297 + '...' in line for line in lines)
+    assert not any('x' * 301 in line for line in lines)
+
+
+def test_card_coverage_canonicalizes_and_redacts_each_field_before_truncation():
+    doc = _card().as_dict()
+    value = 'x' * 270 + ' gh\x1b[31mp_' + 'a' * 36 + '\nend' + 'y' * 400
+    doc['layer1']['not_analyzed'] = [{'path': value, 'reason': value}]
+    lines = text.render_card(doc)
+    start = lines.index('  AST coverage: 1 file(s) not analyzed:')
+    expected = 'x' * 270 + ' [REDACTED_VCS_TOKEN] end' + 'y' * 2 + '...'
+    assert lines[start + 1] == f'    {expected}: {expected}'
+
+
+@pytest.mark.parametrize('count', [1, 22])
+def test_card_cli_size_advisories_are_not_duplicated_and_json_is_unchanged(tmp_path, capsys, monkeypatch, count):
+    from aegis_cli.cli import main
+
+    rules = tmp_path / '.aegis' / 'rules' / 'invariants'
+    rules.mkdir(parents=True)
+    (rules / 'blocked.md').write_text(
+        '---\nid: blocked\ntype: invariant\nenforcement: gate\nhypothesis: No unsafe calls.\n'
+        'target_paths: ["*.ts"]\nforbid_ast:\n  calls: [eval]\n---\n# Blocked\n', encoding='utf-8')
+    source = b'//' + b'x' * (2 * 1024 * 1024 - 1)
+    for number in range(count):
+        (tmp_path / f'bundle{number:02}.ts').write_bytes(source)
+    built = card.build(tmp_path, now=0)
+    before = built.as_dict()
+    assert before['layer1']['pass_rate'] == 1.0
+    assert len(before['layer1']['checks_that_could_not_run']) == count
+    # Freeze the real report so both public CLI calls describe the exact same run.
+    monkeypatch.setattr(card, 'build', lambda root: built)
+    assert main(['check', '--card', '--workspace', str(tmp_path)]) == 0
+    output = capsys.readouterr().out
+    assert f'AST coverage: {count} file(s) not analyzed:' in output
+    assert 'checks that could not run:' not in output
+    assert 'ast_unverified:' not in output
+    assert output.count('size limit (too_large; exceeds 2 MiB)') == min(count, 20)
+    assert ('    ... and 2 more' in output) is (count == 22)
+    assert main(['check', '--card', '--workspace', str(tmp_path), '--json']) == 0
+    assert capsys.readouterr().out == json.dumps(before, indent=2) + '\n'
 
 
 def test_card_text_prints_whole_run_error_without_changing_json(tmp_path, monkeypatch, capsys):
