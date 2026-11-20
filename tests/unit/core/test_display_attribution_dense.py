@@ -10,7 +10,6 @@ import pytest
 
 from aegis_core import display_attribution as attribution, primitives
 from tests.unit.cli import test_cli_helpers as legacy
-from tests.unit.core import test_primitives as regressions
 
 
 LINE = "\x1b[32m+    value = compute(item, index)  # benign diff line\x1b[0m\n"
@@ -171,7 +170,7 @@ REPLAY_FUNCTIONS = (
 )
 # Explicit round-1 cases, refreshed for round 1d after #667. Each row is the stable id, the original test, and the
 # arguments that test received. The replay is built from CORPUS_CASES. The
-# original tests keep their decorators until TEST-DISPLAY-SHARED-TABLE-WIRING.
+# original tests bind their parameters from this same table after definition.
 # original_call_cases reads those parametrizations, and shared_table_errors
 # compares ids and argument digests with this table in both directions.
 # Argument text is split
@@ -3044,6 +3043,209 @@ CORPUS_CASES = (
     ('nfa-test_display_matches_legacy_output_for_supported_escape_corpus-0', 'tests.unit.cli.test_cli_helpers.test_display_matches_legacy_output_for_supported_escape_corpus', ()),
 )
 
+# Historical pytest axis order and explicit labels, without argument values.
+# The stable case id selects a row; its ordinal selects these legacy labels so
+# existing node ids remain unchanged. Each axis records names, size, and labels.
+ORIGINAL_PARAMETER_LAYOUTS = {
+    'test_display_escape_boundaries_mask_secrets_on_every_surface': (
+        (('surface',), 4, None),
+        (('prefix',), 20, ('dcs', 'dcs-csi', 'osc-dcs', 'osc-title-esc7', 'dcs-c1-csi', 'dcs-intermediate-header', 'dcs-parameter-header', 'c1-dcs-parameter-header', 'escape-intermediate-header', 'esc-N', 'esc-O', 'esc-M', 'esc-7', 'esc-8', 'esc-c', 'sos', 'pm', 'apc', 'unknown-escape', 'abandoned-csi')),
+    ),
+    'test_display_removed_controls_preserve_secret_boundaries': (
+        (('code',), 64, None),
+    ),
+    'test_display_ten_million_removed_controls_do_not_build_per_control_state': (
+        (('tail',), 3, None),
+    ),
+    'test_display_boundary_detection_uses_shared_secret_families': (
+        (('value', 'payload'), 7, None),
+    ),
+    'test_display_provenance_masks_low_entropy_keys_after_every_header': (
+        (('surface',), 4, None),
+        (('prefix',), 10, ('esc-numeric-final', 'csi-colon-final', 'csi-intermediate-final', 'dcs-parameters', 'nested-dcs-parameters', 'c1-dcs-parameters', 'c1-csi-parameters', 'unsupported-csi-parameters', 'osc-parameters', 'c1-osc-parameters')),
+    ),
+    'test_display_provenance_masks_overlaps_inside_an_ordinary_match': (
+        (('surface',), 4, None),
+        (('family',), 2, None),
+    ),
+    'test_display_provenance_covers_every_string_form_and_header': (
+        (('surface',), 4, None),
+        (('header',), 3, None),
+        (('introducer',), 10, None),
+    ),
+    'test_display_provenance_overlaps_and_headers_are_independent_in_threads': (
+        (('surface',), 4, None),
+    ),
+    'test_display_source_view_masks_credentials_partly_consumed_by_csi': (
+        (('surface',), 4, None),
+        (('family',), 2, None),
+        (('prefix',), 2, None),
+    ),
+    'test_display_source_view_keeps_header_state_across_ignored_controls': (
+        (('control',), 10, None),
+        (('surface',), 4, None),
+        (('prefix',), 14, ('dcs', 'osc', 'sos', 'pm', 'apc', 'c1-dcs', 'c1-osc', 'c1-sos', 'c1-pm', 'c1-apc', 'esc-intermediate', 'csi-subparameter', 'c1-csi-subparameter', 'csi-parameter')),
+    ),
+    'test_display_source_view_accepts_control_only_nonsecret_text': (
+        (('value', 'expected'), 3, None),
+    ),
+    'test_display_deleted_view_masks_consumed_prefix_with_internal_control': (
+        (('surface',), 4, None),
+        (('family',), 2, None),
+        (('inner',), 5, ('cr', 'nul', 'del', 'c1', 'supported-csi')),
+        (('prefix',), 2, ('csi', 'csi-parameter')),
+    ),
+    'test_display_deleted_view_keeps_bel_transparent_in_nonterminating_headers': (
+        (('surface',), 4, None),
+        (('prefix',), 11, ('csi', 'c1-csi', 'esc-intermediate', 'sos', 'pm', 'apc', 'c1-sos', 'c1-pm', 'c1-apc', 'c1-dcs', 'c1-osc')),
+    ),
+    'test_display_deleted_view_preserves_bel_termination_and_nonsecret_parity': (
+        (('introducer',), 2, None),
+    ),
+    'test_display_renderer_provenance_keeps_control_interrupted_headers': (
+        (('surface',), 4, None),
+        (('header',), 3, None),
+        (('control',), 3, ('bel', 'tab', 'lf')),
+    ),
+    'test_display_renderer_provenance_recovers_consumed_credential_label': (
+        (('surface',), 4, None),
+    ),
+    'test_display_pem_extents_cover_differently_labelled_nested_body': (
+        (('label',), 2, None),
+        (('surface',), 4, None),
+    ),
+    'test_display_source_segments_seal_suppressed_strings': (
+        (('surface',), 4, None),
+        (('hidden', 'tail'), 3, None),
+        (('terminator',), 2, ('bel', 'st')),
+        (('introducer',), 2, ('osc', 'dcs')),
+    ),
+    'test_display_source_segments_do_not_invent_credential_whitespace': (
+        (('surface',), 4, None),
+        (('head', 'tail'), 2, None),
+        (('control',), 4, ('nul', 'cr', 'del', 'c1')),
+    ),
+    'test_display_source_segments_do_not_join_visible_context_through_hidden_payload': (
+        (('surface',), 4, None),
+        (('terminator',), 2, ('bel', 'st')),
+        (('introducer',), 2, ('osc', 'dcs')),
+    ),
+    'test_display_source_segments_still_mask_visible_secrets_on_both_sides': (
+        (('surface',), 4, None),
+        (('terminator',), 2, ('bel', 'st')),
+        (('introducer',), 2, ('osc', 'dcs')),
+    ),
+    'test_display_source_segments_keep_prefixed_secret_context_detectable': (
+        (('surface',), 4, None),
+        (('value',), 3, None),
+    ),
+    'test_display_rendered_segments_seal_hidden_token_prefix': (
+        (('surface',), 4, None),
+        (('terminator',), 2, ('bel', 'st')),
+        (('introducer',), 2, ('osc', 'dcs')),
+    ),
+    'test_display_rendered_segments_preserve_visible_space_inside_nonsecret': (
+        (('surface',), 4, None),
+        (('control',), 2, ('tab', 'lf')),
+    ),
+    'test_display_rendered_segments_still_join_fully_removed_controls': (
+        (('surface',), 4, None),
+        (('control',), 4, ('nul', 'cr', 'del', 'c1')),
+    ),
+    'test_display_rendered_segments_keep_visible_credential_whitespace': (
+        (('surface',), 4, None),
+        (('control',), 2, ('tab', 'lf')),
+        (('prefix',), 2, ('csi', 'csi-parameter')),
+    ),
+    'test_display_reassembled_tokens_use_markers_before_caller_redaction': (
+        (('prefix',), 2, ('plain', 'color')),
+        (('removed',), 3, ('sgr', 'cr', 'nul')),
+        (('family',), 2, None),
+    ),
+    'test_display_unions_canonical_and_source_only_masks': (
+        (('family',), 2, None),
+    ),
+    'test_display_does_not_orphan_value_after_guarding_secret_key_context': (
+        (('surface',), 4, None),
+    ),
+    'test_display_restored_union_masks_before_boundary_changes_or_clipping': (
+        (('case',), 3, None),
+        (('surface',), 4, None),
+    ),
+    'test_display_source_guard_cannot_complete_a_new_credential_or_tear_a_mask': (
+        (('surface',), 4, None),
+    ),
+    'test_display_attribution_preserves_ordinary_left_boundary': (
+        (('suffix',), 2, None),
+    ),
+    'test_display_attribution_covers_shared_rule_families': (
+        (('surface',), 4, None),
+        (('value', 'payload'), 16, None),
+    ),
+    'test_display_attribution_long_benign_colour_runs_keep_parity': (
+        (('count',), 3, None),
+    ),
+    'test_display_attribution_detection_windows_span_removed_control_gaps': (
+        (('surface',), 4, None),
+        (('control',), 4, ('nul', 'cr', 'del', 'c1')),
+        (('count',), 2, None),
+    ),
+    'test_display_attribution_masks_overlapping_ordinary_credentials': (
+        (('family',), 2, None),
+        (('surface',), 4, None),
+    ),
+    'test_display_attribution_fallback_preserves_ordinary_boundary_and_flags': (
+        (('plain',), 2, ('ascii-aws', 'unicode-bearer')),
+        (('surface',), 4, None),
+    ),
+    'test_display_attribution_fallback_keeps_carried_starts': (
+        (('surface',), 4, None),
+    ),
+}
+
+
+def original_parameters(function_name, cases=None):
+    """Build one original's mark from stable table rows and historical labels."""
+    if function_name not in ORIGINAL_PARAMETER_LAYOUTS:
+        raise ValueError("unknown shared display function")
+    layout = ORIGINAL_PARAMETER_LAYOUTS[function_name]
+    names = tuple(name for axis_names, _size, _labels in layout for name in axis_names)
+    source = CORPUS_CASES if cases is None else cases
+    qualname = "tests.unit.core.test_primitives." + function_name
+    rows = tuple(row for row in source if row[1] == qualname)
+    count = 1
+    for _axis_names, size, _labels in layout:
+        count *= size
+    expected_ids = tuple("nfa-" + function_name + "-" + str(index) for index in range(count))
+    if tuple(row[0] for row in rows) != expected_ids:
+        raise ValueError("shared display case ids do not match layout")
+    parameters = []
+    for index, (_case_id, _qualname, arguments) in enumerate(rows):
+        values = dict(arguments)
+        parts = []
+        stride = count
+        for axis_names, size, labels in layout:
+            stride //= size
+            axis_index = (index // stride) % size
+            if labels is not None:
+                parts.append(labels[axis_index])
+            else:
+                # Pass raw id parts to pytest; collection applies its escaping.
+                parts.extend(str(values[name]) for name in axis_names)
+        parameters.append(pytest.param(*(values[name] for name in names), id="-".join(parts)))
+    return pytest.mark.parametrize(names, tuple(parameters))
+
+
+def parametrize_original(function):
+    """Bind a defined original to its shared cases without namespace mutation."""
+    return original_parameters(function.__name__)(function)
+
+
+# The table and original_parameters must exist before importing the originals:
+# test_primitives binds its marks at the end of its module in either import order.
+from tests.unit.core import test_primitives as regressions
+
+
 UNEDITED_CORPUS_FLOOR = 1430
 _IGNORED_MARKS = frozenset({"skip", "skipif", "xfail"})
 _TABLES_LOCK = threading.Lock()
@@ -3425,6 +3627,93 @@ def test_original_parametrizations_match_the_shared_table():
     assert errors == ()
     differences = shared_table_errors(CORPUS_CASES, originals)
     assert differences == (), f"Original/table cases differ: {differences!r}"
+
+
+def assert_collected_original_ids(directory, marker):
+    """Check identity through public collection hooks, after pytest normalizes IDs."""
+    directory.mkdir()
+    name = "test_display_attribution_preserves_ordinary_left_boundary"
+    path = directory / ("test_ids_" + directory.name + ".py")
+    path.write_text("def " + name + "(suffix):\n    pass\n", encoding="utf-8")
+    config = directory / "pytest.ini"
+    config.write_text("[pytest]\n", encoding="utf-8")
+
+    class Capture:
+        nodeids = ()
+
+        @pytest.hookimpl(tryfirst=True)
+        def pytest_pycollect_makeitem(self, collector, name, obj):
+            if name == "test_display_attribution_preserves_ordinary_left_boundary":
+                marker(obj)
+
+        def pytest_collection_modifyitems(self, items):
+            self.nodeids = tuple(item.nodeid for item in items)
+
+    capture = Capture()
+    status = pytest.main(["--collect-only", "-q", "-n", "0", "-o", "addopts=",
+                          "--import-mode=importlib", "-p", "no:cacheprovider",
+                          "-c", str(config), "--confcutdir", str(directory),
+                          "--basetemp", str(directory / "run"), str(path)], plugins=[capture])
+    assert status == pytest.ExitCode.OK
+    prefix = path.name + "::" + name
+    assert capture.nodeids == (prefix + "[]", prefix + r"[\x1b[31m]"), "collected original display ids changed"
+
+
+def test_original_parameters_use_shared_rows_and_stable_case_ids(tmp_path):
+    functions = {qualname.rsplit(".", 1)[-1] for _case_id, qualname, arguments in CORPUS_CASES
+                 if arguments and qualname.startswith("tests.unit.core.test_primitives.")}
+    assert set(ORIGINAL_PARAMETER_LAYOUTS) == functions
+    assert len(functions) == 38
+    for name in functions:
+        mark = original_parameters(name)
+        names, parameters = mark.args
+        rows = [row for row in CORPUS_CASES if row[1] == "tests.unit.core.test_primitives." + name]
+        assert len(parameters) == len(rows)
+        function = _function_map()["tests.unit.core.test_primitives." + name]
+        actual_rows, errors = original_call_cases((function,))
+        assert errors == ()
+        assert actual_rows == tuple(rows)
+        for parameter, (_case_id, _qualname, arguments) in zip(parameters, rows):
+            assert dict(zip(names, parameter.values)) == dict(arguments)
+
+    marker = original_parameters("test_display_attribution_preserves_ordinary_left_boundary")
+    assert_collected_original_ids(tmp_path / "suffixes", marker)
+    name = "test_display_attribution_covers_shared_rule_families"
+    substituted = _substitute_aws_row(CORPUS_CASES)
+    mark = original_parameters(name, substituted)
+    assert dict(zip(mark.args[0], mark.args[1][0].values)) == dict(
+        next(arguments for case_id, _qualname, arguments in substituted if case_id == _aws_case_id()))
+    assert shared_table_errors(CORPUS_CASES, substituted) == (("digest", _aws_case_id()),)
+
+
+def test_original_parameters_reject_missing_duplicate_and_reordered_ids_then_retry_in_parallel():
+    name = "test_display_attribution_covers_shared_rule_families"
+    rows = tuple(row for row in CORPUS_CASES if row[1] == "tests.unit.core.test_primitives." + name)
+    candidates = (rows[:-1], (rows[0],) + rows, (rows[1], rows[0]) + rows[2:],
+                  (("nfa-wrong-0", rows[0][1], rows[0][2]),) + rows[1:])
+    for candidate in candidates:
+        with pytest.raises(ValueError, match="^shared display case ids do not match layout$"):
+            original_parameters(name, candidate)
+    with pytest.raises(ValueError, match="^unknown shared display function$"):
+        original_parameters("missing")
+    def arguments(marker):
+        return marker.args[0], tuple(parameter.values for parameter in marker.args[1])
+
+    expected = arguments(original_parameters(name))
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        actual = list(pool.map(original_parameters, [name] * 6, timeout=10))
+    assert [arguments(mark) for mark in actual] == [expected] * 6
+    assert arguments(original_parameters(name)) == expected
+    assert corpus_case_errors(CORPUS_CASES, ROUND1_CASE_BASELINE, UNEDITED_CORPUS_FLOOR) == ()
+
+
+def test_original_collected_identity_rejects_wrong_label_then_retries(tmp_path):
+    wrong = pytest.mark.parametrize("suffix", [pytest.param("", id=""),
+                                             pytest.param("\x1b[31m", id="wrong")])
+    with pytest.raises(AssertionError, match="collected original display ids changed"):
+        assert_collected_original_ids(tmp_path / "wrong", wrong)
+    marker = original_parameters("test_display_attribution_preserves_ordinary_left_boundary")
+    assert_collected_original_ids(tmp_path / "retry", marker)
 
 
 def test_original_reader_uses_parametrize_marks():

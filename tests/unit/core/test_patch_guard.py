@@ -1,5 +1,6 @@
 """Exercise runtime patch governance through isolated, real pytest sessions."""
 import ast
+from contextlib import nullcontext
 import hashlib
 import inspect
 from itertools import islice
@@ -8771,6 +8772,24 @@ def _dispatch_session(tmp_path, spec):
     return _execute_solo(tmp_path, spec)
 
 
+def _report_batching(config, runtime):
+    groups = runtime.timings
+    summary = ("patch guard batching: " + runtime.batching_status()
+               + "; groups=%d cases=%d group_seconds=%.3f child_seconds=%.3f" % (
+                   len(groups), sum(len(group["nodeids"]) for group in groups),
+                   sum(group["seconds"] for group in groups),
+                   sum(runtime.child_seconds.values())))
+    reporter = config.pluginmanager.getplugin("terminalreporter")
+    if reporter is not None and not hasattr(config, "workerinput"):
+        capture = config.pluginmanager.getplugin("capturemanager")
+        with (capture.global_and_fixture_disabled() if capture is not None else nullcontext()):
+            reporter.write_line(summary)
+    else:
+        # xdist relays captured warnings to the controller's normal summary.
+        # Worker stdout and successful teardown capture are otherwise hidden.
+        config.issue_config_time_warning(pytest.PytestWarning(summary), stacklevel=2)
+
+
 @pytest.fixture(scope="session")
 def _worker_batches(request):
     previous = (_BATCH_STATE.results, _BATCH_STATE.exchange, _BATCH_STATE.result_paths,
@@ -8786,7 +8805,7 @@ def _worker_batches(request):
         yield runtime
     finally:
         try:
-            print("patch guard batching: " + runtime.batching_status())
+            _report_batching(request.config, runtime)
             if runtime.timings:
                 # Hash node identifiers so telemetry never echoes a parameter.
                 digest = lambda nodeid: hashlib.sha256(nodeid.encode("utf-8", "surrogatepass")).hexdigest()
@@ -9801,3 +9820,35 @@ def test_worker_local_batching_status_explains_an_unsupported_probe():
     runtime = _BatchController(support_probe=lambda: False, directory_factory=no_directory)
     runtime.open(SimpleNamespace(option=SimpleNamespace(collectonly=False)))
     assert runtime.batching_status() == "inactive (fork/descriptor unavailable)"
+
+
+@pytest.mark.parametrize("workers", [0, 2])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_worker_local_batching_status_reaches_normal_output(tmp_path, workers, enabled):
+    source = ("from contextlib import nullcontext\nfrom types import SimpleNamespace\nimport pytest\n"
+              + inspect.getsource(_report_batching) + '''
+@pytest.fixture(scope="session", autouse=True)
+def summary(request):
+    yield
+    runtime = SimpleNamespace(timings=[], child_seconds={},
+        batching_status=lambda: STATUS)
+    _report_batching(request.config, runtime)
+@pytest.mark.parametrize("case", range(4))
+def test_probe(case):
+    assert case >= 0
+''')
+    status = "active (single-process)" if enabled else "inactive (disabled by environment)"
+    (tmp_path / "test_report.py").write_text(source.replace("STATUS", repr(status)), encoding="utf-8")
+    env = dict(os.environ)
+    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    result = _run_fork_server(
+        [sys.executable, "-B", "-m", "pytest", "test_report.py", "-q",
+         "-p", "xdist.plugin", "-p", "no:cacheprovider", "-n", str(workers),
+         "--basetemp", str(tmp_path / "run")],
+        run=None, cwd=str(tmp_path), env=env, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=120)
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "4 passed" in output, output
+    assert "patch guard batching: " + status in output, output
+    assert "warm_cases" not in output, output
