@@ -12,7 +12,7 @@ import threading
 import errno
 import tracemalloc
 from itertools import combinations
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch as codec_patch
 
@@ -1439,6 +1439,59 @@ def test_goldens_equal_mailbox_bytes_and_ids():
         assert codec.canonical(value) == encoded(value)
         assert codec.record_id(value) == digest(value) == golden["id"]
         assert codec.parse(encoded(value)) == value
+
+
+@pytest.mark.parametrize("family", ["integer", "long string"])
+def test_rf43_canonical_scalars_match_json_with_bounded_work(family):
+    value = record("record", {"value": [-(10 ** 63) + 1, 10 ** 64 - 1, 0, False, -0.0, 1e-7]},
+                   ('x' * 8190 + '"\\😀\n') * 8)
+    expected = raw(value)
+    sizes = []
+
+    def observe_dumps(frame, event, _arg):
+        if event == "call" and frame.f_code == json.dumps.__code__:
+            subject = frame.f_locals["obj"]
+            if family == "integer" and type(subject) is int:
+                sizes.append(1)
+            if family == "long string" and type(subject) is str and len(subject) >= 128:
+                sizes.append(len(subject))
+
+    previous = sys.getprofile()
+    sys.setprofile(observe_dumps)
+    try:
+        assert codec.canonical(value) == expected
+    finally:
+        sys.setprofile(previous)
+    assert codec.parse(expected) == value
+    if family == "integer":
+        assert sizes == []
+    else:
+        assert 0 < len(sizes) <= 9 and max(sizes) <= 8192
+
+
+def test_rf43_canonical_rechecks_budget_between_string_chunks():
+    body = "\U0001f600" * 16000 + "~" * 40000
+    value = record(body=body)
+    chunks = []
+
+    def observe_dumps(frame, event, _arg):
+        if event == "call" and frame.f_code == json.dumps.__code__:
+            subject = frame.f_locals["obj"]
+            if type(subject) is str and subject.startswith(("\U0001f600", "~")):
+                chunks.append(subject)
+
+    previous = sys.getprofile()
+    sys.setprofile(observe_dumps)
+    try:
+        encoded = codec.canonical(value)
+    finally:
+        sys.setprofile(previous)
+    assert encoded == raw(value)
+    assert "".join(chunks) == body
+    remaining = codec.MAX_BYTES - len(b'{"body":"')
+    for chunk in chunks:
+        assert len(chunk) <= max(1, min(8192, (remaining - 2) // 12))
+        remaining -= len(json.dumps(chunk, ensure_ascii=True)) - 2
 
 
 def test_store_idempotent_verify_on_every_read(tmp_path):
@@ -4446,6 +4499,69 @@ def _store_os(base, **overrides):
         copied["O_BINARY"] = base.O_BINARY
     copied.update(overrides)
     return SimpleNamespace(**copied)
+
+
+@pytest.mark.parametrize("failure", [None, "unlink", "directory-sync"])
+def test_rf43_write_syncs_directory_after_staging_removal(tmp_path, monkeypatch, failure):
+    value = record(body="publication")
+    rid = codec.record_id(value)
+    events = []
+    faults = {failure}
+    with closing(make_store(tmp_path)) as store:
+        def fsync(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                events.append(("directory-sync", tuple(sorted(p.name for p in tmp_path.iterdir()))))
+                if "directory-sync" in faults:
+                    faults.remove("directory-sync")
+                    raise OSError(errno.EIO, MARKER)
+            else:
+                events.append(("file-sync",))
+            os.fsync(fd)
+
+        def unlink(name, *, dir_fd):
+            events.append(("unlink",))
+            if "unlink" in faults:
+                faults.remove("unlink")
+                raise OSError(errno.EIO, MARKER)
+            os.unlink(name, dir_fd=dir_fd)
+
+        monkeypatch.setattr(codec_store, "os", _store_os(os, fsync=fsync, unlink=unlink))
+        if failure is None:
+            assert store.write(value) == rid
+        else:
+            assert_error("E_AUTH", lambda: store.write(value), _OPERATION)
+        expected = [("file-sync",), ("unlink",), ("directory-sync", (rid + ".json",))]
+        if failure == "unlink":
+            expected.insert(2, ("unlink",))
+        if failure == "directory-sync":
+            expected.append(expected[-1])
+        assert events == expected
+        assert store.read(rid) == value
+        assert store.write(value) == rid
+        assert events == expected
+
+
+def test_rf43_competing_publications_each_sync_once(tmp_path, monkeypatch):
+    value = record(body="overlapping publication")
+    rid = codec.record_id(value)
+    directory_syncs = []
+    with closing(make_store(tmp_path)) as writer, closing(make_store(tmp_path)) as peer:
+        def link(source, target, *, src_dir_fd, dst_dir_fd, follow_symlinks):
+            if src_dir_fd == writer.fd:
+                assert peer.write(value) == rid
+            os.link(source, target, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd,
+                    follow_symlinks=follow_symlinks)
+
+        def fsync(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                directory_syncs.append(fd)
+            os.fsync(fd)
+
+        monkeypatch.setattr(codec_store, "os", _store_os(os, fsync=fsync, link=link))
+        assert writer.write(value) == rid
+        assert directory_syncs == [peer.fd, writer.fd]
+        assert writer.read(rid) == peer.read(rid) == value
+        assert [p.name for p in tmp_path.iterdir()] == [rid + ".json"]
 
 
 @contextmanager
