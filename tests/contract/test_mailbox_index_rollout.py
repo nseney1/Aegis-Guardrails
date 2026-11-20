@@ -32,6 +32,7 @@ import stat
 import subprocess
 import symtable
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -40,10 +41,10 @@ from tests.contract.test_process_ratchets import ScopedNames
 
 REPO = Path(__file__).resolve().parents[2]
 INDEX = "tools/hierarchy_mailbox_index.py"
-# Owner approved the doctor and these four shadow readers (MB-2 release ruling).
+# Owner approved the doctor, the four MB-2 shadow readers, and the router (MB-2-ROUTER).
 ADMITTED_IMPORTERS = frozenset({"tools/hierarchy_mailbox_doctor.py", "tools/hierarchy_jobs.py",
                                 "tools/hierarchy_sweep.py", "tools/hierarchy_provision.py",
-                                "tools/hierarchy_provider_recovery.py"})
+                                "tools/hierarchy_provider_recovery.py", "tools/hierarchy_router.py"})
 RECEIVER_ATTR_ALLOW = frozenset({"_path_key"})
 RECEIVER_ATTR_DENY = frozenset({"mode", "__init__", "__new__", "__dict__", "__class__"})
 NEEDLES = (b"MailboxIndex", b"hierarchy_mailbox_index")
@@ -606,9 +607,9 @@ def test_tip_prefilters_once_with_clean_git_environment(monkeypatch):
     assert parsed == [INDEX] + sorted(ADMITTED_IMPORTERS.intersection(tracked))
 
 
-def test_owner_admits_five_shadow_readers_and_refuses_unlisted_importer(shadow_signature):
+def test_owner_admits_six_shadow_readers_and_refuses_unlisted_importer(shadow_signature):
     doctor = "tools/hierarchy_mailbox_doctor.py"
-    assert ADMITTED_IMPORTERS == frozenset({doctor, *("tools/" + name + ".py" for name in SHADOW_READERS)})
+    assert ADMITTED_IMPORTERS == frozenset({doctor, *("tools/" + name + ".py" for name in (*SHADOW_READERS, "hierarchy_router"))})
     raw = b'from tools.hierarchy_mailbox_index import MailboxIndex\nMailboxIndex(mailbox, mode="shadow")\n'
     for path in sorted(ADMITTED_IMPORTERS):
         assert _importer_violations(raw, path, shadow_signature) == []
@@ -688,7 +689,7 @@ LOCKED_READER = '''class _MailboxReader:
 '''
 
 
-def _assert_reader_history(tree, reader):
+def _assert_reader_history(tree, reader, *, reads_expected=None, confined_private_attributes=False):
     name = "tools/" + reader + ".py"
     factories = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "mailbox_reader"]
     assert len(factories) == 1
@@ -705,12 +706,26 @@ def _assert_reader_history(tree, reader):
              name, "RF24_SIGNATURE")
     constructors = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and _reference(node.func, names)]
     _require(len(constructors) == 1 and constructors[0] in owned, name, "RF24_SIGNATURE")
-    _require(not any(isinstance(node, ast.Attribute) and node.attr.startswith("_")
-                     and not node.attr.startswith("__") for node in ast.walk(tree)), name, "RF24_SIGNATURE")
+    if confined_private_attributes:
+        # The router already guards owner-private paths with self._identities and
+        # the snapshot lock. Those attributes stay inside _CapturedPathGuard.
+        # A private attribute anywhere else, including on the index, still refuses.
+        guards = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "_CapturedPathGuard"]
+        _require(len(guards) == 1, name, "RF24_SIGNATURE")
+        allowed = owned | set(ast.walk(guards[0]))
+        leaked = any(node not in allowed and isinstance(node, ast.Attribute) and node.attr.startswith("_")
+                     and not node.attr.startswith("__") for node in ast.walk(tree))
+        _require(not leaked, name, "RF24_SIGNATURE")
+    else:
+        _require(not any(isinstance(node, ast.Attribute) and node.attr.startswith("_")
+                         and not node.attr.startswith("__") for node in ast.walk(tree)), name, "RF24_SIGNATURE")
     reads = [node for node in ast.walk(tree) if node not in owned and isinstance(node, ast.Attribute) and
              (node.attr == "messages" or (node.attr == "get" and isinstance(node.value, ast.Call) and
               isinstance(node.value.func, ast.Name) and node.value.func.id == "mailbox_reader"))]
-    assert len(reads) == dict(zip(SHADOW_READERS, (5, 2, 3, 1)))[reader]
+    if reads_expected is None:
+        assert len(reads) == dict(zip(SHADOW_READERS, (5, 2, 3, 1)))[reader]
+    else:
+        assert len(reads) == reads_expected
     for node in reads:
         assert isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
         assert node.value.func.id == "mailbox_reader"
@@ -720,6 +735,62 @@ def _assert_reader_history(tree, reader):
 def test_admitted_readers_route_all_explicit_history_reads_through_shadow(reader):
     tree = ast.parse(_read_source(REPO, "tools/" + reader + ".py", MAX_SOURCE))
     _assert_reader_history(tree, reader)
+
+
+def _assert_router_pinned_history(tree):
+    definitions = {node.name: node for node in tree.body if isinstance(node, (ast.ClassDef, ast.FunctionDef))}
+    facade = set(ast.walk(definitions["_MailboxReader"]))
+    factory = set(ast.walk(definitions["mailbox_reader"]))
+    prior_delivery = set(ast.walk(definitions["prior_delivery"]))
+    names = ScopedNames(tree, "tools/hierarchy_router.py")
+    outside_facade = [node for node in ast.walk(tree) if node not in facade]
+    raw_reads = [node for node in outside_facade if isinstance(node, ast.Attribute) and node.attr == "messages"]
+    assert len(raw_reads) == 1, "expected one raw router history read outside the facade"
+    assert raw_reads[0] in prior_delivery and _name(raw_reads[0].value, "mailbox"), "raw read left prior_delivery"
+    assert not any(_name(node, "mailbox_reader") or _name(node, "_shadow_mailbox") or _reference(node, names)
+                   or (_name(node, "_MailboxReader") and node not in factory) for node in outside_facade), (
+        "router authority can reach the shadow facade")
+
+
+def test_router_authority_reads_only_pinned_history():
+    tree = ast.parse(_read_source(REPO, "tools/hierarchy_router.py", MAX_SOURCE))
+    _assert_router_pinned_history(tree)
+
+
+@pytest.mark.parametrize("extra, refusal", [
+    ("mailbox.messages()", "expected one raw router history read outside the facade"),
+    ("mailbox_reader(mailbox).get(identifier)", "router authority can reach the shadow facade"),
+])
+def test_router_pinned_history_contract_refuses_extra_row_reads(extra, refusal):
+    tree = ast.parse("class _MailboxReader: pass\n"
+                     "def mailbox_reader(mailbox): return _MailboxReader(mailbox)\n"
+                     "def prior_delivery(mailbox, identifier): return mailbox.messages().get(identifier)\n"
+                     "def row_view(mailbox, identifier): pass\n")
+    _assert_router_pinned_history(tree)
+    row_view = tree.body[-1]
+    row_view.body.extend(ast.parse(extra).body)
+    with pytest.raises(AssertionError, match=refusal):
+        _assert_router_pinned_history(tree)
+
+
+def test_router_shadow_refuses_unsupported_descriptors(tmp_path, monkeypatch):
+    module = importlib.import_module("tools.hierarchy_router")
+    history = {"known": {"message": {"body": "pinned fixture"}}}
+    mailbox = SimpleNamespace(root=tmp_path, messages=lambda: history)
+    calls = []
+
+    def index(*args, **kwargs):
+        calls.append(True)
+        raise AssertionError("index ran without a descriptor adapter")
+
+    monkeypatch.setattr("tools.hierarchy_router.shadow_descriptor_supported", lambda: False)
+    monkeypatch.setattr("tools.hierarchy_router.MailboxIndex", index)
+    reader = module.mailbox_reader(mailbox)
+    assert reader.messages() == history
+    assert reader.get("known") == history["known"]
+    assert reader.get(None) is None
+    assert calls == []
+    assert reader.last_divergence == [{"kind": "mailbox_index_error", "text": "shadow index read failed"}]
 
 
 @pytest.mark.parametrize("mutation", [
@@ -754,20 +825,34 @@ def test_reader_facade_guard_refuses_unlocked_or_bypassed_reads(mutation):
         _assert_reader_history(tree, "hierarchy_jobs")
 
 
-@pytest.mark.parametrize("reader", SHADOW_READERS)
+@pytest.mark.parametrize("reader", (*SHADOW_READERS, "hierarchy_router"))
 @pytest.mark.parametrize("api", ["messages", "get", "missing"])
 @pytest.mark.parametrize("scenario", ["healthy", "concurrent_publish", "concurrent_rewrite", "refusal_retry", "unsupported"])
 def test_admitted_shadow_readers_preserve_pinned_outcomes(tmp_path, monkeypatch, reader, api, scenario):
     module = importlib.import_module("tools." + reader)
     import hierarchy_mailbox as hm
+    if reader == "hierarchy_router" and scenario == "concurrent_publish" and not module.shadow_descriptor_supported():
+        pytest.skip("router match diagnostics require directory descriptors")
 
     class InterleavedMailbox(hm.Mailbox):
         before_read = None
+        after_read = None
+        first_read = None
+        read_depth = 0
 
         def messages(self):
-            if self.before_read is not None:
-                self.before_read()
-            return super().messages()
+            self.read_depth += 1
+            try:
+                if self.before_read is not None:
+                    self.before_read()
+                result = super().messages()
+                if self.read_depth == 1 and self.first_read is None:
+                    self.first_read = result
+                    if self.after_read is not None:
+                        self.after_read()
+                return result
+            finally:
+                self.read_depth -= 1
 
     root = tmp_path / "mailbox"
     endpoints = {"a/front-door": {}, "a/orchestrator": {}, "a/lane/review": {"kind": "reviewer"}}
@@ -779,12 +864,22 @@ def test_admitted_shadow_readers_preserve_pinned_outcomes(tmp_path, monkeypatch,
     message = {"message_id": "seed", "from": "a/orchestrator", "to": "a/lane/review", "host": "test-host",
                "session": "a/orchestrator", "binding_generation": 1, "type": "info", "body": "pinned body"}
     mailbox.publish(message)
+    mailbox.first_read = None
     pinned = super(InterleavedMailbox, mailbox).messages
+    if reader == "hierarchy_router":
+        live_pinned = pinned
+
+        def pinned():
+            # The router's ruling compares its first pinned snapshot, before
+            # shadow reads can observe a later concurrent filesystem change.
+            return mailbox.first_read if mailbox.first_read is not None else live_pinned()
     index = module.mailbox_reader(mailbox)
     assert index.mode == "shadow"
     identifier = "absent" if api == "missing" else "seed"
 
     def read():
+        if reader == "hierarchy_router":
+            mailbox.first_read = None
         return index.messages() if api == "messages" else index.get(identifier)
 
     if scenario == "unsupported":
@@ -807,7 +902,10 @@ def test_admitted_shadow_readers_preserve_pinned_outcomes(tmp_path, monkeypatch,
             rewrites.append(True)
             path.write_bytes(original.replace(b"pinned body", ("concurrent body %d" % len(rewrites)).encode("ascii")))
 
-        mailbox.before_read = rewrite_before_pinned_read
+        if reader == "hierarchy_router":
+            mailbox.after_read = rewrite_before_pinned_read
+        else:
+            mailbox.before_read = rewrite_before_pinned_read
     elif scenario == "refusal_retry":
         path = Path(pinned()["seed"]["path"])
         original = path.read_bytes()
