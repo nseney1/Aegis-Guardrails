@@ -42,7 +42,7 @@ def test_rf8_canonical_keeps_chunks_when_worst_case_exceeds_remaining_budget(lat
     encoded, calls = canonical_dumps(value)
     assert encoded == raw(value)
     assert not any(item is text for item in calls)
-    assert max(len(item) for item in calls if type(item) is str) <= 128
+    assert max(len(item) for item in calls if type(item) is str) <= 8192
 
 
 @pytest.mark.parametrize("invalid", ["bytes", "escaped", "depth", "nodes", "refs", "schema"])

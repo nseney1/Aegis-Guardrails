@@ -3,7 +3,10 @@ from contextlib import contextmanager
 import hashlib
 import json
 import os
+import shutil
 import sys
+import tempfile
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -73,6 +76,27 @@ def start_owner(registration="alpha"):
     queue_role.issue(registration)
     server._start(queue_registration=registration)
     rpc("initialize")
+
+
+def _os_view(**overrides):
+    """Product os reference with the directory-opener callbacks authority() passes through."""
+    values = dict(geteuid=os.geteuid, getpid=os.getpid, open=os.open, close=os.close,
+                  fstat=os.fstat, stat=os.stat, fsencode=os.fsencode)
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _require_authority():
+    if not queue_role.supported():
+        pytest.skip("requires Linux descriptor-relative no-follow operations")
+
+
+def _same_length(raw):
+    mutated = bytearray(raw)
+    mutated[-1] ^= 1
+    mutated = bytes(mutated)
+    assert len(mutated) == len(raw) and mutated != raw
+    return mutated
 
 
 def test_ordinary_initialize_and_tools_list_bytes_unchanged():
@@ -431,7 +455,7 @@ def test_authority_read_fault_has_no_echo_and_closes_handles(owner_factory, tmp_
     before = len(list(Path("/proc/self/fd").iterdir()))
     def failed(*args, **kwargs):
         raise OSError("token=private-value")
-    monkeypatch.setattr(queue_role, "os", SimpleNamespace(geteuid=os.geteuid, getpid=os.getpid, stat=failed))
+    monkeypatch.setattr(queue_role, "os", _os_view(stat=failed))
     with pytest.raises(role.RoleRefusal, match="^role_io_unavailable$"):
         role.issue("alpha")
     assert len(list(Path("/proc/self/fd").iterdir())) == before
@@ -458,7 +482,7 @@ def test_unsafe_owner_files_refuse(owner_factory, monkeypatch, mode):
     elif mode == "group-writable":
         path.chmod(0o620)
     else:
-        monkeypatch.setattr(queue_role, "os", SimpleNamespace(geteuid=lambda: os.geteuid() + 1))
+        monkeypatch.setattr(queue_role, "os", _os_view(geteuid=lambda: os.geteuid() + 1))
     with pytest.raises(role.RoleRefusal, match="^role_invalid$"):
         role.issue("alpha")
 
@@ -743,3 +767,335 @@ def test_role_predicates_agree_across_threads():
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         assert list(pool.map(check, range(8))) == [True] * 8
+
+
+def _watch_decodes_and_hashes(monkeypatch):
+    seen = {"loads": 0, "hashes": 0}
+    real_loads = queue_role.primitives.strict_loads
+    real_sha = queue_role.hashlib.sha256
+
+    def loads(text):
+        seen["loads"] += 1
+        return real_loads(text)
+
+    def sha256(data):
+        seen["hashes"] += 1
+        return real_sha(data)
+
+    monkeypatch.setattr(queue_role, "primitives", SimpleNamespace(
+        strict_loads=loads, envelope=queue_role.primitives.envelope))
+    monkeypatch.setattr(queue_role, "hashlib", SimpleNamespace(sha256=sha256))
+    return seen
+
+
+def test_issue_and_bind_decode_json_claim_only_rehashes(owner_factory, monkeypatch):
+    """JSON is decoded at issue and bind. A claim re-reads, size-checks and re-hashes both records twice."""
+    _require_authority()
+    role, root, path, workspace, policy = owner_factory()
+    seen = _watch_decodes_and_hashes(monkeypatch)
+    role.issue("alpha")
+    assert seen == {"loads": 1, "hashes": 1}
+    role.bind("alpha")
+    assert seen == {"loads": 3, "hashes": 3}
+    server._start(queue_registration="alpha")
+    rpc("initialize")
+    before = dict(seen)
+    result = claim({"id": "ONE", "expect": "a" * 64, "lane": "alpha"})
+    # No git work tree: the queue service refuses after both pin checkpoints.
+    assert result["reason"] == "queue_io_unavailable" and result["refused"] is True
+    assert seen["loads"] == before["loads"]
+    assert seen["hashes"] == before["hashes"] + 4
+    assert server._queue_grant.stale is False
+
+
+def _session_file(root):
+    return next((root / "sessions").glob("*.json"))
+
+
+def _restore_registration(path, original):
+    path.write_bytes(original)
+    path.chmod(0o600)
+
+
+@pytest.mark.parametrize("fault", ["same-length", "malformed", "session-replaced", "mode-widened"])
+def test_claim_replacement_is_role_stale_without_decoding(owner_factory, monkeypatch, fault):
+    _require_authority()
+    role, root, path, workspace, policy = owner_factory()
+    start_owner()
+    grant = server._queue_grant
+    original = path.read_bytes()
+    session = _session_file(root)
+    session_original = session.read_bytes()
+    seen = _watch_decodes_and_hashes(monkeypatch)
+    if fault == "same-length":
+        path.write_bytes(_same_length(original))
+    elif fault == "malformed":
+        path.write_bytes(b"x" * len(original))
+    elif fault == "session-replaced":
+        replacement = session.with_suffix(".new")
+        replacement.write_bytes(b"{" * len(session_original))
+        replacement.chmod(0o600)
+        replacement.replace(session)
+    else:
+        path.chmod(0o666)
+    arguments = {"id": "ONE", "expect": "a" * 64, "lane": "alpha"}
+    result = claim(arguments)
+    rendered = json.dumps(result)
+    assert result["reason"] == "role_stale" and result["error"] == "role_stale"
+    assert result["exit_code"] == 1 and grant.stale is True
+    assert seen["loads"] == 0
+    assert "\n" not in rendered and "private-value" not in rendered and b"x" * 8 not in rendered.encode()
+    if fault == "mode-widened":
+        assert seen["hashes"] == 0
+    else:
+        assert seen["hashes"] == 2
+    _restore_registration(path, original)
+    if fault == "session-replaced":
+        session.write_bytes(session_original)
+        session.chmod(0o600)
+    assert claim(arguments)["reason"] == "role_stale"
+    assert not (workspace / ".aegis" / "state" / "team-queue.json").exists()
+
+
+def test_mutate_replacement_raises_role_stale_without_latching(owner_factory, monkeypatch):
+    _require_authority()
+    role, root, path, workspace, policy = owner_factory()
+    start_owner()
+    grant = server._queue_grant
+    original = path.read_bytes()
+    seen = _watch_decodes_and_hashes(monkeypatch)
+    arguments = {"id": "ONE", "expect": "a" * 64, "lane": "alpha"}
+    with role.authority() as (anchor, chain):
+        path.write_bytes(b"x" * len(original))
+        with pytest.raises(role.RoleRefusal, match="^role_stale$") as caught:
+            grant._mutate(anchor, chain, arguments, grant.session)
+    assert str(caught.value) == "role_stale" and grant.stale is False
+    assert seen["loads"] == 0 and seen["hashes"] == 2
+    _restore_registration(path, original)
+    # Rewriting the record moves its generation, so restored bytes stay stale.
+    assert claim(arguments)["reason"] == "role_stale"
+    assert grant.stale is True
+    assert not (workspace / ".aegis" / "state" / "team-queue.json").exists()
+
+
+def test_expiry_while_waiting_for_the_queue_lock_is_rehashed(owner_factory, monkeypatch):
+    _require_authority()
+    role, root, path, workspace, policy = owner_factory()
+    start_owner()
+    grant = server._queue_grant
+    expires = grant.record["expires_at"]
+    clock = {"now": expires - 1}
+    real = role.storage
+    seen = _watch_decodes_and_hashes(monkeypatch)
+    workspace_calls = []
+    real_workspace = role._workspace_identity
+
+    def workspace_identity(value):
+        workspace_calls.append(value)
+        return real_workspace(value)
+
+    monkeypatch.setattr(queue_role, "_workspace_identity", workspace_identity)
+    monkeypatch.setattr(queue_role, "time", SimpleNamespace(time=lambda: clock["now"]))
+
+    @contextmanager
+    def expired_while_waiting(*args, **kwargs):
+        with real.locked(*args, **kwargs) as held:
+            clock["now"] = expires
+            yield held
+
+    monkeypatch.setattr(queue_role, "storage", SimpleNamespace(
+        locked=expired_while_waiting, file_lock=real.file_lock, LockTimeoutError=real.LockTimeoutError))
+    arguments = {"id": "ONE", "expect": "a" * 64, "lane": "alpha"}
+    assert claim(arguments)["reason"] == "role_stale"
+    assert grant.stale is True
+    # Both checkpoints hash both records. Expiry is checked after the pins, so the
+    # second checkpoint still re-hashes before the workspace pin.
+    assert seen["loads"] == 0 and seen["hashes"] == 4
+    assert len(workspace_calls) == 1
+    path.chmod(0o600)
+    assert claim(arguments)["reason"] == "role_stale"
+
+
+def test_queue_lock_waits_see_a_concurrent_registration_change(owner_factory, monkeypatch):
+    _require_authority()
+    role, root, path, workspace, policy = owner_factory()
+    start_owner()
+    grant = server._queue_grant
+    original = path.read_bytes()
+    mutated = _same_length(original)
+    real = role.storage
+    started, changed = threading.Event(), threading.Event()
+
+    def replace():
+        assert started.wait(timeout=10)
+        path.write_bytes(mutated)
+        changed.set()
+
+    worker = threading.Thread(target=replace)
+    worker.start()
+
+    @contextmanager
+    def wait_for_replacement(*args, **kwargs):
+        started.set()
+        assert changed.wait(timeout=10)
+        with real.locked(*args, **kwargs) as held:
+            yield held
+
+    monkeypatch.setattr(queue_role, "storage", SimpleNamespace(
+        locked=wait_for_replacement, file_lock=real.file_lock, LockTimeoutError=real.LockTimeoutError))
+    seen = _watch_decodes_and_hashes(monkeypatch)
+    try:
+        arguments = {"id": "ONE", "expect": "a" * 64, "lane": "alpha"}
+        assert claim(arguments)["reason"] == "role_stale"
+        assert grant.stale is True and seen["loads"] == 0 and seen["hashes"] == 4
+        _restore_registration(path, original)
+        assert claim(arguments)["reason"] == "role_stale"
+    finally:
+        worker.join(timeout=10)
+        assert not worker.is_alive()
+
+
+def test_claim_acquires_the_queue_lock_inside_authority(owner_factory, monkeypatch):
+    _require_authority()
+    role, root, path, workspace, policy = owner_factory()
+    start_owner()
+    real = role.storage
+    events = []
+
+    @contextmanager
+    def file_lock(*args, **kwargs):
+        events.append("authority-enter")
+        with real.file_lock(*args, **kwargs):
+            yield
+        events.append("authority-exit")
+
+    @contextmanager
+    def locked(*args, **kwargs):
+        events.append("queue-enter")
+        assert "authority-enter" in events and "authority-exit" not in events
+        with real.locked(*args, **kwargs) as held:
+            yield held
+        events.append("queue-exit")
+
+    monkeypatch.setattr(queue_role, "storage", SimpleNamespace(
+        file_lock=file_lock, locked=locked, LockTimeoutError=real.LockTimeoutError))
+    assert claim({"id": "ONE", "expect": "a" * 64, "lane": "alpha"})["reason"] == "queue_io_unavailable"
+    assert events.index("queue-enter") < events.index("authority-exit")
+    assert events.index("queue-exit") < events.index("authority-exit")
+
+
+def _authority_tree(components):
+    """An account home whose mcp-queue path has exactly ``components`` parts."""
+    base = Path(tempfile.mkdtemp(prefix="qr", dir="/tmp"))
+    home = base
+    # /tmp/<name> is three parts; .aegis/mcp-queue adds two. The rest are home parents.
+    for index in range(components - 5):
+        home = home / ("d" + str(index))
+        home.mkdir(mode=0o700)
+        home.chmod(0o700)
+    from aegis_core.workspace.layout import UserLayout
+
+    root = UserLayout(home).aegis_dir / "mcp-queue"
+    root.mkdir(parents=True, mode=0o700)
+    for directory in (root, root.parent):
+        directory.chmod(0o700)
+    assert len(root.parts) == components
+    return base, home, root
+
+
+def _count_directory_opens(monkeypatch):
+    calls = []
+
+    def opened(name, flags, dir_fd=None):
+        calls.append(name)
+        return os.open(name, flags, dir_fd=dir_fd)
+
+    monkeypatch.setattr(queue_role, "os", _os_view(open=opened))
+    return calls
+
+
+@pytest.mark.parametrize("components", [5, 16, 32])
+def test_authority_opens_each_component_once_and_retains_one_parent(monkeypatch, components):
+    _require_authority()
+    base, home, root = _authority_tree(components)
+    calls = _count_directory_opens(monkeypatch)
+    monkeypatch.setattr(queue_role, "account_home", lambda: home)
+    before = len(list(Path("/proc/self/fd").iterdir()))
+    try:
+        with queue_role.authority() as (anchored, chain):
+            during = len(list(Path("/proc/self/fd").iterdir()))
+        prefixes = [Path(*root.parts[:index]) for index in range(1, len(root.parts) + 1)]
+        expected = tuple((path.lstat().st_dev, path.lstat().st_ino) for path in prefixes)
+        assert anchored == root
+        assert chain == expected
+        assert calls == list(root.parts)
+        assert during - before == 2
+    finally:
+        shutil.rmtree(base)
+    assert len(list(Path("/proc/self/fd").iterdir())) == before
+
+
+@pytest.mark.parametrize("fault,reason", [
+    ("unowned", "role_invalid"),
+    ("mode-group", "role_invalid"),
+    ("mode-other", "role_invalid"),
+    ("symlink", "role_invalid"),
+    ("missing", "role_missing"),
+])
+def test_authority_ancestor_failures_keep_refusal_codes(monkeypatch, fault, reason):
+    _require_authority()
+    base, home, root = _authority_tree(5)
+    monkeypatch.setattr(queue_role, "account_home", lambda: home)
+    try:
+        if fault == "unowned":
+            monkeypatch.setattr(queue_role, "os", _os_view(geteuid=lambda: os.geteuid() + 1))
+        elif fault == "mode-group":
+            root.parent.chmod(0o720)
+        elif fault == "mode-other":
+            root.parent.chmod(0o702)
+        elif fault == "symlink":
+            parent = root.parent
+            moved = parent.with_name(parent.name + "-real")
+            parent.rename(moved)
+            symlink_or_skip(moved, parent, target_is_directory=True)
+        else:
+            root.rmdir()
+        with pytest.raises(queue_role.RoleRefusal, match="^" + reason + "$") as caught:
+            with queue_role.authority():
+                raise AssertionError("refused authority must not yield")
+        assert str(caught.value) == reason
+        if fault == "symlink":
+            parent.unlink()
+            moved.rename(parent)
+        elif fault == "missing":
+            root.mkdir(mode=0o700)
+            root.chmod(0o700)
+        elif fault.startswith("mode-"):
+            root.parent.chmod(0o700)
+        else:
+            monkeypatch.setattr(queue_role, "os", _os_view())
+        with queue_role.authority() as (anchored, chain):
+            assert anchored == root and len(chain) == 5
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_authority_walk_is_stable_across_threads(monkeypatch):
+    _require_authority()
+    base, home, root = _authority_tree(6)
+    monkeypatch.setattr(queue_role, "account_home", lambda: home)
+    try:
+        with queue_role.authority() as (anchored, expected):
+            assert anchored == root
+
+        def once(_index):
+            with queue_role.authority() as (found, chain):
+                assert found == root and chain == expected
+            return True
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            assert list(pool.map(once, range(8))) == [True] * 8
+    finally:
+        shutil.rmtree(base)
