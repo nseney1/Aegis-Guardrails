@@ -25,6 +25,7 @@ from pathlib import Path
 import re
 import stat
 from threading import Lock
+from types import MappingProxyType
 from typing import Optional, Sequence, Tuple, Union
 
 from aegis_core import gitsafe, gitsafe_policy, gitsafe_run, team_git_snapshot
@@ -39,7 +40,8 @@ from aegis_core.redaction import redact_insight_text
 __all__ = ["CommitIdentity", "GitRefusal", "GitStore", "Plan", "UNKNOWN_OUTCOME_CODES",
            "cas_fast_forward", "commit_tested",
            "descriptor_support", "ref_oid", "plan_merge", "plan_pick", "plan_revert", "snapshot_tree",
-           "validate_oid", "validate_message",
+           "validate_oid", "validate_message", "object_read_argv", "object_read_env",
+           "MAX_OBJECT_READ_ENV_ENTRIES",
            # Export the internal runner-transfer surface for the lane guard's accounting.
            "_current", "_publish", "_require_runner", "_snapshot_baselines", "_snapshot_fallback_objects", "_write_snapshot"]
 
@@ -52,11 +54,61 @@ MAX_PICKS = 256
 MAX_OBJECT_BYTES = 16 * 1024 * 1024
 MAX_OBJECTS = 20000
 MAX_RESPONSE_BYTES = MAX_PATHS * (MAX_PATH_BYTES + 1)
+MAX_OBJECT_READ_ENV_ENTRIES = 512
+_WINDOWS_OBJECT_READ_ENV = (
+    "SYSTEMROOT",  # Windows process startup, including side-by-side assemblies.
+    "WINDIR",      # Windows system-directory lookup at process startup.
+    "TEMP",        # Windows temporary-directory selection.
+    "TMP",         # Alternate Windows temporary-directory selection.
+)
 # One indeterminate-outcome set. Custody imports this object and never retries these codes.
 UNKNOWN_OUTCOME_CODES = frozenset(("ref_update_unknown", "git_cleanup_failed", "git_timeout", "git_output_limit"))
 _OID = team_git_snapshot.OID_PATTERN
 _DATE = re.compile(r"[0-9]{1,12} [+-](?:[01][0-9]|2[0-3])[0-5][0-9]\Z")
 _FORBIDDEN = re.compile(r"^\s*Aegis-(?:Approve(?:-Insight)?|Exempt-Test)\s*:", re.I | re.M)
+
+
+def object_read_argv(*arguments):
+    """Return arguments without the program for gitsafe.run; caller owns bounds."""
+    return ["--no-optional-locks", "--no-replace-objects", "-c", "core.fsmonitor=false",
+            "-c", "protocol.allow=never", *arguments]
+
+
+def object_read_env(overrides=None, *, inherit_config=False, environ=None):
+    """Build a fixed read policy with only the platform's startup keys from input."""
+    action = "Supply bounded string environment entries, then retry the object read."
+    if type(inherit_config) is not bool:
+        raise GitRefusal("invalid_environment", next_action=action)
+    startup = _WINDOWS_OBJECT_READ_ENV if os.name == "nt" else ()
+    source = {}
+    try:
+        for values in (os.environ if environ is None else environ, overrides):
+            if values is None:
+                continue
+            if (type(values) not in (dict, MappingProxyType, gitsafe_policy.ENVIRON_TYPE)
+                    or len(values) > MAX_OBJECT_READ_ENV_ENTRIES):
+                raise GitRefusal("invalid_environment", next_action=action)
+            # os.environ already canonicalizes Windows names. Avoid its whole-map key snapshot.
+            keys = (key for key in startup if key in values) if type(values) is gitsafe_policy.ENVIRON_TYPE else values
+            for count, key in enumerate(keys, 1):
+                if (count > MAX_OBJECT_READ_ENV_ENTRIES or type(key) is not str or not key
+                        or len(key) > 256 or "=" in key or "\0" in key):
+                    raise GitRefusal("invalid_environment", next_action=action)
+                value = values[key]
+                if type(value) is not str or len(value) > 65536 or "\0" in value:
+                    raise GitRefusal("invalid_environment", next_action=action)
+                name = key.upper() if startup and key.isascii() else key
+                if name in startup:
+                    source[name] = value
+            if len(values) > MAX_OBJECT_READ_ENV_ENTRIES:
+                raise GitRefusal("invalid_environment", next_action=action)
+    except (KeyError, RuntimeError):
+        raise GitRefusal("invalid_environment", next_action=action) from None
+    fixed = {**gitsafe_policy.BASE_ENV, "GIT_PROTOCOL_FROM_USER": "0"}
+    if not inherit_config:
+        fixed.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+    source.update(fixed)
+    return source
 
 
 def _error_code(exc, default="git_failed"):
