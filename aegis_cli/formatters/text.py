@@ -19,9 +19,9 @@ _NO_TIER_WHY = {"gh_missing": "gh unavailable", "gh_too_old": "gh unavailable",
 
 def render_card(doc: Mapping[str, Any]) -> List[str]:
     """The day-0 card (``aegis check --card``, the end of ``aegis init``)."""
-    from aegis_cli import sanitize_display
+    from aegis_cli.ui.theme import diagnostic_text
     from aegis_core.card import NEXT_RULE
-    from aegis_core.redaction import redact_command_secrets
+    from aegis_core.verification.ast_checks import AST_SIZE_NOTE_TOOL
 
     scope, rules, layer1 = doc["scope"], doc["rules"], doc["layer1"]
     lines = ["Aegis day-0 card", f"  workspace: {scope['workspace']}"]
@@ -57,19 +57,22 @@ def render_card(doc: Mapping[str, Any]) -> List[str]:
         lines.append(f"  Layer 1: {percent}% of {layer1['checked']} files without blocking findings "
                      f"({layer1['passed']} of {layer1['checked']}); "
                      f"{layer1['findings']} finding(s) in {layer1['failed']} file(s)")
+    not_analyzed = layer1.get("not_analyzed", [])
     unavailable = layer1.get("checks_that_could_not_run", [])
+    if not_analyzed:
+        # Coverage carries these advisories; keep the compatible JSON list intact.
+        unavailable = [detail for detail in unavailable if not detail.startswith(f"{AST_SIZE_NOTE_TOOL}: ")]
     if unavailable:
         lines.append("  checks that could not run:")
         for detail in unavailable[:20]:
-            clean = redact_command_secrets(sanitize_display(detail, max_len=None))
-            lines.append("    " + sanitize_display(clean, max_len=300))
+            lines.append("    " + diagnostic_text(detail, 300))
         if len(unavailable) > 20:
             lines.append(f"    ... and {len(unavailable) - 20} more")
-    not_analyzed = layer1.get("not_analyzed", [])
     if not_analyzed:
         coverage = "Layer 1 coverage" if layer1["pass_rate"] is None else "AST coverage"
         lines.append(f"  {coverage}: {len(not_analyzed)} file(s) not analyzed:")
-        lines.extend(f"    {item['path']}: {item['reason']}" for item in not_analyzed[:20])
+        lines.extend(f"    {diagnostic_text(item['path'], 300)}: {diagnostic_text(item['reason'], 300)}"
+                     for item in not_analyzed[:20])
         if len(not_analyzed) > 20:
             lines.append(f"    ... and {len(not_analyzed) - 20} more")
     if doc["top_files"]:
