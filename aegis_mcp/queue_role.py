@@ -3,7 +3,7 @@
 Deployment requires child sandboxes to exclude the account authority directory.
 Same-UID unrestricted execution is outside this configuration-bound authority.
 """
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
@@ -16,6 +16,7 @@ import time
 import uuid
 
 from aegis_core import kernel_identity, primitives, storage, storage_confined, team_queue
+from aegis_core.storage_confined import open_directory
 from aegis_core.workspace.layout import UserLayout
 
 MAX_BYTES = 65536
@@ -124,28 +125,32 @@ def _owned_directory(info):
     require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and not info.st_mode & 0o022)
 
 
+def _authority_chain(observations, home_parts):
+    """Pin every component. Owner and mode apply from the account home downward."""
+    require(type(observations) is tuple and type(home_parts) is int and 1 <= home_parts <= len(observations))
+    for observation in observations[home_parts - 1:]:
+        require(type(observation) is tuple and len(observation) == 4)
+        uid, mode = observation[2], observation[3]
+        require(type(uid) is int and type(mode) is int)
+        require(stat.S_ISDIR(mode) and uid == os.geteuid() and not mode & 0o022)
+    return tuple(observation[:2] for observation in observations)
+
+
 @contextmanager
 def authority():
-    """Anchor every directory through the shared confined opener and hold the lock."""
+    """Observe the authority chain in one confined walk and retain the leaf for the lock."""
     try:
         require(supported(), "unsupported_platform")
         home = account_home()
         require(home.is_absolute() and ".." not in home.parts and len(str(home)) <= 4096)
         root = UserLayout(home).aegis_dir / "mcp-queue"
-        chain = []
-        with ExitStack() as stack:
-            for count in range(1, len(root.parts) + 1):
-                directory = Path(*root.parts[:count])
-                handle = stack.enter_context(storage_confined.confined_file(directory, (".probe",)))
-                info = handle.parent_stat()
-                # The account database supplies the trusted home anchor. System
-                # ancestors may have namespace-mapped owners; pin their identity,
-                # and enforce owner/modes from home down to authority storage.
-                if count >= len(home.parts):
-                    _owned_directory(info)
-                chain.append(_identity(info))
-            stack.enter_context(storage.file_lock(root / "authority.lock", LOCK_TIMEOUT, dir_fd=handle._parent))
-            yield root, tuple(chain)
+        with open_directory(os.open, root, close_fd=os.close, stat_fd=os.fstat, stat_entry=os.stat) as anchor:
+            # The account database supplies the trusted home anchor. System
+            # ancestors may have namespace-mapped owners; their identity stays in
+            # the chain, and owner/modes apply from home down to authority storage.
+            chain = _authority_chain(anchor.observations, len(home.parts))
+            with storage.file_lock(root / "authority.lock", LOCK_TIMEOUT, dir_fd=anchor.fd):
+                yield root, chain
     except RoleRefusal:
         raise
     except storage.LockTimeoutError:
@@ -208,7 +213,8 @@ def _json(raw):
         raise RoleRefusal("role_invalid") from None
 
 
-def _read(root, parts):
+def _record_bytes(root, parts):
+    """Re-read one record. Mode, owner, link count and size are checked before the read."""
     with storage_confined.confined_file(root, parts) as handle:
         _owned_directory(handle.parent_stat())
         before = os.stat(handle._name, dir_fd=handle._parent, follow_symlinks=False)
@@ -217,7 +223,19 @@ def _read(root, parts):
         raw = handle.read_bytes(MAX_BYTES)
         after = os.stat(handle._name, dir_fd=handle._parent, follow_symlinks=False)
         require(_generation(before) == _generation(after), "role_stale")
-        return _json(raw), (_generation(after), hashlib.sha256(raw).hexdigest())
+        return raw, _generation(after)
+
+
+def _pin(root, parts):
+    """Size-check and hash the current record. Claim checkpoints do not decode it."""
+    raw, generation = _record_bytes(root, parts)
+    return generation, hashlib.sha256(raw).hexdigest()
+
+
+def _read(root, parts):
+    """Decode at issue and bind only, after the same bounded read a pin uses."""
+    raw, generation = _record_bytes(root, parts)
+    return _json(raw), (generation, hashlib.sha256(raw).hexdigest())
 
 
 def _line(value, limit=128):
@@ -377,8 +395,8 @@ class Grant:
 
     def _check(self, root, chain, session):
         require(not self.stale and session == self.session and chain == self.chain, "role_stale")
-        policy, policy_pin = _read(root, ("registrations", self.registration + ".json"))
-        record, record_pin = _read(root, _session_parts(self.process))
+        policy_pin = _pin(root, ("registrations", self.registration + ".json"))
+        record_pin = _pin(root, _session_parts(self.process))
         require(policy_pin == self.policy_pin and record_pin == self.record_pin, "role_stale")
         require(process_identity() == self.process and int(time.time()) < self.record["expires_at"], "role_stale")
         require(_workspace_identity(self.workspace) == self.workspace_pin, "role_stale")
