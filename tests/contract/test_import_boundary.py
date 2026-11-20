@@ -103,6 +103,8 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.rule_inventory": 1,
     "aegis_core.yaml_engine": 1,
     "aegis_core.match": 1,
+    "aegis_core.team_workspace_display": 0,
+    "aegis_core.team_workspace_store": 0,
     "aegis_core.team_writer_binding": 1,
     "aegis_core.telemetry_engine": 1,
     "aegis_core.fitness": 1,
@@ -212,6 +214,9 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_qualify": 0,
     "aegis_core.team_queue": 2,
     "aegis_core.team_roles": 0,
+    "aegis_core.team_session_census": 1,
+    "aegis_core.team_session_custody": 1,
+    "aegis_core.team_session_stop": 1,
     "aegis_core.team_session_wake": 1,
     # Read-only lane status report over lease declarations and the existing tip gate.
     "aegis_core.team_status": 3,
