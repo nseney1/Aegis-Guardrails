@@ -45,6 +45,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.errors": 0,
     "aegis_core.taxonomy": 0,
     "aegis_core.merge_queue": 2,
+    "aegis_core.merge_queue_model": 1,
     "aegis_core.merge_queue_types": 0,
     # Canonical message records and untrusted views (stdlib only).
     "aegis_core.message_codec": 0,
