@@ -103,6 +103,39 @@ def test_board_usage_is_fixed(tmp_path, capsys, options):
     assert json.loads(captured.out)["reason"] == "invalid_arguments"
 
 
+@pytest.mark.parametrize("verb", ["init", "add-channel", "grant", "revoke", "tombstone", "status", "verify", "digest", "read"])
+@pytest.mark.parametrize("where", ["root", "team", "command", "verb", "option-value", "separator",
+                                   "with-msg", "with-model", "with-queue", "with-all"])
+def test_board_invocation_usage_at_each_parser_level(capsys, verb, where):
+    argv = ["team", "board", verb, "--board", "/unused"]
+    if verb in ("add-channel", "grant", "revoke", "tombstone"):
+        argv += ["--request", "/unused/request.json"]
+    if verb in ("digest", "read"):
+        argv += ["--channel", "alpha"]
+    if where == "option-value":
+        argv[1:2] = ["--workspace", "board", "PRIVATE_SENTINEL"]
+    elif where == "separator":
+        argv[1:1] = ["--", "--unknown=PRIVATE_SENTINEL"]
+    elif where == "root":
+        argv.insert(0, "--json=PRIVATE_SENTINEL")
+    elif where.startswith("with-"):
+        argv.append("--unknown=PRIVATE_SENTINEL")
+        for value in (("msg", "model", "queue") if where == "with-all" else (where[5:],)):
+            argv += ["--workspace", value]
+    else:
+        argv.insert({"team": 1, "command": 2, "verb": 3}[where], "--unknown=PRIVATE_SENTINEL")
+    with pytest.raises(SystemExit) as caught:
+        main(argv)
+    assert caught.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert len(captured.out.splitlines()) == 1
+    assert json.loads(captured.out) == {
+        "status": "refused", "reason": "invalid_arguments", "exit_code": 2,
+        "next_action": "Use aegis team mail or board --help and supply the required options.",
+    }
+
+
 def test_tombstone_and_digest_with_posts_have_legacy_parity(board, capsys):
     assert invoke(board, capsys, "init")[0] == 0
     assert configure(board, capsys, "add-channel", {"channel": "alpha", "orchestrator": "a/orchestrator",
