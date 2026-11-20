@@ -22,8 +22,9 @@ from conftest import symlink_or_skip
 from aegis_core import team_lifecycle as core_module
 from aegis_core import team_lifecycle_writers as writers_module
 from aegis_core import team_mailbox_store as store_module
-from aegis_core.team_mailbox_primitives import MailboxRefusal
+from aegis_core.team_mailbox_primitives import BusyError, MailboxRefusal
 from tests.unit.core.test_team_mailbox import make_store, mailbox, owner_plane
+from tools import hierarchy_host_authority as host_module
 from tools import hierarchy_lifecycle as legacy
 
 
@@ -231,19 +232,20 @@ def decision(journal):
     """Mock only the owner-injected host boundary; this grants no native authority."""
     reader, box = journal
     writers = importlib.import_module("aegis_core.team_lifecycle_writers")
-    class HostError(ValueError):
-        def __init__(self, code):
-            self.code = code
+    HostError = host_module.HostAuthorityError
     class Invocation:
         event_id, actor_cid, decision_recovery_event_id = "approval", "root-1", None
     class Authority:
         canonical_root = reader.root
+        current_hooks = []
         @contextmanager
         def effect_fence(self, invocation, operation):
             yield
         def require_current(self, invocation, policy, state, row):
             if row is not None and state["requests"].get(row["request"]["id"]) is not row:
-                raise HostError("CANONICAL_CORRELATION_MISMATCH")
+                raise HostError("CANONICAL_CORRELATION_MISMATCH", "fixture canonical row mismatch")
+            for hook in self.current_hooks:
+                hook(invocation, policy, state, row)
         def require_decision_command(self, *args):
             for hook in hooks:
                 hook(*args)
@@ -424,8 +426,7 @@ def bootstrap(journal, core):
     runtime = SimpleNamespace(canonical_root=reader.root.parent / "protected", approved_plan_ref=p["authority"][0],
                               accepted_plan={key: p[key] for key in ("source", "actors", "current", "successors")},
                               channel_witness=channel)
-    class HostError(ValueError):
-        pass
+    HostError = host_module.HostAuthorityError
     class Reservation:
         def __init__(self, cid, sequence):
             self.actor_cid, self.owned_runtime = cid, runtime
@@ -488,6 +489,384 @@ def test_bootstrap_missing_genesis_refuses_without_mutation(journal):
         reader.initial_bootstrap()
     assert caught.value.code == "initial_genesis_required"
     assert reader.load()[1]["sequence"] == 0
+
+
+@pytest.fixture(params=["initial", "decision"])
+def protected_refusal_case(request, pytest_request):
+    if request.param == "decision":
+        reader, writer, invocation, command, hooks = pytest_request.getfixturevalue("decision")
+        old = legacy.ProtectedCanonicalDecisionWriter(reader.root, writer.authority)
+        return SimpleNamespace(reader=reader, writer=writer, kind="decision", hooks=hooks,
+                               after_hooks=writer.authority.current_hooks,
+                               call=lambda: writer.commit_decision(invocation, command),
+                               legacy_call=lambda: old.commit_decision(invocation, command),
+                               busy="CANONICAL_WRITER_BUSY", unknown="PUBLICATION_UNKNOWN")
+    runtime, reservations, guard, port, enrollment, box = pytest_request.getfixturevalue("bootstrap")
+    enrollment.initialize_reserved_genesis(runtime, reservations, runtime.approved_plan_ref)
+    hooks = []
+    after_hooks = []
+
+    class Guard(port.InitialCreationGuard):
+        def require_initial_creation_current(self, *args):
+            for hook in hooks:
+                hook(*args)
+        def require_initial_identity_current(self, *args):
+            for hook in after_hooks:
+                hook(*args)
+
+    port = SimpleNamespace(**{**vars(port), "InitialCreationGuard": Guard})
+    guard = Guard()
+    writer = writers_module.ProtectedCanonicalBootstrapWriter(runtime.canonical_root, mailbox=box,
+                                                               host_authority=port, clock=lambda: NOW)
+    old = legacy.ProtectedCanonicalBootstrapWriter(runtime.canonical_root)
+    return SimpleNamespace(reader=writers_module.Lifecycle(runtime.canonical_root, mailbox=box),
+                           writer=writer, kind="initial", hooks=hooks, after_hooks=after_hooks,
+                           call=lambda: writer.commit_initial_creation(guard, reservations[0]),
+                           legacy_call=lambda: old.commit_initial_creation(guard, reservations[0]),
+                           busy="CANONICAL_BUSY", unknown="INITIAL_CREATION_PUBLICATION_UNKNOWN")
+
+
+def lifecycle_bytes(root):
+    return {path.relative_to(root).as_posix(): path.read_bytes()
+            for path in root.rglob("*") if path.is_file()}
+
+
+def test_protected_busy_refusal_has_no_effect_and_retries(protected_refusal_case, monkeypatch):
+    case = protected_refusal_case
+    before = lifecycle_bytes(case.reader.root)
+    entered, release = Event(), Event()
+
+    def hold():
+        # This holder does not acquire the owner evidence lock.
+        with legacy.writer_lock(case.reader.root):
+            entered.set()
+            assert release.wait(timeout=10), "contender release was not signalled"
+
+    canonical_attempts = []
+    original = store_module.Store.lock
+
+    @contextmanager
+    def observed(self, directory, *args, **options):
+        canonical_attempts.append(directory)
+        with original(self, directory, *args, **options):
+            yield
+
+    # The calling thread already owns the evidence transaction, so each call
+    # must reach the independently held canonical exclusion.
+    with case.reader.store.evidence_transaction():
+        monkeypatch.setattr(store_module.Store, "lock", observed)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            holder = pool.submit(hold)
+            try:
+                assert entered.wait(timeout=10), "contender did not acquire canonical lock"
+                assert (case.reader.root / ".write.lock").is_file()
+                for _ in range(2):
+                    answer = case.call()
+                    assert (answer["state"], answer["code"], answer["effect"]) == ("refused", case.busy, "none")
+                assert canonical_attempts == [case.reader.root, case.reader.root]
+            finally:
+                release.set()
+            holder.result(timeout=10)
+        monkeypatch.setattr(store_module.Store, "lock", original)
+    assert lifecycle_bytes(case.reader.root) == before
+    assert case.call()["state"] == "recorded"
+    assert case.call()["state"] == "recovered"
+
+
+@pytest.mark.parametrize("failure", ["busy", "too_large", "invalid_record", "io"])
+def test_protected_generator_body_refusals(protected_refusal_case, monkeypatch, failure):
+    case = protected_refusal_case
+    before = lifecycle_bytes(case.reader.root)
+    original = store_module.Store.read
+
+    def failed(self, path, **options):
+        if path == case.reader.root / "policy.json":
+            if failure == "busy":
+                raise BusyError(path) from None
+            if failure == "io":
+                raise OSError(errno.EIO, "untrusted\ninput")
+            raise MailboxRefusal(failure) from None
+        return original(self, path, **options)
+
+    monkeypatch.setattr(store_module.Store, "read", failed)
+    answer = case.call()
+    monkeypatch.setattr(store_module.Store, "read", original)
+    expected = case.busy if failure == "busy" else (
+        "too_large" if case.kind == "decision" and failure == "too_large" else
+        case.unknown if case.kind == "decision" else "CANONICAL_INVALID")
+    assert answer["code"] == expected
+    assert answer["state"] == ("unknown" if expected == case.unknown else "refused")
+    assert "untrusted" not in json.dumps(answer)
+    assert lifecycle_bytes(case.reader.root) == before
+    assert case.call()["state"] == "recorded"
+
+
+@pytest.mark.parametrize("failure", ["busy", "too_large", "io"])
+def test_initial_failure_after_publication_is_unknown(bootstrap, monkeypatch, failure):
+    runtime, reservations, guard, port, enrollment, box = bootstrap
+    enrollment.initialize_reserved_genesis(runtime, reservations, runtime.approved_plan_ref)
+    writer = writers_module.ProtectedCanonicalBootstrapWriter(runtime.canonical_root, mailbox=box,
+                                                               host_authority=port, clock=lambda: NOW)
+    original = store_module.Store.lock
+    depth = [0]
+
+    @contextmanager
+    def published_then_failed(self, path, *args, **options):
+        depth[0] += 1
+        try:
+            with original(self, path, *args, **options):
+                yield
+        finally:
+            depth[0] -= 1
+        if depth[0]:
+            return
+        if failure == "busy":
+            raise BusyError(path) from None
+        if failure == "io":
+            raise OSError(errno.EIO, "untrusted\ninput")
+        raise core_module.LifecycleRefusal("too_large") from None
+
+    monkeypatch.setattr(store_module.Store, "lock", published_then_failed)
+    answer = writer.commit_initial_creation(guard, reservations[0])
+    monkeypatch.setattr(store_module.Store, "lock", original)
+    assert (answer["state"], answer["code"], answer["effect"]) == (
+        "unknown", "INITIAL_CREATION_PUBLICATION_UNKNOWN", "possible")
+    assert "untrusted" not in json.dumps(answer)
+    assert writers_module.Lifecycle(runtime.canonical_root, mailbox=box).load()[1]["sequence"] == 2
+    assert writer.commit_initial_creation(guard, reservations[0])["state"] == "recovered"
+
+
+def test_genesis_policy_reason_matches_legacy():
+    assert writers_module.CanonicalGenesisError("POLICY_INVALID").reason == legacy.CanonicalGenesisError("POLICY_INVALID").reason
+    assert writers_module.CanonicalGenesisError("POLICY_INVALID").reason == "protected bootstrap evidence is invalid"
+
+
+@pytest.mark.parametrize("entry", ["load", "initial_bootstrap", "record", "view", "transaction"])
+@pytest.mark.parametrize("failure", ["busy", "too_large", "invalid_record", "io"])
+def test_lifecycle_context_callers_translate_body_failures(bootstrap, core, monkeypatch, entry, failure):
+    runtime, reservations, guard, port, enrollment, box = bootstrap
+    enrollment.initialize_reserved_genesis(runtime, reservations, runtime.approved_plan_ref)
+    reader = writers_module.Lifecycle(runtime.canonical_root, mailbox=box, clock=lambda: NOW)
+    writer = writers_module.ProtectedCanonicalBootstrapWriter(reader.root, mailbox=box)
+    original = store_module.Store.read
+    before = lifecycle_bytes(reader.root)
+
+    def failed(self, path, **options):
+        if path == reader.root / "policy.json":
+            if failure == "busy":
+                raise BusyError(path) from None
+            if failure == "io":
+                if entry == "view":
+                    # The real Store normalizes OS errors at its own boundary.
+                    raise MailboxRefusal("io") from None
+                raise OSError(errno.EIO, "untrusted\ninput")
+            raise MailboxRefusal(failure) from None
+        return original(self, path, **options)
+
+    def call():
+        if entry == "view":
+            with reader.view(write=True) as (root_fd, events_fd):
+                return reader.store.read(reader.root / "policy.json", parent=root_fd)
+        if entry == "transaction":
+            with writer.transaction() as active:
+                return active.load()
+        if entry == "record":
+            return reader.record(event("publish", request=raw(request())))
+        if entry == "load":
+            return reader.load()
+        return reader.initial_bootstrap()
+
+    monkeypatch.setattr(store_module.Store, "read", failed)
+    with pytest.raises(core.LifecycleRefusal) as caught:
+        call()
+    monkeypatch.setattr(store_module.Store, "read", original)
+    assert caught.value.code == failure
+    assert "untrusted" not in json.dumps(caught.value.as_dict())
+    assert lifecycle_bytes(reader.root) == before
+    assert call() is not None
+
+
+@pytest.mark.parametrize("failure", ["busy", "too_large", "invalid_record", "io"])
+def test_enrollment_transaction_failure_preserves_unknown_root(bootstrap, monkeypatch, failure):
+    runtime, reservations, guard, port, enrollment, box = bootstrap
+    original = store_module.Store.read
+
+    def failed(self, path, **options):
+        if path == runtime.canonical_root / "policy.json":
+            if failure == "busy":
+                raise BusyError(path) from None
+            if failure == "io":
+                raise OSError(errno.EIO, "untrusted\ninput")
+            raise MailboxRefusal(failure) from None
+        return original(self, path, **options)
+
+    monkeypatch.setattr(store_module.Store, "read", failed)
+    with pytest.raises(writers_module.CanonicalGenesisError) as caught:
+        enrollment.initialize_reserved_genesis(runtime, reservations, runtime.approved_plan_ref)
+    monkeypatch.setattr(store_module.Store, "read", original)
+    assert (caught.value.code, caught.value.state, caught.value.effect) == (
+        "GENESIS_PUBLICATION_UNKNOWN", "unknown", "possible")
+    assert "untrusted" not in json.dumps(caught.value.as_dict())
+    before = lifecycle_bytes(runtime.canonical_root)
+    assert writers_module.Lifecycle(runtime.canonical_root, mailbox=box).load()[1]["sequence"] == 0
+    with pytest.raises(writers_module.CanonicalGenesisError) as retry:
+        enrollment.initialize_reserved_genesis(runtime, reservations, runtime.approved_plan_ref)
+    assert retry.value.code == "ROOT_ALREADY_EXISTS"
+    assert lifecycle_bytes(runtime.canonical_root) == before
+
+
+@pytest.mark.parametrize("failure", ["busy", "too_large", "invalid_record", "io"])
+def test_protected_mid_publication_failure_is_unknown(protected_refusal_case, monkeypatch, failure):
+    case = protected_refusal_case
+    before = lifecycle_bytes(case.reader.root)
+    original = store_module.Store.publish
+
+    def failed(self, path, body, **options):
+        if failure == "busy":
+            raise BusyError(path) from None
+        if failure == "io":
+            raise OSError(errno.EIO, "untrusted\ninput")
+        raise MailboxRefusal(failure) from None
+
+    monkeypatch.setattr(store_module.Store, "publish", failed)
+    answer = case.call()
+    monkeypatch.setattr(store_module.Store, "publish", original)
+    # A store-level exception has no proof of where publication stopped.
+    code = case.unknown
+    assert answer["code"] == code
+    assert answer["state"] == ("refused" if code == "too_large" else "unknown")
+    assert lifecycle_bytes(case.reader.root) == before
+    assert "untrusted" not in json.dumps(answer)
+    assert case.call()["state"] == "recorded"
+
+
+@pytest.mark.parametrize("failure", ["host", "unrelated_cause"])
+def test_protected_host_failures_keep_identity(protected_refusal_case, monkeypatch, failure):
+    case = protected_refusal_case
+    before = lifecycle_bytes(case.reader.root)
+
+    def failed(*args):
+        if failure == "host":
+            raise case.writer.host.HostAuthorityError("STALE_INVOCATION", "untrusted\ninput")
+        raise ValueError("untrusted\ninput") from FileExistsError("untrusted")
+
+    monkeypatch.setattr(host_module, "HostAuthority", case.writer.host.HostAuthority)
+    if case.kind == "decision":
+        monkeypatch.setattr(host_module, "HostInvocation", case.writer.host.HostInvocation)
+    else:
+        monkeypatch.setattr(host_module, "InitialCreationGuard", case.writer.host.InitialCreationGuard)
+        monkeypatch.setattr(host_module, "ReservedEnrollment", case.writer.host.ReservedEnrollment)
+    case.hooks.append(failed)
+    old = case.legacy_call()
+    answer = case.call()
+    case.hooks.clear()
+    expected = ("STALE_INVOCATION" if failure == "host" else case.unknown) if case.kind == "decision" else (
+        "HOST_AUTHORITY_REFUSED" if failure == "host" else "CANONICAL_INVALID")
+    assert answer["code"] == expected
+    if failure == "host":
+        assert {key: answer[key] for key in old} == old
+    assert lifecycle_bytes(case.reader.root) == before
+    assert "untrusted" not in json.dumps(answer)
+    assert case.call()["state"] == "recorded"
+
+
+@pytest.mark.parametrize("failure", ["busy", "too_large", "io"])
+def test_protected_exit_failure_after_retained_publication(protected_refusal_case, monkeypatch, failure):
+    case = protected_refusal_case
+    before = case.reader.load()[1]["sequence"]
+    original = store_module.Store.lock
+    depth = [0]
+
+    @contextmanager
+    def published_then_failed(self, path, *args, **options):
+        depth[0] += 1
+        try:
+            with original(self, path, *args, **options):
+                yield
+        finally:
+            depth[0] -= 1
+        if depth[0]:
+            return
+        assert case.reader.load()[1]["sequence"] == before + 1
+        if failure == "busy":
+            raise BusyError(path) from None
+        raise MailboxRefusal(failure) from None
+
+    monkeypatch.setattr(store_module.Store, "lock", published_then_failed)
+    answer = case.call()
+    monkeypatch.setattr(store_module.Store, "lock", original)
+    assert (answer["state"], answer["code"], answer["effect"]) == ("unknown", case.unknown, "possible")
+    assert case.reader.load()[1]["sequence"] == before + 1
+    assert case.call()["state"] == "recovered"
+
+
+@pytest.mark.parametrize("entry", ["read_view", "write_view", "transaction"])
+def test_host_error_crosses_storage_contexts_unchanged(journal, entry):
+    reader, box = journal
+    before = lifecycle_bytes(reader.root)
+    error = host_module.HostAuthorityError("STALE_INVOCATION", "untrusted\ninput")
+    writer = writers_module.ProtectedCanonicalDecisionWriter(reader.root, mailbox=box)
+    context = writer.transaction() if entry == "transaction" else reader.view(write=entry == "write_view")
+    with pytest.raises(host_module.HostAuthorityError) as caught:
+        with context:
+            raise error
+    assert caught.value is error
+    assert lifecycle_bytes(reader.root) == before
+    assert reader.record(event("publish", request=raw(request())))["sequence"] == 1
+
+
+def test_decision_preflight_size_refusal_has_no_effect(decision, monkeypatch):
+    reader, writer, invocation, command, hooks = decision
+    before = lifecycle_bytes(reader.root)
+    original = writers_module.Lifecycle.publish
+    limit = core_module.MAX_BYTES
+    entered = []
+
+    def limited(self, record, root_fd, events_fd):
+        entered.append(record["sequence"])
+        monkeypatch.setattr(core_module, "MAX_BYTES", 1)
+        try:
+            return original(self, record, root_fd, events_fd)
+        finally:
+            monkeypatch.setattr(core_module, "MAX_BYTES", limit)
+
+    monkeypatch.setattr(writers_module.Lifecycle, "publish", limited)
+    answer = writer.commit_decision(invocation, command)
+    monkeypatch.setattr(writers_module.Lifecycle, "publish", original)
+    assert entered == [2]
+    assert (answer["state"], answer["code"], answer["effect"]) == ("refused", "too_large", "none")
+    assert lifecycle_bytes(reader.root) == before
+    assert writer.commit_decision(invocation, command)["state"] == "recorded"
+
+
+def test_protected_host_error_after_publication_matches_legacy(protected_refusal_case, monkeypatch):
+    case = protected_refusal_case
+    before = case.reader.load()[1]["sequence"]
+    error = case.writer.host.HostAuthorityError("STALE_INVOCATION", "untrusted\ninput")
+
+    def after_publication(*args):
+        if case.reader.load()[1]["sequence"] == before + 1:
+            raise error
+
+    monkeypatch.setattr(host_module, "HostAuthority", case.writer.host.HostAuthority)
+    if case.kind == "decision":
+        monkeypatch.setattr(host_module, "HostInvocation", case.writer.host.HostInvocation)
+    else:
+        monkeypatch.setattr(host_module, "InitialCreationGuard", case.writer.host.InitialCreationGuard)
+        monkeypatch.setattr(host_module, "ReservedEnrollment", case.writer.host.ReservedEnrollment)
+    case.after_hooks.append(after_publication)
+    old = case.legacy_call()
+    assert (old["state"], old["code"], old["effect"]) == ("unknown", case.unknown, "possible")
+    assert case.reader.load()[1]["sequence"] == before + 1
+    # Restore this fixture's appended leaf so both implementations see the
+    # same original canonical input. No tracked file or history is involved.
+    (case.reader.root / "events" / ("%06d.json" % (before + 1))).unlink()
+    answer = case.call()
+    case.after_hooks.clear()
+    assert {key: answer[key] for key in old} == old
+    assert "untrusted" not in json.dumps(answer)
+    assert case.reader.load()[1]["sequence"] == before + 1
+    assert case.call()["state"] == "recovered"
 
 
 def test_measure_legacy_policy_limit_delta(core):
