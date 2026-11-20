@@ -5,9 +5,25 @@ The adapter supplies its renderer; validation order and storage stay with it.
 
 from aegis_core.team_mailbox_primitives import MailboxRefusal, render_mailbox_refusal
 
-__all__ = ["MAX_CHARS", "NEXT_ACTIONS", "error_result", "render_digest", "measured_refusal", "tool_specs"]
+__all__ = ["MAX_CHARS", "NEXT_ACTIONS", "pinned_record_error", "error_result",
+           "render_digest", "measured_refusal", "tool_specs"]
 
 MAX_CHARS = 60000
+
+_PINNED_MAILBOX_ERRORS = {
+    "scope": ("E_AUTH", "scope"),
+    "binding": ("E_AUTH", "binding"),
+    "reference": ("E_REF", None),
+    "history": ("E_LIMIT", "history"),
+}
+
+
+def pinned_record_error(codec, reason):
+    pinned = _PINNED_MAILBOX_ERRORS.get(reason)
+    if pinned is not None:
+        code, detail = pinned
+        return codec.CodecError(code, detail=detail)
+    return None
 
 NEXT_ACTIONS = {
     "binding": "refresh the connection from the current acknowledged endpoint binding",

@@ -29,6 +29,10 @@ _REVOKED = object()
 _AGAIN = object()
 _OPEN = {0x7B: 0x7D, 0x5B: 0x5D}
 _WHITESPACE = (0x20, 0x09, 0x0A, 0x0D)
+_REPLY_PREFIX = b'{"id":'
+_REPLY_SEPARATOR = b',"result":'
+_REPLY_END = b"}\n"
+_REPLY_OVERHEAD = len(_REPLY_PREFIX) + len(_REPLY_SEPARATOR) + len(_REPLY_END)
 _NEXT = {
     "UNSUPPORTED_HOST":
         "Retry on a POSIX host; the bounded pipe transport is unavailable here.",
@@ -305,12 +309,16 @@ def _json_size(value, maximum):
     return walk(value)
 
 
+def _json_bytes(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True, allow_nan=False).encode("ascii")
+
+
 def _encode(value, maximum):
     # The trailing newline is part of the frame. Refuse before dumps builds it.
     if _json_size(value, maximum) + 1 > maximum:
         _invalid()
-    raw = (json.dumps(value, sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=True, allow_nan=False) + "\n").encode("utf-8")
+    raw = _json_bytes(value) + b"\n"
     if len(raw) > maximum:
         _invalid()
     return raw
@@ -333,9 +341,7 @@ def _freeze_reply(result, maximum):
             _invalid()
     if _json_size(result, maximum) > maximum:
         _invalid()
-    return json.loads(json.dumps(
-        result, sort_keys=True, separators=(",", ":"),
-        ensure_ascii=True, allow_nan=False))
+    return _json_bytes(result)
 
 
 class ProtocolClient:
@@ -368,7 +374,7 @@ class ProtocolClient:
         self._initialized = False
         self._timeout = timeout_seconds
         self._maximum = max_frame_bytes
-        self._buffer = b""
+        self._buffer = bytearray()
         self._calls = {}
         self._ids = {}
         try:
@@ -458,16 +464,22 @@ class ProtocolClient:
                 return
 
     def _read(self, deadline):
+        # ControlIO also uses this reader and initializes an empty bytes buffer.
+        if type(self._buffer) is bytes:
+            self._buffer = bytearray(self._buffer)
+        searched = 0
         while True:
-            end = self._buffer.find(b"\n")
+            end = self._buffer.find(b"\n", searched)
             if end >= 0:
-                raw = self._buffer[:end + 1]
-                self._buffer = self._buffer[end + 1:]
+                with memoryview(self._buffer)[:end + 1] as frame:
+                    raw = bytes(frame)
+                del self._buffer[:end + 1]
                 try:
                     return _decode(raw, self._maximum)
                 except HostAuthorityError:
                     self._fail()
-            if len(self._buffer) >= self._maximum:
+            searched = len(self._buffer)
+            if searched >= self._maximum:
                 self._fail()
             self._wait(self._read_fd, deadline)
             chunk = self._take()
@@ -475,7 +487,7 @@ class ProtocolClient:
                 continue
             if chunk is _REVOKED or not chunk:
                 self._fail()
-            self._buffer += chunk
+            self._buffer.extend(chunk)
 
     def _take(self):
         try:
@@ -490,10 +502,10 @@ class ProtocolClient:
                 raise error from exc
 
     def _encode_frame(self, value):
-        """One complete frame, including its newline. A refusal closes both streams.
+        """Encode one generic frame, including its newline.
 
-        Every write goes through here. An encoding HostAuthorityError is terminal
-        in this primitive, before any caller can leave it on an open transport.
+        Initialization and control writes use this encoder. An encoding refusal
+        closes the transport before it reaches the caller.
         """
         try:
             return _encode(value, self._maximum)
@@ -596,7 +608,10 @@ class ProtocolClient:
             self._fail("HOST_CALL_CONFLICT", "host call correlation conflicts")
         self._ids[rpc] = key
         if previous["result"] is not None:
-            self._write({"id": value["id"], "result": previous["result"]}, deadline)
+            body = previous["result"]
+            identifier = value["id"]
+            self._check_reply_size(identifier, body)
+            self._send_reply(identifier, body, deadline)
             return
         if rpc not in previous["aliases"]:
             previous["aliases"][rpc] = value["id"]
@@ -625,12 +640,21 @@ class ProtocolClient:
         row = self._calls.get(self._ids.get(rpc))
         if row is None or row["result"] is not None:
             self._fail("HOST_CALL_CONFLICT", "host reply has no pending call")
-        frozen = _freeze_reply(result, self._maximum)
+        body = _freeze_reply(result, self._maximum)
         # Every alias envelope is a complete frame. Refuse before the first write.
-        frames = []
         for identifier in row["aliases"].values():
-            frames.append(self._encode_frame({"id": identifier, "result": frozen}))
+            self._check_reply_size(identifier, body)
         deadline = self._operation_deadline()
-        for raw in frames:
-            self._send_frame(raw, deadline)
-        row["result"] = frozen
+        for identifier in row["aliases"].values():
+            self._send_reply(identifier, body, deadline)
+        row["result"] = body
+
+    def _check_reply_size(self, identifier, body):
+        remaining = self._maximum - len(body) - _REPLY_OVERHEAD
+        if remaining < 0 or _json_size(identifier, remaining) > remaining:
+            self._fail()
+
+    def _send_reply(self, identifier, body, deadline):
+        raw = b"".join((_REPLY_PREFIX, _json_bytes(identifier), _REPLY_SEPARATOR,
+                        body, _REPLY_END))
+        self._send_frame(raw, deadline)
