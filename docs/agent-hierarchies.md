@@ -595,6 +595,13 @@ and binds each entry in `tools/hierarchy_templates/handoff-spec.json`, reports a
 on one without hiding or blocking the others, and leaves finished entries alone when
 run again. Each successor still acknowledges separately through its own connection.
 
+With a governing host plan, the next checkpoint keeps briefs for open work, the
+last touching brief and `entries[].briefs`, so standing briefs must be relisted
+there or they silently leave the next checkpoint. The last inherited brief is
+kept when none qualifies. A standalone `draft-handoff` preview still lists every
+brief. Under a governing host plan, the preview checkpoint sha differs from
+the bound one when a brief is omitted. Without a plan, briefs carry forward unchanged.
+
 With `delivery_dir`, the draft includes every unread message ID, including messages
 that were woken but not read. The delivery status page's 100-ID display limit does
 not limit the handoff. Pending IDs and checkpoint brief references are deduplicated;
@@ -606,8 +613,12 @@ evidence that its assignment or job finished.
 Ordinary unread messages retain their hash-bound brief references in the inbox.
 The successor reads them with `include_briefs` and follows `next_after` while
 `remaining` is nonzero. Their contents stay pageable instead of accumulating in
-mandatory checkpoint metadata. Active/job, explicit and inherited checkpoint
-briefs retain their existing validation and response limits.
+mandatory checkpoint metadata. Active/job, explicit and still-carried inherited
+checkpoint briefs retain their existing validation and response limits. With a
+governing host plan, an inherited brief is carried only when it is open work,
+the last touching brief, listed in `entries[].briefs`, or the last inherited
+brief when none qualifies. Without a plan, inherited briefs carry forward
+unchanged.
 
 For a mailbox move, current carry briefs retain each open job's original full ID
 and the path and SHA-256 of its original request. Missing terminal receipts can
