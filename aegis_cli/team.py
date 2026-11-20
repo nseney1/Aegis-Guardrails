@@ -22,6 +22,7 @@ from typing import Any, Callable, Dict, List, Optional
 from aegis_core import primitives
 from aegis_cli import sanitize_display, team_queue as queue_cli
 from aegis_cli import team_lease_output as lease_output
+from aegis_cli import team_mail as mail_cli, team_board as board_cli
 from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_core import gitsafe, team
 from aegis_core.primitives import utc_stamp
@@ -646,6 +647,10 @@ def _refused(args: argparse.Namespace, root: Path, now: int, exc: team.LeaseRefu
 
 def run_team(args: argparse.Namespace) -> int:
     action = getattr(args, "team_action", None)
+    if action == "mail":
+        return mail_cli.run_mail(args)
+    if action == "board":
+        return board_cli.run_board(args)
     if action == "queue":
         return queue_cli.run_queue(args)
     if action == "model":
@@ -716,8 +721,7 @@ class TeamCommand(AegisCommand):
     )
 
     def configure_parser(self, parser: argparse.ArgumentParser) -> None:
-        # Before a team action is recognized, malformed prefixes may target model.
-        # Each recognized non-model child restores its normal error policy.
+        # Malformed team prefixes may target model; non-model children restore ordinary errors.
         parser._model_errors = True
         common = argparse.ArgumentParser(add_help=False)
         common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
@@ -728,6 +732,8 @@ class TeamCommand(AegisCommand):
         sub = parser.add_subparsers(dest="team_action", metavar="ACTION")
         _configure_model_parser(sub, common)
         queue_cli.configure_parser(sub, common, parser)
+        mail_cli.configure_parser(sub, common, parser)
+        board_cli.configure_parser(sub, common, parser)
         config = sub.add_parser("config", parents=[common], help="Inspect or initialize a layered team profile")
         config_sub = config.add_subparsers(dest="config_action")
         config_sub.add_parser("show", parents=[common], help="Show every resolved value and its layer")
@@ -817,3 +823,8 @@ class TeamCommand(AegisCommand):
 
     def execute(self, args: argparse.Namespace) -> int:
         return run_team(args)
+
+    def workspace_refusal(self, args, error):
+        if getattr(args, "team_action", None) in ("mail", "board"):
+            return mail_cli.workspace_refusal(args, error)
+        return None
