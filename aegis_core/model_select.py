@@ -352,19 +352,12 @@ def _json_value(value, error, depth=0, budget=None, limit=MAX_LINE_BYTES):
 def _encoded(value, limit, error, *, checked=False):
     if not checked:
         _json_value(value, error, limit=limit)
-    result = bytearray()
-    encoder = json.JSONEncoder(sort_keys=True, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
     try:
-        for chunk in encoder.iterencode(value):
-            _require(len(result) + len(chunk) <= limit,
-                     "decision_line_too_large" if limit <= MAX_LINE_BYTES else error)
-            result.extend(chunk.encode("ascii"))
+        result = json.dumps(value, sort_keys=True, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
     except (ValueError, RecursionError) as exc:
-        # Preserve semantic refusals raised by the bounded encoder above.
-        if isinstance(exc, ModelSelectionError):
-            raise
         raise ModelSelectionError(error) from exc
-    return bytes(result)
+    _require(len(result) <= limit, "decision_line_too_large" if limit <= MAX_LINE_BYTES else error)
+    return result.encode("ascii")
 
 
 def _record(record, error):

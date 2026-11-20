@@ -2307,6 +2307,10 @@ PROOF_REGISTRATION_GROUPS = {
         ((0,), 'The CLI record/replay control changes into its generated repository, proving a malformed tests.command records incomplete evidence without running tests.'),
     ('tests/unit/core/test_argv_consumers.py', 'test_malformed_global_command_refuses_regression', 'fixture', 'monkeypatch.chdir', False):
         ((0,), 'The CLI regression control changes into its generated repository, proving malformed tests.command refuses without echoing its private value or invoking the runner.'),
+    ('tests/unit/core/test_argv_consumers.py', 'test_explicit_ci_environment_is_restored_after_failure', 'fixture', 'monkeypatch.context', False):
+        ((0,), 'TEST-GH-ENV-1: test-owned environment context restores explicit CI inputs after an intentional failure and permits a second attempt.'),
+    ('tests/unit/core/test_argv_consumers.py', 'test_explicit_ci_environment_is_restored_after_failure', 'fixture', 'scoped.setenv', False):
+        ((0,), 'TEST-GH-ENV-1: set one test-owned GitHub/Git input after root isolation; the scoped context restores it on failure.'),
     ('tests/unit/core/test_model_select.py', 'test_mr3c_260_bindings_have_mr1_parity', 'fixture', 'monkeypatch.syspath_prepend', False):
         ((0,), "The MR3c parity control adds the repository tools directory to sys.path and imports hierarchy_provision; it replaces that product module's read_pinned_bindings and hierarchy_hosts.TEAM_HOSTS to compare 260 bindings across parsed, file and transaction surfaces."),
     ('tests/unit/core/test_storage_confined.py', 'test_unsupported_platform_refuses_without_io', 'owner', 'storage_confined', False):
@@ -2363,8 +2367,6 @@ PROOF_REGISTRATION_GROUPS = {
         ((0,), 'TP6 changes to its configured temporary repository before exercising the public team hosts usage CLI entrypoint; pytest restores the working directory.'),
     ('tests/conftest.py', '_no_developer_aegis_env', 'fixture', 'monkeypatch.delenv', False):
         ((0,), 'present at tip 4959830f before RF-11b landed; added by 031d12068dd4; Fixture delenv operation; environment, path or restoration API outside the module-attribute census.'),
-    ('tests/conftest.py', '_no_real_gh', 'fixture', 'monkeypatch.delenv', False):
-        ((0,), 'Fixture delenv operation; environment, path or restoration API outside the module-attribute census.'),
     ('tests/conftest.py', '_no_real_gh', 'owner', 'ghcli', False):
         ((0,), 'Owner ghcli has lexical candidates aegis_core.ghcli; not a unique module-level import. Consumer module or class boundary; no shared process module candidate.'),
     ('tests/conftest.py', '_no_real_gh_on_path', 'owner', 'pathlookup', False):

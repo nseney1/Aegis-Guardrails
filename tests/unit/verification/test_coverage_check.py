@@ -93,8 +93,7 @@ def cov_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     for name in ("HOME", "USERPROFILE"):
         monkeypatch.setenv(name, str(home))
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    for name in ("GITHUB_EVENT_PATH", "GITHUB_EVENT_NAME", "GITHUB_BASE_REF", "GITHUB_STEP_SUMMARY",
-                 "GIT_CONFIG_GLOBAL", "CLAUDE_CONFIG_DIR", "CODEX_HOME"):
+    for name in ("GIT_CONFIG_GLOBAL", "CLAUDE_CONFIG_DIR", "CODEX_HOME"):
         monkeypatch.delenv(name, raising=False)
     before = os.getcwd()
     yield home
