@@ -2,7 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import replace
-from itertools import product
+from itertools import permutations, product
 import shutil
 from threading import Barrier
 from types import SimpleNamespace
@@ -159,8 +159,18 @@ def passing(rig, tree=None, head=None, legs=mq.REQUIRED_LEGS):
 
 
 def entry(rig, **changes):
-    reviews = tuple(mq.Review(session, rig.head, rig.tree) for session in ("reviewer-1", "reviewer-2"))
+    reviews = tuple(mq.Review(session, rig.head, rig.tree, "ACCEPT", True)
+                    for session in ("reviewer-1", "reviewer-2"))
     return replace(mq.QueueEntry("a", "writer", rig.head, reviews), **changes)
+
+
+def successor_entry(rig, *, parent=None, **changes):
+    """A real new lane commit, even when the previous lane already landed."""
+    head = git(rig.repo, "commit-tree", rig.tree, "-p", parent or rig.head,
+               data=b"next reviewed lane commit\n").decode().strip()
+    reviews = tuple(mq.Review(session, head, rig.tree, "ACCEPT", True)
+                    for session in ("reviewer-1", "reviewer-2"))
+    return entry(rig, head=head, reviews=reviews, **changes)
 
 
 def queue(rig, **changes):
@@ -171,13 +181,21 @@ def queue(rig, **changes):
 
 
 def prepare(q, rig, tip=None, mode="none"):
+    """Supply test-owned authentication when scheduling explicitly requires it."""
     observed = tip or rig.base
     state = rig.backends[q].state
     if (state is not None and state.entries and state.health_commit != observed
             and state.issued is None and not state.red and not state.results):
         q.restore_target(rig.store, mq.HostedResult(observed, True), read_target=lambda _: observed)
-    return q.prepare(rig.store, read_target=lambda target: tip or rig.base,
-                     read_mode=lambda target, base, head: mode, identity=IDENTITY, now=100)
+    result = q.prepare(rig.store, read_target=lambda target: observed,
+                       read_mode=lambda target, base, head: mode, identity=IDENTITY, now=100)
+    if (result.status == "target-unobserved" and state is not None and state.entries
+            and state.health_commit == observed and not state.reconciliation_required
+            and state.issued is None and state.cleanup is None and not state.red and not state.results):
+        q.restore_target(rig.store, mq.HostedResult(observed, True), read_target=lambda _: observed)
+        result = q.prepare(rig.store, read_target=lambda target: observed,
+                           read_mode=lambda target, base, head: mode, identity=IDENTITY, now=100)
+    return result
 
 
 def refused(code, action):
@@ -186,6 +204,242 @@ def refused(code, action):
     assert caught.value.code == code
     assert str(caught.value) == mq.REFUSALS[code]
     assert caught.value.next_action
+
+
+@pytest.mark.parametrize("field", ["session", "commit", "tree", "verdict", "helpers_off"])
+def test_review_requires_every_admission_field_explicitly(field):
+    values = dict(session="reviewer", commit="a" * 40, tree="b" * 40,
+                  verdict="ACCEPT", helpers_off=True)
+    del values[field]
+    for _ in range(2):
+        with pytest.raises(TypeError, match="missing 1 required positional argument: '" + field + "'"):
+            mq.Review(**values)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("verdict", None), ("verdict", True), ("verdict", "accept"),
+    ("verdict", "ACCEPT\n"), ("verdict", "REJECT"), ("verdict", []),
+    ("helpers_off", None), ("helpers_off", False), ("helpers_off", 1),
+    ("helpers_off", "True"), ("helpers_off", []),
+])
+def test_review_refusal_leaves_storage_untouched_and_allows_corrected_retry(rig, field, value):
+    passing(rig)
+    q = fresh_queue(rig)
+    backend = rig.backends[q]
+    original = entry(rig)
+    bad = replace(original, reviews=(replace(original.reviews[0], **{field: value}),
+                                     original.reviews[1]))
+    before = backend.state
+    for _ in range(2):
+        refused("not_reviewed", lambda: q.enqueue(rig.store, bad))
+        assert backend.state == before and not backend.dirty
+    assert q.enqueue(rig.store, original) == "queued"
+
+
+class ImmutableIndexBackend(StateBackend):
+    """Same port with an immutable commit-to-completion identity."""
+
+    def save(self, target, expected, state, completion):
+        if completion is not None:
+            old = self.commits.get(completion.landing.commit)
+            if old is not None and replace(old, result=completion.result) != completion:
+                raise OSError("immutable completion index")
+        return super().save(target, expected, state, completion)
+
+
+@pytest.mark.parametrize("backend_type", [StateBackend, ImmutableIndexBackend])
+@pytest.mark.parametrize("relation", ["equal", "behind", "ahead", "diverged"])
+@pytest.mark.parametrize("caller", ["first", "second", "requeued"])
+def test_head_relation_and_completion_identity_matrix(rig, backend_type, relation, caller):
+    passing(rig)
+    descendant = git(rig.repo, "commit-tree", rig.tree, "-p", rig.head,
+                     data=b"outside advance\n").decode().strip()
+    tip = {"equal": rig.head, "behind": descendant,
+           "ahead": rig.base, "diverged": rig.other}[relation]
+    backend = backend_type()
+    q = fresh_queue(rig, backend=backend)
+    q.restore_target(rig.store, mq.HostedResult(tip, True), read_target=lambda _: tip)
+    original = entry(rig)
+    assert q.enqueue(rig.store, original) == "queued"
+    integrated = relation in ("equal", "behind")
+    if not integrated:
+        candidate = prepare(q, rig, tip)
+        passing(rig, candidate.tree, candidate.commit)
+        candidate = prepare(q, rig, tip)
+        assert candidate.status == "ready"
+    if caller != "first":
+        if integrated:
+            if caller == "second":
+                assert q.withdraw("a", expected_head=rig.head) == "released"
+        else:
+            receipt = issue(q, rig, candidate)
+            assert q.observe_landed(rig.store, receipt, read_target=lambda _: receipt.commit) == "done"
+            tip = receipt.commit
+            q.restore_target(rig.store, mq.HostedResult(tip, True), read_target=lambda _: tip)
+            integrated = True
+        assert q.enqueue(rig.store, replace(original, lane="second") if caller == "second"
+                         else original) == ("queued" if caller == "second" else "already")
+    before, archives = backend.state, dict(backend.commits)
+    if caller == "requeued" and backend.lanes:
+        assert prepare(q, rig, tip).status == "empty"
+    elif integrated:
+        for _ in range(2):
+            refused("already_integrated", lambda: prepare(q, rig, tip))
+        assert q.issued is None
+    else:
+        assert prepare(q, rig, tip) == candidate
+    assert backend.state == before and backend.commits == archives and not backend.dirty
+    assert len(backend.commits) == len(backend.lanes) <= 1
+
+
+@pytest.mark.parametrize("events", tuple(permutations(("green", "red0", "red1", "ack"))))
+def test_hosted_return_reports_resulting_pause_in_every_arrival_order(rig, events):
+    q = queue(rig)
+    passing(rig)
+    receipt = issue(q, rig, prepare(q, rig))
+    backend = rig.backends[q]
+    for event in events:
+        if event == "ack":
+            assert q.observe_landed(rig.store, receipt, read_target=lambda _: receipt.commit) == "done"
+        else:
+            result = q.hosted_result(receipt.commit, passed=event == "green",
+                                     attempt=1 if event == "red1" else 0)
+            assert result == ("pending" if backend.state.issued is not None
+                              else "target-red" if backend.state.red else "green")
+    assert backend.state.red
+    assert q.hosted_result(receipt.commit, passed=False, attempt=1) == "target-red"
+    assert q.hosted_result(receipt.commit, passed=True, attempt=2) == "green"
+
+
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("advanced", [False, True])
+def test_landing_target_observation_requires_restore_after_outside_advance(rig, restart, advanced):
+    q = queue(rig)
+    passing(rig)
+    receipt = issue(q, rig, prepare(q, rig))
+    tip = (git(rig.repo, "commit-tree", rig.tree, "-p", receipt.commit,
+               data=b"outside advance\n").decode().strip() if advanced else receipt.commit)
+    assert q.observe_landed(rig.store, receipt, read_target=lambda _: tip) == "done"
+    next_head = git(rig.repo, "commit-tree", rig.tree, "-p", tip,
+                    data=b"next lane\n").decode().strip()
+    reviews = tuple(mq.Review(s, next_head, rig.tree, "ACCEPT", True) for s in ("r1", "r2"))
+    q.enqueue(rig.store, entry(rig, lane="next", head=next_head, reviews=reviews))
+    if restart:
+        q = fresh_queue(rig, backend=rig.backends[q], initialize=False)
+    observed = q.prepare(rig.store, read_target=lambda _: tip, read_mode=lambda *args: "none",
+                         identity=IDENTITY, now=100)
+    assert observed.status == "target-unobserved"
+    refused("observation_failed", lambda: q.restore_target(rig.store,
+        mq.HostedResult(rig.base, True), read_target=lambda _: tip))
+    q = fresh_queue(rig, backend=rig.backends[q], initialize=False)
+    assert q.restore_target(rig.store, mq.HostedResult(tip, True), read_target=lambda _: tip) == "green"
+    assert prepare(q, rig, tip).status == "ready"
+
+
+@pytest.mark.parametrize("field", ["repair", "parents", "deadline", "reviewer sessions", "hosted attempts"])
+def test_module_declares_trusted_caller_preconditions(field):
+    assert field in mq.__doc__
+    assert "trusted caller input" in mq.__doc__
+    assert "model-controlled" in mq.__doc__
+
+
+@pytest.mark.parametrize("backend_type", [StateBackend, ImmutableIndexBackend])
+def test_concurrent_equal_head_plans_never_issue_or_change_archive(rig, backend_type):
+    passing(rig)
+    q = fresh_queue(rig, backend=backend_type())
+    q.restore_target(rig.store, mq.HostedResult(rig.head, True), read_target=lambda _: rig.head)
+    q.enqueue(rig.store, entry(rig))
+    before = rig.backends[q].state
+    barrier = Barrier(2)
+
+    def plan(_):
+        barrier.wait(timeout=10)
+        refused("already_integrated", lambda: prepare(q, rig, rig.head))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(plan, range(2), timeout=30))
+    assert q.issued is None and rig.backends[q].state == before
+    assert rig.backends[q].commits == {}
+
+
+@pytest.mark.parametrize("backend_type", [StateBackend, ImmutableIndexBackend])
+def test_archived_commit_cannot_acquire_second_completion_after_target_rewind(rig, backend_type):
+    passing(rig)
+    q = fresh_queue(rig, backend=backend_type())
+    q.enqueue(rig.store, entry(rig))
+    receipt = issue(q, rig, prepare(q, rig))
+    assert q.observe_landed(rig.store, receipt, read_target=lambda _: rig.head) == "done"
+    q.restore_target(rig.store, mq.HostedResult(rig.base, True), read_target=lambda _: rig.base)
+    q.enqueue(rig.store, entry(rig, lane="second"))
+    backend = rig.backends[q]
+    before = backend.state
+    for _ in range(2):
+        refused("already_integrated", lambda: prepare(q, rig))
+    assert q.issued is None and backend.state == before and not backend.dirty
+    assert backend.commits[rig.head].landing == receipt
+    assert tuple(backend.lanes) == ("a",)
+
+
+def test_concurrent_invalid_review_does_not_block_explicit_valid_admission(rig):
+    passing(rig)
+    q = fresh_queue(rig)
+    original = entry(rig)
+    invalid = replace(original, reviews=(replace(original.reviews[0], helpers_off=None),
+                                         original.reviews[1]))
+    barrier = Barrier(2)
+
+    def admit(index):
+        barrier.wait(timeout=10)
+        if index:
+            refused("not_reviewed", lambda: q.enqueue(rig.store, invalid))
+            return "refused"
+        return q.enqueue(rig.store, original)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sorted(pool.map(admit, range(2), timeout=30)) == ["queued", "refused"]
+    assert q.enqueue(rig.store, original) == "already"
+    assert rig.backends[q].state.entries == (original,)
+
+
+def test_concurrent_higher_red_and_ack_after_early_green_reports_pause(rig):
+    q = queue(rig)
+    passing(rig)
+    receipt = issue(q, rig, prepare(q, rig))
+    assert q.hosted_result(receipt.commit, passed=True) == "pending"
+    barrier = Barrier(2)
+
+    def deliver(index):
+        barrier.wait(timeout=10)
+        if index:
+            return q.hosted_result(receipt.commit, passed=False, attempt=1)
+        return q.observe_landed(rig.store, receipt, read_target=lambda _: receipt.commit)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        result = list(pool.map(deliver, range(2), timeout=30))
+    assert result[0] == "done" and result[1] in ("pending", "target-red")
+    assert q.hosted_result(receipt.commit, passed=False, attempt=1) == "target-red"
+    assert q.hosted_result(receipt.commit, passed=True, attempt=2) == "green"
+
+
+def test_concurrent_advanced_landing_acknowledgements_require_restore(rig):
+    q = queue(rig)
+    passing(rig)
+    receipt = issue(q, rig, prepare(q, rig))
+    tip = git(rig.repo, "commit-tree", rig.tree, "-p", receipt.commit,
+              data=b"concurrent outside advance\n").decode().strip()
+    q.enqueue(rig.store, successor_entry(rig, parent=tip, lane="next"))
+    barrier = Barrier(2)
+
+    def acknowledge(_):
+        barrier.wait(timeout=10)
+        return q.observe_landed(rig.store, receipt, read_target=lambda _: tip)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sorted(pool.map(acknowledge, range(2), timeout=30)) == ["already", "done"]
+    assert q.prepare(rig.store, read_target=lambda _: tip, read_mode=lambda *args: "none",
+                     identity=IDENTITY, now=100).status == "target-unobserved"
+    q.restore_target(rig.store, mq.HostedResult(tip, True), read_target=lambda _: tip)
+    assert prepare(q, rig, tip).status == "ready"
 
 
 def test_fast_forward_runs_only_missing_leg_and_never_moves_refs(rig):
@@ -252,7 +506,9 @@ def test_admission_needs_lane_tree_pass_and_retries_are_immutable(rig):
 
 
 def test_parent_order_and_acknowledgement_are_observed_not_asserted(rig):
-    q = queue(rig, lane="child", parents=("a",))
+    passing(rig, legs=("linux-3.12",))
+    q = fresh_queue(rig)
+    q.enqueue(rig.store, successor_entry(rig, lane="child", parents=("a",)))
     assert prepare(q, rig).status == "blocked-by-parent"
     assert q.enqueue(rig.store, entry(rig)) == "queued"
     passing(rig)
@@ -273,7 +529,7 @@ def test_hosted_red_pauses_regular_lanes_and_prioritizes_repair(rig):
     assert q.hosted_result(rig.head, passed=False) == "target-red"
     q.enqueue(rig.store, entry(rig, lane="ordinary"))
     assert prepare(q, rig, rig.head).status == "target-red"
-    q.enqueue(rig.store, entry(rig, lane="repair", repair=True))
+    q.enqueue(rig.store, successor_entry(rig, lane="repair", repair=True))
     assert prepare(q, rig, rig.head).lane == "repair"
     assert q.hosted_result(rig.base, passed=True) == "unapplied"
     q.restore_target(rig.store, mq.HostedResult(rig.head, False), read_target=lambda _: rig.head)
@@ -352,7 +608,7 @@ def test_hosted_red_is_retained_in_either_acknowledgement_order(rig, before_ack,
     assert q.observe_landed(rig.store, issued, read_target=lambda _: issued.commit) == "done"
     if not before_ack:
         q.hosted_result(issued.commit, passed=passed)
-    q.enqueue(rig.store, entry(rig, lane="ordinary"))
+    q.enqueue(rig.store, successor_entry(rig, lane="ordinary"))
     assert prepare(q, rig, issued.commit).status == ("ready" if passed else "target-red")
 
 
@@ -367,7 +623,7 @@ def test_publication_receipt_survives_every_scheduling_invalidation(rig, operati
     other_tree = git(rig.repo, "rev-parse", rig.other + "^{tree}").decode().strip()
     passing(rig, other_tree, rig.other)
     q.enqueue(rig.store, entry(rig, lane="second", head=rig.other,
-        reviews=tuple(mq.Review(s, rig.other, other_tree) for s in ("r1", "r2"))))
+        reviews=tuple(mq.Review(s, rig.other, other_tree, "ACCEPT", True) for s in ("r1", "r2"))))
     q.enqueue(rig.store, entry(rig, lane="unrelated"))
     pending = prepare(q, rig, first.commit)
     passing(rig, pending.tree, pending.commit)
@@ -434,7 +690,7 @@ def test_delayed_hosted_red_pauses_and_older_green_cannot_clear_newer_red(rig):
     other_tree = git(rig.repo, "rev-parse", rig.other + "^{tree}").decode().strip()
     passing(rig, other_tree, rig.other, ("linux-3.12",))
     q.enqueue(rig.store, entry(rig, lane="second", head=rig.other,
-        reviews=tuple(mq.Review(s, rig.other, other_tree)
+        reviews=tuple(mq.Review(s, rig.other, other_tree, "ACCEPT", True)
                       for s in ("r1", "r2"))))
     second = prepare(q, rig, first.commit)
     passing(rig, second.tree, second.commit)
@@ -517,7 +773,7 @@ def test_hosted_red_invalidates_a_previously_ready_regular_candidate(rig):
     passing(rig)
     first = issue(q, rig, prepare(q, rig))
     q.observe_landed(rig.store, first, read_target=lambda _: first.commit)
-    q.enqueue(rig.store, entry(rig, lane="next"))
+    q.enqueue(rig.store, successor_entry(rig, lane="next"))
     ready = prepare(q, rig, rig.head)
     q.hosted_result(rig.head, passed=False)
     refused("stale_candidate", lambda: q.observe_landed(rig.store, ready, read_target=lambda _: ready.commit))
@@ -710,14 +966,15 @@ def test_completed_archive_does_not_exhaust_pending_capacity_or_forget_ids(rig, 
     tip = rig.base
     first = entry(rig, lane="lane-0")
     for index in range(4):
-        q.enqueue(rig.store, entry(rig, lane="lane-%d" % index))
+        item = first if index == 0 else successor_entry(rig, parent=tip, lane="lane-%d" % index)
+        q.enqueue(rig.store, item)
         published = issue(q, rig, prepare(q, rig, tip))
         q.observe_landed(rig.store, published, read_target=lambda _: published.commit)
         tip = published.commit
     restarted = fresh_queue(rig, backend=rig.backends[q], capacity=1, initialize=False)
     assert restarted.enqueue(rig.store, first) == "already"
     refused("request_conflict", lambda: restarted.enqueue(rig.store, replace(first, author="other")))
-    restarted.enqueue(rig.store, entry(rig, lane="child", parents=("lane-0",)))
+    restarted.enqueue(rig.store, successor_entry(rig, parent=tip, lane="child", parents=("lane-0",)))
     restarted.restore_target(rig.store, mq.HostedResult(tip, True), read_target=lambda _: tip)
     assert prepare(restarted, rig, tip).lane == "child"
 
@@ -941,7 +1198,7 @@ def test_restoration_merges_all_same_revision_copies(rig, archived):
     if archived:
         q.observe_landed(rig.store, first, read_target=lambda _: first.commit)
         q.hosted_result(first.commit, passed=True)
-        q.enqueue(rig.store, entry(rig, lane="duplicate"))
+        q.enqueue(rig.store, successor_entry(rig, lane="duplicate"))
         issue(q, rig, prepare(q, rig, first.commit))
         q.hosted_result(first.commit, passed=False, attempt=1)
     else:
@@ -1392,7 +1649,7 @@ def test_generated_issuance_failures_leave_no_unowned_pins(rig, monkeypatch, ste
             head = git(rig.repo, "commit-tree", rig.tree, "-p", rig.head,
                        data=b"replacement head\n").decode().strip()
             git(rig.repo, "update-ref", "refs/heads/lane/replacement", head)
-            reviews = tuple(mq.Review(session, head, rig.tree) for session in ("r1", "r2"))
+            reviews = tuple(mq.Review(session, head, rig.tree, "ACCEPT", True) for session in ("r1", "r2"))
             recovered.enqueue(store, entry(rig, head=head, reviews=reviews))
             recovered.restore_target(store, mq.HostedResult(tip, True), read_target=lambda _: tip)
             next_candidate = recovered.prepare(store, read_target=lambda _: tip,
@@ -1592,8 +1849,9 @@ def test_bounded_exhaustive_state_sequences_preserve_i1_i2_i3(rig, monkeypatch, 
             if seed_prefix == "duplicate-red":
                 q.observe_landed(rig.store, receipt, read_target=lambda _: target)
                 q.hosted_result(target, passed=True)
-                q.enqueue(rig.store, entry(rig, lane="duplicate"))
-                issue(q, rig, prepare(q, rig, target))
+                q.enqueue(rig.store, successor_entry(rig, lane="duplicate"))
+                next_receipt = issue(q, rig, prepare(q, rig, target))
+                parents[next_receipt.commit] = (target,)
                 q.hosted_result(target, passed=False, attempt=1)
             if seed_prefix == "withdrawn-red":
                 q.hosted_result(receipt.commit, passed=False, attempt=1)
@@ -1650,7 +1908,8 @@ def test_bounded_exhaustive_state_sequences_preserve_i1_i2_i3(rig, monkeypatch, 
                     call(lambda: q.reconcile_not_landed(store, receipt,
                         read_target=lambda _: target, read_outcome=lambda row: "not_applied"))
                 elif event == "withdraw" and receipt is not None:
-                    call(lambda: q.withdraw(receipt.lane, expected_head=rig.head, store=store,
+                    record = backend.state.issued or backend.state.cleanup
+                    call(lambda: q.withdraw(receipt.lane, expected_head=record.entry.head, store=store,
                         read_target=lambda _: target, read_outcome=lambda row: "not_applied"))
                 elif event == "reenqueue":
                     call(lambda: q.enqueue(store, entry(rig)))
@@ -1707,7 +1966,8 @@ def test_bounded_exhaustive_state_sequences_preserve_i1_i2_i3(rig, monkeypatch, 
                         outcome = call(lambda: probe.reconcile_not_landed(store, pending,
                             read_target=lambda _: target, read_outcome=lambda row: "not_applied"))
                         if outcome == "state_conflict":
-                            assert probe.withdraw(pending.lane, expected_head=rig.head, store=store,
+                            record = backend.state.issued or backend.state.cleanup
+                            assert probe.withdraw(pending.lane, expected_head=record.entry.head, store=store,
                                 read_target=lambda _: target, read_outcome=lambda row: "not_applied") == "released"
                         else:
                             assert outcome == "not_applied", sequence

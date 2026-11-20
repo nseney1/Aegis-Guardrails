@@ -1049,6 +1049,17 @@ python3 tools/hierarchy_launcher.py --base /abs/base status
   launcher stops the start's process group and is recorded (`start_incomplete` once a session is known,
   else `failed_to_start`, error "the launcher was interrupted"); during the bind wait it ends the wait
   instead, and the session can still be bound with `add-role`. The start lock is released either way.
+  Other fixed start failure reasons are:
+
+  | Error | State | Operator action |
+  | --- | --- | --- |
+  | "the start reported an invalid session" | `failed_to_start` | Inspect the start logs and repair the host's session report before retrying; the reported value is not a usable binding. |
+  | "the start timed out" | `failed_to_start` without a session, `start_incomplete` with one | Inspect the start logs and host readiness, then retry when ready; adjust `start_timeout_seconds` if the start needs a longer limit. |
+  | "the start process exited unsuccessfully" | `failed_to_start` without a session, `start_incomplete` with one | Inspect the recorded `exit_code` and start logs, fix the host failure, then retry. |
+  | "the start exited without reporting a session" | `failed_to_start` | Inspect the start logs and repair session-event reporting before retrying, even though the process exited successfully. |
+
+  These outcomes leave the endpoint unbound. A session in `start_incomplete` is evidence of a partial
+  start, not a successful bind; inspect it before choosing a retry or an explicit `add-role` recovery.
 - `resume` runs `tools/hierarchy_wake.py` with the current binding's wake profile, unchanged, and
   leaves every timeout to it.
 - `stop` signals the processes whose arguments name the bound session: SIGTERM, then SIGKILL after

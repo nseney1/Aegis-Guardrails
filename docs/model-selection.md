@@ -123,7 +123,45 @@ split resumes only that split's counts. Every split_id requires its exact snapsh
 An explicit outcome.launch_status="not_launched" excludes a HOLD or failed start;
 only an explicit "launched" can reverse that state. An initial decision without
 status counts as launched, while status-free observations preserve its state.
-Other outcome data is opaque.
+Served identity is recorded separately from the chosen identity by
+`aegis_core.model_served.observe_served(path, decision_id, served)`. The caller
+supplies tool-observed data; no identity is inferred from an artifact name or
+from the chosen host/model. The function returns the appended original decision
+with `outcome = {"served": served}` and no launch status. It refuses an unknown
+decision with `unknown_decision_id`, a malformed decision id with
+`invalid_decision_id`, and a malformed served block with `invalid_served`.
+The served block has exactly `host`, `model`, `level`, `family`, and
+`fallback_reason`. Host, level, family and a non-null reason are ASCII tokens
+matching `[A-Za-z0-9][A-Za-z0-9_.-]{0,127}`; model matches
+`[A-Za-z0-9._-]{1,128}`. No controls, whitespace, extra keys or caller-supplied
+coverage flags are accepted. An identity matching all four chosen fields requires
+`fallback_reason = null`; a change to any identity field requires a non-null
+reason token. Hosts, families, models and reason tokens are configuration data,
+not built-in names. These observations describe execution, not binding admission.
+The complete resulting row must fit `MAX_LINE_BYTES` including its LF, and the
+resulting history must fit the existing record and byte caps. Refusals preserve
+the decision log; publication uses `append_decision` and its anchored lock.
+Concurrent observations retain both rows and never change launch state or split
+counts, including when the decision was previously marked `not_launched`.
+`served_of(rows, decision_id)` returns a copy of the newest valid served block
+with a computed boolean `cross_family`: true only when the served family differs
+from a non-null original `author_family`. After examining the complete, in-bounds
+history it returns that block, or `None` if no valid block exists for the decision
+(including absent/malformed blocks and unknown ids). It never substitutes the
+chosen identity, and ignores a later invalid block without hiding an earlier
+valid one. More than `MAX_HISTORY_RECORDS` rows refuses with `ModelSelectionError`
+and `history_limit_exceeded: archive_or_rotate_decision_log`, even when a valid
+block was found before the cap. A bound is a refusal, never absence or a partial
+receipt. The reader consumes at most `MAX_HISTORY_RECORDS + 1` rows to detect this
+overflow. Invalid decision IDs refuse `invalid_decision_id`. The reader accepts
+a list, tuple, or `collections.abc.Iterator`. Other inputs, including sequences
+that only provide `__getitem__`, refuse `invalid_history` before any row is read.
+The reader walks list and tuple storage directly and consumes iterators through
+`next()` without calling their `__iter__`. Errors raised while reading rows
+propagate unchanged. Use `read_decisions` for validated disk rows.
+Other outcome fields retain their existing opaque semantics. Launch integration,
+formal-round coverage enforcement and delivery waivers belong to the launcher;
+this module adds no CLI or MCP verb and grants no execution authority.
 Each new launch hashes previous_decision_id (the previous new decision for its
 team, across policies); observations do not advance the chain. Replay refuses a
 broken chain with invalid_history:decision_chain: restore_complete_decision_log.
