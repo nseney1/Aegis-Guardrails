@@ -137,6 +137,10 @@ class RuleInventoryError(RuntimeError):
         super().__init__(message if code else f"rule inventory {operation} failed for {self.path}: {message}")
 
 
+class _RuleSizeLimitExceeded(ValueError):
+    """A regular rule exceeds MAX_RULE_BYTES."""
+
+
 def _stat_signature(info: os.stat_result) -> Tuple[int, int, int, int, int, int]:
     return (
         info.st_dev,
@@ -327,8 +331,8 @@ def read_rule_file(path: str | Path, *, root: str | Path | None = None,
     canonicalizing or rebuilding it, or separately inspecting its parent.
     The final component is never resolved or followed; descriptor regular-file,
     byte-cap and identity checks apply in both modes.
-    Refusals contain no supplied text; RULE_FILE_NOT_FOUND distinguishes absence
-    from RULE_FILE_READ_REFUSED.
+    Refusal messages are fixed, with separate advice for files above the cap.
+    RULE_FILE_NOT_FOUND distinguishes absence from RULE_FILE_READ_REFUSED.
     OS failures remain available as ``cause``; legacy boundaries opt into raising
     them with ``preserve_os_errors``. ``source`` must identify the captured file
     both before and after reading, before a caller records it as provenance.
@@ -356,8 +360,8 @@ def read_rule_file(path: str | Path, *, root: str | Path | None = None,
         if relative_parts[-1] in (".", ".."):
             raise ValueError("rule path is a directory")
         before = _stat_path(absolute)
-        if before.st_size > MAX_RULE_BYTES:
-            raise ValueError("rule size limit exceeded")
+        if stat.S_ISREG(before.st_mode) and before.st_size > MAX_RULE_BYTES:
+            raise _RuleSizeLimitExceeded
         if source is not None and _stat_signature(_stat_path(str(source))) != _stat_signature(before):
             raise ValueError("rule source differs from captured file")
         root_identity = identities.get(anchor)
@@ -365,7 +369,7 @@ def read_rule_file(path: str | Path, *, root: str | Path | None = None,
         data = _read_stable_file(absolute, before, identities, anchor or ".", listed,
                                  relative_parts=relative_parts, direct=root is None)
         if len(data) > MAX_RULE_BYTES:
-            raise ValueError("rule size limit exceeded")
+            raise _RuleSizeLimitExceeded
         for parent, expected in identities.items():
             if _identity_signature(_stat_path(parent)) != expected:
                 raise ValueError("rule ancestor changed")
@@ -383,9 +387,11 @@ def read_rule_file(path: str | Path, *, root: str | Path | None = None,
             if os_cause.filename is not None:
                 os_cause.filename = str(path)
             raise os_cause from None
+        message = (f"Rule file exceeds the {MAX_RULE_BYTES}-byte size limit"
+                   if isinstance(exc, _RuleSizeLimitExceeded) else "Rule file read refused")
         if error_type is RuleInventoryError:
-            raise RuleInventoryError("read", ".", "Rule file read refused", os_cause, code=code) from None
-        raise error_type("Rule file read refused", code=code) from None
+            raise RuleInventoryError("read", ".", message, os_cause, code=code) from None
+        raise error_type(message, code=code) from None
 
 
 def inventory_rules(workspace: str) -> RuleInventory:

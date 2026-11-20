@@ -10,6 +10,7 @@ import pytest
 
 from tests.conftest import symlink_or_skip
 from tests.integration.hierarchy_fake_wrapper import shell_exec
+from tests.integration.test_hierarchy_launcher import assert_launch_record_added
 from tests.integration.test_hierarchy_mailbox import ROOT, git
 from tests.integration.test_hierarchy_provision import copy_source, worker_source_seed
 from tools.hierarchy_team import API_KEYS
@@ -97,15 +98,12 @@ def test_team_up_reports_the_launcher_failure_and_retains_it_on_retry(tmp_path, 
 
     assert team("init")["init"] == "complete"
     folder = run / "initiatives" / "pilot" / "launches" / "pilot%2Frouter"
-    saved = []
-    for attempt in range(2):
+    saved = {}
+    for _ in range(2):
         answer = team("up", "--no-loop", expect=3)
         assert answer["error"] == ("pilot/router did not start: the start process exited unsuccessfully "
                                    "(launcher exit 3, state %s)" % state)
         assert answer["record"]["state"] == state
         assert answer["record"]["error"] == "the start process exited unsuccessfully"
-        records = [json.loads(path.read_text(encoding="utf-8")) for path in sorted(folder.glob("*.json"))]
-        assert len(records) == attempt + 1 and records[:attempt] == saved
-        assert records[-1] == {key: value for key, value in answer["record"].items() if key != "log"}
-        saved = records
+        saved = assert_launch_record_added(folder, saved, answer["record"])
         assert not (folder / ".start.lock").exists() and not (run / "loop.pid").exists()

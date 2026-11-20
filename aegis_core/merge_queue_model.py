@@ -54,6 +54,7 @@ REFUSALS = {
     "stale_candidate": "candidate no longer matches the serial queue head and target",
     "landing_unconfirmed": "exact candidate landing is unconfirmed; observe without retrying the effect",
     "already_integrated": "lane head is already an ancestor of the target; use a fresh pick lane to re-land reverted work",
+    "archived_completion": "archived completion already records this commit; withdraw the pending entry with its expected head",
 }
 _OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
