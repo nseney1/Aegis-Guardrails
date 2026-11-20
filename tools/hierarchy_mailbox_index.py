@@ -13,11 +13,9 @@ Changed dependencies re-read their dependent messages, then rerun pinned
 validation with before/after confirmation. Directory
 enumeration and credential observations always run; missing observations do not
 authorize partial reuse. Non-POSIX bytes are hashed before parsed reuse.
-Without checked descriptor reads, bytes come from pinned read_bytes and stored
-validation runs every call; POSIX metadata/access reuse is unavailable.
-Pathlib-ignored lstat outcomes share the constant None/not-a-symlink probe key;
-permission and other real I/O failures still propagate to the pinned oracle.
-Each fresh header receives one pinned stored validation per scan attempt.
+The router supplies guarded metadata, listing and record reads. Its scan reads
+each record freshly and lets the router report any refusal. Other callers use
+the original probes and pinned fallback.
 
 Per the ADR access-probe addendum, unchanged access outcomes are reusable.
 Accepted risks: a privileged mandatory-policy reload is not detected for
@@ -49,30 +47,10 @@ reports content_changed against this instance's last observation, or unavailable
 verification after canonical reconciliation. Unreported hash changes survive
 memo clearing; verify reports retained fallback/retry evidence. Successful
 ordinary reads expose and acknowledge new changes through content_changed.
-Evidence coalesces the first old and latest new SHA per known path. History
-admits new paths after a complete pinned-validated scan, or retains an already
-observed candidate SHA during reconciliation. Every canonical fallback return
-reports unavailable PIN-byte coverage: neither canonical equality nor a later
-read establishes PIN's original raw bytes. Matched shadow reads return the
-indexed value with its own byte history; final divergence returns PIN's value
-with unavailable coverage until verify reports it. Clearing a populated memo
-also preserves coverage-loss state until a successful full verify reports it.
-It retains at most
-10,000 detailed paths within a 32 MiB accounting budget (including a conservative
-per-path allowance and 32 KiB summary reserve). Overflow retains eight bounded
-path samples with hashes and saturating counters; verify reports
-content_change_overflow. Truncated samples carry a digest of the full path and
-are never presented as complete content_changed paths. Only successful verify
-acknowledges overflow facts/counters; live sample baselines remain at their
-latest SHA until a successful scan establishes deletion. Persistent capacity
-loss can report overflow again. Facts promoted from samples into detailed
-pending entries retain that verify-only acknowledgement rule.
-Successful scans retire deleted paths from detailed history, refunding their
-budget; pending retired facts move to the bounded summary. Unbaselined returned
-paths make verification explicitly unavailable for all returned records, with
-bounded current-path diagnostics. An unbaselined read after coverage loss counts
-conservatively in omitted_changes and separately in unbaselined_reads: without
-an old SHA it is a possible change, never evidence of unchanged bytes.
+Evidence coalesces old/new hashes in a 10,000-path and 32 MiB budget.
+It samples overflow and acknowledges overflow facts only on a successful verify.
+Reconciliation does not claim the original bytes read by PIN. Deletion retires
+detailed history only after a complete scan. Unknown baselines remain explicit.
 These are observations, not atomic snapshots or authenticated history. Weak
 POSIX timestamps require verify.
 """
@@ -384,6 +362,7 @@ class MailboxIndex(_IndexStorage):
 
     def __init__(self, mailbox, *, mode="shadow"):
         self.mailbox = mailbox
+        self._io = getattr(mailbox, "shadow_io", None)
         self._evidence = _Evidence()
         self._keep_changes = False
         self._baseline_gap = False
@@ -421,10 +400,13 @@ class MailboxIndex(_IndexStorage):
 
     def _read_message(self, path, *, previous=None):
         try:
-            raw = (hm.read_bytes(path) if previous is None else
-                   self._read_raw(path, previous["key"], previous["device"]))
+            if self._io is not None:
+                raw = self._io.read(path)
+            else:
+                raw = (hm.read_bytes(path) if previous is None else
+                       self._read_raw(path, previous["key"], previous["device"]))
         except ValueError as exc:
-            if str(exc) == "file unavailable: " + str(path) and not os.path.exists(path):
+            if self._io is None and str(exc) == "file unavailable: " + str(path) and not os.path.exists(path):
                 raise _ChangedDuringRead() from exc
             raise
         sha = hashlib.sha256(raw).hexdigest()
@@ -434,6 +416,8 @@ class MailboxIndex(_IndexStorage):
         return self._parse_message(path, raw), sha
 
     def _read_raw(self, path, key=None, device=None):
+        if self._io is not None:
+            return self._io.read(path)
         if not _checked_reads_supported():
             return hm.read_bytes(path)
         hm.safe_path(path)
@@ -502,7 +486,8 @@ class MailboxIndex(_IndexStorage):
                 self.last_reconciliation["baseline_unavailable"] = True
             try:
                 if candidate is not None and candidate[0] == path and candidate[2] == hm.digest(record["message"]):
-                    if _stat_key(os.lstat(path)) != candidate[3]:
+                    info = os.lstat(path) if self._io is None else self._io.lstat(path)
+                    if _stat_key(info) != candidate[3]:
                         # PIN may have read a different raw encoding of the
                         # same message. Retain the observed SHA, disclaim PIN's.
                         self._baseline_gap = True
@@ -586,6 +571,11 @@ class MailboxIndex(_IndexStorage):
         folder_paths = self._folder_paths.get(folder)
         if folder_paths is None:
             folder_paths = self._paths(folder)
+        if self._io is not None:
+            names = self._io.names(folder)
+            observed.stable(folder_paths)
+            observed.confirm(folder_paths)
+            return folder_paths, sorted(names, key=os.path.normcase)
         stable_folder = observed.stable(folder_paths)
         if folder not in self._folder_checks or not stable_folder:
             hm.safe_path(folder)
@@ -644,7 +634,8 @@ class MailboxIndex(_IndexStorage):
         else:
             message, sha = self._read_message(path, previous=previous if reuse else None)
             fresh.add(path)
-            if self._key(relpath, os.lstat(path)) != key:
+            current = os.lstat(path) if self._io is None else self._io.lstat(path)
+            if current is None or self._key(relpath, current) != key:
                 raise _ChangedDuringRead()
         validated = False
         if reuse and previous["sha256"] == sha:
@@ -679,12 +670,15 @@ class MailboxIndex(_IndexStorage):
             self._scope_root = root
             self._above_root = {str(path) for path in self.mailbox.root.parents}
             self._observations, self._folder_checks, self._folder_paths = {}, set(), {}
-        hm.safe_path(self.mailbox.root.parent)
         observed = _Observations(self._observations)
+        if self._io is None:
+            hm.safe_path(self.mailbox.root.parent)
+        else:
+            observed.lstat = self._io.lstat
         identity = self._identity()
         context = (root, hm.digest(self.mailbox.manifest), hm.MAX_BYTES, identity)
         reusable_context = identity is not None and context == self._context and _checked_reads_supported()
-        same_limit = self._context is not None and self._context[2] == hm.MAX_BYTES
+        same_limit = self._io is None and self._context is not None and self._context[2] == hm.MAX_BYTES
         folder_checks, folder_paths_used = set(), {}
         for folder, folder_rel in self._list_folders(context):
             folder_paths, names = self._list_folder(folder, observed)
@@ -737,6 +731,8 @@ class MailboxIndex(_IndexStorage):
                                candidate=getattr(error, "candidate", None))
 
     def _reconcile(self, pinned, select, *, error, attempts, full_history=False, candidate=None):
+        if self._io is not None:
+            raise error
         self._keep_changes = True
         # Keyed entries remain candidates only. Next call re-lists, re-stats and
         # re-checks context/dependencies before reuse. Canonical bytes below
@@ -828,6 +824,8 @@ class MailboxIndex(_IndexStorage):
 
     def _shadow(self, read, pinned, select):
         indexed, expected, differences = _observe(read, pinned)
+        if self._io is not None and indexed[1] is not None:
+            raise indexed[1]
         self.last_divergence = differences
         if not differences and indexed[1] is None:
             return indexed[0]  # Equality proves values, not PIN's byte provenance.
