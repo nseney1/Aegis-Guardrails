@@ -9,6 +9,7 @@ Unsafe/closed/unsupported stores refuse E_AUTH; Windows support is deferred.
 JSON is default; MD fences that JSON; TSV marks data and uses JSON cells.
 JSON short escapes are preserved; outline alone emits only envelope and outline.
 """
+from functools import partial
 import hashlib
 from threading import RLock
 from typing import NamedTuple
@@ -201,11 +202,12 @@ class _Coverage:
         self.spans.append((start, end))
         self.ranges.setdefault(("body",), None)
 
-    def omitted(self, size):
+    def measure(self, size, chunks):
         if self.spans:
             self.budget.charge(len(self.value["body"]))
-        for _chunk in json_chunks(self.value, ranges=self.ranges):
-            pass
+        digest = hashlib.sha256()
+        for chunk in chunks(self.value, ranges=self.ranges):
+            digest.update(chunk.encode("ascii"))
         intervals = [self.ranges[path] for path in self.paths]
         if self.spans:
             offsets, previous, position = {}, 0, self.ranges[("body",)][0] + 1
@@ -217,7 +219,7 @@ class _Coverage:
         for start, stop in sorted(intervals):
             covered += max(0, stop - max(start, end))
             end = max(end, stop)
-        return size - covered
+        return digest.hexdigest(), size - covered
 
 
 _MISSING = object()
@@ -402,19 +404,20 @@ def read_view(value, *, selectors=(), spans=(), outline=False, since=None, row_l
     planned = prepare_read(value, selectors=selectors, spans=spans, expand=expand, since=since, row_limit=row_limit,
                            outline=outline, format=format, max_chars=max_chars, store=store, **unknown).planned
     renderer, budget = _renderer(max_chars), Budget(MAX_WORK_BYTES)
-    raw = canonical(value)
+    size = canonical(value, _size_only=True)
     require(all(index < len(value["spans"]) for index in spans), "E_SPAN")
-    rid = hashlib.sha256(raw).hexdigest()
-    handle = _views.Text(rid, 0, 16)
     outline_only = outline and not (selectors or spans or since is not None or expand)
-    view = {"ref": handle, "kind": value["kind"], "from": value["meta"]["from"],
+    view = {"ref": _views.Text("0" * 16), "kind": value["kind"], "from": value["meta"]["from"],
             "untrusted": True, "omitted_chars": 0}
     if not outline_only:
         view["data"] = {}
     renderer.measure(view, format)  # Minimum envelope; no output can be smaller.
+    # The envelope fits, so there is room for at least one escaped character.
+    # Source hashes may cover the entire record, but each encoding stays bounded.
+    chunks = partial(json_chunks, chunk_size=min(128, (max_chars - 2) // 12))
     page, cursor, original = None, None, value
     if since is not None:
-        value, page, cursor = _views.page(value, since, row_limit, json_chunks, require)
+        value, page, cursor = _views.page(value, since, row_limit, chunks, require)
     coverage, schema = _Coverage(original, budget, renderer, page, bool(value["refs"])), _record_schema(value["kind"])
     data, missing = {}, {}
     default = not (selectors or spans or since is not None or outline_only)
@@ -442,7 +445,7 @@ def read_view(value, *, selectors=(), spans=(), outline=False, since=None, row_l
             yield "refs", value["refs"]
     if selectors or spans:
         data = _views.Object(selected_items)
-    whole = not (selectors or spans or since is not None or outline) and len(raw) <= 4000
+    whole = not (selectors or spans or since is not None or outline) and size <= 4000
     if whole:
         data = dict(value)
         coverage.add(()) if not value["refs"] or store is None else None
@@ -466,7 +469,8 @@ def read_view(value, *, selectors=(), spans=(), outline=False, since=None, row_l
         coverage.add(("refs",))
     renderer.json_size(data, MAX_OUTPUT_CHARS if format == "tsv" else max_chars)
     coverage.active = False  # Replay plans without recharging selection analysis.
-    view["omitted_chars"] = coverage.omitted(len(raw))
+    rid, view["omitted_chars"] = coverage.measure(size, chunks)
+    view["ref"] = _views.Text(rid, 0, 16)
     if not outline_only:
         view["data"] = data
     if cursor is not None:
