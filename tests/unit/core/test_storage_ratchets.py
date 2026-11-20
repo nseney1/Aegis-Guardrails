@@ -468,6 +468,10 @@ AUDIT_READ_ONLY_OPERATIONS = {
     ("aegis_core/verification/scanners.py", "_sarif_open_artifact", "os.open"): "read-only confined SARIF artifact directory walk and file inspection; this approved call requests read-only inspection",
     ("aegis_core/workspace/confinement.py", "read_confined_bytes", "os.open"): "read-only bounded confined file inspection; this approved call requests read-only inspection",
     ("aegis_core/yaml_engine/frontmatter.py", "_read_rule_text", "aegis_core.rule_inventory.read_rule_file"): "FRONTMATTER-BOUNDED-READ: one bounded read-only rule snapshot before text decoding/parsing.",
+    ("aegis_mcp/queue_role.py", "Grant.claim", "aegis_mcp.queue_role.authority"): "QUEUE-ROLE-CLAIM-COST: one confined authority walk; lock creation belongs to storage.file_lock",
+    ("aegis_mcp/queue_role.py", "authority", "os.open"): "QUEUE-ROLE-CLAIM-COST: one shared open_directory read-only callback; leaf descriptor only; DirectoryAnchor closes it; no second opener",
+    ("aegis_mcp/queue_role.py", "bind", "aegis_mcp.queue_role.authority"): "QUEUE-ROLE-CLAIM-COST: one confined authority walk; lock creation belongs to storage.file_lock",
+    ("aegis_mcp/queue_role.py", "issue", "aegis_mcp.queue_role.authority"): "QUEUE-ROLE-CLAIM-COST: one confined authority walk; lock creation belongs to storage.file_lock",
 }
 
 # These atomicio wrappers expose its descriptor opener transitively. Other
@@ -519,6 +523,7 @@ FORWARDING_OPENERS = dict.fromkeys(_ATOMIC_WRAPPERS, None) | {
     "aegis_core.verification.scanners._SarifLineCache.fill": None,
     "aegis_core.verification.scanners._sarif_open_artifact": None,
     "aegis_core.workspace.confinement.read_confined_bytes": None,
+    "aegis_mcp.queue_role.authority": None,
 }
 _PARTIAL_OPENERS = {
     "aegis_core.migrate._input": "aegis_core.rule_inventory.read_rule_file",
@@ -564,6 +569,9 @@ CALLBACK_EXCEPTIONS = {
     ),
     ("aegis_core/model_select.py", "_publish", "os.unlink", "_path_call"): (
         1, "reviewed writer removes its unpublished temporary log through the deferred cleanup boundary",
+    ),
+    ("aegis_mcp/queue_role.py", "authority", "os.open", "open_directory"): (
+        1, "QUEUE-ROLE-CLAIM-COST: trusted opener receives fixed read-only no-follow directory flags from storage_confined; one walk; no mutation",
     ),
 }
 
@@ -780,6 +788,10 @@ REVIEWED_DESCRIPTOR_OPERATIONS = {
     ("aegis_core/verification/scanners.py", "_sarif_open_artifact", "os.open"): (2, "read-only confined SARIF artifact directory walk and file inspection"),
     ("aegis_core/workspace/confinement.py", "read_confined_bytes", "os.open"): (1, "read-only bounded confined file inspection"),
     ("aegis_core/yaml_engine/frontmatter.py", "_read_rule_text", "aegis_core.rule_inventory.read_rule_file"): (1, "FRONTMATTER-BOUNDED-READ: one bounded read-only rule snapshot before text decoding/parsing."),
+    ("aegis_mcp/queue_role.py", "Grant.claim", "aegis_mcp.queue_role.authority"): (1, "QUEUE-ROLE-CLAIM-COST: one confined authority walk; lock creation belongs to storage.file_lock"),
+    ("aegis_mcp/queue_role.py", "authority", "os.open"): (1, "QUEUE-ROLE-CLAIM-COST: one shared open_directory read-only callback; leaf descriptor only; DirectoryAnchor closes it; no second opener"),
+    ("aegis_mcp/queue_role.py", "bind", "aegis_mcp.queue_role.authority"): (1, "QUEUE-ROLE-CLAIM-COST: one confined authority walk; lock creation belongs to storage.file_lock"),
+    ("aegis_mcp/queue_role.py", "issue", "aegis_mcp.queue_role.authority"): (1, "QUEUE-ROLE-CLAIM-COST: one confined authority walk; lock creation belongs to storage.file_lock"),
 }
 
 
