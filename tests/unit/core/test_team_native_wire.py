@@ -862,6 +862,90 @@ def test_duplicate_completed_call_replays_without_a_second_dispatch_or_mutation(
     assert rows[1]["result"]["contentItems"][0]["text"] == "no"
 
 
+def test_pending_aliases_and_completed_replay_encode_the_body_once(monkeypatch):
+    _posix()
+    original = call(-(2 ** 63), "one")
+    alias = call('a"\\é😀\n', "one")
+    later = call(8, "two")
+    replay = call("retry\ud800", "one")
+    final = call(9, "three")
+    marker = "immutable tool result"
+    answer = {"success": False, "contentItems": [
+        {"type": "inputText", "text": marker + ' "é😀\n\ud800'}]}
+    expected = [_response_bytes(value["id"], answer) for value in (original, alias, replay)]
+    encodings = []
+
+    class CountBodyEncodes:
+        loads = staticmethod(json.loads)
+
+        @staticmethod
+        def dumps(value, *args, **kwargs):
+            raw = json.dumps(value, *args, **kwargs)
+            if marker in raw:
+                encodings.append(raw)
+            return raw
+
+    monkeypatch.setattr(wire, "json", CountBodyEncodes)
+    with link(frames=map(frame, (original, alias, later, replay, final))) as item:
+        item.client.initialize()
+        assert item.client.receive_call() == original
+        assert item.client.receive_call() == later
+        item.client.reply(alias["id"], answer)
+        answer["contentItems"][0]["text"] = "changed"
+        assert item.client.receive_call() == final
+    assert item.seen[2:] == expected
+    assert len(encodings) == 1
+
+
+@pytest.mark.parametrize("revoke", [False, True], ids=["write-error", "revoked"])
+def test_reply_stops_between_aliases_after_a_transport_failure(monkeypatch, revoke):
+    _posix()
+    original, alias, later = call(7), call("alias"), call(8, "later")
+    answer = {"success": True, "contentItems": []}
+    expected = _response_bytes(7, answer)
+    accepted = bytearray()
+    attempts = []
+
+    with link(frames=map(frame, (original, alias, later))) as item:
+        item.client.initialize()
+        assert item.client.receive_call() == original
+        assert item.client.receive_call() == later
+
+        class AliasIO:
+            @staticmethod
+            def select(readable, writable, exceptional, timeout):
+                if revoke and writable and accepted == expected:
+                    item.client.close()
+                    return [], writable, []
+                return select.select(readable, writable, exceptional, timeout)
+
+            @staticmethod
+            def write(fd, data):
+                attempts.append(bytes(data))
+                if len(attempts) == 1:
+                    raise InterruptedError
+                if len(attempts) == 2:
+                    data = data[:3]
+                if accepted == expected:
+                    raise OSError("injected write failure")
+                written = os.write(fd, data)
+                accepted.extend(data[:written])
+                return written
+
+        monkeypatch.setattr(wire, "select", AliasIO)
+        monkeypatch.setattr(wire, "os", AliasIO)
+        for _attempt in range(2):
+            with pytest.raises(wire.HostAuthorityError) as caught:
+                item.client.reply(7, answer)
+            assert (caught.value.code, caught.value.reason) == (
+                "HOST_PROTOCOL_ERROR", "invalid host protocol frame")
+            assert item.client.closed
+        assert item._client_reader.closed and item._client_writer.closed
+    assert attempts[:3] == [expected, expected, expected[3:]]
+    assert attempts[3:] == ([] if revoke else [_response_bytes("alias", answer)])
+    assert item.seen[2:] == [expected]
+
+
 def test_changed_duplicate_and_unknown_reply_close_without_a_result_frame():
     changed = call(9)
     changed["params"]["arguments"] = {"request_id": "changed"}
@@ -973,6 +1057,55 @@ def test_close_is_idempotent_and_a_fresh_client_can_retry():
     with link(frames=[frame(call())]) as item:
         item.client.initialize()
         assert item.client.receive_call()["id"] == 7
+
+
+def test_fragmented_read_reuses_its_prefix_and_keeps_coalesced_frames(monkeypatch):
+    _posix()
+    maximum = 512
+    first, second, exact = call(7, "first"), call(8, "second"), call(9, "exact")
+    exact["params"]["arguments"] = ""
+    exact["params"]["arguments"] = "x" * (maximum - len(frame(exact)))
+    incoming = frame(first) + frame(second)
+    requested = []
+    recopied = []
+
+    class TrackedChunk(bytes):
+        def __radd__(self, prefix):
+            # The old immutable concatenation invokes this with the full prefix.
+            if prefix:
+                recopied.append(len(prefix))
+            return prefix + bytes(self)
+
+    class FragmentedReader:
+        @staticmethod
+        def read(fd, size):
+            requested.append(size)
+            if len(requested) == 1:
+                size = 4
+            elif len(requested) == 2:
+                raise InterruptedError
+            return TrackedChunk(os.read(fd, size))
+
+    with closing(Link(maximum=maximum)) as item:
+        item.to_client.write(frame({"id": INIT_ID, "result": HANDSHAKE}))
+        item.client.initialize()
+        monkeypatch.setattr(wire, "os", FragmentedReader)
+        item.to_client.write(incoming)
+        assert item.client.receive_call() == first
+        assert item.client.receive_call() == second
+        assert requested == [maximum, maximum - 4, maximum - 4]
+        item.to_client.write(frame(exact))
+        assert item.client.receive_call() == exact
+        assert requested[-1] == maximum
+        item.to_client.write(b'{"id":7')
+        item.to_client.close()
+        with pytest.raises(wire.HostAuthorityError) as caught:
+            item.client.receive_call()
+        assert (caught.value.code, caught.value.reason) == (
+            "HOST_PROTOCOL_ERROR", "invalid host protocol frame")
+        assert item.client.closed
+        assert item._client_reader.closed and item._client_writer.closed
+    assert recopied == []
 
 
 def test_close_during_blocked_write_does_not_write_a_reused_descriptor(tmp_path, monkeypatch):
