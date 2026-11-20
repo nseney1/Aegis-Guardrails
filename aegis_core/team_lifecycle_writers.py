@@ -12,10 +12,40 @@ from threading import local
 from aegis_core import team_lifecycle as domain
 from aegis_core.team_mailbox import Mailbox
 from aegis_core.team_mailbox_index import Index
-from aegis_core.team_mailbox_primitives import MailboxRefusal, safe_path
+from aegis_core.team_mailbox_primitives import MailboxRefusal, render_mailbox_refusal, safe_path
 
 
 __all__ = ['CanonicalGenesisError', 'InitialBootstrapMissing', 'Lifecycle', 'ProtectedCanonicalBootstrapWriter', 'ProtectedCanonicalDecisionWriter', 'ProtectedCanonicalEnrollmentWriter', 'initialize', 'load_json', 'prepare_initial']
+
+
+@contextmanager
+def _refusals():
+    """Translate storage failures during entry, body and exit; preserve host errors."""
+    try:
+        yield
+    except MailboxRefusal as error:
+        raise domain.LifecycleRefusal(render_mailbox_refusal(error)["reason"]) from None
+
+
+class _BodyError(Exception):
+    """Carry a caller failure through storage cleanup without coercing its type."""
+
+    def __init__(self, original):
+        super().__init__("lifecycle caller failed")
+        self.original = original
+
+
+@contextmanager
+def _caller_errors():
+    try:
+        yield
+    except Exception as error:
+        raise _BodyError(error) from None
+
+
+class _Unpublished(domain.LifecycleRefusal):
+    """A capacity/target failure originating in read-only publication preflight."""
+
 
 def _advance(policy, state, record):
     """Apply exactly the reader contract to a candidate before publication."""
@@ -60,19 +90,25 @@ class Lifecycle:
     @contextmanager
     @domain.boundary
     def view(self, *, write=False):
-        with self.store.directory(self.root) as root_fd:
-            if write:
-                with self.store.lock(self.root, parent=root_fd):
-                    with self.store.directory(self.root / "events", parent=root_fd) as events_fd:
-                        previous = getattr(self._local, "writer_fds", None)
-                        self._local.writer_fds = root_fd, events_fd
-                        try:
-                            yield root_fd, events_fd
-                        finally:
-                            self._local.writer_fds = previous
-            else:
-                with self.store.directory(self.root / "events", parent=root_fd) as events_fd:
-                    yield root_fd, events_fd
+        with _refusals():
+            try:
+                with self.store.directory(self.root) as root_fd:
+                    if write:
+                        with self.store.lock(self.root, parent=root_fd):
+                            with self.store.directory(self.root / "events", parent=root_fd) as events_fd:
+                                previous = getattr(self._local, "writer_fds", None)
+                                self._local.writer_fds = root_fd, events_fd
+                                try:
+                                    with _caller_errors():
+                                        yield root_fd, events_fd
+                                finally:
+                                    self._local.writer_fds = previous
+                    else:
+                        with self.store.directory(self.root / "events", parent=root_fd) as events_fd:
+                            with _caller_errors():
+                                yield root_fd, events_fd
+            except _BodyError as error:
+                raise error.original from None
 
     @domain.boundary
     def load(self):
@@ -159,15 +195,20 @@ class Lifecycle:
 
     @domain.boundary
     def publish(self, record, root_fd, events_fd):
-        raw = domain.encoded(record, limit=domain.MAX_BYTES - 1) + b"\n"
-        domain.strict_json(raw)
-        candidate, _ = _advance(self._local.policy, self._local.state, record)
-        snapshot = [*self._local.snapshot, ("%06d.json" % record["sequence"], hashlib.sha256(raw).hexdigest())]
         try:
-            self.require_target(root_fd, events_fd)
-            self.require_snapshot(root_fd, events_fd)
-        except (ValueError, OSError):
-            raise domain.LifecycleRefusal("target_changed") from None
+            raw = domain.encoded(record, limit=domain.MAX_BYTES - 1) + b"\n"
+            domain.strict_json(raw)
+            candidate, _ = _advance(self._local.policy, self._local.state, record)
+            snapshot = [*self._local.snapshot, ("%06d.json" % record["sequence"], hashlib.sha256(raw).hexdigest())]
+            try:
+                self.require_target(root_fd, events_fd)
+                self.require_snapshot(root_fd, events_fd)
+            except (ValueError, OSError):
+                raise domain.LifecycleRefusal("target_changed") from None
+        except domain.LifecycleRefusal as error:
+            if error.code in {"target_changed", "too_large"}:
+                raise _Unpublished(error.code) from None
+            raise
         path = self.root / "events" / ("%06d.json" % record["sequence"])
         self.store.publish(path, raw, limit=domain.MAX_BYTES, parent=events_fd)
         self._local.snapshot = snapshot
@@ -287,14 +328,15 @@ class _ProtectedWriter:
     @contextmanager
     @domain.boundary
     def transaction(self):
-        reader = Lifecycle(self.root, mailbox=self.mailbox, clock=self.clock)
-        with reader.view(write=True) as fds:
-            reader.replay(*fds)
-            self._local.active = reader, fds
-            try:
-                yield reader
-            finally:
-                del self._local.active
+        with _refusals():
+            reader = Lifecycle(self.root, mailbox=self.mailbox, clock=self.clock)
+            with reader.view(write=True) as fds:
+                reader.replay(*fds)
+                self._local.active = reader, fds
+                try:
+                    yield reader
+                finally:
+                    del self._local.active
 
     @domain.boundary
     def read_record(self, path):
@@ -321,7 +363,7 @@ def prepare_initial(policy, state, envelope, at):
 _GENESIS_REASONS = {
     "HOST_AUTHORITY_REFUSED": "current protected host authority is required",
     "PLAN_MISMATCH": "protected bootstrap plan does not match",
-    "POLICY_INVALID": "protected bootstrap domain.evidence is invalid",
+    "POLICY_INVALID": "protected bootstrap evidence is invalid",
     "ROOT_ALREADY_EXISTS": "protected canonical root already exists",
     "GENESIS_PUBLICATION_UNKNOWN": "canonical genesis may have been published; retain the original root and reservations",
 }
@@ -530,14 +572,16 @@ class ProtectedCanonicalBootstrapWriter(_ProtectedWriter):
             if not possible:
                 return refused("INITIAL_GENESIS_REQUIRED")
         except domain.LifecycleRefusal as exc:
-            if exc.code == "too_large" or not possible:
+            if not possible:
+                if exc.code == "busy":
+                    return refused("CANONICAL_BUSY")
+                if exc.code == "missing":
+                    return refused("INITIAL_GENESIS_REQUIRED")
                 return refused("CANONICAL_INVALID")
         except (ValueError, OSError, KeyError, AttributeError) as exc:
             if not possible:
                 if isinstance(exc, FileNotFoundError):
                     return refused("INITIAL_GENESIS_REQUIRED")
-                if isinstance(exc.__cause__, FileExistsError):
-                    return refused("CANONICAL_BUSY")
                 return refused("CANONICAL_INVALID")
         return _initial_result("unknown", code="INITIAL_CREATION_PUBLICATION_UNKNOWN", cid=cid, event_id=identifier)
 
@@ -636,14 +680,13 @@ class ProtectedCanonicalDecisionWriter(_ProtectedWriter):
                 return refused(mappings.get(exc.code, "HOST_AUTHORITY_UNAVAILABLE"))
         except domain.LifecycleRefusal as exc:
             self._last_failure = exc
-            if exc.code in {"target_changed", "too_large"}:
+            if exc.code in {"target_changed", "too_large"} and (
+                    not possible[0] or isinstance(exc, _Unpublished)):
                 return refused(exc.code)
             if exc.code == "busy" and not possible[0]:
                 return refused("CANONICAL_WRITER_BUSY")
         except Exception as exc:
             self._last_failure = exc
-            if not possible[0] and isinstance(exc, ValueError) and isinstance(exc.__cause__, FileExistsError):
-                return refused("CANONICAL_WRITER_BUSY")
         return _decision_result(command, "unknown", "PUBLICATION_UNKNOWN")
 
 
