@@ -203,6 +203,7 @@ OTHER_REVIEWED_HANDLERS = {
         "briefs", "briefs", "checked_path", "index_report", "inspect_store", "lock_report", "messages", "messages",
     ),
     "aegis_core/team_mailbox_primitives.py": ("_refusal_values",),
+    "aegis_core/team_native_bridge.py": ("ProcessBridge._call", "_anchor", "_boundary", "_directory_check", "_evidence_child"),
     "aegis_core/team_native_rollout.py": ("_boundary.call", "_embedded_json", "rollout_records"),
     "aegis_core/team_session_wake.py": ("_failed_start", "_refusals", "_wake", "background_entry", "transcript_mark"),
     "aegis_core/team_workspace_display.py": ("refusals.checked",),
