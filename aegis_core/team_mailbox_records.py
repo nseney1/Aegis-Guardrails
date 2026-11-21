@@ -21,6 +21,7 @@ from aegis_core import message_codec as codec_module
 from aegis_core import team_mailbox_guidance as guidance
 from aegis_core.diagnostic_messages import clip_rendered_text, guidance_value
 from aegis_core.message_codec_format import escape_char, neutral_text
+from aegis_core.message_codec_store import store_supported
 from aegis_core.message_codec_views import Renderer
 from aegis_core.team_mailbox import Mailbox
 from aegis_core.team_mailbox_primitives import (
@@ -187,10 +188,7 @@ def _wait_for_lock(lock, *, monotonic=time.monotonic, sleep=time.sleep):
 
 
 def supported():
-    capabilities = {function.__name__ for function in os.supports_dir_fd}
-    nofollow = {function.__name__ for function in os.supports_follow_symlinks}
-    return ({"open", "mkdir", "stat", "link", "unlink", "rename", "rmdir"} <= capabilities and "stat" in nofollow and
-            hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW") and hasattr(os, "geteuid"))
+    return store_supported(publication=True)
 
 
 @contextmanager
@@ -206,19 +204,23 @@ def record_store(codec, root, *, write=False, state=None, wait=_wait_for_lock):
             parent = os.open(component, flags, dir_fd=parent)
             stack.callback(os.close, parent)
         lease = stack.enter_context(wait(lambda: _publication_lock(codec, parent, ".records-store.lock"))) if write else None
-        created, identity, rootfd = None, None, None
+        created = False
+        created_identity = identity = rootfd = None
         try:
             if write:
                 try:
                     os.mkdir(path.name, mode=0o700, dir_fd=parent)
-                    created = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
                 except FileExistsError:
                     pass
+                else:
+                    created = True
+                    created_identity = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
             directory = os.open(path.name, flags, dir_fd=parent)
             stack.callback(os.close, directory)
             expected = os.fstat(directory)
             codec.require(stat.S_ISDIR(expected.st_mode) and expected.st_uid == os.geteuid()
                           and not expected.st_mode & 0o022, "E_AUTH")
+            codec.require(created_identity is None or _is_root_or_ancestor(created_identity, (expected,)), "E_AUTH")
             _check_store_identity(codec, expected, root)
             store = codec.Store(path)
             stack.callback(store.close)
@@ -260,16 +262,19 @@ def record_store(codec, root, *, write=False, state=None, wait=_wait_for_lock):
                         if current is not None and _is_root_or_ancestor(identity, (current,)):
                             os.unlink(".root-id", dir_fd=rootfd)
                             os.fsync(rootfd)
-                    if created is not None:
+                    if created:
                         try:
                             current = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
-                            if _is_root_or_ancestor(created, (current,)):
-                                os.rmdir(path.name, dir_fd=parent)  # Parent lease excludes another first publisher.
+                            if created_identity is None or _is_root_or_ancestor(created_identity, (current,)):
+                                # If the first stat failed, reconcile through the parent while peers are excluded.
+                                codec.require(stat.S_ISDIR(current.st_mode) and current.st_uid == os.geteuid()
+                                              and not current.st_mode & 0o022, "E_AUTH")
+                                os.rmdir(path.name, dir_fd=parent)
                                 os.fsync(parent)
                         except OSError as error:
                             if error.errno not in (errno.ENOENT, errno.ENOTEMPTY, errno.EEXIST):
                                 raise
-                except OSError:
+                except (OSError, codec.CodecError):
                     lease["clean"] = False
                     raise
 
@@ -392,16 +397,23 @@ def _grant_entry(codec, store, rid):
     """One bounded, no-follow index read; missing and denied IDs have the same refusal."""
     codec.require(type(rid) is str and re.fullmatch(r"[0-9a-f]{64}", rid), "E_AUTH", detail="reference")
     try:
-        fd = os.open(".grants-" + rid, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0), dir_fd=store.fd)
-        try:
-            info = os.fstat(fd)
-            codec.require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and
-                          not info.st_mode & 0o022 and info.st_size <= codec.MAX_BYTES, "E_AUTH", detail="reference")
-            with os.fdopen(fd, "rb", closefd=False) as stream:
-                raw = stream.read(codec.MAX_BYTES + 1)
-            codec.require(len(raw) == info.st_size and len(raw) <= codec.MAX_BYTES, "E_AUTH", detail="reference")
-        finally:
-            os.close(fd)
+        with store.grant_directory() as bound:
+            if bound is None:
+                return None, None
+            grantsfd, _ = bound
+            try:
+                fd = os.open(".grants-" + rid, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0), dir_fd=grantsfd)
+            except FileNotFoundError:
+                return None, None
+            try:
+                info = os.fstat(fd)
+                codec.require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and
+                              not info.st_mode & 0o022 and info.st_size <= codec.MAX_BYTES, "E_AUTH", detail="reference")
+                with os.fdopen(fd, "rb", closefd=False) as stream:
+                    raw = stream.read(codec.MAX_BYTES + 1)
+                codec.require(len(raw) == info.st_size and len(raw) <= codec.MAX_BYTES, "E_AUTH", detail="reference")
+            finally:
+                os.close(fd)
         envelope = codec.parse(raw)  # Codec preflights bytes, depth and nodes before parsing.
         entry = envelope["fields"]["value"]
         codec.require(envelope["kind"] == "record" and not envelope["body"] and
@@ -689,14 +701,14 @@ def _staged_exists(codec, directory, name):
     return True
 
 
-def _link_message(codec, pending, destination, name, state, store, changes):
+def _link_message(codec, pending, destination, name, state, grantsfd, check, changes):
     """Atomically replace each complete grant entry, then publish; undo definite failures."""
     applied, temporary, warning, staged = [], ".pending-" + uuid.uuid4().hex, False, False
     try:
         for target, raw, previous in changes:
-            if _staged_exists(codec, store.fd, temporary):
-                os.unlink(temporary, dir_fd=store.fd)
-            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=store.fd)
+            if _staged_exists(codec, grantsfd, temporary):
+                os.unlink(temporary, dir_fd=grantsfd)
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=grantsfd)
             staged = True
             try:
                 with os.fdopen(fd, "wb", closefd=False) as stream:
@@ -706,9 +718,10 @@ def _link_message(codec, pending, destination, name, state, store, changes):
             finally:
                 os.close(fd)
             applied.append((target, previous))
-            os.rename(temporary, target, src_dir_fd=store.fd, dst_dir_fd=store.fd)
+            os.rename(temporary, target, src_dir_fd=grantsfd, dst_dir_fd=grantsfd)
             staged = False
-        os.fsync(store.fd)
+        os.fsync(grantsfd)
+        check()
         try:
             os.link(pending, name, src_dir_fd=destination, dst_dir_fd=destination, follow_symlinks=False)
         except OSError:
@@ -731,14 +744,14 @@ def _link_message(codec, pending, destination, name, state, store, changes):
                 for target, previous in reversed(applied):
                     if previous is None:
                         try:
-                            os.unlink(target, dir_fd=store.fd)
+                            os.unlink(target, dir_fd=grantsfd)
                         except FileNotFoundError:
                             pass
                     else:
-                        if _staged_exists(codec, store.fd, temporary):
-                            os.unlink(temporary, dir_fd=store.fd)
+                        if _staged_exists(codec, grantsfd, temporary):
+                            os.unlink(temporary, dir_fd=grantsfd)
                         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                                     0o600, dir_fd=store.fd)
+                                     0o600, dir_fd=grantsfd)
                         staged = True
                         try:
                             with os.fdopen(fd, "wb", closefd=False) as stream:
@@ -747,11 +760,11 @@ def _link_message(codec, pending, destination, name, state, store, changes):
                                 os.fsync(fd)
                         finally:
                             os.close(fd)
-                        os.rename(temporary, target, src_dir_fd=store.fd, dst_dir_fd=store.fd)
+                        os.rename(temporary, target, src_dir_fd=grantsfd, dst_dir_fd=grantsfd)
                         staged = False
-                os.fsync(store.fd)
-            if staged and _staged_exists(codec, store.fd, temporary):
-                os.unlink(temporary, dir_fd=store.fd)
+                os.fsync(grantsfd)
+            if staged and _staged_exists(codec, grantsfd, temporary):
+                os.unlink(temporary, dir_fd=grantsfd)
         except (OSError, ValueError):
             state["uncertain"] = True
             raise
@@ -761,7 +774,7 @@ def _commit_record(codec, mailbox, sender, value, path, raw, state, wait):
     """Mailbox publish validates semantics before entering this I/O boundary."""
     codec.require(type(raw) is bytes and len(raw) <= codec.MAX_BYTES, "E_LIMIT")
     codec.require(path.parent == mailbox.route(sender["from"], sender["to"]), "E_AUTH")
-    rid, pending = codec.record_id(value), ".pending-" + uuid.uuid4().hex
+    pending = ".pending-" + uuid.uuid4().hex
     state["stage"] = path.parent / pending
     if _root_identity(codec, mailbox.root) is None:
         # A new root has no grants. Refuse refs and bound its default view before
@@ -779,11 +792,7 @@ def _commit_record(codec, mailbox, sender, value, path, raw, state, wait):
             options = _options(codec, {})
             _bounded(codec, _value_view(codec, store, sender, value, options, access), MAX_CHARS)
             changes = _grant_changes(codec, access, value, sender["to"])
-            try:
-                os.stat(rid + ".json", dir_fd=store.fd, follow_symlinks=False)
-                existed = True
-            except FileNotFoundError:
-                existed = False
+            publication = store.begin_publication()
             created = warning = False
             try:
                 if _staged_exists(codec, destination, pending):
@@ -799,22 +808,29 @@ def _commit_record(codec, mailbox, sender, value, path, raw, state, wait):
                         os.fsync(fd)
                 finally:
                     os.close(fd)
-                store.write(value)
-                warning = _link_message(codec, pending, destination, path.name, state, store, changes)
+                store.write(value, publication=publication)
+                try:
+                    with store.grant_directory(publication=publication) as (grantsfd, check):
+                        try:
+                            warning = _link_message(codec, pending, destination, path.name, state, grantsfd, check, changes)
+                        except OSError:
+                            raise codec.CodecError("E_AUTH") from None
+                except (OSError, codec.CodecError):
+                    if not state["committed"]:
+                        raise
+                    state["uncertain"] = True  # The link is final. Keep both reservations for inspection.
             finally:
                 if state["uncertain"]:
                     lease["clean"] = False
                 try:
-                    if not state["committed"] and not state["uncertain"] and not existed:
-                        try:
-                            os.unlink(rid + ".json", dir_fd=store.fd)
-                        except FileNotFoundError:
-                            pass
+                    if not state["committed"] and not state["uncertain"]:
+                        store.rollback(publication)
                     if created:
                         os.unlink(pending, dir_fd=destination)
-                except OSError:
+                except (OSError, codec.CodecError):
                     lease["clean"] = False
                     if not state["committed"]:
+                        state["uncertain"] = True
                         raise
         return warning or not lease["clean"]
 
@@ -840,7 +856,7 @@ def _accepted_publish(codec, mailbox, request, value, wait):
     view.store = _PublicationStore(mailbox.store, commit)
     result = view.publish(request)
     codec.require(invoked)
-    return warning, result.get("warnings", []), state["stage"]
+    return warning, result.get("warnings", []), state["stage"], state["uncertain"]
 
 
 def publish(codec, mailbox, sender, arguments, *, wait=_wait_for_lock):
@@ -870,11 +886,15 @@ def publish(codec, mailbox, sender, arguments, *, wait=_wait_for_lock):
             codec.require(all(original.get(k) == v for k, v in request.items()) and
                           set(original) - {"schema", "created_at", "authority", "verification"} == set(request))
             return {"id": codec.record_id(value), "message_id": original["message_id"]}
-    warning, warnings, stage = _accepted_publish(codec, mailbox, request, value, wait)
+    warning, warnings, stage, cleanup_uncertain = _accepted_publish(codec, mailbox, request, value, wait)
     result = {"id": codec.record_id(value), "message_id": request["message_id"]}
     if warnings:
         result["warnings"] = warnings
-    if warning:
+    if cleanup_uncertain:
+        result["note"] = ("Message published. The owner should inspect staging and both reservations. "
+                          "Once cleanup is verified, clear an abandoned <store>/.publish.lock first, "
+                          "then an abandoned <parent>/.records-store.lock. Check history before publishing again.")
+    elif warning:
         # Redact the untrusted parent; the generated staging identifier stays usable.
         parent = guidance_value(str(stage.parent), 512)
         parent = clip_rendered_text(parent, 512)

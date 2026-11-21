@@ -67,6 +67,8 @@ _DESCRIPTOR_OPERATIONS = _OS_OPERATIONS | {"path.rename", "path.replace"}
 # exact-count ceilings. New writers are never learned automatically by the hook.
 # This file is the single registry read by both the static ratchet and census.
 AUDIT_WRITERS = {
+    ('aegis_core/message_codec_store.py', 'Store.rollback'): "RF-44: under the mailbox publication lease, unlink only this attempt's inode-checked payload and remove only its matching empty shard through held descriptors",
+    ('aegis_core/message_codec_store.py', 'Store._shard'): 'RF-44: create a mode-0700 two-hex directory beneath the anchored, owner-checked store root only on the write path',
     ("aegis_core/gitsafe_run.py", "capture"): "GM-5 bounded custody: anonymous capped stdin scratch and subprocess DEVNULL; handles closed on failure and completion",
     ("aegis_core/gitsafe_run.py", "execute"): "GM-5 extracted legacy subprocess DEVNULL recipe; unchanged default behavior",
     ("aegis_cli/doctor_repair.py", "_apply_files"): "existing unlink; source lines 236",
@@ -349,6 +351,7 @@ AUDIT_FORWARDER_OPERATIONS = {
 # These operations do not own a mutation in the approving frame: read-only I/O
 # or delegation to an independently registered writer/storage boundary.
 AUDIT_READ_ONLY_OPERATIONS = {
+    ('aegis_core/message_codec_store.py', 'Store._shard', 'os.open'): 'RF-44: inspect the selected shard with a read-only directory open and check its identity under the bound root',
     ("aegis_core/team_git.py", "_read_path", "os.open"): "GM-5 O_RDONLY no-follow parent and regular-leaf opens from the held trusted root; read-only snapshot inspection, every descriptor closed",
     ("aegis_core/team_git.py", "_snapshot_attribute_candidates", "os.open"): "GM-5-ATTR-CONTEXT r2 (coordinator-applied): read-only no-follow directory open for attribute candidate capture from the held trusted root; no create or mutation; descriptors closed in finally",
     ("aegis_core/team_git.py", "snapshot_tree", "os.open"): "GM-5 O_RDONLY no-follow trusted root descriptor for private snapshots; read-only, closed in finally",
@@ -466,7 +469,6 @@ AUDIT_READ_ONLY_OPERATIONS = {
     ("aegis_core/manager_config.py", "public_file", "os.open"): "read-only public manager config inspection; this approved call requests read-only inspection",
     ("aegis_core/manager_store.py", "_sync_directory", "os.open"): "read-only directory descriptor for audit durability; this approved call requests read-only inspection",
     ("aegis_core/message_codec_store.py", "Store.__init__", "os.open"): "read-only directory walk binding the message store root; this approved call requests read-only inspection",
-    ("aegis_core/message_codec_store.py", "Store._resolve", "os.open"): "read-only directory descriptor for message reference lookup; this approved call requests read-only inspection",
     ("aegis_core/model_select.py", "_decision_directory", "os.open"): "read-only directory walk binding the caller's decision log directory; this approved call requests read-only inspection",
     ("aegis_core/model_select.py", "_open_log", "os.open"): "read-only decision log inspection; this approved call requests read-only inspection",
     ("aegis_core/model_select.py", "_open_regular", "os.open"): "read-only ancestor walk and decision config inspection; this approved call requests read-only inspection",
@@ -598,6 +600,7 @@ CALLBACK_EXCEPTIONS = {
 # (file, scope, operation) -> (exact call sites, reason). No scope-wide bypass:
 # another call in an already reviewed function still requires explicit review.
 REVIEWED_DESCRIPTOR_OPERATIONS = {
+    ('aegis_core/message_codec_store.py', 'Store._shard', 'os.open'): (1, 'RF-44: read-only directory open beneath the bound root with O_DIRECTORY and O_NOFOLLOW, followed by identity and privacy checks'),
     ("aegis_core/team_board.py", "Board.move_position", "os.replace"): (1, "TA-1d: one atomic replacement with both names relative to the held positions descriptor; no pathname traversal or symlink following."),
     ("aegis_core/team_git.py", "_read_path", "os.open"): (2, "GM-5 O_RDONLY no-follow parent and regular-leaf opens from the held trusted root; every descriptor closed"),
     ("aegis_core/team_git.py", "_snapshot_attribute_candidates", "os.open"): (1, "GM-5-ATTR-CONTEXT r2 (coordinator-applied): one O_RDONLY|O_DIRECTORY|O_NOFOLLOW directory open relative to the held trusted root or the active chain parent while capturing attribute candidates; read-only, at most the active chain held, every descriptor closed in finally"),
@@ -782,7 +785,6 @@ REVIEWED_DESCRIPTOR_OPERATIONS = {
     ("aegis_core/manager_store.py", "_sync_directory", "os.open"): (1, "read-only directory descriptor for audit durability"),
     ("aegis_core/message_codec_store.py", "Store.__init__", "os.open"): (1, "RF-32: shared read-only directory-opener callback with caller-specific privacy policy"),
     ("aegis_core/message_codec_store.py", "Store._open", "os.open"): (1, "MC-1 stdlib-only message store opener used by its reviewed writer and readers"),
-    ("aegis_core/message_codec_store.py", "Store._resolve", "os.open"): (1, "read-only directory descriptor for message reference lookup"),
     ("aegis_core/model_select.py", "_decision_directory", "os.open"): (1, "RF-32: shared read-only directory-opener callback with decision-directory policy"),
     ("aegis_core/model_select.py", "_open_log", "os.open"): (1, "read-only decision log inspection"),
     ("aegis_core/model_select.py", "_open_regular", "os.open"): (2, "RF-32: one read-only directory-opener callback and one anchored configuration-leaf open"),
