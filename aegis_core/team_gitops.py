@@ -301,9 +301,8 @@ def _directory(root, create):
         raise GitOpsError("unsafe_journal")
     parts = ("aegis", "gitops.jsonl") if create else ("aegis",)
     with confined_file(root, parts, create_parents=create) as handle:
-        # Explicit same-package coupling: borrow only while the helper owns the
-        # context. It supplies the sole root traversal and unconditional flush.
-        parent = handle._parent
+        # Borrow through parent_fd while this context is open. Never close it.
+        parent = handle.parent_fd
         if create:
             fd = parent
         else:
