@@ -83,6 +83,11 @@ _NEXT = {
     "exists": "Read the current history before retrying with a new identifier.",
     "closed": "Open a new mailbox context.",
     "invalid_record": "Reconcile the input and stored history against the mailbox schema.",
+    "rate_limited": "Wait for the rate window to pass before retrying the post or disposition.",
+    "scope": "choose a permitted route and message role for this endpoint",
+    "binding": "refresh the connection from the current acknowledged endpoint binding",
+    "reference": "Use a validated existing message or record reference.",
+    "history": "ask the owner to resolve the mailbox history limit",
     "io": "Check storage availability and read current history before retrying.",
 }
 
@@ -616,13 +621,14 @@ def reply_reference(message, records):
     require(type(message) is dict and type(records) is dict)
     identifier = text(message.get("in_reply_to"), "referenced message", 256)
     reference = records.get(identifier)
+    require(reference is not None, reason="reference")
     reference = result_payload(reference)
     require(type(reference.get("message")) is dict)
     original = reference["message"]
     for left, right in (("from", "to"), ("to", "from")):
         text(message.get(left), "reply endpoint", 256)
         text(original.get(right), "original endpoint", 256)
-        require(message[left] == original[right])
+        require(message[left] == original[right], reason="scope")
     return original
 
 

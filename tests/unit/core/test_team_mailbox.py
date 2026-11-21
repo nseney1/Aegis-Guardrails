@@ -361,7 +361,7 @@ def test_injected_route_policy_and_history_count_refuse_without_writes(tmp_path,
     policy = replace(ROLES, vertical_routes=())
     with mailbox(root, roles=policy) as restricted:
         before = snapshot(root)
-        with refusal("invalid_record"):
+        with refusal("scope"):
             restricted.publish(request("third"))
         assert snapshot(root) == before
     with mailbox(root) as normal:
@@ -987,7 +987,7 @@ def test_binding_history_read_once_per_operation_then_fresh_retry(tmp_path, monk
 
         before = snapshot(root)
         if surface == "fence":
-            with refusal("invalid_record"):
+            with refusal("binding"):
                 observe()
         else:
             assert observe()["ready"] is False
@@ -3907,11 +3907,17 @@ REFUSAL_WIRE_SHA256 = {
     "invalid_record": "812a3301d93ed1483f1e32a9e135b5b9357be08b36e43269056e5f9bdc9fa8fc",
     "io": "362d95e88b1318c552365089907c0b06b94002a33ed217c1dc1b91b340a9b514",
     "missing": "f1f226b61b310b03d6f417806a32ee988ccf395efd81ec21f6faf90a473aab34",
+    "rate_limited": "a80a4dc94e6e1f4f53ded7cd2a4645f6012bdd19af3b667c260bd89074f10faf",
     "too_large": "36b641b57a1719462f7c0227fd7fc04c5469349becf14c4cee47d17d4acfff58",
     "unauthorized": "d86ec41d7d0ebf227580d90ab099450b9e03317cc953b797d66ac5948c340104",
     "unknown_host": "d114db378f4f63dcc37d33c9cadbec8554e71d1e23f3af4d8d23b87cca563c7d",
     "unsafe_path": "e0d692d29d99687b605815236109bb78aa9c83f1a63c3c930f993e64ac3378a9",
     "unsupported_platform": "7b81f3db77b03e445c96a5e5c6436185a23d000468222ed546338d80286f864d",
+    # The four Records parity reasons extend the existing byte assertions.
+    "scope": "575cbf2192afb4b8bf96d747caf1221b5c81a8980e00d5b97002eb39fab3f613",
+    "binding": "900c500f2f710e6dba5b9c0efe99928ddcb2e045d424648a7328f22d2827943b",
+    "reference": "2cd7142791bf99fb66dcfb9dc1a91ab5cb46778a387a96d8352b16b4ee451932",
+    "history": "d1e12b3f445e4d1f768cf49eeff68c25de3c9b8ce374c72804e7d23f93ed055f",
 }
 REFUSAL_ROUTES = ["constructor", "stored_constructor", "reflected_constructor",
                   "require", "stored_require", "reflected_require", "subclass"]

@@ -644,8 +644,7 @@ class Board:
     def require_room(self, state, endpoint):
         limit = self.now() - timedelta(seconds=RATE_WINDOW_SECONDS)
         recent = sum(1 for at in state.activity.get(endpoint, []) if parse_time(at) >= limit)
-        require(recent < RATE_LIMIT_ACTIONS, "rate limit: this endpoint has posted %d times in %d seconds; wait before posting again"
-                % (recent, RATE_WINDOW_SECONDS))
+        require(recent < RATE_LIMIT_ACTIONS, reason="rate_limited")
 
     @board_operation(write=True)
     def publish(self, endpoint, arguments):

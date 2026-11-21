@@ -3,8 +3,11 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import inspect
 import json
+import os
 import re
+import sys
 import threading
+import types
 
 import pytest
 
@@ -3629,37 +3632,472 @@ def test_original_parametrizations_match_the_shared_table():
     assert differences == (), f"Original/table cases differ: {differences!r}"
 
 
-def assert_collected_original_ids(directory, marker):
-    """Check identity through public collection hooks, after pytest normalizes IDs."""
-    directory.mkdir()
-    name = "test_display_attribution_preserves_ordinary_left_boundary"
-    path = directory / ("test_ids_" + directory.name + ".py")
-    path.write_text("def " + name + "(suffix):\n    pass\n", encoding="utf-8")
+# Ordered node-id tails of the pre-#686 originals, captured independently of
+# ORIGINAL_PARAMETER_LAYOUTS under pytest 8.3.4 (importlib, collect-only, no
+# xdist, no cache). Each row is the function, the collected count, and the
+# sha256 of those tails in collection order. A tail is the node id after "::".
+# The digest is length-prefixed UTF-8, so a label change cannot hide inside a
+# joined line. Argument parity stays on the nfa- ordinal ids.
+_NODE_ID_LIMIT = 2048
+_TAIL_LIMIT = 4096
+_DIGEST_BUDGET = 1048576
+_SOURCE_LIMIT = 65536
+_COLLECTION_LOCK = threading.Lock()
+_COLLECTION_EXPORTS = {}
+_COLLECTION_SERIAL = [0]
+PRE686_NODE_BASELINE = (
+    ("test_display_escape_boundaries_mask_secrets_on_every_surface", 80, "da1b5cdc9c8fe991668847e292ab714727a40d0cd4311c9b371a5cc3e2e657bd"),
+    ("test_display_removed_controls_preserve_secret_boundaries", 64, "ce2af8e5ea6f72b71aed8587c782161ef8329da7933d9f676ccb91b331fb3be4"),
+    ("test_display_ten_million_removed_controls_do_not_build_per_control_state", 3, "ac5d555fc339bdd7a88ae5831a1a4bea5ea9ce8e7e89c31cfe383e46a26ec8d4"),
+    ("test_display_boundary_detection_uses_shared_secret_families", 7, "8a1c7fed6810a0841476cfacdd45b8ac55da818193758ae45995f239da4439dd"),
+    ("test_display_provenance_masks_low_entropy_keys_after_every_header", 40, "5bfc0f75d57461574f7e6c52cacda56244eee65525a230a46c9374e7352eb4fd"),
+    ("test_display_provenance_masks_overlaps_inside_an_ordinary_match", 8, "b7e9fd6053828e3e3a0ee3c958649e32309b3e91282823ac8d733582a48e514e"),
+    ("test_display_provenance_covers_every_string_form_and_header", 120, "e5b53c0a4536ea7ce2a32f2d9ddcc5bde6f996ea9240d47a130bc10654d406e4"),
+    ("test_display_provenance_overlaps_and_headers_are_independent_in_threads", 4, "6015ea03ed39659a7f1ce1291b0ab815202da4c26359e19e3d91de4dcb4e5cfa"),
+    ("test_display_source_view_masks_credentials_partly_consumed_by_csi", 16, "ea07eec8cbad1912baee7a1576f835a63a76c47f0f538669210b87c8fa1755fe"),
+    ("test_display_source_view_keeps_header_state_across_ignored_controls", 560, "3c8cdb8ae659fbd82680314b0315a6bc71596d7cc62e9577e0024631528bcb60"),
+    ("test_display_source_view_accepts_control_only_nonsecret_text", 3, "55fc337fdebdc0c0d1b19c13755f78690f5d7c05842166fda6a4539a0971b13c"),
+    ("test_display_deleted_view_masks_consumed_prefix_with_internal_control", 80, "06db41919cd92e60b8d875cf5525ad977a0014bfdc39a150e9dd88f0a328b821"),
+    ("test_display_deleted_view_keeps_bel_transparent_in_nonterminating_headers", 44, "36b097f4861a6e28fa5ee55986bfabfab36f43410b3e6b590a59b0a050102ca8"),
+    ("test_display_deleted_view_preserves_bel_termination_and_nonsecret_parity", 2, "faad7a76ab68da8e621aab320a2eb8efcc92f66a481597128e4f046922f4673d"),
+    ("test_display_renderer_provenance_keeps_control_interrupted_headers", 36, "eeda24284514f7d5e2f4690acae4ceebc642a025540396924333a4d2c43a82b3"),
+    ("test_display_renderer_provenance_recovers_consumed_credential_label", 4, "7e6fa3f3db23f39a3b31d857a6219fc107ac6896ecdcce667592eae342939967"),
+    ("test_display_pem_extents_cover_differently_labelled_nested_body", 8, "fcad3c0f17a8d1656b0062409613b1da90aea6cfd9f6db62abe77da310da4ce2"),
+    ("test_display_source_segments_seal_suppressed_strings", 48, "9bfeba48f836db46be8e28f4fa664b71f2b953f1402bb9b30cb29f6a5a0a5b51"),
+    ("test_display_source_segments_do_not_invent_credential_whitespace", 32, "bd5ba73a086a1e81b0cbe63de47ddfed0cab6b77bbcd6a66e234d49ba73d12c6"),
+    ("test_display_source_segments_do_not_join_visible_context_through_hidden_payload", 16, "a83164c3549af907f5cd184d423174a8c1eca96a39cf0f734e44e0462ebefaed"),
+    ("test_display_source_segments_still_mask_visible_secrets_on_both_sides", 16, "77c1ad28bc5a613b276fe61be5a1b0f1113a568dbfda76f7b389aa9092993f4c"),
+    ("test_display_source_segments_keep_prefixed_secret_context_detectable", 12, "33165d50f1c9cad4cb6acc3be75d01fad7644d3d44e155905bf60317551e1b36"),
+    ("test_display_rendered_segments_seal_hidden_token_prefix", 16, "1e2e3dabb399026b339e9d8d322fdd89ab66f346b82891bf9c937a7a9c5cb9d1"),
+    ("test_display_rendered_segments_preserve_visible_space_inside_nonsecret", 8, "b0e64ae5f9f587b773a106ebdb3f28d271124bf0253e2e939585355be20dde5c"),
+    ("test_display_rendered_segments_still_join_fully_removed_controls", 16, "ca41b56f80e1f99843d488e67d29db5048838d3b4a830d832bfe3be10e90ba1f"),
+    ("test_display_rendered_segments_keep_visible_credential_whitespace", 16, "0ee33d13b3f159115088f3f344b9cae8bf25c26af521f7436e9d81232d404f0d"),
+    ("test_display_reassembled_tokens_use_markers_before_caller_redaction", 12, "f4d8c3d655e96edcb17abf2031bc939419bd50ec6a2e180322bdf68b8c5e62ad"),
+    ("test_display_unions_canonical_and_source_only_masks", 2, "2bfe80daca5586806d0cc25cdba4673fe0178c16b619af0719111c3126abe865"),
+    ("test_display_does_not_orphan_value_after_guarding_secret_key_context", 4, "27313da70148bd4509f0072de493216c306fa45f1676af730981e7b11c9a0f64"),
+    ("test_display_restored_union_masks_before_boundary_changes_or_clipping", 12, "b654983622f6c4a89c98f2a2285f02e9b86859dc9cbce7a9f07a53f16d65ca33"),
+    ("test_display_source_guard_cannot_complete_a_new_credential_or_tear_a_mask", 4, "14639b9ca9152e6751c8ea123d9d0c2894afbae0c2e59b55ac65bbdcb945053b"),
+    ("test_display_attribution_preserves_ordinary_left_boundary", 2, "f72a1559ffedb201949e57cede14e3ec21aafa7dc2ec4f311a36b068cfc6e8ae"),
+    ("test_display_attribution_covers_shared_rule_families", 64, "684c46fe8cfd16ba37b94e0b9d82ee52bd1a7fc383822adfefa2c1b9c7717426"),
+    ("test_display_attribution_long_benign_colour_runs_keep_parity", 3, "576f38612da122910d2ceedd5b1c1d04bfb58b0ee1fcc852634494668bb8de6d"),
+    ("test_display_attribution_detection_windows_span_removed_control_gaps", 32, "a6a1e5ce5dff8796dd88d62166e15699b7ce16e0071459c451cd23eb2de1da11"),
+    ("test_display_attribution_masks_overlapping_ordinary_credentials", 8, "be40b1f77262c9f823a8d26ce81f928ac6dd728099bfbc670c35d78654f13969"),
+    ("test_display_attribution_fallback_preserves_ordinary_boundary_and_flags", 8, "e0d20864f7ec30c563f555bffa4809cce23e643313585036df804f7f90c1d942"),
+    ("test_display_attribution_fallback_keeps_carried_starts", 4, "8ffa9cdce33a3d089fb31bfad94958a5149abd8f2efd1d870a4e81c5e48b8031"),
+)
+
+
+def _node_id_digest(ids):
+    """Hash ordered node-id tails. Oversized or non-text input has no digest."""
+    blob = bytearray()
+    for item in ids:
+        if not isinstance(item, str):
+            return None
+        raw = item.encode("utf-8")
+        if len(raw) > _TAIL_LIMIT or len(blob) + 4 + len(raw) > _DIGEST_BUDGET:
+            return None
+        blob.extend(len(raw).to_bytes(4, "big"))
+        blob.extend(raw)
+    return hashlib.sha256(bytes(blob)).hexdigest()
+
+
+def _group_node_tails(nodeids):
+    """Group collected node ids by function, in collection order.
+
+    The tail after '::' is what a label renames. A non-identifier name or an
+    oversized tail is a refusal and is not kept.
+    """
+    grouped = []
+    positions = {}
+    for nodeid in nodeids:
+        if not isinstance(nodeid, str) or "::" not in nodeid:
+            return None, ("node-id",)
+        tail = nodeid.split("::", 1)[1]
+        if len(tail.encode("utf-8")) > _TAIL_LIMIT:
+            return None, ("limit",)
+        name = tail.split("[", 1)[0]
+        if not name.isidentifier():
+            return None, ("node-id",)
+        slot = positions.get(name)
+        if slot is None:
+            positions[name] = len(grouped)
+            grouped.append((name, [tail]))
+        elif slot != len(grouped) - 1:
+            return None, ("duplicate", name)
+        else:
+            grouped[slot][1].append(tail)
+    return tuple((name, tuple(tails)) for name, tails in grouped), None
+
+
+def node_id_errors(collected, baseline):
+    """Compare ordered node-id tails to the pre-rewire baseline.
+
+    collected is a tuple of (function name, ordered tails). baseline rows are
+    (function name, count, digest). Errors name the function and the kind.
+    They do not include node-id text. A rejected candidate leaves the baseline
+    unchanged.
+    """
+    errors = []
+    if len(collected) != len(baseline):
+        errors.append(("registry", len(collected), len(baseline)))
+    for got, expected in zip(collected, baseline):
+        name, tails = got
+        expected_name, count, digest = expected
+        if name != expected_name:
+            errors.append(("function", expected_name))
+            continue
+        if not isinstance(tails, tuple) or len(tails) != count:
+            errors.append(("count", name))
+            continue
+        actual = _node_id_digest(tails)
+        if actual is None:
+            errors.append(("digest-type", name))
+        elif actual != digest:
+            errors.append(("digest", name))
+    return tuple(errors)
+
+
+def _next_collection_stem():
+    """Process-unique module stem. Caller holds _COLLECTION_LOCK.
+
+    Pytest's importlib mode reuses a module name without executing the new
+    file. A stem taken from the directory name collides when two collections
+    share a basename, so the stem is a process-local counter instead.
+    """
+    _COLLECTION_SERIAL[0] += 1
+    return "test_ids_n" + str(_COLLECTION_SERIAL[0])
+
+
+def _open_text_sink():
+    """Open os.devnull. The descriptor is closed when os.fdopen fails."""
+    descriptor = os.open(os.devnull, os.O_WRONLY)
+    try:
+        return os.fdopen(descriptor, "w", encoding="utf-8", closefd=True)
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _quiet_pytest_main(argv, plugins):
+    """Run pytest.main without printing node ids or import failures.
+
+    Collection text can embed argument strings. Callers receive only the exit
+    code and the in-process capture plugin. The sink is closed on every path.
+    """
+    sink = None
+    old_out = sys.stdout
+    old_err = sys.stderr
+    try:
+        sink = _open_text_sink()
+        sys.stdout = sink
+        sys.stderr = sink
+        return pytest.main(argv, plugins=plugins)
+    finally:
+        sys.stdout = old_out
+        sys.stderr = old_err
+        if sink is not None:
+            sink.close()
+
+
+class _CollectionSession:
+    """Hold the pytest session. Node ids are read only after pytest.main returns."""
+
+    def __init__(self):
+        self.session = None
+
+    def pytest_sessionstart(self, session):
+        # The session object only. Item ids stay mutable until every collection
+        # hook, including hookwrapper code after yield, has finished.
+        self.session = session
+
+
+def _item_function_name(item):
+    """Function name pytest collected, without a parameter id."""
+    name = getattr(item, "originalname", None)
+    if isinstance(name, str):
+        return name
+    raw_name = getattr(item, "name", "")
+    if not isinstance(raw_name, str):
+        return ""
+    return raw_name.split("[", 1)[0]
+
+
+def _final_node_ids(session, limit, allowed=None):
+    """Filter, order, and limit the session's final items.
+
+    Call only after pytest.main returns. allowed is the set of original
+    function names, or None to keep every item (the import-failure probe).
+    A count above limit is refused before ids are stored. On the filtered
+    path a non-text id or an oversized tail is also a refusal and stores
+    nothing. A missing session contributes no ids.
+    """
+    if session is None:
+        return (), None
+    items = getattr(session, "items", None)
+    if not isinstance(items, list):
+        return None, ("collection", "raised")
+    if allowed is None:
+        if len(items) > limit:
+            return None, ("limit",)
+        return tuple(getattr(item, "nodeid", None) for item in items), None
+    kept = []
+    for item in items:
+        if _item_function_name(item) not in allowed:
+            continue
+        if len(kept) >= limit:
+            return None, ("limit",)
+        nodeid = getattr(item, "nodeid", None)
+        if not isinstance(nodeid, str) or "::" not in nodeid:
+            return None, ("node-id",)
+        tail = nodeid.split("::", 1)[1]
+        if len(tail) > _TAIL_LIMIT or len(tail.encode("utf-8")) > _TAIL_LIMIT:
+            return None, ("limit",)
+        kept.append(nodeid)
+    return tuple(kept), None
+
+
+def _collection_result(session, status, limit, allowed=None):
+    """Apply the post-return filter, then the exit status, then grouping."""
+    try:
+        nodeids, id_error = _final_node_ids(session, limit, allowed)
+    except Exception:
+        return None, ("collection", "raised")
+    if id_error is not None:
+        return None, id_error
+    if status != pytest.ExitCode.OK:
+        return None, ("collection", int(status))
+    return _group_node_tails(nodeids)
+
+
+def _collect_module(directory, source, limit, stem):
+    """Collect caller-supplied source. This is the import-failure probe only.
+
+    The original-module guard does not use this path. A nonzero status or an
+    import failure is ("collection", code). The code is the pytest exit status,
+    or "raised" when pytest itself raises. Output text is not returned. More
+    items than limit are refused before their ids are stored. Ids are read
+    from the session after pytest.main returns.
+    """
+    encoded = source.encode("utf-8")
+    if len(encoded) > _SOURCE_LIMIT:
+        return None, ("limit",)
+    if not isinstance(stem, str) or not stem.isidentifier():
+        return None, ("node-id",)
+    try:
+        directory.mkdir(parents=True)
+    except OSError:
+        return None, ("collection", "raised")
+    path = directory / (stem + ".py")
     config = directory / "pytest.ini"
-    config.write_text("[pytest]\n", encoding="utf-8")
+    try:
+        path.write_text(source, encoding="utf-8")
+        config.write_text("[pytest]\n", encoding="utf-8")
+    except OSError:
+        return None, ("collection", "raised")
 
-    class Capture:
-        nodeids = ()
-
-        @pytest.hookimpl(tryfirst=True)
-        def pytest_pycollect_makeitem(self, collector, name, obj):
-            if name == "test_display_attribution_preserves_ordinary_left_boundary":
-                marker(obj)
-
-        def pytest_collection_modifyitems(self, items):
-            self.nodeids = tuple(item.nodeid for item in items)
-
-    capture = Capture()
-    status = pytest.main(["--collect-only", "-q", "-n", "0", "-o", "addopts=",
-                          "--import-mode=importlib", "-p", "no:cacheprovider",
-                          "-c", str(config), "--confcutdir", str(directory),
-                          "--basetemp", str(directory / "run"), str(path)], plugins=[capture])
-    assert status == pytest.ExitCode.OK
-    prefix = path.name + "::" + name
-    assert capture.nodeids == (prefix + "[]", prefix + r"[\x1b[31m]"), "collected original display ids changed"
+    holder = _CollectionSession()
+    saved_path = list(sys.path)
+    try:
+        try:
+            status = _quiet_pytest_main(
+                ["--collect-only", "-q", "-n", "0", "-o", "addopts=",
+                 "--import-mode=importlib", "-p", "no:cacheprovider",
+                 "-c", str(config), "--confcutdir", str(directory),
+                 "--basetemp", str(directory / "run"), str(path)],
+                [holder])
+        except Exception:
+            return None, ("collection", "raised")
+    finally:
+        sys.path[:] = saved_path
+    return _collection_result(holder.session, status, limit)
 
 
-def test_original_parameters_use_shared_rows_and_stable_case_ids(tmp_path):
+def _fixture_label_error(label):
+    """Refuse a fixture id that is not one safe line. Never join lines."""
+    if label is None:
+        return None
+    if not isinstance(label, str) or not label or len(label) > 64:
+        return ("node-id",)
+    for character in label:
+        if character in "\r\n[]:/" or ord(character) <= 32 or ord(character) == 127:
+            return ("node-id",)
+        if not (character.isalnum() or character in "_.-"):
+            return ("node-id",)
+    return None
+
+
+def _original_targets(functions):
+    """Names to collect, plus callables that are not the live module objects."""
+    names = []
+    replacements = {}
+    for function in functions:
+        name = getattr(function, "__name__", None)
+        if not isinstance(name, str) or not name.isidentifier():
+            return None, None, ("node-id",)
+        if name in replacements or name in names:
+            return None, None, ("duplicate", name)
+        names.append(name)
+        current = getattr(regressions, name, None)
+        if current is not function:
+            replacements[name] = function
+    return tuple(names), replacements, None
+
+
+def _singleton_label_plugin(label):
+    """One autouse fixture value, the same shape as a params id on _fake_home."""
+    @pytest.fixture(autouse=True, params=[pytest.param(None, id=label)])
+    def _original_node_guard_label():
+        return None
+
+    return type("OriginalNodeLabel", (), {
+        "_original_node_guard_label": staticmethod(_original_node_guard_label),
+    })()
+
+
+class _PostYieldLayoutLabel:
+    """Relabel primitives items after collection wrappers resume.
+
+    The suffix lands on the live item after yield. The guard reads the
+    session's final items only after pytest.main returns, so this label
+    changes the compared selectors.
+    """
+
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_collection_modifyitems(self, items):
+        yield
+        for item in items:
+            path = getattr(item, "path", None)
+            if getattr(path, "name", None) == "test_primitives.py":
+                item._nodeid += "-layout"
+
+
+class _ReplaceCollectedCallables:
+    """Collect a substituted callable with the real module's fixture closure."""
+
+    def __init__(self, replacements):
+        self.replacements = replacements
+
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_pycollect_makeitem(self, collector, name, obj):
+        replacement = self.replacements.get(name)
+        if replacement is None:
+            return None
+        generated = getattr(collector, "_genfunctions", None)
+        if generated is None:
+            return []
+        return list(generated(name, replacement))
+
+
+def _collect_real_originals(directory, names, replacements, limit, fixture_label,
+                            post_yield_relabel=False):
+    """Collect regressions through pytest, then keep only the requested names.
+
+    Root discovery loads the repository conftest hooks. A label plugin adds one
+    autouse fixture id on the negative-control path. Ids above the limit are
+    not stored. Node-id text is not returned. The session is retained and its
+    final items are filtered only after pytest.main returns.
+    """
+    module_path = getattr(regressions, "__file__", None)
+    if not names or not isinstance(module_path, str) or not module_path.endswith(".py"):
+        return None, ("collection", "raised")
+    try:
+        directory.mkdir(parents=True)
+    except OSError:
+        return None, ("collection", "raised")
+
+    allowed = set(names)
+    holder = _CollectionSession()
+    plugins = [holder]
+    if replacements:
+        plugins.append(_ReplaceCollectedCallables(replacements))
+    if fixture_label is not None:
+        plugins.append(_singleton_label_plugin(fixture_label))
+    if post_yield_relabel:
+        plugins.append(_PostYieldLayoutLabel())
+    argv = ["--collect-only", "-q", "-n", "0", "-o", "addopts=",
+            "--import-mode=importlib", "-p", "no:cacheprovider",
+            "--basetemp", str(directory / "run")]
+    for name in names:
+        argv.append(module_path + "::" + name)
+    saved_path = list(sys.path)
+    try:
+        try:
+            status = _quiet_pytest_main(argv, plugins)
+        except Exception:
+            return None, ("collection", "raised")
+    finally:
+        sys.path[:] = saved_path
+    return _collection_result(holder.session, status, limit, allowed)
+
+
+def collect_original_node_ids(directory, functions, source=None, limit=_NODE_ID_LIMIT,
+                              fixture_label=None, post_yield_relabel=False):
+    """Collect the live original module, including its fixtures and hooks.
+
+    Callers share one lock. A caller-supplied source string is only the
+    import-failure probe. A callable that is not the live function is collected
+    from the real module so its fixture closure still applies. The export map
+    is cleared on every exit, including a failure.
+    """
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+        return None, ("limit",)
+    label_error = _fixture_label_error(fixture_label)
+    if label_error is not None:
+        return None, label_error
+    if post_yield_relabel is not True and post_yield_relabel is not False:
+        return None, ("node-id",)
+    with _COLLECTION_LOCK:
+        try:
+            if source is not None:
+                if fixture_label is not None or post_yield_relabel:
+                    return None, ("node-id",)
+                stem = _next_collection_stem()
+                return _collect_module(directory, source, limit, stem)
+            names, replacements, error = _original_targets(functions)
+            if error is not None:
+                return None, error
+            return _collect_real_originals(
+                directory, names, replacements, limit, fixture_label, post_yield_relabel)
+        finally:
+            _COLLECTION_EXPORTS.clear()
+
+
+def bound_original_functions():
+    """The rewired originals, in the pre-#686 collection order."""
+    names = tuple(name for name, _count, _digest in PRE686_NODE_BASELINE)
+    if set(names) != set(ORIGINAL_PARAMETER_LAYOUTS) or len(names) != len(set(names)):
+        return None, ("registry", len(names), len(ORIGINAL_PARAMETER_LAYOUTS))
+    functions = []
+    for name in names:
+        function = getattr(regressions, name, None)
+        if getattr(function, "__name__", None) != name:
+            return None, ("missing", name)
+        functions.append(function)
+    return tuple(functions), None
+
+
+def _relabel_parametrize(function, new_id):
+    """Copy one original and change only its first explicit parameter id.
+
+    Argument values stay on the copy. The function object that the module
+    binds is not mutated, so the next collection still sees the recorded labels.
+    """
+    mark = _parametrize_marks(function)[0]
+    names, params = mark.args[0], mark.args[1]
+    first = params[0]
+    updated = [pytest.param(*first.values, id=new_id, marks=tuple(getattr(first, "marks", ()) or ()))]
+    updated.extend(params[1:])
+    clone = types.FunctionType(function.__code__, function.__globals__, function.__name__,
+                               function.__defaults__, function.__closure__)
+    clone.__kwdefaults__ = getattr(function, "__kwdefaults__", None)
+    annotations = getattr(function, "__annotations__", None)
+    clone.__annotations__ = dict(annotations) if annotations else {}
+    clone.__module__ = function.__module__
+    clone.__qualname__ = function.__qualname__
+    return pytest.mark.parametrize(names, tuple(updated))(clone)
+
+
+def test_original_parameters_use_shared_rows_and_stable_case_ids():
     functions = {qualname.rsplit(".", 1)[-1] for _case_id, qualname, arguments in CORPUS_CASES
                  if arguments and qualname.startswith("tests.unit.core.test_primitives.")}
     assert set(ORIGINAL_PARAMETER_LAYOUTS) == functions
@@ -3676,8 +4114,6 @@ def test_original_parameters_use_shared_rows_and_stable_case_ids(tmp_path):
         for parameter, (_case_id, _qualname, arguments) in zip(parameters, rows):
             assert dict(zip(names, parameter.values)) == dict(arguments)
 
-    marker = original_parameters("test_display_attribution_preserves_ordinary_left_boundary")
-    assert_collected_original_ids(tmp_path / "suffixes", marker)
     name = "test_display_attribution_covers_shared_rule_families"
     substituted = _substitute_aws_row(CORPUS_CASES)
     mark = original_parameters(name, substituted)
@@ -3707,13 +4143,140 @@ def test_original_parameters_reject_missing_duplicate_and_reordered_ids_then_ret
     assert corpus_case_errors(CORPUS_CASES, ROUND1_CASE_BASELINE, UNEDITED_CORPUS_FLOOR) == ()
 
 
-def test_original_collected_identity_rejects_wrong_label_then_retries(tmp_path):
-    wrong = pytest.mark.parametrize("suffix", [pytest.param("", id=""),
-                                             pytest.param("\x1b[31m", id="wrong")])
-    with pytest.raises(AssertionError, match="collected original display ids changed"):
-        assert_collected_original_ids(tmp_path / "wrong", wrong)
-    marker = original_parameters("test_display_attribution_preserves_ordinary_left_boundary")
-    assert_collected_original_ids(tmp_path / "retry", marker)
+def _assert_no_collection_text(capsys):
+    """Node ids and import failures stay off both streams."""
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_original_node_ids_match_the_pre686_baseline(tmp_path, capsys):
+    # Argument parity still holds, and the collected selectors match the
+    # pre-rewire originals per function and in order.
+    originals, errors = original_call_cases()
+    assert errors == ()
+    assert shared_table_errors(CORPUS_CASES, originals) == ()
+    functions, bind_error = bound_original_functions()
+    assert bind_error is None
+    collected, error = collect_original_node_ids(tmp_path / "originals", functions)
+    assert error is None
+    assert node_id_errors(collected, PRE686_NODE_BASELINE) == ()
+    _assert_no_collection_text(capsys)
+
+
+def test_original_collected_identity_rejects_wrong_label_then_retries(tmp_path, capsys):
+    name = "test_display_escape_boundaries_mask_secrets_on_every_surface"
+    function = getattr(regressions, name)
+    clone = _relabel_parametrize(function, "relabelled")
+    qualname = function.__module__ + "." + name
+    rows = tuple(row for row in CORPUS_CASES if row[1] == qualname)
+    actual, errors = original_call_cases((clone,))
+    assert errors == ()
+    # Values and ordinal ids still match. Only the pytest selector changed.
+    assert shared_table_errors(rows, actual) == ()
+    baseline_row = next(row for row in PRE686_NODE_BASELINE if row[0] == name)
+    collected, error = collect_original_node_ids(tmp_path / "relabel", (clone,))
+    assert error is None
+    assert node_id_errors(collected, (baseline_row,)) == (("digest", name),)
+    restored, error = collect_original_node_ids(tmp_path / "retry", (function,))
+    assert error is None
+    assert node_id_errors(restored, (baseline_row,)) == ()
+    assert getattr(regressions, name) is function
+    _assert_no_collection_text(capsys)
+
+
+def test_original_node_ids_reject_singleton_autouse_fixture_label_then_retry(tmp_path, capsys):
+    # One autouse fixture value renames every real selector. Argument parity
+    # still holds. The guard must fail, then accept the unlabelled module.
+    functions, bind_error = bound_original_functions()
+    assert bind_error is None
+    originals, errors = original_call_cases()
+    assert errors == ()
+    assert shared_table_errors(CORPUS_CASES, originals) == ()
+    labelled, error = collect_original_node_ids(
+        tmp_path / "fixture-label", functions, fixture_label="isolated-home")
+    assert error is None
+    mismatches = node_id_errors(labelled, PRE686_NODE_BASELINE)
+    assert mismatches == tuple(("digest", name) for name, _count, _digest in PRE686_NODE_BASELINE)
+    restored, error = collect_original_node_ids(tmp_path / "retry", functions)
+    assert error is None
+    assert node_id_errors(restored, PRE686_NODE_BASELINE) == ()
+    assert collect_original_node_ids(
+        tmp_path / "multiline", functions, fixture_label="isolated\nhome") == (None, ("node-id",))
+    _assert_no_collection_text(capsys)
+
+
+def test_original_node_ids_reject_post_yield_hookwrapper_relabel_then_retry(tmp_path, capsys):
+    # A hookwrapper that edits node ids after yield renames the final selectors.
+    # Argument parity still holds. The guard must fail, then accept a retry.
+    functions, bind_error = bound_original_functions()
+    assert bind_error is None
+    originals, errors = original_call_cases()
+    assert errors == ()
+    assert shared_table_errors(CORPUS_CASES, originals) == ()
+    labelled, error = collect_original_node_ids(
+        tmp_path / "post-yield", functions, post_yield_relabel=True)
+    assert error is None
+    mismatches = node_id_errors(labelled, PRE686_NODE_BASELINE)
+    assert mismatches == tuple(("digest", name) for name, _count, _digest in PRE686_NODE_BASELINE)
+    restored, error = collect_original_node_ids(tmp_path / "retry", functions)
+    assert error is None
+    assert node_id_errors(restored, PRE686_NODE_BASELINE) == ()
+    _assert_no_collection_text(capsys)
+
+
+def test_node_id_guard_retries_after_rejection_and_concurrent_callers_agree(tmp_path, capsys):
+    functions, bind_error = bound_original_functions()
+    assert bind_error is None
+    collected, error = collect_original_node_ids(tmp_path / "originals", functions)
+    assert error is None
+    assert node_id_errors(collected, PRE686_NODE_BASELINE) == ()
+    saved = PRE686_NODE_BASELINE
+    name, tails = collected[0]
+    changed = ((name, tails[:-1] + (tails[-1] + "-x",)),) + collected[1:]
+    short = ((name, tails[:-1]),) + collected[1:]
+
+    def check(candidate):
+        return node_id_errors(candidate, saved)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(check, [collected, changed, short] * 2, timeout=10))
+    assert results[0::3] == [()] * 2
+    assert results[1::3] == [(("digest", name),)] * 2
+    assert results[2::3] == [(("count", name),)] * 2
+    assert check(collected) == ()
+    assert check(collected[:-1]) == (("registry", len(collected) - 1, len(saved)),)
+    swapped = (collected[1], collected[0]) + collected[2:]
+    assert any(item[0] == "function" for item in check(swapped))
+    assert saved is PRE686_NODE_BASELINE
+    assert _COLLECTION_EXPORTS == {}
+    _assert_no_collection_text(capsys)
+
+
+def test_original_node_collection_refuses_limit_and_import_failure_then_retries(tmp_path, capsys):
+    name = "test_display_attribution_preserves_ordinary_left_boundary"
+    function = getattr(regressions, name)
+    row = next(item for item in PRE686_NODE_BASELINE if item[0] == name)
+    other_name = "test_display_escape_boundaries_mask_secrets_on_every_surface"
+    other = getattr(regressions, other_name)
+    other_row = next(item for item in PRE686_NODE_BASELINE if item[0] == other_name)
+    # Same basename on purpose. The retry must collect the live module, not a
+    # module cached from the earlier directory.
+    primed, error = collect_original_node_ids(tmp_path / "earlier" / "retry", (other,))
+    assert error is None
+    assert node_id_errors(primed, (other_row,)) == ()
+    limited, error = collect_original_node_ids(tmp_path / "limit", (function,), limit=1)
+    assert limited is None and error == ("limit",)
+    broken, error = collect_original_node_ids(
+        tmp_path / "broken", (), source="import does_not_exist_for_original_node_ids\n", limit=8)
+    assert broken is None and error[0] == "collection" and error[1] != 0
+    assert all(isinstance(part, (str, int)) and "does_not_exist_for_original_node_ids" not in str(part) for part in error)
+    assert _COLLECTION_EXPORTS == {}
+    restored, error = collect_original_node_ids(tmp_path / "later" / "retry", (function,))
+    assert error is None
+    assert node_id_errors(restored, (row,)) == ()
+    assert collect_original_node_ids(tmp_path / "bad-limit", (function,), limit=False) == (None, ("limit",))
+    _assert_no_collection_text(capsys)
 
 
 def test_original_reader_uses_parametrize_marks():

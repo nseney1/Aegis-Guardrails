@@ -223,6 +223,8 @@ SELECTOR_SITE_TABLE = (
      "Construct the legacy object-only Git argv with fixed fsmonitor/protocol settings; execution and bounds remain in public gitsafe."),
     ("aegis_core/team_source.py", "SourceViews.argv", "git-config",
      "Add the fixed owner-selected repository and read-only grep settings to the object-only recipe; _read_command validates every executed command before public gitsafe."),
+    ("aegis_core/team_native_bridge.py", "ProcessBridge._run", "reviewed-dynamic",
+     "TA-3h: review bounded owner-supplied evidence-only argv; absolute executable, no shell, bounded JSON stdin/output, held cwd descriptor, deadline and WNOWAIT process-group cleanup; no native qualification."),
     ("aegis_core/testexec.py", "kill_group", "reviewed-dynamic",
      "Run Windows taskkill directly; positional process-group termination shares the scope."),
     ("aegis_core/verification/test_runner.py", "discover_test_evidence", "reviewed-dynamic",
