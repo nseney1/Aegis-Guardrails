@@ -601,6 +601,10 @@ class Lexer(JSXScanner):
         if self.class_fields.get(depth) and not self.expr and self.tokens and self.tokens[-1].line < self.line and word not in ('in', 'instanceof', 'as', 'satisfies'):
             self.class_fields[depth] = False
 
+    def class_body(self):
+        """Directly inside a class body and outside a field initializer, where no statement can start."""
+        return bool(self.frames) and self.frames[-1][1] in ('class_decl', 'class_expr') and not self.class_fields.get(len(self.frames))
+
     def identifier_role(self):
         if self.frames and self.frames[-1][1] == 'module':
             return 'module_binding'
@@ -632,13 +636,14 @@ class Lexer(JSXScanner):
             while cursor < len(self.source) and self.source[cursor].isspace():
                 cursor += 1
             type_declaration = cursor < len(self.source) and self.source[cursor] not in '.?(=;,[!'
-        if word in _CONTROL and self.previous not in ('.', '?.'):
+        member = (word in _CONTROL or word == 'class') and self.class_body()  # `public if() {}` names a method
+        if word in _CONTROL and self.previous not in ('.', '?.') and not member:
             self.control = True
             self.expr, self.statement = True, False
         elif word == 'function':
             self.function = (self.statement or self.declaration_prefix, len(self.frames))
             self.expr, self.statement = True, False
-        elif word == 'class' or type_declaration:
+        elif word == 'class' and not member or type_declaration:
             self.class_pending = (self.statement or self.declaration_prefix or self.decorator_prefix, len(self.frames), word)
             self.decorator_prefix = False
             self.expr, self.statement = True, False

@@ -727,3 +727,49 @@ def test_a_block_after_a_type_operator_word_cannot_hide_calls(source, path):
     with pytest.raises(JSLexError) as error:
         parse(source, path)
     assert error.value.reason == 'unsupported_lexical_context:brace'
+
+
+def _call_targets(source, path, compact):
+    from aegis_core.ast.drivers.js.extractor import Extractor
+
+    return [node.target for node in Extractor(source, path, compact=compact).run().call_sites]
+
+
+def _lex_reason(source, path, compact):
+    from aegis_core.ast.drivers.js.extractor import Extractor
+    from aegis_core.ast.drivers.js.tokenizer import JSLexError
+
+    with pytest.raises(JSLexError) as error:
+        Extractor(source, path, compact=compact)
+    return error.value.reason
+
+
+# A class body holds no statements, so a control word or `class` before `(` there names a method.
+@pytest.mark.parametrize('source', [
+    'class A { public if(): void { eval(code) } }',
+    'class A { public if(): as { eval(code) } }',
+    'class A { m() {} if(): void { eval(code) } }',
+    'class A { x = y\n  if(): void { eval(code) } }',
+    'class A { private static while(): void { eval(code) } }',
+    'class A { public class(): void { eval(code) } }',
+    'class A { m() {}\n  class() { eval(code) } }',
+    'const C = class { m() {} for(): void { eval(code) } };',
+    # Control words and classes keep their meaning inside methods, static blocks and field initializers.
+    'class A { m() { if (x) { eval(code) } } }',
+    'class A { static { while (x) { eval(code) } } }',
+    'class A { f = () => { if (x) { eval(code) } } }',
+    'class A { f = class { m() { eval(code) } } }',
+])
+@pytest.mark.parametrize('path', ['fixture.ts', 'fixture.tsx'])
+@pytest.mark.parametrize('compact', [True, False])
+def test_a_keyword_method_name_keeps_the_method_body_calls(source, path, compact):
+    assert _call_targets(source, path, compact)[-1:] == ['eval']
+
+
+@pytest.mark.parametrize('source', [
+    'class A { m() {}\n  switch() { eval(code) } }',
+    'class A { m() {}\n  class() { eval(code) } }',
+])
+@pytest.mark.parametrize('compact', [True, False])
+def test_a_keyword_method_name_keeps_the_method_body_calls_in_javascript(source, compact):
+    assert _call_targets(source, 'fixture.js', compact)[-1:] == ['eval']
