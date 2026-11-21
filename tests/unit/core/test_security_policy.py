@@ -150,6 +150,7 @@ SPAWN_SITES = {
     # default branch, the tier GETs, then `gh attestation verify` (read-only).
     "aegis_core/release_verify.py": ("`gh`",),
     "aegis_core/team_native_bridge.py": ("owner-configured evidence-only provider argv (absolute executable, no shell)",),
+    "aegis_cli/team_isolation.py": ("`podman`", "`docker`"),
 }
 _SPAWN_MODULES = {"subprocess", "pty", "multiprocessing"}
 _OS_SPAWN = re.compile(r"^(system|popen|startfile|exec\w*|spawn\w*|posix_spawn\w*)$")

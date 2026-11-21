@@ -1,0 +1,120 @@
+"""Stable, input-free isolation refusals for planning and capability checks."""
+
+__all__ = ["CAPABILITY_CODES", "REFUSALS", "IsolationRefusal", "finish", "refusal"]
+
+_CAPABILITY_REFUSALS = {
+    "unknown_field": "isolation document contains an unknown field",
+    "unknown_role": "isolation document role is not in the injected vocabulary",
+    "unknown_host": "isolation document host is not in the injected host table",
+    "oversized": "isolation document exceeds its size limit",
+    "invalid_encoding": "isolation document is not valid UTF-8",
+    "missing_vocabulary": "isolation capability report requires an injected role vocabulary",
+    "missing_host_table": "isolation capability report requires an injected host table",
+    "invalid_table": "injected role or host table is malformed",
+    "invalid_document": "isolation document is malformed",
+    "ambiguous": "isolation document is ambiguous",
+    "invalid_host_mapping": "host capability mapping is malformed",
+    "invalid_mcp_tools": "provisioned MCP tools are malformed",
+    "invalid_file_tools": "provisioned file tools are malformed",
+    "invalid_prohibited_call_tools": "prohibited-call mapping is malformed",
+    "uncovered_prohibited_calls": "prohibited calls are not covered by the injected mapping",
+    "prohibited_capability": "resolved capabilities include a prohibited call",
+    "invalid_resolution": "capability resolution is malformed",
+    "invalid_catalog": "served capability catalog is malformed",
+    "incomplete_catalog": "served capability catalog is incomplete",
+    "invalid_probe_plan": "capability probe plan is malformed",
+    "invalid_observations": "capability probe observations are malformed",
+    "incomplete_observations": "capability probe observations are incomplete",
+    "inconclusive_observations": "capability probe observations are inconclusive",
+    "internal": "Report an internal isolation check failure.",
+}
+
+CAPABILITY_CODES = frozenset(_CAPABILITY_REFUSALS)
+REFUSALS = {
+    **_CAPABILITY_REFUSALS,
+    "container_required": "Verification requires a container-mode plan.",
+    "docker_unqualified": "Set isolation.allow_unqualified to true if Docker use is intended.",
+    "document_invalid": "Supply a valid bounded JSON document.",
+    "document_read": "Supply an accessible regular JSON file without symlink components.",
+    "document_size": "Reduce the isolation input to its documented size limits.",
+    "engine_custody": "Select an owner-approved engine in an absolute, protected PATH directory.",
+    "environment": "Supply only allowlisted environment values and keep the configured homes.",
+    "expected_record": "Recompute the expected container record from validated observations.",
+    "host_registry": "Supply a valid team host table with unique run homes.",
+    "image_inspect": "Provide a successful image inspection for the configured digest.",
+    "image_inspect_timeout": "Retry after the engine can inspect the configured digest within 30 seconds.",
+    "image_tag": "Supply a nonempty image tag that does not start with a dash.",
+    "invalid_arguments": "Use aegis team isolation check --help for the required options.",
+    "isolation_command": "Supply a bounded nonempty command with a valid executable.",
+    "isolation_cpus": "Set a CPU limit within the available CPU count.",
+    "isolation_engine": "Select a supported container engine.",
+    "isolation_fields": "Supply only fields allowed for the selected isolation mode.",
+    "isolation_image": "Supply a valid image reference for the requested engine operation.",
+    "isolation_memory": "Supply a positive memory limit with a k, m or g suffix.",
+    "isolation_mode": "Select host or container isolation.",
+    "isolation_object": "Supply isolation as a JSON object.",
+    "isolation_pids": "Supply an integer PID limit of at least 64 and at most 2147483647.",
+    "isolation_unqualified": "Supply a boolean allow_unqualified value.",
+    "isolation_user": "Supply a valid numeric container UID and GID.",
+    "mount_changed": "Retry with unchanged mount paths and access metadata.",
+    "mount_metadata": "Supply complete trusted mount metadata and readable access ACLs.",
+    "mount_overlap": "Use distinct mounts with no overlap between access domains.",
+    "mount_rows": "Supply valid same-path mount rows within the mount limit.",
+    "owner_homes": "Supply the trusted explicit, ambient and account home paths.",
+    "python_bin": "Set recipes.python to an absolute path inside a bin directory.",
+    "python_prefix": "Use an explicit python_prefix or an inferred prefix with a regular pyvenv.cfg.",
+    "stop_timeout": "Supply a positive bounded integer stop timeout.",
+    "team_run_fields": "Supply only supported team-run fields.",
+    "team_run_recipes": "Supply the Python interpreter in a team-run recipes object.",
+    "team_run_schema": "Use schema aegis.team-run/v2 when specifying isolation.",
+    "unsafe_mount": "Select paths without protected, aliased or unsafe mount components.",
+    "unsupported_platform": "Run this check where Linux descriptor-relative observations are available.",
+}
+
+
+class IsolationRefusal(ValueError):
+    """Stable code string, fixed human message and structured next action."""
+
+    status = "refused"
+    exit_code = 1
+
+    def __init__(self, code):
+        if type(code) is not str or code not in REFUSALS:
+            code = "internal"
+        self.message = REFUSALS[code]
+        self.code = self.reason = code
+        if code == "invalid_arguments":
+            self.exit_code = 2
+        self.next_action = {"actor": "operator", "command": self.message}
+        super().__init__(code)
+
+
+_VERDICT_CODES = {
+    "resolved": "resolved",
+    "match": "equal_catalog",
+    "exceeds": "extra_capabilities",
+    "planned": "planned",
+    "pass": "all_refused",
+    "fail": "attempt_allowed",
+}
+_REFUSAL_DETAILS = ("prohibited_calls", "uncovered_calls", "extras", "missing", "attempts")
+
+
+def refusal(code, *, details=None):
+    error = IsolationRefusal(code)
+    body = {"status": error.status, "code": error.code, "next_action": error.next_action}
+    if error.code != "internal" and details is not None:
+        body.update({key: details[key] for key in _REFUSAL_DETAILS if key in details})
+    return body
+
+
+def finish(result):
+    """Allow only a declared verdict pair or render a registered refusal."""
+    status, code = result.get("status"), result.get("code")
+    if type(status) is str and status in _VERDICT_CODES:
+        if type(code) is str and code == _VERDICT_CODES[status]:
+            return result
+        return refusal("internal")
+    if type(code) is str and code == "invalid_role":
+        code = "unknown_role"
+    return refusal(code, details=result)
