@@ -490,7 +490,7 @@ def test_nudge_closes_all_descriptors_on_success_and_partial_open_failure(pollin
     import errno
     from types import SimpleNamespace
     import hierarchy_loop_subscriptions as helper
-    if not helper.supported():
+    if not helper.read_supported():
         pytest.skip("descriptor confinement unavailable")
     opened = []
 
@@ -572,7 +572,7 @@ def test_r2_abbreviations_refuse_without_echo(world, flags):
 
 def test_r2_nudge_shares_ancestor_descriptors(polling_mailbox):
     import hierarchy_loop_subscriptions as helper
-    if not helper.supported():
+    if not helper.read_supported():
         pytest.skip("descriptor confinement unavailable")
     with helper.InboxNudge([polling_mailbox]) as watcher:
         identities = [(os.fstat(fd).st_dev, os.fstat(fd).st_ino) for fd in watcher.descriptors]
@@ -619,7 +619,7 @@ def test_r2_nudge_portable_stat_polling(polling_mailbox, monkeypatch, change):
         if change and now[0] >= 1:
             (polling_mailbox / "a" / "root" / "new.md").touch()
 
-    monkeypatch.setattr("hierarchy_loop_subscriptions.supported", lambda: False)
+    monkeypatch.setattr("hierarchy_loop_subscriptions.read_supported", lambda: False)
     monkeypatch.setattr("hierarchy_loop_subscriptions.time", SimpleNamespace(monotonic=lambda: now[0], sleep=sleep))
     args = SimpleNamespace(subscriptions=None, nudge_seconds="2", interval=5)
     helper.configure(args)
@@ -632,7 +632,7 @@ def test_r2_nudge_unsupported_is_typed_and_recoverable(polling_mailbox, monkeypa
     from types import SimpleNamespace
     import hierarchy_loop_subscriptions as helper
     monkeypatch.setattr("hierarchy_loop_subscriptions.active_mailboxes", lambda _: [{"mailbox_root": str(polling_mailbox)}])
-    monkeypatch.setattr("hierarchy_loop_subscriptions.supported", lambda: False)
+    monkeypatch.setattr("hierarchy_loop_subscriptions.read_supported", lambda: False)
     monkeypatch.setattr("hierarchy_loop_subscriptions.path_polling_supported", lambda: False)
     watcher, error = helper.prepare_nudge(SimpleNamespace(store="unused"))
     assert watcher is None and error.code == "NUDGE_UNSUPPORTED"
@@ -655,7 +655,7 @@ def test_r2_nudge_unavailable_store_is_typed(tmp_path, monkeypatch):
 def test_r2_nudge_budget_exhaustion_is_typed_and_recoverable(polling_mailbox, monkeypatch):
     from types import SimpleNamespace
     import hierarchy_loop_subscriptions as helper
-    if not helper.supported():
+    if not helper.read_supported():
         pytest.skip("descriptor confinement unavailable")
     monkeypatch.setattr("hierarchy_loop_subscriptions.active_mailboxes", lambda _: [{"mailbox_root": str(polling_mailbox)}])
     monkeypatch.setattr("hierarchy_loop_subscriptions.descriptor_capacity", lambda: 0)
@@ -762,7 +762,7 @@ def test_r4_discovery_without_o_path_uses_store_portable_reader(tmp_path, pollin
         del portable_os.O_PATH
     monkeypatch.setattr("hierarchy_loop_subscriptions.os", portable_os)
     monkeypatch.setattr("hierarchy_workspace.os", portable_os)
-    monkeypatch.setattr("hierarchy_loop_subscriptions.supported", lambda: False)
+    monkeypatch.setattr("hierarchy_loop_subscriptions.read_supported", lambda: False)
     assert [row["id"] for row in helper.active_mailboxes(workspace.store)] == ["a"]
     watcher, error = helper.prepare_nudge(SimpleNamespace(store=workspace.store))
     assert error is None
@@ -849,7 +849,7 @@ def test_r4_nudge_open_failure_is_typed_closes_descriptors_and_recovers(polling_
     import errno
     from types import SimpleNamespace
     import hierarchy_loop_subscriptions as helper
-    if not helper.supported():
+    if not helper.read_supported():
         pytest.skip("descriptor confinement unavailable")
     opened = []
 
@@ -888,7 +888,7 @@ def test_r4b_real_registry_nudge_exhaustion_recovers(tmp_path, polling_mailbox, 
     from tests.integration.test_hierarchy_workspace import Workspace
     if reader == "descriptor" and not registry._memo_supported():
         pytest.skip("descriptor registry replay unavailable")
-    if stage == "watcher" and not helper.supported():
+    if stage == "watcher" and not helper.read_supported():
         pytest.skip("descriptor watcher unavailable")
     workspace = Workspace(tmp_path)
     workspace.run("init", {"writer_limit": 3, "heavy_limit": 3})
@@ -949,7 +949,7 @@ def test_r4b_real_registry_nudge_exhaustion_recovers(tmp_path, polling_mailbox, 
                                                                   "scandir": registry_scandir}))
     monkeypatch.setattr("hierarchy_loop_subscriptions.os", SimpleNamespace(**{**vars(os), "open": watcher_open}))
     if stage != "watcher":
-        monkeypatch.setattr("hierarchy_loop_subscriptions.supported", lambda: False)
+        monkeypatch.setattr("hierarchy_loop_subscriptions.read_supported", lambda: False)
     args = SimpleNamespace(store=workspace.store)
 
     def refused(_):
@@ -1009,7 +1009,7 @@ def test_r4b_registry_refusal_chain_is_classified_before_io(tmp_path, polling_ma
             return super().stat(*args, **kwargs)
 
     monkeypatch.setattr("hierarchy_mailbox.Path", RegistryPath)
-    monkeypatch.setattr("hierarchy_loop_subscriptions.supported", lambda: False)
+    monkeypatch.setattr("hierarchy_loop_subscriptions.read_supported", lambda: False)
     for _ in range(2):
         watcher, error = helper.prepare_nudge(SimpleNamespace(store=workspace.store))
         assert watcher is None
@@ -1770,3 +1770,306 @@ def test_a_lane_that_accepts_its_dispatch_and_stops_is_a_stalled_dispatch_hold_f
 
     assert key not in holds(answered)
     assert set(holds(answered)) == {("sweep", "root_queue", "pilot/root")}
+
+
+class _NotifyWork:
+    def __init__(self):
+        self.holds, self.steps = [], []
+        self.subscription_suppressed = []
+        self.subscription_suppressed_complete = False
+
+    def hold(self, step, kind, why, act, **where):
+        self.holds.append({"step": step, "kind": kind, "detail": why, "act": act, **where})
+
+
+def _bound_initiative(root, prefix):
+    endpoints = {prefix + "/" + role: {} for role in ("front-door", "root", "router", "orchestrator")}
+    invoke(root, "init", {"schema": "aegis.hierarchy-pilot/v1", "endpoints": endpoints,
+                          "counterparts": [], "writer_limit": 3})
+    for endpoint in endpoints:
+        invoke(root, "bind", {"endpoint": endpoint, "host": "host-one", "session": endpoint,
+                              "expected_generation": 0})
+    return root
+
+
+@pytest.fixture(scope="module")
+def initiative_templates(tmp_path_factory):
+    import hierarchy_loop_subscriptions as helper
+    if not helper.supported():
+        return None
+    base = tmp_path_factory.mktemp("initiative-templates")
+    return {prefix: _bound_initiative(base / prefix, prefix) for prefix in ("a", "b", "c")}
+
+
+def _copy_initiatives(tmp_path, templates):
+    if templates is None:
+        pytest.skip("subscription descriptor operations unavailable")
+    parent = tmp_path / "mail"
+    parent.mkdir()
+    roots = {}
+    for prefix, template in templates.items():
+        root = parent / prefix
+        shutil.copytree(template, root)
+        roots[prefix] = root
+    return parent, roots
+
+
+def _subscription_config(path):
+    path.write_text(json.dumps({"schema": "aegis.team-subscriptions/v1", "subscriptions": [
+        {"subscriber": "a/root", "match": [{"type": "info", "from": "a/orchestrator"}],
+         "budget": {"notices_per_hour": 6}},
+        {"subscriber": "b/root", "match": [{"type": "info", "from": "b/orchestrator"}],
+         "budget": {"notices_per_hour": 6}},
+    ]}), encoding="utf-8")
+    return path
+
+
+def _registered_workspace(tmp_path, roots):
+    from tests.integration.test_hierarchy_workspace import Workspace
+    workspace = Workspace(tmp_path)
+    workspace.run("init", {"writer_limit": 3, "heavy_limit": 3})
+    for number, prefix in enumerate(("a", "b", "c")):
+        delivery = tmp_path / "delivery" / prefix
+        delivery.mkdir(parents=True)
+        workspace.register(prefix, priority=10 + number, mailbox_root=str(roots[prefix]),
+                           delivery_dir=str(delivery))
+    workspace.run("update", {"initiative": "c", "source": "owner", "state": "paused"})
+    return workspace
+
+
+def _publish_info(root, prefix, identifier):
+    from tests.integration.test_hierarchy_mailbox import message
+    import hierarchy_mailbox as hm
+    with hm.writer_lock(root):
+        return hm.Mailbox(root).publish(message(prefix + "/orchestrator", prefix + "/root", identifier=identifier))
+
+
+def _assert_one_parse(counts):
+    assert sorted(name for label, name in counts if label == "loop") == ["a", "b", "c"]
+    assert [item for item in counts if item[0] == "notify"] == []
+
+
+def _install_parse_counters(monkeypatch):
+    from threading import Lock, get_ident
+    import hierarchy_loop_subscriptions as helper
+    import hierarchy_subscriptions as subscriptions
+    grouped, guard = {}, Lock()
+
+    def wrap(label, original):
+        def constructed(root):
+            with guard:
+                grouped.setdefault(get_ident(), []).append((label, Path(root).name))
+            return original(root)
+        return constructed
+
+    monkeypatch.setattr("hierarchy_loop_subscriptions.Mailbox", wrap("loop", helper.Mailbox))
+    monkeypatch.setattr("hierarchy_subscriptions.hm.Mailbox", wrap("notify", subscriptions.hm.Mailbox))
+    return grouped
+
+
+def test_pass_parses_each_mailbox_once_and_skips_seen_references(tmp_path, initiative_templates, monkeypatch):
+    import hierarchy_loop_subscriptions as helper
+    parent, roots = _copy_initiatives(tmp_path, initiative_templates)
+    for name in ("seen0", "seen1", "seen2"):
+        _publish_info(roots["a"], "a", name)
+    workspace = _registered_workspace(tmp_path, roots)
+    config = _subscription_config(tmp_path / "subscriptions.json")
+    runner = helper.LoopSubscriptions(workspace.store, str(config))
+    import hierarchy_subscriptions as subscriptions
+    referenced = []
+    real_build = subscriptions._reference_from_verified
+
+    def build(record, digest):
+        referenced.append(record["message"]["message_id"])
+        return real_build(record, digest)
+
+    monkeypatch.setattr("hierarchy_subscriptions._reference_from_verified", build)
+    grouped = _install_parse_counters(monkeypatch)
+    for expected_refs, published in (({"seen0", "seen1", "seen2"}, 1), (set(), 0)):
+        grouped.clear()
+        referenced.clear()
+        work = _NotifyWork()
+        runner.run(work)
+        assert work.holds == []
+        _assert_one_parse(next(iter(grouped.values())))
+        assert set(referenced) == expected_refs
+        assert work.steps[-1]["published"] == published
+        assert work.steps[-1]["complete"] is True
+    assert not (parent / "subscriptions").is_symlink()
+
+
+def _holds(work):
+    return sorted((row["kind"], row.get("initiative"), row["detail"]) for row in work.holds)
+
+
+def test_manifest_parse_failure_is_path_hold_and_retries(tmp_path, initiative_templates, monkeypatch):
+    import hierarchy_loop_subscriptions as helper
+    parent, roots = _copy_initiatives(tmp_path, initiative_templates)
+    _publish_info(roots["a"], "a", "waiting")
+    workspace = _registered_workspace(tmp_path, roots)
+    config = _subscription_config(tmp_path / "subscriptions.json")
+    runner = helper.LoopSubscriptions(workspace.store, str(config))
+    manifest = roots["c"] / "manifest.json"
+    original = manifest.read_bytes()
+    manifest.write_text("{", encoding="utf-8")
+    before = {path.relative_to(parent): path.read_bytes() for path in parent.rglob("*") if path.is_file()}
+    grouped = _install_parse_counters(monkeypatch)
+    failed = _NotifyWork()
+    runner.run(failed)
+    assert {path.relative_to(parent): path.read_bytes() for path in parent.rglob("*") if path.is_file()} == before
+    assert not (parent / "subscriptions").exists()
+    assert sorted((row["kind"], row.get("initiative")) for row in failed.holds) == [
+        ("SUBSCRIPTIONS_PATH", "a"), ("SUBSCRIPTIONS_PATH", "b")]
+    assert [row["detail"] for row in sorted(failed.holds, key=lambda row: row["initiative"])] == [
+        "invalid subscription path", "invalid subscription path"]
+    assert failed.steps[-1]["state"] == "hold" and failed.steps[-1]["published"] is None
+    _assert_one_parse(next(iter(grouped.values())))
+    grouped.clear()
+    retried = _NotifyWork()
+    runner.run(retried)
+    assert sorted((row["kind"], row.get("initiative")) for row in retried.holds) == [
+        ("SUBSCRIPTIONS_PATH", "a"), ("SUBSCRIPTIONS_PATH", "b")]
+    assert not (parent / "subscriptions").exists()
+    _assert_one_parse(next(iter(grouped.values())))
+    manifest.write_bytes(original)
+    grouped.clear()
+    recovered = _NotifyWork()
+    runner.run(recovered)
+    assert recovered.holds == []
+    assert recovered.steps[-1]["state"] == "ok" and recovered.steps[-1]["published"] == 1
+    _assert_one_parse(next(iter(grouped.values())))
+
+
+def test_malformed_active_manifest_keeps_each_caller_code_and_parses_once(tmp_path, initiative_templates, monkeypatch):
+    import hierarchy_loop_subscriptions as helper
+    parent, roots = _copy_initiatives(tmp_path, initiative_templates)
+    _publish_info(roots["b"], "b", "waiting")
+    workspace = _registered_workspace(tmp_path, roots)
+    config = _subscription_config(tmp_path / "subscriptions.json")
+    runner = helper.LoopSubscriptions(workspace.store, str(config))
+    manifest = roots["a"] / "manifest.json"
+    original = manifest.read_bytes()
+    manifest.write_text("{", encoding="utf-8")
+    before = {path.relative_to(parent): path.read_bytes() for path in parent.rglob("*") if path.is_file()}
+    grouped = _install_parse_counters(monkeypatch)
+    failed = _NotifyWork()
+    runner.run(failed)
+    assert {path.relative_to(parent): path.read_bytes() for path in parent.rglob("*") if path.is_file()} == before
+    assert not (parent / "subscriptions").exists()
+    assert _holds(failed) == [
+        ("SUBSCRIPTIONS_MAILBOX", "a", "subscription mailbox refused"),
+        ("SUBSCRIPTIONS_PATH", "b", "invalid subscription path")]
+    assert failed.steps[-1]["state"] == "hold" and failed.steps[-1]["published"] is None
+    names = [name for label, name in next(iter(grouped.values())) if label == "loop"]
+    assert [item for item in next(iter(grouped.values())) if item[0] == "notify"] == []
+    assert names.count("a") == 1 and names.count("b") == 1 and len(names) == len(set(names))
+    grouped.clear()
+    retried = _NotifyWork()
+    runner.run(retried)
+    assert _holds(retried) == _holds(failed)
+    names = [name for label, name in next(iter(grouped.values())) if label == "loop"]
+    assert names.count("a") == 1 and len(names) == len(set(names))
+    manifest.write_bytes(original)
+    grouped.clear()
+    recovered = _NotifyWork()
+    runner.run(recovered)
+    assert recovered.holds == []
+    assert recovered.steps[-1]["state"] == "ok" and recovered.steps[-1]["published"] == 1
+    _assert_one_parse(next(iter(grouped.values())))
+
+
+def test_concurrent_passes_parse_each_mailbox_once(tmp_path, initiative_templates, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, get_ident
+    import hierarchy_loop_subscriptions as helper
+    _parent, roots = _copy_initiatives(tmp_path, initiative_templates)
+    _publish_info(roots["a"], "a", "racing")
+    workspace = _registered_workspace(tmp_path, roots)
+    config = _subscription_config(tmp_path / "subscriptions.json")
+    runner = helper.LoopSubscriptions(workspace.store, str(config))
+    grouped = _install_parse_counters(monkeypatch)
+    barrier = Barrier(2)
+
+    def once(_):
+        barrier.wait(10)
+        work = _NotifyWork()
+        runner.run(work)
+        return get_ident(), work
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(once, range(2)))
+    assert len(grouped) == 2
+    for counts in grouped.values():
+        _assert_one_parse(counts)
+    for _ident, work in results:
+        assert all(row["kind"] == "SUBSCRIPTIONS_BUSY" for row in work.holds)
+    grouped.clear()
+    retried = _NotifyWork()
+    runner.run(retried)
+    assert retried.holds == []
+    _assert_one_parse(next(iter(grouped.values())))
+
+
+def test_concurrent_passes_parse_a_malformed_manifest_once(tmp_path, initiative_templates, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, get_ident
+    import hierarchy_loop_subscriptions as helper
+    _parent, roots = _copy_initiatives(tmp_path, initiative_templates)
+    workspace = _registered_workspace(tmp_path, roots)
+    config = _subscription_config(tmp_path / "subscriptions.json")
+    runner = helper.LoopSubscriptions(workspace.store, str(config))
+    (roots["c"] / "manifest.json").write_text("{", encoding="utf-8")
+    grouped = _install_parse_counters(monkeypatch)
+    barrier = Barrier(2)
+
+    def once(_):
+        barrier.wait(10)
+        work = _NotifyWork()
+        runner.run(work)
+        return get_ident(), work
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(once, range(2)))
+    assert len(grouped) == 2
+    for counts in grouped.values():
+        _assert_one_parse(counts)
+    for _ident, work in results:
+        assert _holds(work) == [
+            ("SUBSCRIPTIONS_PATH", "a", "invalid subscription path"),
+            ("SUBSCRIPTIONS_PATH", "b", "invalid subscription path")]
+
+
+def test_read_capabilities_select_descriptor_polling_without_publisher_writes(polling_mailbox, monkeypatch):
+    import errno
+    import hierarchy_loop_subscriptions as helper
+    if not helper.read_supported():
+        pytest.skip("read descriptor polling unavailable")
+    monkeypatch.setattr("hierarchy_loop_subscriptions.supported", lambda: False)
+    with helper.InboxNudge([polling_mailbox]) as watcher:
+        assert watcher.confined is True and watcher.descriptors
+        opened = list(watcher.descriptors)
+    for descriptor in opened:
+        with pytest.raises(OSError) as caught:
+            os.fstat(descriptor)
+        assert caught.value.errno == errno.EBADF
+
+
+def test_read_capability_probe_refuses_or_uses_portable_polling(polling_mailbox, monkeypatch):
+    from types import SimpleNamespace
+    import hierarchy_loop_subscriptions as helper
+    monkeypatch.setattr("hierarchy_loop_subscriptions.read_supported", lambda: False)
+    monkeypatch.setattr("hierarchy_loop_subscriptions.active_mailboxes", lambda _: [{"mailbox_root": str(polling_mailbox)}])
+    monkeypatch.setattr("hierarchy_loop_subscriptions.path_polling_supported", lambda: False)
+    watcher, error = helper.prepare_nudge(SimpleNamespace(store="unused"))
+    assert watcher is None and error.code == "NUDGE_UNSUPPORTED"
+    assert str(error) == "nudge metadata polling unavailable"
+    monkeypatch.setattr("hierarchy_loop_subscriptions.path_polling_supported", lambda: True)
+    watcher, error = helper.prepare_nudge(SimpleNamespace(store="unused"))
+    assert error is None and watcher is not None and watcher.confined is False and not watcher.descriptors
+    watcher.close()
+
+
+def test_loop_module_keeps_subscription_status_out_of_the_pass_body():
+    source = (ROOT / "tools" / "hierarchy_loop.py").read_text(encoding="utf-8")
+    assert "subscriptions_sha256" not in source
+    assert len(source.splitlines()) < 960
