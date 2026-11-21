@@ -2236,7 +2236,7 @@ def _compat_message_setup(root, verb, case):
     elif case == "unsafe_store":
         directory.chmod(0o777)
     elif case == "hash":
-        (directory / (rid + ".json")).write_bytes(b"{}")
+        (directory / rid[:2] / (rid + ".json")).write_bytes(b"{}")
     if verb == "write":
         argv = ["msg", "--store", str(directory), "write", "--kind", "text", "--in", str(source)]
     else:
