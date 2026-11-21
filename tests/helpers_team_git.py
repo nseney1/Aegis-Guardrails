@@ -18,9 +18,9 @@ IDENTITY = team_git.CommitIdentity("Lane", "lane@example.com", "1700000000 +0000
 LANE_MODULES = frozenset({"aegis_core/team_git.py", "aegis_core/team_git_snapshot.py"})
 
 __all__ = [
-    "IDENTITY", "LANE_MODULES", "commit", "copied_rig", "filter_git_env", "git",
-    "make_store", "new_store", "rig_template", "shared_bytes", "state",
-    "strict_program", "strict_program_guard",
+    "IDENTITY", "LANE_MODULES", "commit", "copy_immutable_repo", "copied_rig",
+    "filter_git_env", "git", "make_store", "new_store", "rig_template",
+    "shared_bytes", "state", "strict_program", "strict_program_guard",
 ]
 
 
@@ -142,4 +142,17 @@ def state(rig):
         p.relative_to(rig.repo).as_posix(): ("link", str(p.readlink())) if p.is_symlink() else
         ("file", p.read_bytes()) if p.is_file() else ("directory",)
         for p in rig.repo.rglob("*") if ".git" not in p.parts})
+
+
+def copy_immutable_repo(template, directory):
+    """Copy one immutable Git template into directory/repo.
+
+    The template is only read. The copy must match its baseline before the
+    caller receives the path. The caller owns directory, including a partial
+    tree left behind when the copy raises.
+    """
+    repo = Path(directory) / "repo"
+    shutil.copytree(template.repo, repo)
+    assert state(SimpleNamespace(repo=repo)) == template.baseline
+    return repo
 
