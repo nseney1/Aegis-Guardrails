@@ -184,6 +184,13 @@ def queue(rig, **changes):
     return result
 
 
+def direct_prepare(q, rig, tip=None):
+    """One prepare call. The scheduling helper may restore the target first."""
+    observed = rig.base if tip is None else tip
+    return q.prepare(rig.store, read_target=lambda target: observed,
+                     read_mode=lambda *args: "none", identity=IDENTITY, now=100)
+
+
 def prepare(q, rig, tip=None, mode="none"):
     """Supply test-owned authentication when scheduling explicitly requires it."""
     observed = tip or rig.base
@@ -523,6 +530,22 @@ def test_review_refusal_leaves_storage_untouched_and_allows_corrected_retry(rig,
     assert q.enqueue(rig.store, original) == "queued"
 
 
+class CountingIndexBackend(StateBackend):
+    """Records commit-index and health reads on the test-owned storage port."""
+
+    def __init__(self):
+        super().__init__()
+        self.reads = []
+
+    def commit(self, target, commit):
+        self.reads.append(("commit", commit))
+        return super().commit(target, commit)
+
+    def health(self, target, commit):
+        self.reads.append(("health", commit))
+        return super().health(target, commit)
+
+
 class ImmutableIndexBackend(StateBackend):
     """Same port with an immutable commit-to-completion identity."""
 
@@ -661,10 +684,174 @@ def test_archived_commit_cannot_acquire_second_completion_after_target_rewind(ri
     backend = rig.backends[q]
     before = backend.state
     for _ in range(2):
-        refused("already_integrated", lambda: prepare(q, rig))
+        refused("archived_completion", lambda: prepare(q, rig))
+    assert "ancestor" not in mq.REFUSALS["archived_completion"]
+    assert "expected head" in mq.REFUSALS["archived_completion"]
+    assert mq.REFUSALS["archived_completion"] != mq.REFUSALS["already_integrated"]
     assert q.issued is None and backend.state == before and not backend.dirty
     assert backend.commits[rig.head].landing == receipt
     assert tuple(backend.lanes) == ("a",)
+
+
+def test_prepare_uses_one_authenticated_completion_miss(rig):
+    """A preparation reads the commit index once and reuses that miss for health.
+
+    Revalidation and issuance keep independent reads. A later preparation does
+    not reuse the earlier miss, and a red health result stays a health result.
+    """
+    passing(rig)
+    backend = CountingIndexBackend()
+    q = fresh_queue(rig, backend=backend)
+    assert q.enqueue(rig.store, entry(rig)) == "queued"
+    backend.reads.clear()
+    candidate = direct_prepare(q, rig)
+    assert [kind for kind, oid in backend.reads] == ["commit", "health"]
+    assert all(oid == rig.head for _, oid in backend.reads)
+    assert candidate.status == "ready" and candidate.commit == rig.head
+    backend.reads.clear()
+    assert direct_prepare(q, rig) == candidate
+    assert [kind for kind, oid in backend.reads] == ["commit", "health"]
+    backend.healths[rig.head] = mq.HostedResult(rig.head, False, 1)
+    backend.reads.clear()
+    assert direct_prepare(q, rig).status == "target-red"
+    assert [kind for kind, oid in backend.reads] == ["commit", "health"]
+    assert all(oid == rig.head for _, oid in backend.reads)
+    del backend.healths[rig.head]
+    ready = direct_prepare(q, rig)
+    backend.healths[ready.commit] = mq.HostedResult(ready.commit, False, 1)
+    backend.reads.clear()
+    refused("target_red", lambda: issue(q, rig, ready))
+    assert [kind for kind, oid in backend.reads] == ["commit", "health"]
+    del backend.healths[ready.commit]
+    ready = direct_prepare(q, rig)
+    backend.reads.clear()
+    receipt = issue(q, rig, ready)
+    assert [kind for kind, oid in backend.reads] == ["commit", "health", "commit", "health"]
+    assert all(oid == receipt.commit for _, oid in backend.reads)
+    backend.reads.clear()
+    assert q.check_issued(rig.store, receipt, read_target=lambda _: rig.base,
+                          read_mode=lambda *args: "none", now=100) is True
+    assert [kind for kind, oid in backend.reads] == ["commit", "health"]
+    assert backend.reads[0][1] == receipt.commit
+
+
+@pytest.mark.parametrize("shape", ["fast-forward", "merge"])
+def test_archived_completion_refusal_is_distinct_from_ancestry(rig, shape):
+    """An archived commit stays archived after rewind, including when its result is red.
+
+    Recovery is expected-head withdrawal. A fresh lane on the same commit is
+    refused again, and ancestry advice is left unchanged.
+    """
+    passing(rig)
+    backend = CountingIndexBackend()
+    q = fresh_queue(rig, backend=backend)
+    assert q.enqueue(rig.store, entry(rig)) == "queued"
+    tip = rig.base if shape == "fast-forward" else rig.other
+    if shape == "merge":
+        assert q.restore_target(rig.store, mq.HostedResult(tip, True),
+                                read_target=lambda _: tip) == "green"
+    candidate = direct_prepare(q, rig, tip)
+    passing(rig, candidate.tree, candidate.commit)
+    candidate = direct_prepare(q, rig, tip)
+    assert candidate.status == "ready"
+    receipt = issue(q, rig, candidate)
+    assert q.observe_landed(rig.store, receipt, read_target=lambda _: receipt.commit) == "done"
+    assert q.restore_target(rig.store, mq.HostedResult(tip, True), read_target=lambda _: tip) == "green"
+    assert q.hosted_result(receipt.commit, passed=False, attempt=1) == "stale"
+    assert q.enqueue(rig.store, entry(rig, lane="second")) == "queued"
+    assert backend.state.red is False
+    before = backend.state
+    backend.reads.clear()
+    for _ in range(2):
+        start = len(backend.reads)
+        refused("archived_completion", lambda: direct_prepare(q, rig, tip))
+        assert [kind for kind, oid in backend.reads[start:]] == ["commit"]
+        assert backend.reads[-1][1] == receipt.commit
+    assert "ancestor" not in mq.REFUSALS["archived_completion"]
+    assert "expected head" in mq.REFUSALS["archived_completion"]
+    assert mq.REFUSALS["archived_completion"] != mq.REFUSALS["already_integrated"]
+    assert "ancestor" in mq.REFUSALS["already_integrated"]
+    assert q.issued is None and backend.state == before and not backend.dirty
+    assert backend.commits[receipt.commit].result == mq.HostedResult(receipt.commit, False, 1)
+    assert q.withdraw("second", expected_head=rig.head) == "released"
+    assert direct_prepare(q, rig, tip).status == "empty"
+    assert q.enqueue(rig.store, entry(rig, lane="third")) == "queued"
+    refused("archived_completion", lambda: direct_prepare(q, rig, tip))
+    assert backend.commits[receipt.commit].landing == receipt
+    assert tuple(backend.lanes) == ("a",)
+
+
+@pytest.mark.parametrize("failure", ["commit-exception", "commit-invalid", "health", "health-invalid"])
+def test_prepare_completion_fault_skips_the_other_read_and_retries_after_restart(rig, failure):
+    """A failed completion or health read returns the documented refusal and faults the queue."""
+    passing(rig)
+    backend = CountingIndexBackend()
+    q = fresh_queue(rig, backend=backend)
+    assert q.enqueue(rig.store, entry(rig)) == "queued"
+    before = backend.state
+    archives = dict(backend.commits)
+    backend.fail = failure
+    backend.reads.clear()
+    refused("state_unavailable", lambda: direct_prepare(q, rig))
+    if failure.startswith("commit-"):
+        assert [kind for kind, _ in backend.reads] == ["commit"]
+    else:
+        assert [kind for kind, oid in backend.reads] == ["commit", "health"]
+        assert all(oid == rig.head for _, oid in backend.reads)
+    assert backend.state == before and backend.commits == archives
+    held = list(backend.reads)
+    refused("state_unavailable", lambda: direct_prepare(q, rig))
+    assert backend.reads == held
+    backend.fail = None
+    restarted = fresh_queue(rig, backend=backend, initialize=False)
+    assert restarted.restore_target(rig.store, mq.HostedResult(rig.base, True),
+                                    read_target=lambda _: rig.base) == "green"
+    backend.reads.clear()
+    candidate = direct_prepare(restarted, rig)
+    assert [kind for kind, oid in backend.reads] == ["commit", "health"]
+    assert all(oid == rig.head for _, oid in backend.reads)
+    assert candidate.status == "ready" and candidate.commit == rig.head
+
+
+@pytest.mark.parametrize("archived", [False, True])
+def test_concurrent_prepares_each_authenticate_one_completion(rig, archived):
+    """Concurrent preparations each take one commit-index read and do not publish."""
+    passing(rig)
+    backend = CountingIndexBackend()
+    q = fresh_queue(rig, backend=backend)
+    assert q.enqueue(rig.store, entry(rig)) == "queued"
+    receipt = None
+    if archived:
+        receipt = issue(q, rig, prepare(q, rig))
+        assert q.observe_landed(rig.store, receipt, read_target=lambda _: receipt.commit) == "done"
+        assert q.restore_target(rig.store, mq.HostedResult(rig.base, True),
+                                read_target=lambda _: rig.base) == "green"
+        assert q.enqueue(rig.store, entry(rig, lane="second")) == "queued"
+    before = backend.state
+    backend.reads.clear()
+    barrier = Barrier(2)
+
+    def plan(_):
+        barrier.wait(timeout=10)
+        if archived:
+            refused("archived_completion", lambda: direct_prepare(q, rig))
+            return "refused"
+        return direct_prepare(q, rig)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(plan, range(2), timeout=30))
+    kinds = [kind for kind, _ in backend.reads]
+    assert q.issued is None and backend.state == before and not backend.dirty
+    if archived:
+        assert results == ["refused", "refused"]
+        assert kinds == ["commit", "commit"]
+        assert all(oid == receipt.commit for _, oid in backend.reads)
+        assert backend.commits[rig.head].landing == receipt
+    else:
+        assert results[0] == results[1] and results[0].status == "ready"
+        assert kinds == ["commit", "health", "commit", "health"]
+        assert all(oid == rig.head for _, oid in backend.reads)
+        assert backend.commits == {}
 
 
 def test_concurrent_invalid_review_does_not_block_explicit_valid_admission(rig):
