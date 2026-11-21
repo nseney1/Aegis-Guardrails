@@ -13,7 +13,7 @@ import re
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple
 
 from aegis_core.insights.capture import (
-    JOIN_WINDOW_S, MAX_INSIGHT_ITEMS, _corroborating_hook, _row_source, clean_insight_row,
+    JOIN_WINDOW_S, _corroborating_hook, _row_source, clean_insight_row,
 )
 from aegis_core.insights.keys import (
     COUNTABLE_LEVELS,
@@ -22,6 +22,7 @@ from aegis_core.insights.keys import (
     insights_path,
     read_insight_rows,
 )
+from aegis_core.insights.records import DECISIONS, MAX_INSIGHT_ITEMS
 from aegis_core.primitives import parse_utc, utc_stamp
 from aegis_core.redaction import redact_insight_text
 from aegis_core.workspace.layout import WorkspaceLayout
@@ -44,9 +45,9 @@ REJECTION_RESURFACE_COUNT = 2
 # RULE_MATCH_SIM_WITH_PATH and any insight at RULE_MATCH_SIM; recurrence counts at RECURRENCE_SIM.
 RULE_MATCH_SIM_WITH_PATH = 0.15
 RULE_MATCH_SIM = 0.30
-DECISIONS = ("propose", "reject", "snooze", "merge-into-rule", "noise", "confirm")
 # The latest of these naming an insight decides whether review lists it (noise hides for good).
 _RULING_DECISIONS = ("propose", "merge-into-rule", "snooze", "reject")
+assert set(_RULING_DECISIONS).issubset(DECISIONS)
 
 
 def _effective_level(row: Mapping[str, Any], confirmed_ids: Set[str]) -> Optional[str]:
@@ -237,15 +238,15 @@ def record_decision(
     if (type(insight_ids) in (tuple, list) and len(insight_ids) <= MAX_INSIGHT_ITEMS and
             all(type(item) is str and not item.strip() for item in insight_ids)):
         raise ValueError(f"{decision} needs at least one insight id")
-    ids = clean_insight_row({"insight_ids": insight_ids}, workspace=workspace)["insight_ids"]
     row: Dict[str, Any] = {"v": INSIGHT_SCHEMA_VERSION, "ts": utc_stamp(), "event": "decision",
-                           "decision": decision, "insight_ids": ids}
+                           "decision": decision, "insight_ids": insight_ids}
     if kind:
         row["kind"] = str(kind)
     if reason:
         row["reason"] = str(reason)
     if rule_id is not None:
         row["rule_id"] = rule_id
+    # The id list is checked once, inside this clean. A refusal returns before append.
     row = clean_insight_row(row, workspace=workspace)
     _append_user_insights(insights_path(workspace, home=home), [row])
     return row

@@ -13,13 +13,14 @@ import re
 from fractions import Fraction
 
 from aegis_core.team_isolation_mounts import (
-    IsolationRefusal, BASE_ENV_ALLOWLIST, ENGINE_ENV_KEYS, ENV_NAME, LINUX_ID_LIMIT,
+    BASE_ENV_ALLOWLIST, ENGINE_ENV_KEYS, ENV_NAME, LINUX_ID_LIMIT,
     NETWORK_MODE, absolute_path, bounded_value, container_env, cpus_limit, engine,
-    home_folders, image, load_document, memory_bytes, mount_rows, pids_limit,
-    read_isolation, require, validate_mounts,
+    home_folders, host_policy, image, load_document, memory_bytes, mount_rows, pids_limit,
+    read_isolation, require as require_refusal, validate_mounts,
 )
+from aegis_core.team_isolation_refusal import IsolationRefusal
 
-__all__ = ["container_name", "expected_plan", "verify"]
+__all__ = ["container_name", "container_user", "expected_plan", "load_inspection", "verify"]
 
 EXPECTED_FIELDS = frozenset(("run", "engine", "image", "user", "read_only", "mounts", "cpus", "memory", "pids",
                              "image_info", "environment"))
@@ -32,13 +33,19 @@ NAMESPACE_REQUESTS = (("--pid", "PidMode", "pid_mode", "private"),
                       ("--network", "NetworkMode", "network_mode", NETWORK_MODE))
 
 
+def require(condition, message):
+    # Private comparison helpers convert diagnostic failures to fixed mismatch names.
+    if not condition:
+        raise ValueError(message)
+
+
 def container_name(run):
     return "aegis-team-" + hashlib.sha256(str(absolute_path(run)).encode("utf-8")).hexdigest()[:12]
 
 
-def _user(uid, gid):
-    require(type(uid) is int and type(gid) is int and 0 <= uid < LINUX_ID_LIMIT and 0 <= gid < LINUX_ID_LIMIT,
-            "isolation_user")
+def container_user(uid, gid):
+    require_refusal(type(uid) is int and type(gid) is int and 0 <= uid < LINUX_ID_LIMIT and 0 <= gid < LINUX_ID_LIMIT,
+                    "isolation_user")
     return "%d:%d" % (uid, gid)
 
 
@@ -46,7 +53,7 @@ def _valid_user_record(value):
     if type(value) is not str or re.fullmatch(r"[0-9]+:[0-9]+", value) is None:
         return False
     try:
-        _user(*map(int, value.split(":")))
+        container_user(*map(int, value.split(":")))
     except ValueError:
         return False
     return True
@@ -58,6 +65,11 @@ def _inspection(value):
     if isinstance(value, list):
         value = value[0] if len(value) == 1 else None
     return value if isinstance(value, dict) else None
+
+
+def load_inspection(raw):
+    """Decode one transport and admit exactly one inspection object."""
+    return _inspection(load_document(raw))
 
 
 def _repo_digests(value):
@@ -162,7 +174,7 @@ def _validated_expected(expected, host_table, mount_context=None):
         if mount_context is not None:
             checked["mounts"] = validate_mounts(checked["mounts"], **mount_context)
     except IsolationRefusal as exc:
-        if exc.reason not in ("mount_rows", "unsafe_mount", "mount_overlap"):
+        if exc.code not in ("mount_rows", "unsafe_mount", "mount_overlap"):
             raise
         bad.add("mounts")
     except ValueError:
@@ -645,7 +657,7 @@ def expected_plan(isolation, *, run, mounts, image_inspect, host_table, home, ob
                   cpu_count, platform, uid, gid, env=None, private_gids=(), owner_homes=None):
     """Build a comparison record from validated config and trusted observations."""
     isolation = read_isolation(isolation, cpu_count=cpu_count, platform=platform)
-    require(isolation is not None, "container_required")
+    require_refusal(isolation is not None, "container_required")
     if type(image_inspect) in (str, bytes):
         image_inspect = load_document(image_inspect)
     bounded_value(image_inspect)
@@ -653,14 +665,16 @@ def expected_plan(isolation, *, run, mounts, image_inspect, host_table, home, ob
         info = _image_record(image_inspect, isolation["image"])
     except (ValueError, KeyError, RecursionError):
         raise IsolationRefusal("image_inspect") from None
+    host_table = host_policy(host_table)
     record = {"run": str(absolute_path(run)), "engine": isolation["engine"], "image": isolation["image"],
-              "user": _user(uid, gid), "read_only": True,
+              "user": container_user(uid, gid), "read_only": True,
               "mounts": validate_mounts(mounts, home=home, observed=observed, owner_uid=owner_uid,
-                                        private_gids=private_gids, owner_homes=owner_homes),
+                                        private_gids=private_gids, owner_homes=owner_homes,
+                                        protected_names=host_table.protected_names),
               "cpus": isolation["cpus"], "memory": memory_bytes(isolation["memory"]), "pids": isolation["pids"],
               "image_info": info, "environment": _env_fingerprints(container_env(run, env, host_table=host_table))}
     checked, errors = _validated_expected(record, host_table)
-    require(not errors, "expected_record")
+    require_refusal(not errors, "expected_record")
     return checked
 
 
@@ -674,9 +688,10 @@ def verify(inspect_json, expected, *, host_table, home, observed, owner_uid, pri
         inspect_json = load_document(inspect_json)
     bounded_value(inspect_json)
     bounded_value(expected)
-    home_folders(host_table)
+    host_table = host_policy(host_table)
     mount_context = dict(home=home, observed=observed, owner_uid=owner_uid,
-                         private_gids=private_gids, owner_homes=owner_homes)
+                         private_gids=private_gids, owner_homes=owner_homes,
+                         protected_names=host_table.protected_names)
     # Qualify context even if expected has no mount field. Row/schema/policy
     # errors are aggregated below; missing or changed observations still refuse.
     validate_mounts([], **mount_context)
