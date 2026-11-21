@@ -140,9 +140,17 @@ reason token. Hosts, families, models and reason tokens are configuration data,
 not built-in names. These observations describe execution, not binding admission.
 The complete resulting row must fit `MAX_LINE_BYTES` including its LF, and the
 resulting history must fit the existing record and byte caps. Refusals preserve
-the decision log; publication uses `append_decision` and its anchored lock.
-Concurrent observations retain both rows and never change launch state or split
-counts, including when the decision was previously marked `not_launched`.
+the decision log. Publication finds that decision id, checks the served block
+against its choice, and appends from the same bounded snapshot under one anchored
+lock (`append_decision(..., known_decision=...)`). An id absent from that
+generation refuses `unknown_decision_id` and is never admitted as a new launch.
+That includes a previously suppressed first launch whose counts and predecessor
+would otherwise match an empty replacement log. A changed generation refuses
+`stale_decision` before rename. Both the file fsync and the directory fsync still
+run; a directory flush error after rename propagates after that replacement is
+visible, and every descriptor opened for the attempt is closed. Concurrent
+observations retain both rows and never change launch state or split counts,
+including when the decision was previously marked `not_launched`.
 `served_of(rows, decision_id)` returns a copy of the newest valid served block
 with a computed boolean `cross_family`: true only when the served family differs
 from a non-null original `author_family`. After examining the complete, in-bounds
@@ -196,8 +204,11 @@ re-encoding or hashing. select_and_append retains only validated immutable raw
 lines (at most MAX_HISTORY_BYTES, MAX_HISTORY_RECORDS) for publication under its
 same anchored lock, avoiding a second validation pass. read_decisions,
 append_decision and select_and_append share one locked-log context with a
-60-second timeout for the 4096-row cap and a queued peer. Low-level append validates
-its own streaming rewrite. Before rename, both publication paths reopen the log
+60-second timeout for the 4096-row cap and a queued peer. A served receipt uses
+that same context: the locked read captures immutable raw lines, and publication
+writes those lines plus the receipt without a second validation pass. Low-level
+append of a new decision validates its own streaming rewrite. Before rename, both
+publication paths reopen the log
 relative to the held directory and compare device/inode and the size/mtime_ns/ctime_ns
 generation from storage.file_generation against the read snapshot (or continued
 absence). A changed log refuses stale_decision and leaves the external bytes intact.

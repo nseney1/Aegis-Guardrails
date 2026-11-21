@@ -899,7 +899,7 @@ def _publish(path, payload, directory, snapshot=None, generation=None):
             raise cleanup_error
 
 
-def append_decision(path, record):
+def append_decision(path, record, *, known_decision=None, prepare=None):
     """Publish old bytes plus one bounded record atomically under the .lock.
 
     Any failure before rename leaves old history unchanged. History limits refuse
@@ -907,10 +907,44 @@ def append_decision(path, record):
     filename operations refuse unsafe_decision_path. Cleanup errors are chained
     under the primary failure. New decisions with stale counts_before or a stale
     previous_decision_id refuse stale_decision; use select_and_append for launches.
+    known_decision publishes prepare(original) only for an id already present in
+    the same locked snapshot. An absent id refuses unknown_decision_id and is never
+    admitted as a launch. prepare runs after that snapshot is validated; its refusal
+    leaves storage untouched. A missing log is probed before lock creation.
     """
-    payload = _line(record)
-    with _locked_log(path) as (target, directory):
-        _publish(target, payload, directory)
+    snapshot = generation = None
+    if known_decision is None:
+        payload = _line(record)
+        read = False
+    else:
+        # Refuse a bad id before any path I/O. prepare must return that same id.
+        _require(type(known_decision) is str and
+                 re.fullmatch(r"[0-9a-f]{64}", known_decision) is not None, "invalid_decision_id")
+        _require(callable(prepare), "invalid_history")
+        payload = None
+        read = True
+    with _locked_log(path, read=read) as (target, directory):
+        if known_decision is not None:
+            if directory is None:
+                raise ModelSelectionError("unknown_decision_id")
+            history = _HistoryReader(target, directory, capture=True)
+            original = None
+            try:
+                for row in history:
+                    if original is None and row["decision_id"] == known_decision:
+                        original = row
+            finally:
+                history.close()
+            if original is None:
+                raise ModelSelectionError("unknown_decision_id")
+            record = prepare(original)
+            _require(type(record) is dict and record.get("decision_id") == known_decision,
+                     "invalid_history")
+            payload = _line(record)
+            snapshot, generation = history._snapshot, history._generation
+        _publish(target, payload, directory, snapshot, generation)
+    if known_decision is not None:
+        return record
 
 
 def select_and_append(path, bindings, policy, task_kind, role_kind, *, host_kinds, subject=None, intent=None,

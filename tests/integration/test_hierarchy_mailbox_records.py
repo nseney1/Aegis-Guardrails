@@ -39,11 +39,17 @@ from aegis_core import message_codec_format as codec_format
 
 
 def make_store(root):
-    capabilities = {function.__name__ for function in os.supports_dir_fd}
-    if not ({"open", "mkdir", "stat", "link", "unlink", "rename", "rmdir"} <= capabilities and
-            hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY") and hasattr(os, "geteuid")):
+    if not codec.Store.supported(publication=True):
         pytest.skip("anchored record operations unavailable")
     return codec.Store(root)
+
+
+def record_path(directory, rid):
+    return directory / rid[:2] / (rid + ".json")
+
+
+def grant_file(directory, rid):
+    return directory / "grants" / (".grants-" + rid)
 
 
 def connection(root, endpoint="a/orchestrator"):
@@ -78,7 +84,7 @@ def test_publish_retry_legacy_stub_read_and_digest(bound):
     inbox = invoke(root, "inbox", endpoint="a/lane/review")
     stub = inbox["messages"][0]["message"]["body"]
     assert stub == "aegis-record/1 sha256=" + first["id"] + " kind=text"
-    assert (root.parent / "mailbox-records" / (first["id"] + ".json")).is_file()
+    assert (record_path(root.parent / "mailbox-records", first["id"])).is_file()
     assert not (root / "mailbox-records").exists()
     view = data(call(reader, "mailbox_read_record", {"message_id": "record-1", "fields": ["body"]}))
     assert view["untrusted"] is True and view["data"]["body"] == "# Evidence\nHOSTILE_MARKER"
@@ -124,7 +130,7 @@ def test_read_contract_public_golden(bound, monkeypatch):
     parent = data(call(writer, "mailbox_publish_record", request("wrapper", to="a/front-door",
         content=json.dumps({"fields": {}, "body": "wrapper", "refs": {"child": child}}))))["id"]
     directory = _root.parent / "mailbox-records"
-    path = directory / (".grants-" + parent)
+    path = grant_file(directory, parent)
     envelope = codec.parse(path.read_bytes())
     entry = envelope["fields"]["value"]
     entry["grants"].append(dict(entry["grants"][0], endpoint="a/lane/review"))
@@ -143,7 +149,7 @@ def test_read_contract_public_golden(bound, monkeypatch):
 def test_integrity_and_attribution_refusals_are_total(bound, change, code):
     root, writer, reader = bound
     published = data(call(writer, "mailbox_publish_record", request()))
-    path = root.parent / "mailbox-records" / (published["id"] + ".json")
+    path = record_path(root.parent / "mailbox-records", published["id"])
     if change == "tamper":
         path.write_bytes(b"HOSTILE_MARKER")
     else:
@@ -157,7 +163,9 @@ def test_integrity_and_attribution_refusals_are_total(bound, change, code):
             value["meta"]["from" if change == "sender" else change] = "HOSTILE_MARKER"
             raw = codec.canonical(value)
             rid = hashlib.sha256(raw).hexdigest()
-            (path.parent / (rid + ".json")).write_bytes(raw)
+            forged = record_path(path.parent.parent, rid)
+            forged.parent.mkdir(mode=0o700, exist_ok=True)
+            forged.write_bytes(raw)
             payload["body"] = payload["body"].replace(published["id"], rid)
         header = {k: v for k, v in payload.items() if k != "body"}
         from hierarchy_mailbox import encoded
@@ -192,7 +200,7 @@ def test_invalid_publish_has_fixed_errors_before_store_creation(bound, args, cod
 
 def test_unsupported_platform_refuses_without_creating_store(pilot, monkeypatch):  # noqa: F811
     root, _ = pilot
-    monkeypatch.setattr(records, "supported", lambda: False)
+    monkeypatch.setattr(records, "supported", lambda codec: False)
     assert data(call(connection(root), "mailbox_publish_record", request())) == codec.CodecError("E_AUTH").as_dict()
     assert not (root.parent / "mailbox-records").exists()
 
@@ -320,7 +328,7 @@ def test_failed_mailbox_publish_leaves_no_dangling_stub_and_retries(bound, monke
     assert data(call(writer, "mailbox_publish_record", request())) == codec.CodecError("E_AUTH").as_dict()
     monkeypatch.setattr(mcp.Mailbox, "publish", publish)
     assert not writer.checked_mailbox().messages()
-    assert not list((root.parent / "mailbox-records").glob("*.json"))
+    assert not list((root.parent / "mailbox-records").rglob("*.json"))
     assert "id" in data(call(writer, "mailbox_publish_record", request()))
 
 
@@ -377,7 +385,7 @@ def test_r2_refused_publications_never_commit_records(bound, refusal):
             args["in_reply_to"] = "missing"
         code = "E_REF" if refusal == "reply" else "E_FORMAT"
         assert data(call(writer, "mailbox_publish_record", args)) == codec.CodecError(code).as_dict()
-        assert not list((root.parent / "mailbox-records").glob("*.json"))
+        assert not list((root.parent / "mailbox-records").rglob("*.json"))
         assert not writer.checked_mailbox().messages()
     assert "id" in data(call(writer, "mailbox_publish_record", request("accepted")))
 
@@ -389,7 +397,7 @@ def test_r2_concurrent_refusals_and_retry_keep_only_committed_records(bound):
         results = list(pool.map(lambda args: data(call(connection(root), "mailbox_publish_record", args)), requests))
     assert results[0] == codec.CodecError("E_FORMAT").as_dict()
     assert results[1] == results[2]
-    assert len(list((root.parent / "mailbox-records").glob("*.json"))) == 1
+    assert len(list((root.parent / "mailbox-records").rglob("*.json"))) == 1
     assert list(writer.checked_mailbox().messages()) == ["record-1"]
 
 
@@ -423,7 +431,7 @@ def test_r2_commit_failure_reclaims_new_record_and_all_owned_fds(bound, monkeypa
     assert data(call(writer, "mailbox_publish_record", request())) == codec.CodecError("E_AUTH").as_dict()
     monkeypatch.setattr(records, "os", os)
     assert sorted(opened) == sorted(closed)
-    assert not list((root.parent / "mailbox-records").glob("*.json"))
+    assert not list((root.parent / "mailbox-records").rglob("*.json"))
     assert not writer.checked_mailbox().messages()
     assert "id" in data(call(writer, "mailbox_publish_record", request()))
 
@@ -576,10 +584,11 @@ def test_r2_equal_store_is_refused_before_mailbox_lock_io(bound, monkeypatch):
     assert data(call(writer, "mailbox_publish_record", request())) == codec.CodecError("E_AUTH").as_dict()
 
 
-@pytest.mark.parametrize("failure", ["pending", "lock", "link-after"])
+@pytest.mark.parametrize("failure", ["pending", "lock", "link-after", "grant-exit"])
 def test_r2_cleanup_failure_after_commit_returns_success_and_stops_growth(bound, monkeypatch, failure):
     root, writer, reader = bound
     real_unlink, real_link = os.unlink, os.link
+    linked_message = Event()
     def refused(path, *args, **kwargs):
         if path == (".pending-stub" if failure == "pending" else ".publish.lock") and failure != "link-after":
             raise PermissionError("HOSTILE_MARKER")
@@ -588,18 +597,44 @@ def test_r2_cleanup_failure_after_commit_returns_success_and_stops_growth(bound,
         result = real_link(source, destination, *args, **kwargs)
         if failure == "link-after" and str(destination).endswith(".md"):
             raise OSError("HOSTILE_MARKER")
+        if failure == "grant-exit" and destination.endswith(".md"):
+            linked_message.set()
         return result
+    def stated(name, *args, **kwargs):
+        if name == "grants" and linked_message.is_set():
+            linked_message.clear()
+            raise OSError(errno.EIO, "HOSTILE_MARKER")
+        return os.stat(name, *args, **kwargs)
     monkeypatch.setattr(records, "os", SimpleNamespace(**{**vars(os), "unlink": refused, "link": linked}))
+    if failure == "grant-exit":
+        monkeypatch.setattr(codec_store, "os", SimpleNamespace(**{**vars(os), "stat": stated}))
     published = call(writer, "mailbox_publish_record", request())
     assert not published.get("isError"), published
     assert data(published)["id"]
     assert data(call(reader, "mailbox_read_record", {"message_id": "record-1"}))["from"] == "a/orchestrator"
     if failure == "link-after":
         assert data(call(writer, "mailbox_publish_record", request()))["id"] == data(published)["id"]
+    elif failure == "grant-exit":
+        note = data(published)["note"]
+        assert "<store>/.publish.lock first, then an abandoned <parent>/.records-store.lock" in note
+        assert "HOSTILE_MARKER" not in note
+        inner = root.parent / "mailbox-records" / ".publish.lock"
+        outer = root.parent / ".records-store.lock"
+        assert inner.is_file() and outer.is_file()
+        monkeypatch.setattr(codec_store, "os", os)
+        monkeypatch.setattr(records, "os", os)
+        inner.unlink()
+        ticks = iter((0, 6))
+        with patch.object(records, "time", SimpleNamespace(monotonic=lambda: next(ticks), sleep=lambda _: None)):
+            assert data(call(writer, "mailbox_publish_record", request("second"))) == auth_error("lock")
+        assert outer.is_file()
     else:
         assert data(call(writer, "mailbox_publish_record", request("second"))) == auth_error("lock")
-    assert len(list((root.parent / "mailbox-records").glob("*.json"))) == 1
+    assert len(list((root.parent / "mailbox-records").rglob("*.json"))) == 1
     assert list(writer.checked_mailbox().messages()) == ["record-1"]
+    if failure == "grant-exit":
+        outer.unlink()
+        assert data(call(writer, "mailbox_publish_record", request("second")))["message_id"] == "second"
 
 
 @pytest.mark.parametrize("tool", ["mailbox_read_record", "mailbox_digest"])
@@ -703,7 +738,7 @@ def test_r2_shared_store_serializes_commits_without_patching_the_pinned_writer(b
         assert not first.result(timeout=5).get("isError")
         assert not other.result(timeout=5).get("isError")
     assert mailbox_module.publish_file is pinned_writer
-    assert len(list((root.parent / "mailbox-records").glob("*.json"))) == 2
+    assert len(list((root.parent / "mailbox-records").rglob("*.json"))) == 2
     assert not (root.parent / "mailbox-records" / ".publish.lock").exists()
     assert not (root.parent / "mailbox-records" / ".pending-stub").exists()
 
@@ -971,7 +1006,7 @@ def test_r3_cross_mount_link_stages_in_destination_and_keeps_record_first(bound,
             source_fd, target_fd = kwargs["src_dir_fd"], kwargs["dst_dir_fd"]
             if source_fd != target_fd:
                 raise OSError(errno.EXDEV, "cross-device link")
-            assert len(list((root.parent / "mailbox-records").glob("*.json"))) == 1
+            assert len(list((root.parent / "mailbox-records").rglob("*.json"))) == 1
             assert os.fstat(target_fd).st_ino == (root / "a" / "lane").stat().st_ino
             links.append((source, source_fd, target_fd))
         return real_link(source, target, *args, **kwargs)
@@ -990,10 +1025,12 @@ def test_r3_store_descriptor_alias_identity_is_refused_before_store_binding(boun
     real_open = os.open
     def aliased(path, *args, **kwargs):
         return real_open(target, *args) if path == "mailbox-records" else real_open(path, *args, **kwargs)
-    def forbidden(*args, **kwargs):
-        raise AssertionError("aliased store reached codec binding")
+    class ForbiddenStore(codec.Store):
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("aliased store reached codec binding")
+
     monkeypatch.setattr(records, "os", SimpleNamespace(**{**vars(os), "open": aliased}))
-    toolbox = SimpleNamespace(**{**vars(codec), "Store": forbidden})
+    toolbox = SimpleNamespace(**{**vars(codec), "Store": ForbiddenStore})
     monkeypatch.setattr(records, "codec_tools", lambda: toolbox, raising=True)
     assert data(call(connection(root), "mailbox_publish_record", request())) == codec.CodecError("E_AUTH").as_dict()
 
@@ -1086,7 +1123,7 @@ def test_r4_delegation_and_denials_ignore_unrelated_received_record_bytes(bound,
     unrelated = set()
     for number in range(65):
         unrelated.add(data(call(lead, "mailbox_publish_record", large_request("unrelated-" + str(number))))["id"])
-    assert sum((root.parent / "mailbox-records" / (item + ".json")).stat().st_size for item in unrelated) > codec.MAX_REF_BYTES
+    assert sum((record_path(root.parent / "mailbox-records", item)).stat().st_size for item in unrelated) > codec.MAX_REF_BYTES
     assert not call(lead, "mailbox_publish", {"message_id": "missing-stub", "to": "a/lane/review",
         "type": "info", "body": "aegis-record/1 sha256=" + "0" * 64 + " kind=text"}).get("isError")
     private = data(call(lead, "mailbox_publish_record", request("private", to="a/front-door")))["id"]
@@ -1227,8 +1264,8 @@ raise SystemExit('crash boundary was not reached')
                           json.dumps(request())], capture_output=True, text=True, timeout=20)
     assert run.returncode == 91 and not run.stderr, run.stdout + run.stderr
     store = root.parent / "mailbox-records"
-    [record] = list(store.glob("*.json"))
-    grant = store / (".grants-" + record.stem)
+    [record] = list(store.rglob("*.json"))
+    grant = grant_file(store, record.stem)
     if phase == "before-index":
         assert not grant.exists()
     else:
@@ -1255,7 +1292,7 @@ def test_r4_grants_are_consistent_for_concurrent_publishers(bound):
         results = list(pool.map(lambda endpoint: call(connection(root), "mailbox_publish_record",
             request("to-" + endpoint.rsplit("/", 1)[-1], to=endpoint, content=content)), endpoints))
     assert all(not result.get("isError") for result in results), results
-    entry = grant_entry(root.parent / "mailbox-records" / (".grants-" + rid))
+    entry = grant_entry(grant_file(root.parent / "mailbox-records", rid))
     assert {row["endpoint"] for row in entry["grants"]} == {"a/orchestrator", *endpoints}
     for endpoint in endpoints:
         identifier = "to-" + endpoint.rsplit("/", 1)[-1]
@@ -1269,7 +1306,7 @@ def test_r4_grant_failures_are_bounded_local_and_close_descriptors(bound, monkey
     root, writer, reader = bound
     rid = data(call(writer, "mailbox_publish_record", request()))["id"]
     store = root.parent / "mailbox-records"
-    grant = store / (".grants-" + rid)
+    grant = grant_file(store, rid)
     assert grant.is_file(), "publication did not record its grant index"
     opened, closed, names = [], [], {}
     real_open, real_close, real_fdopen = os.open, os.close, os.fdopen
@@ -1326,7 +1363,7 @@ def test_r4_shared_store_grants_are_scoped_to_each_mailbox_root(bound, monkeypat
         results = list(pool.map(lambda mailbox: data(call(connection(mailbox), "mailbox_publish_record", request())),
                                 (root, second)))
     assert results[0] == results[1]
-    entry = grant_entry(root.parent / "mailbox-records" / (".grants-" + results[0]["id"]))
+    entry = grant_entry(grant_file(root.parent / "mailbox-records", results[0]["id"]))
     assert len(entry["grants"]) == 4
     for mailbox in (root, second):
         assert data(call(connection(mailbox, "a/lane/review"), "mailbox_read_record", {"message_id": "record-1"}))["from"] == "a/orchestrator"
@@ -1358,8 +1395,8 @@ def test_r4_grant_write_fdopen_failure_closes_every_owned_descriptor_and_retries
     assert data(call(writer, "mailbox_publish_record", request())) == codec.CodecError("E_AUTH").as_dict()
     monkeypatch.setattr(records, "os", os)
     assert sorted(opened) == sorted(closed)
-    assert not list((root.parent / "mailbox-records").glob(".grants-*"))
-    assert not list((root.parent / "mailbox-records").glob("*.json"))
+    assert not list((root.parent / "mailbox-records" / "grants").glob(".grants-*"))
+    assert not list((root.parent / "mailbox-records").rglob("*.json"))
     assert "id" in data(call(writer, "mailbox_publish_record", request()))
 
 
@@ -1539,7 +1576,7 @@ def test_r5_publish_output_limit_has_publish_guidance_and_retries(bound, monkeyp
 def test_r5_publish_grant_limit_has_grant_guidance_and_leaves_state_unchanged(bound):
     root, writer, _ = bound
     rid = data(call(writer, "mailbox_publish_record", request("source", to="a/front-door")))["id"]
-    path = root.parent / "mailbox-records" / (".grants-" + rid)
+    path = grant_file(root.parent / "mailbox-records", rid)
     envelope = codec.parse(path.read_bytes())
     entry = envelope["fields"]["value"]
     owner = next(row for row in entry["grants"] if row["endpoint"] == "a/orchestrator")
@@ -1602,8 +1639,8 @@ raise SystemExit('reference update crash boundary was not reached')
                           json.dumps(args), rid], capture_output=True, text=True, timeout=20)
     assert run.returncode == 92 and not run.stderr, run.stdout + run.stderr
     directory = root.parent / "mailbox-records"
-    assert not (directory / (".grants-" + wrapper)).exists(), "wrapper entry was not written last"
-    assert any(row.get("via") == wrapper for row in grant_entry(directory / (".grants-" + rid))["grants"])
+    assert not (grant_file(directory, wrapper)).exists(), "wrapper entry was not written last"
+    assert any(row.get("via") == wrapper for row in grant_entry(grant_file(directory, rid))["grants"])
     (root / ".write.lock").unlink(missing_ok=True)
     assert (directory / ".publish.lock").is_file() and (root.parent / ".records-store.lock").is_file()
     ticks = iter((0, 6))
@@ -1877,7 +1914,7 @@ def test_r6_first_identity_is_installed_only_after_shared_store_accepts(bound, m
         shutil.copytree(root, sibling)
         monkeypatch.setattr(mailbox_module, "timestamp", lambda: "2026-11-12T02:22:00Z")
         rid = data(call(connection(sibling), "mailbox_publish_record", request()))["id"]
-        path = directory / (".grants-" + rid)
+        path = grant_file(directory, rid)
         envelope = codec.parse(path.read_bytes())
         entry = envelope["fields"]["value"]
         scope = entry["grants"][0]["root"]
@@ -2022,7 +2059,8 @@ def test_r7_first_commit_preserves_a_preexisting_shared_store(bound, monkeypatch
     value = codec.compose(args["kind"], args["content"].encode(), {"from": "a/orchestrator", "host": "host-one",
         "session": "a/orchestrator", "created_at": "2026-11-13T05:54:00Z"})
     rid = codec.record_id(value)
-    existing = directory / (rid + ".json" if failure == "tamper" else ".pending-grants")
+    existing = record_path(directory, rid) if failure == "tamper" else directory / "grants" / ".pending-grants"
+    existing.parent.mkdir(mode=0o700)
     existing.write_bytes(b"HOSTILE_MARKER")
     existing.chmod(0o600 if failure == "tamper" else 0o666)
     before = existing.read_bytes()
@@ -2035,23 +2073,40 @@ def test_r7_first_commit_preserves_a_preexisting_shared_store(bound, monkeypatch
     assert data(call(reviewer, "mailbox_read_record", {"message_id": "ungranted"})) == auth_error("reference")
 
 
-def test_r7_failed_first_publisher_cannot_remove_a_concurrent_publishers_store(bound, monkeypatch):
+@pytest.mark.parametrize("failure", ["link", "store-stat"])
+def test_r7_failed_first_publisher_cannot_remove_a_concurrent_publishers_store(bound, monkeypatch, failure):
     root, writer, _ = bound
+    directory = root.parent / "mailbox-records"
     second = root.parent / "second-mailbox"
     shutil.copytree(root, second)
     entered, attempted, release = Event(), Event(), Event()
-    real_open = os.open
+    creations = []
     def opened(path, *args, **kwargs):
-        if path == ".pending-stub" and not entered.is_set():
-            entered.set()
-            assert release.wait(5), "failed publisher latch was not released"
-            raise PermissionError("HOSTILE_MARKER")
         if path == ".records-store.lock" and entered.is_set() and not release.is_set():
             attempted.set()
-        return real_open(path, *args, **kwargs)
-    monkeypatch.setattr(records, "os", SimpleNamespace(**{**vars(os), "open": opened}))
+        return os.open(path, *args, **kwargs)
+    def made(path, *args, **kwargs):
+        os.mkdir(path, *args, **kwargs)
+        if path == directory.name:
+            creations.append(path)
+    def fail_at_boundary():
+        entered.set()
+        assert release.wait(5), "failed publisher latch was not released"
+        raise PermissionError("HOSTILE_MARKER")
+    def stated(path, *args, **kwargs):
+        if failure == "store-stat" and path == directory.name and not entered.is_set():
+            assert directory.is_dir() and (root.parent / ".records-store.lock").is_file()
+            fail_at_boundary()
+        return os.stat(path, *args, **kwargs)
+    def linked(source, target, *args, **kwargs):
+        if failure == "link" and str(target).endswith(".md") and not entered.is_set():
+            fail_at_boundary()
+        return os.link(source, target, *args, **kwargs)
+    monkeypatch.setattr(records, "os", SimpleNamespace(**{**vars(os), "open": opened, "link": linked,
+                                                        "mkdir": made, "stat": stated}))
     with ThreadPoolExecutor(max_workers=2) as pool:
-        failed = pool.submit(call, writer, "mailbox_publish_record", request())
+        args = request(content=json.dumps({"fields": {}, "body": "refused payload", "refs": {}}))
+        failed = pool.submit(call, writer, "mailbox_publish_record", args)
         try:
             assert entered.wait(5)
             successful = pool.submit(call, connection(second), "mailbox_publish_record", request("second"))
@@ -2061,6 +2116,8 @@ def test_r7_failed_first_publisher_cannot_remove_a_concurrent_publishers_store(b
         assert data(failed.result(timeout=10)) == codec.CodecError("E_AUTH").as_dict()
         published = data(successful.result(timeout=10))
     assert not (root / ".root-id").exists() and "id" in published
+    assert creations == [directory.name, directory.name]
+    assert list(directory.rglob("*.json")) == [record_path(directory, published["id"])]
     assert data(call(connection(second, "a/lane/review"), "mailbox_read_record", {"message_id": "second"}))["data"]["body"] == "# Evidence\nHOSTILE_MARKER"
     assert not (root.parent / ".records-store.lock").exists()
 
@@ -2109,7 +2166,7 @@ def test_r8_default_delegated_view_withholds_ungranted_children_per_row(bound, m
     assert full["data"]["body"] == "parent body"
     assert full["data"]["refs"]["private"]["ref"] == leaf[:16]
     assert "refs_withheld" not in full
-    index = root.parent / "mailbox-records" / (".grants-" + leaf)
+    index = grant_file(root.parent / "mailbox-records", leaf)
     original_index = index.read_bytes()
     original_read, reads = codec_store.Store._read_bytes, []
     def read(self, reference, *values, **options):
@@ -2171,7 +2228,7 @@ def test_r8_implicit_expanded_refs_use_the_marked_outline_fallback(bound, monkey
 @pytest.mark.parametrize("tool", ["mailbox_read_record", "mailbox_digest"])
 def test_r8_fallback_does_not_hide_an_authorized_child_integrity_error(bound, tool):
     root, lead, reviewer, leaf, parent, _ = r8_delegated_chain(bound)
-    (root.parent / "mailbox-records" / (leaf + ".json")).write_bytes(b"altered payload")
+    (record_path(root.parent / "mailbox-records", leaf)).write_bytes(b"altered payload")
     args = {"ref": parent} if tool == "mailbox_read_record" else {"refs": [parent]}
     reviewer_result = data(call(reviewer, tool, args))
     view = reviewer_result if tool == "mailbox_read_record" else reviewer_result["records"][0]
@@ -2267,7 +2324,7 @@ def test_mc4b_message_value_and_reference_views_share_request_refusals(bound, mo
         monkeypatch.setattr(mailbox_module, "timestamp", lambda: "2026-11-14T03:18:00.600010Z")
     root, lead, reviewer, leaf, parent, _other = r8_delegated_chain(bound)
     if tamper:
-        (root.parent / "mailbox-records" / (leaf + ".json")).write_bytes(b"TAMPERED_CHILD")
+        (record_path(root.parent / "mailbox-records", leaf)).write_bytes(b"TAMPERED_CHILD")
     reads = _mc4b_count_reads(monkeypatch)
     expected = None if code is None else codec.CodecError(code).as_dict()
     views = {}
@@ -2327,7 +2384,7 @@ def test_mc4b_message_value_and_reference_views_share_request_refusals(bound, mo
 ])
 def test_mc4b_concurrent_malformed_views_do_not_read_a_tampered_child(bound, monkeypatch, options, code):
     root, lead, reviewer, leaf, parent, _other = r8_delegated_chain(bound)
-    (root.parent / "mailbox-records" / (leaf + ".json")).write_bytes(b"TAMPERED_CHILD")
+    (record_path(root.parent / "mailbox-records", leaf)).write_bytes(b"TAMPERED_CHILD")
     reads = _mc4b_count_reads(monkeypatch)
     expected = codec.CodecError(code).as_dict()
     workers = (
@@ -2611,7 +2668,7 @@ def test_mc_records_perf_large_grant_read_bounds_retained_bytes(request, monkeyp
     # lookup and tracemalloc's statistics setup must also precede every start.
     _perf_source_span(records._grant_entry)
     tracemalloc.Snapshot([], _PERF_TRACE_DEPTH).statistics("traceback")
-    grant = root.parent / "mailbox-records" / (".grants-" + rid)
+    grant = grant_file(root.parent / "mailbox-records", rid)
     envelope = codec.parse(grant.read_bytes())
     entry = envelope["fields"]["value"]
     scope = entry["grants"][0]["root"]
@@ -2867,8 +2924,8 @@ def test_mc_records_perf_publish_rollback_restores_original_bytes(bound, monkeyp
     unrelated_content = json.dumps({"fields": {}, "body": "# Evidence\nHOSTILE_MARKER\nunrelated", "refs": {}})
     unrelated = data(call(writer, "mailbox_publish_record", request("unrelated", content=unrelated_content)))
     directory = root.parent / "mailbox-records"
-    source_grant = directory / (".grants-" + source["id"])
-    unrelated_grant = directory / (".grants-" + unrelated["id"])
+    source_grant = grant_file(directory, source["id"])
+    unrelated_grant = grant_file(directory, unrelated["id"])
     original = source_grant.read_bytes()
     unrelated_bytes = unrelated_grant.read_bytes()
     real_link = os.link
@@ -2885,7 +2942,7 @@ def test_mc_records_perf_publish_rollback_restores_original_bytes(bound, monkeyp
     assert "HOSTILE_MARKER" not in failed["content"][0]["text"]
     assert source_grant.read_bytes() == original
     assert unrelated_grant.read_bytes() == unrelated_bytes
-    assert sorted(path.name for path in directory.glob(".grants-*")) == sorted(
+    assert sorted(path.name for path in (directory / "grants").glob(".grants-*")) == sorted(
         [".grants-" + source["id"], ".grants-" + unrelated["id"]])
     assert set(writer.checked_mailbox().messages()) == {"source", "unrelated"}
     monkeypatch.setattr(records, "os", os)
@@ -3900,7 +3957,7 @@ def test_digest_record_retry_identifies_the_failing_reference(bound):
     for name, body in (("small", "small"), ("large", "x" * 65000), ("bad", "bad")):
         identifiers.append(data(call(writer, "mailbox_publish_record", request(name, content=json.dumps({
             "fields": {}, "body": body, "refs": {}}))))["id"])
-    (root.parent / "mailbox-records" / (identifiers[2] + ".json")).write_bytes(b"broken")
+    (record_path(root.parent / "mailbox-records", identifiers[2])).write_bytes(b"broken")
     arguments = {"refs": identifiers, "fields": ["body"], "max_chars": 400}
     refused = data(call(writer, "mailbox_digest", arguments))
     _assert_measured_budget(refused)
@@ -3976,7 +4033,7 @@ def test_digest_received_record_retry_missing_payload_refuses_and_recovers(bound
     _assert_measured_budget(refused)
     retry = refused["error"]["retry"]
     assert retry["tool"] == "mailbox_read_record"
-    payload = root.parent / "mailbox-records" / (published["id"] + ".json")
+    payload = record_path(root.parent / "mailbox-records", published["id"])
     original = payload.read_bytes()
     payload.unlink()
     try:
@@ -4372,24 +4429,24 @@ def test_every_emitted_refusal_names_an_accepted_action(bound, monkeypatch):
             assert not call(reader, tool, dict(arguments, fields=["body"])).get("isError")
 
     base_id = data(call(writer, "mailbox_publish_record", request("base")))["id"]
-    record_path = root.parent / "mailbox-records" / (base_id + ".json")
-    record_bytes = record_path.read_bytes()
+    payload_path = record_path(root.parent / "mailbox-records", base_id)
+    record_bytes = payload_path.read_bytes()
     retry_calls = ((writer, "mailbox_publish_record", request("base")),
                    (reader, "mailbox_read_record", {"message_id": "base"}),
                    (reader, "mailbox_digest", {"limit": 1}))
     for damaged, code, detail in ((b"HOSTILE", "E_HASH", ""),
                                   (b"x" * (codec.MAX_BYTES + 1), "E_LIMIT", "record")):
-        record_path.write_bytes(damaged)
+        payload_path.write_bytes(damaged)
         for who, tool, arguments in retry_calls:
             cover(tool, code, detail, data(call(who, tool, arguments)))
             # Repeating the unchanged damaged record remains a refusal.
             assert data(call(who, tool, arguments))["error"]["code"] == code
-        record_path.write_bytes(record_bytes)
+        payload_path.write_bytes(record_bytes)
         for who, tool, arguments in retry_calls:
             assert not call(who, tool, arguments).get("isError")
 
     real_open, real_fstat = os.open, os.fstat
-    store_identity = record_path.parent.stat()
+    store_identity = payload_path.parent.parent.stat()
 
     def unavailable(path, *args, **kwargs):
         if str(path) == base_id + ".json":
@@ -4596,7 +4653,7 @@ def test_every_emitted_refusal_names_an_accepted_action(bound, monkeypatch):
     assert data(call(writer, "mailbox_read_record", {"message_id": "ref-a", "fields": ["body"]}))["data"]["body"].startswith("REF-BODY-")
 
     original_supported = records.supported
-    monkeypatch.setattr(records, "supported", lambda: False)
+    monkeypatch.setattr(records, "supported", lambda codec: False)
     bare_publish = data(call(writer, "mailbox_publish_record", request("unsupported")))
     cover("mailbox_publish_record", "E_AUTH", "", bare_publish)
     bare_read = data(call(reader, "mailbox_read_record", {"message_id": "base"}))
@@ -4672,7 +4729,7 @@ def test_every_emitted_refusal_names_an_accepted_action(bound, monkeypatch):
     assert "id" in data(call(writer, "mailbox_publish_record", request("too-wide")))
 
     source_id = data(call(writer, "mailbox_publish_record", request("grant-source", to="a/front-door")))["id"]
-    grant_path = root.parent / "mailbox-records" / (".grants-" + source_id)
+    grant_path = grant_file(root.parent / "mailbox-records", source_id)
     grant_bytes = grant_path.read_bytes()
     envelope = codec.parse(grant_bytes)
     entry = envelope["fields"]["value"]
