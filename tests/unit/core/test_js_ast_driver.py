@@ -865,3 +865,54 @@ def test_a_tsx_element_whose_text_starts_like_a_signature_fails_closed(source, c
 @pytest.mark.parametrize('compact', [True, False])
 def test_jsx_that_cannot_be_a_generic_signature_is_still_read(source, compact):
     assert _call_targets(source, 'fixture.tsx', compact)[-1:] == ['eval']
+
+
+# `case` and `default` labels exist only directly inside a switch body.
+@pytest.mark.parametrize('source', [
+    'case { eval(code) }',
+    'default { eval(code) }',
+    'if (x) { case 1: eval(code) }',
+    'switch (x) { case 1: { case 2: eval(code) } }',
+    'switch (x) {} case 1: eval(code)',
+    'switch (x) {} if (y) { case 1: eval(code) }',
+    # A switch head that is not followed by its body does not make a later block a switch body.
+    'switch (a)\nfoo(); { case { eval(code) } }',
+    'switch (a);\nif (b) { case { eval(code) } }',
+    'switch (a)\nfoo()\nwhile (b) { case { eval(code) } }',
+])
+@pytest.mark.parametrize('path', ['fixture.ts', 'fixture.js'])
+@pytest.mark.parametrize('compact', [True, False])
+def test_case_outside_a_switch_body_fails_closed(source, path, compact):
+    assert _lex_reason(source, path, compact) == 'unsupported_lexical_context:case_outside_switch'
+
+
+@pytest.mark.parametrize('source', [
+    'switch (x) { case 1: { break } case 2: eval(code) }',
+    'switch (x) { case 1: f()\n  case 2: eval(code) }',
+    'switch (a) { case 1: switch (b) { case 2: eval(code) } default: }',
+    'switch ({ a: 1 }.a) { default: eval(code) }',
+    'switch (x) /* c */ { case 1: eval(code) }',
+    'switch (x)\n{ case 1: eval(code) }',
+    'class A { m() {}\n  case() { eval(code) } }',
+    'class A { public case() {} m() { eval(code) } }',
+    'class A { default() { eval(code) } }',
+    'const o = { case: eval(code) }',
+    'obj.case(eval(code))',
+    'export default { a: eval(code) }',
+])
+@pytest.mark.parametrize('path', ['fixture.ts', 'fixture.js'])
+@pytest.mark.parametrize('compact', [True, False])
+def test_case_and_default_keep_their_other_meanings(source, path, compact):
+    assert _call_targets(source, path, compact)[-1:] == ['eval']
+
+
+# In an object or type literal `case` and `default` after a line break are member names.
+@pytest.mark.parametrize('source', [
+    'type T = {\n  a: string\n  case: number\n}; eval(code)',
+    'type T = {\n  a: string\n  default: number\n}; eval(code)',
+    'interface I {\n  a: string\n  case: number\n} eval(code)',
+])
+@pytest.mark.parametrize('path', ['fixture.ts', 'fixture.tsx'])
+@pytest.mark.parametrize('compact', [True, False])
+def test_case_and_default_members_after_a_line_break_are_names(source, path, compact):
+    assert _call_targets(source, path, compact)[-1:] == ['eval']

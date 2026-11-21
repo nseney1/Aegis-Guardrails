@@ -103,6 +103,8 @@ class Lexer(JSXScanner):
         self.generator_pending, self.body_generator, self.class_kind = None, False, None
         # Frame depths: generator parameters/bodies, strict class bodies, concise arrows, for-statement heads, TS type literals.
         self.generator_frames, self.strict_frames, self.arrow_markers, self.for_heads, self.type_literals = set(), set(), set(), set(), set()
+        # Switch bodies, switch heads still open, and (depth, token index) of the `)` that closed the last head.
+        self.switch_frames, self.switch_heads, self.switch_close = set(), set(), None
 
     def error(self, reason, offset=None, line=None):
         raise JSLexError(reason, self.line if line is None else line, self.i if offset is None else offset)
@@ -626,7 +628,11 @@ class Lexer(JSXScanner):
             self.expr, self.statement, self.previous = False, False, word
             return
         self.label_pending = self.statement and word not in _NON_LABEL
-        if word == 'case' or (word == 'default' and self.previous != 'export' and self.statement):
+        # `case` and `default` label only a switch body; in a class body `case() {}` names a method.
+        if (word == 'case' or (word == 'default' and self.previous != 'export' and self.statement)) and not self.class_body():
+            # In an object or type literal it is a member name after ASI: `type T = {` + `a: string` + `case: number }`.
+            if len(self.frames) not in self.switch_frames and not (self.frames and self.frames[-1][1] == 'object'):
+                self.error('unsupported_lexical_context:case_outside_switch')
             self.case_pending = True
         if word in ('import', 'export') and self.statement:
             self.module_clause = word
@@ -804,7 +810,7 @@ class Lexer(JSXScanner):
             if not self.frames or self.frames[-1][0] != ch:
                 self.error('syntax:unbalanced_delimiter')
             _, role, resume = self.frames.pop()
-            if role.startswith('parameters_') or self.generator_frames or self.strict_frames or self.for_heads or self.arrow_markers or self.type_literals:
+            if role.startswith('parameters_') or self.generator_frames or self.strict_frames or self.for_heads or self.arrow_markers or self.type_literals or self.switch_frames or self.switch_heads:
                 self.close_context(role)
             if role in ('class_decl', 'class_expr'):
                 del self.class_fields[len(self.frames) + 1]
@@ -864,6 +870,14 @@ class Lexer(JSXScanner):
         depth = len(self.frames)
         if role == 'control' and self.previous == 'for':
             self.for_heads.add(depth)
+        if role == 'control' and self.previous == 'switch':
+            self.switch_heads.add(depth)
+        elif ch == '{' and self.switch_close and self.switch_close[0] == depth:
+            before = len(self.tokens) - 2  # the `{` is tokens[-1]; its body must follow the head's `)` directly
+            while before >= 0 and self.tokens[before].kind == 'comment':
+                before -= 1
+            if self.switch_close[1] == before:
+                self.switch_frames.add(depth)
         if role.startswith('parameters_') and self.generator_pending == depth - 1:
             self.generator_frames.add(depth)
             self.generator_pending = None
@@ -885,6 +899,10 @@ class Lexer(JSXScanner):
         self.for_heads.discard(depth)
         self.arrow_markers.discard(depth)
         self.type_literals.discard(depth)
+        self.switch_frames.discard(depth)
+        if role == 'control' and depth in self.switch_heads:
+            self.switch_heads.discard(depth)
+            self.switch_close = (depth, len(self.tokens))  # the index the closing `)` is about to take
 
     def after_operator(self, operator):
         depth = len(self.frames)
