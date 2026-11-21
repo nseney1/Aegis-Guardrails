@@ -193,7 +193,7 @@ class Lexer(JSXScanner, TypePositions):
                 if syntax_word:
                     self.after_word(value)
                 else:
-                    self.label_pending, self.expr, self.statement = self.statement and role != 'reference', False, False
+                    self.label_pending, self.expr, self.statement = (self.statement or self.colon_next() and self.asi_start()) and role != 'reference', False, False
                     self.declaration_prefix, self.previous = False, value.rsplit('.', 1)[-1] if dotted else value
                 if end != match_end:
                     return
@@ -612,6 +612,25 @@ class Lexer(JSXScanner, TypePositions):
         if self.class_fields.get(depth) and not self.expr and self.tokens and self.tokens[-1].line < self.line and word not in ('in', 'instanceof'):
             self.class_fields[depth] = False
 
+    def colon_next(self):
+        """Whether a `:` follows the word just read (whitespace and comments aside): only then can it be a label."""
+        return self.source.startswith(':', self.after_trivia(self.i))
+
+    def asi_start(self):
+        """Whether the word just emitted starts a statement because a line break ended the previous one (ASI).
+
+        Labels and `default:` there (`f()` + `foo: { … }`) must still read the block after them as code.
+        """
+        tokens, before = self.tokens, len(self.tokens) - 2
+        while before >= 0 and tokens[before].kind == 'comment':
+            before -= 1
+        if before < 0 or tokens[before].line == tokens[-1].line:
+            return False
+        if self.frames and not (self.frames[-1][1] == 'block' or self.frames[-1][1].startswith('function_')):
+            return False
+        return (self.line_break(tokens[before].end, tokens[-1].start)
+                and (tokens[before].value in ('return', 'yield') or self.operand_end(before)))
+
     def class_body(self):
         """Directly inside a class body and outside a field initializer, where no statement can start."""
         return bool(self.frames) and self.frames[-1][1] in ('class_decl', 'class_expr') and not self.class_fields.get(len(self.frames))
@@ -634,9 +653,11 @@ class Lexer(JSXScanner, TypePositions):
         if self.tokens[-1].role in ('module_binding', 'property_name'):
             self.expr, self.statement, self.previous = False, False, word
             return
-        self.label_pending = self.statement and word not in _NON_LABEL
+        start = self.statement or (word == 'default' or self.colon_next()) and self.asi_start()
+        # `await`, `yield` and `let` are labels in scripts: `await: { … }`.
+        self.label_pending = start and (word not in _NON_LABEL or word in _CONTEXTUAL_OPERANDS)
         # `case` and `default` label only a switch body; in a class body `case() {}` names a method.
-        if (word == 'case' or (word == 'default' and self.previous != 'export' and self.statement)) and not self.class_body():
+        if (word == 'case' or (word == 'default' and self.previous != 'export' and start)) and not self.class_body():
             # In an object or type literal it is a member name after ASI: `type T = {` + `a: string` + `case: number }`.
             if len(self.frames) not in self.switch_frames and not (self.frames and self.frames[-1][1] == 'object'):
                 self.error('unsupported_lexical_context:case_outside_switch')

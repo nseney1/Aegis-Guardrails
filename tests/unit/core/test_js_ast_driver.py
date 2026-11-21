@@ -907,7 +907,6 @@ def test_case_outside_a_switch_body_fails_closed(source, path, compact):
 def test_case_and_default_keep_their_other_meanings(source, path, compact):
     assert _call_targets(source, path, compact)[-1:] == ['eval']
 
-
 # In an object or type literal `case` and `default` after a line break are member names.
 @pytest.mark.parametrize('source', [
     'type T = {\n  a: string\n  case: number\n}; eval(code)',
@@ -1029,8 +1028,61 @@ def test_a_type_literal_after_a_type_operator_in_a_type_position_keeps_following
 def test_a_leading_colon_is_lexed_without_an_index_error(source, path, compact):
     assert _call_targets(source, path, compact) == []
 
-
 # A long run of postfix operators before a type operator is walked without recursion.
 @pytest.mark.parametrize('compact', [True, False])
 def test_a_long_postfix_run_before_a_type_operator_does_not_recurse(compact):
     assert _call_targets('y = x' + '!' * 5000 + ' as { a: 1 }; eval(code)', 'fixture.ts', compact)[-1:] == ['eval']
+
+
+# A line break that ends a statement (ASI) starts a new one, so a label or `default:` there labels the
+# block after it, which must be read as code.
+@pytest.mark.parametrize('source', [
+    'switch (x) {\n  case 1:\n    f()\n  default: { eval(code) }\n}',
+    'switch (x) {\n  case 1:\n    f()\n  default:\n    { eval(code) }\n}',
+    'x = 1\nfoo: { eval(code) }',
+    'f()\nfoo: { eval(code) }',
+    'x = a\n// c\nfoo: { eval(code) }',
+    'x = y++\nfoo: { eval(code) }',
+    'x = function () {}\nfoo: { eval(code) }',
+    'function g() {\n  return\n  foo: { eval(code) }\n}',
+    'function* g() {\n  yield\n  foo: { eval(code) }\n}',
+    'await: { eval(code) }',
+    'yield: { eval(code) }',
+    'let: { eval(code) }',
+    'if (c) {\n  x = 1\n  foo: { eval(code) }\n}',
+])
+@pytest.mark.parametrize('path', ['fixture.js', 'fixture.ts', 'fixture.tsx'])
+@pytest.mark.parametrize('compact', [True, False])
+def test_a_label_after_a_line_break_labels_a_block(source, path, compact):
+    assert _call_targets(source, path, compact)[-1:] == ['eval']
+
+
+@pytest.mark.parametrize('source', [
+    'x = 1\nfoo: { const e = <b>{eval(code)}</b> }',
+    'switch (x) {\n  case 1:\n    f()\n  default: {\n    const e = <b>{eval(code)}</b>\n  }\n}',
+])
+@pytest.mark.parametrize('compact', [True, False])
+def test_a_label_after_a_line_break_is_no_tsx_annotation(source, compact):
+    assert _call_targets(source, 'fixture.tsx', compact)[-1:] == ['eval']
+
+
+@pytest.mark.parametrize('source', ['x\ndefault: { eval(code) }', 'f()\ndefault { eval(code) }'])
+@pytest.mark.parametrize('path', ['fixture.js', 'fixture.ts'])
+@pytest.mark.parametrize('compact', [True, False])
+def test_default_after_a_line_break_outside_a_switch_fails_closed(source, path, compact):
+    assert _lex_reason(source, path, compact) == 'unsupported_lexical_context:case_outside_switch'
+
+
+# A colon after a line break inside an object, a ternary, a type or a class member is no label.
+@pytest.mark.parametrize('source,path', [
+    ('const o = {\n  a: 1,\n  b: { c: eval(code) }\n}', 'fixture.js'),
+    ('x = c\n  ? a\n  : { k: eval(code) }', 'fixture.js'),
+    ('const f = (\n  a,\n  b\n) => { eval(code) }', 'fixture.js'),
+    ('type A = {\n  a: number\n  b: { c: readonly { d: 1 }[] }\n}; eval(code)', 'fixture.ts'),
+    ('interface I {\n  a: number\n  b: readonly { c: 1 }[]\n} eval(code)', 'fixture.ts'),
+    ('class A {\n  x = 1\n  y: readonly { a: 1 }[] = z\n  m() { eval(code) }\n}', 'fixture.ts'),
+    ('function f(\n  a: number,\n  b: readonly { c: 1 }[]\n) { eval(code) }', 'fixture.ts'),
+])
+@pytest.mark.parametrize('compact', [True, False])
+def test_a_colon_after_a_line_break_in_an_object_type_or_class_is_no_label(source, path, compact):
+    assert _call_targets(source, path, compact)[-1:] == ['eval']
