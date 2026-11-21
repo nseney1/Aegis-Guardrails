@@ -899,7 +899,7 @@ def test_read_context_failure_accounting_and_repair(tmp_path, failure):
         rid = store.write(value)
         facts = {"author": value["meta"], "kind": value["kind"]}
         context = codec.ReadContext(store, lambda reference: facts)
-        path = tmp_path / (rid + ".json")
+        path = tmp_path / rid[:2] / (rid + ".json")
         if failure == "hash":
             path.write_bytes(b"x" * len(raw(value)))
         elif failure == "metadata":
@@ -982,7 +982,7 @@ def test_read_context_budget_aliases_preserve_verification_and_exact_charges(tmp
         assert len(encoded) == 162
         content = encoded if payload == "valid" else b"{}"
         rid = hashlib.sha256(b"[]" if payload == "hash" else content).hexdigest()
-        (tmp_path / (rid + ".json")).write_bytes(content)
+        _seed_record_path(tmp_path, rid).write_bytes(content)
         context = codec.ReadContext(store, lambda reference: {"author": value["meta"], "kind": "text"})
         context.io.limit = len(content)
         ancestor = codec.Budget(len(content))
@@ -1160,9 +1160,13 @@ def test_r9_replay_refusal_does_not_partially_charge_a_view_chain(tmp_path):
 
 
 def _store_supported():
-    capabilities = {function.__name__ for function in os.supports_dir_fd}
-    return ({"open", "stat", "link", "unlink"} <= capabilities and
-            hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY"))
+    return codec.Store.supported()
+
+
+def _seed_record_path(root, rid):
+    shard = root / rid[:2]
+    shard.mkdir(mode=0o700, exist_ok=True)
+    return shard / (rid + ".json")
 
 
 def make_store(root, *, fixture_owned=False):
@@ -1364,14 +1368,14 @@ def test_e_hash(tmp_path, case):
     store = make_store(tmp_path)
     value = record(body=MARKER)
     rid = store.write(value)
-    path = tmp_path / (rid + ".json")
+    path = tmp_path / rid[:2] / (rid + ".json")
     if case == "existing_oversized":
         path.write_bytes(MARKER.encode() + b" " * 262144)
     elif case in ("tampered", "existing"):
         path.write_bytes(raw(record(body=MARKER + "changed")))
     else:
         rid = "b" * 64
-        (tmp_path / (rid + ".json")).write_bytes(raw(value))
+        _seed_record_path(tmp_path, rid).write_bytes(raw(value))
     assert_error("E_HASH", lambda: store.write(value) if case.startswith("existing") else store.read(rid))
 
 
@@ -1390,7 +1394,7 @@ def test_e_selector(selectors):
 def test_e_ref(tmp_path, reference):
     # Controlled filenames deliberately test prefix resolution separately from read verification.
     for suffix in ("a" * 48, "b" * 48):
-        (tmp_path / ("1" * 16 + suffix + ".json")).write_text(MARKER)
+        _seed_record_path(tmp_path, "1" * 16 + suffix).write_text(MARKER)
     message = ("reference not found or ambiguous; use the full id or a longer handle"
                if reference in ("f" * 16, "1" * 16) else "handle must be 16-64 lowercase hex")
     assert_error("E_REF", lambda: make_store(tmp_path).resolve(reference), message)
@@ -1423,7 +1427,7 @@ def test_e_auth(tmp_path, case):
         rid = hashlib.sha256(raw(value)).hexdigest()
         target = outside / "target"
         target.write_bytes(raw(value))
-        symlink_or_skip(target, root / (rid + ".json"))
+        symlink_or_skip(target, _seed_record_path(root, rid))
         store = make_store(root)
         assert_error("E_AUTH", lambda: store.read(rid))
         assert_error("E_AUTH", lambda: store.write(value))
@@ -1498,7 +1502,7 @@ def test_store_idempotent_verify_on_every_read(tmp_path):
     store = make_store(tmp_path)
     value = record(body="café")
     rid = store.write(value)
-    path = tmp_path / (rid + ".json")
+    path = tmp_path / rid[:2] / (rid + ".json")
     before = path.stat()
     assert store.write(value) == rid
     assert path.stat().st_ino == before.st_ino
@@ -1506,7 +1510,8 @@ def test_store_idempotent_verify_on_every_read(tmp_path):
     assert store.read(rid[:16]) == value
     assert store.resolve(rid[:20]) == rid
     assert store.resolve(rid) == rid
-    assert sorted(p.name for p in tmp_path.iterdir()) == [rid + ".json"]
+    assert list(tmp_path.iterdir()) == [path.parent]
+    assert list(path.parent.iterdir()) == [path]
     path.write_bytes(b"HOSTILE_MARKER")
     assert_error("E_HASH", lambda: store.read(rid))
 
@@ -1515,12 +1520,12 @@ def test_store_checks_size_before_read_and_canonical_after_hash(tmp_path):
     store = make_store(tmp_path)
     payload = b" " * 262145
     rid = hashlib.sha256(payload).hexdigest()
-    path = tmp_path / (rid + ".json")
+    path = _seed_record_path(tmp_path, rid)
     path.write_bytes(payload)
     assert_record_limit(lambda: store.read(rid))
     payload = raw(record()) + b"\n"
     rid = hashlib.sha256(payload).hexdigest()
-    (tmp_path / (rid + ".json")).write_bytes(payload)
+    _seed_record_path(tmp_path, rid).write_bytes(payload)
     assert_error("E_FORMAT", lambda: store.read(rid))
 
 
@@ -1764,7 +1769,7 @@ def test_replaced_store_identity_and_nonregular_record_are_refused(tmp_path):
     root.rename(tmp_path / "original")
     root.mkdir(mode=0o700)
     assert_error("E_AUTH", lambda: store.read(rid))
-    (root / (rid + ".json")).mkdir(mode=0o700)
+    _seed_record_path(root, rid).mkdir(mode=0o700)
     assert_error("E_AUTH", lambda: make_store(root).read(rid))
 
 
@@ -1902,9 +1907,9 @@ def test_class_b_publication_verifies_destination(tmp_path, monkeypatch, race):
         real_link = os.link
 
         def substituted(source, destination, *args, **kwargs):
-            path = tmp_path / Path(source).name
+            path = tmp_path / codec.record_id(value)[:2] / source
             if race == "replace":
-                replacement = tmp_path / "replacement"
+                replacement = path.with_name("replacement")
                 replacement.write_bytes(forged)
                 replacement.replace(path)
             else:
@@ -1913,7 +1918,7 @@ def test_class_b_publication_verifies_destination(tmp_path, monkeypatch, race):
 
         monkeypatch.setattr(os, "link", substituted)
         assert_error("E_HASH", lambda: store.write(value))
-        assert not list(tmp_path.glob(".msg-*"))
+        assert not list(tmp_path.glob("*/.msg-*"))
 
 
 @pytest.mark.parametrize("operation", ["read", "write"])
@@ -1923,7 +1928,7 @@ def test_class_b_entry_operations_use_anchored_directory(tmp_path, monkeypatch, 
             pytest.skip("anchored store operations unavailable on this platform (end-of-build platform pass)")
         value = record(body=MARKER)
         rid = hashlib.sha256(raw(value)).hexdigest()
-        (tmp_path / (rid + ".json")).write_bytes(raw(value))
+        _seed_record_path(tmp_path, rid).write_bytes(raw(value))
         real_open, opened, directories = os.open, [], []
 
         def observed(path, flags, *args, **kwargs):
@@ -2171,7 +2176,7 @@ def test_r3_class_b_validation_is_identical_across_store_paths(tmp_path, part, b
     value = dict(record(), **{part: bad})
     payload = raw(value)
     rid = hashlib.sha256(payload).hexdigest()
-    (tmp_path / (rid + ".json")).write_bytes(payload)
+    _seed_record_path(tmp_path, rid).write_bytes(payload)
     parent = dict(record(), refs={"child": rid})
     for action in (lambda: store.read(rid), lambda: store.describe(rid),
                    lambda: store.read(store.resolve(rid[:16])),
@@ -2197,16 +2202,21 @@ def test_r3_class_c_link_count_change_is_not_tampering(tmp_path, monkeypatch):
         value = record(body=MARKER)
         rid = store.write(value)
         alias = tmp_path / "temporary-hard-link"
-        os.link(tmp_path / (rid + ".json"), alias)
-        original, calls = os.fstat, []
+        path = tmp_path / rid[:2] / (rid + ".json")
+        identity = path.stat()
+        os.link(path, alias)
+        calls = []
 
         def observed(fd):
-            calls.append(fd)
-            if len(calls) == 3:
-                alias.unlink()
-            return original(fd)
+            info = os.fstat(fd)
+            if (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino):
+                calls.append(fd)
+                if len(calls) == 2:
+                    alias.unlink()
+                    return os.fstat(fd)
+            return info
 
-        monkeypatch.setattr(os, "fstat", observed)
+        monkeypatch.setattr(codec_store, "os", _store_os(os, fstat=observed))
         assert store.read(rid) == value
         assert not alias.exists()
 
@@ -2230,17 +2240,19 @@ def test_r3_class_c_prefix_lookup_ignores_foreign_entries(tmp_path, monkeypatch,
 def test_r3_class_c_cleanup_preserves_original_error(tmp_path, monkeypatch, failure):
     with monkeypatch.context() as monkeypatch:
         store = make_store(tmp_path)
+        rid = codec.record_id(record())
         original_link, original_fsync = os.link, os.fsync
 
         def forged(source, destination, *args, **kwargs):
-            (tmp_path / Path(source).name).write_bytes(b"HOSTILE_MARKER")
+            (tmp_path / rid[:2] / source).write_bytes(b"HOSTILE_MARKER")
             return original_link(source, destination, *args, **kwargs)
 
         def denied_unlink(*args, **kwargs):
             raise OSError("HOSTILE_MARKER unlink")
 
         def denied_fsync(fd):
-            if fd == store.fd:
+            info = os.fstat(fd)
+            if fd != store.fd and stat.S_ISDIR(info.st_mode):
                 raise OSError("HOSTILE_MARKER fsync")
             return original_fsync(fd)
 
@@ -2305,11 +2317,11 @@ def test_r4_class_b_child_failure_is_total(tmp_path, damage, code):
     store = make_store(tmp_path)
     rid = "a" * 64
     if damage == "hash":
-        (tmp_path / (rid + ".json")).write_text(MARKER)
+        _seed_record_path(tmp_path, rid).write_text(MARKER)
     elif damage == "schema":
         payload = raw(dict(record(), body=1))
         rid = hashlib.sha256(payload).hexdigest()
-        (tmp_path / (rid + ".json")).write_bytes(payload)
+        _seed_record_path(tmp_path, rid).write_bytes(payload)
     parent = dict(record(), refs={"child": rid})
     message = "reference not found or ambiguous; use the full id or a longer handle" if code == "E_REF" else None
     assert_error(code, lambda: codec.read_view(parent, store=store), message)
@@ -2465,7 +2477,7 @@ def test_real_leaf_replacement_before_open_binds_current_entry(tmp_path, monkeyp
             value = record(body="current real entry at leaf open")
             rid = store.write(value)
             assert store.read(rid) == value
-            assert (root / (rid + ".json")).read_bytes() == raw(value)
+            assert (root / rid[:2] / (rid + ".json")).read_bytes() == raw(value)
         finally:
             store.close()
         assert swapped
@@ -3483,7 +3495,7 @@ def test_r9_class_d_descriptions_verify_each_call_and_detect_tampering(tmp_path,
         assert codec.read_view(parent, store=store) == first
         assert len(calls) == 8
         rid = refs["r0"]
-        (tmp_path / (rid + ".json")).write_bytes(raw(record(body="tamper")))
+        (tmp_path / rid[:2] / (rid + ".json")).write_bytes(raw(record(body="tamper")))
         assert_error("E_HASH", lambda: codec.read_view(parent, store=store))
 
 
@@ -3495,7 +3507,7 @@ def test_r9_class_d_descriptions_recheck_entry_identity(tmp_path, damage):
     descriptor = store.describe(rid)
     descriptor["kind"] = "forged by caller"
     assert store.describe(rid)["kind"] == "text"
-    path = tmp_path / (rid + ".json")
+    path = tmp_path / rid[:2] / (rid + ".json")
     if damage == "same_size":
         path.write_bytes(raw(record(body="tampered")))
     else:
@@ -3537,7 +3549,7 @@ def test_r9_class_d_md_collection_honors_callers_budget():
 def test_r9_class_e_reference_resolution_has_specific_fixed_next_action(tmp_path, reference):
     if len(reference) == 16:
         for suffix in ("a" * 48, "b" * 48):
-            (tmp_path / (reference + suffix + ".json")).write_text(MARKER)
+            _seed_record_path(tmp_path, reference + suffix).write_text(MARKER)
     assert_error("E_REF", lambda: make_store(tmp_path).resolve(reference),
                  "reference not found or ambiguous; use the full id or a longer handle")
 
@@ -3594,7 +3606,7 @@ def test_r10_close_release_error_invalidates_before_fd_reuse(tmp_path, monkeypat
         store = make_store(root)
         value = record(body=MARKER)
         rid = store.write(value)
-        (outside / (rid + ".json")).write_bytes(raw(value))
+        _seed_record_path(outside, rid).write_bytes(raw(value))
         fd = store.fd
         action = (lambda: store.write(record(body="new"))) if operation == "write" else (
             lambda: store.resolve(rid[:16])) if operation == "scan" else lambda: getattr(store, operation)(rid)
@@ -3819,7 +3831,7 @@ def test_coord1_argon1_unchanged_stamp_never_bypasses_verification(tmp_path, mon
     rid = store.write(record(body="original"))
     parent = dict(record(), refs={"child": rid})
     store.describe(rid)
-    path = tmp_path / (rid + ".json")
+    path = tmp_path / rid[:2] / (rid + ".json")
     stamp = path.stat()
     path.write_bytes(raw(record(body="tampered")))
     real_stat, real_fstat = os.stat, os.fstat
@@ -3980,7 +3992,8 @@ def test_coord3_store_deleted_or_replaced_root_is_access_failure(tmp_path, state
     value = record(body="bound root")
     rid = store.write(value)
     if state == "deleted":
-        (root / (rid + ".json")).unlink()
+        (root / rid[:2] / (rid + ".json")).unlink()
+        (root / rid[:2]).rmdir()
         root.rmdir()
     else:
         root.rename(tmp_path / "original")
@@ -4002,7 +4015,7 @@ def test_coord3_store_enoent_maps_by_operation(tmp_path, monkeypatch, step):
     rid = store.write(record()) if step in ("store_scan", "root_stat", "root_deleted_during_lookup") else None
     with monkeypatch.context() as patch:
         def opened(path, *args, **kwargs):
-            if (step == "temp_create" and str(path).startswith(".msg-")) or (step == "store_scan" and path == "."):
+            if (step == "temp_create" and str(path).startswith(".msg-")) or (step == "store_scan" and path == rid[:2]):
                 raise FileNotFoundError(errno.ENOENT, MARKER)
             return real_open(path, *args, **kwargs)
         def linked(source, target, *args, **kwargs):
@@ -4016,7 +4029,8 @@ def test_coord3_store_enoent_maps_by_operation(tmp_path, monkeypatch, step):
             if step == "root_stat" and path == store.root:
                 raise FileNotFoundError(errno.ENOENT, MARKER)
             if step == "root_deleted_during_lookup" and path == rid + ".json":
-                os.unlink(path, dir_fd=store.fd)
+                os.unlink(path, dir_fd=kwargs["dir_fd"])
+                (root / rid[:2]).rmdir()
                 root.rmdir()
             return real_stat(path, *args, **kwargs)
         patch.setattr(os, "open", opened)
@@ -4033,7 +4047,7 @@ def test_coord3_store_intact_unknown_and_ambiguous_refs_stay_e_ref(tmp_path, ref
     store = make_store(tmp_path)
     if len(reference) == 16:
         for suffix in ("a" * 48, "b" * 48):
-            (tmp_path / (reference + suffix + ".json")).write_text(MARKER)
+            _seed_record_path(tmp_path, reference + suffix).write_text(MARKER)
     assert_error("E_REF", lambda: store.resolve(reference),
                  "reference not found or ambiguous; use the full id or a longer handle")
 
@@ -4490,8 +4504,12 @@ def _store_os(base, **overrides):
         "stat": base.stat,
         "scandir": base.scandir,
         "link": base.link,
+        "mkdir": base.mkdir,
         "fsync": base.fsync,
         "unlink": base.unlink,
+        "supports_dir_fd": base.supports_dir_fd,
+        "supports_fd": base.supports_fd,
+        "supports_follow_symlinks": base.supports_follow_symlinks,
     }
     if hasattr(base, "O_NONBLOCK"):
         copied["O_NONBLOCK"] = base.O_NONBLOCK
@@ -4499,6 +4517,107 @@ def _store_os(base, **overrides):
         copied["O_BINARY"] = base.O_BINARY
     copied.update(overrides)
     return SimpleNamespace(**copied)
+
+
+def test_rf44_prefix_scans_only_its_shard(tmp_path, monkeypatch):
+    value = record(body="selected shard")
+    with closing(make_store(tmp_path)) as store:
+        rid = store.write(value)
+        other = "00" if rid[:2] != "00" else "ff"
+        (tmp_path / other).mkdir(mode=0o700)
+        scans = []
+
+        def scan(fd):
+            info = os.fstat(fd)
+            scans.append((info.st_dev, info.st_ino))
+            return os.scandir(fd)
+
+        monkeypatch.setattr(codec_store, "os", _store_os(os, scandir=scan))
+        assert store.read(rid) == value
+        assert scans == []
+        assert store.read(rid[:16]) == value
+        info = (tmp_path / rid[:2]).stat()
+        assert scans == [(info.st_dev, info.st_ino)]
+        assert (tmp_path / rid[:2] / (rid + ".json")).read_bytes() == raw(value)
+
+
+def test_rf44_refuses_flat_store_on_bind(tmp_path):
+    value = record()
+    path = tmp_path / (codec.record_id(value) + ".json")
+    path.write_bytes(raw(value))
+    with pytest.raises(codec.CodecError) as caught:
+        with closing(make_store(tmp_path)):
+            pytest.fail("bound a flat message store")
+    assert caught.value.as_dict() == {"error": {"code": "E_AUTH", "message":
+        "flat message store layout is unsupported; use a new empty store directory"}}
+    assert path.read_bytes() == raw(value)
+    assert list(tmp_path.iterdir()) == [path]
+
+
+@pytest.mark.parametrize("replacement", ["directory", "symlink"])
+@pytest.mark.parametrize("action", ["read", "write"])
+def test_rf44_shard_replacement_between_stat_and_open_refuses(tmp_path, monkeypatch, replacement, action):
+    root, outside, parked = (tmp_path / name for name in ("store", "outside", "parked"))
+    root.mkdir(mode=0o700)
+    outside.mkdir(mode=0o700)
+    value = record(body="original shard")
+    rid = codec.record_id(value)
+    shard = root / rid[:2]
+    record_name = rid + ".json"
+    with closing(make_store(root)) as store:
+        shard.mkdir(mode=0o700)
+        if action == "read":
+            (shard / record_name).write_bytes(raw(value))
+        swapped = []
+
+        def opened(name, flags, *args, **kwargs):
+            if name == rid[:2] and not swapped:
+                assert kwargs["dir_fd"] == store.fd
+                assert flags & os.O_DIRECTORY and flags & os.O_NOFOLLOW
+                shard.rename(parked)
+                if replacement == "directory":
+                    shard.mkdir(mode=0o700)
+                else:
+                    symlink_or_skip(outside, shard, target_is_directory=True)
+                swapped.append(True)
+            return os.open(name, flags, *args, **kwargs)
+
+        operation = (lambda: store.read(rid[:16])) if action == "read" else lambda: store.write(value)
+        monkeypatch.setattr(codec_store, "os", _store_os(os, open=opened))
+        assert_error("E_AUTH", operation)
+        assert swapped == [True]
+        assert list(shard.iterdir()) == []
+        assert list(outside.iterdir()) == []
+        if replacement == "symlink":
+            shard.unlink()
+        else:
+            shard.rmdir()
+        parked.rename(shard)
+        assert operation() == (value if action == "read" else rid)
+
+
+@pytest.mark.parametrize("missing", ["mkdir", "scandir"])
+def test_rf44_requires_shard_descriptor_capabilities(tmp_path, monkeypatch, missing):
+    def forbidden(*args, **kwargs):
+        pytest.fail("unsupported shard capability reached descriptor open")
+
+    capabilities = {os.open, os.stat, os.link, os.unlink, os.mkdir}
+    if missing == "mkdir":
+        capabilities.remove(os.mkdir)
+    local_os = SimpleNamespace(
+        supports_dir_fd=capabilities,
+        supports_fd=set() if missing == "scandir" else {os.scandir},
+        supports_follow_symlinks={os.stat},
+        O_DIRECTORY=getattr(os, "O_DIRECTORY", 0),
+        O_NOFOLLOW=getattr(os, "O_NOFOLLOW", 0),
+        geteuid=lambda: 0,
+        open=forbidden,
+        close=os.close,
+        fstat=os.fstat,
+        stat=os.stat,
+    )
+    monkeypatch.setattr(codec_store, "os", local_os)
+    assert_error("E_AUTH", lambda: codec.Store(tmp_path))
 
 
 @pytest.mark.parametrize("failure", [None, "unlink", "directory-sync"])
@@ -4509,8 +4628,11 @@ def test_rf43_write_syncs_directory_after_staging_removal(tmp_path, monkeypatch,
     faults = {failure}
     with closing(make_store(tmp_path)) as store:
         def fsync(fd):
-            if stat.S_ISDIR(os.fstat(fd).st_mode):
-                events.append(("directory-sync", tuple(sorted(p.name for p in tmp_path.iterdir()))))
+            if fd == store.fd:
+                events.append(("root-sync",))
+            elif stat.S_ISDIR(os.fstat(fd).st_mode):
+                shard = tmp_path / rid[:2]
+                events.append(("shard-sync", tuple(sorted(p.name for p in shard.iterdir()))))
                 if "directory-sync" in faults:
                     faults.remove("directory-sync")
                     raise OSError(errno.EIO, MARKER)
@@ -4530,9 +4652,9 @@ def test_rf43_write_syncs_directory_after_staging_removal(tmp_path, monkeypatch,
             assert store.write(value) == rid
         else:
             assert_error("E_AUTH", lambda: store.write(value), _OPERATION)
-        expected = [("file-sync",), ("unlink",), ("directory-sync", (rid + ".json",))]
+        expected = [("root-sync",), ("file-sync",), ("unlink",), ("shard-sync", (rid + ".json",))]
         if failure == "unlink":
-            expected.insert(2, ("unlink",))
+            expected.insert(3, ("unlink",))
         if failure == "directory-sync":
             expected.append(expected[-1])
         assert events == expected
@@ -4544,10 +4666,12 @@ def test_rf43_write_syncs_directory_after_staging_removal(tmp_path, monkeypatch,
 def test_rf43_competing_publications_each_sync_once(tmp_path, monkeypatch):
     value = record(body="overlapping publication")
     rid = codec.record_id(value)
-    directory_syncs = []
+    directory_syncs, links = [], []
     with closing(make_store(tmp_path)) as writer, closing(make_store(tmp_path)) as peer:
         def link(source, target, *, src_dir_fd, dst_dir_fd, follow_symlinks):
-            if src_dir_fd == writer.fd:
+            assert src_dir_fd == dst_dir_fd
+            links.append(src_dir_fd)
+            if len(links) == 1:
                 assert peer.write(value) == rid
             os.link(source, target, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd,
                     follow_symlinks=follow_symlinks)
@@ -4559,9 +4683,12 @@ def test_rf43_competing_publications_each_sync_once(tmp_path, monkeypatch):
 
         monkeypatch.setattr(codec_store, "os", _store_os(os, fsync=fsync, link=link))
         assert writer.write(value) == rid
-        assert directory_syncs == [peer.fd, writer.fd]
+        first_shardfd, peer_shardfd = links
+        assert first_shardfd != peer_shardfd
+        assert directory_syncs == [writer.fd, peer.fd, peer_shardfd, first_shardfd]
         assert writer.read(rid) == peer.read(rid) == value
-        assert [p.name for p in tmp_path.iterdir()] == [rid + ".json"]
+        assert [p.relative_to(tmp_path).as_posix() for p in tmp_path.glob("*/*")] == [
+            rid[:2] + "/" + rid + ".json"]
 
 
 @contextmanager
@@ -5102,6 +5229,7 @@ def test_store_write_raw_descriptor_has_one_closer(tmp_path, monkeypatch, failur
     root.mkdir(mode=0o700)
     store = make_store(root, fixture_owned=True)
     value = record(body="closer-" + failure)
+    shard = root / codec.record_id(value)[:2]
     ledger = _watch_store_descriptors(monkeypatch, failure)
     rows, bad = ledger.rows, ledger.bad
     try:
@@ -5110,10 +5238,10 @@ def test_store_write_raw_descriptor_has_one_closer(tmp_path, monkeypatch, failur
                 rid = store.write(value)
                 assert store.read(rid) == value
                 assert store.write(value) == rid
-                assert [path.name for path in root.iterdir()] == [rid + ".json"]
+                assert [path.name for path in shard.iterdir()] == [rid + ".json"]
             else:
                 _refuse_write(failure, store, value)
-                names = [path.name for path in root.iterdir()]
+                names = [path.name for path in shard.iterdir()]
                 assert all(not name.endswith(".json") for name in names)
                 if failure == "memory-unlink":
                     assert len(names) == 1 and names[0].startswith(".msg-")
@@ -5121,7 +5249,7 @@ def test_store_write_raw_descriptor_has_one_closer(tmp_path, monkeypatch, failur
                     assert names == []
                 rid = store.write(value)
                 assert store.read(rid) == value
-                leftover = [path.name for path in root.iterdir() if path.name != rid + ".json"]
+                leftover = [path.name for path in shard.iterdir() if path.name != rid + ".json"]
                 assert leftover == ([names[0]] if failure == "memory-unlink" else [])
             creat = [row for row in rows if row["creat"]]
             if failure in ("fdopen-oserror", "fdopen-memory", "fdopen-memory-closeerr",
@@ -5154,7 +5282,7 @@ def test_store_read_fdopen_failure_closes_descriptor(tmp_path, monkeypatch, fail
             else:
                 with pytest.raises(MemoryError):
                     action()
-            assert (root / (rid + ".json")).is_file()
+            assert (root / rid[:2] / (rid + ".json")).is_file()
             assert rows and rows[0]["good"] == 1
             if operation == "read":
                 assert store.read(rid) == value
@@ -5230,7 +5358,8 @@ def test_store_write_fdopen_failure_unblocks_waiting_writer(tmp_path, monkeypatc
             assert str(errors[0][2]) == _OPERATION
             assert MARKER not in json.dumps(errors[0][2].as_dict())
             assert store.read(written[0]) == record(body="second")
-            assert [path.name for path in root.iterdir()] == [written[0] + ".json"]
+            assert [path.relative_to(root).as_posix() for path in root.glob("*/*")] == [
+                written[0][:2] + "/" + written[0] + ".json"]
             creat = [row for row in rows if row["creat"]]
             assert len(creat) == 2 and creat[0]["good"] == 1
             assert interference.callback_ran
