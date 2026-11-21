@@ -217,11 +217,12 @@ def _record_bytes(root, parts):
     """Re-read one record. Mode, owner, link count and size are checked before the read."""
     with storage_confined.confined_file(root, parts) as handle:
         _owned_directory(handle.parent_stat())
-        before = os.stat(handle._name, dir_fd=handle._parent, follow_symlinks=False)
+        name = parts[-1]
+        before = os.stat(name, dir_fd=handle.parent_fd, follow_symlinks=False)
         require(stat.S_ISREG(before.st_mode) and before.st_uid == os.geteuid() and
                 not before.st_mode & 0o077 and before.st_nlink == 1 and before.st_size <= MAX_BYTES)
         raw = handle.read_bytes(MAX_BYTES)
-        after = os.stat(handle._name, dir_fd=handle._parent, follow_symlinks=False)
+        after = os.stat(name, dir_fd=handle.parent_fd, follow_symlinks=False)
         require(_generation(before) == _generation(after), "role_stale")
         return raw, _generation(after)
 

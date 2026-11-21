@@ -2543,3 +2543,65 @@ def test_mr3c_stale_probe_fdopen_failure_closes_descriptor(bindings, policy, tmp
     assert closed.value.errno == errno.EBADF
     assert path.read_bytes() == original
     assert not list(tmp_path.glob(".model-select-*"))
+
+
+def test_selection_hashes_canonical_json_from_dumps(bindings, policy, monkeypatch):
+    from types import SimpleNamespace
+
+    encoded = []
+
+    def capture_dumps(value, **options):
+        serialized = json.dumps(value, **options)
+        encoded.append(serialized.encode("ascii"))
+        return serialized
+
+    monkeypatch.setattr(core, "json", SimpleNamespace(
+        JSONEncoder=json.JSONEncoder, dumps=capture_dumps, loads=json.loads))
+    _, record = choose(bindings, policy)
+
+    identity = {key: value for key, value in record.items() if key not in ("outcome", "decision_id")}
+    split = {key: policy[key] for key in ("target_shares", "family_order")}
+    legacy_encoder = json.JSONEncoder(sort_keys=True, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+    expected = ["".join(legacy_encoder.iterencode(value)).encode("ascii") for value in (policy, split, identity)]
+    assert all(payload in encoded for payload in expected)
+    assert [record[key] for key in ("policy_id", "split_id", "decision_id")] == [
+        hashlib.sha256(payload).hexdigest() for payload in expected]
+
+
+@requires_anchored_io
+def test_replay_preserves_legacy_bytes_at_the_line_limit(bindings, policy, tmp_path):
+    path = tmp_path / "log"
+    _, row = choose(bindings, policy)
+    row["outcome"] = {
+        "text": '\u00e9\U0001f642\ud800\x7f"\\\b\f\n\r\t',
+        "numbers": [-0.0, 5e-324, 1.7976931348623157e308, (1 << 425) - 1],
+        "padding": "",
+    }
+    legacy_encoder = json.JSONEncoder(sort_keys=True, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+
+    def legacy_line(record):
+        return ("".join(legacy_encoder.iterencode(record)) + "\n").encode("ascii")
+
+    row["outcome"]["padding"] = "x" * (MAX_LINE_BYTES - len(legacy_line(row)))
+    expected = legacy_line(row)
+    assert len(expected) == MAX_LINE_BYTES
+    append_decision(path, row)
+    assert path.read_bytes() == expected
+    assert read_decisions(path) == [row]
+
+    too_large = dict(row, outcome=dict(row["outcome"], padding=row["outcome"]["padding"] + "x"))
+    with pytest.raises(ModelSelectionError, match="^decision_line_too_large$"):
+        append_decision(path, too_large)
+    assert path.read_bytes() == expected
+
+    noncanonical = expected.replace(rb"\u00e9", rb"\u00E9")
+    assert noncanonical != expected and json.loads(noncanonical) == row
+    path.write_bytes(noncanonical)
+    with pytest.raises(ModelSelectionError, match="^invalid_history$"):
+        read_decisions(path)
+    path.write_bytes(expected)
+
+    _, next_row = core.select_and_append(path, bindings, policy, "T9", "implementer",
+                                         host_kinds=("codex-cli", "claude-code"), subject="next")
+    assert path.read_bytes() == expected + legacy_line(next_row)
+    assert read_decisions(path) == [row, next_row]

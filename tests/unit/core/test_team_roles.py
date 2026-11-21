@@ -7,12 +7,13 @@ import inspect
 import json
 from pathlib import Path
 import re
+import sys
 from types import SimpleNamespace
 
 import pytest
 
 from aegis_core import team_roles as roles
-from aegis_core.team_mailbox_primitives import RoleTables
+from aegis_core.team_mailbox_primitives import MailboxRefusal, RoleTables, render_mailbox_refusal
 from tools import hierarchy_roles as legacy
 
 
@@ -274,7 +275,7 @@ def public_operations():
 def operation_inputs(function):
     """Valid schema fixtures keyed by parameter, never a list of operations."""
     entry = deepcopy(BASE["roles"]["root"])
-    samples = {"condition": True, "reason": "invalid_registry", "required": set(BASE),
+    samples = {"condition": True, "reason": "invalid_registry", "repair": None, "required": set(BASE),
                "optional": (), "value": BASE, "label": "field", "limit": 4096,
                "raw": RAW, "registry": BASE, "entry": entry, "role": entry, "name": "root",
                "group": "reads", "allowed": {key: set(entry[key]) for key in roles.VOCABULARY},
@@ -490,3 +491,801 @@ def test_successive_operations_see_fresh_registry_without_shared_cache(monkeypat
     second_role = roles.role("alpha/root")
     assert second_role["title"] == "second"
     assert second_role["reads"] == BASE["roles"]["root"]["reads"]
+
+
+MISSING_FIELDS = "Restore the required registry fields and retry."
+FIELD_TYPES = "Use the field types required by the role schema and retry."
+ROUTE_PAIRS = "Restore the required endpoint route pairs and retry."
+REGISTRY_FALLBACK = "Restore a complete registry matching the role schema and retry."
+TOO_LARGE_ACTION = "Reduce the registry or input to the documented size limits and retry."
+DUPLICATE_ROLE_ACTION = "Give each endpoint exactly one registry role and retry."
+CLOSED_ACTIONS = {
+    "invalid_registry": REGISTRY_FALLBACK,
+    "unsupported_schema": "Install a registry using aegis.role-registry/v1 and retry.",
+    "unknown_key": "Remove fields outside the role registry schema and retry.",
+    "duplicate_key": "Remove duplicate JSON keys from the registry and retry.",
+    "duplicate_role": DUPLICATE_ROLE_ACTION,
+    "unknown_action": "Select actions from the closed role vocabulary and retry.",
+    "unknown_endpoint": "Use a registered endpoint and its manifest lane kind and retry.",
+    "independent_session": "Bind the independent role to a separate host session and retry.",
+    "not_permitted": "Use a role permitted for the requested capability and retry.",
+    "too_large": TOO_LARGE_ACTION,
+    "missing_registry": "Restore the installed package role registry and retry.",
+    "registry_io": "Check the installed package resource is readable and retry.",
+    "policy_io": "Check role policy observations and retry from current trusted mailbox state.",
+}
+
+
+def refusal(call, *args):
+    """Refuse without mutating caller input or echoing it into the envelope."""
+    snapshot = deepcopy(args)
+    with pytest.raises(roles.RoleRefusal) as caught:
+        call(*args)
+    assert args == snapshot
+    error = caught.value
+    assert error.code == 1 and error.status == "refused"
+    assert str(error) == "role registry refused: " + error.reason
+    assert set(error.as_dict()) == {"status", "reason", "code", "next_action"}
+    assert error.as_dict() == {"status": "refused", "reason": error.reason, "code": 1,
+                               "next_action": error.next_action}
+    assert "\n" not in error.next_action
+    return error
+
+
+ROLE_REPAIRS = (
+    ("missing-title", lambda role: role.pop("title"), "invalid_registry", MISSING_FIELDS),
+    ("wrong-type", lambda role: role.update(kind=[]), "invalid_registry", FIELD_TYPES),
+    ("title-type", lambda role: role.update(title=None), "invalid_registry", FIELD_TYPES),
+    ("malformed-field", lambda role: role.update(kind="private-marker"), "invalid_registry", REGISTRY_FALLBACK),
+    ("empty-title", lambda role: role.update(title=""), "invalid_registry", REGISTRY_FALLBACK),
+    ("oversized", lambda role: role.update(title="x" * 262145), "too_large", TOO_LARGE_ACTION),
+)
+
+
+@pytest.mark.parametrize("reason,action", sorted(CLOSED_ACTIONS.items()))
+def test_closed_reason_repairs_stay_on_the_reason_table(reason, action):
+    error = roles.RoleRefusal(reason)
+    assert error.reason == reason and error.code == 1 and error.status == "refused"
+    assert error.next_action == action
+    assert str(error) == "role registry refused: " + reason
+    assert error.as_dict() == {"status": "refused", "reason": reason, "code": 1, "next_action": action}
+
+
+def test_category_repair_is_selected_only_for_invalid_registry():
+    error = refusal(lambda: roles.require(False, repair="missing_field"))
+    assert error.reason == "invalid_registry" and error.next_action == MISSING_FIELDS
+    error = refusal(lambda: roles.require(False, repair="field_type"))
+    assert error.next_action == FIELD_TYPES
+    error = refusal(lambda: roles.require(False, repair="routes"))
+    assert error.next_action == ROUTE_PAIRS
+    error = refusal(lambda: roles.require(False, repair="private-marker"))
+    assert error.reason == "invalid_registry" and error.next_action == REGISTRY_FALLBACK
+    assert "private-marker" not in str(error) + error.next_action + repr(error.as_dict())
+    assert roles.require(True, repair=None) is None
+
+
+@pytest.mark.parametrize("caller", ["validate_role", "validate", "role_tables"])
+@pytest.mark.parametrize("label,mutate,reason,action", ROLE_REPAIRS, ids=[item[0] for item in ROLE_REPAIRS])
+def test_role_repairs_match_across_top_level_and_nested_validation(caller, label, mutate, reason, action):
+    if caller == "validate_role":
+        role = deepcopy(BASE["roles"]["root"])
+        mutate(role)
+        error = refusal(roles.validate_role, "root", role)
+        assert roles.validate_role("root", deepcopy(BASE["roles"]["root"])) is None
+    else:
+        registry = deepcopy(BASE)
+        mutate(registry["roles"]["root"])
+        call = roles.validate if caller == "validate" else roles.role_tables
+        error = refusal(call, registry)
+        assert roles.validate(deepcopy(BASE)) == BASE
+    assert error.reason == reason and error.next_action == action
+    assert "private-marker" not in str(error) + error.next_action + repr(error.as_dict())
+    assert "x" * 64 not in error.next_action
+
+
+@pytest.mark.parametrize("caller", ["validate", "role_tables"])
+@pytest.mark.parametrize("label,routes,action", (
+    ("not-a-list", None, ROUTE_PAIRS),
+    ("short-pair", [[1]], ROUTE_PAIRS),
+    ("marked-short-pair", [["private-marker"]], ROUTE_PAIRS),
+    ("element-type", [[1, 2]], FIELD_TYPES),
+    ("mixed-elements", [[{}, []]], FIELD_TYPES),
+    ("self-pair", [["private-marker", "private-marker"]], ROUTE_PAIRS),
+    ("wrong-pairs", [["front-door", "lane"]], ROUTE_PAIRS),
+), ids=["not-a-list", "short-pair", "marked-short-pair", "element-type", "mixed-elements", "self-pair", "wrong-pairs"])
+def test_route_repair_precedes_element_type(caller, label, routes, action):
+    registry = deepcopy(BASE)
+    registry["routes"] = routes
+    call = roles.validate if caller == "validate" else roles.role_tables
+    error = refusal(call, registry)
+    assert error.reason == "invalid_registry" and error.next_action == action
+    assert "private-marker" not in str(error) + error.next_action + repr(error.as_dict())
+    assert "front-door" not in error.next_action
+    assert roles.validate(deepcopy(BASE)) == BASE
+
+
+@pytest.mark.parametrize("caller", ["validate", "role_tables"])
+def test_duplicate_endpoint_keeps_its_repair(caller):
+    registry = deepcopy(BASE)
+    registry["roles"].update(duplicate=deepcopy(registry["roles"]["router"]))
+    call = roles.validate if caller == "validate" else roles.role_tables
+    error = refusal(call, registry)
+    assert error.reason == "duplicate_role" and error.next_action == DUPLICATE_ROLE_ACTION
+    assert "duplicate" not in error.next_action and "router" not in error.next_action
+    assert roles.role_tables(deepcopy(BASE)).endpoint_roles == RoleTables().endpoint_roles
+
+
+def test_other_invalid_registry_checks_keep_the_fallback_repair():
+    registry = deepcopy(BASE)
+    registry["schema"] = "private-marker"
+    error = refusal(roles.validate, registry)
+    assert error.reason == "unsupported_schema" and error.next_action == CLOSED_ACTIONS["unsupported_schema"]
+    registry = deepcopy(BASE)
+    registry["private-marker"] = 1
+    error = refusal(roles.validate, registry)
+    assert error.reason == "unknown_key" and error.next_action == CLOSED_ACTIONS["unknown_key"]
+    role = deepcopy(BASE["roles"]["root"])
+    role["reads"].append("private-marker")
+    error = refusal(roles.validate_role, "root", role)
+    assert error.reason == "unknown_action" and error.next_action == CLOSED_ACTIONS["unknown_action"]
+    error = refusal(roles.load_registry, b'{"schema":1,"schema":2}')
+    assert error.reason == "duplicate_key" and error.next_action == CLOSED_ACTIONS["duplicate_key"]
+    assert "private-marker" not in error.next_action
+    assert roles.load_registry(RAW) == BASE
+
+
+def test_validation_bounds_each_caller_tree_once():
+    registry = deepcopy(BASE)
+    result, expanded, ordered = _trace_visits(lambda: roles.validate(registry))
+    assert result == registry and not ordered and len(expanded) == 1759
+    for role in registry["roles"].values():
+        assert expanded.count(id(role)) == 1
+    result, expanded, ordered = _trace_visits(lambda: roles.validate(registry=registry))
+    assert result["schema"] == BASE["schema"] and len(expanded) + len(ordered) == 1760
+    for role in registry["roles"].values():
+        assert expanded.count(id(role)) == 1
+    role = deepcopy(BASE["roles"]["root"])
+    result, expanded, ordered = _trace_visits(lambda: roles.validate_role("root", role))
+    assert result is None and len(expanded) + len(ordered) == 120
+    assert expanded.count(id(role)) == 1
+    table_input = deepcopy(BASE)
+    result, expanded, ordered = _trace_visits(lambda: roles.role_tables(table_input))
+    # role_tables and its nested validate each bound the registry in their own call.
+    assert result.endpoint_roles == RoleTables().endpoint_roles and len(expanded) + len(ordered) == 3110
+    for role in table_input["roles"].values():
+        assert expanded.count(id(role)) == 2
+    huge = deepcopy(BASE)
+    huge["roles"]["root"]["title"] = "x" * 262145
+    error, expanded, ordered = _trace_visits(lambda: refusal(roles.validate, huge))
+    assert error.reason == "too_large" and error.next_action == TOO_LARGE_ACTION
+    assert not ordered
+    assert len(expanded) == 33 and expanded.count(id(huge["roles"]["root"])) == 1
+    result, expanded, ordered = _trace_visits(lambda: roles.validate(registry))
+    assert result == registry and len(expanded) + len(ordered) == 1759
+
+
+def test_repair_retry_and_concurrent_callers_stay_isolated():
+    def attempt(index):
+        if index % 4 == 0:
+            registry = deepcopy(BASE)
+            registry["roles"]["root"].pop("title")
+            error = refusal(roles.validate, registry)
+            assert error.next_action == MISSING_FIELDS
+        elif index % 4 == 1:
+            role = deepcopy(BASE["roles"]["root"])
+            role["kind"] = []
+            error = refusal(roles.validate_role, "root", role)
+            assert error.next_action == FIELD_TYPES
+        elif index % 4 == 2:
+            registry = deepcopy(BASE)
+            registry["routes"] = [[1]]
+            error = refusal(roles.role_tables, registry)
+            assert error.next_action == ROUTE_PAIRS
+        else:
+            role = deepcopy(BASE["roles"]["root"])
+            role["title"] = "y" * 262145
+            error = refusal(roles.validate_role, "root", role)
+            assert error.reason == "too_large" and error.next_action == TOO_LARGE_ACTION
+        assert roles.validate(deepcopy(BASE)) == BASE
+        assert roles.validate_role("root", deepcopy(BASE["roles"]["root"])) is None
+        return index
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert sorted(pool.map(attempt, range(12))) == list(range(12))
+
+
+def expect_refusal(call, refusal_type=roles.RoleRefusal):
+    """Refusal envelope for a call that may close over a cyclic value."""
+    with pytest.raises(refusal_type) as caught:
+        call()
+    error = caught.value
+    assert error.code == 1 and error.status == "refused"
+    assert str(error) == "role registry refused: " + error.reason
+    assert set(error.as_dict()) == {"status", "reason", "code", "next_action"}
+    assert "\n" not in error.next_action
+    assert "x" * 64 not in error.next_action and "A" * 64 not in error.next_action
+    return error
+
+
+def fresh_bound_reason(value):
+    """Baseline budget: one fresh bounded_tree, with no shared-child shortcut."""
+    try:
+        roles.bounded_tree(value)
+    except MailboxRefusal as error:
+        reason = render_mailbox_refusal(error)["reason"]
+        return "too_large" if reason == "too_large" else "invalid_registry"
+    return None
+
+
+def first_bound_reason(values):
+    for value in values:
+        reason = fresh_bound_reason(value)
+        if reason is not None:
+            return reason
+    return None
+
+
+def actions_envelope_reason(role, name):
+    """Former actions(...) budgets, in vocabulary order, after the outer call fits."""
+    for group in roles.VOCABULARY:
+        reason = fresh_bound_reason((role, name, group))
+        if reason is not None:
+            return reason
+    prohibitions = role["prohibitions"]
+    for group in roles.VOCABULARY:
+        reason = fresh_bound_reason((prohibitions, name, group))
+        if reason is not None:
+            return reason
+    return None
+
+
+def keyword_role_reason(name, role):
+    reason = first_bound_reason(((name,), {"role": role}))
+    if reason is not None:
+        return reason
+    return actions_envelope_reason(role, name)
+
+
+def positional_role_reason(name, role):
+    reason = first_bound_reason(((name, role), {}))
+    if reason is not None:
+        return reason
+    return actions_envelope_reason(role, name)
+
+
+def assert_role_matches_baseline(name, role):
+    expected = keyword_role_reason(name, role)
+    error = expect_refusal(lambda: roles.validate_role(name, role=role))
+    assert error.reason == expected and error.next_action == CLOSED_ACTIONS[expected]
+    assert roles.validate_role("root", deepcopy(BASE["roles"]["root"])) is None
+    expected = positional_role_reason(name, role)
+    error = expect_refusal(lambda: roles.validate_role(name, role))
+    assert error.reason == expected and error.next_action == CLOSED_ACTIONS[expected]
+
+
+def test_shared_positional_and_keyword_values_keep_one_budget():
+    role = deepcopy(BASE["roles"]["root"])
+    keywords = {"role": role}
+    name = next(iter(keywords))
+    role["title"] = name
+    role["model_profile"] = {"source": "fixed", "tier": None, "effort": [None] * 10001}
+    assert_role_matches_baseline(name, role)
+    role = deepcopy(BASE["roles"]["root"])
+    role["title"] = "role"
+    role["model_profile"] = {"source": "fixed", "effort": "role", "tier": ["role"] + ["x"] * 10000}
+    assert_role_matches_baseline("role", role)
+    group = ["name"] + [1] * 10000
+    expected = first_bound_reason((("name",), {"name": "ok", "group": group}))
+    error = expect_refusal(lambda: roles.actions("name", name="ok", group=group))
+    assert error.reason == expected and error.next_action == CLOSED_ACTIONS[expected]
+
+
+def _bounded_role(kind):
+    role = deepcopy(BASE["roles"]["root"])
+    role["title"] = "role"
+    if kind == "links":
+        role["hat_of"] = "A" * 200000
+        role["reports_to"] = "B" * 200000
+    elif kind == "cycle":
+        cycle = ["role"]
+        cycle.append(cycle)
+        role["model_profile"] = {"source": "fixed", "effort": cycle}
+    elif kind == "depth":
+        nested = "role"
+        for _ in range(200):
+            nested = [nested]
+        role["model_profile"] = {"source": "fixed", "effort": nested}
+    elif kind == "items":
+        role["model_profile"] = {"source": "fixed", "effort": ["role"] * 50000}
+    elif kind == "int-key":
+        role["model_profile"] = {"source": "fixed", "effort": {1: "role"}}
+    return role
+
+
+@pytest.mark.parametrize("kind", ["links", "cycle", "depth", "items", "int-key"])
+def test_keyword_containers_keep_baseline_bounds(kind):
+    role = _bounded_role(kind)
+    assert_role_matches_baseline("role", role)
+    assert roles.role_tables(deepcopy(BASE)).endpoint_roles == RoleTables().endpoint_roles
+
+
+def test_bounds_precede_field_repair_when_singletons_are_shared():
+    role = deepcopy(BASE["roles"]["root"])
+    role["title"] = "x" * 262145
+    expected = keyword_role_reason(["role", None], role)
+    error = expect_refusal(lambda: roles.validate_role(["role", None], role=role))
+    assert error.reason == expected and error.next_action == CLOSED_ACTIONS[expected]
+    assert error.reason == "too_large"
+    role = deepcopy(BASE["roles"]["root"])
+    role["model_profile"] = {"source": "fixed", "effort": "x" * 262145, "tier": ()}
+    expected = keyword_role_reason((), role)
+    error = expect_refusal(lambda: roles.validate_role(name=(), role=role))
+    assert error.reason == expected and error.next_action == CLOSED_ACTIONS[expected]
+    role = deepcopy(BASE["roles"]["root"])
+    role["title"] = "x" * 262145
+    expected = first_bound_reason(((), {"name": (), "group": None, "role": role}))
+    error = expect_refusal(lambda: roles.actions(name=(), group=None, role=role))
+    assert error.reason == expected and error.next_action == CLOSED_ACTIONS[expected]
+
+
+def test_nested_actions_envelope_refuses_the_baseline_boundary():
+    role = deepcopy(BASE["roles"]["root"])
+    role["model_profile"] = {"source": "fixed", "effort": "x" * 261088}
+    expected = positional_role_reason("root", role)
+    error = expect_refusal(lambda: roles.validate_role("root", role))
+    assert expected == "too_large"
+    assert error.reason == expected and error.next_action == CLOSED_ACTIONS[expected]
+    assert roles.validate_role("root", deepcopy(BASE["roles"]["root"])) is None
+    # Ids from a prior public call are not evidence for the next one.
+    assert roles.role_tables(deepcopy(BASE)).endpoint_roles == RoleTables().endpoint_roles
+    role = deepcopy(BASE["roles"]["root"])
+    role["model_profile"] = {"source": "fixed", "effort": "x" * 261088}
+    error = expect_refusal(lambda: roles.validate_role("root", role=role))
+    assert error.reason == keyword_role_reason("root", role)
+
+
+@pytest.mark.parametrize("value", ([], 123, True, {}))
+@pytest.mark.parametrize("caller", ["validate_role", "validate", "role_tables"])
+def test_service_type_precedes_the_kind_invariant(value, caller):
+    if caller == "validate_role":
+        role = deepcopy(BASE["roles"]["root"])
+        role["service"] = value
+        error = expect_refusal(lambda: roles.validate_role("root", role))
+    else:
+        registry = deepcopy(BASE)
+        registry["roles"]["root"]["service"] = value
+        call = roles.validate if caller == "validate" else roles.role_tables
+        error = expect_refusal(lambda: call(registry))
+    assert error.reason == "invalid_registry" and error.next_action == FIELD_TYPES
+    assert roles.validate_role("root", deepcopy(BASE["roles"]["root"])) is None
+
+
+@pytest.mark.parametrize("value", ([], 123, True, "bad"))
+@pytest.mark.parametrize("caller", ["validate_role", "validate", "role_tables"])
+def test_provision_type_precedes_the_endpoint_invariant(value, caller):
+    if caller == "validate_role":
+        role = deepcopy(BASE["roles"]["test-author"])
+        role["provision"] = value
+        error = expect_refusal(lambda: roles.validate_role("test-author", role))
+    else:
+        registry = deepcopy(BASE)
+        registry["roles"]["test-author"]["provision"] = value
+        call = roles.validate if caller == "validate" else roles.role_tables
+        error = expect_refusal(lambda: call(registry))
+    assert error.reason == "invalid_registry" and error.next_action == FIELD_TYPES
+    assert roles.validate(deepcopy(BASE)) == BASE
+
+
+def test_bound_refusals_retry_and_stay_isolated_across_callers():
+    def attempt(index):
+        if index % 2 == 0:
+            role = deepcopy(BASE["roles"]["root"])
+            role["model_profile"] = {"source": "fixed", "effort": "x" * 261088}
+            error = expect_refusal(lambda: roles.validate_role("root", role))
+            assert error.reason == "too_large" and error.next_action == TOO_LARGE_ACTION
+        else:
+            role = deepcopy(BASE["roles"]["root"])
+            role["service"] = []
+            error = expect_refusal(lambda: roles.validate_role("root", role))
+            assert error.reason == "invalid_registry" and error.next_action == FIELD_TYPES
+        assert roles.validate_role("root", deepcopy(BASE["roles"]["root"])) is None
+        return index
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert sorted(pool.map(attempt, range(8))) == list(range(8))
+
+
+def _effort_role(count):
+    role = deepcopy(BASE["roles"]["root"])
+    role["model_profile"] = {"source": "fixed", "effort": "x" * count}
+    return role
+
+
+def _refuse_role(role, style):
+    if style == "keyword":
+        expected = keyword_role_reason("root", role)
+        error = expect_refusal(lambda: roles.validate_role("root", role=role))
+    else:
+        expected = positional_role_reason("root", role)
+        error = expect_refusal(lambda: roles.validate_role("root", role))
+    assert expected == "too_large"
+    assert error.reason == expected and error.next_action == CLOSED_ACTIONS[expected]
+    return error
+
+
+@pytest.mark.parametrize("count", [261077, 261080])
+@pytest.mark.parametrize("style", ["positional", "keyword"])
+def test_later_actions_envelope_is_charged_when_the_first_group_fits(count, style):
+    role = _effort_role(count)
+    groups = list(roles.VOCABULARY)
+    assert fresh_bound_reason((role, "root", groups[0])) is None
+    assert actions_envelope_reason(role, "root") == "too_large"
+    _refuse_role(role, style)
+    assert roles.validate_role("root", deepcopy(BASE["roles"]["root"])) is None
+    assert roles.role_tables(deepcopy(BASE)).endpoint_roles == RoleTables().endpoint_roles
+
+
+def test_effort_inside_every_actions_envelope_is_accepted():
+    role = _effort_role(261076)
+    assert positional_role_reason("root", role) is None
+    assert keyword_role_reason("root", role) is None
+    assert roles.validate_role("root", role) is None
+    assert roles.validate_role("root", role=deepcopy(role)) is None
+
+
+@pytest.mark.parametrize("count", [261077, 261080])
+@pytest.mark.parametrize("style", ["positional", "keyword"])
+def test_registry_effort_boundary_refuses_with_the_outer_budget(count, style):
+    registry = deepcopy(BASE)
+    registry["roles"]["root"]["model_profile"] = {"source": "fixed", "effort": "x" * count}
+    if style == "keyword":
+        expected = first_bound_reason(((), {"registry": registry}))
+        error = expect_refusal(lambda: roles.validate(registry=registry))
+    else:
+        expected = first_bound_reason(((registry,), {}))
+        error = expect_refusal(lambda: roles.validate(registry))
+    assert expected == "too_large"
+    assert error.reason == expected and error.next_action == CLOSED_ACTIONS[expected]
+    assert roles.validate(deepcopy(BASE)) == BASE
+
+
+def test_writer_walks_its_tree_once():
+    entry = {"writes": ["source"]}
+    result, cached, ordered = _trace_visits(lambda: roles.writer(entry))
+    assert result is True
+    assert len(cached) + len(ordered) == 6 and cached.count(id(entry)) == 1
+    assert roles.writer({"writes": []}) is False
+    assert roles.writer({"writes": ["source"]}) is True
+
+
+def test_later_envelope_refusals_retry_and_stay_isolated():
+    def attempt(index):
+        role = _effort_role(261080 if index % 2 == 0 else 261077)
+        _refuse_role(role, "positional" if index % 4 < 2 else "keyword")
+        assert roles.validate_role("root", deepcopy(BASE["roles"]["root"])) is None
+        return index
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert sorted(pool.map(attempt, range(8))) == list(range(8))
+
+
+def _boxed(node, count, kind):
+    for _ in range(count):
+        node = [node] if kind == "list" else (node,)
+    return node
+
+
+def _shared_bytes(kind):
+    if kind == "tuple":
+        return ("x" * 140000, ())
+    if kind == "dict":
+        return {"pad": "x" * 140000, "tail": []}
+    return ["x" * 140000, []]
+
+
+def _cache_entries():
+    """Reviewer trees where a cached summary and the baseline walk can disagree."""
+    shared = _shared_bytes("list")
+    shared_tuple = _shared_bytes("tuple")
+    shared_dict = _shared_bytes("dict")
+    return {
+        "bytes-dict": ({"writes": ["source"], "a": shared, "b": _boxed(shared, 29, "list")}, shared),
+        "tuple-dict": ({"writes": ["source"], "a": shared_tuple, "b": _boxed(shared_tuple, 29, "tuple")},
+                       shared_tuple),
+        "dict-dict": ({"writes": ["source"], "a": shared_dict, "b": _boxed(shared_dict, 29, "list")},
+                      shared_dict),
+        "bytes-list": ({"writes": ["source"], "nest": [shared, _boxed(shared, 28, "list")]}, shared),
+        "bytes-tuple": ({"writes": ["source"], "nest": (shared, _boxed(shared, 28, "tuple"))}, shared),
+    }
+
+
+_CACHE_ENTRIES = _cache_entries()
+_PRECEDENCE_CASES = (*_CACHE_ENTRIES, "depth-pad", "node-pad")
+
+
+def _precedence_entry(caller, label, style):
+    if label in _CACHE_ENTRIES:
+        return _CACHE_ENTRIES[label]
+    # Extra bytes and nodes before the second alias relative to writer(entry).
+    byte_overhead, node_overhead = {
+        "writer": {"positional": (0, 0), "keyword": (8, 1)},
+        "actions": {"positional": (2, 0), "keyword": (11, 1)},
+        "validate_role": {"positional": (7, 1), "keyword": (21, 3)},
+        "validate": {"positional": (0, 0), "keyword": (11, 1)},
+    }[caller][style]
+    nested = _boxed(None, 30, "list")
+    # The second alias gets 59 bytes or 30 nodes. The ordered walk reaches the
+    # depth error before consuming either budget, but its full summary needs
+    # 64 bytes and 31 nodes, so neither padded case can use the summary.
+    if label == "depth-pad":
+        pad = "x" * (261977 - byte_overhead)
+    else:
+        pad = [[0] * count for count in (10000, 10000, 10000, 2694 - node_overhead)]
+    return {"writes": [], "first": nested, "pad": pad, "again": [nested]}, nested
+
+
+def _precedence_args(caller, entry, style):
+    kwargs = {
+        "writer": {"entry": entry},
+        "actions": {"role": entry, "name": "root", "group": "reads"},
+        "validate_role": {"name": "root", "role": entry},
+        "validate": {"registry": entry},
+    }[caller]
+    return ((), kwargs) if style == "keyword" else (tuple(kwargs.values()), {})
+
+
+def _assert_cached_matches_baseline(uncached_roles, caller, label, style):
+    entry, shared = _precedence_entry(caller, label, style)
+    args, kwargs = _precedence_args(caller, entry, style)
+    baseline = uncached_roles[caller]
+    expected, uncached, baseline_visits = _trace_visits(
+        lambda: expect_refusal(lambda: baseline(*args, **kwargs), uncached_roles["RoleRefusal"])
+    )
+    actual = getattr(roles, caller)
+    error, cached, ordered = _trace_visits(lambda: expect_refusal(lambda: actual(*args, **kwargs)))
+    reason = "invalid_registry" if label in ("depth-pad", "node-pad") else "too_large"
+    assert expected.reason == reason and expected.next_action == CLOSED_ACTIONS[reason]
+    assert error.as_dict() == expected.as_dict()
+    assert not uncached
+    assert cached.count(id(shared)) == 1
+    assert ordered.count(id(shared)) == baseline_visits.count(id(shared)) == 2
+    assert len(ordered) == len(baseline_visits)
+    # Skip the fresh root tuple or dict and, for keywords, the empty args tuple.
+    prefix = 2 if style == "keyword" else 1
+    assert ordered[prefix:] == baseline_visits[prefix:]
+    assert roles.writer({"writes": ["source"]}) is True
+    assert roles.validate_role("root", deepcopy(BASE["roles"]["root"])) is None
+
+
+@pytest.mark.parametrize("caller", ["writer", "actions", "validate_role", "validate"])
+@pytest.mark.parametrize("label", _PRECEDENCE_CASES)
+@pytest.mark.parametrize("style", ["positional", "keyword"])
+def test_cached_summary_refusal_matches_baseline(uncached_roles, caller, label, style):
+    _assert_cached_matches_baseline(uncached_roles, caller, label, style)
+
+
+def test_cached_summary_and_lane_kind_refusals_retry_and_stay_isolated(uncached_roles):
+    def attempt(index):
+        if index % 5 == 4:
+            role = deepcopy(BASE["roles"]["reviewer"])
+            role["endpoint"].pop("lane_kind")
+            error = refusal(roles.validate_role, "reviewer", role)
+            assert error.reason == "invalid_registry" and error.next_action == MISSING_FIELDS
+        else:
+            label = _PRECEDENCE_CASES[index % len(_PRECEDENCE_CASES)]
+            caller = "writer" if index % 2 == 0 else "validate_role"
+            style = "positional" if index % 4 < 2 else "keyword"
+            _assert_cached_matches_baseline(uncached_roles, caller, label, style)
+        assert roles.validate_role("reviewer", deepcopy(BASE["roles"]["reviewer"])) is None
+        return index
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert sorted(pool.map(attempt, range(8))) == list(range(8))
+
+
+def test_lane_endpoint_missing_lane_kind_selects_missing_field():
+    role = deepcopy(BASE["roles"]["reviewer"])
+    role["endpoint"].pop("lane_kind")
+    error = refusal(roles.validate_role, "reviewer", role)
+    assert error.reason == "invalid_registry" and error.next_action == MISSING_FIELDS
+    keyword_role = deepcopy(role)
+    keyword_snapshot = deepcopy(keyword_role)
+    error = expect_refusal(lambda: roles.validate_role("reviewer", role=keyword_role))
+    assert keyword_role == keyword_snapshot
+    assert error.reason == "invalid_registry" and error.next_action == MISSING_FIELDS
+    registry = deepcopy(BASE)
+    registry["roles"]["reviewer"]["endpoint"].pop("lane_kind")
+    error = refusal(roles.validate, registry)
+    assert error.reason == "invalid_registry" and error.next_action == MISSING_FIELDS
+    error = refusal(roles.role_tables, deepcopy(registry))
+    assert error.next_action == MISSING_FIELDS
+    assert roles.validate(deepcopy(BASE)) == BASE
+    assert roles.validate_role("reviewer", deepcopy(BASE["roles"]["reviewer"])) is None
+
+
+def test_non_lane_endpoint_keeps_lane_kind_on_the_fallback_repair():
+    role = deepcopy(BASE["roles"]["root"])
+    role["endpoint"]["lane_kind"] = "reviewer"
+    error = refusal(roles.validate_role, "root", role)
+    assert error.reason == "invalid_registry" and error.next_action == REGISTRY_FALLBACK
+    assert roles.validate_role("root", deepcopy(BASE["roles"]["root"])) is None
+
+
+def _trace_visits(call):
+    """Return the result and actual node visits from each bounds implementation."""
+    expanded = []
+    ordered = []
+    ordered_source = roles.bounded_tree.__code__.co_filename
+    cached_source = roles.__file__
+
+    def tracer(frame, event, _arg):
+        code = frame.f_code
+        if event == "call":
+            if code.co_filename == ordered_source and code.co_name == "visit":
+                ordered.append(id(frame.f_locals["item"]))
+            elif code.co_filename == cached_source and code.co_name == "_account_new":
+                expanded.append(id(frame.f_locals["item"]))
+        return None
+
+    previous = sys.gettrace()
+    sys.settrace(tracer)
+    try:
+        result = call()
+    finally:
+        sys.settrace(previous)
+    return result, expanded, ordered
+
+
+@pytest.fixture(scope="module")
+def uncached_roles():
+    """Load the public role operations with the original uncached budget routing."""
+    path = ROOT / "aegis_core/team_roles.py"
+    source = path.read_text(encoding="utf-8")
+    # Work on a fresh module namespace. Preserve the operation wrappers, and
+    # call them at the nested sites where the cache normally elides them.
+    replacements = (
+        ("    completed = _BOUNDED.get()\n", "    completed = None\n"),
+        ("        _former_args((role, name, group))\n        allowed[group] = _actions(",
+         "        allowed[group] = actions("),
+        ("        _former_args((prohibitions, name, group))\n        refused = _actions(",
+         "        refused = actions("),
+        ("        _validate_role(name, role)\n", "        validate_role(name, role)\n"),
+    )
+    for before, after in replacements:
+        assert source.count(before) == 1, before
+        source = source.replace(before, after)
+    namespace = {"__name__": "uncached_team_roles"}
+    exec(compile(source, str(path), "exec"), namespace)
+    return namespace
+
+
+def test_direct_call_expands_each_fresh_node_once(uncached_roles):
+    entry = {"writes": ["source"]}
+    result, expanded, ordered = _trace_visits(lambda: roles.writer(entry))
+    expected, uncached, baseline = _trace_visits(lambda: uncached_roles["writer"](entry))
+    assert result is expected is True
+    assert not uncached and not ordered
+    assert expanded.count(id(entry)) == 1
+    assert len(expanded) == len(baseline) == 6
+    # The wrappers allocate their own positional and keyword roots.
+    assert expanded[1:-1] == baseline[1:-1]
+
+
+def test_alias_is_expanded_once_when_it_fits(uncached_roles):
+    shared = {"name": "alpha"}
+    entry = {"writes": [], "a": shared, "b": shared}
+    result, expanded, ordered = _trace_visits(lambda: roles.writer(entry))
+    expected, uncached, baseline = _trace_visits(lambda: uncached_roles["writer"](entry))
+    assert result is expected is False
+    assert not uncached and not ordered
+    assert expanded.count(id(shared)) == 1
+    assert baseline.count(id(shared)) == 2
+    assert len(expanded) == 10 and len(baseline) == 13
+
+
+def test_mixed_arguments_reuse_a_shared_container_when_it_fits(uncached_roles):
+    shared = {"name": "alpha"}
+    role = {"reads": [shared]}
+    error, expanded, ordered = _trace_visits(
+        lambda: expect_refusal(lambda: roles.actions(role, "root", group=shared))
+    )
+    expected, uncached, baseline = _trace_visits(
+        lambda: expect_refusal(lambda: uncached_roles["actions"](role, "root", group=shared),
+                               uncached_roles["RoleRefusal"])
+    )
+    # Bounding both envelopes succeeds, then actions refuses the group type.
+    assert error.next_action == FIELD_TYPES and error.as_dict() == expected.as_dict()
+    assert not uncached and not ordered
+    assert expanded.count(id(shared)) == 1 and baseline.count(id(shared)) == 2
+    assert len(expanded) == 10 and len(baseline) == 13
+
+
+def test_mixed_arguments_fall_back_for_a_shared_container(uncached_roles):
+    shared = _shared_bytes("list")
+    role = {"reads": [], "first": shared}
+    group = {"pad": "x" * 140000, "again": _boxed(shared, 29, "list")}
+    error, expanded, ordered = _trace_visits(
+        lambda: expect_refusal(lambda: roles.actions(role, "root", group=group))
+    )
+    expected, uncached, baseline = _trace_visits(
+        lambda: expect_refusal(lambda: uncached_roles["actions"](role, "root", group=group),
+                               uncached_roles["RoleRefusal"])
+    )
+    assert expected.reason == "too_large" and expected.next_action == TOO_LARGE_ACTION
+    assert error.as_dict() == expected.as_dict()
+    assert not uncached
+    assert expanded.count(id(shared)) == ordered.count(id(shared)) == 1
+    assert baseline.count(id(shared)) == 2
+    # The ordered phase repeats the keyword envelope. Its descendants are
+    # the final bounded_tree walk in the fully uncached public call as well.
+    assert ordered[1:] == baseline[-len(ordered):][1:]
+
+
+def test_nested_envelopes_expand_shared_role_once(uncached_roles):
+    role = deepcopy(BASE["roles"]["root"])
+    result, expanded, ordered = _trace_visits(lambda: roles.validate_role("root", role))
+    expected, uncached, baseline = _trace_visits(lambda: uncached_roles["validate_role"]("root", role))
+    assert result is expected is None
+    assert not uncached and not ordered
+    assert expanded.count(id(role)) == expanded.count(id(role["prohibitions"])) == 1
+    # Outer role, one actions call per group, then the two connection budgets.
+    assert baseline.count(id(role)) == 1 + len(roles.VOCABULARY) + 2
+    assert len(expanded) == 120 and len(baseline) == 790
+
+
+@pytest.mark.parametrize("fallback", [False, True], ids=["fresh", "fallback"])
+def test_early_refusal_skips_nodes_the_walk_never_reaches(uncached_roles, fallback):
+    tail = {"later": 1}
+    overflow = "x" * 262145
+    entry = {"writes": ["source"], "big": overflow, "tail": tail}
+    if fallback:
+        cached_entry, shared = _CACHE_ENTRIES["bytes-dict"]
+        entry = {**cached_entry, "tail": tail}
+        overflow = shared[0]
+    error, expanded, ordered = _trace_visits(lambda: expect_refusal(lambda: roles.writer(entry)))
+    expected, uncached, baseline = _trace_visits(
+        lambda: expect_refusal(lambda: uncached_roles["writer"](entry), uncached_roles["RoleRefusal"])
+    )
+    assert error.reason == "too_large" and error.next_action == TOO_LARGE_ACTION
+    assert error.as_dict() == expected.as_dict() and not uncached
+    # Compare the reached nodes after the call's freshly allocated argument tuple.
+    if fallback:
+        assert len(expanded) == 39 and len(ordered) == len(baseline) == 41
+        assert expanded.count(id(shared)) == 1 and ordered.count(id(shared)) == 2
+        assert expanded.count(id(overflow)) == 1 and ordered.count(id(overflow)) == 2
+        assert ordered[1:] == baseline[1:]
+    else:
+        assert not ordered
+        assert len(expanded) == len(baseline) == 7
+        assert expanded[1:] == baseline[1:]
+    assert id(tail) not in expanded + ordered + baseline
+    assert roles.writer({"writes": ["source"]}) is True
+
+
+def test_stock_registry_node_visits_show_the_cache_pays(uncached_roles):
+    """Measure both modes through the same twelve public entry points."""
+    registry = deepcopy(BASE)
+    role = deepcopy(BASE["roles"]["root"])
+    # Each pair is positional, keyword.
+    cases = (
+        ("role_tables", {"value": registry}, (3110, 3111), (12741, 12742)),
+        ("actions", {"role": role, "name": "root", "group": "reads"}, (97, 100), (97, 100)),
+        ("validate_role", {"name": "root", "role": role}, (120, 122), (790, 792)),
+        ("validate", {"registry": registry}, (1759, 1760), (11390, 11391)),
+        ("fixed_model_profile", {"entry": role}, (95, 96), (95, 96)),
+        ("writer", {"entry": role}, (95, 96), (95, 96)),
+        ("file_tools", {"entry": role}, (95, 96), (95, 96)),
+        ("workspace_tools", {"entry": role}, (95, 96), (95, 96)),
+        ("lifecycle_tools", {"entry": role}, (95, 96), (95, 96)),
+        ("decision_tools", {"entry": role}, (95, 96), (95, 96)),
+        ("takes_board", {"entry": role}, (95, 96), (95, 96)),
+        ("source_views", {"entry": role}, (95, 96), (95, 96)),
+    )
+    for entry, arguments, expected_current, expected_baseline in cases:
+        actual = getattr(roles, entry)
+        uncached = uncached_roles[entry]
+        for index, (args, kwargs) in enumerate(((tuple(arguments.values()), {}), ((), arguments))):
+            result, cached, ordered = _trace_visits(lambda: actual(*args, **kwargs))
+            expected, expanded, baseline = _trace_visits(lambda: uncached(*args, **kwargs))
+            assert result == expected, entry
+            assert not expanded, entry
+            assert len(cached) + len(ordered) == expected_current[index], entry
+            assert len(baseline) == expected_baseline[index], entry
+    assert roles.validate(deepcopy(BASE)) == BASE
+    assert roles.role_tables(deepcopy(BASE)).endpoint_roles == RoleTables().endpoint_roles
