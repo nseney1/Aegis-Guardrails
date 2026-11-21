@@ -37,7 +37,7 @@ from aegis_core.primitives import key_within, real_key
 from aegis_core.pathlookup_gitcache import GitCache as BaseGitCache, ordinary_root
 
 __all__ = ["Hit", "INSIDE_FENCE", "RELATIVE_ENTRY", "descriptor_fence_supported", "GitCache",
-           "git_fence", "is_bare", "only_skipped", "ordinary_root", "which"]
+           "fenced_program", "git_fence", "is_bare", "only_skipped", "ordinary_root", "which"]
 
 _MAX_FENCE_CHARS = 16384
 _MAX_COMPONENTS = 512
@@ -116,10 +116,12 @@ def is_bare(name: str, *, windows: bool = os.name == "nt") -> bool:
     return "/" not in name and (not windows or ("\\" not in name and not ntpath.splitdrive(name)[0]))
 
 
-def _candidates(name: str) -> List[str]:
+def _candidates(name: str, pathext: Optional[str] = None) -> List[str]:
     if sys.platform != "win32":
         return [name]
-    exts = [e for e in (os.environ.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD").split(os.pathsep) if e]
+    if pathext is None:
+        pathext = os.environ.get("PATHEXT")
+    exts = [e for e in (pathext or ".COM;.EXE;.BAT;.CMD").split(os.pathsep) if e]
     if os.path.splitext(name)[1].upper() in {e.upper() for e in exts}:
         return [name]
     return [name + e for e in exts]
@@ -140,9 +142,9 @@ def _spelled(directory: str, candidates: List[str]) -> List[str]:
     return [names[c.lower()] for c in candidates if c.lower() in names]
 
 
-def _programs(directory: str, name: str) -> List[str]:
+def _programs(directory: str, name: str, pathext: Optional[str] = None) -> List[str]:
     found = []
-    for candidate in _spelled(directory, _candidates(name)):
+    for candidate in _spelled(directory, _candidates(name, pathext)):
         full = _PathSpelling.join(directory, candidate)
         if os.path.isfile(full) and os.access(full, os.X_OK):
             found.append(full)
@@ -168,14 +170,24 @@ def _visible(programs: List[str], fence: Optional[str], *, descriptors=None) -> 
         return programs
     return [program for program in programs if not _provenance_inside(program, fence, descriptors=descriptors)]
 
+def fenced_program(program: str, outside: PathLike, *, descriptors=None) -> Optional[str]:
+    """Validate the exact owner-selected executable with the ordinary program fence."""
+    fence = _fence(outside)
+    if fence is None or not _bounded_text(program) or not os.path.isabs(program) or _drive_less_rooted(program):
+        return None
+    if _provenance_inside(program, fence, descriptors=descriptors):
+        return None
+    return program if os.path.isfile(program) and os.access(program, os.X_OK) else None
 
 def which(name: str, path: Optional[str] = None, outside: Optional[PathLike] = None,
-          *, fence_program: bool = False, descriptors=None) -> Optional[str]:
+          *, fence_program: bool = False, descriptors=None, pathext: Optional[str] = None) -> Optional[str]:
     """The first program ``name`` in an absolute entry of ``path`` (default ``$PATH``)
     that is not inside ``outside``, or None.
 
     ``fence_program`` checks both program spellings and resolved paths. Strict transports
     retain the default entry-only fence and apply their own typed program refusal.
+    On Windows, ``pathext=None`` reads the ambient PATHEXT. An explicit empty
+    value uses the standard ``.COM;.EXE;.BAT;.CMD`` list.
     """
     if not is_bare(name):
         return None
@@ -185,7 +197,7 @@ def which(name: str, path: Optional[str] = None, outside: Optional[PathLike] = N
             continue
         if fence is not None and _provenance_inside(entry, fence, descriptors=descriptors):
             continue
-        found = _programs(entry, name)
+        found = _programs(entry, name, pathext)
         if fence_program:
             found = _visible(found, fence, descriptors=descriptors)
         if found:
