@@ -598,7 +598,9 @@ class Lexer(JSXScanner):
 
     def class_member_line(self, word):
         depth = len(self.frames)
-        if self.class_fields.get(depth) and not self.expr and self.tokens and self.tokens[-1].line < self.line and word not in ('in', 'instanceof', 'as', 'satisfies'):
+        # A new line ends a field unless it continues the initializer; TS never continues `as` or `satisfies`
+        # across a line break, so `x = y` + `as(): T {}` is a method.
+        if self.class_fields.get(depth) and not self.expr and self.tokens and self.tokens[-1].line < self.line and word not in ('in', 'instanceof'):
             self.class_fields[depth] = False
 
     def class_body(self):

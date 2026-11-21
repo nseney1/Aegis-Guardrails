@@ -773,3 +773,22 @@ def test_a_keyword_method_name_keeps_the_method_body_calls(source, path, compact
 @pytest.mark.parametrize('compact', [True, False])
 def test_a_keyword_method_name_keeps_the_method_body_calls_in_javascript(source, compact):
     assert _call_targets(source, 'fixture.js', compact)[-1:] == ['eval']
+
+
+# TypeScript never continues `as` or `satisfies` across a line break, so a new line that starts
+# with them after an unfinished field starts a new member.
+@pytest.mark.parametrize('source', [
+    'class A { x = y\n  as(): void { eval(code) } }',
+    'class A { x = y\n  as(): satisfies { eval(code) } }',
+    'class A { x = y\n  satisfies(): void { eval(code) } }',
+    'class A { x = y\n  as<T>(): void { eval(code) } }',
+    'class A { x = y\n  as?(): void { eval(code) } }',
+    'class A { x = y\n  as /* c */ (): void { eval(code) } }',
+    'class A { x = y\n  \\u0061s(): void { eval(code) } }',
+    'class A { x = y\n  as\n  *g(): void { eval(code) } }',
+    'class A { x = y\n  as\n  [k](): void { eval(code) } }',
+])
+@pytest.mark.parametrize('path', ['fixture.ts', 'fixture.tsx'])
+@pytest.mark.parametrize('compact', [True, False])
+def test_a_line_starting_with_as_after_a_field_starts_a_member(source, path, compact):
+    assert _call_targets(source, path, compact)[-1:] == ['eval']
