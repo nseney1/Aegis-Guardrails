@@ -622,6 +622,14 @@ def _policy_environment(tmp_path, monkeypatch):
     monkeypatch.delenv("GIT_CONFIG_GLOBAL", raising=False)
 
 
+def _add_overlapping_remotes(project):
+    project.git("remote", "add", "team", "/not-contacted")
+    # Git 2.51+ refuses overlapping names in `remote add`. Create the legacy
+    # configuration these tests exercise, including the usual tracking refspec.
+    project.git("config", "--local", "remote.team/fork.url", "/not-contacted")
+    project.git("config", "--local", "remote.team/fork.fetch", "+refs/heads/*:refs/remotes/team/fork/*")
+
+
 @pytest.mark.parametrize("base_policy", [None, {"main": "none", "*": "signature"},
                                          {"main": "signature", "*": "none"}],
                          ids=["legacy", "known-none", "known-signature"])
@@ -654,8 +662,9 @@ def test_git_selector_table_agrees_across_public_commands(tmp_path, _policy_envi
     project.git("tag", "v1.2", base)
     project.git("tag", "ambiguous", older)
     project.git("branch", "ambiguous", base)
-    for remote in ("origin", "upstream", "team", "team/fork"):
+    for remote in ("origin", "upstream"):
         project.git("remote", "add", remote, "/not-contacted")
+    _add_overlapping_remotes(project)
     project.branch("work")
     project.git("branch", "--set-upstream-to=origin/main", "work")
     project.write(".github/workflows/ci.yml", "name: changed\n")
@@ -846,8 +855,7 @@ def test_remote_inventory_retry_requeries_git(tmp_path, _policy_environment, mon
 
 def test_parallel_slash_remote_checks_share_the_target_table(repo, monkeypatch):
     base = repo.git("rev-parse", "main")
-    for remote in ("team", "team/fork"):
-        repo.git("remote", "add", remote, "/not-contacted")
+    _add_overlapping_remotes(repo)
     repo.git("update-ref", "refs/remotes/team/fork/main", base)
     original, ready = gitsafe.run, Barrier(2)
     def overlap(args, *rest, **kwargs):
