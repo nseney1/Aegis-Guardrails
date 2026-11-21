@@ -3907,6 +3907,7 @@ REFUSAL_WIRE_SHA256 = {
     "invalid_record": "812a3301d93ed1483f1e32a9e135b5b9357be08b36e43269056e5f9bdc9fa8fc",
     "io": "362d95e88b1318c552365089907c0b06b94002a33ed217c1dc1b91b340a9b514",
     "missing": "f1f226b61b310b03d6f417806a32ee988ccf395efd81ec21f6faf90a473aab34",
+    "rate_limited": "a80a4dc94e6e1f4f53ded7cd2a4645f6012bdd19af3b667c260bd89074f10faf",
     "too_large": "36b641b57a1719462f7c0227fd7fc04c5469349becf14c4cee47d17d4acfff58",
     "unauthorized": "d86ec41d7d0ebf227580d90ab099450b9e03317cc953b797d66ac5948c340104",
     "unknown_host": "d114db378f4f63dcc37d33c9cadbec8554e71d1e23f3af4d8d23b87cca563c7d",

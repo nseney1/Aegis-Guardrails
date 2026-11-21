@@ -143,6 +143,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_native_bridge": 1,
     "aegis_core.team_native_keys": 0,
     "aegis_core.team_native_rollout": 0,
+    "aegis_core.team_native_session": 1,
     "aegis_core.team_native_wire": 0,
     "aegis_core.team_paths": 1,
     "aegis_core.team_profile": 1,
