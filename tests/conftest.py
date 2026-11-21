@@ -161,6 +161,9 @@ except ImportError:
 # GitHub inputs consumed by product code, plus the union of the former per-file
 # scrub lists. Git repository selectors follow `git rev-parse --local-env-vars`;
 # config injection and namespaces also affect the repository selected by Git.
+# setup-python exports LD_LIBRARY_PATH on Linux. Its standard hosted builds
+# link against the toolcache lib directory through rpath, so child interpreters
+# can still start after pytest removes it. Leave other loader keys untouched.
 # Both session-entry isolation and per-test restoration use this one policy.
 _CI_ENVIRONMENT = frozenset((
     "GITHUB_EVENT_PATH", "GITHUB_EVENT_NAME", "GITHUB_REF", "GITHUB_BASE_REF",
@@ -173,6 +176,7 @@ _CI_ENVIRONMENT = frozenset((
     "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX",
     "GIT_SHALLOW_FILE", "GIT_COMMON_DIR", "GIT_NAMESPACE",
     "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+    "LD_LIBRARY_PATH",
 ))
 
 
