@@ -91,7 +91,7 @@ class Lexer(JSXScanner):
         self.class_fields = {}
         self.module_clause, self.type_angles = None, 0
         self.label_pending, self.case_pending, self.ternaries = False, False, {}
-        self.jsx_tag, self.jsx_closing, self.jsx_return = '', False, 'code'
+        self.jsx_tag, self.jsx_closing, self.jsx_return, self.jsx_head = '', False, 'code', 0
         extension = PurePosixPath(path).suffix.lower()
         self.typescript = extension in ('.ts', '.tsx', '.mts', '.cts')
         self.jsx_allowed = extension in ('.jsx', '.tsx', '.js', '.mjs', '.cjs')
@@ -813,7 +813,7 @@ class Lexer(JSXScanner):
             if role == 'function_arrow':
                 self.arrow_close = (len(self.tokens), self.i)
             if role == 'jsx_expression':
-                self.mode, self.jsx_tag, self.jsx_return, self.jsx_closing = resume
+                self.mode, self.jsx_tag, self.jsx_return, self.jsx_closing, self.jsx_head = resume
             elif role == 'interpolation':
                 self.mode = resume
             if role.startswith('parameters_'):

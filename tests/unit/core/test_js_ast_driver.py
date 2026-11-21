@@ -792,3 +792,76 @@ def test_a_keyword_method_name_keeps_the_method_body_calls_in_javascript(source,
 @pytest.mark.parametrize('compact', [True, False])
 def test_a_line_starting_with_as_after_a_field_starts_a_member(source, path, compact):
     assert _call_targets(source, path, compact)[-1:] == ['eval']
+
+
+# In .tsx a generic signature `<T>(x: T) => T` inside any type reads like a JSX element whose text
+# starts with `(`; code up to a matching `</T>` would be read as JSX text, so such an element fails closed.
+@pytest.mark.parametrize('source', [
+    'let a: { f: <T>(x: T) => T } = b; eval(code) //</T>}',
+    'type A = { f: <T>(x: T) => T }; eval(code) //</T>}',
+    'let a: A | { f: <T>(x: T) => T } = b; eval(code) //</T>}',
+    'let a: Array<{ f: <T>(x: T) => T }> = b; eval(code) //</T>}>',
+    'interface I { a?: { f: <T>(x: T) => T } } eval(code) //</T>}}',
+    'function f(a?: { g: <T>(x: T) => T }) {} eval(code) //</T>})',
+    'type A = { <T>(x: T) }; eval(code) //</T>}',
+    'type A = { new <T>(x: T): T }; eval(code) //</T>}',
+    'type A = { f: <T = string>(x: T) => T }; eval(code) //</T>}',
+    'let f: <T> (x: T) => T = g; eval(code) //</T>',
+    'let f: <T>\n(x: T) => T = g; eval(code) //</T>',
+    'type A = { f: <T extends { a: 1 }>(x: T) => T }; eval(code) //</T>}',
+    "type A = { f: <T extends 'a' = 'a'>(x: T) => T }; eval(code) //</T>}",
+    'type A = { f: <T, U = {}>(x: T) => T }; eval(code) //</T>}',
+    # Comments are whitespace in a type.
+    'let a: A | { f: <T>/*c*/(x: T) => T } = b; eval(code) //</T>}',
+    'let a: A | { f: <T>//c\n(x: T) => T } = b; eval(code) //</T>}',
+    'let a: A | { f: <T>\n/*c*/\n(x: T) => T } = b; eval(code) //</T>}',
+    'let a: A | { f: <T //c\n>(x: T) => T } = b; eval(code) //</T>}',
+    'let a: A | { <T>/*c*/(x: T): T } = b; eval(code) //</T>}',
+    # The tag ends at a `>` inside a comment in its head; U+FEFF is whitespace in a type.
+    'let a: A | { f: <T/*>*/>(x: T) => T } = b; eval(code) //</T>}',
+    'let a: A | { f: <T\ufeff>(x: T) => T } = b; eval(code) //</T>}',
+    'let a: A | { f: <T>\ufeff(x: T) => T } = b; eval(code) //</T>}',
+    # Quoted types and comments cannot close the parameters early; nor can a chain of call signatures.
+    "let a: A | { f: <T>(x: ')<') => T } = b; eval(code) //</T>}",
+    'let a: A | { f: <T>(x: "){") => T } = b; eval(code) //</T>}',
+    'let a: A | { f: <T>(x /* )< */: T) => T } = b; eval(code) //</T>}',
+    'let a: A | { f: <T>(x: `)<`) => T } = b; eval(code) //</T>}',
+    'type A = { <T>(x: T)\n  <U>(y: U) }; eval(code) //</U></T>}',
+    # JSX text that cannot be told apart from a signature fails closed too.
+    "const x = <b>(don't)</b>; eval(code)",
+    'const x = <b>(1) item</b>; eval(code)',
+    'const x = <b>(' + 'a' * 5000 + ')</b>; eval(code)',
+])
+@pytest.mark.parametrize('compact', [True, False])
+def test_a_tsx_element_whose_text_starts_like_a_signature_fails_closed(source, compact):
+    assert _lex_reason(source, 'fixture.tsx', compact) == 'unsupported_lexical_context:tsx_generic_or_jsx'
+
+
+@pytest.mark.parametrize('source', [
+    'const x = <b>{eval(code)}</b>',
+    'const x = <b>text (x)</b>; eval(code)',
+    'const x = <b><i>x</i>(y)</b>; eval(code)',
+    'const x = <b />; eval(code)',
+    'const x = <b a="(" />; eval(code)',
+    # An element with attributes is JSX even when its text starts with `(`.
+    'const x = <a title="x,y">(hi)</a>; eval(code)',
+    'const x = <b className="c">(optional)</b>; eval(code)',
+    'const x = <b disabled>(optional)</b>; eval(code)',
+    'const x = <b a={<i />}>(optional)</b>; eval(code)',
+    # So is parenthesized text followed by a child element or expression, and a name no type parameter has.
+    'const x = <b>(optional)</b>; eval(code)',
+    'const x = <b> (x)</b>; eval(code)',
+    'const x = <b>\n  (x)\n</b>; eval(code)',
+    'const x = <span>({count})</span>; eval(code)',
+    'const x = <b>(a "(b)")</b>; eval(code)',
+    'const x = <b>(<i>x</i>)</b>; eval(code)',
+    'const x = <b>(x){y}</b>; eval(code)',
+    'const x = <a href="http://x">(hi)</a>; eval(code)',
+    'const x = <Foo.Bar>(hi) there</Foo.Bar>; eval(code)',
+    'const x = <my-tag>(hi) there</my-tag>; eval(code)',
+    'const x = <svg:g>(hi) there</svg:g>; eval(code)',
+    'const x = <span className="extends">(x) y</span>; eval(code)',
+])
+@pytest.mark.parametrize('compact', [True, False])
+def test_jsx_that_cannot_be_a_generic_signature_is_still_read(source, compact):
+    assert _call_targets(source, 'fixture.tsx', compact)[-1:] == ['eval']
