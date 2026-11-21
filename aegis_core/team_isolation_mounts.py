@@ -25,7 +25,7 @@ __all__ = [
     "host_policy", "home_folders", "container_env", "metadata", "foreign_write", "aliases_overlap", "secret_names",
     "credential_names",
     "ABSENCE", "inside_alias", "link_target", "resolved_path", "path_identities", "validated_owner_homes",
-    "protected_roots", "validate_mounts", "mount_plan",
+    "protected_roots", "validate_mounts", "assess_expected_mounts", "mount_plan",
 ]
 
 ABSENCE = None  # An explicit mapping entry, never an omitted or unreadable observation.
@@ -250,7 +250,7 @@ def container_env(run, env=None, *, host_table):
     return result
 
 
-def metadata(path, observed, *, directory=True, allow_absence=False):
+def _read_metadata(path, observed, *, directory=True, allow_absence=False):
     require(str(path) in observed, "mount_metadata")
     row = observed.get(str(path))
     if row is ABSENCE:
@@ -268,6 +268,35 @@ def metadata(path, observed, *, directory=True, allow_absence=False):
             any(test(row["mode"]) for test in (stat.S_ISDIR, stat.S_ISREG, stat.S_ISLNK)), "unsafe_mount")
     foreign_write(row, row["uid"], (row["gid"],))  # Validate ACLs even on protected, unmounted roots.
     return row
+
+
+class _QualifiedMetadata:
+    """Operation-local successful metadata reads. Failures are not remembered."""
+
+    __slots__ = ("observed", "rows")
+
+    def __init__(self, observed):
+        self.observed = observed
+        self.rows = {}
+
+    def get(self, path, *, directory, allow_absence):
+        key = (str(path), directory, allow_absence)
+        if key not in self.rows:
+            self.rows[key] = _read_metadata(path, self.observed, directory=directory, allow_absence=allow_absence)
+        return self.rows[key]
+
+
+def _metadata(path, observed, *, directory=True, allow_absence=False, qualified=None):
+    """Read metadata, optionally through one operation-local success cache."""
+    if qualified is not None:
+        require(type(qualified) is _QualifiedMetadata and qualified.observed is observed, "mount_metadata")
+        return qualified.get(path, directory=directory, allow_absence=allow_absence)
+    return _read_metadata(path, observed, directory=directory, allow_absence=allow_absence)
+
+
+def metadata(path, observed, *, directory=True, allow_absence=False):
+    """Read one injected observation. This entry point never reuses another call's cache."""
+    return _read_metadata(path, observed, directory=directory, allow_absence=allow_absence)
 
 
 def foreign_write(row, owner_uid, private_gids):
@@ -344,10 +373,13 @@ def link_target(value):
     return value
 
 
-def resolved_path(path, observed):
-    """Resolve components in order, charging every logical link follow to this call."""
+def _resolved_path(path, observed, *, qualified=None):
+    """Resolve components in order, charging every logical link follow to this call.
+
+    A qualified metadata cache does not share this call's follow budget.
+    """
     root = Path("/")
-    root_info = metadata(root, observed)
+    root_info = _metadata(root, observed, qualified=qualified)
     require("target" not in root_info, "mount_metadata")
     known, followed = {str(root): root_info}, 0
 
@@ -364,7 +396,7 @@ def resolved_path(path, observed):
             require(len(str(base).rstrip("/")) + len(part) + 1 <= 4096
                     and len(base.parts) <= 128, "unsafe_mount")
             candidate = base / part
-            entry = (metadata(candidate, observed, directory=False, allow_absence=True)
+            entry = (_metadata(candidate, observed, directory=False, allow_absence=True, qualified=qualified)
                      if info is not None or str(candidate) in observed else None)
             require(info is not None or entry is None, "mount_metadata")
             if entry is not None and stat.S_ISLNK(entry["mode"]):
@@ -383,14 +415,19 @@ def resolved_path(path, observed):
     return walk(root, root_info, str(path).split("/")[1:])[0]
 
 
-def path_identities(path, observed, identities, *, owner_uid=None, private_gids=()):
+def resolved_path(path, observed):
+    """Resolve one path from the supplied observations. The follow budget belongs to this call."""
+    return _resolved_path(path, observed)
+
+
+def _path_identities(path, observed, identities, *, owner_uid=None, private_gids=(), qualified=None):
     """Check existing ancestors; a confirmed absent prefix implies an absent tail."""
     absent, info = False, None
     chain = tuple(reversed((path, *path.parents)))
     for index, component in enumerate(chain):
         if absent and str(component) not in observed:
             continue
-        info = metadata(component, observed, directory=False, allow_absence=True)
+        info = _metadata(component, observed, directory=False, allow_absence=True, qualified=qualified)
         if info is None:
             absent = True
             continue
@@ -401,9 +438,14 @@ def path_identities(path, observed, identities, *, owner_uid=None, private_gids=
         if owner_uid is not None:
             require(info["uid"] in (0, owner_uid), "unsafe_mount")
             if foreign_write(info, owner_uid, private_gids) and index + 1 < len(chain):
-                child = metadata(chain[index + 1], observed, directory=False, allow_absence=True)
+                child = _metadata(chain[index + 1], observed, directory=False, allow_absence=True, qualified=qualified)
                 require(info["mode"] & stat.S_ISVTX and child is not None and child["uid"] in (0, owner_uid), "unsafe_mount")
     return None if absent else info
+
+
+def path_identities(path, observed, identities, *, owner_uid=None, private_gids=()):
+    """Check ancestors from the supplied observations. Each call validates those facts again."""
+    return _path_identities(path, observed, identities, owner_uid=owner_uid, private_gids=private_gids)
 
 
 def validated_owner_homes(home, owner_homes):
@@ -416,45 +458,111 @@ def validated_owner_homes(home, owner_homes):
     return owners
 
 
-def protected_roots(owners, observed, identities, *, protected_names=None):
+def _unique_paths(paths):
+    """Drop later equal paths. Callers validate every role before this."""
+    unique = []
+    for path in paths:
+        if path not in unique:
+            unique.append(path)
+    return tuple(unique)
+
+
+def _protected_roots(owners, observed, identities, *, protected_names=None, qualified=None):
     """Preserve legacy home/local containment and symmetric secret exclusion."""
     names = credential_names(protected_names)
     roots = []
-    for supplied in owners:
-        owner = resolved_path(supplied, observed)
-        info = path_identities(owner, observed, identities)
+    for supplied in _unique_paths(owners):
+        owner = _resolved_path(supplied, observed, qualified=qualified)
+        info = _path_identities(owner, observed, identities, qualified=qualified)
         roots.append((owner, "home"))
         if info is None or not stat.S_ISDIR(info["mode"]):
             continue
         for name in sorted(names | {".local"}):
             path = owner / name
-            entry = metadata(path, observed, directory=False, allow_absence=True)
+            entry = _metadata(path, observed, directory=False, allow_absence=True, qualified=qualified)
             if entry is None:
                 continue
-            target = resolved_path(path, observed)
-            path_identities(target, observed, identities)
+            target = _resolved_path(path, observed, qualified=qualified)
+            _path_identities(target, observed, identities, qualified=qualified)
             roots.append((target, "local" if name == ".local" else "secret"))
     return roots
 
 
-def validate_mounts(mounts, *, home, observed, owner_uid, private_gids=(), owner_homes=None,
-                    protected_names=None):
+def protected_roots(owners, observed, identities, *, protected_names=None):
+    """Build protected roots from the supplied observations and name set."""
+    return _protected_roots(owners, observed, identities, protected_names=protected_names)
+
+
+class _MountContext:
+    """One call's qualified homes, metadata and protected roots. Not reusable."""
+
+    __slots__ = ("home", "observed", "owner_uid", "private_gids", "owner_homes", "owners",
+                 "protected_names", "qualified", "identities", "protected")
+
+    def __init__(self, home, observed, owner_uid, private_gids, owner_homes, owners,
+                 protected_names, qualified):
+        self.home = home
+        self.observed = observed
+        self.owner_uid = owner_uid
+        self.private_gids = private_gids
+        self.owner_homes = owner_homes
+        self.owners = owners
+        self.protected_names = protected_names
+        self.qualified = qualified
+        self.identities = {}
+        self.protected = None
+
+    def qualify(self):
+        if self.protected is None:
+            self.protected = tuple(_protected_roots(
+                self.owners, self.observed, self.identities,
+                protected_names=self.protected_names, qualified=self.qualified))
+        return self.protected
+
+    def check_mounts(self, mounts):
+        # Structural row errors stay ahead of root qualification on a fresh context.
+        rows = mount_rows(mounts)
+        protected = self.qualify()
+        return _enforce_mount_policy(rows, self.observed, self.identities, protected,
+                                     owner_uid=self.owner_uid, private_gids=self.private_gids,
+                                     qualified=self.qualified)
+
+
+def _prepare_mount_context(*, home, observed, owner_uid, private_gids=(), owner_homes=None,
+                           protected_names=None):
     bounded_value(observed)
     require(type(observed) is dict, "mount_metadata")
     require(type(owner_uid) is int and 0 <= owner_uid < LINUX_ID_LIMIT, "mount_metadata")
     require(type(private_gids) in (tuple, list) and len(private_gids) <= 128
             and all(type(g) is int and 0 <= g < LINUX_ID_LIMIT for g in private_gids), "mount_metadata")
+    # Every role is validated before equal paths are collapsed in protected_roots.
     owners = validated_owner_homes(home, owner_homes)
-    rows = mount_rows(mounts)
-    checked = {}
-    protected = protected_roots(owners, observed, checked, protected_names=protected_names)
+    return _MountContext(home, observed, owner_uid, tuple(private_gids), owner_homes, owners,
+                         protected_names, _QualifiedMetadata(observed))
+
+
+def _mount_operation_context(*, home, observed, owner_uid, private_gids=(), owner_homes=None,
+                             protected_names=None):
+    """Qualify metadata and protected roots even when no mount rows are supplied.
+
+    The context stays inside this module. Another call re-reads its own facts.
+    """
+    context = _prepare_mount_context(home=home, observed=observed, owner_uid=owner_uid,
+                                    private_gids=private_gids, owner_homes=owner_homes,
+                                    protected_names=protected_names)
+    context.qualify()
+    return context
+
+
+def _enforce_mount_policy(rows, observed, identities, protected, *, owner_uid, private_gids, qualified):
     for row in rows:
         path = Path(row["source"])
         require(path.name != ".local" or all(path.parent != root for root, kind in protected if kind == "home"),
                 "unsafe_mount")  # The image's HOME/.local root stays reserved even when absent.
-        path_identities(path, observed, checked, owner_uid=owner_uid, private_gids=private_gids)
+        _path_identities(path, observed, identities, owner_uid=owner_uid, private_gids=private_gids,
+                         qualified=qualified)
         for root, kind in protected:
-            unsafe = aliases_overlap(path, root, checked) if kind == "secret" else inside_alias(root, path, checked)
+            unsafe = aliases_overlap(path, root, identities) if kind == "secret" else inside_alias(root, path, identities)
             require(not unsafe, "unsafe_mount")
     # Bind aliases share an ancestor identity. Compare the remaining suffixes,
     # including missing lexical relationships, across both access domains.
@@ -463,8 +571,38 @@ def validate_mounts(mounts, *, home, observed, owner_uid, private_gids=(), owner
             left, right = Path(row["source"]), Path(other["source"])
             if row["rw"] == other["rw"]:
                 continue
-            require(not aliases_overlap(left, right, checked), "mount_overlap")
+            require(not aliases_overlap(left, right, identities), "mount_overlap")
     return rows
+
+
+def validate_mounts(mounts, *, home, observed, owner_uid, private_gids=(), owner_homes=None,
+                    protected_names=None):
+    """Validate mounts from the arguments of this call. Nothing is reused from an earlier call."""
+    context = _prepare_mount_context(home=home, observed=observed, owner_uid=owner_uid,
+                                    private_gids=private_gids, owner_homes=owner_homes,
+                                    protected_names=protected_names)
+    return context.check_mounts(mounts)
+
+
+def assess_expected_mounts(expected_mounts, *, home, observed, owner_uid, private_gids=(),
+                           owner_homes=None, protected_names=None):
+    """Qualify one verify operation, then validate its expected rows.
+
+    Returns ``(rows, None)`` or ``(None, code)`` for a structural row refusal
+    (``mount_rows``, ``unsafe_mount``, or ``mount_overlap``). Every other
+    refusal propagates. The cache is neither an argument nor a result.
+    """
+    context = _mount_operation_context(home=home, observed=observed, owner_uid=owner_uid,
+                                      private_gids=private_gids, owner_homes=owner_homes,
+                                      protected_names=protected_names)
+    try:
+        return context.check_mounts(expected_mounts), None
+    except IsolationRefusal as exc:
+        if exc.code not in ("mount_rows", "unsafe_mount", "mount_overlap"):
+            raise
+        return None, exc.code
+    except ValueError:
+        return None, "mounts"
 
 
 def mount_plan(*, run, project, source, python_prefix, live_checkouts=(), home, observed, owner_uid,
