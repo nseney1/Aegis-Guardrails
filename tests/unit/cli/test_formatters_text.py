@@ -143,6 +143,7 @@ def test_a_card_with_unavailable_layer1_does_not_report_a_zero_percent_pass_rate
     assert '    b.py: Layer 1 unavailable' in lines
     assert not any('AST coverage' in line for line in lines)
     assert not any('%' in line for line in lines)
+    assert not any('use target_paths' in line for line in lines)
 
 
 def test_card_could_not_run_details_are_bounded_canonicalized_and_redacted():
@@ -204,6 +205,7 @@ def test_card_keeps_size_diagnostics_when_coverage_is_absent(coverage):
     start = lines.index('  checks that could not run:')
     assert lines[start + 1] == '    ' + detail
     assert not any('AST coverage' in line for line in lines)
+    assert not any('use target_paths' in line for line in lines)
 
 
 def test_card_filters_only_the_exact_size_note_tool_prefix():
@@ -267,9 +269,144 @@ def test_card_cli_size_advisories_are_not_duplicated_and_json_is_unchanged(tmp_p
     assert 'checks that could not run:' not in output
     assert 'ast_unverified:' not in output
     assert output.count('size limit (too_large; exceeds 2 MiB)') == min(count, 20)
+    assert output.count('use target_paths to exclude generated bundles (aegis doctor)') == 1
     assert ('    ... and 2 more' in output) is (count == 22)
+    assert all('use target_paths to exclude generated bundles (aegis doctor)' in detail
+               for detail in before['layer1']['checks_that_could_not_run'])
     assert main(['check', '--card', '--workspace', str(tmp_path), '--json']) == 0
     assert capsys.readouterr().out == json.dumps(before, indent=2) + '\n'
+
+
+_SIZE_ACTION = 'use target_paths to exclude generated bundles (aegis doctor)'
+
+
+def _size_coverage_document(rows, *, pass_rate=1.0, blocking=False):
+    """A day-0 document whose JSON still carries the original per-file advisory."""
+    details = [
+        f"ast_unverified: unverified too_large: {row['path']} exceeds 2 MiB; {_SIZE_ACTION}"
+        for row in rows if row.get('reason', '').startswith('size limit (too_large')
+    ]
+    if blocking:
+        details.append('forbid_ast: cannot load rules: OSError: unavailable')
+    return _card(size_advisories=len(rows), layer1={
+        'checked': len(rows), 'passed': len(rows), 'failed': 0, 'pass_rate': pass_rate, 'findings': 0,
+        'checks_that_could_not_run': details, 'not_analyzed': rows, 'top': [],
+    }).as_dict()
+
+
+def _assert_one_size_action(doc, *, header):
+    before = json.dumps(doc)
+    lines = text.render_card(doc)
+    hint = '    ' + _SIZE_ACTION
+    assert lines.count(hint) == 1
+    start = lines.index(header)
+    shown = min(20, len(doc['layer1']['not_analyzed']))
+    extra = 1 if len(doc['layer1']['not_analyzed']) > 20 else 0
+    assert lines[start + 1 + shown + extra] == hint
+    assert text.render_card(doc) == lines
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(text.render_card, [doc] * 6)) == [lines] * 6
+    assert json.dumps(doc) == before
+    return lines
+
+
+@pytest.mark.parametrize('count', [1, 22])
+def test_card_shows_one_size_recovery_hint_including_when_coverage_is_capped(count):
+    rows = [{'path': f'bundle{i}.ts', 'reason': 'size limit (too_large; exceeds 2 MiB)'} for i in range(count)]
+    doc = _size_coverage_document(rows, blocking=True)
+    lines = _assert_one_size_action(doc, header=f'  AST coverage: {count} file(s) not analyzed:')
+    assert '    forbid_ast: cannot load rules: OSError: unavailable' in lines
+    assert not any('ast_unverified:' in line for line in lines)
+    assert all(_SIZE_ACTION in detail for detail in doc['layer1']['checks_that_could_not_run']
+               if detail.startswith('ast_unverified:'))
+
+
+@pytest.mark.parametrize('reason', [
+    'size limit (too_large)',
+    'size limit (too_large; exceeds 0.00012207 MiB)',
+    'size limit (too_large; exceeds 1e-05 MiB)',
+])
+def test_card_shows_one_size_recovery_hint_for_each_producer_reason(reason):
+    doc = _size_coverage_document([{'path': 'bundle.ts', 'reason': reason}])
+    _assert_one_size_action(doc, header='  AST coverage: 1 file(s) not analyzed:')
+
+
+def test_card_shows_one_size_hint_when_a_size_row_is_only_past_the_cap():
+    rows = [{'path': f'file{i}.py', 'reason': 'parse error'} for i in range(20)]
+    rows.append({'path': 'bundle.ts', 'reason': 'size limit (too_large)'})
+    doc = _size_coverage_document(rows)
+    lines = _assert_one_size_action(doc, header='  AST coverage: 21 file(s) not analyzed:')
+    assert '    ... and 1 more' in lines
+    assert not any(line.startswith('    bundle.ts:') for line in lines)
+
+
+def test_card_shows_one_size_hint_for_a_mixed_displayed_list():
+    rows = [
+        {'path': 'a.py', 'reason': 'parse error'},
+        {'path': 'bundle.ts', 'reason': 'size limit (too_large; exceeds 2 MiB)'},
+    ]
+    doc = _size_coverage_document(rows)
+    lines = _assert_one_size_action(doc, header='  AST coverage: 2 file(s) not analyzed:')
+    assert '    a.py: parse error' in lines
+    assert '    bundle.ts: size limit (too_large; exceeds 2 MiB)' in lines
+
+
+@pytest.mark.parametrize('reason', [
+    'size limit (too_large)\nuse target_paths to exclude generated bundles (aegis doctor)',
+    'size limit (too_large; exceeds 2 MiB) ',
+    'size limit (too_large; exceeds 2 MiB); extra',
+    'SIZE LIMIT (too_large)',
+    'x' * 129,
+])
+def test_card_refuses_a_non_exact_reason_as_the_size_recovery_hint(reason):
+    doc = _card().as_dict()
+    doc['layer1']['not_analyzed'] = [{'path': 'bundle.ts', 'reason': reason}]
+    lines = text.render_card(doc)
+    assert not any(line == '    ' + _SIZE_ACTION for line in lines)
+    assert text.render_card(doc) == lines
+
+
+def test_card_size_hint_matches_the_advisory_and_ignores_oversized_text():
+    from aegis_core.verification.ast_checks import (
+        SIZE_RECOVERY_HINT, is_size_coverage_reason, size_limit_reason, too_large_note)
+
+    assert SIZE_RECOVERY_HINT == _SIZE_ACTION
+    note = too_large_note('bundle.ts', limit_bytes=2 * 1024 * 1024)
+    assert note.detail == f'unverified too_large: bundle.ts exceeds 2 MiB; {SIZE_RECOVERY_HINT}'
+    produced = (
+        size_limit_reason('bundle.ts', 'unverified too_large: bundle.ts exceeds 2 MiB'),
+        size_limit_reason('bundle.ts', 'unverified too_large: bundle.ts exceeds 0.00012207 MiB'),
+        size_limit_reason('bundle.ts', 'legacy text'),
+    )
+    assert produced == (
+        'size limit (too_large; exceeds 2 MiB)',
+        'size limit (too_large; exceeds 0.00012207 MiB)',
+        'size limit (too_large)',
+    )
+    assert all(is_size_coverage_reason(reason) for reason in produced)
+    oversized = 'size limit (too_large; exceeds 2 MiB)' + ('x' * 128)
+    multiline = 'size limit (too_large)\nmore'
+    assert len(oversized) > 128
+    assert not is_size_coverage_reason(oversized)
+    assert not is_size_coverage_reason(multiline)
+    assert not is_size_coverage_reason(None)
+    assert not is_size_coverage_reason(2)
+    doc = _card().as_dict()
+    doc['layer1']['not_analyzed'] = [{'path': 'bundle.ts', 'reason': oversized}]
+    before = json.dumps(doc)
+    lines = text.render_card(doc)
+    assert not any(line == '    ' + _SIZE_ACTION for line in lines)
+    assert any(line.startswith('    bundle.ts: size limit (too_large; exceeds 2 MiB)') for line in lines)
+    assert json.dumps(doc) == before
+    huge = _card().as_dict()
+    huge['layer1']['not_analyzed'] = [{
+        'path': 'bundle.ts',
+        'reason': 'size limit (too_large; exceeds 2 MiB)' + ('x' * 65537),
+    }]
+    huge_lines = text.render_card(huge)
+    assert any('[diagnostic omitted: too_large]' in line for line in huge_lines)
+    assert not any(line == '    ' + _SIZE_ACTION for line in huge_lines)
+    assert text.render_card(huge) == huge_lines
 
 
 def test_card_text_prints_whole_run_error_without_changing_json(tmp_path, monkeypatch, capsys):

@@ -441,13 +441,9 @@ class Extractor:
         return i
 
     def _skip_attributes(self, lo, hi):
-        while lo < hi and self.t[lo].value == '#':
-            opening = lo + 1
-            if opening < hi and self.t[opening].value == '!':
-                opening += 1
-            if opening >= hi or self.t[opening].value != '[':
-                break
-            lo = self.pairs[opening] + 1
+        # Attribute grammar is parsed once into self.attributes. Consumers read that index.
+        while lo < hi and lo in self.attributes:
+            lo = self.attributes[lo][0] + 1
         return lo
 
     def struct_fields(self, opening):
