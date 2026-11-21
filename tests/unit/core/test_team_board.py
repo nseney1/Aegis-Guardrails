@@ -23,6 +23,7 @@ from tools import hierarchy_board as legacy
 
 
 NOW = datetime(2026, 11, 16, 12, tzinfo=timezone.utc)
+WAIT_ADVICE = "Wait for the rate window to pass before retrying the post or disposition."
 ROLES = RoleTables(writes={"owner": {"initialize", "configure", "publish", "disposition",
                                       "move_position", "tombstone"},
                           "child": {"publish", "disposition", "move_position"}})
@@ -684,8 +685,11 @@ def test_thread_disposition_revoke_and_clock_rate_window(tmp_path):
         for number in range(core.RATE_LIMIT_ACTIONS - 2):
             board.publish("a/lane/one", post("rate%d" % number))
         before = snapshot(root)
-        with refused("invalid_record"):
+        with refused("rate_limited") as caught:
             board.publish("a/lane/one", post("next"))
+        assert caught.value.code == 1
+        assert caught.value.as_dict()["next_action"] == WAIT_ADVICE
+        assert "a/lane/one" not in str(caught.value.as_dict())
         assert snapshot(root) == before
         from datetime import timedelta
         moment[0] += timedelta(seconds=core.RATE_WINDOW_SECONDS + 1)
@@ -695,6 +699,170 @@ def test_thread_disposition_revoke_and_clock_rate_window(tmp_path):
         with refused("invalid_record"):
             board.read_thread("a/lane/one", {"post_id": reply["post_id"]}, legacy.cli_line)
         assert snapshot(root) == before
+
+
+def rate_limited_payload(caught):
+    payload = caught.value.as_dict()
+    assert payload == {"status": "refused", "reason": "rate_limited", "code": 1, "next_action": WAIT_ADVICE}
+    assert "\n" not in payload["next_action"]
+    assert caught.value.code == 1
+    return payload
+
+
+def test_quota_refusal_keeps_replay_and_other_endpoints(tmp_path):
+    """A valid post or disposition over the quota is rate_limited and writes nothing.
+
+    The window is a mix of posts and dispositions. Resolve and reopen are both
+    inside the cap, and reopen takes the last slot: if either disposition stopped
+    counting, the next post would still be admitted. Replay of an identical key
+    stays available. A different endpoint has its own window. Invalid input keeps
+    its own reason and does not consume a slot.
+    """
+    assert core.RATE_LIMIT_ACTIONS >= 5
+    root = make_store(tmp_path)
+    moment = [NOW]
+    from datetime import timedelta
+    with core.Board(root, **{**OPTIONS, "clock": lambda: moment[0]}) as board:
+        blocker = board.publish("a/lane/one", post("blocker", kind="blocker"))
+        # Blocker plus these notes leaves three slots: resolve, one post, reopen.
+        for number in range(core.RATE_LIMIT_ACTIONS - 4):
+            board.publish("a/lane/one", post("q%d" % number))
+        before = snapshot(root)
+        with refused("invalid_record"):
+            board.publish("a/lane/one", post("bad", body=""))
+        with refused("invalid_record"):
+            board.disposition("a/lane/one", {"post_id": blocker["post_id"], "state": "nope"})
+        assert snapshot(root) == before
+        resolved = board.disposition(
+            "a/lane/one", {"post_id": blocker["post_id"], "state": "resolved"})
+        assert resolved["open"] is False
+        assert resolved["disposition"]["state"] == "resolved"
+        between = board.publish("a/lane/one", post("between"))
+        assert between["replayed"] is False
+        filled = board.verify()
+        assert filled == {"ok": True, "events": core.RATE_LIMIT_ACTIONS + 2,
+                          "posts": core.RATE_LIMIT_ACTIONS - 2}
+        before = snapshot(root)
+        reopened = board.disposition(
+            "a/lane/one", {"post_id": blocker["post_id"], "state": "reopened"})
+        assert reopened["open"] is True
+        assert reopened["disposition"]["state"] == "reopened"
+        assert board.verify() == {"ok": True, "events": filled["events"] + 1, "posts": filled["posts"]}
+        before = snapshot(root)
+
+        def assert_limited(call):
+            with refused("rate_limited") as caught:
+                call()
+            payload = rate_limited_payload(caught)
+            assert "a/lane/one" not in str(payload)
+            assert "hello" not in str(payload)
+            assert snapshot(root) == before
+
+        assert_limited(lambda: board.publish("a/lane/one", post("over")))
+        assert_limited(lambda: board.disposition(
+            "a/lane/one", {"post_id": blocker["post_id"], "state": "resolved"}))
+        assert_limited(lambda: board.call("a/lane/one", "board_publish", post("via-call"), legacy.cli_line))
+        assert_limited(lambda: board.call(
+            "a/lane/one", "board_disposition",
+            {"post_id": blocker["post_id"], "state": "resolved", "note": "later"}, legacy.cli_line))
+        assert_limited(lambda: board.publish("a/lane/one", post("over-again")))
+        replayed = board.publish("a/lane/one", post("q0"))
+        assert replayed["replayed"] is True
+        assert snapshot(root) == before
+        with refused("invalid_record"):
+            board.publish("a/lane/one", post("q0", body="different"))
+        assert snapshot(root) == before
+        board.configure("grant", {"channel": "alpha", "endpoint": "a/lane/two", "access": "post", "source": "owner"})
+        other = board.publish("a/lane/two", post("other"))
+        assert other["replayed"] is False
+        before = snapshot(root)
+        assert_limited(lambda: board.publish("a/lane/one", post("still-over")))
+        moment[0] += timedelta(seconds=core.RATE_WINDOW_SECONDS + 1)
+        sent = board.publish("a/lane/one", post("after"))
+        assert sent["replayed"] is False
+        closed = board.disposition("a/lane/one", {"post_id": blocker["post_id"], "state": "resolved", "note": "done"})
+        assert closed["open"] is False
+        assert closed["disposition"]["state"] == "resolved"
+        assert board.publish("a/lane/one", post("after-two"))["replayed"] is False
+        before = snapshot(root)
+        with refused("invalid_record"):
+            board.disposition("a/lane/one", {"post_id": blocker["post_id"], "state": "resolved"})
+        assert snapshot(root) == before
+
+
+@pytest.mark.parametrize("winner", ["publish", "disposition"])
+def test_concurrent_publish_and_disposition_share_one_quota_slot(tmp_path, winner):
+    """The second writer meets the held board lock with one slot left.
+
+    Publish-first and disposition-first each commit that slot before the waiter
+    retries. The waiter is rate_limited and the board bytes stay as the winner
+    left them. A disposition that did not consume the slot would let the waiting
+    publish commit.
+    """
+    assert core.RATE_LIMIT_ACTIONS >= 5
+    root = make_store(tmp_path)
+    with core.Board(root, **OPTIONS) as board:
+        blocker = board.publish("a/lane/one", post("blocker", kind="blocker"))
+        for number in range(core.RATE_LIMIT_ACTIONS - 2):
+            board.publish("a/lane/one", post("q%d" % number))
+        baseline = board.verify()
+    assert baseline == {"ok": True, "events": core.RATE_LIMIT_ACTIONS + 2,
+                        "posts": core.RATE_LIMIT_ACTIONS - 1}
+    identifier = blocker["post_id"]
+    quiet = snapshot(root)
+    entered, release = Event(), Event()
+
+    @contextmanager
+    def guard():
+        entered.set()
+        assert release.wait(5)
+        yield
+
+    def write():
+        with core.Board(root, **OPTIONS) as board:
+            board.writer_guard = guard
+            if winner == "publish":
+                return board.publish("a/lane/one", post("race-post"))
+            return board.disposition("a/lane/one", {"post_id": identifier, "state": "resolved"})
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(write)
+        committed = []
+
+        def let_writer_finish():
+            release.set()
+            committed.append((first.result(timeout=5), snapshot(root)))
+
+        timer = WaitClock(let_writer_finish)
+        try:
+            assert entered.wait(5)
+            with core.Board(root, **OPTIONS) as board:
+                timer.inject(board)
+                with refused("rate_limited") as caught:
+                    if winner == "publish":
+                        board.disposition("a/lane/one", {"post_id": identifier, "state": "resolved"})
+                    else:
+                        board.publish("a/lane/one", post("race-post"))
+                payload = rate_limited_payload(caught)
+                assert "a/lane/one" not in str(payload)
+                assert "hello" not in str(payload)
+                assert len(committed) == 1
+                assert committed[0][1] != quiet
+                assert snapshot(root) == committed[0][1]
+                checked = board.verify()
+                assert snapshot(root) == committed[0][1]
+        finally:
+            release.set()
+        assert 0 < timer.elapsed < 5.0
+    outcome = committed[0][0]
+    if winner == "publish":
+        assert outcome["replayed"] is False
+        assert checked["posts"] == core.RATE_LIMIT_ACTIONS
+    else:
+        assert outcome["open"] is False
+        assert outcome["disposition"]["state"] == "resolved"
+        assert checked["posts"] == core.RATE_LIMIT_ACTIONS - 1
+    assert checked == {"ok": True, "events": baseline["events"] + 1, "posts": checked["posts"]}
 
 
 @pytest.mark.parametrize("damage,reason", [("missing", "missing"), ("mode", "unsafe_path"),
