@@ -1,11 +1,11 @@
 """Serial queue contracts using test-owned history and real qualification records."""
-import ast
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, replace
-from inspect import getsource
 from itertools import permutations, product
 import json
+import os
+from pathlib import Path
 import pickle
 import shutil
 from threading import Barrier
@@ -14,7 +14,9 @@ from types import SimpleNamespace
 import pytest
 
 from aegis_core import gitsafe_run, merge_queue as mq, merge_queue_types, team_gitops, team_qualify as qual
-from tests.helpers_team_git import IDENTITY, commit, git, make_store, shared_bytes
+from tests.helpers_team_git import (
+    IDENTITY, commit, copy_immutable_repo, filter_git_env, git, make_store, shared_bytes, state,
+)
 
 
 class StateBackend:
@@ -130,25 +132,167 @@ def issue(q, rig, candidate):
                         read_mode=lambda *args: "none", identity=IDENTITY, now=100)
 
 
-@pytest.fixture
-def rig(tmp_path):
+def merge_queue_author_env():
+    """Pinned author dates so a fresh graph and the worker template share one id."""
+    home = Path(os.environ.get("HOME", os.path.expanduser("~")))
+    return {**filter_git_env(home), "GIT_AUTHOR_DATE": "1700000000 +0000",
+            "GIT_COMMITTER_DATE": "1700000000 +0000"}
+
+
+def build_merge_queue_graph(repo, env):
+    """The rig graph: main at ``other``, lane/a at ``head``, both children of ``base``."""
+    git(repo, "init", "-q", "-b", "main", env=env)
+    base = commit(repo, "base", b"base\n", env=env)
+    git(repo, "checkout", "-qb", "lane/a", env=env)
+    head = commit(repo, "a", b"a\n", env=env)
+    tree = git(repo, "rev-parse", "HEAD^{tree}", env=env).decode().strip()
+    git(repo, "checkout", "-q", "main", env=env)
+    other = commit(repo, "b", b"b\n", env=env)
+    return SimpleNamespace(repo=repo, base=base, head=head, tree=tree, other=other)
+
+
+@pytest.fixture(scope="module")
+def merge_queue_template(tmp_path_factory):
+    """One immutable graph per worker. Each test mutates only its own copy."""
     if shutil.which("git") is None:
         pytest.skip("needs git")
+    repo = tmp_path_factory.mktemp("merge-queue-template") / "repo"
+    repo.mkdir()
+    template = build_merge_queue_graph(repo, merge_queue_author_env())
+    template.baseline = state(template)
+    yield template
+    assert state(template) == template.baseline
+
+
+@pytest.fixture
+def rig(tmp_path, request):
+    # Capability skip before the template exists: resolving it copies a Git graph.
+    context = make_store(tmp_path / "repo")
+    if not qual.descriptor_supported():
+        pytest.skip("qualification requires descriptor-relative custody")
+    template = request.getfixturevalue("merge_queue_template")
+    repo = copy_immutable_repo(template, tmp_path)
+    with context as store:
+        yield SimpleNamespace(repo=repo, store=store, base=template.base,
+                              head=template.head, tree=template.tree,
+                              other=template.other,
+                              journal=team_gitops.GitOpsJournal(repo / ".git"), count=0,
+                              backends={})
+
+
+@contextmanager
+def sequence_stores():
+    """Close every store opened for one sequence before the caller continues."""
+    opened = []
+    with ExitStack() as stack:
+        def open_store(repo):
+            store = stack.enter_context(make_store(repo))
+            opened.append(store.scratch)
+            return store
+        yield open_store
+    for scratch in opened:
+        assert not scratch.exists()
+
+
+def test_fresh_graph_matches_the_immutable_template(tmp_path, merge_queue_template):
     repo = tmp_path / "repo"
     repo.mkdir()
-    git(repo, "init", "-q", "-b", "main")
-    base = commit(repo, "base", b"base\n")
-    git(repo, "checkout", "-qb", "lane/a")
-    head = commit(repo, "a", b"a\n")
-    tree = git(repo, "rev-parse", "HEAD^{tree}").decode().strip()
-    git(repo, "checkout", "-q", "main")
-    other = commit(repo, "b", b"b\n")
-    with make_store(repo) as store:
-        if not qual.descriptor_supported():
-            pytest.skip("qualification requires descriptor-relative custody")
-        yield SimpleNamespace(repo=repo, store=store, base=base, head=head, tree=tree,
-                              other=other, journal=team_gitops.GitOpsJournal(repo / ".git"), count=0,
-                              backends={})
+    built = build_merge_queue_graph(repo, merge_queue_author_env())
+    assert (built.base, built.head, built.tree, built.other) == (
+        merge_queue_template.base, merge_queue_template.head,
+        merge_queue_template.tree, merge_queue_template.other)
+    assert (repo / "base").read_bytes() == (merge_queue_template.repo / "base").read_bytes() == b"base\n"
+    assert (repo / "b").read_bytes() == b"b\n"
+    assert not (repo / "a").exists()
+    assert not (merge_queue_template.repo / "a").exists()
+
+
+def test_failed_copy_leaves_the_template_unchanged_and_retry_matches(tmp_path, merge_queue_template):
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    (blocked / "repo").mkdir()
+    with pytest.raises(FileExistsError):
+        copy_immutable_repo(merge_queue_template, blocked)
+    assert state(merge_queue_template) == merge_queue_template.baseline
+    assert list((blocked / "repo").iterdir()) == []
+    repo = copy_immutable_repo(merge_queue_template, tmp_path)
+    again = tmp_path / "retry"
+    again.mkdir()
+    retried = copy_immutable_repo(merge_queue_template, again)
+    assert state(SimpleNamespace(repo=repo)) == merge_queue_template.baseline
+    assert state(SimpleNamespace(repo=retried)) == merge_queue_template.baseline
+    assert repo != retried
+
+
+def test_concurrent_copies_mutate_only_their_own_bytes(tmp_path, merge_queue_template):
+    barrier = Barrier(2)
+
+    def mutate(name):
+        directory = tmp_path / name
+        directory.mkdir()
+        repo = copy_immutable_repo(merge_queue_template, directory)
+        barrier.wait(timeout=30)
+        commit(repo, name + ".txt", name.encode() + b"\n")
+        return repo
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        left, right = tuple(pool.map(mutate, ("left", "right")))
+    assert (left / "left.txt").read_bytes() == b"left\n"
+    assert not (left / "right.txt").exists()
+    assert (right / "right.txt").read_bytes() == b"right\n"
+    assert not (right / "left.txt").exists()
+    assert (left / "base").read_bytes() == (right / "base").read_bytes() == b"base\n"
+    assert state(merge_queue_template) == merge_queue_template.baseline
+
+
+def test_rig_mutation_does_not_change_the_template_or_a_sibling_copy(rig, tmp_path, request):
+    # rig already passed the capability guards; do not resolve the template first.
+    merge_queue_template = request.getfixturevalue("merge_queue_template")
+    sibling_dir = tmp_path / "sibling"
+    sibling_dir.mkdir()
+    sibling = copy_immutable_repo(merge_queue_template, sibling_dir)
+    (rig.repo / "base").write_bytes(b"mutated-by-this-test\n")
+    assert (sibling / "base").read_bytes() == b"base\n"
+    assert (merge_queue_template.repo / "base").read_bytes() == b"base\n"
+    assert state(merge_queue_template) == merge_queue_template.baseline
+
+
+def test_sequence_store_closes_on_failure_and_retry_opens_another(rig):
+    failed = None
+    with pytest.raises(RuntimeError, match="injected sequence failure"):
+        with sequence_stores() as open_store:
+            store = open_store(rig.repo)
+            failed = store.scratch
+            assert failed.exists() and failed != rig.store.scratch
+            raise RuntimeError("injected sequence failure")
+    assert failed is not None and not failed.exists()
+    with sequence_stores() as open_store:
+        store = open_store(rig.repo)
+        retried = store.scratch
+        assert retried.exists() and retried != failed
+    assert not retried.exists()
+
+
+def test_concurrent_sequence_stores_release_independent_scratches(tmp_path, request):
+    # Main-thread capability skip. Workers must not be the first make_store probe.
+    make_store(tmp_path)
+    merge_queue_template = request.getfixturevalue("merge_queue_template")
+
+    def once(name):
+        directory = tmp_path / name
+        directory.mkdir()
+        repo = copy_immutable_repo(merge_queue_template, directory)
+        with sequence_stores() as open_store:
+            store = open_store(repo)
+            scratch = store.scratch
+            assert scratch.exists()
+        assert not scratch.exists()
+        return str(scratch)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        scratches = tuple(pool.map(once, ("one", "two")))
+    assert scratches[0] != scratches[1]
+    assert state(merge_queue_template) == merge_queue_template.baseline
 
 
 def passing(rig, tree=None, head=None, legs=mq.REQUIRED_LEGS):
@@ -379,22 +523,114 @@ def test_model_json_checkpoint_reopens_receipts_and_archive(rig, phase, has_resu
     assert restarted.hosted_result(receipt.commit, passed=True, attempt=4) == "stale"
 
 
-def model_cleanup_resolutions():
+# Test-owned durable strings and outcomes. Coverage is compared with the model's
+# named declaration; these literals are not read from the validator source.
+DURABLE_CLEANUP_OUTCOMES = {
+    "issuing": "not_applied",
+    "aborted": "not_applied",
+    "done": "already",
+    "not_applied": "not_applied",
+    "released": "released",
+}
+UNKNOWN_CLEANUP_RESOLUTIONS = ("unknown", "done\n", "not_applied\r", "issuing aborted", "ISSUING", "")
+
+
+def _synthetic_entry(lane, parents=()):
+    commit, tree = "a" * 40, "b" * 40
+    reviews = tuple(mq.Review(session, commit, tree, "ACCEPT", True)
+                    for session in ("reviewer-1", "reviewer-2"))
+    return mq.QueueEntry(lane, "writer", commit, reviews, parents=tuple(parents))
+
+
+def _validated_state(entries, cleanup=None, serial=0):
     from aegis_core import merge_queue_model as model
 
-    # The accepted values are inline in the model validator. Require the source
-    # predicate so a change to its shape cannot silently empty the test matrix.
-    predicate, = (
-        node for node in ast.walk(ast.parse(getsource(model.validate_state)))
-        if isinstance(node, ast.Compare) and len(node.ops) == 1
-        and isinstance(node.ops[0], ast.NotIn) and ast.unparse(node.left) == "record.resolution"
-    )
-    values = ast.literal_eval(predicate.comparators[0])
-    assert values
-    return values
+    state = model.QueueState("integration", model.REQUIRED_LEGS, ("linux-3.12",),
+                             entries=tuple(entries), cleanup=cleanup, serial=serial)
+    return model.validate_state(state, "integration", model.REQUIRED_LEGS, ("linux-3.12",),
+                                model.MAX_ENTRIES)
 
 
-@pytest.mark.parametrize("resolution", model_cleanup_resolutions())
+def _cleanup_state(resolution, result=None):
+    from aegis_core import merge_queue_model as model
+
+    entry = _synthetic_entry("a")
+    landing = model.Landing("ready", "a", "c" * 40, entry.head, "b" * 40, issuance=1)
+    record = model.IssuedRecord(entry, landing, result=result, resolution=resolution,
+                                ref=model.pin_ref("integration", landing), expected=entry.head)
+    return _validated_state((entry,), record, serial=1)
+
+
+def test_cleanup_resolution_declaration_matches_independent_recovery_table():
+    """Invariant: the durable resolution declaration and the test-owned table agree."""
+    from aegis_core import merge_queue_model as model
+
+    declared = getattr(model, "CLEANUP_RESOLUTIONS", None)
+    assert type(declared) is tuple and declared
+    assert len(set(declared)) == len(declared)
+    assert set(declared) == set(DURABLE_CLEANUP_OUTCOMES)
+    for value in declared:
+        assert type(value) is str and value == value.strip() and "\n" not in value and "\r" not in value
+        assert " " not in value
+
+
+def test_validate_state_pins_declared_cleanup_resolutions_and_refuses_unknown():
+    """Unknown and multi-line resolutions are refused whole; a declared value retries."""
+    from aegis_core import merge_queue_model as model
+
+    for resolution in DURABLE_CLEANUP_OUTCOMES:
+        for result in (None, model.HostedResult("a" * 40, True, 3)):
+            state = _cleanup_state(resolution, result)
+            assert state.cleanup.resolution == resolution
+            assert state.cleanup.result == result
+    for resolution in UNKNOWN_CLEANUP_RESOLUTIONS:
+        for result in (None, model.HostedResult("a" * 40, True, 3)):
+            refused("state_unavailable", lambda resolution=resolution, result=result:
+                    _cleanup_state(resolution, result))
+            repaired = _cleanup_state("issuing", result)
+            assert repaired.cleanup.resolution == "issuing"
+            assert repaired.cleanup.result == result
+
+
+def test_validate_state_rejects_pending_cycles_and_keeps_external_parents():
+    """One cycle check: enqueue root is parent_cycle; full restore is state_unavailable."""
+    from aegis_core import merge_queue_model as model
+
+    solo = _synthetic_entry("solo", ("outside",))
+    left = _synthetic_entry("left", ("right",))
+    right = _synthetic_entry("right", ("left",))
+    diamond_d = _synthetic_entry("d")
+    diamond_b = _synthetic_entry("b", ("d",))
+    diamond_c = _synthetic_entry("c", ("d", "outside"))
+    diamond_a = _synthetic_entry("a", ("b", "c"))
+    acyclic = {"solo": solo, "d": diamond_d, "b": diamond_b, "c": diamond_c, "a": diamond_a}
+    snapshot = dict(acyclic)
+
+    model.check_acyclic(_synthetic_entry("fresh", ("outside",)), acyclic)
+    refused("parent_cycle", lambda: model.check_acyclic(_synthetic_entry("right", ("left",)),
+                                                        {"left": left}))
+    hidden = {"loop-a": _synthetic_entry("loop-a", ("loop-b",)),
+              "loop-b": _synthetic_entry("loop-b", ("loop-a",))}
+    refused("parent_cycle", lambda: model.check_acyclic(_synthetic_entry("child", ("loop-a",)), hidden))
+    model.check_acyclic(_synthetic_entry("child", ("outside",)), dict(hidden))
+    assert acyclic == snapshot
+
+    _validated_state((solo, diamond_d, diamond_b, diamond_c, diamond_a))
+    _validated_state(())
+    refused("state_unavailable", lambda: _validated_state((solo, left, right)))
+    refused("state_unavailable", lambda: _validated_state((
+        _synthetic_entry("a", ("b",)), _synthetic_entry("b", ("c",)), _synthetic_entry("c", ("a",)))))
+    refused("state_unavailable", lambda: _validated_state((_synthetic_entry("a", ("a",)),)))
+    chain = tuple(_synthetic_entry("n%d" % index, (("n%d" % (index + 1),) if index < 4 else ("n0",)))
+                  for index in range(5))
+    refused("state_unavailable", lambda: _validated_state((solo,) + chain))
+    repaired = _validated_state((solo, left, replace(right, parents=("outside",))))
+    assert {item.lane for item in repaired.entries} == {"solo", "left", "right"}
+    refused("state_unavailable", lambda: model.check_acyclic(None, {"left": left, "right": right}))
+    model.check_acyclic(None, {item.lane: item for item in repaired.entries})
+
+
+@pytest.mark.parametrize("resolution", list(DURABLE_CLEANUP_OUTCOMES))
 @pytest.mark.parametrize("has_result", [False, True], ids=["without-result", "with-result"])
 def test_model_json_checkpoint_recovers_every_cleanup_resolution(rig, resolution, has_result):
     original = queue(rig)
@@ -426,13 +662,8 @@ def test_model_json_checkpoint_recovers_every_cleanup_resolution(rig, resolution
     def acknowledge(active):
         return active.observe_landed(rig.store, receipt, read_target=lambda _: receipt.commit)
 
-    recover, expected = {
-        "issuing": (reconcile, "not_applied"),
-        "aborted": (reconcile, "not_applied"),
-        "done": (acknowledge, "already"),
-        "not_applied": (reconcile, "not_applied"),
-        "released": (withdraw, "released"),
-    }[resolution]
+    expected = DURABLE_CLEANUP_OUTCOMES[resolution]
+    recover = {"not_applied": reconcile, "already": acknowledge, "released": withdraw}[expected]
     if resolution != "issuing":
         backend.fail = "cleanup-before"
         refused("state_unavailable", lambda: recover(original))
@@ -462,6 +693,272 @@ def test_model_json_checkpoint_recovers_every_cleanup_resolution(rig, resolution
     else:
         assert recover(restarted) == "already"
     assert git(rig.repo, "for-each-ref", "--format=%(objectname)", "refs/aegis/merge-queue/") == b""
+
+
+@pytest.mark.parametrize("has_result", [False, True], ids=["without-result", "with-result"])
+def test_unknown_cleanup_resolution_reopen_refuses_and_declared_retry_recovers(rig, has_result):
+    """Reopen refuses unknown input whole; a declared resolution retries the saved result."""
+    original = queue(rig)
+    backend = rig.backends[original]
+    passing(rig)
+    candidate = prepare(original, rig)
+    backend.fail = "issue-before"
+    refused("state_unavailable", lambda: issue(original, rig, candidate))
+    backend.fail = None
+    original = fresh_queue(rig, backend=backend, initialize=False)
+    receipt = original.issued
+    if has_result:
+        assert original.hosted_result(receipt.commit, passed=True, attempt=3) == "pending"
+    saved_result = mq.HostedResult(receipt.commit, True, 3) if has_result else None
+    assert backend.state.cleanup.resolution == "issuing"
+    assert backend.state.cleanup.result == saved_result
+
+    def reopen(active_backend):
+        fresh_queue(rig, backend=active_backend, initialize=False)
+
+    for unknown in UNKNOWN_CLEANUP_RESOLUTIONS:
+        backend.state = replace(backend.state, cleanup=replace(backend.state.cleanup, resolution=unknown))
+        recovered = json_round_trip_backend(backend)
+        assert recovered.state.cleanup.resolution == unknown
+        assert recovered.state.cleanup.result == saved_result
+        refused("state_unavailable", lambda recovered=recovered: reopen(recovered))
+        assert recovered.state.cleanup.resolution == unknown
+
+    backend.state = replace(backend.state, cleanup=replace(backend.state.cleanup, resolution="done\n"))
+    recovered = json_round_trip_backend(backend)
+    barrier = Barrier(2)
+
+    def concurrent(_):
+        barrier.wait(timeout=10)
+        try:
+            reopen(recovered)
+            return "opened"
+        except mq.QueueRefused as exc:
+            return exc.code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sorted(pool.map(concurrent, (0, 1))) == ["state_unavailable", "state_unavailable"]
+    assert recovered.state.cleanup.resolution == "done\n"
+    assert recovered.state.cleanup.result == saved_result
+
+    recovered.state = replace(recovered.state, cleanup=replace(recovered.state.cleanup, resolution="issuing"))
+    restarted = fresh_queue(rig, backend=recovered, initialize=False)
+    assert restarted.issued == receipt
+    refused("landing_unconfirmed", lambda: restarted.reconcile_not_landed(
+        rig.store, receipt, read_target=lambda _: receipt.tip, read_outcome=lambda _: "pending"))
+    assert restarted.issued == receipt
+    assert restarted.reconcile_not_landed(
+        rig.store, receipt, read_target=lambda _: receipt.tip,
+        read_outcome=lambda _: "not_applied") == "not_applied"
+    assert restarted.issued is None
+    refused("stale_candidate", lambda: restarted.reconcile_not_landed(
+        rig.store, receipt, read_target=lambda _: receipt.tip, read_outcome=lambda _: "not_applied"))
+
+
+# Resolutions that are not in the durable declaration. Built directly so recovery
+# is tested without validate_state rewriting or refusing them first.
+UNDECLARED_CLEANUP_RESOLUTIONS = ("retry", "forced")
+
+
+def _issuing_checkpoint(rig):
+    """Settled issuing cleanup from a lost issuance reply. The caller plants resolutions."""
+    original = queue(rig)
+    backend = rig.backends[original]
+    passing(rig)
+    candidate = prepare(original, rig)
+    backend.fail = "issue-before"
+    refused("state_unavailable", lambda: issue(original, rig, candidate))
+    backend.fail = None
+    receipt = original.issued
+    baseline = backend.state
+    assert baseline.cleanup.resolution == "issuing"
+    assert receipt == baseline.cleanup.landing
+    # The lost reply left the test journal dirty. The planted record is the settled checkpoint.
+    backend.dirty = False
+    backend.pending.clear()
+    return backend, baseline, receipt
+
+
+def _bind_direct_cleanup(rig, backend, baseline, resolution, result=None):
+    """Install cleanup.resolution on a live queue without calling validate_state."""
+    planted = replace(baseline, reconciliation_required=baseline.reconciliation_required or backend.dirty,
+                      cleanup=replace(baseline.cleanup, resolution=resolution, result=result))
+    backend.state = planted
+    opened = mq.MergeQueue("integration")
+    opened._storage = backend.port()
+    opened._state = planted
+    opened._repo = rig.store.repo
+    rig.backends[opened] = backend
+    return opened
+
+
+def _recovery_snapshot(rig, active, backend):
+    cleanup = active._state.cleanup
+    return (cleanup.resolution, cleanup.result, tuple(item.lane for item in active._state.entries),
+            dict(backend.lanes), dict(backend.commits), active._target_checked, active._faulted,
+            git(rig.repo, "rev-parse", cleanup.ref).decode().strip())
+
+
+def test_direct_undeclared_cleanup_resolution_refuses_without_reopen(rig, monkeypatch):
+    """An undeclared resolution built past validate_state refuses at recovery and does not reopen."""
+    from aegis_core import merge_queue_model as model
+
+    backend, baseline, receipt = _issuing_checkpoint(rig)
+    real_validate = model.validate_state
+    validations = []
+
+    def reject_validation(*args, **kwargs):
+        validations.append(args)
+        raise mq.QueueRefused("state_unavailable")
+
+    monkeypatch.setattr(mq.model, "validate_state", reject_validation)
+
+    def recover_all(active):
+        refused("state_unavailable", lambda: active.withdraw(
+            receipt.lane, expected_head=rig.head, store=rig.store,
+            read_target=lambda _: receipt.tip, read_outcome=lambda _: "not_applied"))
+        refused("state_unavailable", lambda: active.observe_landed(
+            rig.store, receipt, read_target=lambda _: receipt.commit))
+        refused("state_unavailable", lambda: active.reconcile_not_landed(
+            rig.store, receipt, read_target=lambda _: receipt.tip, read_outcome=lambda _: "not_applied"))
+
+    for resolution in UNDECLARED_CLEANUP_RESOLUTIONS:
+        for result in (None, mq.HostedResult(receipt.commit, True, 3)):
+            planted = replace(baseline, cleanup=replace(baseline.cleanup, resolution=resolution, result=result))
+            refused("state_unavailable", lambda planted=planted: real_validate(
+                planted, "integration", model.REQUIRED_LEGS, ("linux-3.12",), model.MAX_ENTRIES))
+            opened = _bind_direct_cleanup(rig, backend, baseline, resolution, result)
+            before = _recovery_snapshot(rig, opened, backend)
+            recover_all(opened)
+            assert validations == []
+            assert _recovery_snapshot(rig, opened, backend) == before
+            assert opened.issued == receipt
+            assert opened.prepare(rig.store, read_target=lambda _: rig.base,
+                                  read_mode=lambda *args: "none", identity=IDENTITY,
+                                  now=100).status == "reconciliation-required"
+            assert opened._state.cleanup.resolution == resolution
+            assert opened._state.cleanup.result == result
+
+    concurrent = _bind_direct_cleanup(rig, backend, baseline, "retry", mq.HostedResult(receipt.commit, True, 3))
+    before = _recovery_snapshot(rig, concurrent, backend)
+    barrier = Barrier(3)
+
+    def attack(kind):
+        barrier.wait(timeout=10)
+        try:
+            if kind == "withdraw":
+                concurrent.withdraw(receipt.lane, expected_head=rig.head, store=rig.store,
+                                    read_target=lambda _: receipt.tip, read_outcome=lambda _: "not_applied")
+            elif kind == "acknowledge":
+                concurrent.observe_landed(rig.store, receipt, read_target=lambda _: receipt.commit)
+            else:
+                concurrent.reconcile_not_landed(rig.store, receipt, read_target=lambda _: receipt.tip,
+                                                read_outcome=lambda _: "not_applied")
+            return "opened"
+        except mq.QueueRefused as exc:
+            return exc.code
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert sorted(pool.map(attack, ("withdraw", "acknowledge", "reconcile"))) == ["state_unavailable"] * 3
+    assert validations == []
+    assert _recovery_snapshot(rig, concurrent, backend) == before
+    assert concurrent.issued == receipt
+
+    restart = _bind_direct_cleanup(rig, backend, baseline, "retry")
+    before = _recovery_snapshot(rig, restart, backend)
+    refused("state_unavailable", lambda: restart.restore_target(
+        rig.store, mq.HostedResult(rig.base, True), read_target=lambda _: rig.base))
+    assert _recovery_snapshot(rig, restart, backend) == before
+    assert restart.issued == receipt
+    assert restart.prepare(rig.store, read_target=lambda _: rig.base,
+                           read_mode=lambda *args: "none", identity=IDENTITY,
+                           now=100).status == "reconciliation-required"
+    refused("state_unavailable", lambda: restart.withdraw(
+        receipt.lane, expected_head=rig.head, store=rig.store,
+        read_target=lambda _: receipt.tip, read_outcome=lambda _: "not_applied"))
+    assert validations == []
+
+    repaired = _bind_direct_cleanup(rig, backend, baseline, "issuing")
+    refused("landing_unconfirmed", lambda: repaired.reconcile_not_landed(
+        rig.store, receipt, read_target=lambda _: receipt.tip, read_outcome=lambda _: "pending"))
+    assert repaired.issued == receipt
+    assert repaired.reconcile_not_landed(
+        rig.store, receipt, read_target=lambda _: receipt.tip,
+        read_outcome=lambda _: "not_applied") == "not_applied"
+    assert repaired.issued is None
+    assert validations == []
+
+
+def test_recovery_dispatch_keys_match_declaration_and_reach_each_handler(rig, monkeypatch):
+    """Every declared resolution reaches the one dispatch handler for the independent outcome."""
+    from aegis_core import merge_queue_model as model
+
+    declared = model.CLEANUP_RESOLUTIONS
+    assert tuple(mq._CLEANUP_RECOVERY) == declared
+    assert set(mq._CLEANUP_RECOVERY) == set(DURABLE_CLEANUP_OUTCOMES)
+    assert len(mq._CLEANUP_RECOVERY) == len(declared)
+    backend, baseline, receipt = _issuing_checkpoint(rig)
+    validations = []
+
+    def reject_validation(*args, **kwargs):
+        validations.append(args)
+        raise mq.QueueRefused("state_unavailable")
+
+    monkeypatch.setattr(mq.model, "validate_state", reject_validation)
+    git(rig.repo, "update-ref", baseline.cleanup.ref, baseline.cleanup.expected)
+
+    def reconcile(active, outcome="not_applied"):
+        return active.reconcile_not_landed(rig.store, receipt, read_target=lambda _: receipt.tip,
+                                           read_outcome=lambda _: outcome)
+
+    def acknowledge(active):
+        return active.observe_landed(rig.store, receipt, read_target=lambda _: receipt.commit)
+
+    def release(active):
+        return active.withdraw(receipt.lane, expected_head=rig.head, store=rig.store,
+                              read_target=lambda _: receipt.tip, read_outcome=lambda _: "not_applied")
+
+    wrong = _bind_direct_cleanup(rig, backend, baseline, "done")
+    refused("stale_candidate", lambda: reconcile(wrong))
+    refused("request_conflict", lambda: release(wrong))
+    assert wrong._state.cleanup.resolution == "done"
+    held = _bind_direct_cleanup(rig, backend, baseline, "not_applied")
+    refused("stale_candidate", lambda: acknowledge(held))
+    refused("request_conflict", lambda: release(held))
+    assert held._state.cleanup.resolution == "not_applied"
+
+    failed = _bind_direct_cleanup(rig, backend, baseline, "done")
+    backend.fail = "cleanup-before"
+    refused("state_unavailable", lambda: acknowledge(failed))
+    backend.fail = None
+    assert failed._state.cleanup.resolution == "done"
+    assert failed._faulted is True
+    retried = _bind_direct_cleanup(rig, backend, baseline, "done")
+    assert acknowledge(retried) == "already"
+    assert retried.issued is None
+
+    runners = {"abort": reconcile, "acknowledge": acknowledge, "settle": reconcile, "release": release}
+    for resolution in declared:
+        git(rig.repo, "update-ref", baseline.cleanup.ref, baseline.cleanup.expected)
+        opened = _bind_direct_cleanup(rig, backend, baseline, resolution)
+        handler = mq._CLEANUP_RECOVERY[resolution]
+        if resolution in ("issuing", "aborted"):
+            assert handler == mq._CLEANUP_RECOVERY["issuing"] == mq._CLEANUP_RECOVERY["aborted"]
+            refused("landing_unconfirmed", lambda opened=opened: reconcile(opened, "pending"))
+            assert opened.issued == receipt
+            assert opened._state.cleanup.resolution == resolution
+        else:
+            # A finish-only handler must not rewrite the resolution before the failing save.
+            backend.fail = "cleanup-before"
+            refused("state_unavailable", lambda opened=opened, handler=handler: runners[handler](opened))
+            backend.fail = None
+            assert opened._state.cleanup.resolution == resolution
+            assert opened._faulted is True
+            git(rig.repo, "update-ref", baseline.cleanup.ref, baseline.cleanup.expected)
+            opened = _bind_direct_cleanup(rig, backend, baseline, resolution)
+        assert runners[handler](opened) == DURABLE_CLEANUP_OUTCOMES[resolution]
+        assert opened.issued is None
+    assert validations == []
 
 
 @pytest.mark.parametrize("phase", ["empty", "queued", "issued", "cleanup", "completed"])
@@ -1200,6 +1697,102 @@ def test_parent_cycles_are_rejected_and_retry_keeps_existing_order(rig):
     assert prepare(q, rig).status == "blocked-by-parent"
     q.enqueue(rig.store, entry(rig, lane="b"))
     assert prepare(q, rig).lane == "b"
+
+
+def test_enqueue_cycle_refuses_and_open_prefix_restores(rig):
+    """Admission refuses parent_cycle; an open external prefix reopens and then retries."""
+    passing(rig, legs=("linux-3.12",))
+    q = fresh_queue(rig)
+    first = entry(rig, lane="a", parents=("c",))
+    second = entry(rig, lane="b", parents=("a",))
+    closing = entry(rig, lane="c", parents=("b",))
+    assert q.enqueue(rig.store, first) == "queued"
+    assert q.enqueue(rig.store, second) == "queued"
+    refused("parent_cycle", lambda: q.enqueue(rig.store, closing))
+    refused("parent_cycle", lambda: q.enqueue(rig.store, closing))
+    assert {item.lane for item in rig.backends[q].state.entries} == {"a", "b"}
+
+    restarted = fresh_queue(rig, backend=rig.backends[q], initialize=False)
+    assert prepare(restarted, rig).status == "blocked-by-parent"
+    before = rig.backends[restarted].state
+    barrier = Barrier(2)
+
+    def close(_):
+        barrier.wait(timeout=10)
+        try:
+            return restarted.enqueue(rig.store, closing)
+        except mq.QueueRefused as exc:
+            return exc.code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sorted(pool.map(close, (0, 1))) == ["parent_cycle", "parent_cycle"]
+    assert rig.backends[restarted].state == before
+    opened = replace(closing, parents=())
+    assert restarted.enqueue(rig.store, opened) == "queued"
+    assert restarted.enqueue(rig.store, opened) == "already"
+    assert prepare(restarted, rig).lane == "c"
+    assert {item.lane for item in rig.backends[restarted].state.entries} == {"a", "b", "c"}
+
+
+def test_restart_refuses_cyclic_checkpoint_and_retries_acyclic_graph(rig):
+    """A durable cycle is state_unavailable; repairing it reopens the external parents."""
+    passing(rig, legs=("linux-3.12",))
+    q = fresh_queue(rig)
+    keep = entry(rig, lane="keep", parents=("outside",))
+    assert q.enqueue(rig.store, keep) == "queued"
+    restarted = fresh_queue(rig, backend=rig.backends[q], initialize=False)
+    assert restarted.enqueue(rig.store, keep) == "already"
+    assert prepare(restarted, rig).status == "blocked-by-parent"
+
+    backend = rig.backends[q]
+    left = entry(rig, lane="left", parents=("right",))
+    right = entry(rig, lane="right", parents=("left",))
+    backend.state = replace(backend.state, entries=(keep, left, right))
+    recovered = json_round_trip_backend(backend)
+    before = recovered.state
+    barrier = Barrier(2)
+
+    def reopen(_):
+        barrier.wait(timeout=10)
+        try:
+            fresh_queue(rig, backend=recovered, initialize=False)
+            return "opened"
+        except mq.QueueRefused as exc:
+            return exc.code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sorted(pool.map(reopen, (0, 1))) == ["state_unavailable", "state_unavailable"]
+    refused("state_unavailable", lambda: fresh_queue(rig, backend=recovered, initialize=False))
+    assert recovered.state == before
+
+    recovered.state = replace(recovered.state, entries=(keep, left, replace(right, parents=("new",))))
+    repaired = fresh_queue(rig, backend=recovered, initialize=False)
+    assert {item.lane for item in rig.backends[repaired].state.entries} == {"keep", "left", "right"}
+    joining = entry(rig, lane="new", parents=("left",))
+    refused("parent_cycle", lambda: repaired.enqueue(rig.store, joining))
+    assert repaired.enqueue(rig.store, replace(joining, parents=())) == "queued"
+    assert prepare(repaired, rig).lane == "new"
+
+
+def test_reloaded_cycle_refuses_issued_check_until_repaired_restart(rig):
+    """check_issued reloads through the same restore validation as restart."""
+    q = queue(rig)
+    passing(rig)
+    receipt = issue(q, rig, prepare(q, rig))
+    backend = rig.backends[q]
+    record = backend.state.issued
+    left = entry(rig, lane="left", parents=("right",))
+    right = entry(rig, lane="right", parents=("left",))
+    backend.state = replace(backend.state, entries=(record.entry, left, right))
+    refused("state_unavailable", lambda: q.check_issued(
+        rig.store, receipt, read_target=lambda _: rig.base, read_mode=lambda *args: "none", now=100))
+    refused("state_unavailable", lambda: q.check_issued(
+        rig.store, receipt, read_target=lambda _: rig.base, read_mode=lambda *args: "none", now=100))
+    backend.state = replace(backend.state, entries=(record.entry, left, replace(right, parents=("outside",))))
+    restarted = fresh_queue(rig, backend=backend, initialize=False)
+    restarted.restore_target(rig.store, mq.HostedResult(rig.base, True), read_target=lambda _: rig.base)
+    assert restarted.check_issued(rig.store, receipt, read_target=lambda _: rig.base,
+                                  read_mode=lambda *args: "none", now=100) is True
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -2217,7 +2810,7 @@ def test_unissued_intent_result_survives_abort_with_empty_scratch(rig, monkeypat
 
 @pytest.mark.parametrize("prefix", ["initial", "issued", "landed", "descendant-red",
     "duplicate-red", "withdrawn-red", "cached-merge"])
-def test_bounded_exhaustive_state_sequences_preserve_i1_i2_i3(rig, monkeypatch, request, prefix):
+def test_bounded_exhaustive_state_sequences_preserve_i1_i2_i3(rig, monkeypatch, prefix):
     """Every two-event suffix from seven prefixes; I1-I4 checked after each event.
 
     The independent oracle tracks per-revision attempts, actual target ancestry
@@ -2226,8 +2819,6 @@ def test_bounded_exhaustive_state_sequences_preserve_i1_i2_i3(rig, monkeypatch, 
     their first real read. No repository history or new dependency is needed.
     """
     passing(rig)
-    stores = ExitStack()
-    request.addfinalizer(stores.close)
     subjects = result_subjects(rig)
     base_tree = git(rig.repo, "rev-parse", rig.base + "^{tree}").decode().strip()
     cached_tip = git(rig.repo, "commit-tree", base_tree, "-p", rig.base,
@@ -2340,109 +2931,110 @@ def test_bounded_exhaustive_state_sequences_preserve_i1_i2_i3(rig, monkeypatch, 
     resolved_states = set()
     for seed, initial_target in seeds:
         for sequence in product(events, repeat=2):
-            backend, target = clone(seed), initial_target
-            store = rig.store
-            q = fresh_queue(rig, backend=backend, initialize=False)
-            oracle = {oid: (row.attempt, row.passed) for oid, row in backend.healths.items()}
-            observe(oracle, target, True, 0)
-            q.restore_target(store, mq.HostedResult(target, True), read_target=lambda _: target)
-            fault = False
-            for event in sequence:
-                receipt = q.issued
-                if event == "issue":
-                    candidate = call(lambda: q.prepare(store, read_target=lambda _: target,
-                        read_mode=lambda *args: "none", identity=IDENTITY, now=100))
-                    if isinstance(candidate, mq.Landing) and candidate.status == "ready":
-                        assert not fault and oracle.get(target, (0, True))[1], sequence
-                        assert oracle.get(candidate.commit, (0, True))[1], sequence
-                        issued = call(lambda: q.revalidate(store, candidate, read_target=lambda _: target,
+            with sequence_stores() as open_store:
+                backend, target = clone(seed), initial_target
+                store = rig.store
+                q = fresh_queue(rig, backend=backend, initialize=False)
+                oracle = {oid: (row.attempt, row.passed) for oid, row in backend.healths.items()}
+                observe(oracle, target, True, 0)
+                q.restore_target(store, mq.HostedResult(target, True), read_target=lambda _: target)
+                fault = False
+                for event in sequence:
+                    receipt = q.issued
+                    if event == "issue":
+                        candidate = call(lambda: q.prepare(store, read_target=lambda _: target,
                             read_mode=lambda *args: "none", identity=IDENTITY, now=100))
-                        if isinstance(issued, mq.Landing):
-                            parents.setdefault(issued.commit, (issued.tip, rig.head))
-                elif event == "land":
-                    if receipt is not None:
-                        target = receipt.commit
-                elif event.startswith("advance-"):
-                    target = descendant if event == "advance-descendant" else rig.other
-                elif event in ("red0", "green0", "red1", "green1", "receipt-red0", "receipt-green1"):
-                    subject = receipt.commit if event.startswith("receipt-") and receipt else target
-                    passed, attempt = "green" in event, int(event[-1])
-                    outcome = call(lambda: q.hosted_result(subject, passed=passed, attempt=attempt))
-                    if outcome not in ("state_unavailable", "state_capacity"):
-                        observe(oracle, subject, passed, attempt)
-                elif event == "acknowledge" and receipt is not None:
-                    call(lambda: q.observe_landed(store, receipt, read_target=lambda _: target))
-                elif event == "restore":
-                    outcome = call(lambda: q.restore_target(store, mq.HostedResult(target, True),
-                                                            read_target=lambda _: target))
-                    if outcome in ("green", "target-red"):
-                        observe(oracle, target, True, 0)
-                        fault = False
-                elif event == "reconcile" and receipt is not None:
-                    call(lambda: q.reconcile_not_landed(store, receipt,
-                        read_target=lambda _: target, read_outcome=lambda row: "not_applied"))
-                elif event == "withdraw" and receipt is not None:
-                    record = backend.state.issued or backend.state.cleanup
-                    call(lambda: q.withdraw(receipt.lane, expected_head=record.entry.head, store=store,
-                        read_target=lambda _: target, read_outcome=lambda row: "not_applied"))
-                elif event == "reenqueue":
-                    call(lambda: q.enqueue(store, entry(rig)))
-                elif event == "at-capacity":
-                    for subject in subjects[:-1]:
-                        outcome = call(lambda: q.hosted_result(subject, passed=False))
-                        if outcome not in ("state_unavailable", "state_capacity"):
-                            observe(oracle, subject, False, 0)
-                elif event == "over-capacity":
-                    for subject in subjects:
-                        observe(oracle, subject, False, 0)
-                        backend.healths[subject] = mq.HostedResult(subject, oracle[subject][1], oracle[subject][0])
-                        backend.pending[subject] = backend.healths[subject]
-                    backend.dirty = True
-                    q = fresh_queue(rig, backend=backend, initialize=False)
-                elif event == "restart-fresh-store":
-                    if prefix == "cached-merge":
-                        store = stores.enter_context(make_store(rig.repo))
-                        assert store.scratch != rig.store.scratch
-                        assert not tuple((store.scratch / "objects").iterdir())
+                        if isinstance(candidate, mq.Landing) and candidate.status == "ready":
+                            assert not fault and oracle.get(target, (0, True))[1], sequence
+                            assert oracle.get(candidate.commit, (0, True))[1], sequence
+                            issued = call(lambda: q.revalidate(store, candidate, read_target=lambda _: target,
+                                read_mode=lambda *args: "none", identity=IDENTITY, now=100))
+                            if isinstance(issued, mq.Landing):
+                                parents.setdefault(issued.commit, (issued.tip, rig.head))
+                    elif event == "land":
                         if receipt is not None:
-                            assert store.object(receipt.commit, "commit")
-                    q = fresh_queue(rig, backend=backend, initialize=False)
-                elif event == "restart":
-                    q = fresh_queue(rig, backend=backend, initialize=False)
-                elif event == "storage-fault":
-                    backend.fail = "before"
-                    assert call(lambda: q.hosted_result(target, passed=False, attempt=1)) == "state_unavailable"
-                    observe(oracle, target, False, 1)
-                    backend.fail, fault = None, True
-                red = oracle.get(target, (0, True))[1] is False
-                if red or fault:  # I1 / I3: no ordinary publication after RED / uncertainty.
-                    observation = call(lambda: q.prepare(store, read_target=lambda _: target,
-                        read_mode=lambda *args: "none", identity=IDENTITY, now=100))
-                    assert not isinstance(observation, mq.Landing) or observation.status != "ready", sequence
-                    if q.issued is not None:
-                        assert call(lambda: q.check_issued(store, q.issued,
-                            read_target=lambda _: target, read_mode=lambda *args: "none", now=100)) is not True
-                # I2: even with a fault/restart/contradictory hosted result, every
-                # durable receipt has a public authenticated resolution path.
-                fingerprint = (backend.state, target, backend.dirty, tuple(backend.healths.items()),
-                               tuple(backend.lanes.items()), tuple(backend.commits.items()),
-                               tuple(backend.pending.items()))
-                if fingerprint in resolved_states:
-                    continue
-                resolved_states.add(fingerprint)
-                probe = fresh_queue(rig, backend=clone(backend), initialize=False)
-                if probe.issued is not None:
-                    pending = probe.issued
-                    if landed(pending.commit, target):
-                        assert probe.observe_landed(store, pending,
-                            read_target=lambda _: target) == "done", sequence
-                    else:
-                        outcome = call(lambda: probe.reconcile_not_landed(store, pending,
+                            target = receipt.commit
+                    elif event.startswith("advance-"):
+                        target = descendant if event == "advance-descendant" else rig.other
+                    elif event in ("red0", "green0", "red1", "green1", "receipt-red0", "receipt-green1"):
+                        subject = receipt.commit if event.startswith("receipt-") and receipt else target
+                        passed, attempt = "green" in event, int(event[-1])
+                        outcome = call(lambda: q.hosted_result(subject, passed=passed, attempt=attempt))
+                        if outcome not in ("state_unavailable", "state_capacity"):
+                            observe(oracle, subject, passed, attempt)
+                    elif event == "acknowledge" and receipt is not None:
+                        call(lambda: q.observe_landed(store, receipt, read_target=lambda _: target))
+                    elif event == "restore":
+                        outcome = call(lambda: q.restore_target(store, mq.HostedResult(target, True),
+                                                                read_target=lambda _: target))
+                        if outcome in ("green", "target-red"):
+                            observe(oracle, target, True, 0)
+                            fault = False
+                    elif event == "reconcile" and receipt is not None:
+                        call(lambda: q.reconcile_not_landed(store, receipt,
                             read_target=lambda _: target, read_outcome=lambda row: "not_applied"))
-                        if outcome == "state_conflict":
-                            record = backend.state.issued or backend.state.cleanup
-                            assert probe.withdraw(pending.lane, expected_head=record.entry.head, store=store,
-                                read_target=lambda _: target, read_outcome=lambda row: "not_applied") == "released"
+                    elif event == "withdraw" and receipt is not None:
+                        record = backend.state.issued or backend.state.cleanup
+                        call(lambda: q.withdraw(receipt.lane, expected_head=record.entry.head, store=store,
+                            read_target=lambda _: target, read_outcome=lambda row: "not_applied"))
+                    elif event == "reenqueue":
+                        call(lambda: q.enqueue(store, entry(rig)))
+                    elif event == "at-capacity":
+                        for subject in subjects[:-1]:
+                            outcome = call(lambda: q.hosted_result(subject, passed=False))
+                            if outcome not in ("state_unavailable", "state_capacity"):
+                                observe(oracle, subject, False, 0)
+                    elif event == "over-capacity":
+                        for subject in subjects:
+                            observe(oracle, subject, False, 0)
+                            backend.healths[subject] = mq.HostedResult(subject, oracle[subject][1], oracle[subject][0])
+                            backend.pending[subject] = backend.healths[subject]
+                        backend.dirty = True
+                        q = fresh_queue(rig, backend=backend, initialize=False)
+                    elif event == "restart-fresh-store":
+                        if prefix == "cached-merge":
+                            store = open_store(rig.repo)
+                            assert store.scratch != rig.store.scratch
+                            assert not tuple((store.scratch / "objects").iterdir())
+                            if receipt is not None:
+                                assert store.object(receipt.commit, "commit")
+                        q = fresh_queue(rig, backend=backend, initialize=False)
+                    elif event == "restart":
+                        q = fresh_queue(rig, backend=backend, initialize=False)
+                    elif event == "storage-fault":
+                        backend.fail = "before"
+                        assert call(lambda: q.hosted_result(target, passed=False, attempt=1)) == "state_unavailable"
+                        observe(oracle, target, False, 1)
+                        backend.fail, fault = None, True
+                    red = oracle.get(target, (0, True))[1] is False
+                    if red or fault:  # I1 / I3: no ordinary publication after RED / uncertainty.
+                        observation = call(lambda: q.prepare(store, read_target=lambda _: target,
+                            read_mode=lambda *args: "none", identity=IDENTITY, now=100))
+                        assert not isinstance(observation, mq.Landing) or observation.status != "ready", sequence
+                        if q.issued is not None:
+                            assert call(lambda: q.check_issued(store, q.issued,
+                                read_target=lambda _: target, read_mode=lambda *args: "none", now=100)) is not True
+                    # I2: even with a fault/restart/contradictory hosted result, every
+                    # durable receipt has a public authenticated resolution path.
+                    fingerprint = (backend.state, target, backend.dirty, tuple(backend.healths.items()),
+                                   tuple(backend.lanes.items()), tuple(backend.commits.items()),
+                                   tuple(backend.pending.items()))
+                    if fingerprint in resolved_states:
+                        continue
+                    resolved_states.add(fingerprint)
+                    probe = fresh_queue(rig, backend=clone(backend), initialize=False)
+                    if probe.issued is not None:
+                        pending = probe.issued
+                        if landed(pending.commit, target):
+                            assert probe.observe_landed(store, pending,
+                                read_target=lambda _: target) == "done", sequence
                         else:
-                            assert outcome == "not_applied", sequence
-                    assert probe.issued is None, sequence
+                            outcome = call(lambda: probe.reconcile_not_landed(store, pending,
+                                read_target=lambda _: target, read_outcome=lambda row: "not_applied"))
+                            if outcome == "state_conflict":
+                                record = backend.state.issued or backend.state.cleanup
+                                assert probe.withdraw(pending.lane, expected_head=record.entry.head, store=store,
+                                    read_target=lambda _: target, read_outcome=lambda row: "not_applied") == "released"
+                            else:
+                                assert outcome == "not_applied", sequence
+                        assert probe.issued is None, sequence

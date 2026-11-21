@@ -2,6 +2,7 @@
 import copy
 import errno
 import importlib
+import inspect
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -12,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from aegis_core import hosts
+from aegis_core import hosts, team_isolation
 
 
 IMAGE = "localhost/aegis-teams@sha256:" + "a" * 64
@@ -916,3 +917,333 @@ def test_direct_duplicate_same_access_rows_keep_their_refusal(core):
     row = dict(source="/source", destination="/source", rw=False)
     with pytest.raises(core.IsolationRefusal, match="^mount_rows$"):
         core.mount_rows([row, dict(row)])
+
+
+def test_verify_uses_new_registry_owner_folder_for_expected_mounts(core, verifier):
+    context = verification_context()
+    registry = {**TABLE, "fixture": {"home": {"variable": "FIXTURE_STATE", "run_folder": "fixture-state",
+                                             "owner_folder": ".fixturestate"}}}
+    credential = "/owner/.fixturestate"
+    observed = facts("/work/run", "/work/project", "/source", "/venv", "/owner", credential)
+    context.update(host_table=registry, observed=observed)
+    image = [{"Id": "sha256:" + "b" * 64, "RepoDigests": [IMAGE], "Config": {"Env": []}}]
+    options = dict(run="/work/run", image_inspect=image, cpu_count=4, platform="linux", uid=1000, gid=1000)
+    wanted = verifier.expected_plan(ISOLATION, mounts=plan(core), **options, **context)
+    forbidden = [dict(source=credential, destination=credential, rw=False)]
+    with pytest.raises(core.IsolationRefusal, match="^unsafe_mount$"):
+        verifier.expected_plan(ISOLATION, mounts=forbidden, **options, **context)
+    assert verifier.verify({}, dict(wanted, mounts=forbidden), **context) == ["mounts"]
+
+
+@pytest.mark.parametrize("rw", [False, True], ids=["read-only", "writable"])
+@pytest.mark.parametrize("root", [
+    ".aws", ".claude", ".claude.json", ".codeium", ".codex", ".config", ".copilot", ".cursor",
+    ".docker", ".gemini", ".git-credentials", ".gnupg", ".kiro", ".kube", ".local", ".netrc", ".ssh",
+])
+def test_baseline_credential_roots_apply_without_registry_owner_folders(core, verifier, root, rw):
+    # TABLE intentionally omits owner_folder. The host catalogue supplies only the test oracle.
+    path = "/owner/" + root
+    observed = facts("/work/run", "/work/project", "/source", "/venv", "/owner", path)
+    if root in (".claude.json", ".git-credentials", ".netrc"):
+        observed[path]["mode"] = observed[path]["after"]["mode"] = stat.S_IFREG | 0o600
+    context = dict(home="/owner", owner_homes=verification_context()["owner_homes"],
+                   observed=observed, owner_uid=1000)
+    protected_names = core.host_policy(TABLE).protected_names
+    rows = [dict(source=path, destination=path, rw=rw)]
+    changes = {"project" if rw else "source": path}
+    with pytest.raises(core.IsolationRefusal, match="^unsafe_mount$"):
+        plan(core, protected_names=protected_names, **context, **changes)
+    with pytest.raises(core.IsolationRefusal, match="^unsafe_mount$"):
+        team_isolation.create_argv(ISOLATION, run="/work/run", mounts=rows, host_table=TABLE,
+                                   cpu_count=4, platform="linux", uid=1000, gid=1000, **context)
+    image = [{"Id": "sha256:" + "b" * 64, "RepoDigests": [IMAGE], "Config": {"Env": []}}]
+    options = dict(run="/work/run", image_inspect=image, cpu_count=4, platform="linux", uid=1000, gid=1000)
+    with pytest.raises(core.IsolationRefusal, match="^unsafe_mount$"):
+        verifier.expected_plan(ISOLATION, mounts=rows, host_table=TABLE, **options, **context)
+    wanted = verifier.expected_plan(ISOLATION, mounts=plan(core), host_table=TABLE, **options, **context)
+    actual = inspected(core, verifier, wanted)
+    assert verifier.verify(actual, dict(wanted, mounts=rows), host_table=TABLE, **context) == ["mounts"]
+    assert verifier.verify(actual, wanted, host_table=TABLE, **context) == []
+
+
+@pytest.mark.parametrize("mode", ["missing-root", "missing-observation", "invalid-name"])
+def test_incomplete_credential_metadata_refuses_mount_planning(core, mode):
+    names = core.secret_names()
+    observed = facts("/work/run", "/work/project", "/source", "/venv", "/owner")
+    if mode == "missing-root":
+        names = names - {".ssh"}
+    elif mode == "missing-observation":
+        del observed["/owner/.kiro"]
+    else:
+        names = names | {"../invalid"}
+    with pytest.raises(core.IsolationRefusal, match="^mount_metadata$"):
+        plan(core, protected_names=names, observed=observed)
+    assert plan(core)
+
+
+def _count_qualification(core, monkeypatch):
+    """Count uncached metadata reads, protected-root builds and resolutions."""
+    calls = {"metadata": 0, "roots": 0}
+    resolved = []
+    read = core._read_metadata
+
+    def count_read(*args, **kwargs):
+        calls["metadata"] += 1
+        return read(*args, **kwargs)
+
+    monkeypatch.setattr("aegis_core.team_isolation_mounts._read_metadata", count_read)
+    roots = core._protected_roots
+
+    def count_roots(*args, **kwargs):
+        calls["roots"] += 1
+        return roots(*args, **kwargs)
+
+    monkeypatch.setattr("aegis_core.team_isolation_mounts._protected_roots", count_roots)
+    resolve = core._resolved_path
+
+    def count_resolve(path, *args, **kwargs):
+        resolved.append(str(path))
+        return resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr("aegis_core.team_isolation_mounts._resolved_path", count_resolve)
+    return calls, resolved
+
+
+def test_verify_reuses_qualified_metadata_and_protected_roots(core, verifier, monkeypatch):
+    # Build the fixture before installing counters so only one verify is measured.
+    wanted = expected(core, verifier)
+    actual = inspected(core, verifier, wanted)
+    calls, resolved = _count_qualification(core, monkeypatch)
+    assert verifier.verify(actual, wanted, **verification_context()) == []
+    # One operation qualifies each distinct metadata key once and walks roots once.
+    assert calls["metadata"] == 25
+    assert calls["roots"] == 1
+    assert resolved.count("/owner") == 1
+
+
+def test_equal_owner_homes_deduped_after_role_validation(core, verifier, monkeypatch):
+    wanted = expected(core, verifier)
+    calls, resolved = _count_qualification(core, monkeypatch)
+    incomplete = verification_context()
+    incomplete["owner_homes"] = {"explicit": "/owner", "ambient": "/owner", "password": ""}
+    with pytest.raises(core.IsolationRefusal, match="^owner_homes$") as error:
+        verifier.verify({}, wanted, **incomplete)
+    assert error.value.reason == "owner_homes"
+    assert resolved == []
+    assert calls["roots"] == 0
+    homes = {"explicit": "/owner", "ambient": "/alt", "password": "/owner"}
+    context = dict(host_table=TABLE, home="/owner", owner_uid=1000, owner_homes=homes,
+                   observed=round2_facts(homes))
+    result = verifier.verify({}, wanted, **context)
+    assert result[0] == "label"
+    assert "mounts" in result
+    assert resolved == ["/owner", "/alt"]
+    assert calls["roots"] == 1
+    # Public role validation still reports every role; dedupe happens after that.
+    assert core.validated_owner_homes("/owner", dict.fromkeys(
+        ("explicit", "ambient", "password"), "/owner")) == (PurePosixPath("/owner"),) * 3
+
+
+def test_absent_mounts_still_qualify_changed_observations(core, verifier):
+    wanted = expected(core, verifier)
+    del wanted["mounts"]
+    context = verification_context()
+    context["observed"]["/owner"]["after"]["inode"] += 1
+    with pytest.raises(core.IsolationRefusal, match="^mount_changed$") as error:
+        verifier.verify({}, wanted, **context)
+    assert error.value.reason == "mount_changed"
+    context["observed"]["/owner"]["after"]["inode"] -= 1
+    # A missing mounts field is an expected-record error once the context qualifies.
+    assert verifier.verify({}, wanted, **context) == ["mounts"]
+
+
+def test_mount_row_refusal_precedes_root_qualification(core):
+    observed = facts("/work/run", "/work/project", "/source", "/venv", "/owner")
+    del observed["/owner/.ssh"]
+    duplicate = dict(source="/work/run", destination="/work/run", rw=True)
+    with pytest.raises(core.IsolationRefusal, match="^mount_rows$") as error:
+        core.validate_mounts([duplicate, dict(duplicate)], home="/owner", observed=observed,
+                             owner_uid=1000,
+                             owner_homes=dict.fromkeys(("explicit", "ambient", "password"), "/owner"))
+    assert error.value.reason == "mount_rows"
+    with pytest.raises(core.IsolationRefusal, match="^mount_metadata$"):
+        core.validate_mounts([duplicate], home="/owner", observed=observed, owner_uid=1000,
+                             owner_homes=dict.fromkeys(("explicit", "ambient", "password"), "/owner"))
+
+
+def _secret_chain(observed, start, prefix, length, final):
+    links = [start] + ["/links/%s%d" % (prefix, index) for index in range(length - 1)]
+    for link, target in zip(links, links[1:] + [final]):
+        observed_link(observed, link, target)
+
+
+def test_reused_context_keeps_per_resolution_link_budgets(core, verifier):
+    homes = dict.fromkeys(("explicit", "ambient", "password"), "/owner")
+    observed = round2_facts(homes, "/vault/ssh", "/vault/gpg", "/links")
+    _secret_chain(observed, "/owner/.ssh", "s", 40, "/vault/ssh")
+    _secret_chain(observed, "/owner/.gnupg", "g", 40, "/vault/gpg")
+    # Two 40-follow resolutions in one operation must not share a budget.
+    assert round3_surface(core, verifier, "verify", homes, observed) == []
+    longer = round2_facts(homes, "/vault/ssh", "/links")
+    _secret_chain(longer, "/owner/.ssh", "t", 41, "/vault/ssh")
+    with pytest.raises(core.IsolationRefusal, match="^mount_metadata$") as error:
+        round3_surface(core, verifier, "verify", homes, longer)
+    assert error.value.reason == "mount_metadata"
+    assert round3_surface(core, verifier, "verify", homes, observed) == []
+
+
+def test_qualified_context_does_not_persist_across_operations(core, verifier):
+    wanted = expected(core, verifier)
+    actual = inspected(core, verifier, wanted)
+    context = verification_context()
+    assert verifier.verify(actual, wanted, **context) == []
+    context["observed"]["/source"]["after"]["inode"] += 1
+    with pytest.raises(core.IsolationRefusal, match="^mount_changed$") as error:
+        verifier.verify(actual, wanted, **context)
+    assert error.value.reason == "mount_changed"
+    context["observed"]["/source"]["after"]["inode"] -= 1
+    assert verifier.verify(actual, wanted, **context) == []
+
+    def attempt(token):
+        snapshot = verification_context()
+        if token == "bad":
+            snapshot["observed"]["/owner"]["after"]["inode"] += 1
+            try:
+                verifier.verify(actual, wanted, **snapshot)
+            except core.IsolationRefusal as refusal:
+                return refusal.reason
+        return verifier.verify(actual, wanted, **snapshot)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(attempt, ["ok", "bad", "ok", "bad"], timeout=10))
+    assert results == [[], "mount_changed", [], "mount_changed"]
+
+
+def _boundary_fixture(core):
+    """Group-writable /work plus a credential symlink whose target is mountable."""
+    homes = dict.fromkeys(("explicit", "ambient", "password"), "/owner")
+    observed = facts("/work/run", "/work/project", "/source", "/venv", "/owner", "/vault")
+    observed["/work"]["gid"] = observed["/work"]["after"]["gid"] = 2000
+    observed["/work"]["mode"] = observed["/work"]["after"]["mode"] = stat.S_IFDIR | 0o770
+    observed_link(observed, "/owner/.fixturestate", "/vault")
+    rows = [dict(source="/vault", destination="/vault", rw=False),
+            dict(source="/work/project", destination="/work/project", rw=True)]
+    return homes, observed, rows, core.secret_names()
+
+
+def _validate(core, observed, homes, rows, **extra):
+    kwargs = dict(home="/owner", observed=observed, owner_uid=1000, owner_homes=homes,
+                  private_gids=(2000,))
+    kwargs.update(extra)
+    return core.validate_mounts(rows, **kwargs)
+
+
+def _refusal(core, observed, homes, rows, **extra):
+    try:
+        _validate(core, observed, homes, rows, **extra)
+    except core.IsolationRefusal as refusal:
+        return refusal.reason
+    return "accepted"
+
+
+def test_exported_mount_entry_points_validate_fresh(core):
+    """Exported mount functions neither accept nor return an operation cache."""
+    entry_points = (
+        core.require, core.bounded_value, core.load_document, core.container_supported, core.engine,
+        core.image, core.cpus_limit, core.memory_bytes, core.pids_limit, core.read_isolation,
+        core.load_isolation, core.absolute_path, core.inside, core.system_mount, core.mount_rows,
+        core.host_policy, core.home_folders, core.container_env, core.metadata, core.foreign_write,
+        core.aliases_overlap, core.secret_names, core.credential_names, core.inside_alias,
+        core.link_target, core.resolved_path, core.path_identities, core.validated_owner_homes,
+        core.protected_roots, core.validate_mounts, core.assess_expected_mounts, core.mount_plan)
+    exported_functions = {name for name in core.__all__ if name[:1].islower()}
+    assert exported_functions == {fn.__name__ for fn in entry_points}
+    for fn in entry_points:
+        params = inspect.signature(fn).parameters
+        assert "qualified" not in params, fn.__name__
+        assert "context" not in params, fn.__name__
+    try:
+        core.mount_operation_context
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError("mount_operation_context is still callable")
+    homes, observed, rows, _names = _boundary_fixture(core)
+    with pytest.raises(TypeError):
+        core.validate_mounts(rows, context=object(), home="/owner", observed=observed,
+                             owner_uid=1000, owner_homes=homes)
+    with pytest.raises(TypeError):
+        core.metadata(PurePosixPath("/owner"), observed, qualified=object())
+    with pytest.raises(TypeError):
+        core.resolved_path(PurePosixPath("/owner"), observed, qualified=object())
+    with pytest.raises(TypeError):
+        core.path_identities(PurePosixPath("/owner"), observed, {}, qualified=object())
+    with pytest.raises(TypeError):
+        core.protected_roots((PurePosixPath("/owner"),), observed, {}, qualified=object())
+    accepted = _validate(core, observed, homes, rows)
+    assert type(accepted) is list and all(type(row) is dict for row in accepted)
+    checked, structural = core.assess_expected_mounts(
+        rows, home="/owner", observed=observed, owner_uid=1000, owner_homes=homes, private_gids=(2000,))
+    assert structural is None and [row["source"] for row in checked] == ["/vault", "/work/project"]
+    duplicate = dict(source="/vault", destination="/vault", rw=False)
+    missing, code = core.assess_expected_mounts(
+        [duplicate, dict(duplicate)], home="/owner", observed=observed, owner_uid=1000, owner_homes=homes,
+        private_gids=(2000,))
+    assert missing is None and code == "mount_rows"
+    observed["/vault"]["after"]["inode"] += 1
+    with pytest.raises(core.IsolationRefusal, match="^mount_changed$") as error:
+        core.assess_expected_mounts(rows, home="/owner", observed=observed, owner_uid=1000,
+                                    owner_homes=homes, private_gids=(2000,))
+    assert error.value.reason == "mount_changed"
+    observed["/vault"]["after"]["inode"] -= 1
+
+
+def test_public_mount_boundary_rechecks_refreshed_facts_and_policy(core):
+    """A later public call enforces the facts and policy arguments of that call."""
+    homes, observed, rows, names = _boundary_fixture(core)
+    assert [row["source"] for row in _validate(core, observed, homes, rows)] == ["/vault", "/work/project"]
+    observed["/vault"]["after"]["inode"] += 1
+    fresh = copy.deepcopy(observed)
+    assert _refusal(core, observed, homes, rows) == _refusal(
+        core, fresh, homes, rows) == "mount_changed"
+    observed["/vault"]["after"]["inode"] -= 1
+    assert _validate(core, observed, homes, rows)
+    with pytest.raises(core.IsolationRefusal, match="^mount_changed$"):
+        core.metadata(PurePosixPath("/vault"), fresh)
+    fresh["/vault"]["after"]["inode"] -= 1
+    assert core.metadata(PurePosixPath("/vault"), fresh)["inode"] == fresh["/vault"]["inode"]
+    assert core.resolved_path(PurePosixPath("/vault"), fresh) == PurePosixPath("/vault")
+    assert _refusal(core, observed, homes, rows, owner_uid=1000.0) == "mount_metadata"
+    assert _refusal(core, observed, homes, rows, private_gids=(2000.0,)) == "mount_metadata"
+    assert _refusal(core, observed, homes, rows, private_gids=()) == "unsafe_mount"
+    assert _refusal(core, observed, homes, rows, home="/alt") == "owner_homes"
+    assert _refusal(core, observed, homes, rows,
+                    owner_homes=dict(homes, ambient="/alt")) == "mount_metadata"
+    assert _refusal(core, observed, homes, rows,
+                    protected_names=names | {".fixturestate"}) == "unsafe_mount"
+    owners = core.validated_owner_homes("/owner", homes)
+    roots = core.protected_roots(owners, observed, {}, protected_names=names | {".fixturestate"})
+    assert ("/vault", "secret") in [(str(path), kind) for path, kind in roots]
+    assert _validate(core, observed, homes, rows, protected_names=names)
+
+    def attempt(token):
+        snap = copy.deepcopy(observed)
+        extra = {}
+        if token == "changed":
+            snap["/vault"]["after"]["inode"] += 1
+        elif token == "float":
+            extra["owner_uid"] = 1000.0
+        elif token == "gids":
+            extra["private_gids"] = ()
+        elif token == "names":
+            extra["protected_names"] = names | {".fixturestate"}
+        elif token == "home":
+            extra["home"] = "/alt"
+        return _refusal(core, snap, homes, rows, **extra) if token != "ok" else (
+            "ok" if _validate(core, snap, homes, rows) else "rejected")
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(attempt, ["ok", "changed", "float", "gids", "names", "home", "ok"],
+                                 timeout=10))
+    assert results == ["ok", "mount_changed", "mount_metadata", "unsafe_mount", "unsafe_mount",
+                       "owner_homes", "ok"]

@@ -639,11 +639,9 @@ class Pass:
 
     def run(self):
         """Steps in order; a stop request is honoured only between them."""
+        from hierarchy_loop_subscriptions import nudge_exhausted, steps_with_notify
         status = rows = None
-        steps = (("router_status", "route", "dispatch", "sweep", "run_open")
-                 if getattr(self.args, "dispatcher_host_plan", None) else ("router_status", "route", "sweep", "run_open"))
-        if getattr(self.args, "subscription_runner", None) is not None:
-            steps = (*steps[:steps.index("sweep")], "notify", *steps[steps.index("sweep"):])
+        steps = steps_with_notify(self.args, getattr(self.args, "dispatcher_host_plan", None))
         for step in steps:
             if Stop.requested:
                 return True
@@ -663,13 +661,8 @@ class Pass:
                 else:
                     self.run_open()
             except OSError as error:
-                if getattr(self.args, "nudge_seconds", None) is None or error.errno not in {errno.EMFILE, errno.ENFILE}:
+                if not nudge_exhausted(self, step, error):
                     raise
-                from hierarchy_loop_subscriptions import release_nudge
-                refusal = release_nudge(self.args)
-                if not any(row["step"] == "nudge" and row["kind"] == refusal.code for row in self.holds):
-                    self.hold("nudge", refusal.code, str(refusal), "owner")
-                self.steps.append({"step": step, "state": "hold", "exit": 2})
         return False
 
 
@@ -759,17 +752,14 @@ def one_pass(args, interval, memory=None):
     skipped = {(row.get("initiative"), row["endpoint"]): row for row in previous.get("holds", [])
                if (row["step"], row["kind"]) == ("sweep", "start_failing") and row.get("endpoint")}
     base = {**(previous or empty_status(interval)), "interval": interval}
-    subscriptions = getattr(args, "subscription_runner", None)
-    if subscriptions is not None:
-        base.update(subscriptions_sha256=subscriptions.sha256, subscription_suppressed=[],
-                    subscription_suppressed_complete=False)
+    from hierarchy_loop_subscriptions import SubscriptionStatus
+    subscription_status = SubscriptionStatus(getattr(args, "subscription_runner", None))
+    subscription_status.seed(base)
 
     def beat(step):
         # A heartbeat at each step start: a step may wait on a model turn for hours, and status must not
         # read that as a dead loop. A failed heartbeat is left to the end-of-pass write to report.
-        if subscriptions is not None:
-            base.update(subscription_suppressed=work.subscription_suppressed,
-                        subscription_suppressed_complete=work.subscription_suppressed_complete)
+        subscription_status.heartbeat(base, work)
         try:
             write_status(args.state_dir, {**base, "current_step": step, "step_started_at": timestamp()})
         except OSError:
@@ -804,9 +794,7 @@ def one_pass(args, interval, memory=None):
              "consecutive_journal_unavailable": unavailable, "current_step": None, "step_started_at": None}
     if work.small_changes is not None:
         value["small_changes"] = work.small_changes
-    if subscriptions is not None:
-        value.update(subscriptions_sha256=subscriptions.sha256, subscription_suppressed=work.subscription_suppressed,
-                     subscription_suppressed_complete=work.subscription_suppressed_complete)
+    subscription_status.finish(value, work)
     shown, wrote = value, True
     try:
         write_status(args.state_dir, value)
@@ -828,9 +816,8 @@ def serve(args):
             watcher = None
             try:
                 if getattr(args, "nudge_seconds", None) is not None:
-                    from hierarchy_loop_subscriptions import prepare_nudge
-                    watcher, args.nudge_failure = prepare_nudge(args)
-                    args.nudge_watcher = watcher
+                    from hierarchy_loop_subscriptions import arm_nudge
+                    watcher = arm_nudge(args)
                 code, stopped, value, wrote = one_pass(args, args.interval, memory)
                 memory = None if wrote else value
                 done += 1
@@ -904,26 +891,22 @@ def positive(value, flag):
 
 
 def main(argv=None):
-    parser_type = argparse.ArgumentParser
-    if any(flag.startswith(value[:len(flag) + 1].partition("=")[0]) or value.startswith(flag + "=")
-           for value in (sys.argv[1:] if argv is None else argv) if value.startswith("--")
-           for flag in ("--subscriptions", "--nudge-seconds")):
-        from hierarchy_loop_subscriptions import SubscriptionParser
-        parser_type = SubscriptionParser
-    parser = parser_type(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter, allow_abbrev=False)
+    from hierarchy_loop_subscriptions import (
+        add_subscription_arguments, configure_subscriptions, subscription_parser_type)
+    parser = subscription_parser_type(argv)(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter, allow_abbrev=False)
     parser.add_argument("--lifecycle", required=True, help="Absolute path to the lifecycle journal")
     parser.add_argument("--store", required=True, help="Absolute path to the workspace store")
     parser.add_argument("--recipes", required=True, help="Absolute path to root's recipe file")
     parser.add_argument("--state-dir", required=True, help="Absolute path to the folder for status.json")
     parser.add_argument("--max-jobs", type=int, help="Passed to run-open")
     parser.add_argument("--dispatcher-host-plan", help="Opt in to model-free dispatch using this existing host-plan record")
-    parser.add_argument("--subscriptions", help="Absolute path to subscriptions; frozen until loop restart")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("once", help="Run one pass", allow_abbrev=False)
     runner = commands.add_parser("run", help="Run passes until SIGTERM or SIGINT, or until --passes are done", allow_abbrev=False)
     runner.add_argument("--interval", type=int, default=DEFAULT_INTERVAL, help="Seconds between passes, 5 to 600")
     runner.add_argument("--passes", type=int, help="Stop after this many passes")
-    runner.add_argument("--nudge-seconds", help="Stat-only inbox polling during waits; minimum 1, default off")
+    add_subscription_arguments(parser, runner)
     shown = commands.add_parser("status", help="Whether the loop runs, and its last pass", allow_abbrev=False)
     shown.add_argument("--text", action="store_true", help="Holds grouped by who must act")
     args = parser.parse_args(argv)
@@ -948,13 +931,9 @@ def main(argv=None):
             code, result = report(args)
             sys.stdout.write(as_text(result) if args.text else json.dumps(result, sort_keys=True) + "\n")
             return code
-        if args.subscriptions is not None or getattr(args, "nudge_seconds", None) is not None:
-            from hierarchy_loop_subscriptions import configure, SubscriptionError
-            try:
-                configure(args)
-            except SubscriptionError as error:
-                print(json.dumps({"code": error.code, "error": str(error)}, sort_keys=True))
-                return 2
+        code = configure_subscriptions(args)
+        if code is not None:
+            return code
         signal.signal(signal.SIGTERM, request_stop)
         signal.signal(signal.SIGINT, request_stop)
         return serve(args)

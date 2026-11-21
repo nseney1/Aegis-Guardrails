@@ -524,10 +524,14 @@ def test_ancestor_rename_between_validation_and_read_is_confined(owner_factory, 
     @contextmanager
     def swapping_file(anchor, parts, **options):
         with original(anchor, parts, **options) as handle:
-            if parts == ("registrations", "alpha.json") and not moved.exists():
+            if parts != ("registrations", "alpha.json"):
+                yield handle
+                return
+            if not moved.exists():
                 path.parent.rename(moved)
                 symlink_or_skip(workspace, path.parent, target_is_directory=True)
-            yield handle
+            yield SimpleNamespace(parent_fd=handle.parent_fd, parent_stat=handle.parent_stat,
+                                  read_bytes=handle.read_bytes)
     monkeypatch.setattr(queue_role, "storage_confined", SimpleNamespace(
         confined_file=swapping_file, descriptor_supported=storage_confined.descriptor_supported,
         ConfinedFileError=storage_confined.ConfinedFileError))
@@ -536,6 +540,36 @@ def test_ancestor_rename_between_validation_and_read_is_confined(owner_factory, 
     role.issue("alpha")
     with pytest.raises(role.RoleRefusal, match="^role_invalid$"):
         role.bind("alpha")
+    path.parent.unlink()
+    moved.rename(path.parent)
+    assert role.bind("alpha").workspace == str(workspace)
+
+
+def test_record_generation_change_during_read_refuses_then_allows_retry(owner_factory, monkeypatch):
+    role, root, path, workspace, _ = owner_factory()
+    replacement = path.with_name("replacement.json")
+    replacement.write_bytes(path.read_bytes())
+    replacement.chmod(0o600)
+    parent = path.parent.stat()
+    stats = []
+
+    def inspect(name, *, dir_fd=None, follow_symlinks=True):
+        if name == path.name:
+            assert dir_fd is not None and follow_symlinks is False
+            held = os.fstat(dir_fd)
+            assert (held.st_dev, held.st_ino) == (parent.st_dev, parent.st_ino)
+            stats.append(dir_fd)
+            if len(stats) == 2:
+                replacement.replace(path)
+        return os.stat(name, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(queue_role, "os", _os_view(stat=inspect))
+    with pytest.raises(role.RoleRefusal, match="^role_stale$"):
+        role.issue("alpha")
+    assert len(stats) == 2 and stats[0] == stats[1]
+    assert not (root / "sessions").exists()
+    role.issue("alpha")
+    assert role.bind("alpha").workspace == str(workspace)
 
 
 _ROLE_ARGUMENT_NEXT = "Use only id, expect and lane from the queue list and owner policy."

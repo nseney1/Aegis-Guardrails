@@ -9,7 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from aegis_core import storage, team_custody as custody, team_git, team_gitops, team_qualify
+from aegis_core import gitsafe, storage, team, team_git, team_gitops, team_lease_custody, team_qualify
+from aegis_core import team_custody as custody
 from aegis_core.errors import LockTimeoutError
 from tests.conftest import symlink_or_skip
 from tests.helpers_team_git import IDENTITY, copied_rig, git, make_store, rig_template, state
@@ -121,6 +122,42 @@ def test_commit_exact_tested_bytes_and_retry_once(rig):
     assert retry.status == "committed_recovered" and retry.commit == first.commit
     assert len(results(rig)) == 1 and results(rig)[0]["status"] == "done"
     assert state(rig) == after
+
+
+def test_lease_custody_checks_open_parent_and_recovers_after_refusal(rig, monkeypatch):
+    if not team_lease_custody.descriptor_supported():
+        pytest.skip("requires parent-addressable lease descriptors")
+    boundary = team_lease_custody.storage_confined
+    closed, acquired = True, []
+
+    @contextmanager
+    def confined(*args, **kwargs):
+        with boundary.confined_file(*args, **kwargs) as handle:
+            fd = handle.parent_fd
+            acquired.append(fd)
+            assert not os.get_inheritable(fd)
+            if not closed:
+                yield SimpleNamespace(parent_fd=fd)
+                return
+        yield handle
+
+    monkeypatch.setattr(team_lease_custody, "storage_confined", SimpleNamespace(
+        **{**vars(boundary), "confined_file": confined}))
+    with pytest.raises(gitsafe.GitError, match="^liveness_unknown$") as error:
+        with team.lease_custody(rig.repo):
+            pytest.fail("lease custody accepted a closed parent")
+    assert error.value.code == "git_failed"
+
+    closed = False
+    with team.lease_custody(rig.repo):
+        team.verify_lease_repository(rig.repo)
+        head = gitsafe.run_checked(["rev-parse", "HEAD"], rig.repo).stdout.strip()
+        assert head == rig.options["expected_head"].encode()
+    assert acquired
+    for fd in set(acquired):
+        with pytest.raises(OSError) as error:
+            os.fstat(fd)
+        assert error.value.errno == errno.EBADF
 
 
 @pytest.mark.parametrize("decision", [False, None, 1, "yes", "exception"])

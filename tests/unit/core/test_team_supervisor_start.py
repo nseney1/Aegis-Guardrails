@@ -322,6 +322,14 @@ def test_held_directory_survives_ancestor_swap(tmp_path, monkeypatch):
     outside.mkdir()
     switched = [False]
 
+    @contextmanager
+    def confined(root, parts, **kwargs):
+        with boundary.confined_file(root, parts, **kwargs) as handle:
+            if parts == (".config", "aegis", team_supervisor.STATE_NAME):
+                yield SimpleNamespace(parent_fd=handle.parent_fd, parent_stat=handle.parent_stat)
+            else:
+                yield handle
+
     class Publication:
         def __init__(self, directory, name):
             self.handle = boundary.ConfinedFile(directory, name)
@@ -334,10 +342,11 @@ def test_held_directory_survives_ancestor_swap(tmp_path, monkeypatch):
             return self.handle.publish_bytes(*args, **kwargs)
 
     monkeypatch.setattr(module, "storage_confined", SimpleNamespace(**{
-        **vars(boundary), "ConfinedFile": Publication,
+        **vars(boundary), "ConfinedFile": Publication, "confined_file": confined,
     }))
     assert run(module, root)["attempts"] == [{"id": "writer", "outcome": "started"}]
     assert len(calls) == 1 and not list(outside.iterdir())
+    assert calls[0][1]["close_fds"] is True and not calls[0][1].get("pass_fds")
     assert json.loads((old / team_supervisor.STATE_NAME).read_text())["version"] == 1
     assert run(module, root)["code"] == "state_unavailable"
 
@@ -420,10 +429,10 @@ def test_state_helper_failure_closes_borrowed_descriptor(tmp_path, monkeypatch, 
         if failure == "before_acquire":
             raise boundary.ConfinedFileError("io")
         with boundary.confined_file(root, parts, **kwargs) as handle:
-            acquired.append(handle._parent)
+            acquired.append(handle.parent_fd)
             if failure == "after_acquire":
                 raise boundary.ConfinedFileError("io")
-            yield SimpleNamespace(_parent=handle._parent, parent_stat=unavailable)
+            yield SimpleNamespace(parent_fd=handle.parent_fd, parent_stat=unavailable)
 
     monkeypatch.setattr(module, "storage_confined", SimpleNamespace(**{
         **vars(boundary), "confined_file": confined,
@@ -732,7 +741,7 @@ def test_namespace_helper_failure_closes_borrowed_descriptors(tmp_path, monkeypa
     def confined(root, parts, **kwargs):
         with boundary.confined_file(root, parts, **kwargs) as handle:
             if parts[-1] in ("self", "pid"):
-                acquired.append(handle._parent)
+                acquired.append(handle.parent_fd)
                 if (failure == "proc_root" and parts == ("self",)
                         or failure == "namespace_parent" and parts[-1] == "pid"):
                     raise boundary.ConfinedFileError("io")

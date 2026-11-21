@@ -12,6 +12,7 @@ import select
 import queue
 from threading import Event, Thread
 import signal
+import stat
 import subprocess
 import tempfile
 import time
@@ -20,7 +21,7 @@ from typing import Mapping, Optional
 from aegis_core.errors import AegisError
 from aegis_core.primitives import sanitize_display, key_within, real_key
 from aegis_core.redaction import redact_insight_text
-from aegis_core import gitsafe_policy
+from aegis_core import gitsafe_policy, pathlookup
 from aegis_core.gitsafe_policy import (
     BASE_ENV,
     LOCAL_ENV,
@@ -91,18 +92,24 @@ def _argv(args, program, hardening, policy):
 def request_environment(source=None, *, profile="ordinary", scope=None, overrides=None, base=None,
                         roots=(), root=None, repository=None, bindings=None, error=GitError, scrub=False, allowed=None, kind=None):
     """Snapshot the facade's ambient source; all request rules live below transport."""
+    replacement = _replacement_environment(source, allow=profile == "ordinary"
+        and scope is None and overrides is None and bindings is None
+        and (base is None or type(base) is dict and not base), error=error)
+    if replacement is not None:
+        return gitsafe_policy.request_environment(replacement, base=base)
     return gitsafe_policy.request_environment(os.environ if source is None else source,
         profile=profile, scope=scope, overrides=overrides, base=base, roots=roots, root=root,
         repository=repository, bindings=bindings, error=error, scrub=scrub, allowed=allowed, kind=kind,
         ambient=source is None or type(source) is _ENVIRON_TYPE, environ_type=_ENVIRON_TYPE)
 __all__ = ["BASE_ENV", "DEFAULT_HARDENING", "HARDENING_KEEP_HOOKS_PATH", "LOCAL_ENV",
            "capture", "checked", "completed", "custody", "custody_active",
-           "execute", "memo_context", "output", "query_result",
+           "execute", "memo_context", "output", "query_result", "validate_review_preparation",
            "private_headers", "private_object", "private_objects", "scrubbed", "text", "update_once",
            "strict_active", "lane_update_ref", "validate_update_input", "find_executable", "git_path",
-           "LaneRunner", "hashed_blob", "check_ref_name", "CustodyRefusal", "request_environment", "Environment", "outside_roots", "AMBIENT_ENV", "custody_inputs", "merge_inputs", "transport_services"]
+           "LaneRunner", "hashed_blob", "check_ref_name", "CustodyRefusal", "request_environment", "Environment", "outside_roots", "AMBIENT_ENV", "custody_inputs", "merge_inputs", "transport_services", "REPLACEMENT_UNSET"]
 _SCRUB = contextvars.ContextVar("aegis_git_scrub", default=False)
 _CUSTODY = contextvars.ContextVar("aegis_git_custody", default=None)
+REPLACEMENT_UNSET = object()
 _MAX_CAPTURE = 128 * 1024 * 1024
 _MAX_INPUT = 128 * 1024 * 1024
 _CHUNK = 65536
@@ -151,8 +158,10 @@ def _pin_program(path, roots, error, stack):
     except (OSError, ValueError, UnicodeError, storage_confined.ConfinedFileError):
         environment_refusal(error, "effect_command_refused")
     environment_refusal(error, "effect_command_refused")
-def find_executable(cache, environ, lookup, *, error, profile="ordinary", cwd=None, missing_ok=False, stack=None):
+def find_executable(cache, environ, lookup, *, error, profile="ordinary", cwd=None, missing_ok=False, stack=None, ordinary_git=False):
     """Sole resolver; callbacks retain the facade's program-specific PATH lookup."""
+    if ordinary_git:
+        cache, environ, lookup, error = _git_lookup(cache, environ, cwd, lookup, error)
     environ = request_environment(environ, profile=profile, base={}, root=cwd, error=error) if not isinstance(environ, Environment) else request_environment(environ, profile="strict/effect", error=error)
     roots = environ.roots if isinstance(environ, Environment) else ()
     key = (environ.get("PATH"), environ.get("PATHEXT"), roots)
@@ -171,6 +180,175 @@ def find_executable(cache, environ, lookup, *, error, profile="ordinary", cwd=No
             fd = _pin_program(found, roots, error, stack if stack is not None else temporary)
             if stack is not None: return f"/proc/{os.getpid()}/fd/{fd}"
     return found
+def _git_lookup(cache, environ, cwd, lookup, error):
+    replacement = _replacement_environment(environ, error=error)
+    if environ is not None:
+        return {}, environ, lambda effective: lookup({
+            "outside": getattr(effective, "root", cwd), "path": effective.get("PATH", os.defpath),
+        }), error
+    cache = cache.for_cwd(cwd)
+    settings = {"outside": cache.fence, "fence_program": True, "descriptors": False}
+    if replacement is None:
+        return cache, None, lambda effective: lookup(settings), cache.error(error)
+    program = _CUSTODY.get().program
+    if program is not None:
+        if pathlookup.fenced_program(program, cache.fence, descriptors=False) is None:
+            raise error("invalid custody program", code="invalid_custody", process_started=False)
+        return {}, None, lambda _: program, cache.error(error)
+    return {}, None, lambda effective: lookup(
+        dict(settings, path=effective.get("PATH", os.defpath), pathext=effective.get("PATHEXT", ""))), cache.error(error)
+
+def _git_marker_entry(parent, name):
+    try:
+        return os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+def _git_marker_line(parent, name, read_open, stack, checks):
+    fd = read_open(name, parent)
+    stack.callback(os.close, fd)
+    seen = os.fstat(fd)
+    if not stat.S_ISREG(seen.st_mode) or not 0 < seen.st_size <= 4096:
+        raise ValueError("invalid Git metadata")
+    raw = os.read(fd, seen.st_size + 1)
+    if len(raw) != seen.st_size:
+        raise ValueError("changed Git metadata")
+    checks.append((parent, name, seen))
+    end = len(raw)
+    while end and raw[end - 1] in b"\r\n":
+        end -= 1
+    body = raw[:end]
+    if not body or b"\0" in body:
+        raise ValueError("invalid Git metadata")
+    return os.fsdecode(body)
+
+def _git_marker_directory(parent, name, stack, checks):
+    from aegis_core.pathlookup_fence import open_directory
+
+    fd = open_directory(parent, name)
+    stack.callback(os.close, fd)
+    if parent is not None:
+        checks.append((parent, name, os.fstat(fd)))
+    return fd
+
+def _git_marker_location(parent, value, stack, checks):
+    if (not value or len(os.fsencode(value)) > 4096
+            or any(c in value for c in "\0\r\n\v\f\x1c\x1d\x1e\x85\u2028\u2029")):
+        raise ValueError("invalid Git metadata path")
+    pointer = Path(value)
+    parts = pointer.parts
+    # Path normalizes these endings, but the preceding component must be a directory.
+    if pointer.name and value.endswith(("/", "/.")):
+        parts += (".",)
+    if len(parts) > 128 or pointer.anchor not in ("", "/"):
+        raise ValueError("invalid Git metadata path")
+    if pointer.is_absolute():
+        parent = _git_marker_directory(None, "/", stack, checks)
+        parts = parts[1:]
+    for part in parts[:-1]:
+        parent = _git_marker_directory(parent, part, stack, checks)
+    return parent, parts[-1] if parts else "."
+
+def _review_git_directory(root, marker, read_open, stack, checks):
+    parent, name, info = root, ".git", marker
+    if stat.S_ISLNK(info.st_mode):
+        if not 0 < info.st_size <= 4096:
+            raise ValueError("invalid Git metadata link")
+        value = os.readlink(name, dir_fd=parent)
+        parent, name = _git_marker_location(root, value, stack, checks)
+        info = _git_marker_entry(parent, name)
+        if info is None:
+            raise ValueError("missing Git metadata target")
+        checks.append((parent, name, info))
+    if stat.S_ISREG(info.st_mode):
+        pointer = _git_marker_line(parent, name, read_open, stack, checks)
+        if not pointer.startswith("gitdir: "):
+            raise ValueError("invalid Git metadata record")
+        parent, name = _git_marker_location(root, pointer[8:], stack, checks)
+    return _git_marker_directory(parent, name, stack, checks)
+
+def _check_preparation_overlap(fd, protected):
+    info = os.fstat(fd)
+    if (info.st_dev, info.st_ino) in protected:
+        raise ValueError("preparation directory overlaps Git metadata")
+
+def _review_git_boundaries(root, protected, read_open, stack, checks):
+    marker = _git_marker_entry(root, ".git")
+    checks.append((root, ".git", marker))
+    if marker is None:
+        bare = [(root, name, _git_marker_entry(root, name)) for name in ("HEAD", "objects", "refs")]
+        checks.extend(bare)
+        if not all(info is not None for _, _, info in bare):
+            return
+    _check_preparation_overlap(root, protected)
+    admin = root if marker is None else _review_git_directory(root, marker, read_open, stack, checks)
+    _check_preparation_overlap(admin, protected)
+    common = _git_marker_entry(admin, "commondir")
+    checks.append((admin, "commondir", common))
+    if common is not None:
+        pointer = _git_marker_line(admin, "commondir", read_open, stack, checks)
+        parent, name = _git_marker_location(admin, pointer, stack, checks)
+        _check_preparation_overlap(_git_marker_directory(parent, name, stack, checks), protected)
+
+def _check_git_marker_entries(checks):
+    for parent, name, seen in checks:
+        current = _git_marker_entry(parent, name)
+        if seen is None and current is None:
+            continue
+        if (current is None or seen is None or not os.path.samestat(current, seen)
+                or not stat.S_ISDIR(seen.st_mode) and current.st_ctime_ns != seen.st_ctime_ns):
+            raise ValueError("changed Git metadata")
+
+def _review_preparation_ancestors(fd, preparation, stack, checks):
+    protected = set()
+    for part in reversed(preparation.parts[1:]):
+        info = os.fstat(fd)
+        protected.add((info.st_dev, info.st_ino))
+        parent = _git_marker_directory(fd, "..", stack, checks)
+        checks.append((parent, part, info))
+        fd = parent
+    root = _git_marker_directory(None, "/", stack, checks)
+    info = os.fstat(root)
+    if not os.path.samestat(info, os.fstat(fd)):
+        raise ValueError("changed preparation ancestry")
+    protected.add((info.st_dev, info.st_ino))
+    return protected
+
+@contextmanager
+def _review_preflight_refusal():
+    try:
+        yield
+    except (OSError, ValueError):
+        raise GitError("invalid review preparation boundary", code="record_required", process_started=False) from None
+
+def validate_review_preparation(repo, preparation, stack, *, walk, read_open):
+    """Check every enclosing marker and referenced Git location before discovery."""
+    from aegis_core import storage_confined
+
+    with ExitStack() as paths:
+        checks, parents = [], []
+        with _review_preflight_refusal():
+            state = paths.enter_context(storage_confined.confined_file(preparation, (".preflight",)))
+            info = state.parent_stat()
+            if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+                raise ValueError("preparation directory is not private")
+            protected = _review_preparation_ancestors(state.parent_fd, preparation, paths, checks)
+
+        def inspect(fd, depth):
+            with _review_preflight_refusal():
+                held = os.dup(fd)
+                paths.callback(os.close, held)
+                if parents:
+                    checks.append((parents[-1], repo.parts[depth - 1], os.fstat(held)))
+                parents.append(held)
+                _review_git_boundaries(held, protected, read_open, paths, checks)
+
+        source = walk(inspect)
+        stack.callback(os.close, source)
+        with _review_preflight_refusal():
+            _check_git_marker_entries(checks)
+        return source, (info.st_dev, info.st_ino)
+
 @dataclass(frozen=True)
 class _TransportServices:
     environment: object
@@ -212,6 +390,8 @@ class _Policy:
     services: object = None
     worktree_root: object = None
     boundary: str = "git"
+    replace_env: bool = False
+    program: Optional[str] = None
 @contextmanager
 def scrubbed():
     """Drop ambient repository-local GIT_* variables, preserving explicit _env."""
@@ -222,33 +402,79 @@ def scrubbed():
         _SCRUB.reset(token)
 @contextmanager
 def custody(*, scratch: Path, env: Optional[Mapping[str, str]] = None,
-            stdout_limit: int = 16 * 1024 * 1024, stderr_limit: int = 65536, strict_lane: bool = False, _services=None, worktree_root=None, _boundary=None):
-    """Bound a dynamic scope to existing owner-controlled scratch; nested scopes replace env."""
+            stdout_limit: int = 16 * 1024 * 1024, stderr_limit: int = 65536, strict_lane: bool = False, _services=None, worktree_root=None, _boundary=None,
+            replace_env=REPLACEMENT_UNSET, program: Optional[str] = None):
+    """Bound a dynamic scope to owner-controlled scratch and preserve replacement inputs."""
+    outer = _CUSTODY.get()
+    inherited = _replacement_environment(allow=replace_env is not False and type(env) is not _ENVIRON_TYPE)
     if not isinstance(strict_lane, bool): raise GitError("invalid custody mode", code="invalid_custody")
     strict_lane = strict_lane or strict_active()
+    if replace_env is not REPLACEMENT_UNSET and type(replace_env) is not bool:
+        raise GitError("invalid custody environment mode", code="invalid_custody", process_started=False)
+    if program is not None and (replace_env is not True or type(program) is not str or not 1 <= len(program) <= 16384
+                                or "\0" in program or not Path(program).is_absolute()):
+        raise GitError("invalid custody program", code="invalid_custody", process_started=False)
+    replace_env = replace_env is True or inherited is not None
+    if strict_lane and replace_env:
+        raise GitError("replacement environment requires ordinary custody", code="invalid_custody", process_started=False)
+    if inherited is not None:
+        if program is not None and program != outer.program:
+            raise GitError("invalid custody program", code="invalid_custody", process_started=False)
+        program = outer.program
     if strict_lane and env is not None: env = strict_environment(env, 64, environ_type=_ENVIRON_TYPE)
     for cap in (stdout_limit, stderr_limit):
         if isinstance(cap, bool) or not isinstance(cap, int) or not 0 <= cap <= _MAX_CAPTURE: raise GitError("invalid custody limit", code="invalid_custody")
     if not isinstance(scratch, (str, Path)) or not str(scratch) or len(str(scratch)) > 16384 or "\0" in str(scratch): raise GitError("invalid custody scratch", code="invalid_custody")
     path = Path(scratch)
     if not path.is_absolute() or ".." in path.parts: raise GitError("invalid custody scratch", code="invalid_custody")
-    if env is not None and (not isinstance(env, Mapping) or len(env) > 64): raise GitError("invalid custody environment", code="invalid_custody")
-    copied = {}
-    for key, value in (env or {}).items():
-        if (not isinstance(key, str) or not isinstance(value, str) or len(key) > 128 or len(value) > 65536
-                or "\0" in key or "\0" in value or "=" in key):
-            raise GitError("invalid custody environment", code="invalid_custody")
-        copied[key] = value
-    token = _CUSTODY.set(_Policy(path, MappingProxyType(copied), stdout_limit, stderr_limit, strict_lane, _services, worktree_root, _boundary or ("lane" if strict_lane else "git")))
+    try:
+        copied = _custody_environment(env, replace_env) if env is not None or inherited is None else inherited
+    except (KeyError, RuntimeError):
+        if not replace_env:
+            raise
+        raise GitError("invalid custody environment", code="invalid_custody", process_started=False) from None
+    if inherited is not None and copied != inherited:
+        raise GitError("invalid custody environment", code="invalid_custody", process_started=False)
+    token = _CUSTODY.set(_Policy(path, copied if inherited is None else inherited, stdout_limit, stderr_limit, strict_lane, _services, worktree_root, _boundary or ("lane" if strict_lane else "git"), replace_env, program))
     try:
         with scrubbed():
             yield
     finally:
         _CUSTODY.reset(token)
+def _custody_environment(env, replace_env):
+    if env is not None and (not isinstance(env, Mapping) or len(env) > 64):
+        raise _custody_environment_error(replace_env)
+    copied = {}
+    for count, (key, value) in enumerate((env or {}).items(), 1):
+        if (replace_env and count > 64 or not isinstance(key, str) or not isinstance(value, str)
+                or len(key) > 128 or len(value) > 65536
+                or "\0" in key or "\0" in value or "=" in key):
+            raise _custody_environment_error(replace_env)
+        if replace_env and os.name == "nt":
+            key = str.upper(key)
+            if len(key) > 128 or key in copied and copied[key] != value:
+                raise GitError("invalid custody environment", code="invalid_custody", process_started=False)
+        copied[key] = value
+    return MappingProxyType(copied)
+def _custody_environment_error(replace_env):
+    if replace_env:
+        return GitError("invalid custody environment", code="invalid_custody", process_started=False)
+    return GitError("invalid custody environment", code="invalid_custody")
 def custody_inputs():
     """The current caller's scoped input, separate from issued bindings."""
+    replacement = _replacement_environment()
+    if replacement is not None:
+        return replacement
     policy = _CUSTODY.get()
     return {} if policy is None else policy.env
+def _replacement_environment(source=None, *, allow=True, error=GitError):
+    """Return the only permitted environment when replacement custody is active."""
+    policy = _CUSTODY.get()
+    if policy is None or not policy.replace_env:
+        return None
+    if source is not None or not allow:
+        raise error("invalid replacement custody override", code="invalid_custody", process_started=False)
+    return policy.env
 def custody_active() -> bool:
     return _CUSTODY.get() is not None
 def strict_active() -> bool:
@@ -278,6 +504,7 @@ class _LaneBinding:
     write_roots: object = ()
     ambient: bool = False
 def issue_runner(cwd, scratch, services, effect_fds=None, *, environ=None, write_roots=(), worktree_root=None):
+    _replacement_environment(allow=False, error=services.error)
     if type(write_roots) not in (tuple, list) or len(write_roots) > 15: raise services.error("Git operation effect roots unavailable.", code="effect_environment_unavailable", process_started=False, next_action="Supply at most fifteen write roots; no effect process started.")
     write_roots = tuple(write_roots)
     cwd, scratch = Path(strict_root(cwd)), Path(strict_root(scratch))
@@ -432,6 +659,9 @@ class LaneRunner:
 def memo_context():
     """Legacy boolean key, or a private-store-aware key in custody scopes."""
     policy = _CUSTODY.get()
+    replacement = _replacement_environment()
+    if replacement is not None:
+        return (_SCRUB.get(), tuple(sorted(replacement.items())), True, policy.program)
     return (_SCRUB.get(), tuple(sorted(policy.env.items()))) if policy is not None else _SCRUB.get()
 def _collect_threaded(process, policy, deadline, error):
     """Blocking Windows pipe readers; a bounded queue applies backpressure."""
@@ -536,6 +766,7 @@ def _capture_limits(policy, timeout, stdin, error):
         raise error("invalid custody capture", code="invalid_custody")
     if stdin is not None and (not isinstance(stdin, bytes) or len(stdin) > _MAX_INPUT): raise error("git custody input limit exceeded", code="git_input_limit")
 def capture(argv, *, cwd, env, stdin, timeout, error=GitError, _lane=None, _policy=None, _grant=None, effect_fds=None, _tty=False, write_roots=(), worktree_root=None):
+    replacement = _replacement_environment(env, allow=effect_fds is None and _lane is None and _policy is None, error=error)
     policy = _CUSTODY.get() if _policy is None else _policy
     error = _lane.services.error if _lane is not None else (GitError if policy is not None and policy.strict_lane else error)
     source_envelope = type(env) is Environment
@@ -560,7 +791,7 @@ def capture(argv, *, cwd, env, stdin, timeout, error=GitError, _lane=None, _poli
                 if services is None or not argv or argv[0] != services.program(cwd, environ=env): strict_refuse()
                 args, _ = _command(argv, cwd, stdin, _grant)
         if not isinstance(env, Environment):
-            env = request_environment(env, profile="ordinary", base={})
+            env = request_environment(env, profile="ordinary", base={} if replacement is None else None)
         elif effect_fds is None and not (_lane is not None or policy is not None and policy.strict_lane): env = request_environment(env, profile="strict/effect", kind=policy.boundary if policy is not None else "git", error=error)
         _capture_limits(policy, timeout, stdin, error)
         if _lane is None and policy.strict_lane:
@@ -599,13 +830,14 @@ def capture(argv, *, cwd, env, stdin, timeout, error=GitError, _lane=None, _poli
             if (gitops_fds.cleanup_holder(process) if effect_fds is not None else _finish(process, stop=process.returncode is None)): raise error("git custody cleanup failed", code="git_cleanup_failed", process_started=True) from None
 def execute(args, cwd, *, executable, legacy_runner, error, environ, timeout, stdin, hardening, env, tty,
             legacy_namespace=None, effect_fds=None, write_roots=(), worktree_root=None):
+    policy = _CUSTODY.get()
+    replacement = _replacement_environment(environ, allow=effect_fds is None and env is None, error=error)
     if effect_fds is not None:
         from aegis_core import gitops_fds
         gitops_fds.pass_through(effect_fds, error=error)
         gitops_fds.effect_inputs(args, stdin, timeout, effect_fds, error=error, hardening=hardening)
         return gitops_fds.execute_effect(args, cwd, environ, env, hardening, _CUSTODY.get(), timeout, stdin, tty, effect_fds,
             error=error, observe=capture, scope=custody, build=_argv, base=BASE_ENV, resolver=executable, issue=issue_runner, identity=lambda values, command: identity_environment(values, command, environ_type=_ENVIRON_TYPE), write_roots=write_roots, worktree_root=worktree_root, preflight=lambda argv: _command(argv, cwd, stdin) if tty is False and tuple(hardening) == DEFAULT_HARDENING and len(args) <= 450 else strict_refuse(), transport=transport_services())
-    policy = _CUSTODY.get()
     if strict_active():
         services = policy.services
         if services is None or executable is not services.executable: strict_refuse()
@@ -619,9 +851,12 @@ def execute(args, cwd, *, executable, legacy_runner, error, environ, timeout, st
         return issue_runner(cwd, policy.scratch, services, effect_fds, environ=effective, worktree_root=worktree_root or policy.worktree_root, write_roots=write_roots).run(args, cwd, timeout, stdin, hardening,
             supplied, tty, stdout_limit=policy.stdout_limit, stderr_limit=policy.stderr_limit, effect_fds=effect_fds)
     argv = _argv(args, executable(), hardening, policy)
+    if replacement is not None:
+        return capture(argv, cwd=cwd, env=None, stdin=stdin, timeout=timeout, error=error)
     namespace = subprocess if legacy_namespace is None else legacy_namespace
     scrub = _SCRUB.get()
-    effective = request_environment(environ, profile="ordinary", scrub=scrub, scope=policy.env if policy is not None else None, overrides=env)
+    effective = request_environment(environ, profile="ordinary", scrub=scrub, overrides=env,
+                                    scope=policy.env if policy is not None else None)
     if policy is not None: return capture(argv, cwd=cwd, env=effective, stdin=stdin, timeout=timeout, error=error)
     try:
         return legacy_runner(argv, cwd=str(cwd), env=effective, input=stdin,

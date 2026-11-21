@@ -750,7 +750,7 @@ def _read(root, parts, layer):
                 if info.st_uid != os.getuid() or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
                     raise ProfileError("user profile directory must be owned by the current user and not group/other-writable")
                 data = team_supervisor.read_owned_leaf(
-                    handle._parent, parts[-1], MAX_BYTES,
+                    handle.parent_fd, parts[-1], MAX_BYTES,
                     "user profile file must be owned by the current user and not group/other-writable")
                 return {} if data is None else _parse(data)
             return _parse(handle.read_bytes(MAX_BYTES))
