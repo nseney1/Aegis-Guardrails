@@ -371,7 +371,7 @@ def test_round6_write_stores_numeric_bytes_verbatim(token, store, workspace, mon
     output = capsys.readouterr()
     assert not output.err
     rid = json.loads(output.out)["id"]
-    stored = (store.root / (rid + ".json")).read_bytes()
+    stored = (store.root / rid[:2] / (rid + ".json")).read_bytes()
     expected = store.read(rid)
     expected["fields"]["value"] = None
     assert stored == codec.canonical(expected).replace(b'"value":null', b'"value":' + token)
@@ -399,7 +399,7 @@ def test_round6b_store_preserves_relative_root_refusals(action, directory, works
 def test_round6b_selector_count_precedes_allocation_and_record_read(record_state, store, workspace, capsys):
     rid = store.write(GOLDENS[0]["record"])
     if record_state == "corrupt":
-        (store.root / (rid + ".json")).write_bytes(b"HOSTILE_MARKER")
+        (store.root / rid[:2] / (rid + ".json")).write_bytes(b"HOSTILE_MARKER")
     elif record_state == "missing":
         rid = "a" * 64
     slices = [0]
@@ -647,10 +647,31 @@ def test_verify_checks_bytes_and_reports_full_id(store, workspace, capsys):
     rid = store.write(GOLDENS[0]["record"])
     assert invoke(store, "verify", rid[:16]) == 0
     assert json.loads(capsys.readouterr().out) == {"id": rid, "ref": rid[:16], "verified": True}
-    (store.root / (rid + ".json")).write_bytes(b"HOSTILE_MARKER")
+    (store.root / rid[:2] / (rid + ".json")).write_bytes(b"HOSTILE_MARKER")
     for action in ("verify", "read"):
         assert invoke(store, action, rid) == 2
         assert_error(capsys.readouterr(), "E_HASH")
+
+
+@pytest.mark.parametrize("action", ["read", "verify", "write"])
+def test_rf44_cli_refuses_flat_store(action, store, workspace, capsys):
+    value = GOLDENS[0]["record"]
+    data = codec.canonical(value)
+    rid = hashlib.sha256(data).hexdigest()
+    path = store.root / (rid + ".json")
+    path.write_bytes(data)
+    arguments = [rid[:16]]
+    if action == "write":
+        source = workspace / "content.json"
+        source.write_bytes(json.dumps(content(value)).encode())
+        arguments = ["--kind", value["kind"], "--in", str(source)]
+    assert invoke(store, action, *arguments) == 2
+    output = capsys.readouterr()
+    assert not output.err
+    assert json.loads(output.out) == {"error": {"code": "E_AUTH", "message":
+        "flat message store layout is unsupported; use a new empty store directory"}}
+    assert list(store.root.iterdir()) == [path]
+    assert path.read_bytes() == data
 
 
 @pytest.mark.parametrize("width", [16, 64])
@@ -677,7 +698,8 @@ def test_rf43_verify_encodes_once_per_call(store, workspace, capsys, width):
 def test_rf43_verify_refuses_noncanonical_bytes_with_matching_hash(store, workspace, capsys):
     data = b" " + codec.canonical(GOLDENS[0]["record"])
     rid = hashlib.sha256(data).hexdigest()
-    path = store.root / (rid + ".json")
+    path = store.root / rid[:2] / (rid + ".json")
+    path.parent.mkdir(mode=0o700)
     path.write_bytes(data)
     assert invoke(store, "verify", rid[:16]) == 2
     assert_error(capsys.readouterr(), "E_FORMAT")
@@ -699,7 +721,7 @@ def test_default_store_uses_target_workspace(position, workspace, tmp_path, monk
     assert main(argv) == 0
     rid = json.loads(capsys.readouterr().out)["id"]
     directory = target / ".aegis" / "state" / "messages"
-    assert (directory / (rid + ".json")).is_file()
+    assert (directory / rid[:2] / (rid + ".json")).is_file()
     assert directory.stat().st_mode & 0o077 == 0
     assert (directory.parent / ".gitignore").read_text().endswith("*\n")
     assert not (workspace / ".aegis" / "state").exists()
@@ -843,12 +865,14 @@ def test_write_refuses_unresolvable_refs(reference, store, workspace, tmp_path, 
         child = store.write(GOLDENS[0]["record"])[:16]
     elif reference == "malformed":
         child = "HOSTILE_MARKER"
-    before = {p.name: p.read_bytes() for p in store.root.iterdir()}
+    before = {p.relative_to(store.root): None if p.is_dir() else p.read_bytes()
+              for p in store.root.rglob("*")}
     payload = json.dumps({"fields": {}, "body": "parent", "refs": {"child": child}}).encode()
     monkeypatch.setattr(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(payload)))
     assert invoke(store, "write", "--kind", "text", "--in", "-") == 2
     assert_error(capsys.readouterr(), "E_REF", "write_ref")
-    assert {p.name: p.read_bytes() for p in store.root.iterdir()} == before
+    assert {p.relative_to(store.root): None if p.is_dir() else p.read_bytes()
+              for p in store.root.rglob("*")} == before
 
 
 def test_write_resolves_refs_in_target_store(store, workspace, monkeypatch, capsys):
@@ -1102,7 +1126,7 @@ def test_invalid_read_options_have_identical_frontend_refusals_before_io(
         try:
             if record_state == "corrupt-record":
                 rid = probe.write(GOLDENS[0]["record"])
-                (directory / (rid + ".json")).write_bytes(b"HOSTILE_MARKER")
+                (directory / rid[:2] / (rid + ".json")).write_bytes(b"HOSTILE_MARKER")
         finally:
             probe.close()
     for name, value in server.fresh_state().items():

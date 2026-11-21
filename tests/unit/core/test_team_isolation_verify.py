@@ -1,11 +1,13 @@
 """Pure isolation contracts: caller-owned observations, no filesystem probes."""
 import copy
+import dataclasses
 import errno
 import importlib
 import inspect
 import json
 import os
 from pathlib import Path, PurePosixPath
+import posixpath
 import stat
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -13,7 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from aegis_core import hosts, team_isolation
+from aegis_core import hosts, team_host_registry, team_isolation
 
 
 IMAGE = "localhost/aegis-teams@sha256:" + "a" * 64
@@ -32,7 +34,44 @@ def verifier():
     return importlib.import_module("aegis_core.team_isolation_verify")
 
 
-def facts(*paths):
+def _catalogue_names(rows):
+    """Casefolded top-level roots of home-relative catalogue paths.
+
+    Twin of _normalized_catalogue_root in tests/unit/core/test_team_isolation.py.
+    The path is PurePosixPath(HOME).joinpath of the components after '~/', then
+    posixpath.normpath of that absolute path. HOME is /owner, the same anchor as
+    that twin. The result must be strictly below HOME. HOME itself or a path
+    outside it raises AssertionError catalogue-defect. Callers do not skip that
+    entry. The top-level root is the first component below HOME.
+    """
+    HOME = "/owner"
+    found = set()
+    for host in rows:
+        paths = host.config_paths
+        if type(paths) not in (tuple, list):
+            continue
+        for config_path in paths:
+            if type(config_path) is not str or not config_path.startswith("~/"):
+                continue
+            absolute = PurePosixPath(HOME).joinpath(*config_path[2:].split("/"))
+            normalized = PurePosixPath(posixpath.normpath(str(absolute)))
+            try:
+                below = normalized.relative_to(PurePosixPath(HOME))
+            except ValueError:
+                raise AssertionError("catalogue-defect: config path normalizes outside the home directory")
+            if not below.parts:
+                raise AssertionError("catalogue-defect: config path normalizes to the home directory")
+            found.add(below.parts[0].casefold())
+    return found
+
+
+def _non_teams_host(config_paths):
+    """Copy of a catalogue host outside the Teams registry, with injected paths."""
+    source = next(row for row in hosts.HOSTS if row.id not in team_host_registry.TEAM_HOSTS)
+    return dataclasses.replace(source, config_paths=tuple(config_paths))
+
+
+def facts(*paths, catalogue=None):
     """Model descriptor observations, including a second unchanged metadata sample."""
     from pathlib import PurePosixPath
     result = {}
@@ -45,7 +84,7 @@ def facts(*paths):
                           mode=stat.S_IFDIR | 0o700, acl=None)
             result[str(part)] = dict(record, after=copy.deepcopy(record))
     names = {".ssh", ".gnupg", ".config", ".aws", ".kube", ".docker", ".netrc", ".git-credentials", ".local"}
-    names.update(p[2:].split("/")[0].casefold() for host in hosts.HOSTS for p in host.config_paths if p.startswith("~/"))
+    names.update(_catalogue_names(hosts.HOSTS if catalogue is None else catalogue))
     owner = next((path for path in paths if path.endswith("/home") or path == "/owner"), "/owner")
     for name in names:
         result.setdefault(owner + "/" + name, None)
@@ -360,10 +399,11 @@ def test_malformed_field_shapes_use_the_public_refusal_contract(core, verifier):
                 refused_or_mismatched(invalid, wanted)
 
 
-def round2_facts(homes, *extra):
-    observed = facts("/work/run", "/work/project", "/source", "/venv", *homes.values(), *extra)
+def round2_facts(homes, *extra, catalogue=None):
+    observed = facts("/work/run", "/work/project", "/source", "/venv", *homes.values(), *extra,
+                     catalogue=catalogue)
     names = {".ssh", ".gnupg", ".config", ".aws", ".kube", ".docker", ".netrc", ".git-credentials", ".local"}
-    names.update(p[2:].split("/")[0].casefold() for host in hosts.HOSTS for p in host.config_paths if p.startswith("~/"))
+    names.update(_catalogue_names(hosts.HOSTS if catalogue is None else catalogue))
     for home in homes.values():
         for name in names:
             observed.setdefault(home + "/" + name, None)
@@ -1247,3 +1287,77 @@ def test_public_mount_boundary_rechecks_refreshed_facts_and_policy(core):
                                  timeout=10))
     assert results == ["ok", "mount_changed", "mount_metadata", "unsafe_mount", "unsafe_mount",
                        "owner_homes", "ok"]
+
+
+@pytest.mark.parametrize("config_path", ["~/.", "~/./.", "~/foo/..", "~/"])
+def test_catalogue_entry_that_is_the_home_directory_is_a_catalogue_defect(config_path):
+    """Observation setup fails a home-relative entry that normalizes to HOME."""
+    host = _non_teams_host((config_path,))
+    assert host.id not in team_host_registry.TEAM_HOSTS
+    message = "catalogue-defect: config path normalizes to the home directory"
+    with pytest.raises(AssertionError) as caught:
+        _catalogue_names((host,))
+    assert str(caught.value) == message
+    with pytest.raises(AssertionError) as observed:
+        facts("/owner", catalogue=(host,))
+    assert str(observed.value) == message
+    homes = dict.fromkeys(("explicit", "ambient", "password"), "/owner")
+    with pytest.raises(AssertionError) as recorded:
+        round2_facts(homes, catalogue=(host,))
+    assert str(recorded.value) == message
+
+
+@pytest.mark.parametrize("config_path", ["~/..", "~/../.next-host", "~/foo/../.."])
+def test_catalogue_entry_outside_home_is_a_catalogue_defect(config_path):
+    """Observation setup fails a home-relative entry that normalizes outside HOME."""
+    host = _non_teams_host((config_path,))
+    message = "catalogue-defect: config path normalizes outside the home directory"
+    with pytest.raises(AssertionError) as caught:
+        _catalogue_names((host,))
+    assert str(caught.value) == message
+    with pytest.raises(AssertionError) as observed:
+        facts("/owner", catalogue=(host,))
+    assert str(observed.value) == message
+
+
+_DOTTED_NEXT = ("~/./.next-host", "~/a/../.next-host", "~//.next-host", "~///.next-host")
+
+
+@pytest.mark.parametrize("spelling", _DOTTED_NEXT,
+                         ids=["dot-slash", "parent-dotdot", "double-slash", "triple-slash"])
+def test_dotted_catalogue_spelling_is_observed_as_the_normalized_root(spelling):
+    """~/./.next-host is observed as .next-host, then again on a fresh call."""
+    host = _non_teams_host((spelling,))
+    assert host.id not in team_host_registry.TEAM_HOSTS
+    assert _catalogue_names((host,)) == {".next-host"}
+    observed = facts("/owner", catalogue=(host,))
+    assert "/owner/.next-host" in observed
+    assert observed["/owner/.next-host"] is None
+    assert "/owner/." not in observed
+    again = facts("/owner", catalogue=(host,))
+    assert again["/owner/.next-host"] is None
+    assert "/owner/." not in again
+    homes = dict.fromkeys(("explicit", "ambient", "password"), "/owner")
+    recorded = round2_facts(homes, catalogue=(host,))
+    assert recorded["/owner/.next-host"] is None
+    assert "/owner/." not in recorded
+
+
+def test_dotted_catalogue_observations_are_isolated_under_concurrency():
+    """Concurrent dotted spellings observe .next-host, and a bad entry still fails."""
+    def once(spelling):
+        host = _non_teams_host((spelling,))
+        try:
+            observed = facts("/owner", catalogue=(host,))
+            names = _catalogue_names((host,))
+        except AssertionError as exc:
+            return "defect" if str(exc).startswith("catalogue-defect:") else spelling
+        if names == {".next-host"} and observed.get("/owner/.next-host") is None and "/owner/." not in observed:
+            return "ok"
+        return spelling
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        spellings = list(_DOTTED_NEXT) * 3
+        assert list(pool.map(once, spellings)) == ["ok"] * len(spellings)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(once, ["~/.", "~/.."] * 3)) == ["defect"] * 6

@@ -131,6 +131,8 @@ def _embedded_json(raw):
     The shared parser preflights the raw byte limit first. The refusal probe
     checks legacy syntax, duplicate keys and constants, discarding numeric and
     object values; it never returns an unchecked tree as parsed evidence.
+    Decoder recursion exhaustion keeps the original bounded refusal instead of
+    the legacy-text sentinel.
     """
     try:
         return True, _rollout_json(raw)
@@ -149,7 +151,9 @@ def _embedded_json(raw):
         try:
             json.loads(raw, object_pairs_hook=pairs, parse_constant=nonfinite,
                        parse_int=lambda _value: None, parse_float=lambda _value: None)
-        except (ValueError, RecursionError, OverflowError):
+        except RecursionError:
+            raise error from None
+        except (ValueError, OverflowError):
             return False, None
         raise
 
