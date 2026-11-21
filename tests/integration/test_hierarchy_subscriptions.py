@@ -605,3 +605,323 @@ def test_concurrent_pass_during_failed_notice_flush_does_not_advance_cursor(tmp_
     assert api.notify(*store)["recovered"] == 1
     assert len(notices(store[0])) == 1
     assert api.notify(*store)["published"] == 0
+
+
+def _tree_bytes(root):
+    return {path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+
+
+def test_seen_record_is_hashed_before_verification_and_not_walked_again(tmp_path, bound_mailbox, monkeypatch):
+    store = make_store(tmp_path, bound_mailbox)
+    published = {}
+    for name in ("m0", "m1", "m2"):
+        published[name] = publish_direct(store[0], name)
+    referenced, verified = [], []
+    real_build, real_verify = api._reference_from_verified, api._verify_record
+
+    def build(record, digest):
+        referenced.append(record["message"]["message_id"])
+        return real_build(record, digest)
+
+    def verify(raw, record):
+        verified.append(record["message"]["message_id"])
+        return real_verify(raw, record)
+
+    monkeypatch.setattr(api, "_reference_from_verified", build)
+    monkeypatch.setattr(api, "_verify_record", verify)
+    assert api.notify(*store)["published"] == 1
+    assert set(referenced) == {"m0", "m1", "m2"}
+    assert {"m0", "m1", "m2"} <= set(verified)
+    referenced.clear()
+    verified.clear()
+    publish_direct(store[0], "fresh")
+    assert api.notify(*store)["published"] == 1
+    assert referenced == ["fresh"]
+    # A matching re-read is verified once and then not walked. The seen set skips only the build.
+    assert {"m0", "m1", "m2", "fresh"} <= set(verified)
+    assert verified.count("m0") == 1 and verified.count("m1") == 1 and verified.count("m2") == 1
+    assert verified.count("fresh") == 1
+    replaced = publish_direct(store[0], "replaced")
+    replaced_path = Path(replaced["path"])
+    fresh_bytes = replaced_path.read_bytes()
+    old_bytes = Path(published["m0"]["path"]).read_bytes()
+    old_digest = hashlib.sha256(old_bytes).hexdigest()
+    assert old_digest != replaced["sha256"]
+    cursor_path = next(store[1].glob("*.json"))
+    cursor = json.loads(cursor_path.read_bytes())
+    assert old_digest in cursor["seen"] and replaced["sha256"] not in cursor["seen"]
+    state_before = _tree_bytes(store[1])
+    mailbox_before = _tree_bytes(store[0])
+    notice_before = len(notices(store[0]))
+    referenced.clear()
+    verified.clear()
+    real_messages = api.hm.Mailbox.messages
+
+    def messages(self):
+        # messages() has already built the new envelope; the file is then the seen bytes.
+        records = real_messages(self)
+        replaced_path.write_bytes(old_bytes)
+        return records
+
+    monkeypatch.setattr(api.hm.Mailbox, "messages", messages)
+    with pytest.raises(api.SubscriptionError) as caught:
+        api.notify(*store)
+    assert caught.value.code == "SUBSCRIPTIONS_MAILBOX"
+    assert str(caught.value) == "subscription mailbox refused"
+    assert "replaced" in verified and "replaced" not in referenced
+    assert verified.count("replaced") == 1
+    assert _tree_bytes(store[1]) == state_before
+    relative = replaced_path.relative_to(store[0])
+    attacked = _tree_bytes(store[0])
+    assert attacked[relative] == old_bytes
+    attacked.pop(relative)
+    expected_mailbox = dict(mailbox_before)
+    expected_mailbox.pop(relative)
+    assert attacked == expected_mailbox
+    monkeypatch.setattr(api.hm.Mailbox, "messages", real_messages)
+    replaced_path.write_bytes(fresh_bytes)
+    assert len(notices(store[0])) == notice_before
+    verified.clear()
+    referenced.clear()
+    assert api.notify(*store)["published"] == 1
+    assert verified.count("replaced") == 1 and referenced == ["replaced"]
+    assert len(notices(store[0])) == notice_before + 1
+    assert api.notify(*store)["published"] == 0
+
+
+def test_unseen_verification_failure_leaves_storage_untouched_and_retries(tmp_path, bound_mailbox, monkeypatch):
+    store = make_store(tmp_path, bound_mailbox)
+    publish_direct(store[0], "m-ok")
+    publish_direct(store[0], "m-bad")
+    before = _tree_bytes(store[0])
+    active, record_open = set(), set()
+    real_os, real_verify = api.os, api._verify_record
+
+    def opened(path, *args, **kwargs):
+        descriptor = real_os.open(path, *args, **kwargs)
+        active.add(descriptor)
+        if isinstance(path, str) and "m-bad" in path:
+            record_open.add(descriptor)
+        return descriptor
+
+    def closed(descriptor):
+        active.discard(descriptor)
+        record_open.discard(descriptor)
+        return real_os.close(descriptor)
+
+    def verify(raw, record):
+        if record["message"]["message_id"] == "m-bad":
+            assert record_open == set()
+            raise api.SubscriptionError("MAILBOX")
+        return real_verify(raw, record)
+
+    monkeypatch.setattr(api, "os", SimpleNamespace(**{**vars(api.os), "open": opened, "close": closed}))
+    monkeypatch.setattr(api, "_verify_record", verify)
+    with pytest.raises(api.SubscriptionError) as caught:
+        api.notify(*store)
+    assert caught.value.code == "SUBSCRIPTIONS_MAILBOX"
+    assert str(caught.value) == "subscription mailbox refused"
+    assert active == set()
+    assert list(store[1].glob("*.json")) == []
+    assert notices(store[0]) == []
+    assert _tree_bytes(store[0]) == before
+    monkeypatch.setattr(api, "_verify_record", real_verify)
+    monkeypatch.setattr(api, "os", real_os)
+    assert api.notify(*store)["published"] == 1
+    assert len(notices(store[0])) == 1
+    assert api.notify(*store)["published"] == 0
+
+
+def test_seen_hash_read_survives_directory_rename_and_closes_descriptors(tmp_path, bound_mailbox, monkeypatch):
+    store = make_store(tmp_path, bound_mailbox)
+    published = publish_direct(store[0], "kept")
+    record_path = Path(published["path"])
+    assert api.notify(*store)["published"] == 1
+    assert len(notices(store[0])) == 1
+    acted, active = [], set()
+    real_os = api.os
+    parent = record_path.parent
+    saved = parent.with_name(parent.name + "-saved")
+    hostile = tmp_path / "hostile-record"
+
+    def opened(path, flags, *args, **kwargs):
+        if path == record_path.name and not acted:
+            acted.append(True)
+            parent.rename(saved)
+            hostile.mkdir()
+            (hostile / record_path.name).write_bytes(b"HOSTILE")
+            symlink_or_skip(hostile, parent, target_is_directory=True)
+        descriptor = real_os.open(path, flags, *args, **kwargs)
+        active.add(descriptor)
+        return descriptor
+
+    def closed(descriptor):
+        active.discard(descriptor)
+        return real_os.close(descriptor)
+
+    monkeypatch.setattr(api, "os", SimpleNamespace(**{**vars(api.os), "open": opened, "close": closed}))
+    assert api.notify(*store)["published"] == 0
+    assert acted and active == set()
+    assert len(list(saved.glob("*notice-*"))) == 1
+    assert list(hostile.glob("*notice-*")) == []
+    cursor = json.loads(next(store[1].glob("*.json")).read_bytes())
+    assert published["sha256"] in cursor["seen"]
+    assert b"HOSTILE" not in next(store[1].glob("*.json")).read_bytes()
+
+
+def test_repeat_pass_concurrent_callers_skip_seen_records(tmp_path, bound_mailbox, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    store = make_store(tmp_path, bound_mailbox)
+    publish_direct(store[0], "seen-one")
+    assert api.notify(*store)["published"] == 1
+    verified, referenced = [], []
+    entered, release = Event(), Event()
+    real_verify, real_bytes, real_build = api._verify_record, api._record_bytes, api._reference_from_verified
+
+    def verify(raw, record):
+        verified.append(record["message"]["message_id"])
+        return real_verify(raw, record)
+
+    def record_bytes(mailbox, record):
+        raw = real_bytes(mailbox, record)
+        if record["message"]["message_id"] == "seen-one" and not entered.is_set():
+            entered.set()
+            assert release.wait(10), "seen-record barrier was not released"
+        return raw
+
+    def build(record, digest):
+        referenced.append(record["message"]["message_id"])
+        return real_build(record, digest)
+
+    monkeypatch.setattr(api, "_verify_record", verify)
+    monkeypatch.setattr(api, "_record_bytes", record_bytes)
+    monkeypatch.setattr(api, "_reference_from_verified", build)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(api.notify, *store)
+        try:
+            assert entered.wait(10), "repeat pass did not reach the seen record"
+            with pytest.raises(api.SubscriptionError) as caught:
+                api.notify(*store)
+            assert caught.value.code == "SUBSCRIPTIONS_BUSY"
+            # The in-flight read has not verified yet, and the busy caller must not either.
+            assert "seen-one" not in verified and referenced == []
+        finally:
+            release.set()
+        assert first.result(timeout=10)["published"] == 0
+    assert verified == ["seen-one"] and referenced == []
+    assert len(notices(store[0])) == 1
+    assert api.notify(*store)["published"] == 0
+
+
+def _verify_counts(monkeypatch):
+    verified = []
+    real_verify = api._verify_record
+
+    def verify(raw, record):
+        verified.append(record["message"]["message_id"])
+        return real_verify(raw, record)
+
+    monkeypatch.setattr(api, "_verify_record", verify)
+    return verified
+
+
+def test_each_matching_record_is_verified_once_including_budget_hold(tmp_path, bound_mailbox, monkeypatch):
+    store = make_store(tmp_path, bound_mailbox)
+    write_config(store[2], budget=1)
+    verified = _verify_counts(monkeypatch)
+    publish_direct(store[0], "fresh-a")
+    publish_direct(store[0], "fresh-b")
+    assert api.notify(*store, now=10000)["published"] == 1
+    assert verified.count("fresh-a") == 1 and verified.count("fresh-b") == 1
+    verified.clear()
+    publish_direct(store[0], "held-c")
+    held = api.notify(*store, now=10001)
+    assert held["published"] == 0 and held["subscription_suppressed"][0]["reason"] == "budget"
+    assert verified.count("held-c") == 1
+    assert verified.count("fresh-a") == 1 and verified.count("fresh-b") == 1
+    verified.clear()
+    again = api.notify(*store, now=10002)
+    assert again["published"] == 0 and again["subscription_suppressed"][0]["reason"] == "budget"
+    assert verified.count("held-c") == 1 and verified.count("fresh-a") == 1
+    state_before = _tree_bytes(store[1])
+    notice_before = len(notices(store[0]))
+    verified.clear()
+    released = api.notify(*store, now=13601)
+    assert released["published"] == 1 and released["subscription_suppressed"] == []
+    assert verified.count("held-c") == 1 and verified.count("fresh-a") == 1
+    assert len(notices(store[0])) == notice_before + 1
+    assert _tree_bytes(store[1]) != state_before
+
+
+def test_reference_without_a_prior_verify_still_verifies(tmp_path, bound_mailbox, monkeypatch):
+    store = make_store(tmp_path, bound_mailbox)
+    published = publish_direct(store[0], "direct")
+    mailbox = api.hm.Mailbox(store[0])
+    record = next(item for item in mailbox.messages().values()
+                  if item["message"]["message_id"] == "direct")
+    raw = Path(published["path"]).read_bytes()
+    verified = _verify_counts(monkeypatch)
+    built = api._reference(mailbox, record, raw)
+    assert verified == ["direct"]
+    assert built["message_id"] == "direct" and built["sha256"] == hashlib.sha256(raw).hexdigest()
+
+
+def test_budget_held_verify_is_once_when_a_second_pass_is_busy(tmp_path, bound_mailbox, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    store = make_store(tmp_path, bound_mailbox)
+    write_config(store[2], budget=1)
+    publish_direct(store[0], "fresh-a")
+    assert api.notify(*store, now=10000)["published"] == 1
+    publish_direct(store[0], "held-c")
+    verified = []
+    entered, release = Event(), Event()
+    real_verify = api._verify_record
+
+    def verify(raw, record):
+        if record["message"]["message_id"] == "held-c" and not entered.is_set():
+            entered.set()
+            assert release.wait(10), "budget-held barrier was not released"
+        verified.append(record["message"]["message_id"])
+        return real_verify(raw, record)
+
+    monkeypatch.setattr(api, "_verify_record", verify)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(api.notify, *store, now=10001)
+        try:
+            assert entered.wait(10), "budget-held pass did not reach verification"
+            with pytest.raises(api.SubscriptionError) as caught:
+                api.notify(*store, now=10001)
+            assert caught.value.code == "SUBSCRIPTIONS_BUSY"
+            assert verified.count("held-c") == 0
+        finally:
+            release.set()
+        result = first.result(timeout=10)
+    assert result["published"] == 0 and result["subscription_suppressed"][0]["reason"] == "budget"
+    assert verified.count("held-c") == 1
+    assert api.notify(*store, now=13601)["published"] == 1
+
+
+def test_notify_reuses_a_matching_mailbox_and_refuses_a_different_root(tmp_path, bound_mailbox, monkeypatch):
+    store = make_store(tmp_path, bound_mailbox)
+    publish_direct(store[0], "once")
+    mailbox = api.hm.Mailbox(store[0])
+    calls = []
+    real = api.hm.Mailbox
+
+    def counting(root):
+        calls.append(str(root))
+        return real(root)
+
+    monkeypatch.setattr(api.hm, "Mailbox", counting)
+    assert api.notify(*store, mailbox=mailbox)["published"] == 1
+    assert calls == []
+    before = next(store[1].glob("*.json")).read_bytes()
+    notice_count = len(notices(store[0]))
+    with pytest.raises(api.SubscriptionError) as caught:
+        api.notify(*store, mailbox=SimpleNamespace(root=store[1]))
+    assert caught.value.code == "SUBSCRIPTIONS_MAILBOX"
+    assert calls == []
+    assert next(store[1].glob("*.json")).read_bytes() == before
+    assert len(notices(store[0])) == notice_count
