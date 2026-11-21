@@ -29,6 +29,7 @@ from aegis_core.team_mailbox_primitives import (
 from aegis_core.team_mailbox_store import Store, initialize_store
 from aegis_core.team_mailbox_service import operation, witnesses
 from aegis_core.team_mailbox_delivery import MailboxDelivery
+from aegis_core.team_mailbox_index_scan import pending_entry
 
 __all__ = ["Mailbox", "MailboxRefusal", "initialize"]
 
@@ -102,7 +103,7 @@ class Mailbox(MailboxDelivery):
     @operation(write=False)
     def endpoint(self, endpoint):
         self.roles.endpoint_parts(endpoint)
-        require(endpoint in self.manifest["endpoints"], "unknown endpoint: " + endpoint)
+        require(endpoint in self.manifest["endpoints"], reason="scope")
         return self.manifest["endpoints"][endpoint]
 
     @operation(write=False)
@@ -123,7 +124,7 @@ class Mailbox(MailboxDelivery):
         left, right = self.roles.endpoint_parts(sender), self.roles.endpoint_parts(recipient)
         vertical = left[0] == right[0] and any({left[1], right[1]} == set(pair) for pair in self.roles.vertical_routes)
         across = any({sender, recipient} == set(pair) for pair in self.manifest["counterparts"])
-        require(vertical or across, "route is not vertical or an explicit counterpart")
+        require(vertical or across, reason="scope")
         return self.root / ("across" if across else right[0]) / right[1]
 
     @operation(write=False)
@@ -190,10 +191,10 @@ class Mailbox(MailboxDelivery):
         for path in entries:
             safe_path(path)
             require(re.fullmatch(r"\d{6}\.(json|ack)", path.name) is not None
-                    or re.fullmatch(r"\.pending-[0-9a-f]{32}", path.name) is not None,
+                    or pending_entry(path, self.root),
                     "unexpected binding history entry")
         for path in (p for p in entries if p.suffix == ".json"):
-            require(len(result) < MAX_RECORDS, "binding history exceeds record limit")
+            require(len(result) < MAX_RECORDS, reason="history")
             raw = self.store.read(path, limit=min(MAX_BYTES, MAX_HISTORY_BYTES - total_bytes))
             total_bytes += len(raw)
             record = strict_json(raw)
@@ -258,8 +259,8 @@ class Mailbox(MailboxDelivery):
         binding, history = self._current_binding(sender["from"])
         expected = {"host": binding["host"], "session": binding["session"], "binding_generation": binding["generation"]}
         require(all(type(sender.get(key)) is type(value) and sender.get(key) == value for key, value in expected.items()),
-                "stale or mismatched sender binding")
-        require(not ready or self._ready(binding, history), "handoff checkpoint has not been acknowledged")
+                reason="binding")
+        require(not ready or self._ready(binding, history), reason="binding")
         return binding
 
     @operation(write=False)
@@ -269,7 +270,7 @@ class Mailbox(MailboxDelivery):
 
     def _current_binding(self, endpoint):
         history = self.bindings(endpoint)
-        require(bool(history), "endpoint has no session binding: " + endpoint)
+        require(bool(history), reason="binding")
         return history[-1], history
 
     @operation(write=False)
@@ -293,12 +294,12 @@ class Mailbox(MailboxDelivery):
         if message["type"] == "job_request":
             left, right = self.roles.endpoint_parts(message["from"]), self.roles.endpoint_parts(message["to"])
             require(left[0] == right[0] and left[1] == "orchestrator" and right[1] == "root",
-                    "only an orchestrator can request a job from its own root")
+                    reason="scope")
             require("brief" in message, "job request requires a hash-bound packet")
         if message["type"] == "job_receipt":
             left, right = self.roles.endpoint_parts(message["from"]), self.roles.endpoint_parts(message["to"])
             require(left[1] == "root" and right[1] == "orchestrator" and "in_reply_to" in message,
-                    "job receipt must come from root and reply to a job request")
+                    reason="scope")
             self.job_receipt(message.get("receipt"))
         elif "receipt" in message:
             raise MailboxRefusal("invalid_record")
@@ -307,7 +308,7 @@ class Mailbox(MailboxDelivery):
         if message["type"] == "dispatch":
             left, right = self.roles.endpoint_parts(message["from"]), self.roles.endpoint_parts(message["to"])
             require(left[0] == right[0] and left[1] == "orchestrator" and right[1] == "lane",
-                    "only an orchestrator can dispatch its own lane")
+                    reason="scope")
         if message["type"] == "ack":
             require(isinstance(message.get("acknowledgment"), str) and message["acknowledgment"] in STAGES and "in_reply_to" in message,
                     "ack requires a stage and referenced message")
@@ -339,10 +340,10 @@ class Mailbox(MailboxDelivery):
             safe_path(folder)
             for path in self.store.entries(folder):
                 safe_path(path)
-                if re.fullmatch(r"\.pending-[0-9a-f]{32}", path.name):
+                if pending_entry(path, self.root, message_folders=folders):
                     continue
                 require(path.suffix == ".md", "unexpected mailbox entry: " + str(path))
-                require(len(records) < MAX_RECORDS, "mailbox exceeds record limit")
+                require(len(records) < MAX_RECORDS, reason="history")
                 raw_bytes = self.store.read(path, limit=min(MAX_BYTES, MAX_HISTORY_BYTES - total_bytes))
                 total_bytes += len(raw_bytes)
                 raw = raw_bytes.decode("utf-8")
@@ -353,7 +354,7 @@ class Mailbox(MailboxDelivery):
                     require(type(message) is dict)
                     message["body"] = body
                     destination = self.validate_message(message, stored=True)
-                    require(destination == folder, "message is in the wrong routing folder")
+                    require(destination == folder, reason="scope")
                     require(message["message_id"] not in records, "duplicate message_id in history")
                     records[message["message_id"]] = {"path": str(path), "message": message}
                 except MailboxRefusal as error:
@@ -640,11 +641,11 @@ class Mailbox(MailboxDelivery):
         destination = self.validate_message(request)
         records = self.messages()
         require(request["message_id"] not in records, "message_id already exists: " + request["message_id"])
-        require(len(records) < MAX_RECORDS, "mailbox history limit reached")
+        require(len(records) < MAX_RECORDS, reason="history")
         self.fence(request)
         recipient, history = self._current_binding(request["to"])
         if request["type"] == "dispatch":
-            require(self._ready(recipient, history), "recipient has not acknowledged its handoff checkpoint")
+            require(self._ready(recipient, history), reason="binding")
         original = self.reply(request, records) if "in_reply_to" in request else None
         if request["type"] == "job_receipt":
             require(original["type"] == "job_request", "job receipt must reply to a job request")

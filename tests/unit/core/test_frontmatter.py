@@ -1,9 +1,11 @@
 """Rule path readers refuse unsafe inputs before reading or parsing them."""
 from __future__ import annotations
 
-from contextlib import contextmanager
+from argparse import Namespace
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 import errno
+import json
 import os
 from pathlib import Path
 import signal
@@ -23,6 +25,7 @@ from aegis_core import rule_inventory
 
 
 TEXT = "---\nid: bounded\n---\nbody\n"
+SIZE_ADVICE = f"Rule file exceeds the {MAX_RULE_BYTES}-byte size limit"
 ENTRIES = ("parse_rule_frontmatter", "parse_rule_file", "AegisYAML.parse_file")
 
 
@@ -95,6 +98,8 @@ def test_rule_path_matrix(tmp_path, entry, kind):
         error, message, code = RuleNotFoundError, f"Rule file not found: {path}", "ERR_AEGIS"
     elif kind.startswith("symlink") and entry == "AegisYAML.parse_file":
         message, code = f"Symlink parsing prohibited for security: {path}", None
+    elif kind == "oversize":
+        message = SIZE_ADVICE
     if kind == "fifo":
         with fifo_deadline(), pytest.raises(error) as refused:
             read_rule(entry, path, root)
@@ -153,18 +158,50 @@ def test_single_file_facade_matrix(tmp_path, kind, rooted):
     if kind == "regular":
         assert read_rule_file(path, **kwargs) == TEXT.encode()
     else:
-        with pytest.raises(RuleInventoryError, match="^Rule file read refused$") as refused:
+        with pytest.raises(RuleInventoryError) as refused:
             read_rule_file(path, **kwargs)
+        assert str(refused.value) == (SIZE_ADVICE if kind == "oversize" else "Rule file read refused")
         assert refused.value.code == ("RULE_FILE_NOT_FOUND" if kind == "missing" else "RULE_FILE_READ_REFUSED")
 
 
 def test_facade_unsupported_probe_keeps_inventory_fallback(tmp_path, monkeypatch):
-    from aegis_core.rule_inventory import read_rule_file
+    from aegis_core.rule_inventory import read_rule_file, RuleInventoryError
 
     path = tmp_path / "rule.md"
     path.write_bytes(b"---\r\nid: bounded\r\n---\r\nbody\x1a\r\n")
     monkeypatch.setattr(rule_inventory, "descriptor_supported", lambda: False)
     assert read_rule_file(path, root=tmp_path) == path.read_bytes()
+    path.write_bytes(b"x" * (MAX_RULE_BYTES + 1))
+    with pytest.raises(RuleInventoryError) as refused:
+        read_rule_file(path, root=tmp_path)
+    assert refused.value.code == "RULE_FILE_READ_REFUSED"
+    assert str(refused.value) == SIZE_ADVICE
+
+
+@pytest.mark.parametrize("rooted", [False, True], ids=["rootless", "rooted"])
+def test_size_advice_remains_fixed_across_concurrent_refusals(tmp_path, rooted):
+    root = tmp_path.resolve()
+    path = root / "private-rule.md"
+    path.write_bytes(b"x" * (MAX_RULE_BYTES + 1))
+    non_file = root / "private-directory.md"
+    non_file.mkdir()
+    kwargs = {"root": root} if rooted else {}
+
+    def refuse(target):
+        with pytest.raises(rule_inventory.RuleInventoryError) as error:
+            rule_inventory.read_rule_file(target, **kwargs)
+        return error.value.code, str(error.value)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        actual = list(pool.map(refuse, (path, non_file, non_file, path), timeout=15))
+    assert actual == [
+        ("RULE_FILE_READ_REFUSED", SIZE_ADVICE),
+        ("RULE_FILE_READ_REFUSED", "Rule file read refused"),
+        ("RULE_FILE_READ_REFUSED", "Rule file read refused"),
+        ("RULE_FILE_READ_REFUSED", SIZE_ADVICE),
+    ]
+    path.write_bytes(b"x" * MAX_RULE_BYTES)
+    assert rule_inventory.read_rule_file(path, **kwargs) == path.read_bytes()
 
 
 @pytest.mark.parametrize("phase", ["leaf", "before-ancestor", "parent-replaced", "ancestor", "read", "growth", "io"])
@@ -251,8 +288,9 @@ def test_facade_size_limit_precedes_open_and_parsing(tmp_path, monkeypatch):
     with path.open("wb") as stream:
         stream.truncate(MAX_RULE_BYTES + 1)
     monkeypatch.setattr(rule_inventory, "os", module_os(open=lambda *a, **k: pytest.fail("oversize file opened")))
-    with pytest.raises(RuleInventoryError, match="^Rule file read refused$"):
+    with pytest.raises(RuleInventoryError) as refused:
         read_rule_file(path)
+    assert str(refused.value) == SIZE_ADVICE
 
 
 @pytest.mark.parametrize("entry", ENTRIES)
@@ -304,7 +342,7 @@ def test_file_parse_refusal_preserves_legacy_diagnostic(tmp_path, entry):
     path.write_text("---\nPRIVATE_KEY_NAME: 1\nPRIVATE_KEY_NAME: 2\n---\nbody\n", encoding="utf-8")
     error = RuleParseError if entry == "parse_rule_file" else AegisYAMLError
     diagnostic = "Duplicate key 'PRIVATE_KEY_NAME' detected at line 2"
-    message = f"Error parsing rule {path}: {diagnostic}" if entry == "parse_rule_file" else diagnostic
+    message = f"Error parsing rule {path}: Invalid YAML frontmatter" if entry == "parse_rule_file" else diagnostic
     with pytest.raises(error) as refused:
         read_rule(entry, path, tmp_path)
     assert type(refused.value) is error
@@ -322,11 +360,65 @@ def test_migration_skips_oversize_rule_before_parsing(tmp_path):
     planned = migrate.plan(tmp_path)
     assert not planned.refusal
     assert planned.strips == []
-    assert planned.skipped == [{"path": ".aegis/rules/traps/rule.md", "reason": "Rule file read refused"}]
+    assert planned.skipped == [{"path": ".aegis/rules/traps/rule.md", "reason": SIZE_ADVICE}]
     path.write_text(text, encoding="utf-8")
     retried = migrate.plan(tmp_path)
     assert not retried.skipped
     assert len(retried.strips) == 1
+
+
+@pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("kind", ["oversize", "symlink", "unreadable", "not-file"])
+def test_migration_reports_rule_read_advice(tmp_path, monkeypatch, capsys, kind, as_json):
+    from aegis_cli.migrate import run_migrate
+
+    relative_path = ".aegis/rules/traps/private-rule.md"
+    path = tmp_path / relative_path
+    path.parent.mkdir(parents=True)
+    (path.parent / "legacy.md").write_text(
+        "---\nid: legacy\ntype: trap\nscore: 1\n---\nbody\n", encoding="utf-8",
+    )
+    if kind == "oversize":
+        path.write_bytes(b"x" * (MAX_RULE_BYTES + 1))
+        advice = SIZE_ADVICE
+    elif kind == "symlink":
+        target = tmp_path / "private-target.md"
+        target.write_text(TEXT, encoding="utf-8")
+        symlink_or_skip(target, path)
+        advice = "a symlink or outside the workspace; not followed"
+    elif kind == "unreadable":
+        path.write_text(TEXT, encoding="utf-8")
+
+        def deny_rule(name, flags, *args, **kwargs):
+            if Path(name).name == path.name:
+                raise PermissionError(errno.EACCES, "private OS diagnostic", str(path))
+            return os.open(name, flags, *args, **kwargs)
+
+        monkeypatch.setattr(rule_inventory, "os", module_os(open=deny_rule))
+        with pytest.raises(rule_inventory.RuleInventoryError) as refused:
+            rule_inventory.read_rule_file(path, root=tmp_path)
+        assert refused.value.code == "RULE_FILE_READ_REFUSED"
+        assert str(refused.value) == "Rule file read refused"
+        advice = None
+    else:
+        if os.name != "posix":
+            pytest.skip("requires a POSIX FIFO")
+        os.mkfifo(path)
+        advice = "Rule file read refused"
+
+    with fifo_deadline() if kind == "not-file" else nullcontext():
+        assert run_migrate(Namespace(workspace=tmp_path, json=as_json)) == 0
+    output = capsys.readouterr().out
+    assert "private OS diagnostic" not in output
+    assert "private-target.md" not in output
+    if as_json:
+        report = json.loads(output)
+        assert report["skipped"] == ([] if advice is None else [{"path": relative_path, "reason": advice}])
+        assert report["unreadable"] == ([relative_path] if advice is None else [])
+    elif advice is None:
+        assert f"  ! cannot read {relative_path}: left in place" in output.splitlines()
+    else:
+        assert f"  ! {relative_path}: {advice}" in output.splitlines()
 
 
 def test_migration_recheck_and_backup_use_rule_reader(tmp_path, monkeypatch):

@@ -1159,7 +1159,7 @@
     "aegis_cli/cli.py": {
       "reason": "STRIP-LEGACY-2 (f6 lease): remove retained layout constant and _migratable checks, then remove dead refuse_unmigrated_v3 and unconverted_rule_files calls, including their doctor_base.py setup/fix callers; keep the v4 maintenance command.",
       "counts": {
-        "soma": 7,
+        "soma": 6,
         "cell": 0,
         "genome": 0,
         "enzyme": 0,

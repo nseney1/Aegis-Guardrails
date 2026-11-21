@@ -1,6 +1,6 @@
 """Validated board over TA-1a descriptor storage and injected owner policy.
 
-Posts are untrusted information. No tools imports, processes or implicit clocks.
+Posts are untrusted information. Event timestamps come from an injected clock.
 Use Board as a context manager; initialize creates the complete legacy wire tree.
 """
 from __future__ import annotations
@@ -12,6 +12,7 @@ import hashlib
 import os
 import re
 from threading import local
+import time
 from types import MappingProxyType
 import uuid
 
@@ -42,6 +43,8 @@ DEFAULT_PAGE_POSTS = 20
 MAX_PAGE_POSTS = 50
 RATE_LIMIT_ACTIONS = 30
 RATE_WINDOW_SECONDS = 60
+LOCK_WAIT_SECONDS = 5.0
+LOCK_POLL_SECONDS = 0.01
 DIGEST_RECENT_POSTS = 50
 DIGEST_LINE_CHARS = 160
 KINDS = ("note", "blocker")
@@ -51,6 +54,7 @@ ACCESS = ("read", "post")
 NOT_AVAILABLE = "that channel or post is not available to this endpoint"
 CLOSING = ("resolved", "withdrawn")
 EVENT_NAME = re.compile(r"(\d{8})\.json")
+PENDING_EVENT_NAME = re.compile(r"\.pending-[0-9a-f]{32}")
 # Newline and tab stay. C0, DEL, C1 and bidirectional overrides can hide or reorder text for a reader.
 FORBIDDEN = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f‪-‮⁦-⁩]")
 
@@ -308,10 +312,12 @@ def initialize(path, *, clock, roles, hosts, caller_role):
 class Board:
     writer_guard = staticmethod(nullcontext)
 
-    def __init__(self, path, *, clock, roles, hosts, caller_role):
+    def __init__(self, path, *, clock, roles, hosts, caller_role, monotonic=time.monotonic, sleep=time.sleep):
         require(isinstance(roles, RoleTables) and callable(clock) and type(hosts) is dict and bool(hosts))
+        require(callable(monotonic) and callable(sleep))
         require(mailbox_storage.descriptor_supported(), reason="unsupported_platform")
         self.roles, self.clock, self.caller_role = roles, clock, caller_role
+        self.monotonic, self.sleep = monotonic, sleep
         self.hosts = MappingProxyType(dict(hosts))
         self.path = safe_path(path)
         self.events, self.content, self.positions = (self.path / name for name in ("events", "content", "positions"))
@@ -356,8 +362,23 @@ class Board:
 
     @contextmanager
     def lock(self):
-        with self.store.lock(self.path), self.store.creation("mailbox"), self.store.evidence_transaction(), self.writer_guard():
-            yield
+        """Wait for board exclusion before entering the write or its guard."""
+        deadline = self.monotonic() + LOCK_WAIT_SECONDS
+        with ExitStack() as stack:
+            while True:
+                try:
+                    stack.enter_context(self.store.lock(self.path))
+                    break
+                except BusyError:
+                    # The sleep may land on the deadline. Retry once before raising,
+                    # so a release inside the budget is not missed.
+                    now = self.monotonic()
+                    if now >= deadline:
+                        raise
+                    self.sleep(min(LOCK_POLL_SECONDS, deadline - now))
+                    continue
+            with self.store.creation("mailbox"), self.store.evidence_transaction(), self.writer_guard():
+                yield
 
     @board_operation()
     def load(self):
@@ -365,7 +386,10 @@ class Board:
         previous, total = None, 0
         parent = self.calls.directories[self.events]
         paths = self.store.entries(self.events, parent=parent)
-        for count, path in enumerate(paths, 1):
+        for path in paths:
+            if PENDING_EVENT_NAME.fullmatch(path.name) is not None:
+                continue
+            count = state.seq + 1
             require(EVENT_NAME.fullmatch(path.name) is not None and path.name == "%08d.json" % count)
             raw = self.store.read(path, limit=min(MAX_BYTES, MAX_HISTORY_BYTES - total), parent=parent)
             total += len(raw)
@@ -385,6 +409,27 @@ class Board:
         self.calls.previous, self.calls.history_bytes = previous, total
         return state
 
+    def _reap_stale_pending(self, parent):
+        """Unlink exact staging names before they count. The write lock excludes a live publisher."""
+        require(type(parent) is int, reason="unsafe_path")
+        names = []
+        seen = 0
+        with os.scandir(parent) as scanned:
+            for entry in scanned:
+                seen += 1
+                require(seen <= MAX_RECORDS, reason="too_large")
+                name = entry.name
+                if type(name) is not str or len(name) > 41:
+                    continue
+                if PENDING_EVENT_NAME.fullmatch(name) is None:
+                    continue
+                names.append(name)
+        for name in names:
+            try:
+                os.unlink(name, dir_fd=parent)
+            except FileNotFoundError:
+                continue
+
     def _append(self, state, kind, data, *, undo=None):
         require(state.seq < MAX_RECORDS, reason="too_large")
         event = {"schema": SCHEMA, "seq": state.seq + 1, "at": self.timestamp(), "kind": kind,
@@ -394,7 +439,9 @@ class Board:
         raw = encoded(event) + b"\n"
         path = self.events / ("%08d.json" % event["seq"])
         require(self.calls.history_bytes + len(raw) <= MAX_HISTORY_BYTES, reason="too_large")
-        require(len(self.store.entries(self.events, parent=self.calls.directories[self.events])) < MAX_RECORDS,
+        parent = self.calls.directories[self.events]
+        self._reap_stale_pending(parent)
+        require(len(self.store.entries(self.events, parent=parent)) < MAX_RECORDS,
                 reason="too_large")
         undo = self.calls.event_undo if undo is None else undo
         self.store.publish(path, raw, parent=self.calls.directories[self.events], undo=undo)
@@ -597,8 +644,7 @@ class Board:
     def require_room(self, state, endpoint):
         limit = self.now() - timedelta(seconds=RATE_WINDOW_SECONDS)
         recent = sum(1 for at in state.activity.get(endpoint, []) if parse_time(at) >= limit)
-        require(recent < RATE_LIMIT_ACTIONS, "rate limit: this endpoint has posted %d times in %d seconds; wait before posting again"
-                % (recent, RATE_WINDOW_SECONDS))
+        require(recent < RATE_LIMIT_ACTIONS, reason="rate_limited")
 
     @board_operation(write=True)
     def publish(self, endpoint, arguments):

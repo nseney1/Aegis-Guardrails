@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from aegis_core import hosts
+from aegis_core import hosts, team_isolation
 
 
 IMAGE = "localhost/aegis-teams@sha256:" + "a" * 64
@@ -916,3 +916,65 @@ def test_direct_duplicate_same_access_rows_keep_their_refusal(core):
     row = dict(source="/source", destination="/source", rw=False)
     with pytest.raises(core.IsolationRefusal, match="^mount_rows$"):
         core.mount_rows([row, dict(row)])
+
+
+def test_verify_uses_new_registry_owner_folder_for_expected_mounts(core, verifier):
+    context = verification_context()
+    registry = {**TABLE, "fixture": {"home": {"variable": "FIXTURE_STATE", "run_folder": "fixture-state",
+                                             "owner_folder": ".fixturestate"}}}
+    credential = "/owner/.fixturestate"
+    observed = facts("/work/run", "/work/project", "/source", "/venv", "/owner", credential)
+    context.update(host_table=registry, observed=observed)
+    image = [{"Id": "sha256:" + "b" * 64, "RepoDigests": [IMAGE], "Config": {"Env": []}}]
+    options = dict(run="/work/run", image_inspect=image, cpu_count=4, platform="linux", uid=1000, gid=1000)
+    wanted = verifier.expected_plan(ISOLATION, mounts=plan(core), **options, **context)
+    forbidden = [dict(source=credential, destination=credential, rw=False)]
+    with pytest.raises(core.IsolationRefusal, match="^unsafe_mount$"):
+        verifier.expected_plan(ISOLATION, mounts=forbidden, **options, **context)
+    assert verifier.verify({}, dict(wanted, mounts=forbidden), **context) == ["mounts"]
+
+
+@pytest.mark.parametrize("rw", [False, True], ids=["read-only", "writable"])
+@pytest.mark.parametrize("root", [
+    ".aws", ".claude", ".claude.json", ".codeium", ".codex", ".config", ".copilot", ".cursor",
+    ".docker", ".gemini", ".git-credentials", ".gnupg", ".kiro", ".kube", ".local", ".netrc", ".ssh",
+])
+def test_baseline_credential_roots_apply_without_registry_owner_folders(core, verifier, root, rw):
+    # TABLE intentionally omits owner_folder. The host catalogue supplies only the test oracle.
+    path = "/owner/" + root
+    observed = facts("/work/run", "/work/project", "/source", "/venv", "/owner", path)
+    if root in (".claude.json", ".git-credentials", ".netrc"):
+        observed[path]["mode"] = observed[path]["after"]["mode"] = stat.S_IFREG | 0o600
+    context = dict(home="/owner", owner_homes=verification_context()["owner_homes"],
+                   observed=observed, owner_uid=1000)
+    protected_names = core.host_policy(TABLE).protected_names
+    rows = [dict(source=path, destination=path, rw=rw)]
+    changes = {"project" if rw else "source": path}
+    with pytest.raises(core.IsolationRefusal, match="^unsafe_mount$"):
+        plan(core, protected_names=protected_names, **context, **changes)
+    with pytest.raises(core.IsolationRefusal, match="^unsafe_mount$"):
+        team_isolation.create_argv(ISOLATION, run="/work/run", mounts=rows, host_table=TABLE,
+                                   cpu_count=4, platform="linux", uid=1000, gid=1000, **context)
+    image = [{"Id": "sha256:" + "b" * 64, "RepoDigests": [IMAGE], "Config": {"Env": []}}]
+    options = dict(run="/work/run", image_inspect=image, cpu_count=4, platform="linux", uid=1000, gid=1000)
+    with pytest.raises(core.IsolationRefusal, match="^unsafe_mount$"):
+        verifier.expected_plan(ISOLATION, mounts=rows, host_table=TABLE, **options, **context)
+    wanted = verifier.expected_plan(ISOLATION, mounts=plan(core), host_table=TABLE, **options, **context)
+    actual = inspected(core, verifier, wanted)
+    assert verifier.verify(actual, dict(wanted, mounts=rows), host_table=TABLE, **context) == ["mounts"]
+    assert verifier.verify(actual, wanted, host_table=TABLE, **context) == []
+
+
+@pytest.mark.parametrize("mode", ["missing-root", "missing-observation", "invalid-name"])
+def test_incomplete_credential_metadata_refuses_mount_planning(core, mode):
+    names = core.secret_names()
+    observed = facts("/work/run", "/work/project", "/source", "/venv", "/owner")
+    if mode == "missing-root":
+        names = names - {".ssh"}
+    elif mode == "missing-observation":
+        del observed["/owner/.kiro"]
+    else:
+        names = names | {"../invalid"}
+    with pytest.raises(core.IsolationRefusal, match="^mount_metadata$"):
+        plan(core, protected_names=names, observed=observed)
+    assert plan(core)

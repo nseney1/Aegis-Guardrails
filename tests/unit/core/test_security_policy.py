@@ -132,6 +132,8 @@ SPAWN_SITES = {
     "aegis_core/verification/mutation_tester.py": ("`pytest`",),
     "aegis_core/inference_provider.py": ("your model command",),
     "aegis_core/team_supervisor_start.py": ("owner-configured component argv (absolute executable, cwd=/, no shell)",),
+    # Wake turns/control use a caller-selected profile under owner custody; liveness probes start ps.
+    "aegis_core/team_session_wake.py": ("wake profile and control argv",),
     # Install runs the aegis it is about to register once, on an empty payload, in an empty directory.
     "aegis_cli/hooks/registrar.py": ("`aegis`, the hook handler",),
     # `aegis benchmark` starts the same handler under this Python (-I -c) on a fixture payload, in a temp workspace.
@@ -147,6 +149,8 @@ SPAWN_SITES = {
     # `aegis doctor --release` asks `gh --version`, one read-only `gh api` GET of the repository for its
     # default branch, the tier GETs, then `gh attestation verify` (read-only).
     "aegis_core/release_verify.py": ("`gh`",),
+    "aegis_core/team_native_bridge.py": ("owner-configured evidence-only provider argv (absolute executable, no shell)",),
+    "aegis_cli/team_isolation.py": ("`podman`", "`docker`"),
 }
 _SPAWN_MODULES = {"subprocess", "pty", "multiprocessing"}
 _OS_SPAWN = re.compile(r"^(system|popen|startfile|exec\w*|spawn\w*|posix_spawn\w*)$")

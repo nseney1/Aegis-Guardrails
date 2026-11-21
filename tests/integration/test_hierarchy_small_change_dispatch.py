@@ -25,6 +25,70 @@ from tests.integration.test_hierarchy_small_change_admission import SmallChange
 ROUTER = ROOT / "tools/hierarchy_router.py"
 
 
+@pytest.mark.parametrize("damage", ["steady", "process-step", "missing-process", "missing-log", "extra-log",
+                                  "step-limit"])
+def test_argon_terminal_structure_is_checked_without_recipes(tmp_path, damage):
+    world = DispatchWorld(tmp_path)
+    folder = formal_completed_job(world)
+    assert json.loads((folder / "result.json").read_text())["process_stopped_confirmed"] is True
+    if damage == "process-step":
+        path = folder / "process.json"
+        record = json.loads(path.read_text())
+        record["step"] = 0
+        path.write_text(json.dumps(record))
+    elif damage == "missing-process":
+        (folder / "process.json").unlink()
+    elif damage == "step-limit":
+        from tools.hierarchy_jobs import MAX_STEPS
+        path = folder / "result.json"
+        result = json.loads(path.read_text())
+        result["steps"] = [result["steps"][0]] * (MAX_STEPS + 1)
+        path.write_text(json.dumps(result))
+        path = folder / "process.json"
+        record = json.loads(path.read_text())
+        record["step"] = len(result["steps"])
+        path.write_text(json.dumps(record))
+        r8_refresh_receipt(world, folder)
+    elif damage in {"missing-log", "extra-log"}:
+        if damage == "missing-log":
+            (folder / "step-1.log").unlink()
+        else:
+            (folder / "step-20.log").write_text("")
+        from tools.hierarchy_jobs import Job
+        job = Job(world.workspace.store, {"id": "engine"}, world.messages("job_request")[0]["message"])
+        receipt = next(row for row in world.messages("job_receipt")
+                       if row["message"]["receipt"]["state"] == "completed")
+        rewrite_message(receipt, lambda message: message["receipt"].update(evidence=job.evidence()))
+        r8_refresh_receipt(world, folder)
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    argv = [sys.executable, "-I", "-B", str(ROUTER), "--lifecycle", str(world.ledger.path),
+            "--store", str(world.workspace.store), "status", "--wait", "5"]
+
+    def probe():
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=40)
+        assert proc.returncode == 0 and not proc.stderr, proc.stdout + proc.stderr
+        row = json.loads(proc.stdout)["small_changes"][0]
+        if damage == "steady":
+            assert row["state"] == "review_ready", row
+        else:
+            assert (row["state"], row.get("reason")) == ("held", "small_change_receipt_invalid"), row
+            expected = ("completed job step count exceeds retained limit" if damage == "step-limit" else
+                        "completed job process step differs from retained result"
+                        if damage in {"process-step", "missing-process"}
+                        else "completed job log artifacts differ from retained result")
+            assert row["detail"] == expected, row
+
+    probe()
+    assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+    probe()
+    assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for future in [pool.submit(probe), pool.submit(probe)]:
+            future.result(timeout=60)
+    assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+
+
 @pytest.mark.parametrize("planned", [False,True])
 def test_round13_row_target_error_retains_its_baseline_hold(tmp_path,planned):
     from tests.integration.test_hierarchy_fresh_brief import r13_consumer_probe,R13_CONSUMER_GOLDENS

@@ -361,7 +361,7 @@ def test_injected_route_policy_and_history_count_refuse_without_writes(tmp_path,
     policy = replace(ROLES, vertical_routes=())
     with mailbox(root, roles=policy) as restricted:
         before = snapshot(root)
-        with refusal("invalid_record"):
+        with refusal("scope"):
             restricted.publish(request("third"))
         assert snapshot(root) == before
     with mailbox(root) as normal:
@@ -491,6 +491,104 @@ def test_unexpected_hidden_entries_are_ambiguous(tmp_path, area):
             call()
         bad.unlink()
         call()
+
+
+@pytest.mark.parametrize("name,area", [
+    (".pending-root-id", "root"),
+    (".pending-grants", "records"),
+    (".pending-stub", "message"),
+    (".pending-stub", "across"),
+    (".pending-" + "a" * 32, "message"),
+])
+def test_legacy_pending_names_mid_write_parity_and_retry(tmp_path, name, area):
+    from aegis_core.team_mailbox_index import Index
+    from tools.hierarchy_mailbox_index import MailboxIndex
+
+    root, box = populated(tmp_path)
+    folders = {"root": root, "records": root.parent / "mailbox-records",
+               "message": root / "alpha" / "orchestrator", "across": root / "across" / "orchestrator"}
+    folder = folders[area]
+    folder.mkdir(exist_ok=True)
+    with box:
+        box.publish(request())
+        expected = box.messages()
+        indexed = Index(box, mode="indexed")
+        shadow = Index(box)
+        old = legacy.Mailbox(root)
+        old_index = MailboxIndex(old, mode="indexed")
+        pending = folder / name
+        with pending.open("wb") as stream:
+            stream.write(b"\xff incomplete staging bytes")
+            stream.flush()
+            before = snapshot(root.parent)
+            # Keep the writer's stage open while independent readers inspect it.
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                reads = [pool.submit(reader.messages) for reader in (box, indexed, shadow)]
+                assert [read.result(timeout=10) for read in reads] == [expected] * 3
+            assert old.messages() == old_index.messages() == expected
+            with refusal("invalid_record"):
+                box.publish(request())
+            assert snapshot(root.parent) == before
+        pending.unlink()
+        assert indexed.messages() == shadow.messages() == box.messages() == expected
+        assert indexed.verify() == []
+
+
+@pytest.mark.parametrize("name,area", [
+    (name, area)
+    for name in (".pending-root-id", ".pending-grants", ".pending-stub",
+                 ".pending-x", ".pending-" + "A" * 32, ".pending-stub.md")
+    for area in ("binding", "message", "across")
+    if name != ".pending-stub" or area == "binding"
+])
+def test_legacy_pending_names_wrong_folder_refuses_then_retries(tmp_path, name, area):
+    from aegis_core.team_mailbox_index import Index
+
+    root, box = populated(tmp_path)
+    with box:
+        box.publish(request())
+        indexed = Index(box, mode="indexed")
+        expected = box.messages()
+        assert indexed.messages() == expected
+        if area == "binding":
+            folder = root / "bindings" / "alpha" / "front-door"
+            reads = [lambda: box.bindings("alpha/front-door")]
+        else:
+            folder = root / ("alpha" if area == "message" else "across") / "orchestrator"
+            reads = [box.messages, indexed.messages]
+        bad = folder / name
+        bad.write_bytes(b"\xff incomplete staging bytes")
+        before = snapshot(root.parent)
+        for read in reads:
+            with refusal("invalid_record"):
+                read()
+            assert snapshot(root.parent) == before
+        bad.unlink()
+        assert len(box.bindings("alpha/front-door")) == 1
+        assert indexed.messages() == box.messages() == expected
+        assert indexed.verify() == []
+
+
+@pytest.mark.parametrize("name,allowed", [
+    (".pending-root-id", {"root"}),
+    (".pending-grants", {"records"}),
+    (".pending-stub", {"message", "across"}),
+    (".pending-" + "a" * 32, {"root", "records", "message", "across", "binding", "other"}),
+    (".pending-x", set()),
+    (".pending-stub.md", set()),
+    (".pending-root-id-extra", set()),
+    (".pending-grants-extra", set()),
+])
+def test_pending_entry_exact_folder_contract(tmp_path, name, allowed):
+    from aegis_core.team_mailbox_index_scan import pending_entry
+
+    root = tmp_path / "mail"
+    folders = {"root": root, "records": tmp_path / "mailbox-records",
+               "message": root / "alpha" / "orchestrator", "across": root / "across" / "orchestrator",
+               "binding": root / "bindings" / "alpha" / "front-door", "other": tmp_path / "other"}
+    message_folders = {folders["message"], folders["across"]}
+    for area, folder in folders.items():
+        assert pending_entry(folder / name, root, message_folders=message_folders) is (area in allowed)
 
 
 def test_sizes_refused_before_open_or_parse_and_then_retry(tmp_path, monkeypatch):
@@ -889,7 +987,7 @@ def test_binding_history_read_once_per_operation_then_fresh_retry(tmp_path, monk
 
         before = snapshot(root)
         if surface == "fence":
-            with refusal("invalid_record"):
+            with refusal("binding"):
                 observe()
         else:
             assert observe()["ready"] is False
@@ -3809,11 +3907,17 @@ REFUSAL_WIRE_SHA256 = {
     "invalid_record": "812a3301d93ed1483f1e32a9e135b5b9357be08b36e43269056e5f9bdc9fa8fc",
     "io": "362d95e88b1318c552365089907c0b06b94002a33ed217c1dc1b91b340a9b514",
     "missing": "f1f226b61b310b03d6f417806a32ee988ccf395efd81ec21f6faf90a473aab34",
+    "rate_limited": "a80a4dc94e6e1f4f53ded7cd2a4645f6012bdd19af3b667c260bd89074f10faf",
     "too_large": "36b641b57a1719462f7c0227fd7fc04c5469349becf14c4cee47d17d4acfff58",
     "unauthorized": "d86ec41d7d0ebf227580d90ab099450b9e03317cc953b797d66ac5948c340104",
     "unknown_host": "d114db378f4f63dcc37d33c9cadbec8554e71d1e23f3af4d8d23b87cca563c7d",
     "unsafe_path": "e0d692d29d99687b605815236109bb78aa9c83f1a63c3c930f993e64ac3378a9",
     "unsupported_platform": "7b81f3db77b03e445c96a5e5c6436185a23d000468222ed546338d80286f864d",
+    # The four Records parity reasons extend the existing byte assertions.
+    "scope": "575cbf2192afb4b8bf96d747caf1221b5c81a8980e00d5b97002eb39fab3f613",
+    "binding": "900c500f2f710e6dba5b9c0efe99928ddcb2e045d424648a7328f22d2827943b",
+    "reference": "2cd7142791bf99fb66dcfb9dc1a91ab5cb46778a387a96d8352b16b4ee451932",
+    "history": "d1e12b3f445e4d1f768cf49eeff68c25de3c9b8ce374c72804e7d23f93ed055f",
 }
 REFUSAL_ROUTES = ["constructor", "stored_constructor", "reflected_constructor",
                   "require", "stored_require", "reflected_require", "subclass"]

@@ -73,6 +73,30 @@ def report(raw, vocabulary=VOCAB, hosts=HOSTS):
     return cap.capability_report(raw, vocabulary=vocabulary, hosts=hosts)
 
 
+@pytest.mark.parametrize("mutation", ['result["code"] = "typo"', 'result.update(code="typo")'],
+                         ids=["subscript", "update"])
+@pytest.mark.parametrize("status", ["unknown", "planned"])
+def test_probe_refuses_unregistered_producer_codes(mutation, status):
+    path = Path(cap.__file__)
+    source = path.read_text(encoding="utf-8")
+    original = 'return {"status": "unknown", "code": "invalid_probe_plan", "attempts": []}'
+    assert source.count(original) == 1
+    seed_code = "invalid_probe_plan" if status == "unknown" else "planned"
+    result = dict(status=status, code=seed_code, attempts=["untrusted diagnostic"])
+    replacement = f"result = {result!r}\n    {mutation}\n    return result"
+    # Rebind the real public entry point in a test-owned namespace.
+    namespace = dict(vars(cap))
+    exec(compile(source.replace(original, replacement), str(path), "exec"), namespace)
+    options = dict(vocabulary=VOCAB, host_capabilities={}, mcp_tools=[], prohibited_tool="shell",
+                   prohibited_mcp="mcp:fixture/status", write_roots=[], outside_path=None,
+                   edit_path=None, canary_path=None)
+    assert namespace["probe_plan"](None, None, **options) == {
+        "status": "refused", "code": "internal",
+        "next_action": {"actor": "operator", "command": "Report an internal isolation check failure."},
+    }
+    assert cap.probe_plan(None, None, **options)["code"] == "invalid_probe_plan"
+
+
 def _boom(*_args, **_kwargs):
     raise AssertionError("untrusted input was decoded or parsed")
 

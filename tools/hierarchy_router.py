@@ -1,37 +1,25 @@
 #!/usr/bin/env python3
 """Route ROOT-approved canonical requests from the lifecycle journal to the team's orchestrator.
 
-The Router routes and reports; it never approves or executes. This code is the model-free half: it reads
-the journal, finds authority requests whose last ROOT decision is an unexpired approve and that have not
-been routed, and delivers each to `<team>/orchestrator` in that team's mailbox. The Router role session is
-the voice: it reads `status` and tells ROOT about anything held, and about each request the team
-Decider escalated (option A: the Decider's `delegated_decision` approves only inside a delegation).
-
-The team registry is the workspace initiative ledger. A request's `team` names an active initiative, and
-that initiative's `mailbox_root` holds the team's endpoints. The message goes out under the current
-binding of `<team>/router`, borrowed the way the job runner borrows ROOT's, so the item-2 fence applies.
-
-Deduplication is by request hash. The message ID and the journal event ID are both `route-<sha256>`, so a
-second run finds the earlier message and records nothing new, and a run that delivered but lost its journal
-write is finished by the next run without a second message, even after a deny or an expiry. Before sending,
-the route event is replayed on a copy of the journal state, so a delivery the journal would refuse to record
-is never sent. A routed request is never routed again, even if ROOT later denies it; status reports that as
-`revoked_after_route` for the Router to raise.
-
-The journal accepts a `route` event from the router actor without checking approval. This code is where
-that check lives at this tier. The router actor and the borrowed binding are configuration, not
-authenticated identities, so mutation needs --evidence-only, as the journal's own CLI does.
+The workspace ledger supplies the team's mailbox. The router checks live approval
+and previews journal acceptance before publication through its configured binding.
+Delivery and journal IDs derive from the request hash, so a later pass can record
+a delivery whose journal write was lost, even after revocation. Mutation requires
+--evidence-only because actor and binding identities are configured.
 """
 from __future__ import annotations
 
 import argparse
 import copy
+from collections import OrderedDict
 from contextlib import contextmanager
 from functools import wraps
 import os
 import stat
 import sys
 import threading
+from threading import Lock
+from types import SimpleNamespace
 import time
 from pathlib import Path, PurePath, PureWindowsPath
 
@@ -39,7 +27,8 @@ sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hierarchy_lifecycle import MAX_EVENTS, Lifecycle, reduce_event  # noqa: E402
-from hierarchy_mailbox import (Mailbox, cli_path, digest, encoded, matching, parse_time, require, SLUG,  # noqa: E402
+from hierarchy_mailbox_index import MailboxIndex  # noqa: E402
+from hierarchy_mailbox import (MAX_BYTES, Mailbox, cli_path, digest, encoded, matching, parse_time, require, SLUG,  # noqa: E402
                                timestamp)
 from hierarchy_workspace import Store  # noqa: E402
 import hierarchy_hosts  # noqa: E402
@@ -501,12 +490,115 @@ def expected_message(team, key, raw):
     return {"from": team + "/router", "to": team + "/orchestrator", "type": "info", "body": route_body(key, raw)}
 
 
-def prior_delivery(mailbox, team, key, raw):
-    """'same' if this request's route ID already names this exact delivery, 'conflict' if it names anything else.
+def shadow_descriptor_supported():
+    from hierarchy_fresh_brief import _reference_descriptors
+    return _reference_descriptors() and os.scandir in os.supports_fd
 
-    A stable ID alone is not this delivery. A successor router binding may have sent the original, so the
-    sender's binding fields are not compared."""
-    prior = mailbox.messages().get(route_id(raw["sha256"]))
+
+def _shadow_mailbox(mailbox):
+    from hierarchy_fresh_brief import _CapturedMailbox, _Operation, _read_reference
+    require(shadow_descriptor_supported(), "shadow descriptor reads unavailable")
+    operation = _Operation(_path_guard=_operation_guard())
+    guard = operation.path_guard
+    authority = _CapturedMailbox(mailbox.root, _operation=operation)
+    authority.shadow_io = SimpleNamespace(
+        lstat=lambda path: (guard.check(path) or (None,))[0],
+        names=lambda path: operation._directory_members(path)[1],
+        read=lambda path: _read_reference(path, limit=MAX_BYTES, capture=True, _guard=guard)[1],
+    )
+    return authority
+
+
+class _MailboxReader:
+    """Capture pinned history and collect diagnostics for an explicit shadow read."""
+    mode = property(lambda self: "shadow")
+
+    def __init__(self, mailbox):
+        self._mailbox = mailbox
+        self._reader_lock = threading.RLock()
+        self._index = self._shadow = self._index_lock = None
+        self._diagnostics = ([], None, [])
+
+    def _observe(self, history, read_index):
+        # _read holds _reader_lock throughout this comparison.
+        try:
+            if self._index_lock is None:
+                self._index_lock = Lock()
+            operation = getattr(self._mailbox, "operation", None)
+            guard = operation.path_guard if operation is not None else _operation_guard()
+            with self._index_lock, copy.copy(guard).active():
+                if self._shadow is None:
+                    self._shadow = _shadow_mailbox(self._mailbox)
+                authority = self._shadow
+                authority.messages = lambda: dict(history)
+                try:
+                    if self._index is None:
+                        self._index = MailboxIndex(authority, mode="shadow")
+                    index = self._index
+                    read_index(index)
+                    divergence = index.last_divergence
+                    self._diagnostics = copy.deepcopy((divergence, index.last_reconciliation, index.content_changed))
+                finally:
+                    del authority.messages
+                if divergence:
+                    self._index = self._shadow = None
+        except BaseException:
+            self._diagnostics = ([{"kind": "mailbox_index_error", "text": "shadow index read failed"}], None, [])
+            self._index = self._shadow = self._index_lock = None
+
+    def _read(self, read_pinned, read_index):
+        with self._reader_lock:
+            self._diagnostics = ([], None, [])
+            history = self._mailbox.messages()
+            pinned = read_pinned(history)
+            self._observe(history, read_index)
+            return pinned
+
+    def messages(self):
+        return self._read(lambda history: history, lambda index: index.messages())
+
+    def get(self, message_id):
+        return self._read(lambda history: history.get(message_id), lambda index: index.get(message_id))
+
+    @property
+    def last_divergence(self):
+        with self._reader_lock:
+            return copy.deepcopy(self._diagnostics[0])
+
+    @property
+    def last_reconciliation(self):
+        with self._reader_lock:
+            return copy.deepcopy(self._diagnostics[1])
+
+    @property
+    def content_changed(self):
+        with self._reader_lock:
+            return copy.deepcopy(self._diagnostics[2])
+
+
+_MAILBOX_READERS = OrderedDict()
+_MAILBOX_READERS_LOCK = Lock()
+_MAILBOX_READER_CACHE_LIMIT = 16
+
+
+def mailbox_reader(mailbox):
+    """Return the explicit shadow facade for this exact Mailbox authority."""
+    key = (mailbox.root, os.getpid(), id(mailbox))
+    with _MAILBOX_READERS_LOCK:
+        reader = _MAILBOX_READERS.get(key)
+        if reader is None:
+            if len(_MAILBOX_READERS) >= _MAILBOX_READER_CACHE_LIMIT:
+                _MAILBOX_READERS.popitem(last=False)
+            reader = _MailboxReader(mailbox)
+            _MAILBOX_READERS[key] = reader
+        _MAILBOX_READERS.move_to_end(key)
+        return reader
+
+
+def prior_delivery(mailbox, team, key, raw):
+    """Classify the pinned route ID, ignoring the sender's binding generation."""
+    identifier = route_id(raw["sha256"])
+    prior = mailbox.messages().get(identifier)
     if prior is None:
         return None
     expected = expected_message(team, key, raw)
@@ -700,11 +792,7 @@ def journal_accepts(policy, state, envelope):
 
 @_request_context
 def deliver(lifecycle, ledger, actor, key, wait):
-    """Deliver one request, or finish one whose journal write was lost, and record the route.
-
-    Lock order is mailbox, then journal, as ROOT's adapter takes them. The journal lock is not held from
-    the check to the record, so a ROOT deny can land between them; the route is then recorded and status
-    shows it as revoked_after_route, the same as a deny that comes later."""
+    """Publish and record under mailbox-then-journal lock order."""
     from hierarchy_fresh_brief import _CapturedLifecycle, _CommittedEvent, _Operation
     try:
         if not isinstance(lifecycle, _CapturedLifecycle):

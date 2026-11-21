@@ -656,8 +656,8 @@ def load_state(user_root=None):
                 raise SupervisorError(
                     "user profile directory must be owned by the current user and not group/other-writable",
                     layer="user")
-            # Held parent descriptor: a path reopen would race a leaf swap.
-            data = read_owned_leaf(handle._parent, STATE_NAME)
+            # Borrowed parent_fd: a path reopen would race a leaf swap.
+            data = read_owned_leaf(handle.parent_fd, STATE_NAME)
             if data is None:
                 return empty_state()
             return _parse_state(data)
@@ -684,7 +684,7 @@ def store_state(state, user_root=None):
                 raise SupervisorError(
                     "user profile directory must be owned by the current user and not group/other-writable",
                     layer="user")
-            _refuse_foreign_leaf(handle._parent, STATE_NAME)
+            _refuse_foreign_leaf(handle.parent_fd, STATE_NAME)
             handle.publish_bytes(data, replace=True, mode=0o600)
     except (storage_confined.ConfinedFileError, OSError):
         raise SupervisorError(_STATE_REASON, layer="state") from None

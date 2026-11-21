@@ -83,6 +83,11 @@ _NEXT = {
     "exists": "Read the current history before retrying with a new identifier.",
     "closed": "Open a new mailbox context.",
     "invalid_record": "Reconcile the input and stored history against the mailbox schema.",
+    "rate_limited": "Wait for the rate window to pass before retrying the post or disposition.",
+    "scope": "choose a permitted route and message role for this endpoint",
+    "binding": "refresh the connection from the current acknowledged endpoint binding",
+    "reference": "Use a validated existing message or record reference.",
+    "history": "ask the owner to resolve the mailbox history limit",
     "io": "Check storage availability and read current history before retrying.",
 }
 
@@ -465,8 +470,9 @@ def safe_path(value):
     return path
 
 
-def bounded_tree(value, *, limit=MAX_BYTES, ascii_strings=False):
+def bounded_tree(value, *, limit=MAX_BYTES, ascii_strings=False, source_bytes=False):
     """Budget JSON-shaped values before serialization; reject cycles and depth."""
+    require(type(source_bytes) is bool)
     budget = [limit, 0]
 
     def visit(item, depth):
@@ -486,7 +492,7 @@ def bounded_tree(value, *, limit=MAX_BYTES, ascii_strings=False):
             else:
                 for char in item:
                     code = ord(char)
-                    require(not 0xD800 <= code <= 0xDFFF)
+                    require(source_bytes or not 0xD800 <= code <= 0xDFFF)
                     if ascii_strings:
                         cost = (2 if char in ('"', "\\", "\b", "\f", "\n", "\r", "\t")
                                 else 6 if code < 32 or 127 <= code <= 65535
@@ -511,9 +517,10 @@ def bounded_tree(value, *, limit=MAX_BYTES, ascii_strings=False):
                     visit(key, depth + 1)
         elif item is None or type(item) in (bool, int, float):
             require(type(item) is not int or item.bit_length() <= 64)
-            require(type(item) is not float or math.isfinite(item))
+            require(source_bytes or type(item) is not float or math.isfinite(item))
             # Scalars are bounded above before this small representation allocation.
-            budget[0] -= len(repr(item))
+            if not source_bytes or type(item) not in (int, float):
+                budget[0] -= len(repr(item))
         else:
             require(False)
         require(budget[0] >= 0, reason="too_large")
@@ -521,13 +528,23 @@ def bounded_tree(value, *, limit=MAX_BYTES, ascii_strings=False):
     visit(value, 0)
 
 
-def strict_json(raw):
+def strict_json(raw, *, limit=MAX_BYTES, max_atom=64, source_bytes=False):
     require(type(raw) in (str, bytes))
-    require(len(raw) <= MAX_BYTES, reason="too_large")
+    require(type(limit) is int and limit >= 0)
+    require(type(max_atom) is int and max_atom > 0 and type(source_bytes) is bool)
+    require(len(raw) <= limit, reason="too_large")
     try:
-        checked = json_preflight(raw, max_bytes=MAX_BYTES, max_depth=MAX_JSON_DEPTH,
+        preflight = raw
+        if source_bytes and type(raw) is str:
+            # Count original UTF-8/surrogatepass width before allocating a copy.
+            # The two extra bytes are bounded_tree's surrounding string quotes.
+            bounded_tree(raw, limit=limit + 2, source_bytes=True)
+            # U+FFFD has the same width and JSON lexical role as a surrogate.
+            # Only preflight sees it; parsing retains the original legacy text.
+            preflight = re.sub("[\ud800-\udfff]", "\ufffd", raw)
+        checked = json_preflight(preflight, max_bytes=limit, max_depth=MAX_JSON_DEPTH,
                                  max_nodes=MAX_JSON_NODES, max_items=MAX_JSON_ITEMS,
-                                 max_string=MAX_BYTES, max_atom=64)
+                                 max_string=limit, max_atom=max_atom)
         def pairs(items):
             result = {}
             for key, value in items:
@@ -536,8 +553,19 @@ def strict_json(raw):
             return result
         def nonfinite(value):
             raise MailboxRefusal("invalid_record")
-        result = json.loads(checked, object_pairs_hook=pairs, parse_constant=nonfinite)
-        bounded_tree(result)
+        def bounded_integer(value):
+            # A raw-byte policy may admit long float atoms, never giant ints.
+            require(len(value) <= 21)
+            digits = value.lstrip("-")
+            require(len(digits) < 20 or len(digits) == 20 and digits <= "18446744073709551615")
+            return int(value)
+        if not source_bytes:
+            result = json.loads(checked, object_pairs_hook=pairs, parse_constant=nonfinite)
+        else:
+            source = raw if type(raw) is str else checked
+            result = json.loads(source, object_pairs_hook=pairs, parse_constant=nonfinite,
+                                parse_int=bounded_integer)
+        bounded_tree(result, limit=limit, source_bytes=source_bytes)
         return result
     except MailboxRefusal as error:
         render_mailbox_refusal(error, reraise=True)
@@ -593,13 +621,14 @@ def reply_reference(message, records):
     require(type(message) is dict and type(records) is dict)
     identifier = text(message.get("in_reply_to"), "referenced message", 256)
     reference = records.get(identifier)
+    require(reference is not None, reason="reference")
     reference = result_payload(reference)
     require(type(reference.get("message")) is dict)
     original = reference["message"]
     for left, right in (("from", "to"), ("to", "from")):
         text(message.get(left), "reply endpoint", 256)
         text(original.get(right), "original endpoint", 256)
-        require(message[left] == original[right])
+        require(message[left] == original[right], reason="scope")
     return original
 
 

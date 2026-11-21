@@ -45,7 +45,28 @@ sdist; no additional manifest directive is needed. Read installed trusted assets
 with `importlib.resources.files("aegis_core.team_templates").joinpath(...)` using
 fixed resource names. Python 3.9 supports this API. User paths must never become
 resource names. Do not resolve templates relative to the working directory or
-import from an editable checkout at runtime.
+import from an editable checkout at runtime. `.github/scripts/verify_dist.py`
+uses one admission rule for wheel members and sdist members beneath their one
+validated root. Every component must match one portable grammar (ASCII letters,
+digits, and `._+-`, or an NFKC-stable letter), must not be a Windows device name
+(`CON`, `NUL`, `AUX`, `PRN`, `COM1`–`COM9`, `LPT1`–`LPT9`) in any case or with
+any extension. One protected-prefix table lists `aegis_core/ast/drivers/templates`,
+`aegis_core/team_templates`, `aegis_core/_data`, the package roots (`aegis_core`,
+`aegis_cli`, `aegis_mcp`, `aegis_sdk`) and the forbidden directories. That table
+supplies both the canonical spelling of every component after NFC and casefold
+and the case-folded location match checked before generic package `.py`
+admission, so a noncanonical spelling of `ast`, `drivers` or `templates` is
+refused. A second member whose case-folded
+destination collides with an admitted member is refused in both formats. Template
+files under `aegis_core/team_templates/` must have regular-file metadata, one
+unchanged normalized relative POSIX name with no trailing space or dot in any
+component, no ZIP Unicode Path extra record, no `_data` component, a `.json`,
+`.md` or `.py` suffix, and no execute bit. Directory entries must have consistent
+metadata, zero bytes and an admitted descendant. The verifier refuses special
+members, traversal, `__pycache__`, bytecode and forbidden suffixes before
+admission. Both record and verify admit `dist/` only when it holds exactly one
+regular wheel and one regular sdist: a directory, symlink, dot-prefixed extra
+archive, or any other name matching either suffix in any case is refused.
 
 The namespace is empty until TA-4 moves the templates. Its installation does not
 make legacy tooling available. Each future family package must be added to the
