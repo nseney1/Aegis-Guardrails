@@ -7,20 +7,23 @@ not authority to use a later pathname: the adapter must reobserve before executi
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
 from pathlib import PurePosixPath as Path
 import re
 import stat
 
-from aegis_core import hosts
+from aegis_core import team_host_registry
 from aegis_core.primitives import json_preflight, strict_loads
+from aegis_core.team_isolation_refusal import REFUSALS, IsolationRefusal
 
 __all__ = [
-    "IsolationRefusal", "MAX_DOCUMENT_BYTES", "LINUX_ID_LIMIT", "NETWORK_MODE", "DEFAULT_PATH",
+    "IsolationRefusal", "REFUSALS", "MAX_DOCUMENT_BYTES", "LINUX_ID_LIMIT", "NETWORK_MODE", "DEFAULT_PATH",
     "BASE_ENV_ALLOWLIST", "ENGINE_ENV_KEYS", "ENV_NAME", "ISOLATION_FIELDS", "require", "bounded_value",
     "load_document", "container_supported", "engine", "image", "cpus_limit", "memory_bytes", "pids_limit",
     "read_isolation", "load_isolation", "absolute_path", "inside", "system_mount", "mount_rows",
-    "home_folders", "container_env", "metadata", "foreign_write", "aliases_overlap", "secret_names",
+    "host_policy", "home_folders", "container_env", "metadata", "foreign_write", "aliases_overlap", "secret_names",
+    "credential_names",
     "ABSENCE", "inside_alias", "link_target", "resolved_path", "path_identities", "validated_owner_homes",
     "protected_roots", "validate_mounts", "mount_plan",
 ]
@@ -34,22 +37,15 @@ BASE_ENV_ALLOWLIST = frozenset(("PATH", "LANG", "LC_ALL", "TERM", "TZ", "PYTHOND
 ENGINE_ENV_KEYS = frozenset(("container", "HOSTNAME", "HOME", "TERM", "PWD"))
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 ISOLATION_FIELDS = frozenset(("mode", "engine", "image", "cpus", "memory", "pids", "allow_unqualified"))
-SECRET_NAMES = frozenset((".ssh", ".gnupg", ".config", ".aws", ".kube", ".docker", ".netrc", ".git-credentials"))
+# These built-in roots remain required even when an injected host table omits owner folders.
+_CLAUDE_OWNER_DIR = team_host_registry.entry(team_host_registry.CLAUDE)["home"]["owner_folder"]
+_CODEX_OWNER_DIR = team_host_registry.entry(team_host_registry.CODEX)["home"]["owner_folder"]
+SECRET_NAMES = frozenset((".ssh", ".gnupg", ".config", ".aws", ".kube", ".docker", ".netrc", ".git-credentials",
+                          ".codeium", ".copilot", ".cursor", ".gemini", ".kiro",
+                          _CLAUDE_OWNER_DIR, _CLAUDE_OWNER_DIR + ".json", _CODEX_OWNER_DIR))
 SYSTEM_TREES = tuple(Path(p) for p in
                      ("/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/usr", "/etc", "/boot",
                       "/proc", "/sys", "/run", "/dev", "/var", "/opt", "/tmp"))
-
-
-class IsolationRefusal(ValueError):
-    """Fixed, non-echoing operational refusal for the CLI/MCP adapters."""
-
-    status = "refused"
-    exit_code = 1
-    next_action = "Supply validated isolation data and fresh trusted observations."
-
-    def __init__(self, reason):
-        self.reason = reason
-        super().__init__(reason)
 
 
 def require(condition, reason):
@@ -106,7 +102,7 @@ def container_supported(platform):
 
 
 def engine(value):
-    require(value in ("podman", "docker"), "isolation_engine")
+    require(type(value) is str and value in ("podman", "docker"), "isolation_engine")
     return value
 
 
@@ -201,19 +197,44 @@ def mount_rows(mounts):
     return sorted(rows, key=lambda row: row["source"])
 
 
-def home_folders(host_table):
+@dataclass(frozen=True)
+class _HostPolicy:
+    homes: tuple
+    protected_names: frozenset
+
+
+def _credential_name(value):
+    return (type(value) is str and 0 < len(value) <= 128 and value not in (".", "..", ".local")
+            and re.fullmatch(r"[A-Za-z0-9._-]+", value) is not None)
+
+
+def host_policy(host_table):
+    """Project the injected registry into a single immutable isolation policy."""
+    if type(host_table) is _HostPolicy:
+        credential_names(host_table.protected_names)
+        return host_table
     bounded_value(host_table)
     require(type(host_table) is dict and 0 < len(host_table) <= 64, "host_registry")
     folders = {"HOME": "home"}
+    protected = set(SECRET_NAMES)
     for row in host_table.values():
         require(type(row) is dict and type(row.get("home")) is dict, "host_registry")
-        variable, folder = row["home"].get("variable"), row["home"].get("run_folder")
+        home = row["home"]
+        variable, folder = home.get("variable"), home.get("run_folder")
         require(type(variable) is str and len(variable) <= 128 and ENV_NAME.fullmatch(variable), "host_registry")
         require(type(folder) is str and len(folder) <= 128 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", folder)
                 and folder not in folders.values() and variable not in BASE_ENV_ALLOWLIST | ENGINE_ENV_KEYS
                 and variable not in folders, "host_registry")
         folders[variable] = folder
-    return folders
+        if "owner_folder" in home:
+            owner = home["owner_folder"]
+            require(_credential_name(owner), "host_registry")
+            protected.add(owner)
+    return _HostPolicy(tuple(folders.items()), frozenset(protected))
+
+
+def home_folders(host_table):
+    return dict(host_policy(host_table).homes)
 
 
 def container_env(run, env=None, *, host_table):
@@ -298,8 +319,21 @@ def aliases_overlap(left, right, identities):
 
 
 def secret_names():
-    return SECRET_NAMES | {part[2:].split("/")[0].casefold() for host in hosts.HOSTS for part in host.config_paths
-                           if part.startswith("~/")}
+    """Default exclusions for standalone mount APIs that predate injected Teams policy."""
+    table = {kind: team_host_registry.entry(kind) for kind in team_host_registry.TEAM_HOSTS}
+    return host_policy(table).protected_names
+
+
+def credential_names(protected_names=None):
+    """Require the complete baseline and bounded single-component additions."""
+    if protected_names is None:
+        return secret_names()
+    limit = len(SECRET_NAMES) + 64
+    require(type(protected_names) in (set, frozenset) and len(protected_names) <= limit, "mount_metadata")
+    names = frozenset(protected_names)
+    require(len(names) <= limit and SECRET_NAMES <= names
+            and all(_credential_name(name) for name in names), "mount_metadata")
+    return names
 
 
 def link_target(value):
@@ -382,8 +416,9 @@ def validated_owner_homes(home, owner_homes):
     return owners
 
 
-def protected_roots(owners, observed, identities):
+def protected_roots(owners, observed, identities, *, protected_names=None):
     """Preserve legacy home/local containment and symmetric secret exclusion."""
+    names = credential_names(protected_names)
     roots = []
     for supplied in owners:
         owner = resolved_path(supplied, observed)
@@ -391,7 +426,7 @@ def protected_roots(owners, observed, identities):
         roots.append((owner, "home"))
         if info is None or not stat.S_ISDIR(info["mode"]):
             continue
-        for name in sorted(secret_names() | {".local"}):
+        for name in sorted(names | {".local"}):
             path = owner / name
             entry = metadata(path, observed, directory=False, allow_absence=True)
             if entry is None:
@@ -402,7 +437,8 @@ def protected_roots(owners, observed, identities):
     return roots
 
 
-def validate_mounts(mounts, *, home, observed, owner_uid, private_gids=(), owner_homes=None):
+def validate_mounts(mounts, *, home, observed, owner_uid, private_gids=(), owner_homes=None,
+                    protected_names=None):
     bounded_value(observed)
     require(type(observed) is dict, "mount_metadata")
     require(type(owner_uid) is int and 0 <= owner_uid < LINUX_ID_LIMIT, "mount_metadata")
@@ -411,7 +447,7 @@ def validate_mounts(mounts, *, home, observed, owner_uid, private_gids=(), owner
     owners = validated_owner_homes(home, owner_homes)
     rows = mount_rows(mounts)
     checked = {}
-    protected = protected_roots(owners, observed, checked)
+    protected = protected_roots(owners, observed, checked, protected_names=protected_names)
     for row in rows:
         path = Path(row["source"])
         require(path.name != ".local" or all(path.parent != root for root, kind in protected if kind == "home"),
@@ -432,7 +468,7 @@ def validate_mounts(mounts, *, home, observed, owner_uid, private_gids=(), owner
 
 
 def mount_plan(*, run, project, source, python_prefix, live_checkouts=(), home, observed, owner_uid,
-               private_gids=(), owner_homes=None):
+               private_gids=(), owner_homes=None, protected_names=None):
     bounded_value(live_checkouts)
     require(type(live_checkouts) in (list, tuple) and len(live_checkouts) <= 124, "mount_rows")
     requested = [(run, True), (project, True), (source, False), (python_prefix, False)]
@@ -441,4 +477,4 @@ def mount_plan(*, run, project, source, python_prefix, live_checkouts=(), home, 
     require(len({path for path, _ in rows}) == len(rows), "mount_overlap")
     return validate_mounts([dict(source=p, destination=p, rw=rw) for p, rw in sorted(rows)],
                            home=home, observed=observed, owner_uid=owner_uid, private_gids=private_gids,
-                           owner_homes=owner_homes)
+                           owner_homes=owner_homes, protected_names=protected_names)
