@@ -1,6 +1,7 @@
 """Product records, typed refusals and legacy wire parity through public APIs."""
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
+import errno
 import hashlib
 import importlib
 import json
@@ -19,6 +20,7 @@ from tests.unit.core.test_team_mailbox import (
 )
 from aegis_core.team_mailbox_primitives import BusyError, MailboxRefusal, OWNER_EVIDENCE_LOCK
 from aegis_core import message_codec as codec
+from aegis_core import message_codec_store as codec_store
 from tools import hierarchy_mailbox as legacy_mailbox
 from aegis_core import team_mailbox as mailbox_module
 from aegis_core import team_mailbox_records as records_module
@@ -56,11 +58,322 @@ def test_publish_retry_read_digest_and_injected_clock(tmp_path):
         reader = records_module.Records(box, sender("alpha/orchestrator"))
         view = json.loads(reader.call("mailbox_read_record", {"message_id": "record"}))
         assert view["from"] == "alpha/front-door"
-        raw = json.loads((root.parent / "mailbox-records" / (first["id"] + ".json")).read_bytes())
+        rid = first["id"]
+        raw = json.loads((root.parent / "mailbox-records" / rid[:2] / (rid + ".json")).read_bytes())
         assert raw["meta"]["created_at"] == "2026-11-16T12:00:00.000000Z"
         digest = json.loads(reader.call("mailbox_digest", {}))
         assert digest["messages"][0]["record"] == view
         assert json.loads(reader.call("mailbox_digest", {"after_message_id": "record"}))["messages"] == []
+
+
+@pytest.mark.parametrize("failure,existing", [
+    ("stub-link", False), ("stub-link", True), ("payload-fdopen", False), ("payload-link-after", False),
+])
+def test_refused_publication_rolls_back_only_owned_payload(tmp_path, monkeypatch, failure, existing):
+    with service(tmp_path) as (root, _box, records):
+        directory = root.parent / "mailbox-records"
+        first = records.call(PUBLISH_RECORD, request("first")) if existing else None
+        if first is not None:
+            rid = first["id"]
+            payload = directory / rid[:2] / (rid + ".json")
+            original = payload.stat()
+        before = snapshot(root.parent)
+
+        def stub_link(source, target, *args, **kwargs):
+            if str(target).endswith(".md"):
+                raise OSError("injected stub link failure")
+            return os.link(source, target, *args, **kwargs)
+
+        def payload_fdopen(fd, mode, *args, **kwargs):
+            if mode == "wb":
+                raise OSError("injected payload fdopen failure")
+            return os.fdopen(fd, mode, *args, **kwargs)
+
+        def payload_link(source, target, *args, **kwargs):
+            os.link(source, target, *args, **kwargs)
+            raise OSError("injected failure after payload link")
+
+        if failure == "stub-link":
+            monkeypatch.setattr(records_module, "os", SimpleNamespace(**{**vars(os), "link": stub_link}))
+        elif failure == "payload-fdopen":
+            monkeypatch.setattr(codec_store, "os", SimpleNamespace(**{**vars(os), "fdopen": payload_fdopen}))
+        else:
+            monkeypatch.setattr(codec_store, "os", SimpleNamespace(**{**vars(os), "link": payload_link}))
+        try:
+            with pytest.raises(records_module.RecordRefusal) as caught:
+                records.call(PUBLISH_RECORD, request("retry"))
+            assert caught.value.reason == "E_AUTH"
+            assert "injected" not in json.dumps(caught.value.record_error)
+            assert snapshot(root.parent) == before
+            assert directory.exists() is existing
+        finally:
+            if failure == "stub-link":
+                monkeypatch.setattr(records_module, "os", os)
+            else:
+                monkeypatch.setattr(codec_store, "os", os)
+        sent = records.call(PUBLISH_RECORD, request("retry"))
+        assert records.call(PUBLISH_RECORD, request("retry")) == sent
+        if first is not None:
+            assert sent["id"] == first["id"]
+            assert os.path.samestat(payload.stat(), original)
+
+
+@pytest.mark.parametrize("publisher", ["core", "legacy"])
+def test_rf44_staging_cleanup_failure_retains_both_reservations(tmp_path, monkeypatch, publisher):
+    with service(tmp_path) as (root, _box, records):
+        directory = root.parent / "mailbox-records"
+        inner = directory / ".publish.lock"
+        outer = root.parent / ".records-store.lock"
+
+        def unlink(name, *args, **kwargs):
+            if name.startswith(".msg-"):
+                raise OSError("injected staging cleanup failure")
+            return os.unlink(name, *args, **kwargs)
+
+        monkeypatch.setattr(codec_store, "os", SimpleNamespace(**{**vars(os), "unlink": unlink}))
+        if publisher == "core":
+            with pytest.raises(records_module.RecordRefusal) as caught:
+                records.call(PUBLISH_RECORD, request())
+            assert caught.value.reason == "E_AUTH"
+            assert "injected" not in json.dumps(caught.value.record_error)
+        else:
+            result = legacy_call(root, sender(), PUBLISH_RECORD, request())
+            assert result["error"]["code"] == "E_AUTH"
+            assert "injected" not in json.dumps(result)
+        assert inner.is_file() and outer.is_file()
+        [staging] = list(directory.glob("*/.msg-*"))
+        [payload] = list(directory.glob("*/*.json"))
+        original = payload.read_bytes()
+        assert staging.read_bytes() == original
+        monkeypatch.setattr(codec_store, "os", os)
+        # Simulate the owner inspecting and clearing the abandoned reservation.
+        staging.unlink()
+        inner.unlink()
+        outer.unlink()
+        sent = (records.call(PUBLISH_RECORD, request()) if publisher == "core" else
+                legacy_call(root, sender(), PUBLISH_RECORD, request()))
+        assert "id" in sent
+        retry = (records.call(PUBLISH_RECORD, request()) if publisher == "core" else
+                 legacy_call(root, sender(), PUBLISH_RECORD, request()))
+        assert retry == sent
+        assert payload.read_bytes() == original
+
+
+@pytest.mark.parametrize("publisher", ["core", "legacy"])
+@pytest.mark.parametrize("failure", ["stat", "replacement"])
+def test_rf44_first_store_bind_reclaims_only_owned_root(tmp_path, monkeypatch, publisher, failure):
+    with service(tmp_path) as (root, _box, records):
+        directory = root.parent / "mailbox-records"
+        retired = root.parent / "retired-store"
+        outer = root.parent / ".records-store.lock"
+        before = snapshot(root.parent)
+        injected = []
+
+        def stated(name, *args, **kwargs):
+            if failure == "stat" and name == directory.name and not injected:
+                assert os.path.samestat(os.fstat(kwargs["dir_fd"]), root.parent.stat())
+                assert directory.is_dir() and outer.is_file()
+                injected.append(name)
+                raise OSError(errno.EIO, "injected first store stat failure")
+            return os.stat(name, *args, **kwargs)
+
+        def opened(name, *args, **kwargs):
+            if failure == "replacement" and name == directory.name and not injected:
+                assert outer.is_file()
+                directory.rename(retired)
+                directory.mkdir(mode=0o700)
+                injected.append(name)
+            return os.open(name, *args, **kwargs)
+
+        patched_os = SimpleNamespace(**{**vars(os), "stat": stated, "open": opened})
+        if publisher == "core":
+            monkeypatch.setattr(records_module, "os", patched_os)
+            try:
+                with pytest.raises(records_module.RecordRefusal) as caught:
+                    records.call(PUBLISH_RECORD, request())
+                assert caught.value.reason == "E_AUTH"
+                assert "injected" not in json.dumps(caught.value.record_error)
+            finally:
+                monkeypatch.setattr(records_module, "os", os)
+        else:
+            monkeypatch.setattr(legacy_records, "os", patched_os)
+            try:
+                assert legacy_call(root, sender(), PUBLISH_RECORD, request()) == codec.CodecError("E_AUTH").as_dict()
+            finally:
+                monkeypatch.setattr(legacy_records, "os", os)
+
+        assert injected == [directory.name]
+        if failure == "stat":
+            assert not directory.exists() and not outer.exists()
+            assert snapshot(root.parent) == before
+        else:
+            # A replacement with a different inode is not ours to reclaim or publish into.
+            assert not list(directory.iterdir()) and not list(retired.iterdir())
+            assert not (root / ".root-id").exists()
+            assert not outer.exists()
+        if publisher == "core":
+            sent = records.call(PUBLISH_RECORD, request())
+            assert records.call(PUBLISH_RECORD, request()) == sent
+        else:
+            sent = legacy_call(root, sender(), PUBLISH_RECORD, request())
+            assert legacy_call(root, sender(), PUBLISH_RECORD, request()) == sent
+        assert sent["message_id"] == "record"
+
+
+@pytest.mark.parametrize("publisher", ["core", "legacy"])
+@pytest.mark.parametrize("check", ["before-link", "after-link-grants", "after-link-root"])
+def test_rf44_grant_context_fault_uses_message_commit_state(tmp_path, monkeypatch, publisher, check):
+    clock = WaitClock()
+    with service(tmp_path, monotonic=clock.monotonic, sleep=clock.sleep) as (root, box, records):
+        directory = root.parent / "mailbox-records"
+        fault_target = directory.resolve() if check == "after-link-root" else "grants"
+        inner = directory / ".publish.lock"
+        outer = root.parent / ".records-store.lock"
+        before = snapshot(root.parent)
+        armed = Event()
+        injected = []
+
+        def synced(fd):
+            os.fsync(fd)
+            grants = directory / "grants"
+            if check == "before-link" and grants.is_dir() and os.path.samestat(os.fstat(fd), grants.stat()):
+                armed.set()
+
+        def linked(source, target, *args, **kwargs):
+            os.link(source, target, *args, **kwargs)
+            if check != "before-link" and target.endswith(".md"):
+                armed.set()
+
+        def stated(name, *args, **kwargs):
+            if armed.is_set() and name == fault_target and not injected:
+                assert inner.is_file() and outer.is_file()
+                injected.append(name)
+                raise OSError(errno.EIO, "injected grant context check failure")
+            return os.stat(name, *args, **kwargs)
+
+        def publish():
+            if publisher == "core":
+                return records.call(PUBLISH_RECORD, request())
+            return legacy_call(root, sender(), PUBLISH_RECORD, request())
+
+        patched_os = SimpleNamespace(**{**vars(os), "fsync": synced, "link": linked})
+        if publisher == "core":
+            monkeypatch.setattr(records_module, "os", patched_os)
+        else:
+            monkeypatch.setattr(legacy_records, "os", patched_os)
+        monkeypatch.setattr(codec_store, "os", SimpleNamespace(**{**vars(os), "stat": stated}))
+        try:
+            if check == "before-link" and publisher == "core":
+                with pytest.raises(records_module.RecordRefusal) as caught:
+                    publish()
+                assert caught.value.reason == "E_AUTH"
+                assert "injected" not in json.dumps(caught.value.record_error)
+            else:
+                result = publish()
+        finally:
+            monkeypatch.setattr(codec_store, "os", os)
+            if publisher == "core":
+                monkeypatch.setattr(records_module, "os", os)
+            else:
+                monkeypatch.setattr(legacy_records, "os", os)
+
+        assert len(injected) == 1
+        if check == "before-link":
+            if publisher == "legacy":
+                assert result["error"]["code"] == "E_AUTH"
+                assert "injected" not in json.dumps(result)
+            assert not directory.exists() and not outer.exists()
+            assert snapshot(root.parent) == before
+            result = publish()
+        else:
+            assert "injected" not in json.dumps(result)
+            assert result["note"] == (
+                "Message published. The owner should inspect staging and both reservations. "
+                "Once cleanup is verified, clear an abandoned <store>/.publish.lock first, "
+                "then an abandoned <parent>/.records-store.lock. Check history before publishing again."
+            )
+            assert inner.is_file() and outer.is_file()
+            committed = snapshot(root.parent)
+            with pytest.raises(BusyError):
+                records.call(PUBLISH_RECORD, request("new"))
+            assert snapshot(root.parent) == committed
+
+        reader = records_module.Records(box, sender("alpha/orchestrator"))
+        assert json.loads(reader.call(READ_RECORD, {"message_id": "record"}))["data"]["body"] == "evidence"
+        retried = publish()
+        assert retried == {key: result[key] for key in ("id", "message_id")}
+        if check != "before-link":
+            assert inner.is_file() and outer.is_file()
+            inner.unlink()
+            outer.unlink()
+            assert publish() == retried
+
+
+@pytest.mark.parametrize("publisher", ["core", "legacy"])
+def test_rf44_mailbox_bind_does_not_enumerate_grant_history(tmp_path, monkeypatch, publisher):
+    with service(tmp_path) as (root, box, records):
+        directory = root.parent / "mailbox-records"
+        identifiers = []
+        for index in range(4):
+            args = request("grant-" + str(index), content=json.dumps({
+                "fields": {}, "body": "grant " + str(index), "refs": {},
+            }))
+            sent = (records.call(PUBLISH_RECORD, args) if publisher == "core" else
+                    legacy_call(root, sender(), PUBLISH_RECORD, args))
+            identifiers.append(sent["id"])
+        expected = directory.stat()
+        binds, visited = [], []
+
+        @contextmanager
+        def scan(fd):
+            with os.scandir(fd) as entries:
+                if not os.path.samestat(os.fstat(fd), expected):
+                    yield entries
+                    return
+                binds.append(fd)
+
+                def observe():
+                    for entry in entries:
+                        visited.append(entry.name)
+                        yield entry
+
+                yield observe()
+
+        monkeypatch.setattr(codec_store, "os", SimpleNamespace(**{**vars(os), "scandir": scan}))
+        author = sender("alpha/orchestrator")
+        arguments = {"ref": identifiers[0]}
+        if publisher == "core":
+            result = json.loads(records_module.Records(box, author).call(READ_RECORD, arguments))
+        else:
+            result = json.loads(legacy_call(root, author, READ_RECORD, arguments))
+        assert result["data"]["body"] == "grant 0"
+        assert binds and "grants" in visited
+        assert all(not name.startswith(".grants-") for name in visited)
+        assert sorted(path.name for path in (directory / "grants").iterdir()) == sorted(
+            ".grants-" + rid for rid in identifiers)
+
+
+@pytest.mark.parametrize("publisher", ["core", "legacy"])
+def test_rf44_missing_descriptor_scandir_refuses_before_store_creation(tmp_path, monkeypatch, publisher):
+    with service(tmp_path) as (root, _box, records):
+        before = snapshot(root.parent)
+        attempted = []
+
+        def mkdir(*args, **kwargs):
+            attempted.append(True)
+            return os.mkdir(*args, **kwargs)
+
+        monkeypatch.setattr(codec_store, "os", SimpleNamespace(**{**vars(os), "supports_fd": set()}))
+        monkeypatch.setattr(legacy_records, "os", SimpleNamespace(**{**vars(os), "mkdir": mkdir}))
+        if publisher == "core":
+            with pytest.raises(MailboxRefusal) as caught:
+                records.call(PUBLISH_RECORD, request())
+            assert caught.value.reason == "unsupported_platform"
+        else:
+            assert legacy_call(root, sender(), PUBLISH_RECORD, request()) == codec.CodecError("E_AUTH").as_dict()
+        assert snapshot(root.parent) == before
+        assert attempted == []
+        assert not (root.parent / "mailbox-records").exists()
 
 
 @pytest.mark.parametrize("name,arguments,reason", [
@@ -532,7 +845,7 @@ def test_guidance_specs_and_refusal_bytes_match_legacy():
 def test_unhashable_grant_kind_refuses_and_retry(tmp_path):
     with service(tmp_path) as (root, box, records):
         sent = records.call("mailbox_publish_record", request())
-        path = root.parent / "mailbox-records" / (".grants-" + sent["id"])
+        path = root.parent / "mailbox-records" / "grants" / (".grants-" + sent["id"])
         previous = path.read_bytes()
         value = codec.parse(previous)
         value["fields"]["value"]["kind"] = {}
@@ -579,7 +892,7 @@ def test_fdopen_failure_closes_owned_descriptors_and_retry(tmp_path, monkeypatch
             name, directory = names[fd]
             if phase in ("identity", "stub", "grant"):
                 parent = {"identity": root, "stub": root / "alpha" / "orchestrator",
-                          "grant": root.parent / "mailbox-records"}[phase]
+                          "grant": root.parent / "mailbox-records" / "grants"}[phase]
                 selected = (re.fullmatch(r"\.pending-[0-9a-f]{32}", name) is not None and
                             os.path.samestat(os.fstat(directory), parent.stat()))
             else:
