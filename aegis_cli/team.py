@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from aegis_core import primitives
 from aegis_cli import sanitize_display, team_queue as queue_cli
+from aegis_cli import team_isolation as isolation_cli
 from aegis_cli import team_lease_output as lease_output
 from aegis_cli import team_mail as mail_cli, team_board as board_cli
 from aegis_cli.base import AegisCommand, CommandCategory
@@ -638,6 +639,8 @@ def run_team(args: argparse.Namespace) -> int:
         return board_cli.run_board(args)
     if action == "queue":
         return queue_cli.run_queue(args)
+    if action == "isolation":
+        return isolation_cli.run_isolation(args)
     if action == "model":
         values = {key: getattr(args, key) for key in MODEL_REQUIRED + MODEL_OPTIONAL}
         root = args.ws.root if getattr(args, "ws", None) is not None else args.workspace
@@ -692,6 +695,14 @@ def _configure_model_parser(sub, common):
     model.add_argument("--record", action="store_true", help="Atomically select and append under the history lock (60-second timeout); default preview")
 
 
+def _configure_action_parsers(sub, common, parser):
+    _configure_model_parser(sub, common)
+    queue_cli.configure_parser(sub, common, parser)
+    mail_cli.configure_parser(sub, common, parser)
+    board_cli.configure_parser(sub, common, parser)
+    isolation_cli.configure_parser(sub, common, parser)
+
+
 class TeamCommand(AegisCommand):
     """Lane leases: cooperative conflict input for parallel agents."""
 
@@ -715,10 +726,7 @@ class TeamCommand(AegisCommand):
                             help="Strip ANSI styling and emoji")
         common.add_argument("--workspace", type=str, default=argparse.SUPPRESS, help="Target workspace root")
         sub = parser.add_subparsers(dest="team_action", metavar="ACTION")
-        _configure_model_parser(sub, common)
-        queue_cli.configure_parser(sub, common, parser)
-        mail_cli.configure_parser(sub, common, parser)
-        board_cli.configure_parser(sub, common, parser)
+        _configure_action_parsers(sub, common, parser)
         config = sub.add_parser("config", parents=[common], help="Inspect or initialize a layered team profile")
         config_sub = config.add_subparsers(dest="config_action")
         config_sub.add_parser("show", parents=[common], help="Show every resolved value and its layer")
