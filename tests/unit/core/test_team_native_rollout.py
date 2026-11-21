@@ -795,3 +795,156 @@ def test_round1d_preflight_substitution_never_changes_parsed_keys_or_syntax():
         legacy.strict_json(malformed_bytes.decode("utf-8"))
     with pytest.raises(MailboxRefusal, match="^mailbox refused: invalid_record$"):
         strict_json(malformed_bytes, source_bytes=True)
+
+
+# Past every supported decoder ceiling: CPython 3.9's recursion limit and the
+# 3.12 Windows C recursion limit both exhaust before this depth. The string is
+# only brackets plus one marker, so the refusal must not echo it.
+_EXHAUSTING_DEPTH = 10000
+
+
+def _exhausting_value(shape):
+    if shape == "array":
+        return "[" * _EXHAUSTING_DEPTH + '"private-marker"' + "]" * _EXHAUSTING_DEPTH
+    return '{"k":' * _EXHAUSTING_DEPTH + '"private-marker"' + "}" * _EXHAUSTING_DEPTH
+
+
+def _retry_embedded(name, key):
+    plain = {key: "*** Add File: retry.py\n" + ("[" * 400)}
+    assert getattr(core, name)(plain) == getattr(legacy, name)(plain)
+    syntax = {key: "[" * 80}
+    assert getattr(core, name)(syntax) == getattr(legacy, name)(syntax)
+    duplicate = {key: '{"edge":1,"edge":2}'}
+    assert getattr(core, name)(duplicate) == getattr(legacy, name)(duplicate)
+    nan = {key: '{"a":NaN}'}
+    assert getattr(core, name)(nan) == getattr(legacy, name)(nan)
+    if name == "patch_input":
+        assert core.patch_input({"arguments": '{"patch":"*** Add File: retry.py"}'}) == "*** Add File: retry.py"
+    else:
+        assert core.patch_output({"output": '{"output":"Success","metadata":{"exit_code":7}}'}) == ("Success", 7)
+
+
+@pytest.mark.parametrize("shape", ["array", "object"])
+@pytest.mark.parametrize("name,key", [("patch_input", "arguments"), ("patch_output", "output")])
+def test_decoder_exhaustion_keeps_the_bounded_refusal(shape, name, key):
+    payload = {"type": "function_call", key: _exhausting_value(shape)}
+    before = deepcopy(payload)
+    refused("invalid_record", getattr(core, name), payload)
+    assert payload == before
+    _retry_embedded(name, key)
+
+
+def test_decoder_exhaustion_response_patch_refuses_either_side():
+    raw = _exhausting_value("array")
+    call = {"type": "function_call", "call_id": "call", "arguments": raw}
+    output = {"output": "Success"}
+    witness = {"line": 1}
+    before_call, before_output = deepcopy(call), deepcopy(output)
+    refused("invalid_record", core.response_patch, call, output, "turn", witness)
+    assert call == before_call and output == before_output
+    plain_call = {"type": "function_call", "call_id": "call", "arguments": "*** Add File: retry.py"}
+    plain_output = {"output": "Success"}
+    retried = core.response_patch(plain_call, plain_output, "turn", witness)
+    assert retried["paths"] == ["retry.py"] and retried["success"] is True
+    deep_output = {"output": raw}
+    before_deep = deepcopy(deep_output)
+    refused("invalid_record", core.response_patch, plain_call, deep_output, "turn", witness)
+    assert deep_output == before_deep
+    assert core.response_patch(plain_call, plain_output, "turn", witness) == retried
+
+
+def test_decoder_exhaustion_refusal_is_stable_across_threads():
+    raw = _exhausting_value("object")
+    def check(_index):
+        refused("invalid_record", core.patch_input, {"arguments": raw})
+        assert core.patch_input({"arguments": "*** Add File: retry.py"}) == "*** Add File: retry.py"
+        refused("invalid_record", core.patch_output, {"output": raw})
+        assert core.patch_output({"output": '{"output":"Success","metadata":{"exit_code":3}}'}) == ("Success", 3)
+        syntax = {"arguments": "[" * 80, "output": '{"a":1,"a":2}'}
+        assert core.patch_input(syntax) == legacy.patch_input(syntax)
+        assert core.patch_output(syntax) == legacy.patch_output(syntax)
+        return True
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(check, range(6))) == [True] * 6
+
+
+# Syntax, duplicate keys, bad escapes and non-ASCII digits stay legacy text even
+# when later brackets are deep. Only a decoder RecursionError keeps the refusal.
+_MALFORMED_DEEP_LABELS = (
+    "unclosed", "invalid-escape", "raw-newline", "short-u",
+    "duplicate-keys", "unicode-digit", "raw-nul",
+)
+
+
+def _malformed_deep_text(label):
+    deep = "[" * 300 + "null" + "]" * 300
+    if label == "unclosed":
+        return "[" * 257
+    if label == "invalid-escape":
+        return '{"a":"\\q","b":' + deep + "}"
+    if label == "raw-newline":
+        return '["line1\nline2",' + "[" * 256
+    if label == "short-u":
+        return '{"a":"\\u12","b":' + deep + "}"
+    if label == "duplicate-keys":
+        return '[{"a":1,"a":2},' + "[" * 256 + "]" * 257
+    if label == "unicode-digit":
+        return "[\u00b2," + "[" * 256
+    if label == "raw-nul":
+        return '{"a":"\x00","b":' + deep + "}"
+    raise AssertionError(label)
+
+
+def _assert_legacy_text(name, key, raw):
+    payload = {"type": "function_call", key: raw}
+    before = deepcopy(payload)
+    assert getattr(core, name)(payload) == getattr(legacy, name)(payload)
+    assert payload == before
+
+
+@pytest.mark.parametrize("label", _MALFORMED_DEEP_LABELS)
+@pytest.mark.parametrize("name,key", [("patch_input", "arguments"), ("patch_output", "output")])
+def test_malformed_deep_text_matches_the_legacy_reader(label, name, key):
+    raw = _malformed_deep_text(label)
+    _assert_legacy_text(name, key, raw)
+    _retry_embedded(name, key)
+
+
+@pytest.mark.parametrize("label", _MALFORMED_DEEP_LABELS)
+def test_malformed_deep_text_response_patch_keeps_both_sides(label):
+    raw = _malformed_deep_text(label)
+    witness = {"line": 1}
+    call = {"type": "function_call", "call_id": "call", "arguments": raw}
+    output = {"output": "Success"}
+    before_call = deepcopy(call)
+    observed = core.response_patch(call, output, "turn", witness)
+    assert call == before_call
+    assert observed["paths"] == [] and observed["success"] is True and observed["stderr"] == "Success"
+    plain_call = {"type": "function_call", "call_id": "call", "arguments": "*** Add File: retry.py"}
+    bad_output = {"output": raw}
+    before_output = deepcopy(bad_output)
+    observed = core.response_patch(plain_call, bad_output, "turn", witness)
+    assert bad_output == before_output
+    assert observed["paths"] == ["retry.py"] and observed["stderr"] == raw and observed["success"] is False
+    both = core.response_patch(
+        {"type": "function_call", "call_id": "call", "arguments": raw}, {"output": raw}, "turn", witness)
+    assert both["paths"] == [] and both["stderr"] == raw and both["success"] is False
+    retried = core.response_patch(plain_call, output, "turn", witness)
+    assert retried["paths"] == ["retry.py"] and retried["success"] is True
+
+
+def test_malformed_deep_text_is_stable_across_threads():
+    samples = [_malformed_deep_text(label) for label in _MALFORMED_DEEP_LABELS]
+
+    def check(_index):
+        for raw in samples:
+            _assert_legacy_text("patch_input", "arguments", raw)
+            _assert_legacy_text("patch_output", "output", raw)
+            call = {"type": "function_call", "call_id": "call", "arguments": raw}
+            assert core.response_patch(call, {"output": "Success"}, "turn", {"line": 1})["success"] is True
+        assert core.patch_input({"arguments": "*** Add File: retry.py"}) == "*** Add File: retry.py"
+        assert core.patch_output({"output": '{"output":"Success","metadata":{"exit_code":3}}'}) == ("Success", 3)
+        return True
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(check, range(6))) == [True] * 6
