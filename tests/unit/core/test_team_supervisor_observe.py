@@ -5,6 +5,7 @@ from copy import deepcopy
 import json
 import os
 import subprocess
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -312,7 +313,7 @@ def test_all_borrowed_descriptors_close_on_service_and_disk_errors(tmp_path, mon
     @contextmanager
     def tracked(*args, **kwargs):
         with original(*args, **kwargs) as handle:
-            opened.append(handle._parent)
+            opened.append(handle.parent_fd)
             yield handle
     def failed(*args, **kwargs):
         raise OSError("TOKEN=secret")
@@ -747,3 +748,141 @@ def test_multiline_lane_is_omitted_and_blocks_aggregate_death(tmp_path, monkeypa
     assert "REDACTED" in shown
     assert len(shown) == 63
     assert "\n" not in shown
+
+
+class _DiskBorrow:
+    """Public parent_fd only. The test owns the descriptor."""
+
+    def __init__(self, fd, open_borrow=True, seen=None):
+        self._fd = fd
+        self._open = open_borrow
+        self._seen = seen
+
+    def parent_stat(self):
+        return SimpleNamespace(st_dev=1, st_ino=1)
+
+    @property
+    def parent_fd(self):
+        if self._seen is not None:
+            self._seen.append(self._fd)
+        if not self._open:
+            raise storage_confined.ConfinedFileError("closed")
+        return self._fd
+
+
+def _borrowed_disk(monkeypatch, factory, statvfs, close):
+    @contextmanager
+    def confined(root, parts):
+        yield factory()
+
+    monkeypatch.setattr(module, "descriptor_supported", lambda: True)
+    monkeypatch.setattr(module, "disk_supported", lambda: True)
+    monkeypatch.setattr(module, "storage_confined", SimpleNamespace(
+        **{**vars(storage_confined), "confined_file": confined}))
+    monkeypatch.setattr(module, "os", SimpleNamespace(
+        **{**vars(os), "statvfs": statvfs, "close": close}))
+
+
+def test_closed_parent_borrow_refuses_workspace_then_retry_succeeds(tmp_path, monkeypatch, services):
+    """A closed parent_fd refuses the workspace; the next open borrow can be read."""
+    state = {"open": False}
+    seen, closed = [], []
+
+    def statvfs(fd):
+        assert fd == 42
+        return SimpleNamespace(f_bavail=5000, f_frsize=1024 * 1024)
+
+    def track_close(fd):
+        closed.append(fd)
+        if fd != 42:
+            os.close(fd)
+
+    _borrowed_disk(monkeypatch, lambda: _DiskBorrow(42, state["open"], seen), statvfs, track_close)
+    root = tmp_path.resolve()
+    rows = observations(run(root))
+    assert rows["disk"] == {"state": "unknown", "reason": "workspace_unavailable"}
+    assert rows["audit"] == {"state": "unknown", "reason": "workspace_unavailable"}
+    assert rows["writer_dead"]["leases"] == {"state": "unknown", "reason": "workspace_unavailable"}
+    assert "confined file context is closed" not in repr(rows)
+    assert seen == [42]
+    state["open"] = True
+    assert observations(run(root))["disk"] == {
+        "state": "healthy", "free_bytes": 5000 * 1024 * 1024, "floor_mib": 4096}
+    assert 42 not in closed
+
+
+def test_statvfs_failure_leaves_parent_borrow_open_for_retry(tmp_path, monkeypatch, services):
+    """statvfs failure is disk_unavailable and does not close or consume the borrow."""
+    seen, closed, calls = [], [], []
+
+    def statvfs(fd):
+        calls.append(fd)
+        if len(calls) == 1:
+            raise OSError("TOKEN=secret")
+        return SimpleNamespace(f_bavail=5000, f_frsize=1024 * 1024)
+
+    def track_close(fd):
+        closed.append(fd)
+        if fd != 42:
+            os.close(fd)
+
+    _borrowed_disk(monkeypatch, lambda: _DiskBorrow(42, True, seen), statvfs, track_close)
+    root = tmp_path.resolve()
+    first = observations(run(root))
+    assert first["disk"] == {"state": "unknown", "reason": "disk_unavailable"}
+    assert first["audit"] == {"state": "clean", "findings": 0}
+    assert "secret" not in repr(first)
+    assert calls == [42] and seen == [42] and 42 not in closed
+    assert observations(run(root))["disk"] == {
+        "state": "healthy", "free_bytes": 5000 * 1024 * 1024, "floor_mib": 4096}
+    assert calls == [42, 42] and seen == [42, 42] and 42 not in closed
+
+
+def test_concurrent_disk_borrows_stay_distinct_and_unclosed(tmp_path, monkeypatch, services):
+    """Concurrent observations borrow distinct parent descriptors and close none of them."""
+    local = threading.local()
+    seen, closed = [], []
+    lock = threading.Lock()
+
+    class Handle:
+        def parent_stat(self):
+            return SimpleNamespace(st_dev=local.fd, st_ino=local.fd)
+
+        @property
+        def parent_fd(self):
+            with lock:
+                seen.append(local.fd)
+            return local.fd
+
+    def statvfs(fd):
+        if fd != local.fd:
+            raise OSError("crossed borrow")
+        return SimpleNamespace(f_bavail=5000, f_frsize=1024 * 1024)
+
+    def track_close(fd):
+        with lock:
+            closed.append(fd)
+        if fd not in (11, 12, 13):
+            os.close(fd)
+
+    @contextmanager
+    def confined(root, parts):
+        yield Handle()
+
+    monkeypatch.setattr(module, "descriptor_supported", lambda: True)
+    monkeypatch.setattr(module, "disk_supported", lambda: True)
+    monkeypatch.setattr(module, "storage_confined", SimpleNamespace(
+        **{**vars(storage_confined), "confined_file": confined}))
+    monkeypatch.setattr(module, "os", SimpleNamespace(
+        **{**vars(os), "statvfs": statvfs, "close": track_close}))
+
+    def one(fd):
+        local.fd = fd
+        assert observations(run(tmp_path.resolve()))["disk"]["state"] == "healthy"
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(one, fd) for fd in (11, 12, 13)]
+        for future in futures:
+            future.result(timeout=5)
+    assert sorted(seen) == [11, 12, 13]
+    assert not any(fd in (11, 12, 13) for fd in closed)
