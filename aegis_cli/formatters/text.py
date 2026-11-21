@@ -21,7 +21,8 @@ def render_card(doc: Mapping[str, Any]) -> List[str]:
     """The day-0 card (``aegis check --card``, the end of ``aegis init``)."""
     from aegis_cli.ui.theme import diagnostic_text
     from aegis_core.card import NEXT_RULE
-    from aegis_core.verification.ast_checks import AST_SIZE_NOTE_TOOL
+    from aegis_core.verification.ast_checks import (
+        AST_SIZE_NOTE_TOOL, SIZE_RECOVERY_HINT, is_size_coverage_reason)
 
     scope, rules, layer1 = doc["scope"], doc["rules"], doc["layer1"]
     lines = ["Aegis day-0 card", f"  workspace: {scope['workspace']}"]
@@ -75,6 +76,13 @@ def render_card(doc: Mapping[str, Any]) -> List[str]:
                      for item in not_analyzed[:20])
         if len(not_analyzed) > 20:
             lines.append(f"    ... and {len(not_analyzed) - 20} more")
+        # One fixed action for every size advisory in this list, including rows the
+        # cap does not print. The action is not read from row text, so a multi-line
+        # reason cannot be joined into it. JSON keeps each original detail.
+        if isinstance(not_analyzed, (list, tuple)) and any(
+                isinstance(item, Mapping) and is_size_coverage_reason(item.get("reason"))
+                for item in not_analyzed):
+            lines.append("    " + diagnostic_text(SIZE_RECOVERY_HINT, 300))
     if doc["top_files"]:
         lines.append("  files with the most findings:")
         lines.extend(f"    {row['findings']:>5}  {row['path']}" for row in doc["top_files"])

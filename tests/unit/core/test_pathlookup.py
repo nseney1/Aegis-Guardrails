@@ -1407,6 +1407,32 @@ class TestWindowsLookup:
         shim.chmod(0o755)
         assert which("codex", str(shim.parent)) == str(shim)
 
+    def test_explicit_pathext_selects_candidates_and_keeps_the_fence(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+
+        exe, shim = tmp_path / "Git.Exe", tmp_path / "git.cmd"
+        for program in (exe, shim):
+            program.touch()
+            if os.name == "posix":
+                program.chmod(0o755)
+        monkeypatch.setattr("aegis_core.pathlookup.os", SimpleNamespace(
+            **{**vars(os), "pathsep": ";", "environ": {"PATHEXT": ".CMD;.EXE"}}))
+        monkeypatch.setattr("aegis_core.pathlookup.sys", SimpleNamespace(**{**vars(sys), "platform": "win32"}))
+
+        assert which("git", str(tmp_path)) == str(shim)
+        assert which("git", str(tmp_path), pathext=".EXE") == str(exe)
+        assert which("git", str(tmp_path), pathext="") == str(exe)
+        assert which("git", str(tmp_path), outside=tmp_path, pathext=".EXE") is None
+        assert which("git", str(tmp_path), pathext=".BAT") is None
+        assert only_skipped("git", str(tmp_path), outside=tmp_path) == [
+            Hit(str(program), str(tmp_path), pathlookup.INSIDE_FENCE) for program in (shim, exe)
+        ]
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            selected = workers.submit(which, "git", str(tmp_path), pathext=".EXE")
+            ambient = workers.submit(which, "git", str(tmp_path))
+            assert selected.result(timeout=5) == str(exe)
+            assert ambient.result(timeout=5) == str(shim)
+
     def test_a_name_that_carries_an_extension_is_looked_up_as_given(self, tmp_path, windows):
         exe = tmp_path / "bin" / "python3.exe"
         exe.parent.mkdir()
@@ -1451,6 +1477,12 @@ class TestWindowsLookup:
         exe.chmod(0o755)
         assert only_skipped("codex", "bin", outside=ws, base=ws) == [
             Hit(path=os.path.normpath(str(exe)), entry="bin", reason="relative_entry")]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="uses a POSIX executable")
+def test_explicit_pathext_does_not_change_posix_lookup(tmp_path):
+    program = _program(tmp_path, "git")
+    assert which("git", str(tmp_path), pathext=".CMD") == str(program)
 
 
 # ── only_skipped ─────────────────────────────────────────────────────────────
@@ -2251,6 +2283,12 @@ def test_a_windows_rooted_path_uses_the_current_drive(monkeypatch):
         assert skipped and skipped[0].reason == pathlookup.INSIDE_FENCE
         modeled.getcwd = lambda: r"D:\host"
         assert pathlookup._provenance_inside(r"\ws\bin", fence, descriptors=False) is False
+        # Python 3.9–3.12 report a drive-less rooted path as absolute.
+        paths.isabs = lambda path: rooted_isabs(path) or str(path).startswith("\\")
+        paths.abspath = lambda path: "D:" + path if path.startswith("\\") else path
+        assert pathlookup._provenance_inside(r"\bin\git.exe", r"C:\bin", descriptors=False) is False
+        assert pathlookup.fenced_program(r"\bin\git.exe", r"C:\bin", descriptors=False) is None
+        assert pathlookup.fenced_program(r"D:\bin\git.exe", r"C:\bin", descriptors=False) == r"D:\bin\git.exe"
     finally:
         monkeypatch.setattr("aegis_core.pathlookup.os", original)
         monkeypatch.setattr("aegis_core.primitives.os", primitive_os)

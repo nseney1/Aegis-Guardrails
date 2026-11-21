@@ -225,6 +225,8 @@ SELECTOR_SITE_TABLE = (
      "Add the fixed owner-selected repository and read-only grep settings to the object-only recipe; _read_command validates every executed command before public gitsafe."),
     ("aegis_core/team_native_bridge.py", "ProcessBridge._run", "reviewed-dynamic",
      "TA-3h: review bounded owner-supplied evidence-only argv; absolute executable, no shell, bounded JSON stdin/output, held cwd descriptor, deadline and WNOWAIT process-group cleanup; no native qualification."),
+    ("aegis_cli/team_isolation.py", "inspect_image", "reviewed-dynamic",
+     "TA-6c: one owner-PATH engine resolved outside the workspace; validated digest-only image inspect, cwd=/, no shell, DEVNULL stdin and stderr, bounded stdout and 30-second deadline."),
     ("aegis_core/testexec.py", "kill_group", "reviewed-dynamic",
      "Run Windows taskkill directly; positional process-group termination shares the scope."),
     ("aegis_core/verification/test_runner.py", "discover_test_evidence", "reviewed-dynamic",
