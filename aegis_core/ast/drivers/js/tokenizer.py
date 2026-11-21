@@ -7,6 +7,7 @@ from typing import NamedTuple
 
 from aegis_core.ast.driver_errors import ASTDriverError
 from aegis_core.ast.drivers.js.jsx import JSXScanner
+from aegis_core.ast.drivers.js.typescript import TypePositions
 from aegis_core.ast.drivers.js.values import (
     MAX_DEPTH,
     decode_string,
@@ -80,7 +81,7 @@ class Token(NamedTuple):
 _TOKEN_NEW = tuple.__new__
 
 
-class Lexer(JSXScanner):
+class Lexer(JSXScanner, TypePositions):
     def __init__(self, source, path, *, compact=False):
         self.source, self.path, self.i, self.line = source, path, 0, 1
         self.compact = compact
@@ -100,7 +101,7 @@ class Lexer(JSXScanner):
         self.arrow_close, self.closing_names = None, None
         # (end of the `(` run, `)` count or -1) of the last failed transparent-group attempt.
         self.group_skip = (-1, -1)
-        self.generator_pending, self.body_generator, self.class_kind = None, False, None
+        self.generator_pending, self.body_generator, self.class_kind, self.annotation_at = None, False, None, -1
         # Frame depths: generator parameters/bodies, strict class bodies, concise arrows, for-statement heads, TS type literals.
         self.generator_frames, self.strict_frames, self.arrow_markers, self.for_heads, self.type_literals = set(), set(), set(), set(), set()
         # Switch bodies, switch heads still open, and (depth, token index) of the `)` that closed the last head.
@@ -108,6 +109,12 @@ class Lexer(JSXScanner):
 
     def error(self, reason, offset=None, line=None):
         raise JSLexError(reason, self.line if line is None else line, self.i if offset is None else offset)
+
+    def line_break(self, begin, end):
+        return _LINE_END.search(self.source, begin, end) is not None
+
+    def syntax_word(self, word):
+        return word in _SYNTAX_WORDS
 
     def emit(self, kind, value, begin, line, role=''):
         self.tokens.append(_TOKEN_NEW(Token, (kind, value, line, begin, self.i, role, None)))
@@ -736,6 +743,8 @@ class Lexer(JSXScanner):
             self.mode, self.expr, self.statement, self.previous = 'code', True, False, '${'
 
     def brace_role(self):
+        if self.typescript and (self.annotation_at == len(self.tokens) - 1 or self.previous == '=' and self.type_alias_value(len(self.tokens) - 1)):
+            self.type_literals.add(len(self.frames) + 1)  # `let a: { … }` or `type A = { … }`; its role is unchanged
         if self.previous == 'static' and self.frames and self.frames[-1][1].startswith('class'):
             return 'block'
         if self.control and self.previous == 'catch':
@@ -761,10 +770,9 @@ class Lexer(JSXScanner):
             return 'block'
         if self.expr:
             return 'object'
-        if (self.typescript and self.previous in ('as', 'satisfies', 'extends', 'readonly', 'is') and self.tokens[-1].value == self.previous
-                and self.tokens[-1].line == self.line and (len(self.tokens) < 2 or self.tokens[-2].value not in ('.', '?.') and self.tokens[-2].kind != 'comment')):
+        if self.type_operator_brace():
             self.type_literals.add(len(self.frames) + 1)  # a TS type literal: `x as { a: T }`, `T extends { a: T }`
-            return 'object'  # `x.as`, or a newline or comment next to the word, may be an ASI block: fail closed below
+            return 'object'
         self.error('unsupported_lexical_context:brace')
 
     def punctuation(self, operator=None):
@@ -912,6 +920,14 @@ class Lexer(JSXScanner):
             self.arrow_markers.discard(depth)
         if operator == '=' and self.module_clause == 'import':
             self.module_clause = None  # TS `import name = Namespace.member` has no module body.
+        if operator == ':' and self.typescript and len(self.tokens) > 1:
+            # An annotation colon: not a ternary, label or case colon (a class body has no labels; `a?:` is optional,
+            # and any colon in a type literal is a type), and not an object key unless it follows a method's `)`.
+            tokens, in_type = self.tokens, depth in self.type_literals
+            label = (self.label_pending and tokens[-2].kind == 'identifier' or self.case_pending) and not self.class_body()
+            annotation = (in_type or tokens[-2].value == '?' or not self.ternaries.get(depth)) and not label and (
+                in_type or not self.frames or self.frames[-1][1] != 'object' or tokens[-2].value == ')')
+            self.annotation_at = len(tokens) - 1 if annotation else -1  # the index of this colon token
 
 
 def tokenize(source: str, path: str = 'fixture.ts', *, compact: bool = False) -> list[Token]:
