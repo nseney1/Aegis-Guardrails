@@ -102,7 +102,8 @@ Read [How Aegis works](https://github.com/nseney1/Aegis-Guardrails/blob/main/doc
 
 ## What's included
 
-- **A CLI** with 15 commands (`init`, `uninstall`, `doctor`, `migrate`, `check`, `approve`, `scan`, `status`, `rule`, `sync`, `hook`, `team`, `skills`, `benchmark`, `package`) and **an MCP server** with 5 tools (`aegis_scan`, `aegis_report_outcome`, `aegis_create_rule`, `aegis_list_rules`, `aegis_capture_insight`).
+- **A CLI** with 17 commands (`init`, `uninstall`, `doctor`, `migrate`, `check`, `approve`, `scan`, `status`, `rule`, `sync`, `hook`, `team`, `skills`, `benchmark`, `package`, `workspace`, `msg`) and **an MCP server** with 10 tools (`aegis_scan`, `aegis_report_outcome`, `aegis_create_rule`, `aegis_list_rules`, `aegis_capture_insight`, `aegis_msg_read`, `aegis_msg_write`, `aegis_team_config`, `aegis_team_model`, `aegis_team_queue`).
+- **Opt-in manager audit prototype:** `aegis workspace` prepares a separate manager registration with owner-approved management policy and zero fitness credit. It grants no native Teams enforcement or delegation authority. See [v5.0](https://github.com/nseney1/Aegis-Guardrails/blob/main/README.md#v50) and the [team surface chooser](https://github.com/nseney1/Aegis-Guardrails/blob/main/README.md#agent-teams).
 - **12 starter [rules](https://github.com/nseney1/Aegis-Guardrails/tree/main/rules)**: grounding claims in code, dry runs before destructive commands, behavioral tests, TDD, git hygiene and more (`aegis init --rules minimal|standard|full` seeds 2, 5 or all 12; set `target_paths` to activate them).
 - **15 [skills](https://github.com/nseney1/Aegis-Guardrails/tree/main/skills)**: `SKILL.md` playbooks synced by `aegis skills sync` (or `aegis init --skills`) into `.claude/skills/` and `.agents/skills/`.
 - **Built-in security checks**: language security packs and a known-format secret scan check what your change introduces; explicit allow comments record suppressions.
@@ -117,11 +118,35 @@ Read [How Aegis works](https://github.com/nseney1/Aegis-Guardrails/blob/main/doc
 
 Go parsing needs Go ≥1.21. JS/TS and Rust parsing need no Node or Rust toolchain; executing their tests needs installed tools and dependencies. See [Language checks](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/languages.md) for extraction limits, configuration, unavailable evidence and receipt requirements.
 
+## v5.0
+
+Team coordination on this branch sits beside the single-developer loop. The package version remains 4.5.0 until the release cut. [Agent teams](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/teams.md) has the lane and queue detail. [Model selection](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/model-selection.md) has the admission rules.
+
+Source-checkout hierarchy tools are outside the installed wheel (`tools/hierarchy_team.py`). The product mailbox is the `aegis_core.team_mailbox` library. `aegis team mail` sends, reads and diagnoses mail. `aegis team board` configures and inspects boards. Both require [mailbox descriptor support](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/teams.md#mail-and-board). `aegis team isolation check` plans container isolation from an absolute team-run file, or compares an engine inspection, and does not start a container. `aegis msg` reads and writes `aegis.msg/1` records; Windows codec support is deferred. `aegis team model` previews an admitted choice and `--record` appends it; it launches no host, and unprobed or rejected levels refuse with `binding_not_admitted`. `aegis team queue` is the work queue: a claim is not a path lease and starts no agent. Lane Git code can snapshot a tree, plan a merge and publish a ref only by compare-and-swap. It has no subcommand. Qualification records and the publisher are libraries; publisher activation is not wired. Proposal sources include `mine`. Merging proposals does not install a rule. `aegis rule lint` reports findings and exits 0.
+
+```bash
+aegis team claim docs --paths 'docs/**'
+aegis team queue list --json
+aegis rule lint
+```
+
+`aegis_core.merge_queue.MergeQueue` checks qualification for the exact landing tree. Automatic landing remains separate work. `revalidate` refuses `issued_unresolved` while an issued record or cleanup is set. `check_issued` refuses `issued_unresolved` when that issued checkpoint conflicts or results remain. A refusal's `next_action` names the custodian and a fixed recovery text, and it echoes no transport text. Core libraries also provide session wake (`aegis_core.team_session_wake`), recipe and packet validation (`aegis_core.team_jobs_recipes`), the Codex stdio client `aegis_core.team_native_wire` (it launches no process), the workspace ledger `aegis_core.team_workspace_store` with `aegis_core.team_workspace_display` (`tools/hierarchy_workspace.py` stays outside the wheel), and session stop in `aegis_core.team_session_stop` with `team_session_census` and `team_session_custody` (a stop signals only a process proven to belong to the recorded session). `aegis_core.model_served.observe_served` records the host, model, level and family that served a decision, plus a fallback reason, and adds no command. `tools/hierarchy_templates/` stays outside the wheel. The wheel includes `job-recipes.json` and `role-registry.json` under `aegis_core/team_templates/`. `aegis_core.team_roles.registry` reads the role registry. `aegis_core.team_source` serves pinned source pages from an owner-selected root and refuses grep output over 4194304 bytes.
+
+Snapshots refuse `unsupported_platform` unless `descriptor_support` is true: `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `stat` and `readlink`. The work queue refuses `unsupported_platform` unless `storage.confined_descriptor_supported` is true: `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `mkdir`, `link`, `rename`, `unlink` and `stat`. That function does not use `readlink`. Both probes are false when `os.name` is not `posix`, so Windows fails them. Neither function tests for macOS. `MergeQueue.prepare` refuses `unsupported_platform` unless the snapshot and [qualification probes](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/architecture.md#git-delivery) pass, including Linux subreaper support.
+
 ## Agent teams
 
-When parallel agents work in separate worktrees (lanes), declare each lane's path scope with `aegis team claim docs --paths 'docs/**' README.md`. A lease is cooperative conflict input — not a lock, not an identity, and not proof an agent is still running — and overlapping live claims are refused.
+Choose the surface for your task:
 
-Verify containment with `aegis check --lane docs`: every path changed since the merge base must stay inside the lane's scope, and no Python test may disappear or gain a skip. With a lease or `--paths` the check is self-attested; with `--base-policy` it reads `.aegis/team.json` from the base branch and is witnessed. In CI it is advisory (not a required check). See [Agent teams](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/teams.md) for lease refs and `aegis team metrics`.
+- [Repository lanes](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/teams.md) — `aegis team` leases and `aegis check --lane` for committed path scopes.
+- [Management audit](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/manager-workspaces.md) — `aegis workspace` serves management rules and records decision claims.
+- [Runtime team prototype](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/agent-hierarchies.md) — source-checkout tools set up runs and start or stop supported CLI sessions.
+
+See [setup and limits](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/teams.md#setup-and-limits-of-each-surface) for installation, authority and runtime prerequisites.
+
+Declare a lane with `aegis team claim docs --paths 'docs/**'`. A lease is cooperative conflict input, not a lock, identity or proof of liveness; overlapping live claims are refused. Root-file work needs coordination: a bare `README.md` pattern conservatively overlaps every scope.
+
+Verify containment with `aegis check --lane docs`: changed paths must stay within scope, and no Python test may disappear or gain a skip. With a lease or `--paths` the check is self-attested; with `--base-policy` it reads `.aegis/team.json` from the base branch and is witnessed. In CI it is advisory (not a required check).
 
 ## Limits and trust
 

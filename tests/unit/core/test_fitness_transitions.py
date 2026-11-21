@@ -30,7 +30,7 @@ def _old_rule(rule_type: str) -> SimpleNamespace:
     return SimpleNamespace(id="r", type=rule_type, served=True, meta={"created": "2020-01-01"})
 
 
-def _check_cell(fit: fitness.Fitness, rule_type: str) -> str:
+def _check_rule(fit: fitness.Fitness, rule_type: str) -> str:
     assert fit.state in STATES, fit
     assert (fit.suggestion in MOVES) == (fit.state == "decided"), fit
     if fit.state == "untestable" or not fit.evidence_available:
@@ -40,19 +40,19 @@ def _check_cell(fit: fitness.Fitness, rule_type: str) -> str:
 
 
 @pytest.mark.parametrize("rule_type", ["trap", "invariant", "gate"])
-def test_every_tp_fp_cell_shows_one_answer_and_moves_only_when_decided(rule_type: str) -> None:
+def test_every_tp_fp_rule_shows_one_answer_and_moves_only_when_decided(rule_type: str) -> None:
     """Given every (tp, fp) in 0..40 as local totals and as labels, When compute and suggest run,
     Then they agree and a move appears exactly in state decided."""
     moves = set()
     for tp in range(41):
         for fp in range(41):
-            moves.add(_check_cell(fitness.compute({"tp": tp, "fp": fp}, rule_type=rule_type), rule_type))
-            moves.add(_check_cell(fitness.compute({}, rule_type=rule_type, adjudicated_tp=tp, adjudicated_fp=fp,
+            moves.add(_check_rule(fitness.compute({"tp": tp, "fp": fp}, rule_type=rule_type), rule_type))
+            moves.add(_check_rule(fitness.compute({}, rule_type=rule_type, adjudicated_tp=tp, adjudicated_fp=fp,
                                                   sessions_count=3, repos_count=2), rule_type))
     unavailable = set()
     for tp in range(0, 41, 5):
         for fp in range(0, 41, 5):
-            unavailable.add(_check_cell(fitness.compute({}, rule_type=rule_type, adjudicated_tp=tp, adjudicated_fp=fp,
+            unavailable.add(_check_rule(fitness.compute({}, rule_type=rule_type, adjudicated_tp=tp, adjudicated_fp=fp,
                                                         sessions_count=3, repos_count=2, evidence_available=False,
                                                         evidence_error="cut short"), rule_type))
     assert unavailable == {""} and "" in moves and moves & MOVES

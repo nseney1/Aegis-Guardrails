@@ -44,6 +44,31 @@ def test_supplied_js_source_is_parsed_instead_of_the_file(tmp_path, extension):
     assert target.read_text() == 'harmless()'
 
 
+@pytest.mark.parametrize('extension', EXTENSIONS)
+def test_native_decorator_ast_matches_the_public_parser(tmp_path, extension):
+    from aegis_core.ast.drivers.js import parse
+
+    source = '''@outer
+@inner
+export class Worker { @checked run() {} plain() {} }
+@task
+export default function finish() {}
+@arrow
+export const start = () => {};
+@orphan;
+function later() {}
+'''
+    target = tmp_path / ('app' + extension)
+    target.write_text(source, encoding='utf-8')
+    expected = parse(source, str(target)).to_dict()
+    assert ASTDriverRunner().parse_file(target, workspace_root=tmp_path).to_dict() == expected
+    assert extract_normalized_ast(target, code=source).to_dict() == expected
+    assert [definition['decorators'] for definition in expected['definitions']
+            if 'decorators' in definition] == [['outer', 'inner'], ['checked'], ['task'], ['arrow']]
+    assert next(definition for definition in expected['definitions']
+                if definition['name'] == 'later').get('decorators') is None
+
+
 def test_python_parsing_does_not_import_native_js(tmp_path):
     target = tmp_path / 'app.py'
     target.write_text('value = 1', encoding='utf-8')

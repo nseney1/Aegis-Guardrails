@@ -65,7 +65,7 @@ def _v2(**fields: Any) -> Dict[str, Any]:
 def _mixed_ledger(ws: Path) -> Path:
     rows: List[Dict[str, Any]] = [
         # (i) legacy v1, converted in memory
-        {"cell": "trap-a", "signal": "success", "timestamp": "2026-01-01T00:00:00Z", "source": "ci", "event_id": "v1-1"},
+        {"rule_id": "trap-a", "signal": "success", "timestamp": "2026-01-01T00:00:00Z", "source": "ci", "event_id": "v1-1"},
         # (ii) v2 outcome row as 4.3.3 ledger.append writes it
         _v2(seq=1, rule="trap-a", outcome="tp", source="ci", host=None, session=None, key="k-tp"),
         # (iv) v2 outcome row with keys a 4.4.0 writer may add

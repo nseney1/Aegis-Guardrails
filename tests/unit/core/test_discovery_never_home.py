@@ -7,6 +7,8 @@ repository under it falls back to.
 """
 from __future__ import annotations
 
+import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -74,3 +76,45 @@ def test_a_pin_naming_a_real_workspace_still_binds(home, monkeypatch, tmp_path):
     monkeypatch.setenv("AEGIS_WORKSPACE", str(proj))
     monkeypatch.chdir(tmp_path)
     assert resolve_workspace_root() == proj
+
+
+@pytest.fixture
+def real_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """``$HOME`` overridden (``make test``, CI, sandboxes) while the account's own home, as
+    the password database names it, holds the user rule layer. ROOT C2's 2026-11-02 hang:
+    tests whose TMPDIR sat inside the real home bound the whole home as their workspace."""
+    pwd = pytest.importorskip("pwd")
+    real = tmp_path / "real-home"
+    (real / ".aegis" / "rules").mkdir(parents=True)
+    isolated = tmp_path / "isolated-home"
+    isolated.mkdir()
+    monkeypatch.setenv("HOME", str(isolated))
+    monkeypatch.setenv("USERPROFILE", str(isolated))
+    monkeypatch.delenv("AEGIS_WORKSPACE", raising=False)
+    getpwuid = pwd.getpwuid
+    mine = getpwuid(os.getuid())
+    entry = pwd.struct_passwd((*mine[:5], str(real), *mine[6:]))
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: entry if uid == os.getuid() else getpwuid(uid))
+    return real.resolve()
+
+
+@pytest.mark.parametrize("how", ["cwd", "start", "caller_file"])
+def test_a_folder_under_the_real_home_never_resolves_to_it_when_home_is_overridden(real_home, monkeypatch, how):
+    start = real_home / "jobs" / "job" / "tmp"
+    start.mkdir(parents=True)
+    assert not _is_workspace_dir(str(real_home))
+    monkeypatch.chdir(start if how == "cwd" else real_home.parent)
+    kwargs = {"start": start} if how == "start" else ({"caller_file": start / "app.py"} if how == "caller_file" else {})
+    root = resolve_workspace_root(**kwargs)
+    assert root != real_home
+    assert root == (real_home.parent if how == "caller_file" else start)
+
+
+def test_user_configuration_in_the_real_home_is_not_a_workspace(real_home):
+    shutil.rmtree(real_home / ".aegis")
+    (real_home / ".aegis").mkdir()
+    (real_home / ".aegis/config.json").write_text('{"v": 1}\n', encoding="utf-8")
+    start = real_home / "code"
+    start.mkdir()
+    assert resolve_workspace_root(start=start) == start
+    assert not _is_workspace_dir(str(real_home))

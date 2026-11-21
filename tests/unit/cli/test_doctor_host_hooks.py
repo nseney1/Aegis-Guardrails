@@ -386,7 +386,7 @@ def test_an_unreadable_file_beside_a_registered_entry_keeps_the_entry(env):
 
 def test_a_read_run_with_hook_files_writes_nothing(env):
     env.install("claude-code")
-    env.write_json(env.home / ".codex" / "hooks.json", {"hooks": {"Stop": [{"hooks": [handler("soma hook stop")]}]}})
+    env.write_json(env.home / ".codex" / "hooks.json", {"hooks": {"Stop": [{"hooks": [handler("aegis hook stop")]}]}})
     before = _snapshot(env.tmp)
     env.doctor()
     env.run()
@@ -400,9 +400,9 @@ V3_CLAUDE = {
     "hooks": {
         "PreToolUse": [
             {"matcher": "Bash", "hooks": [handler("aegis hook pre-invocation"), handler("/usr/bin/lint")]},
-            {"matcher": "Edit", "hooks": [handler("/home/u/.local/bin/soma hook immune-init", timeout=15)]},
+            {"matcher": "Edit", "hooks": [handler("/home/u/.local/bin/aegis hook governance-monitor", timeout=15)]},
         ],
-        "Stop": [{"hooks": [handler("cd /repo && soma hook session-close")]}],
+        "Stop": [{"hooks": [handler("cd /repo && aegis hook session-close")]}],
         "SessionEnd": [{"hooks": [handler("/usr/bin/keep-me")]}],
     },
 }
@@ -424,10 +424,10 @@ def test_v3_hook_entries_are_flagged_in_every_host_file(env):
 
 
 @pytest.mark.parametrize("command", [
-    "cd /repo; soma hook stop",
-    "exec soma hook stop",
+    "cd /repo; aegis hook stop",
+    "exec aegis hook stop",
     "true || aegis hook session-close",
-    r"C:\Tools\soma.exe hook stop",
+    r"C:\Tools\aegis.exe hook stop",
     r"C:\Tools\aegis.exe hook stop",
 ])
 def test_a_v3_call_anywhere_a_command_starts_is_flagged(env, command):
@@ -488,9 +488,9 @@ def test_fix_removes_only_the_v3_entries_and_backs_each_file_up(env):
     "aegis hook safety-gate",
     "aegis hook install",
     "aegis hook pre-commit",
-    "somatic hook stop",
-    "echo soma hook stop",
-    "/x/soma-hook stop",
+    "other-program hook stop",
+    "echo aegis hook stop",
+    "/x/aegis-hook stop",
 ])
 def test_commands_that_only_look_like_v3_hooks_are_left_alone(env, command):
     env.write_json(env.home / ".claude" / "settings.json",
@@ -500,7 +500,7 @@ def test_commands_that_only_look_like_v3_hooks_are_left_alone(env, command):
 
 def test_an_exec_form_v3_entry_is_flagged(env):
     env.write_json(env.home / ".claude" / "settings.json", {"hooks": {"Stop": [{"hooks": [
-        handler("/home/u/.local/bin/soma", args=["hook", "session-close"])]}]}})
+        handler("/home/u/.local/bin/aegis", args=["hook", "session-close"])]}]}})
     assert len(findings(env.doctor(), "legacy_hook_entry")) == 1
 
 
@@ -510,8 +510,8 @@ def plugin(env: Env) -> Path:
 
 def test_the_stale_agy_plugin_is_flagged_and_fix_deletes_it_with_a_backup(env):
     path = env.write_json(plugin(env), {
-        "governance-monitor": {"PreInvocation": [handler("soma hook pre-invocation", timeout=15)]},
-        "session-close": {"Stop": [handler("soma hook session-close", timeout=30)]}})
+        "governance-monitor": {"PreInvocation": [handler("aegis hook pre-invocation", timeout=15)]},
+        "session-close": {"Stop": [handler("aegis hook session-close", timeout=30)]}})
     original = path.read_bytes()
     payload = env.doctor()
     (stale,) = findings(payload, "legacy_hook_plugin")
@@ -529,7 +529,7 @@ def test_the_stale_agy_plugin_is_flagged_and_fix_deletes_it_with_a_backup(env):
 def test_a_plugin_file_with_other_entries_loses_only_the_v3_ones(env):
     keep = {"matcher": "run_command", "hooks": [handler("/usr/bin/mine")]}
     path = env.write_json(plugin(env), {
-        "governance-monitor": {"PreInvocation": [handler("soma hook pre-invocation")]},
+        "governance-monitor": {"PreInvocation": [handler("aegis hook pre-invocation")]},
         "mine": {"PreToolUse": [keep]}})
     (stale,) = findings(env.doctor(), "legacy_hook_plugin")
     assert "deletes" not in stale["message"]
@@ -539,7 +539,7 @@ def test_a_plugin_file_with_other_entries_loses_only_the_v3_ones(env):
 
 
 def _stale_plugin(env: Env) -> Path:
-    return env.write_json(plugin(env), {"governance-monitor": {"PreInvocation": [handler("soma hook pre-invocation")]}})
+    return env.write_json(plugin(env), {"governance-monitor": {"PreInvocation": [handler("aegis hook pre-invocation")]}})
 
 
 def _bits(path: Path) -> int:
@@ -581,8 +581,8 @@ def test_fix_refuses_a_symlinked_backups_directory_and_writes_nothing_through_it
 
 def test_fix_skips_a_hook_file_that_changed_after_the_check(env, monkeypatch):
     path = env.write_json(env.home / ".codex" / "hooks.json",
-                          {"hooks": {"Stop": [{"hooks": [handler("soma hook stop")]}]}})
-    changed = json.dumps({"hooks": {"Stop": [{"hooks": [handler("soma hook stop")]}], "x": []}})
+                          {"hooks": {"Stop": [{"hooks": [handler("aegis hook stop")]}]}})
+    changed = json.dumps({"hooks": {"Stop": [{"hooks": [handler("aegis hook stop")]}], "x": []}})
 
     def confirm_then_edit(prompt):
         path.write_text(changed, encoding="utf-8")
@@ -598,7 +598,7 @@ def test_fix_refuses_a_symlinked_hook_file(env):
     if os.name == "nt":
         pytest.skip("symlinks need privileges on Windows")
     real = env.write_json(env.tmp / "dotfiles" / "settings.json",
-                          {"hooks": {"Stop": [{"hooks": [handler("soma hook stop")]}]}})
+                          {"hooks": {"Stop": [{"hooks": [handler("aegis hook stop")]}]}})
     link = env.home / ".claude" / "settings.json"
     link.parent.mkdir(parents=True)
     link.symlink_to(real)

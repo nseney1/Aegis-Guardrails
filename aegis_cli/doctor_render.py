@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from aegis_cli.doctor_base import SCHEMA, SOURCE, Registered, _Ctx, _Finding, _clean
 from aegis_cli.doctor_findings import _TIER_TEXT
 from aegis_cli.formatters.text import render_tier
+from aegis_cli.ui.theme import OutputContext, diagnostic_text
 from aegis_core import primitives
 from aegis_core import codeowners, github_ruleset, human_gate
 
@@ -60,16 +61,19 @@ def _payload(diag: _Diagnosis, checks: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 _ICON = {"ok": "✅", "missing_binary": "➖", "unregistered": "❌", "auth_unknown": "❔", "policy_gap": "⚠️ "}
+_BADGE_LABEL = {"ok": "PASS", "missing_binary": "INFO", "unregistered": "FAIL", "auth_unknown": "WARN", "policy_gap": "WARN"}
+_DIAGNOSTIC_UI = OutputContext(emoji_enabled=True)
 
 
-def _print_hosts(diag: _Diagnosis) -> None:
+def _print_hosts(diag: _Diagnosis, ui: OutputContext = _DIAGNOSTIC_UI) -> None:
     ctx = diag.ctx
     how = "from .aegis/config.json" if ctx.selection == "config" else "every supported host; aegis init --host picks yours"
     print(f"\nHosts ({how}):")
     for row in diag.rows:
         reg, boot, budget = row["registration"], row["bootstrap"], row["budget"]
         label = " [experimental]" if row["experimental"] else ""
-        print(f"  {_ICON[row['state']]} {row['display_name']} ({row['id']}){label}: {row['state']}")
+        badge = ui.diagnostic_badge(_ICON[row["state"]], _BADGE_LABEL[row["state"]])
+        print(f"  {badge} {row['display_name']} ({row['id']}){label}: {row['state']}")
         if row["experimental"]:
             print("      experimental documented by the vendor, not yet checked on a real install "
                   "(verified after 3 clean runs)")
@@ -143,14 +147,14 @@ def _print_tiers(diag: _Diagnosis) -> None:
                 print(f"  {'':<14} {'':<12}   - {gap}")
 
 
-def _print_trust(diag: _Diagnosis) -> None:
+def _print_trust(diag: _Diagnosis, ui: OutputContext = _DIAGNOSTIC_UI) -> None:
     from aegis_core import gitsafe
 
     print("")
     for line in render_tier(diag.trust.as_dict()):
         print(_clean(line, 4096))
     if gitsafe.toplevel(diag.ctx.root) is not None:
-        for line in _ci_workflow_lines(_ci_workflow(diag.ctx.root)):
+        for line in _ci_workflow_lines(_ci_workflow(diag.ctx.root), ui):
             print("  " + _clean(line, 4096))
     modes = diag.modes
     if modes is not None and modes.supported and modes.looser:
@@ -158,13 +162,13 @@ def _print_trust(diag: _Diagnosis) -> None:
               "(aegis migrate --apply tightens them).")
 
 
-def _print_findings(findings: List[_Finding]) -> None:
+def _print_findings(findings: List[_Finding], ui: OutputContext = _DIAGNOSTIC_UI) -> None:
     if not findings:
         return
     print("\nWarnings:")
     for finding in findings:
-        icon = "ℹ️ " if finding.severity == "info" else "⚠️ "
-        print(f"  {icon} {finding.message}")
+        icon = ui.diagnostic_badge("ℹ️ ", "INFO") if finding.severity == "info" else ui.diagnostic_badge("⚠️ ", "WARN")
+        print(f"  {icon} {diagnostic_text(finding.message, 4096)}")
 
 
 def _print_plan(plan: List[_Change], home: Optional[Path]) -> None:
@@ -180,16 +184,18 @@ def _print_plan(plan: List[_Change], home: Optional[Path]) -> None:
         print(f"  {index}. {_clean(change.path, 4096)}: {_clean('; '.join(change.describe), 4096)}")
 
 
-def _print_results(results: List[Dict[str, Any]], backup: Optional[Path]) -> None:
+def _print_results(results: List[Dict[str, Any]], backup: Optional[Path],
+                   ui: OutputContext = _DIAGNOSTIC_UI) -> None:
     print("")
     for item in results:
-        icon = {"applied": "✅", "skipped": "⚠️ ", "failed": "❌"}[item["status"]]
-        line = f"  {icon} {_clean(item['path'], 4096)}: {_clean('; '.join(item['changes']), 4096)}"
+        icon, label = {"applied": ("✅", "PASS"), "skipped": ("⚠️ ", "WARN"), "failed": ("❌", "FAIL")}[item["status"]]
+        badge = ui.diagnostic_badge(icon, label)
+        line = f"  {badge} {diagnostic_text(item['path'], 4096)}: {diagnostic_text('; '.join(item['changes']), 4096)}"
         if item["reason"]:
-            line += f" ({item['status']}: {item['reason']})"
+            line += f" ({item['status']}: {diagnostic_text(item['reason'], 4096)})"
         print(line)
     if backup is not None:
-        print(f"\nBackups: {_clean(backup, 4096)}")
+        print(f"\nBackups: {diagnostic_text(str(backup), 4096)}")
 
 
 # ── --github: what the trust tiers need, and --apply ────────────────────────
@@ -225,13 +231,13 @@ def _ci_workflow(root: Path) -> Dict[str, Any]:
     return {"name": name, "source": "user-config" if named else "default", "present": present}
 
 
-def _ci_workflow_lines(info: Dict[str, Any]) -> List[str]:
-    where = f".github/workflows/{info['name']}"
+def _ci_workflow_lines(info: Dict[str, Any], ui: OutputContext = _DIAGNOSTIC_UI) -> List[str]:
+    where = f".github/workflows/{diagnostic_text(info['name'], 4096)}"
     how = ("(ci.workflow)" if info["source"] == "user-config"
            else "(default; set ci.workflow in ~/.aegis/config.json to use another workflow)")
     lines = [f"CI credit: credit looks for runs of {where} {how}"]
     if not info["present"]:
-        lines.append(f"⚠️  {where} is missing at HEAD, so no credit can be confirmed")
+        lines.append(f"{ui.diagnostic_badge('⚠️ ', 'WARN')} {where} is missing at HEAD, so no credit can be confirmed")
     return lines
 
 
@@ -254,11 +260,11 @@ def _github_plan(root: Path, report: Any) -> Dict[str, Any]:
     }
 
 
-def _print_github(plan: Dict[str, Any], report: Any) -> None:
+def _print_github(plan: Dict[str, Any], report: Any, ui: OutputContext = _DIAGNOSTIC_UI) -> None:
     print("aegis doctor --github: what the trust tiers need (read-only; nothing below has been applied)\n")
     for line in render_tier(report.as_dict()):
         print(_clean(line, 4096))
-    for line in _ci_workflow_lines(plan["ci_workflow"]):
+    for line in _ci_workflow_lines(plan["ci_workflow"], ui):
         print(_clean(line, 4096))
     checks = ", ".join(plan["required_checks"])
     if plan["required_checks_from_workflows"]:

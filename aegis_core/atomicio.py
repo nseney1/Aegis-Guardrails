@@ -9,6 +9,7 @@ storage, which re-exports the public names, and gitsafe both use them without im
   (a key file); False when the file already exists.
 - ``_open_regular``: the opener of storage's readers, locks and appends; it refuses a symlink and
   anything but a regular file.
+- ``open_regular``: the public entry point with the same descriptor and refusal semantics.
 """
 from __future__ import annotations
 
@@ -28,6 +29,7 @@ __all__ = [
     "atomic_write_text",
     "create_private_file",
     "fsync_dir",
+    "open_regular",
 ]
 
 _O_BINARY = getattr(os, "O_BINARY", 0)
@@ -100,6 +102,16 @@ def _open_regular(path: Path, flags: int, mode: Optional[int] = None) -> int:
         os.close(fd)
         raise
     return fd
+
+
+def open_regular(path: Path | str, flags: int, mode: Optional[int] = None) -> int:
+    """Open a regular file without following a leaf symlink; the caller closes the descriptor.
+
+    Passes flags and mode to the established opener, including exclusive creation. Raises
+    PathTraversalError for symlinks/nonregular files and OSError for other open failures.
+    Ancestor confinement remains the caller's responsibility.
+    """
+    return _open_regular(Path(path), flags, mode)
 
 
 # ── Atomic writes ─────────────────────────────────────────────────────────────

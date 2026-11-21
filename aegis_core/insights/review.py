@@ -3,16 +3,18 @@ decisions that hide or resurface insights, and the closed-template proposal."""
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import replace
 from datetime import datetime
 import hashlib
-import json
 import math
 import os
 from pathlib import Path
 import re
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple
 
-from aegis_core.insights.capture import JOIN_WINDOW_S, _corroborating_hook, _row_source
+from aegis_core.insights.capture import (
+    JOIN_WINDOW_S, _corroborating_hook, _row_source, clean_insight_row,
+)
 from aegis_core.insights.keys import (
     COUNTABLE_LEVELS,
     INSIGHT_SCHEMA_VERSION,
@@ -20,9 +22,9 @@ from aegis_core.insights.keys import (
     insights_path,
     read_insight_rows,
 )
+from aegis_core.insights.records import DECISIONS, MAX_INSIGHT_ITEMS
 from aegis_core.primitives import parse_utc, utc_stamp
 from aegis_core.redaction import redact_insight_text
-from aegis_core.storage import atomic_write_text
 from aegis_core.workspace.layout import WorkspaceLayout
 
 if TYPE_CHECKING:
@@ -43,9 +45,9 @@ REJECTION_RESURFACE_COUNT = 2
 # RULE_MATCH_SIM_WITH_PATH and any insight at RULE_MATCH_SIM; recurrence counts at RECURRENCE_SIM.
 RULE_MATCH_SIM_WITH_PATH = 0.15
 RULE_MATCH_SIM = 0.30
-DECISIONS = ("propose", "reject", "snooze", "merge-into-rule", "noise", "confirm")
 # The latest of these naming an insight decides whether review lists it (noise hides for good).
 _RULING_DECISIONS = ("propose", "merge-into-rule", "snooze", "reject")
+assert set(_RULING_DECISIONS).issubset(DECISIONS)
 
 
 def _effective_level(row: Mapping[str, Any], confirmed_ids: Set[str]) -> Optional[str]:
@@ -60,11 +62,17 @@ def _effective_level(row: Mapping[str, Any], confirmed_ids: Set[str]) -> Optiona
     return None
 
 
+def _insight_decision(row: Mapping[str, Any]) -> bool:
+    # Old proposal rows shared the event name. They are queue state, including
+    # when read from an existing log, and never insight review decisions.
+    return row.get("event") == "decision" and "proposal_ids" not in row
+
+
 def _confirmed(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Optional[str]]:
     """{insight id: kind or None} of the suggestions a human confirmed."""
     found: Dict[str, Optional[str]] = {}
     for r in rows:
-        if r.get("event") == "decision" and r.get("decision") == "confirm":
+        if _insight_decision(r) and r.get("decision") == "confirm":
             kind = r.get("kind") if isinstance(r.get("kind"), str) else None
             found.update({str(i): kind or found.get(str(i)) for i in r.get("insight_ids") or []})
     return found
@@ -226,19 +234,20 @@ def record_decision(
 ) -> Dict[str, Any]:
     """A human decision on the insights it names; ``confirm`` names the suggestions a human
     confirms (and their ``kind``)."""
-    if decision not in DECISIONS:
-        raise ValueError(f"decision must be one of {list(DECISIONS)}, got {decision!r}")
-    ids = [str(i) for i in insight_ids if str(i).strip()]
-    if not ids:
+    decision = clean_insight_row({"decision": decision}, workspace=workspace)["decision"]
+    if (type(insight_ids) in (tuple, list) and len(insight_ids) <= MAX_INSIGHT_ITEMS and
+            all(type(item) is str and not item.strip() for item in insight_ids)):
         raise ValueError(f"{decision} needs at least one insight id")
     row: Dict[str, Any] = {"v": INSIGHT_SCHEMA_VERSION, "ts": utc_stamp(), "event": "decision",
-                           "decision": decision, "insight_ids": ids}
+                           "decision": decision, "insight_ids": insight_ids}
     if kind:
         row["kind"] = str(kind)
     if reason:
-        row["reason"] = redact_insight_text(str(reason))
-    if rule_id:
-        row["rule_id"] = str(rule_id)
+        row["reason"] = str(reason)
+    if rule_id is not None:
+        row["rule_id"] = rule_id
+    # The id list is checked once, inside this clean. A refusal returns before append.
+    row = clean_insight_row(row, workspace=workspace)
     _append_user_insights(insights_path(workspace, home=home), [row])
     return row
 
@@ -307,12 +316,12 @@ def review_insights(workspace: Any, *, home: Optional[Path] = None) -> Dict[str,
     noise_ids = {
         str(x)
         for r in all_rows
-        if r.get("event") == "decision" and r.get("decision") == "noise"
+        if _insight_decision(r) and r.get("decision") == "noise"
         for x in (r.get("insight_ids") or [])
         if x
     }
     decisions = [(idx, r) for idx, r in enumerate(all_rows)
-                 if r.get("event") == "decision" and r.get("decision") in _RULING_DECISIONS]
+                 if _insight_decision(r) and r.get("decision") in _RULING_DECISIONS]
     confirmed = _confirmed(all_rows)
     # Review is the authority on corroboration: recomputed here, read-only, whatever the order
     # of capture and prompt. A corroborated suggestion annotates its hook row and never counts.
@@ -382,7 +391,6 @@ def review_insights(workspace: Any, *, home: Optional[Path] = None) -> Dict[str,
     return {"insights": shown, "suppressed": suppressed, "suggestions": suggestions}
 
 
-_SAFE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,63}$")
 _VERBATIM_MIN_CHARS = 25
 
 
@@ -416,7 +424,7 @@ def _proposal_targets(members: Sequence[Sequence[str]], rows: Sequence[Mapping[s
     return [c + "**" if c.endswith("/") else c for c in chosen]
 
 
-def write_proposal(
+def _insight_proposal(
     workspace: Any,
     *,
     proposal_id: str,
@@ -424,12 +432,31 @@ def write_proposal(
     summary_bullets: Sequence[str] = (),
     kind: Optional[str] = None,
     home: Optional[Path] = None,
-) -> Path:
+) -> Any:
     """The closed-template proposal (spec T8 Propose): an advisory trap whose kind (the reviewer's,
     else the one its counted insights share), count, ids and target_paths come from the insights."""
-    clean_id = proposal_id.strip()
-    if not _SAFE_ID_RE.match(clean_id):
-        raise ValueError(f"invalid proposal_id {proposal_id!r}")
+    from aegis_core.proposals.model import (
+        Proposal, ProposalError, bounded_tuple, checked_id, checked_insight_id, clean_text,
+    )
+
+    try:
+        clean_id = checked_id(proposal_id)
+    except ValueError:
+        raise ProposalError("insight_id") from None
+    try:
+        ids = list(bounded_tuple(insight_ids, 256, checked_insight_id))
+    except ProposalError:
+        raise ProposalError("insight_counted") from None
+    if type(summary_bullets) not in (tuple, list) or len(summary_bullets) > 64:
+        raise ProposalError("insight_summary")
+    for bullet in summary_bullets:
+        clean_text(bullet, 200)
+    if kind is None:
+        typed_kind = ""
+    else:
+        if type(kind) is not str or "\r" in kind or "\n" in kind:
+            raise ProposalError("invalid")
+        typed_kind = clean_text(kind, 64)
     # Only human text is protected: an agent capture must not be able to veto a proposal. A
     # short prompt ("no", "revert") protects only a bullet equal to it.
     rows = read_insight_rows(workspace, home=home)
@@ -441,55 +468,88 @@ def write_proposal(
         for r in rows
         if levels.get(id(r)) in ("H", "cli", "W2") and str(r.get("text") or "").strip()
     ]
-    typed_kind = " ".join(str(kind).split()) if kind and str(kind).strip() else ""
-    typed_clean = redact_insight_text(typed_kind, max_len=64)
-    written = [redact_insight_text(str(b).strip(), max_len=200) for b in summary_bullets if str(b).strip()]
+    typed_clean = typed_kind
+    written = [clean_text(b, 200) for b in summary_bullets if b.strip()]
     # Stored text is redacted, so a typed copy holding an email or a home path differs from it
     # raw: the forms the proposal writes (the bullet quotes the kind without backticks) are linted too.
-    for cand in (kind or "", *summary_bullets, typed_clean, typed_clean.replace("`", ""), *written):
+    for cand in ("" if kind is None else kind, *summary_bullets, typed_clean, typed_clean.replace("`", ""), *written):
         clow = str(cand).strip().lower()
         if clow and any(ex == clow or (len(ex) >= _VERBATIM_MIN_CHARS and ex in clow)
                         or (len(clow) >= _VERBATIM_MIN_CHARS and clow in ex) for ex in protected):
-            raise ValueError("proposal may not contain verbatim H/cli/W2 prompt text")
-    ids = list(dict.fromkeys(str(i).strip() for i in insight_ids if str(i).strip()))
+            raise ProposalError("insight_verbatim")
     superseded = _superseded(rows)
     counted = {str(r.get("id")): r for r in rows if levels.get(id(r)) in COUNTABLE_LEVELS and id(r) not in superseded}
     missing = [i for i in ids if i not in counted]
     if not ids or missing:
-        raise ValueError(f"not a counted insight: {', '.join(missing) or 'none given'}")
+        raise ProposalError("insight_counted", insight_ids=missing)
     members = [counted[i] for i in ids]
     kinds = sorted({str(k) for k in (confirmed.get(i) if _row_source(r) == "mcp" else r.get("kind")
                                      for i, r in zip(ids, members)) if k})
-    chosen_kind = typed_kind or (kinds[0] if len(kinds) == 1 else "")
+    chosen_kind = typed_kind if len(typed_kind) > 0 else (kinds[0] if len(kinds) == 1 else "")
     if not chosen_kind:
-        raise ValueError(f"the insights share no single kind ({', '.join(kinds) or 'none'}); pass --kind")
+        raise ProposalError("insight_kind")
     member_paths = [[str(p) for p in r.get("paths") or []] for r in members]
     if not any(member_paths):
-        raise ValueError("the insights carry no paths, so the proposal would target every file; "
-                         "record them with aegis rule insight add --paths")
+        raise ProposalError("insight_paths")
     targets = _proposal_targets([ps for ps in member_paths if ps], rows)
-    clean_kind = redact_insight_text(chosen_kind, max_len=64)
+    clean_kind = clean_text(chosen_kind, 64)
     bullets = [f"{len(members)} counted correction(s) of kind `{clean_kind.replace('`', '')}`."]
     bullets += written
     hyp = f"Prevent recurring {clean_kind} issues in {', '.join(targets)}."
-    lines = [
-        "---",
-        f"id: {clean_id}",
-        "type: trap",
-        "status: proposal",
-        "enforcement: advisory",
-        f"kind: {json.dumps(clean_kind)}",
-        f"count: {len(members)}",
-        f"hypothesis: {json.dumps(hyp)}",
-        "target_paths:\n" + "\n".join(f"  - {json.dumps(p)}" for p in targets),
-        "insight_ids:\n" + "\n".join(f"  - {json.dumps(i)}" for i in ids),
-        "---",
-        f"# Proposal: {clean_id}\n",
-        "## Guidance\n",
-        "\n".join(f"- {b}" for b in bullets) + "\n",
-    ]
-    prop_dir = WorkspaceLayout(Path(os.fspath(workspace)).resolve()).aegis_dir / "proposals"
-    prop_dir.mkdir(parents=True, exist_ok=True)
-    target = prop_dir / f"{clean_id}.md"
-    atomic_write_text(target, "\n".join(lines))
+    proposal = Proposal(id=clean_id, source="insight", kind=clean_kind,
+                    candidate_key="insight:" + hashlib.sha256("\n".join(sorted(ids)).encode()).hexdigest(),
+                    evidence_ids=tuple("insight:" + i for i in ids), insight_ids=tuple(ids),
+                    target_paths=tuple(targets), status="proposal", hypothesis=hyp,
+                    do=bullets[0], guidance=tuple(bullets))
+    def legacy_retry():
+        # Only an existing legacy mismatch needs historical truncation. Building
+        # this projection must never veto a valid current proposal or retry.
+        baseline_kind_input = kind if len(typed_kind) > 0 else kinds[0]
+        baseline_kind = redact_insight_text(baseline_kind_input, max_len=64)
+        baseline_first = clean_text(f"{len(members)} counted correction(s) of kind `{clean_text(baseline_kind, 64).replace('`', '')}`.", 200)
+        baseline_guidance = (baseline_first,) + tuple(redact_insight_text(b, max_len=200)
+                                                    for b in summary_bullets if b.strip())
+        baseline_hyp = f"Prevent recurring {baseline_kind} issues in {', '.join(targets)}."
+        return replace(proposal, kind=baseline_kind, hypothesis=baseline_hyp,
+                       do=baseline_first, guidance=baseline_guidance)
+
+    return proposal, legacy_retry
+
+
+def _proposal_root(workspace: Any) -> Path:
+    from aegis_core.proposals.model import ProposalError
+
+    spelling = workspace.__fspath__() if isinstance(workspace, os.PathLike) else workspace
+    if type(spelling) is not str or not 1 <= len(spelling) <= 32768:
+        raise ProposalError("invalid")
+    try:
+        return Path(spelling).resolve()
+    except (OSError, RuntimeError, ValueError):
+        raise ProposalError("invalid") from None
+
+
+def write_proposal(
+    workspace: Any, *, proposal_id: str, insight_ids: Sequence[str],
+    summary_bullets: Sequence[str] = (), kind: Optional[str] = None, home: Optional[Path] = None,
+) -> Path:
+    """Keep insight eligibility/verbatim checks; publish through the proposal store."""
+    from aegis_core.proposals import store as proposal_store
+    from aegis_core.proposals.model import ProposalError, legacy_insight_text
+    from aegis_core.storage import atomic_write_text
+
+    root = _proposal_root(workspace)
+    store = proposal_store.ProposalStore(root, home=home)
+    proposal, legacy_retry = _insight_proposal(root, proposal_id=proposal_id, insight_ids=insight_ids,
+                                summary_bullets=summary_bullets, kind=kind, home=store.home)
+    if proposal_store.descriptor_supported():
+        store.write(proposal, legacy_retry=legacy_retry)
+        return WorkspaceLayout(root).aegis_dir / "proposals" / (proposal.id + ".md")
+    # Coordinator ruling: retain the pre-change publication path on platforms
+    # without the descriptor primitives. New store operations still refuse.
+    target = WorkspaceLayout(root.resolve()).aegis_dir / "proposals" / (proposal.id + ".md")
+    text = legacy_insight_text(proposal)
+    try:
+        atomic_write_text(target, text)
+    except OSError:
+        raise ProposalError("io") from None
     return target

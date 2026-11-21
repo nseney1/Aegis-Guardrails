@@ -78,6 +78,10 @@ docs/postmortem-work-sessions.md
 .aegis/locks/
 .aegis/human_insights.jsonl
 .aegis/receipts.jsonl
+.aegis/receipt_key
+.aegis/evidence/signals.jsonl
+.aegis/evidence/fitness.jsonl
+.aegis/evidence/sessions_processed.jsonl
 # Legacy MCP outcomes ledger: machine-local, wiped from git per ADR 0005 D13 (L1)
 .aegis/evidence/outcomes.jsonl
 docs/internal/

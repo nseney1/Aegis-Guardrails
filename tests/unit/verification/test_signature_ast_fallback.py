@@ -1,6 +1,6 @@
 """Behavioral tests for BUG-077: ast.literal_eval crash on complex default expressions.
 
-extract_signatures() in immune_verify.py must not crash when encountering
+extract_signatures() in safety_verify.py must not crash when encountering
 non-literal default argument values (e.g. Path.cwd(), function calls, module constants).
 It must fall back to ast.unparse() to extract valid function signatures.
 """

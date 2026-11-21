@@ -160,9 +160,9 @@ def test_export_filters_by_fitness(src, tmp_path, capsys):
 
 def test_export_rejects_an_unknown_type_as_a_usage_error(src, tmp_path, capsys):
     with pytest.raises(SystemExit) as info:
-        main(["rule", "export", str(tmp_path / "p.json"), "--workspace", str(src), "--type", "wall"])
+        main(["rule", "export", str(tmp_path / "p.json"), "--workspace", str(src), "--type", "unsupported"])
     assert info.value.code == 2
-    assert "invalid choice: 'wall'" in capsys.readouterr().err
+    assert "invalid choice: 'unsupported'" in capsys.readouterr().err
 
 
 def test_export_reports_skipped_expired_rules(src, tmp_path, capsys):
@@ -332,7 +332,7 @@ def test_import_rename_keeps_both(src, dst, tmp_path, capsys):
 
 
 def test_import_json_refusal_lists_every_problem(src, dst, tmp_path, capsys):
-    pack = _write_pack(tmp_path / "evil.json", _entry("../../x.md", "a"), _entry("walls/y.md", "b"))
+    pack = _write_pack(tmp_path / "evil.json", _entry("../../x.md", "a"), _entry("unsupported/y.md", "b"))
     rc, stdout, stderr = _import(capsys, dst, pack, "--json")
     doc = json.loads(stdout)
     assert (rc, stderr) == (1, "")

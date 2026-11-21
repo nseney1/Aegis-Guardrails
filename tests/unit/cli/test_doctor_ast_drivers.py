@@ -3,6 +3,7 @@ import json
 import os
 import shlex
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -145,3 +146,58 @@ def test_driver_planning_failure_keeps_the_public_warning_document(project, caps
         "go: parser unavailable; pack 4; tests go test (default); coverage coverprofile (default)",
         f"⚠️  AST driver (.go): {reason}",
     ]
+
+
+@pytest.mark.parametrize("drivers_only", [False, True], ids=["full", "drivers"])
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("cold_cache", [False, True], ids=["missing", "cold"])
+def test_repair_hint_keeps_inspection_scope(project, monkeypatch, capsys, drivers_only, json_mode, cold_cache):
+    from aegis_cli import doctor
+    from aegis_core.ast import gobuild
+
+    root, home, _node = project
+    (root / "app.go").write_bytes(b"package main\n")
+    if cold_cache:
+        (root / ".aegis" / "config.json").write_bytes(b'{"v":1,"ast":{"packaged_drivers":["go"]}}')
+        monkeypatch.setattr(gobuild, "inspect_go_driver", lambda root: SimpleNamespace(
+            cache_hit=False, goversion="go1.22", compiler="go", binary=None))
+    monkeypatch.setattr(doctor, "_run_host_cli", lambda *args, **kwargs: pytest.fail("host CLI ran"))
+    monkeypatch.setattr(doctor._repair, "_apply", lambda *args: pytest.fail("repair ran"))
+    args = ["doctor", "--workspace", str(root)]
+    args += ["--drivers"] if drivers_only else []
+    args += ["--json"] if json_mode else ["--plain"]
+    main(args)
+    output = capsys.readouterr().out
+    if json_mode:
+        checks = json.loads(output)["checks"]
+        output = "\n".join(next(c for c in checks if c["id"] == "ast_drivers")["detail"])
+    hint = "aegis doctor --drivers --fix" if drivers_only else "aegis doctor --fix"
+    assert hint in output
+    other = "aegis doctor --fix" if drivers_only else "aegis doctor --drivers --fix"
+    assert other not in output
+    if not cold_cache:
+        assert "other languages need a user-scope driver" in output
+    assert not (home / ".aegis" / "backups").exists()
+
+
+@pytest.mark.parametrize("quoting", ["single", "double", "unquoted"])
+def test_windows_doctor_uses_the_runners_driver_decoding(project, monkeypatch, capsys, quoting):
+    from aegis_cli import doctor
+    from aegis_core import argv
+
+    root, home, node = project
+    program = node.parent / "Program Files" / "node.exe"
+    program.parent.mkdir()
+    program.write_bytes(b"not executed")
+    program.chmod(0o755)
+    (root / "app.go").write_bytes(b"package main\n")
+    first = {"single": shlex.quote(str(program)), "double": f'"{program}"', "unquoted": str(program)}[quoting]
+    command = first + " --json"
+    (home / ".aegis" / "config.json").write_text(json.dumps({"v": 1, "drivers": {"go": command}}), encoding="utf-8")
+    for module in (doctor, runner, argv):
+        monkeypatch.setattr(module, "os", SimpleNamespace(**{**vars(os), "name": "nt"}))
+    plan = runner.ASTDriverRegistry().plan_driver(".go", workspace_root=root)
+    assert plan.unavailable is None and plan.argv == (str(program), "--json")
+    code, check = _doctor(root, capsys)
+    assert (code, check["status"]) == (0, "pass")
+    assert check["detail"][-1] == f"✅ AST driver (.go): {program} resolvable ({program})"

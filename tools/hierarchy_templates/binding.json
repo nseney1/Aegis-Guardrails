@@ -1,0 +1,6 @@
+{
+  "endpoint": "a/lane/f2",
+  "host": "claude-code",
+  "session": "REPLACE_WITH_SESSION_LABEL",
+  "expected_generation": 0
+}

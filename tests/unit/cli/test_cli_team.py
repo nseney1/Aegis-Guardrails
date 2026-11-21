@@ -3,7 +3,7 @@
 The dispatcher runs these. Text mode prints the new lease oid alone on stdout (so a
 script can pass it to ``--expect``); ``--json`` prints one document carrying
 ``source``, ``aegis_version``, ``checked_at`` and ``scope``. Exit codes: 0 done, 1
-refused (taken, overlap, stale, absent, expired, unreadable) or a git error, 2 usage.
+refused (CLAIM_REFUSALS, including legacy_paths) or a git error, 2 usage.
 ``list`` and ``metrics`` are side-effect free. Real temp git repositories throughout.
 """
 from __future__ import annotations
@@ -20,7 +20,9 @@ from typing import List, Optional
 import pytest
 
 from aegis_cli.cli import main
-from aegis_core import events, team
+from aegis_cli import team_lease_output
+from aegis_core import events, team, team_queue, team_lease_custody
+from aegis_core import gitsafe as rendering_git
 from aegis_core._version import __version__
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
@@ -31,6 +33,297 @@ NOW = 1_760_000_000
 ENVELOPE = ("source", "aegis_version", "checked_at", "scope")
 VIEW_KEYS = ["lane", "role", "owner", "claim_id", "gen", "oid", "branch", "paths", "expires_at",
              "clock_basis", "expired", "clock_skew", "overlaps"]
+
+
+@pytest.mark.parametrize("argv", [
+    ["team", "model", "--json"],
+    ["--json", "team", "model", "--unknown", "token=private-value"],
+    ["--json=token=private-value", "team", "model"],
+    ["team", "model", "--bindings", "--json"],
+])
+def test_model_usage_is_json_exit_two_without_echo(capsys, argv):
+    assert main(argv) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out) == {"error": "invalid_model_arguments"}
+
+
+def test_model_workspace_failure_is_json_exit_two(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AEGIS_WORKSPACE", str(tmp_path / "missing-pin"))
+    assert main(["team", "model", "--bindings", "b", "--policy", "p", "--history", "h",
+                 "--task-kind", "T9", "--role-kind", "implementer", "--subject", "lane",
+                 "--host-kind", "codex-cli", "--workspace", "token=private-value", "--json"]) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out) == {"error": "model_workspace_unavailable"}
+
+
+def test_model_host_registry_is_bounded_during_argument_parsing(capsys):
+    assert main(["team", "model", "--json"] + ["--host-kind", "host"] * 257) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out) == {"error": "invalid_model_arguments"}
+
+
+def test_model_workspace_text_is_bounded_before_resolution(capsys):
+    assert main(["team", "model", "--workspace", "x" * 262145, "--bindings", "b", "--policy", "p",
+                 "--history", "h", "--task-kind", "T9", "--role-kind", "implementer", "--subject", "lane",
+                 "--host-kind", "host", "--json"]) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out) == {"error": "invalid_model_arguments"}
+
+
+def _model_argv_with_workspace(root, option, location):
+    workspace = [option + str(root)] if option.endswith("=") else [option, str(root)]
+    prefix = workspace + ["team", "model"] if location == "global" else ["team", *workspace, "model"]
+    return prefix + ["--bindings", "bindings.json", "--policy", "policy.json", "--history", "history.jsonl",
+                     "--task-kind", "T9", "--role-kind", "implementer", "--subject", "lane-one",
+                     "--host-kind", "codex-cli", "--json"]
+
+
+@pytest.mark.parametrize("option", ["--work", "--worksp", "--workspace=", "--worksp="])
+@pytest.mark.parametrize("location", ["global", "team"])
+@pytest.mark.parametrize("failure", ["usage", "workspace"])
+def test_model_workspace_spellings_keep_fixed_json_errors(tmp_path, monkeypatch, capsys, option, location, failure):
+    root = tmp_path / "workspace"
+    (root / ".aegis" / "rules").mkdir(parents=True)
+    monkeypatch.chdir(root)
+    monkeypatch.delenv("AEGIS_WORKSPACE", raising=False)
+    argv = _model_argv_with_workspace(root, option, location)
+    if failure == "usage":
+        argv.extend(["--unknown", "token=private-value"])
+        error = "invalid_model_arguments"
+    else:
+        monkeypatch.setenv("AEGIS_WORKSPACE", str(tmp_path / "missing-pin"))
+        error = "model_workspace_unavailable"
+    assert main(argv) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out) == {"error": error}
+
+
+@pytest.mark.parametrize("location", ["global", "team"])
+def test_abbreviated_workspace_operation_failure_is_fixed_json(tmp_path, monkeypatch, capsys, location):
+    from types import SimpleNamespace
+    from aegis_core import model_select
+
+    if not model_select._DIR_FD_SUPPORTED:
+        pytest.skip("requires anchored model-selection I/O")
+    root = tmp_path / "workspace"
+    (root / ".aegis" / "rules").mkdir(parents=True)
+    (root / "bindings.json").write_text("{}", encoding="utf-8")
+    monkeypatch.chdir(root)
+    monkeypatch.delenv("AEGIS_WORKSPACE", raising=False)
+
+    def fail(*args, **kwargs):
+        raise TypeError("token=private-value")
+
+    module_os = SimpleNamespace(**{name: getattr(os, name) for name in dir(os)})
+    module_os.open = fail
+    monkeypatch.setattr(model_select, "os", module_os)
+    assert main(_model_argv_with_workspace(root, "--worksp", location)) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out) == {"error": "model_io_unavailable"}
+
+
+@pytest.mark.parametrize("argv", [
+    ["--=token=private-value", "team", "model"],
+    ["team", "--=token=private-value", "model"],
+    ["team", "model", "--=token=private-value"],
+    ["--unknown", "token=private-value", "team", "model"],
+    ["team", "--unknown", "token=private-value", "model"],
+    ["team", "token=private-value", "model"],
+    ["team", "--unknown=token=private-value", "model"],
+    ["team", "model", "--unknown", "token=private-value"],
+    ["team", "model", "token=private-value"],
+], ids=["ambiguous-root", "ambiguous-team", "ambiguous-model", "unknown-value-root",
+        "unknown-value-before", "value-before", "unknown-equals-before", "unknown-value-after", "value-after"])
+def test_parser_routes_unknown_values_to_model_json_errors(capsys, argv):
+    assert main(argv) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out) == {"error": "invalid_model_arguments"}
+
+
+@pytest.mark.parametrize("argv", [
+    ["audit", "team", "model"],
+    ["hook", "stop", "team", "model"],
+    ["--work", "team", "model"],
+    ["--unknown", "token=private-value", "msg", "team", "model"],
+])
+def test_model_invocation_superset_covers_preparse_refusals(capsys, argv):
+    assert main(argv) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out) == {"error": "invalid_model_arguments"}
+
+
+@pytest.mark.parametrize("option", ["--w", "--wo", "--wor", "--work", "--works", "--worksp",
+                                   "--workspa", "--workspac", "--workspace", "--work=",
+                                   "--worksp=", "--workspace="])
+@pytest.mark.parametrize("name", ["audit", "install", "report", "agent"])
+@pytest.mark.parametrize("failure", ["usage", "workspace"])
+def test_removed_command_workspace_values_keep_model_json(tmp_path, monkeypatch, capsys, option, name, failure):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AEGIS_WORKSPACE", raising=False)
+    argv = _model_argv_with_workspace(name, option, "global")
+    if failure == "usage":
+        argv.extend(["--unknown", "token=private-value"])
+    assert main(argv) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    error = "invalid_model_arguments" if failure == "usage" else "model_workspace_unavailable"
+    assert json.loads(captured.out) == {"error": error}
+
+
+@pytest.mark.parametrize("option", ["--w", "--wo", "--wor", "--work", "--works", "--worksp",
+                                   "--workspa", "--workspac", "--workspace", "--work=",
+                                   "--worksp=", "--workspace="])
+def test_root_workspace_values_are_not_removed_commands(capsys, option):
+    workspace = [option + "audit"] if option.endswith("=") else [option, "audit"]
+    with pytest.raises(SystemExit) as exited:
+        main(workspace + ["status", "--help"])
+    assert exited.value.code == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "usage: aegis status" in captured.out
+
+
+@pytest.mark.parametrize("option", ["--round-workspace", "--round-work", "--round-work="])
+def test_removed_command_scan_uses_the_built_root_option_table(monkeypatch, capsys, option):
+    from aegis_cli import cli as cli_module
+
+    build_parser = cli_module._build_parser
+
+    def build(*args, **kwargs):
+        parser = build_parser(*args, **kwargs)
+        parser.add_argument("--round-workspace")
+        return parser
+
+    monkeypatch.setattr(cli_module, "_build_parser", build)
+    values = [option + "audit"] if option.endswith("=") else [option, "audit"]
+    with pytest.raises(SystemExit) as exited:
+        main(values + ["status", "--help"])
+    assert exited.value.code == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "usage: aegis status" in captured.out
+
+
+@pytest.mark.parametrize("argv", [
+    ["--=token=private-value", "status"],
+    ["--unknown", "token=private-value", "status"],
+    ["--unknown", "token=private-value", "model", "team"],
+    ["--unknown", "token=private-value", "--", "team", "model"],
+    ["--unknown", "token=private-value", "team", "--", "model"],
+    ["--unknown", "token=private-value", "team=model"],
+])
+def test_non_model_root_failures_keep_argparse_diagnostics(capsys, argv):
+    with pytest.raises(SystemExit) as exited:
+        main(argv)
+    assert exited.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "error:" in captured.err
+    assert "token=private-value" in captured.err
+
+
+def test_genuine_removed_audit_command_keeps_its_pointer(capsys):
+    assert main(["audit"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "aegis audit was removed in v4: use aegis doctor\n"
+
+
+@pytest.mark.parametrize("option,expected", [("--help", "Aegis"), ("--version", f"aegis {__version__}")])
+def test_non_model_keeps_successful_root_output(capsys, option, expected):
+    with pytest.raises(SystemExit) as exited:
+        main([option])
+    assert exited.value.code == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert expected in captured.out
+
+
+@pytest.mark.parametrize("argv,expected", [
+    (["hook", "run"], []),
+    # Root help already loads command metadata through the existing registry.
+    (["--help"], ["aegis_cli.team", "aegis_core.team_profile"]),
+], ids=["hook", "root-help"])
+def test_non_model_startup_preserves_baseline_imports(tmp_path, argv, expected):
+    import sys
+
+    root = Path(__file__).resolve().parents[3]
+    environment = dict(os.environ, PYTHONPATH=str(root))
+    environment.pop("AEGIS_WORKSPACE", None)
+    script = """import contextlib, io, json, sys
+from aegis_cli.cli import main
+with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    try:
+        code = main(json.loads(sys.argv[1]))
+    except SystemExit as error:
+        code = error.code
+assert code == 0, code
+print(json.dumps(sorted(sys.modules)))
+"""
+    result = subprocess.run([sys.executable, "-c", script, json.dumps(argv)], cwd=tmp_path,
+                            env=environment, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    modules = json.loads(result.stdout)
+    watched = {"aegis_cli.team", "aegis_core.model_select", "aegis_core.team_profile"}
+    assert sorted(set(modules) & watched) == expected
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+@pytest.mark.parametrize("argv", [
+    ["--work", "team", "--work", "model"],
+    ["team", "--work", "model", "--workspace", "token=private-value"],
+    ["team", "--work", "model"],
+    ["--worksp", "team", "--worksp", "model"],
+    ["team", "--worksp", "model", "--workspace=token=private-value"],
+    ["team", "--workspace=unused", "--worksp", "model"],
+    ["--workspace=unused", "--work", "team", "--worksp", "model"],
+    ["--work", "team", "--workspace=model", "model"],
+    ["--worksp", "team", "model"],
+    ["--work", "team", "status", "--work", "model"],
+    ["team", "claim", "docs", "--paths", "docs/**", "--owner", "model"],
+    ["--help", "team", "model"],
+    ["--version", "team", "model"],
+    ["team", "--help", "model"],
+    ["team", "model", "--help"],
+    ["hook", "run", "team", "model"],
+    ["hook", "run", "--host", "team", "model"],
+])
+def test_raw_model_invocation_has_only_model_json_outcomes(tmp_path, monkeypatch, capsys, argv, pinned):
+    root = tmp_path / "workspace"
+    (root / ".aegis" / "rules").mkdir(parents=True)
+    monkeypatch.chdir(root)
+    if pinned:
+        monkeypatch.setenv("AEGIS_WORKSPACE", str(root))
+    else:
+        monkeypatch.delenv("AEGIS_WORKSPACE", raising=False)
+    assert main(argv) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out) == {"error": "invalid_model_arguments"}
+
+
+def test_outer_model_policy_covers_stdout_setup_failure(monkeypatch, capsys):
+    from types import SimpleNamespace
+    from aegis_cli import cli as cli_module
+
+    def fail(**kwargs):
+        raise OSError("token=private-value")
+
+    # Replace this module's reference, leaving pytest's process streams intact.
+    monkeypatch.setattr(cli_module, "sys", SimpleNamespace(stdout=SimpleNamespace(reconfigure=fail)))
+    assert main(["team", "model"]) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out) == {"error": "model_io_unavailable"}
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -71,6 +364,7 @@ def _json(capsys, *argv: str):
 
 
 def _envelope(payload: dict, action: str) -> None:
+    assert payload["schema"] == f"aegis.team.{action}/v1"
     assert payload["source"] == f"aegis team {action}"
     assert payload["aegis_version"] == __version__
     assert TS.match(payload["checked_at"])
@@ -227,7 +521,7 @@ def test_outside_a_git_repository_team_is_a_usage_error(tmp_path: Path, monkeypa
 def test_no_action_prints_usage_and_exits_2(ws: Path, capsys):
     rc, out, err = _run(capsys)
     assert (rc, out) == (2, "")
-    assert err == ("usage: aegis team {claim,renew,transfer,release,gc,list,metrics} ...\n"
+    assert err == ("usage: aegis team {claim,renew,transfer,release,gc,list,status,metrics} ...\n"
                    "aegis team --help describes each action.\n")
 
 
@@ -306,6 +600,37 @@ def test_gc_collects_expired_leases(ws: Path, capsys):
     assert (rc, out, err) == (0, "nothing to collect\n", "kept junk: unreadable\n")
     rc, payload, _ = _json(capsys, "gc")
     assert payload["kept"] == [{"lane": "junk", "reason": "unreadable"}]
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_gc_separates_event_and_lane_warnings_and_clears_them_on_retry(ws: Path, tmp_path: Path, capsys, as_json):
+    shared = Path(os.path.realpath(ws / ".git")) / "aegis"
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    try:
+        os.symlink(str(elsewhere), str(shared), target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are unavailable")
+    for lane in ("api", "docs"):
+        team.claim(ws, lane, [lane + "/**"], owner="o@h", ttl_s=60, now=NOW, branch="main")
+    if as_json:
+        rc, payload, err = _json(capsys, "gc")
+        assert (rc, err) == (0, "")
+        assert [row["lane"] for row in payload["collected"]] == ["api", "docs"]
+        assert len(payload["warnings"]) == 2
+        assert all(isinstance(warning, str) and warning.startswith("event not recorded: ")
+                   for warning in payload["warnings"])
+        assert payload["lane_warnings"] == [
+            {"lane": lane, "reason": "expired_with_worktree"} for lane in ("api", "docs")]
+    else:
+        rc, out, err = _run(capsys, "gc")
+        assert (rc, out) == (0, "collected api\ncollected docs\n")
+        assert err.count("Warning: event not recorded: ") == 2
+        assert err.endswith("Warning: api: expired_with_worktree\nWarning: docs: expired_with_worktree\n")
+    assert all(_ref(ws, lane) is None for lane in ("api", "docs"))
+    rc, payload, err = _json(capsys, "gc")
+    assert (rc, payload["status"], payload["collected"], err) == (0, "nothing to collect", [], "")
+    assert payload["warnings"] == payload["lane_warnings"] == []
 
 
 # ── list ─────────────────────────────────────────────────────────────────────
@@ -453,3 +778,998 @@ def test_metrics_text_counts_an_excluded_synthetic_merge(ws: Path, capsys):
     assert rc == 0
     assert f"First-parent merges on {tip[:12]} since main: 0\n" in out
     assert out.endswith("  excluded synthetic pull-request merges: 1\n")
+
+
+# ── branch bytes on the public claim commands ───────────────────────────────
+
+_BRANCH_REASON = "branch must be 1 to 200 characters with no spaces or control characters"
+_SURROGATE_BYTES = b"feature/\xffmarker".decode("utf-8", "surrogateescape")
+_CLI_BRANCHES = [
+    ("feature/bytes", True, False),
+    ("feature/\u00fc", True, False),
+    ("feature/\ud800marker", False, True),
+    (_SURROGATE_BYTES, False, True),
+    ("", False, False),
+    ("x" * 201, False, False),
+    ("feature/a\nb", False, False),
+]
+_CLI_BRANCH_IDS = ["ascii", "utf8", "lone-surrogate", "surrogateescape", "empty", "over-length", "embedded-newline"]
+
+
+def _skip_posix_argv(posix_only: bool) -> None:
+    if posix_only and os.name == "nt":
+        pytest.skip("Windows argv cannot carry surrogate-escaped non-UTF-8 bytes")
+
+
+def _prepare_queue(ws: Path, tmp_path: Path) -> None:
+    if not team_queue.descriptor_supported():
+        pytest.skip("requires descriptor-relative nofollow operations")
+    (ws / ".aegis" / "team.json").write_text(
+        json.dumps({"v": 1, "lanes": {"docs": ["docs/**"]}}), encoding="utf-8")
+    home = tmp_path / "queue-home"
+    home.mkdir(exist_ok=True)
+    # The autouse hermetic_environment_and_mcp_isolation fixture restores this.
+    os.environ.update({"HOME": str(home), "USERPROFILE": str(home)})
+
+
+def _queue_json(capsys, root: Path, *argv: str):
+    rc = main(["--workspace", str(root), "team", "queue", *argv, "--json"])
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    return rc, json.loads(captured.out)
+
+
+@pytest.mark.parametrize("mode", ["text", "json"])
+@pytest.mark.parametrize("branch,accepted,posix_only", _CLI_BRANCHES, ids=_CLI_BRANCH_IDS)
+def test_cli_claim_branch_matrix(ws: Path, capsys, mode, branch, accepted, posix_only):
+    _skip_posix_argv(posix_only)
+    argv = ["claim", "docs", "--paths", "docs/**", "--owner", "o@h", "--branch", branch]
+    if mode == "json":
+        rc, payload, err = _json(capsys, *argv)
+        if accepted:
+            assert rc == 0 and err == ""
+            assert payload["lease"]["branch"] == branch
+            assert team.read_leases(ws).get("docs").branch == branch
+            return
+        assert rc == 2 and err == ""
+        assert payload["status"] == "error" and payload["error"] == _BRANCH_REASON
+        assert "marker" not in json.dumps(payload)
+    else:
+        rc, out, err = _run(capsys, *argv)
+        if accepted:
+            assert rc == 0, err
+            assert out == f"{_ref(ws, 'docs')}\n"
+            assert team.read_leases(ws).get("docs").branch == branch
+            return
+        assert rc == 2 and out == ""
+        assert err == f"Error: {_BRANCH_REASON}\n"
+        assert "marker" not in err
+    assert _ref(ws, "docs") is None
+    rc, out, err = _run(capsys, "claim", "docs", "--paths", "docs/**", "--owner", "o@h", "--branch", "feature/retry")
+    assert rc == 0, err
+    assert team.read_leases(ws).get("docs").branch == "feature/retry"
+
+
+@pytest.mark.parametrize("branch,accepted,posix_only", _CLI_BRANCHES, ids=_CLI_BRANCH_IDS)
+def test_cli_queue_claim_branch_matrix(ws: Path, tmp_path: Path, capsys, branch, accepted, posix_only):
+    _skip_posix_argv(posix_only)
+    if not accepted and not team_queue.descriptor_supported():
+        rc, payload = _queue_json(capsys, ws, "claim", "ONE", "--expect", "0" * 64, "--lane", "docs",
+                                  "--capability", "core", "--branch", branch)
+        assert rc == 2 and payload["reason"] == "invalid_arguments" and payload["exit_code"] == 2
+        assert payload["next_action"] == "Use the documented queue arguments and the revision returned by list."
+        assert "marker" not in json.dumps(payload)
+        assert not (ws / ".aegis" / "state" / "team-queue.json").exists()
+        return
+    _prepare_queue(ws, tmp_path)
+    item = json.dumps({"id": "ONE", "title": "Queue work", "paths": ["docs/**"], "capabilities": ["core"]})
+    rc, added = _queue_json(capsys, ws, "add", "--item", item)
+    assert rc == 0, added
+    revision = added["item"]["revision"]
+    path = ws / ".aegis" / "state" / "team-queue.json"
+    before = path.read_bytes()
+    rc, payload = _queue_json(capsys, ws, "claim", "ONE", "--expect", revision, "--lane", "docs",
+                              "--capability", "core", "--branch", branch)
+    if accepted:
+        assert rc == 0 and payload["refused"] is False, payload
+        assert payload["item"]["branch"] == branch
+        return
+    assert rc == 2 and payload["reason"] == "invalid_arguments" and payload["exit_code"] == 2
+    assert payload["next_action"] == "Use the documented queue arguments and the revision returned by list."
+    assert "marker" not in json.dumps(payload)
+    assert path.read_bytes() == before
+    rc, retried = _queue_json(capsys, ws, "claim", "ONE", "--expect", revision, "--lane", "docs",
+                              "--capability", "core", "--branch", "feature/retry")
+    assert rc == 0 and retried["item"]["branch"] == "feature/retry"
+
+
+@pytest.mark.parametrize("branch", ["feature/\ud800marker", _SURROGATE_BYTES], ids=["lone-surrogate", "surrogateescape"])
+def test_cli_list_of_stored_surrogate_branch_does_not_crash(ws: Path, capsys, branch):
+    blob = {"v": 1, "lane": "docs", "role": "implementer", "owner": "o@h", "claim_id": "0123456789abcdef",
+            "gen": 1, "branch": branch, "paths": ["docs/**"], "ts": NOW, "ttl_s": 600}
+    raw = (json.dumps(blob, ensure_ascii=True, separators=(",", ":")) + "\n").encode("ascii")
+    oid = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=str(ws), input=raw,
+                         capture_output=True, check=True).stdout.decode().strip()
+    _git(ws, "update-ref", "refs/aegis/lanes/docs", oid)
+    rc, out, err = _run(capsys, "list")
+    assert rc == 0 and err == ""
+    assert "unreadable" in out and "marker" not in out
+    rc, payload, err = _json(capsys, "list")
+    assert rc == 0 and err == ""
+    assert payload["leases"] == []
+    assert payload["unreadable"][0]["lane"] == "docs"
+    assert payload["unreadable"][0]["oid"] == oid
+    assert "marker" not in json.dumps(payload)
+
+
+@pytest.mark.parametrize("branch", ["feature/\ud800marker", _SURROGATE_BYTES], ids=["lone-surrogate", "surrogateescape"])
+def test_cli_queue_audit_of_stored_surrogate_branch_stays_unsupported(ws: Path, tmp_path: Path, capsys, branch):
+    _prepare_queue(ws, tmp_path)
+    item = json.dumps({"id": "ONE", "title": "Queue work", "paths": ["docs/**"], "capabilities": ["core"]})
+    rc, added = _queue_json(capsys, ws, "add", "--item", item)
+    assert rc == 0, added
+    rc, claimed = _queue_json(capsys, ws, "claim", "ONE", "--expect", added["item"]["revision"],
+                              "--lane", "docs", "--capability", "core", "--branch", "feature/ok")
+    assert rc == 0, claimed
+    assert team.claim(ws, "docs", ["docs/**"], owner="owner", branch="lane/docs").lease.branch == "lane/docs"
+    path = ws / ".aegis" / "state" / "team-queue.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["items"]["ONE"]["branch"] = branch
+    planted = json.dumps(state, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    path.write_bytes(planted)
+    rc, audited = _queue_json(capsys, ws, "audit")
+    assert rc == 0 and audited["refused"] is False
+    assert [row["code"] for row in audited["findings"]] == ["CLAIM-BRANCH-UNSUPPORTED"]
+    assert "marker" not in json.dumps(audited["findings"])
+    assert path.read_bytes() == planted
+    rc, listed = _queue_json(capsys, ws, "list")
+    assert rc == 0 and listed["items"][0]["branch_supported"] is False
+    assert listed["items"][0]["branch"] == branch
+
+
+@pytest.mark.parametrize("action", ["renew", "gc"])
+def test_lease_liveness_uses_metadata_scratch_without_descriptor_support(ws, capsys, monkeypatch, action):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from aegis_core import gitsafe
+
+    old = team.claim(ws, "docs", ["docs/**"], owner="owner", branch="main", ttl_s=60,
+                     now=int(time.time()) - 100)
+    common = gitsafe.common_dir(ws)
+    seen = []
+    limits = []
+    original = gitsafe.custody
+
+    @contextmanager
+    def capture(**kwargs):
+        seen.append(Path(kwargs["scratch"]))
+        limits.append((kwargs["stdout_limit"], kwargs["stderr_limit"]))
+        with original(**kwargs):
+            yield
+
+    monkeypatch.setattr(team_lease_custody, "descriptor_supported", lambda: False)
+    monkeypatch.setattr(team_lease_custody, "gitsafe", SimpleNamespace(**{**vars(gitsafe), "custody": capture}))
+    args = ("renew", "docs", "--expect", old.oid) if action == "renew" else ("gc",)
+    rc, payload, err = _json(capsys, *args)
+    assert (rc, payload["status"], err) == (0, "renewed" if action == "renew" else "collected", "")
+    assert seen[0] == Path(ws.anchor)  # No-stdin discovery never opens this bootstrap scratch.
+    assert limits[0] == (65536, 65536)
+    assert seen[1:] and all(path == common / "aegis-lease-scratch" for path in seen[1:])
+    assert seen[1].is_dir() and list(seen[1].iterdir()) == []
+
+
+@pytest.mark.parametrize("action", ["renew", "gc"])
+@pytest.mark.parametrize("failure", ["none", "observation", "cleanup"])
+@pytest.mark.parametrize("as_json", [False, True])
+def test_lease_pending_response_never_captures_other_threads(
+        ws, capsys, monkeypatch, action, failure, as_json):
+    from contextlib import contextmanager
+    from threading import Thread
+    import sys
+
+    old = team.claim(ws, "docs", ["docs/**"], owner="owner", branch="main")
+    original_evidence, original_custody = team.lease_branch_evidence, team.lease_custody
+    observed = []
+
+    def unrelated():
+        print("other stdout")
+        print("other stderr", file=sys.stderr)
+
+    def evidence(*args, **kwargs):
+        worker = Thread(target=unrelated)
+        worker.start()
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        observed.append(capsys.readouterr())
+        if failure == "observation":
+            raise rendering_git.GitError("private-observation-marker")
+        return original_evidence(*args, **kwargs)
+
+    @contextmanager
+    def custody(*args, **kwargs):
+        with original_custody(*args, **kwargs):
+            yield
+        if failure == "cleanup":
+            raise rendering_git.GitError("private-cleanup-marker")
+
+    monkeypatch.setattr(team, "lease_branch_evidence", evidence)
+    monkeypatch.setattr(team, "lease_custody", custody)
+    argv = ["renew", "docs", "--expect", old.oid] if action == "renew" else ["gc"]
+    if as_json:
+        argv.append("--json")
+    code = main(["--workspace", str(ws), "team", *argv])
+    captured = capsys.readouterr()
+    assert observed == [("other stdout\n", "other stderr\n")]
+    assert "other" not in captured.out + captured.err
+    assert "private-" not in captured.out + captured.err
+    assert code == (0 if failure == "none" else 1)
+    if as_json:
+        payload = json.loads(captured.out)
+        assert captured.err == ""
+        if failure == "none":
+            assert payload["status"] == ("renewed" if action == "renew" else "nothing to collect")
+        else:
+            assert payload["reason"] == "liveness_unknown"
+    elif failure != "none":
+        assert captured.out == ""
+        assert captured.err == "liveness_unknown\nRestore private Git metadata, then retry.\n"
+    monkeypatch.setattr(team, "lease_branch_evidence", original_evidence)
+    monkeypatch.setattr(team, "lease_custody", original_custody)
+    current = _ref(ws, "docs")
+    retry = ["renew", "docs", "--expect", current] if action == "renew" else ["gc"]
+    assert main(["--workspace", str(ws), "team", *retry, "--json"]) == 0
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_pending_lease_response_bounds_output_and_retries(ws, capsys, stream):
+    from aegis_cli.team_lease_output import PendingResponse, operation
+
+    def oversized(args, root, now):
+        pending = PendingResponse()
+        pending.write("x" * (2 * 1024 * 1024 + 1), stream)
+        return pending
+
+    with pytest.raises(rendering_git.GitError, match="^liveness_unknown$") as caught:
+        operation(ws, oversized, None, NOW)
+    assert caught.value.code == "git_output_limit"
+    assert capsys.readouterr() == ("", "")
+
+    def retry(args, root, now):
+        pending = PendingResponse()
+        pending.line("one result")
+        return pending
+
+    assert operation(ws, retry, None, NOW) == 0
+    assert capsys.readouterr() == ("one result\n", "")
+
+
+@pytest.mark.parametrize("payload", [
+    None, True, False, 17, -3, 1.25,
+    "plain", '\\"\b\f\n\r\t\0\x1f\x7f\u00e9\U0001f600\ud800',
+    {"key": [None, True, False, 17, -3, 1.25, {}, [], {"nested": "value"}]},
+])
+def test_pending_lease_json_preserves_exact_bytes_and_limit(monkeypatch, capsys, payload):
+    expected = json.dumps(payload, indent=2) + "\n"
+    monkeypatch.setattr(team_lease_output, "_OUTPUT_LIMIT", len(expected))
+    pending = team_lease_output.PendingResponse(1)
+    pending.json(payload)
+    assert pending.publish() == 1
+    assert capsys.readouterr() == (expected, "")
+    monkeypatch.setattr(team_lease_output, "_OUTPUT_LIMIT", len(expected) - 1)
+    with pytest.raises(rendering_git.GitError, match="^liveness_unknown$") as caught:
+        team_lease_output.PendingResponse().json(payload)
+    assert caught.value.code == "git_output_limit"
+    assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.parametrize("value", ["x" * 21, "\x7f" * 4, "\U0001f600" * 2])
+def test_pending_lease_json_refuses_before_escaped_allocation(monkeypatch, value):
+    from types import SimpleNamespace
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("oversized response reached JSON allocation")
+
+    monkeypatch.setattr(team_lease_output, "_OUTPUT_LIMIT", 20)
+    monkeypatch.setattr(team_lease_output, "json", SimpleNamespace(dumps=unexpected))
+    with pytest.raises(rendering_git.GitError, match="^liveness_unknown$") as caught:
+        team_lease_output.PendingResponse().json(value)
+    assert caught.value.code == "git_output_limit"
+
+
+def test_lease_custody_is_absent_from_ordinary_team_import():
+    import sys
+
+    source = Path(__file__).resolve().parents[3]
+    result = subprocess.run([sys.executable, "-I", "-c", (
+        "import sys; sys.path.insert(0,sys.argv[1]); from aegis_core import team; "
+        "assert 'aegis_core.team_lease_custody' not in sys.modules"), str(source)],
+        capture_output=True, text=True, timeout=30)
+    assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
+
+
+def test_lease_custody_documents_backend_selection_and_residual():
+    documentation = " ".join(team_lease_custody.__doc__.split())
+    for term in ("descriptor backend", "pathname backend", "storage_confined.descriptor_supported()",
+                 "/proc/self/fd", "/proc/<pid>/fd", "Linux", "macOS", "Windows", "rename race residual"):
+        assert term in documentation
+
+
+@pytest.mark.parametrize("confined", [False, True])
+@pytest.mark.parametrize("proc_fds", [False, True])
+@pytest.mark.parametrize("dev_fds", [False, True])
+def test_lease_descriptor_probe_requires_parent_addressable_fds(monkeypatch, confined, proc_fds, dev_fds):
+    from types import SimpleNamespace
+    from tests.unit.core.test_storage_confined import ModuleOS
+
+    directories = {"/proc/self/fd": proc_fds, "/dev/fd": dev_fds}
+    path = SimpleNamespace(**{**vars(os.path), "isdir": lambda value: directories.get(value, False)})
+    monkeypatch.setattr(team_lease_custody, "os", ModuleOS(path=path))
+    monkeypatch.setattr(team_lease_custody, "storage_confined", SimpleNamespace(descriptor_supported=lambda: confined))
+    assert team_lease_custody.descriptor_supported() is (confined and proc_fds)
+
+
+@pytest.mark.parametrize("action", ["renew", "gc"])
+@pytest.mark.parametrize("backend", ["descriptor", "pathname"])
+@pytest.mark.parametrize("kind", ["worktree", "bare", "configured_worktree"])
+def test_nested_workspace_lease_mutations_keep_the_workspace_identity(ws, capsys, monkeypatch, action, backend, kind):
+    if backend == "descriptor" and not team_lease_custody.descriptor_supported():
+        pytest.skip("requires parent-addressable lease descriptors")
+    if backend == "pathname":
+        monkeypatch.setattr(team_lease_custody, "descriptor_supported", lambda: False)
+    repository = ws
+    common = ws / ".git"
+    if kind == "bare":
+        repository = ws.parent / "bare.git"
+        _git(ws, "clone", "-q", "--bare", "--no-hardlinks", str(ws), str(repository))
+        common = repository
+    elif kind == "configured_worktree":
+        checkout = ws.parent / "configured-checkout"
+        checkout.mkdir()
+        _git(ws, "config", "core.worktree", str(checkout))
+    nested = repository / "packages" / "app"
+    (nested / ".aegis" / "rules").mkdir(parents=True)
+    base = ["--workspace", str(nested), "team"]
+    assert main([*base, "claim", "docs", "--paths", "docs/**", "--owner", "o@h",
+                 "--branch", "main", "--json"]) == 0
+    claimed = json.loads(capsys.readouterr().out)
+    oid = claimed["oid"]
+    if action == "gc":
+        team.release(nested, "docs", oid)
+        oid = team.claim(nested, "docs", ["docs/**"], owner="o@h", branch="main", ttl_s=60,
+                         now=int(time.time()) - 100).oid
+    for _ in range(2):
+        args = ["renew", "docs", "--expect", oid] if action == "renew" else ["gc"]
+        code = main([*base, *args, "--json"])
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        assert (code, captured.err, payload["scope"]["workspace"]) == (0, "", str(nested))
+        if action == "renew":
+            assert payload["status"] == "renewed" and payload["oid"] != oid
+            oid = payload["oid"]
+            assert _ref(repository, "docs") == oid
+        else:
+            assert _ref(repository, "docs") is None
+    assert not (nested / ".git").exists()
+    assert not (nested / "aegis-lease-scratch").exists()
+    assert (common / "aegis-lease-scratch").is_dir()
+
+
+@pytest.mark.parametrize("action", ["renew", "gc"])
+@pytest.mark.parametrize("backend", ["descriptor", "pathname"])
+def test_nested_workspace_replacement_during_discovery_refuses_and_retries(
+        ws, capsys, monkeypatch, action, backend):
+    from types import SimpleNamespace
+    from aegis_core import gitsafe
+
+    if backend == "descriptor" and not team_lease_custody.descriptor_supported():
+        pytest.skip("requires parent-addressable lease descriptors")
+    if backend == "pathname":
+        monkeypatch.setattr(team_lease_custody, "descriptor_supported", lambda: False)
+    nested, moved, discarded = (ws / name for name in ("nested", "held-nested", "replacement"))
+    (nested / ".aegis" / "rules").mkdir(parents=True)
+    old = team.claim(nested, "docs", ["docs/**"], owner="o@h", branch="main", ttl_s=60,
+                     now=int(time.time()) - 100)
+    original = gitsafe.run
+    changed = []
+
+    def discover(argv, cwd, **kwargs):
+        result = original(argv, cwd, **kwargs)
+        if "--show-toplevel" in argv and not changed:
+            assert kwargs["stdin"] is None
+            nested.rename(moved)
+            (nested / ".aegis" / "rules").mkdir(parents=True)
+            changed.append(True)
+        return result
+
+    monkeypatch.setattr(team_lease_custody, "gitsafe", SimpleNamespace(**{**vars(gitsafe), "run": discover}))
+    args = ["renew", "docs", "--expect", old.oid] if action == "renew" else ["gc"]
+    try:
+        code = main(["--workspace", str(nested), "team", *args, "--json"])
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        assert (code, payload["reason"], payload["message"], captured.err) == (
+            1, "liveness_unknown", "liveness_unknown", "")
+        assert changed and _ref(ws, "docs") == old.oid
+    finally:
+        if changed:
+            nested.rename(discarded)
+            moved.rename(nested)
+    assert main(["--workspace", str(nested), "team", *args, "--json"]) == 0
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("backend", ["descriptor", "pathname"])
+@pytest.mark.parametrize("failure", ["timeout", "oversized", "relative", "multiline"])
+def test_lease_repository_discovery_refuses_bad_evidence_and_retries(
+        ws, capsys, monkeypatch, backend, failure):
+    from types import SimpleNamespace
+    from aegis_core import gitsafe
+
+    if backend == "descriptor" and not team_lease_custody.descriptor_supported():
+        pytest.skip("requires parent-addressable lease descriptors")
+    if backend == "pathname":
+        monkeypatch.setattr(team_lease_custody, "descriptor_supported", lambda: False)
+    old = team.claim(ws, "docs", ["docs/**"], owner="o@h", branch="main")
+    original = gitsafe.run
+
+    def discover(argv, cwd, **kwargs):
+        if "--show-toplevel" not in argv:
+            return original(argv, cwd, **kwargs)
+        assert kwargs["stdin"] is None
+        if failure == "timeout":
+            raise gitsafe.GitError("private-discovery-marker", code="git_timeout")
+        result = original(argv, cwd, **kwargs)
+        fields = result.stdout.splitlines()
+        fields[0] = {"oversized": b"/" + b"x" * 16384, "relative": b"relative",
+                     "multiline": b"/private-discovery-marker\n/another"}[failure]
+        return subprocess.CompletedProcess(argv, 0, b"\n".join(fields) + b"\n", b"")
+
+    monkeypatch.setattr(team_lease_custody, "gitsafe", SimpleNamespace(**{**vars(gitsafe), "run": discover}))
+    for _ in range(2):
+        code, payload, err = _json(capsys, "renew", "docs", "--expect", old.oid)
+        assert (code, payload["reason"], payload["message"], err) == (
+            1, "liveness_unknown", "liveness_unknown", "")
+        assert _ref(ws, "docs") == old.oid
+    monkeypatch.setattr(team_lease_custody, "gitsafe", gitsafe)
+    assert _json(capsys, "renew", "docs", "--expect", old.oid)[0] == 0
+
+
+@pytest.mark.parametrize("action", ["renew", "gc"])
+@pytest.mark.parametrize("bad", ["file", "symlink", "owner", "mode"])
+def test_pathname_lease_scratch_refuses_bad_entries_and_retries(ws, capsys, monkeypatch, action, bad):
+    from types import SimpleNamespace
+    from conftest import symlink_or_skip
+    from tests.unit.core.test_storage_confined import ModuleOS
+
+    if bad == "mode" and os.name != "posix":
+        pytest.skip("POSIX permission modes are unavailable")
+    if bad == "owner" and not hasattr(os, "geteuid"):
+        pytest.skip("numeric owner identity is unavailable")
+    monkeypatch.setattr(team_lease_custody, "descriptor_supported", lambda: False)
+    old = team.claim(ws, "docs", ["docs/**"], owner="o@h", branch="main", ttl_s=60,
+                     now=int(time.time()) - 100)
+    scratch, outside = ws / ".git" / "aegis-lease-scratch", ws.parent / "outside"
+    outside.mkdir()
+    if bad == "file":
+        scratch.write_bytes(b"private-scratch-marker")
+    elif bad == "symlink":
+        symlink_or_skip(outside, scratch, target_is_directory=True)
+    else:
+        scratch.mkdir(mode=0o700)
+        if bad == "mode":
+            scratch.chmod(0o755)
+
+    def info(path, **kwargs):
+        result = os.stat(path, **kwargs)
+        if bad == "owner" and os.fspath(path) == str(scratch):
+            return SimpleNamespace(st_dev=result.st_dev, st_ino=result.st_ino,
+                                   st_mode=result.st_mode, st_uid=result.st_uid + 1)
+        return result
+
+    monkeypatch.setattr(team_lease_custody, "os", ModuleOS(stat=info))
+    args = ("renew", "docs", "--expect", old.oid) if action == "renew" else ("gc",)
+    for _ in range(2):
+        code, payload, err = _json(capsys, *args)
+        assert (code, payload["reason"], payload["message"], err) == (
+            1, "liveness_unknown", "liveness_unknown", "")
+        assert _ref(ws, "docs") == old.oid
+    monkeypatch.setattr(team_lease_custody, "os", os)
+    assert list(outside.iterdir()) == []
+    if bad in ("file", "symlink"):
+        scratch.unlink()
+    else:
+        scratch.chmod(0o700)
+    assert _json(capsys, *args)[0] == 0
+
+
+@pytest.mark.parametrize("action", ["renew", "gc"])
+def test_pathname_repository_identity_change_refuses_and_retries(ws, capsys, monkeypatch, action):
+    from aegis_core import gitsafe
+
+    monkeypatch.setattr(team_lease_custody, "descriptor_supported", lambda: False)
+    other = ws.parent / "other-repository"
+    other.mkdir()
+    _git(other, "init", "-q", "-b", "main")
+    _git(other, "commit", "--allow-empty", "-q", "-m", "other")
+    old = team.claim(ws, "docs", ["docs/**"], owner="o@h", branch="main", ttl_s=60,
+                     now=int(time.time()) - 100)
+    data = gitsafe.read_object(ws, old.oid, team.MAX_LEASE_BYTES)
+    oid = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=str(other), input=data,
+                         capture_output=True, check=True).stdout.decode().strip()
+    assert oid == old.oid
+    _git(other, "update-ref", team.lane_ref("docs"), oid)
+    original = team.lease_branch_evidence
+    held = ws.parent / "held.git"
+    changed = []
+
+    def preflight(*args, **kwargs):
+        result = original(*args, **kwargs)
+        (ws / ".git").rename(held)
+        (other / ".git").rename(ws / ".git")
+        changed.append(True)
+        return result
+
+    monkeypatch.setattr(team, "lease_branch_evidence", preflight)
+    args = ("renew", "docs", "--expect", old.oid) if action == "renew" else ("gc",)
+    try:
+        code, payload, err = _json(capsys, *args)
+        assert (code, payload["reason"], payload["message"], err) == (
+            1, "liveness_unknown", "liveness_unknown", "")
+    finally:
+        if changed:
+            (ws / ".git").rename(other / ".git")
+            held.rename(ws / ".git")
+    monkeypatch.setattr(team, "lease_branch_evidence", original)
+    assert _ref(ws, "docs") == _ref(other, "docs") == old.oid
+    assert _json(capsys, *args)[0] == 0
+    assert _ref(other, "docs") == old.oid
+
+
+# ── lease refusal reasons are one source with the core ───────────────────────
+
+_LEGACY_SECRET = "docs/token=secret src/**"
+
+
+def _core_lease_reasons():
+    """Every LeaseRefused reason literal in the core, the one refusal set."""
+    import ast
+
+    root = Path(__file__).resolve().parents[3] / "aegis_core"
+    reasons = set()
+    for path in sorted(root.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if name != "LeaseRefused":
+                continue
+            reason = None
+            if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+                if isinstance(node.args[1].value, str):
+                    reason = node.args[1].value
+            for keyword in node.keywords:
+                if keyword.arg == "reason" and isinstance(keyword.value, ast.Constant):
+                    if isinstance(keyword.value.value, str):
+                        reason = keyword.value.value
+            if reason is None:
+                raise AssertionError(f"LeaseRefused reason is not a literal at {path}:{node.lineno}")
+            reasons.add(reason)
+    return reasons
+
+
+def _plant_blob(repo: Path, lane: str, payload) -> str:
+    raw = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+    oid = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=str(repo), input=raw,
+                         capture_output=True, check=True).stdout.decode().strip()
+    _git(repo, "update-ref", f"refs/aegis/lanes/{lane}", oid)
+    return oid
+
+
+def _fresh_repo(parent: Path, name: str) -> Path:
+    root = parent / name
+    root.mkdir()
+    _git(root, "init", "-q", "-b", "main")
+    (root / ".aegis").mkdir()
+    (root / "a.txt").write_text("a\n", encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "init")
+    return root.resolve()
+
+
+def _refusal_argv(repo: Path, reason: str):
+    """Drive one core reason through the public CLI. The repo stays writable."""
+    if reason == "absent":
+        return ["release", "docs", "--expect", "a" * 40]
+    if reason == "expired":
+        old = team.claim(repo, "docs", ["docs/**"], owner="a@h", ttl_s=60, now=NOW)
+        return ["transfer", "docs", "--expect", old.oid, "--owner", "b@h"]
+    if reason == "legacy_paths":
+        oid = _plant_blob(repo, "docs", {
+            "v": 1, "lane": "docs", "role": "implementer", "owner": "o@h",
+            "claim_id": "0123456789abcdef", "gen": 1, "branch": None,
+            "paths": [_LEGACY_SECRET], "ts": int(time.time()), "ttl_s": 3600,
+        })
+        return ["renew", "docs", "--expect", oid]
+    if reason == "overlap":
+        team.claim(repo, "api", ["src/**"], owner="o@h")
+        return ["claim", "core", "--paths", "src/core/**", "--owner", "o@h"]
+    if reason == "stale":
+        first = team.claim(repo, "docs", ["docs/**"], owner="a@h")
+        team.renew(repo, "docs", first.oid)
+        return ["renew", "docs", "--expect", first.oid]
+    if reason == "taken":
+        team.claim(repo, "docs", ["docs/**"], owner="holder@box")
+        return ["claim", "docs", "--paths", "docs/**", "--owner", "late@box"]
+    if reason == "unreadable":
+        oid = _plant_blob(repo, "docs", b"junk")
+        return ["renew", "docs", "--expect", oid]
+    raise AssertionError("no CLI driver for " + reason)
+
+
+def _invoke(root: Path, *argv: str):
+    from contextlib import redirect_stderr, redirect_stdout
+    import io
+
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        code = main(["--workspace", str(root), "team", *argv])
+    return code, out.getvalue(), err.getvalue()
+
+
+def _concurrent_refusal_cli(root, argv, *, unavailable_view=False):
+    import sys
+    from concurrent.futures import ThreadPoolExecutor
+
+    script = (
+        "import json,sys\n"
+        "from aegis_core import gitsafe,team\n"
+        "from aegis_cli.cli import main\n"
+        "def unavailable(*args,**kwargs):\n"
+        "    raise gitsafe.GitError('view unavailable')\n"
+        "if sys.argv[2] == '1':\n"
+        "    team.describe = unavailable\n"
+        "sys.exit(main(json.loads(sys.argv[1])))\n"
+    )
+
+    def once(_slot):
+        return subprocess.run(
+            [sys.executable, "-c", script, json.dumps(["--workspace", str(root), "team", *argv]),
+             "1" if unavailable_view else "0"],
+            cwd=str(Path(__file__).resolve().parents[3]), capture_output=True, text=True, timeout=30)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        return list(pool.map(once, range(3)))
+
+
+def test_claim_refusal_text_is_the_core_reason_set(ws: Path):
+    """Each core lease reason exits 1 with its fixed text; legacy paths are not echoed."""
+    from aegis_cli import team as cli_team
+    from aegis_core.primitives import utc_stamp
+
+    reasons = _core_lease_reasons()
+    assert cli_team.CLAIM_REFUSALS == {reason: reason + ":" for reason in reasons}
+    assert "legacy_paths" in reasons
+    held = {}
+    for reason in sorted(reasons):
+        repo = _fresh_repo(ws, reason)
+        argv = _refusal_argv(repo, reason)
+        lane = "core" if reason == "overlap" else "docs"
+        current = _ref(repo, lane)
+        expected = {
+            "absent": "absent: lane docs has no lease",
+            "expired": f"expired: lane docs's lease expired at {utc_stamp(NOW + 60)}; claim or renew it instead",
+            "legacy_paths": ("legacy_paths: lane docs has legacy whitespace paths; "
+                             f"release docs --expect {current}, then claim each path as its own entry"),
+            "overlap": "overlap: lane core may overlap live lease(s) of api",
+            "stale": f"stale: lane docs holds {current}, not {argv[-1]}",
+            "taken": f"taken: lane docs is leased (oid {current})",
+            "unreadable": (f"unreadable: lane docs holds {current}, which is no readable lease; "
+                           f"release it with --expect {current}"),
+        }[reason]
+        code, out, err = _invoke(repo, *argv)
+        assert code == 1, (reason, out, err)
+        fixed = cli_team.CLAIM_REFUSALS[reason]
+        assert err.splitlines()[0] == expected, (reason, err)
+        assert _LEGACY_SECRET not in out + err
+        assert _ref(repo, lane) == current
+        code, out, err = _invoke(repo, *argv, "--json")
+        assert (code, err) == (1, ""), (reason, err)
+        payload = json.loads(out)
+        assert payload["reason"] == reason
+        assert payload["message"] == expected
+        assert _LEGACY_SECRET not in out
+        assert _ref(repo, lane) == current
+        if reason == "legacy_paths":
+            assert payload["lease"] is None
+            assert payload["message"].endswith("claim each path as its own entry")
+            code, out, err = _invoke(repo, "transfer", "docs", "--expect", _ref(repo, "docs"),
+                                     "--owner", "n@h")
+            assert code == 1 and err.startswith(fixed) and _LEGACY_SECRET not in out + err
+        held[reason] = (lane, _ref(repo, lane))
+    # Retry uses the lease left by the first refusal and must not write another.
+    retry = {
+        "absent": ["release", "docs", "--expect", "a" * 40],
+        "expired": ["transfer", "docs", "--expect", "{oid}", "--owner", "c@h"],
+        "legacy_paths": ["renew", "docs", "--expect", "{oid}"],
+        "overlap": ["claim", "core", "--paths", "src/core/**", "--owner", "o@h"],
+        "stale": ["renew", "docs", "--expect", "b" * 40],
+        "taken": ["claim", "docs", "--paths", "docs/**", "--owner", "again@box"],
+        "unreadable": ["renew", "docs", "--expect", "{oid}"],
+    }
+    assert set(retry) == reasons
+    for reason, (lane, oid) in held.items():
+        argv = [part.replace("{oid}", oid or "") for part in retry[reason]]
+        code, out, err = _invoke(ws / reason, *argv, "--json")
+        assert code == 1 and json.loads(out)["reason"] == reason, (reason, out, err)
+        assert _LEGACY_SECRET not in out + err
+        assert _ref(ws / reason, lane) == oid
+
+
+@pytest.mark.parametrize("action", ["renew", "transfer"])
+def test_legacy_paths_refusal_survives_view_failure_retry_and_concurrency(ws: Path, monkeypatch, action):
+    """Display failure, a second caller, and overlapping callers still exit 1."""
+    import sys
+    from concurrent.futures import ThreadPoolExecutor
+
+    repo = _fresh_repo(ws, "legacy")
+    oid = _plant_blob(repo, "docs", {
+        "v": 1, "lane": "docs", "role": "implementer", "owner": "o@h",
+        "claim_id": "0123456789abcdef", "gen": 1, "branch": None,
+        "paths": [_LEGACY_SECRET], "ts": int(time.time()), "ttl_s": 3600,
+    })
+    argv = [action, "docs", "--expect", oid]
+    if action == "transfer":
+        argv.extend(["--owner", "n@h"])
+
+    def boom(*_args, **_kwargs):
+        raise OSError("token=secret view failed")
+
+    original = team.describe
+    monkeypatch.setattr(team, "describe", boom)
+    try:
+        for _ in range(2):
+            code, out, err = _invoke(repo, *argv)
+            assert code == 1 and err.startswith("legacy_paths:")
+            assert "token=secret" not in out + err and "view failed" not in out + err
+            code, out, err = _invoke(repo, *argv, "--json")
+            payload = json.loads(out)
+            assert (code, err, payload["reason"], payload["lease"]) == (1, "", "legacy_paths", None)
+            assert "token=secret" not in out
+            assert _ref(repo, "docs") == oid
+    finally:
+        monkeypatch.setattr(team, "describe", original)
+
+    def once(_slot):
+        # Separate processes exercise independent CLI invocations and Git custody.
+        script = "import json,sys\nfrom aegis_cli.cli import main\nsys.exit(main(json.loads(sys.argv[1])))\n"
+        result = subprocess.run([sys.executable, "-c", script, json.dumps(
+            ["--workspace", str(repo), "team", *argv])], capture_output=True, text=True,
+            cwd=str(Path(__file__).resolve().parents[3]), timeout=30)
+        return result.returncode, result.stdout, result.stderr
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        raced = list(pool.map(once, range(3)))
+    assert [code for code, _out, _err in raced] == [1, 1, 1]
+    assert all(err.startswith("legacy_paths:") and _LEGACY_SECRET not in out + err
+               for _code, out, err in raced)
+    assert _ref(repo, "docs") == oid
+    code, out, err = _invoke(repo, *argv, "--json")
+    assert code == 1 and json.loads(out)["reason"] == "legacy_paths"
+    assert _ref(repo, "docs") == oid
+
+
+def test_unknown_lease_reason_exits_1_without_echoing_input(ws: Path, monkeypatch, capsys):
+    """A reason outside the core set is fixed text, never the exception or a joined line."""
+    def refused(*_args, **_kwargs):
+        raise team.LeaseRefused("token=secret\nstill secret", "not_a_core_reason", "docs")
+
+    monkeypatch.setattr(team, "claim", refused)
+    rc, out, err = _run(capsys, "claim", "docs", "--paths", "docs/**", "--owner", "o@h")
+    assert rc == 1 and out == "" and err == "refused\n"
+    rc, out, err = _run(capsys, "claim", "docs", "--paths", "docs/**", "--owner", "o@h", "--json")
+    assert rc == 1 and err == ""
+    payload = json.loads(out)
+    assert payload["reason"] == "not_a_core_reason"
+    assert payload["message"] == "refused"
+    assert "token=secret" not in out + err
+
+
+@pytest.mark.parametrize("message, expected", [
+    ("taken: token=private-marker", "taken: token=REDACTED"),
+    ("taken: token=private\x1b[31m-marker", "taken: token=REDACTED"),
+    ("taken: token=private-marker\nsecond line", "taken:"),
+    ("taken: token=private-marker\rsecond line", "taken:"),
+], ids=["secret", "canonical-secret", "newline", "carriage-return"])
+def test_known_refusal_message_is_safe(ws, capsys, monkeypatch, message, expected):
+    def refused(*_args, **_kwargs):
+        raise team.LeaseRefused(message, "taken", "docs")
+
+    monkeypatch.setattr(team, "claim", refused)
+    for mode in ([], ["--json"]):
+        code, out, err = _run(capsys, "claim", "docs", "--paths", "docs/**", *mode)
+        assert code == 1
+        if mode:
+            assert err == ""
+            assert json.loads(out)["message"] == expected
+        else:
+            assert (out, err) == ("", expected + "\n")
+
+
+@pytest.mark.parametrize("mode", ["text", "json"])
+@pytest.mark.parametrize("legacy", [False, True], ids=["ten-live-leases", "three-legacy-leases"])
+def test_long_overlap_refusal_preserves_complete_message(ws, mode, legacy):
+    """Long existing refusals retain every lane and complete recovery command."""
+    lanes = []
+    held = {}
+    commands = []
+    for index in range(3 if legacy else 10):
+        lane = f"lane{index:02d}-".ljust(63, "a")
+        lanes.append(lane)
+        if legacy:
+            oid = _plant_blob(ws, lane, {
+                "v": 1, "lane": lane, "role": "implementer", "owner": "o@h",
+                "claim_id": "0123456789abcdef", "gen": 1, "branch": None,
+                "paths": [f"scope{index}/one/** scope{index}/two/**"],
+                "ts": int(time.time()), "ttl_s": 3600,
+            })
+            commands.append(f"release {lane} --expect {oid}")
+        else:
+            oid = team.claim(ws, lane, [f"scope{index}/**"], owner="o@h").oid
+        held[lane] = oid
+    assert all(len(lane) == 63 for lane in lanes)
+    expected = "overlap: lane core may overlap live lease(s) of " + ", ".join(lanes)
+    expected += "".join(f"; {command}, then claim each path as its own entry" for command in commands)
+    assert len(expected) > 512
+    with pytest.raises(team.LeaseRefused) as refused:
+        team.claim(ws, "core", ["**"], owner="o@h")
+    assert str(refused.value) == expected
+
+    argv = ["claim", "core", "--paths", "**", "--owner", "o@h"]
+    if mode == "json":
+        argv.append("--json")
+    for _ in range(2):
+        code, out, err = _invoke(ws, *argv)
+        assert code == 1
+        if mode == "json":
+            assert err == ""
+            payload = json.loads(out)
+            assert (payload["status"], payload["reason"], payload["lanes"]) == (
+                "refused", "overlap", lanes)
+            assert payload["current"] is payload["lease"] is None
+            message = payload["message"]
+        else:
+            assert out == ""
+            assert err == expected + "\n"
+            message = err.removesuffix("\n")
+        assert message == expected
+        assert all(command in message for command in commands)
+        assert _ref(ws, "core") is None
+        assert {lane: _ref(ws, lane) for lane in lanes} == held
+
+
+@pytest.mark.parametrize("mode", ["text", "json"])
+@pytest.mark.parametrize("action", ["claim", "renew", "transfer", "release"])
+def test_legacy_lease_refusal_never_displays_paths(ws, mode, action):
+    """Taken and stale refusals retain recovery while omitting legacy lease detail."""
+    oid = _refusal_argv(ws, "legacy_paths")[-1]
+    expect = "0" * 40
+    assert expect != oid
+    if action == "claim":
+        argv = [action, "docs", "--paths", "docs/**", "--owner", "late@box"]
+        reason = "taken"
+        expected = f"taken: lane docs is leased (oid {oid})"
+    else:
+        argv = [action, "docs", "--expect", expect]
+        if action == "transfer":
+            argv.extend(["--owner", "late@box"])
+        reason = "stale"
+        expected = f"stale: lane docs holds {oid}, not {expect}"
+    expected += f"; release docs --expect {oid}, then claim each path as its own entry"
+    if mode == "json":
+        argv.append("--json")
+    for _ in range(2):
+        code, out, err = _invoke(ws, *argv)
+        assert code == 1
+        assert "token=secret" not in out + err
+        if mode == "json":
+            assert err == ""
+            payload = json.loads(out)
+            assert (payload["reason"], payload["message"], payload["current"], payload["lease"]) == (
+                reason, expected, oid, None)
+        else:
+            assert (out, err) == ("", expected + "\n")
+        assert _ref(ws, "docs") == oid
+    for result in _concurrent_refusal_cli(ws, argv):
+        assert result.returncode == 1
+        assert "token=secret" not in result.stdout + result.stderr
+        if mode == "json":
+            assert result.stderr == ""
+            payload = json.loads(result.stdout)
+            assert (payload["reason"], payload["message"], payload["lease"]) == (reason, expected, None)
+        else:
+            assert (result.stdout, result.stderr) == ("", expected + "\n")
+    assert _ref(ws, "docs") == oid
+
+
+@pytest.mark.parametrize("mode", ["text", "json"])
+@pytest.mark.parametrize("action", ["claim", "renew"])
+@pytest.mark.parametrize("failure", ["git", "os", "repository", "value"])
+def test_refusal_view_failure_follows_action_contract(ws, monkeypatch, mode, action, failure):
+    """Claims keep their refusal; renew retains the typed liveness fallback."""
+    held = team.claim(ws, "docs", ["docs/**"], owner="holder@box")
+    expect = "0" * 40
+    assert expect != held.oid
+    if action == "claim":
+        argv = [action, "docs", "--paths", "docs/**", "--owner", "late@box"]
+        reason, expected = "taken", f"taken: lane docs is leased (oid {held.oid})"
+    else:
+        argv = [action, "docs", "--expect", expect]
+        reason, expected = "stale", f"stale: lane docs holds {held.oid}, not {expect}"
+    if mode == "json":
+        argv.append("--json")
+    original_describe, original_listing = team.describe, rendering_git.list_refs
+    rendering, failures, available = [], [], [False]
+
+    def describe(*args, **kwargs):
+        if failure != "git" and not available[0]:
+            failures.append(True)
+            error = {"os": OSError, "repository": team.TeamUsageError, "value": ValueError}[failure]
+            raise error("token=secret view repository unavailable")
+        rendering.append(True)
+        try:
+            return original_describe(*args, **kwargs)
+        finally:
+            rendering.pop()
+
+    def listing(*args, **kwargs):
+        if rendering and not available[0]:
+            failures.append(True)
+            raise rendering_git.GitError("token=secret view listing failed")
+        return original_listing(*args, **kwargs)
+
+    monkeypatch.setattr(team, "describe", describe)
+    monkeypatch.setattr(rendering_git, "list_refs", listing)
+
+    def assert_refusal(code, out, err):
+        assert code == 1
+        assert "token=secret" not in out + err
+        if mode == "json":
+            assert err == ""
+            payload = json.loads(out)
+            if action == "claim":
+                assert (payload["reason"], payload["message"], payload["current"], payload["lease"]) == (
+                    reason, expected, held.oid, None)
+            else:
+                assert (payload["reason"], payload["message"], payload["next_action"]) == (
+                    "liveness_unknown", "liveness_unknown", "Restore private Git metadata, then retry.")
+                assert "current" not in payload and "lease" not in payload
+        else:
+            message = (expected + "\n" if action == "claim" else
+                       "liveness_unknown\nRestore private Git metadata, then retry.\n")
+            assert (out, err) == ("", message)
+
+    for _ in range(2):
+        assert_refusal(*_invoke(ws, *argv))
+        assert not rendering
+        assert _ref(ws, "docs") == held.oid
+    assert len(failures) == 2
+
+    if failure == "git":
+        for result in _concurrent_refusal_cli(ws, argv, unavailable_view=True):
+            assert_refusal(result.returncode, result.stdout, result.stderr)
+
+    available[0] = True
+    code, out, err = _invoke(ws, *argv)
+    assert code == 1 and not rendering
+    if mode == "json":
+        assert err == ""
+        payload = json.loads(out)
+        assert (payload["reason"], payload["message"], payload["lease"]["oid"]) == (
+            reason, expected, held.oid)
+    else:
+        assert out == "" and err.startswith(expected + "\n")
+        assert "paths: docs/**" in err
+    assert _ref(ws, "docs") == held.oid

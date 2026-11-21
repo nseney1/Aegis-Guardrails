@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 from aegis_core.pathlookup import which
-from aegis_core.workspace.layout import AEGIS_DIRNAME, LEGACY_SOMA_DIRNAME, WorkspaceLayout
+from aegis_core.workspace.layout import AEGIS_DIRNAME, LEGACY_SOMA_DIRNAME as _RETIRED_DIRNAME, WorkspaceLayout
 
 __all__ = [
     "detect_project_languages",
@@ -24,13 +24,12 @@ __all__ = [
 _SKIP_DIRS = {
     "__pycache__", ".git", "node_modules", ".pytest_cache",
     ".mypy_cache", ".ruff_cache", "target", "dist", "build",
-    AEGIS_DIRNAME, LEGACY_SOMA_DIRNAME, ".tox", ".venv", "venv",
+    AEGIS_DIRNAME, _RETIRED_DIRNAME, ".tox", ".venv", "venv",
 }
 
 # A packaged driver's selector names a v3 staging path; nothing there is ever run (the
 # runner always uses the template inside aegis), it only identifies the driver.
 _SELECTOR_DIR = f"{AEGIS_DIRNAME}/drivers"
-_LEGACY_SELECTOR_DIR = f"{LEGACY_SOMA_DIRNAME}/drivers"
 
 LANGUAGE_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     "rust": {
@@ -93,14 +92,14 @@ def packaged_driver_for_extension(extension: str) -> Optional[Dict[str, Any]]:
 
 
 def names_packaged_driver(value: str, config: Mapping[str, Any]) -> bool:
-    """True for a selector `aegis init` provisioned, including legacy .soma paths."""
+    """True for a selector `aegis init` provisioned."""
     if not config.get('driver_filename') or not config.get('default_command'):
         return False
     parts = value.split()
     canonical = str(config["default_command"]).split()
     if len(parts) != len(canonical):
         return False
-    if parts[-1] not in (f"{_SELECTOR_DIR}/{config['driver_filename']}", f"{_LEGACY_SELECTOR_DIR}/{config['driver_filename']}"):
+    if parts[-1] not in (f"{_SELECTOR_DIR}/{config['driver_filename']}",):
         return False
     if canonical[0] == "{python}" and parts[0] in ("python3", "python"):
         return True

@@ -1,0 +1,6039 @@
+"""Public lane plumbing contracts; all Git history is created by these tests."""
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+import ast
+import errno
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+from threading import Barrier, Event, Lock, Thread
+from types import SimpleNamespace
+
+import pytest
+
+from aegis_core import gitsafe, gitsafe_policy, gitsafe_run, gitops_fds, team_git as tg, team_git_snapshot
+from aegis_core import team, team_lease_custody
+from tests.helpers_team_git import (IDENTITY, LANE_MODULES, commit, filter_git_env, git,
+                                    make_store, new_store, shared_bytes, strict_program,
+                                    strict_program_guard)
+from tools import hierarchy_git as legacy_git
+
+pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+
+
+@pytest.mark.parametrize("inherit", [False, True])
+def test_object_read_policy_overrides_cannot_enable_effects(inherit):
+    overrides = {"GIT_NO_REPLACE_OBJECTS": "0", "GIT_NO_LAZY_FETCH": "0", "GIT_ALLOW_PROTOCOL": "all",
+                 "GIT_PROTOCOL_FROM_USER": "1", "GIT_OPTIONAL_LOCKS": "1", "GIT_TERMINAL_PROMPT": "1"}
+    environment = tg.object_read_env(overrides, inherit_config=inherit)
+    assert environment["GIT_NO_REPLACE_OBJECTS"] == "1"
+    assert environment["GIT_NO_LAZY_FETCH"] == "1"
+    assert environment["GIT_ALLOW_PROTOCOL"] == ""
+    assert environment["GIT_PROTOCOL_FROM_USER"] == "0"
+    assert environment["GIT_OPTIONAL_LOCKS"] == "0"
+    assert environment["GIT_TERMINAL_PROMPT"] == "0"
+    if not inherit:
+        assert environment["GIT_CONFIG_GLOBAL"] == os.devnull
+        assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert overrides["GIT_ALLOW_PROTOCOL"] == "all"
+
+
+def test_object_read_argv_adds_object_only_hardening():
+    argv = tg.object_read_argv("cat-file", "-t", "0" * 40)
+    legacy_argv = legacy_git.object_read_argv("cat-file", "-t", "0" * 40)
+    assert legacy_argv[0] == "git"
+    assert legacy_argv[1:] == argv
+    assert "--no-optional-locks" in argv and "--no-replace-objects" in argv
+    assert "core.fsmonitor=false" in argv
+    assert "protocol.allow=never" in argv
+    assert argv[-3:] == ["cat-file", "-t", "0" * 40]
+
+
+def test_object_read_environment_is_bounded_and_retries(monkeypatch):
+    monkeypatch.setattr(tg, "os", SimpleNamespace(**{**vars(os), "environ": {}}))
+    with pytest.raises(tg.GitRefusal) as caught:
+        tg.object_read_env({"X": "x" * 65537})
+    assert caught.value.code == "invalid_environment"
+    assert caught.value.next_action
+    environment = tg.object_read_env({"X": "ok"})
+    assert "X" not in environment and environment["GIT_ALLOW_PROTOCOL"] == ""
+
+
+def test_object_read_env_discards_repository_selectors_from_both_layers(monkeypatch):
+    names = gitsafe_policy.LOCAL_ENV | {"GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"}
+    ambient = {**dict.fromkeys(names, "fixture"), "VISIBLE": "ambient"}
+    overrides = {**dict.fromkeys((key.lower() for key in names), "fixture"), "VISIBLE": "override"}
+    monkeypatch.setattr(tg, "os", SimpleNamespace(**{**vars(os), "environ": ambient}))
+
+    environment = tg.object_read_env(overrides)
+    assert {key for key in environment if key.upper() in names} == {"GIT_NO_REPLACE_OBJECTS"}
+    assert environment["GIT_NO_REPLACE_OBJECTS"] == "1"
+    assert environment["GIT_CONFIG_GLOBAL"] == os.devnull and environment["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert "VISIBLE" not in environment
+
+
+@pytest.mark.parametrize("oversized_layer", ["ambient", "overrides"])
+def test_object_read_env_reserves_fixed_policy_outside_input_budget(monkeypatch, oversized_layer):
+    ambient = dict.fromkeys((f"INPUT_{i}" for i in range(512)), "ok")
+    platform = SimpleNamespace(**{**vars(os), "environ": ambient})
+    monkeypatch.setattr(tg, "os", platform)
+
+    oversized = {**ambient, "GIT_ALLOW_PROTOCOL": "discard"}
+    if oversized_layer == "ambient":
+        platform.environ = oversized
+    with pytest.raises(tg.GitRefusal) as caught:
+        tg.object_read_env(oversized if oversized_layer == "overrides" else {})
+    assert caught.value.code == "invalid_environment" and caught.value.next_action
+    platform.environ = ambient
+    environment = tg.object_read_env({"GIT_ALLOW_PROTOCOL": "discard", "GIT_DIR": "discard", "EXTRA": "discard"})
+    assert not (ambient.keys() | {"GIT_DIR", "EXTRA"}) & environment.keys()
+    assert environment["GIT_ALLOW_PROTOCOL"] == "" and environment["GIT_NO_REPLACE_OBJECTS"] == "1"
+
+
+@pytest.mark.parametrize("platform", ["posix", "nt"])
+@pytest.mark.parametrize("inherit", [False, True])
+def test_object_read_env_accepts_only_platform_keys_and_fixed_policy(monkeypatch, platform, inherit):
+    startup = {"SYSTEMROOT": "system", "WINDIR": "windows", "TEMP": "temp", "TMP": "tmp"}
+    denied = {"PATH", "HOME", "USERPROFILE", "TMPDIR", "GIT_TRACE", "GIT_TRACE2_EVENT", "GIT_TRACE_SETUP"}
+    fixed = dict(gitsafe_policy.BASE_ENV, GIT_PROTOCOL_FROM_USER="0")
+    isolated = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    ambient = {**startup, **dict.fromkeys(denied, "ambient")}
+    overrides = dict.fromkeys((key.lower() for key in {*fixed, *isolated, *denied}), "override")
+    overrides["Temp"] = "replacement"
+    monkeypatch.setattr(tg, "os", SimpleNamespace(**{**vars(os), "name": platform, "environ": ambient}))
+
+    expected = fixed if inherit else {**fixed, **isolated}
+    if platform == "nt":
+        expected = {**expected, **startup, "TEMP": "replacement"}
+    assert tg.object_read_env(overrides, inherit_config=inherit) == expected
+
+
+ENV_REDIRECTS = ("GIT_TRACE", "GIT_TRACE2", "GIT_TRACE2_EVENT", "GIT_TRACE2_PERF",
+                 "GIT_CONFIG", "GIT_DIR", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY")
+
+
+@pytest.mark.parametrize("module", [
+    "tests.helpers_team_git",
+    "tests.unit.core.test_team_git",
+    "tests.unit.core.test_team_custody",
+    "tests.unit.core.test_team_custody_checks",
+])
+def test_team_helpers_import_without_collecting_other_test_modules(module):
+    script = """
+import importlib
+import sys
+sys.path.insert(0, sys.argv[1])
+importlib.import_module(sys.argv[2])
+coupled = {
+    "tests.unit.core.test_gitsafe",
+    "tests.unit.core.test_team_git",
+    "tests.unit.core.test_team_custody",
+    "tests.unit.core.test_team_custody_checks",
+} - {sys.argv[2]}
+assert not coupled.intersection(sys.modules), sorted(coupled.intersection(sys.modules))
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(Path(__file__).resolve().parents[3]), module],
+        capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("phase", ["custody", "verify"])
+@pytest.mark.parametrize("case", ["selector", "config", "several", "many", "count", "value", "name", "retained"])
+def test_lease_ambient_names_are_bounded_without_values_and_retry(repo, monkeypatch, phase, case):
+    secret = "ghp_" + "a" * 36
+    keys = {"selector": ["GIT_DIR"], "config": ["GIT_CONFIG_KEY_0"],
+            "several": ["GIT_WORK_TREE", "GIT_DIR", "GIT_CONFIG_KEY_0"],
+            "many": ["GIT_CONFIG_KEY_%02d" % index for index in reversed(range(20))],
+            "count": ["VARIABLE_%03d" % index for index in reversed(range(600))],
+            "value": ["LARGE_VALUE"], "name": ["N" * 129],
+            "retained": ["GIT_CUSTOM_%02d" % index for index in reversed(range(57))]}[case]
+    environment = dict.fromkeys(keys, secret)
+    if case == "value":
+        environment[keys[0]] = secret + "x" * (70 * 1024)
+    before = shared_bytes(repo)
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    try:
+        def refused(_slot):
+            with pytest.raises(gitsafe.GitError) as caught:
+                if phase == "custody":
+                    with team.lease_custody(repo):
+                        pytest.fail("ambient environment reached the effect body")
+                else:
+                    team.verify_lease_repository(repo)
+            exc = caught.value
+            assert exc.code == "ambient_git_environment"
+            if case in ("count", "value", "name", "retained"):
+                label = "<non-standard Git variable name>"
+                remaining = len(keys) - 1
+            else:
+                label = ", ".join(sorted(keys)[:16])
+                remaining = max(0, len(keys) - 16)
+            if remaining:
+                label += " (+%d more)" % remaining
+            assert str(exc) == "Ambient Git environment refused: " + label + "."
+            assert exc.next_action == "Unset " + label + " in the environment, then retry."
+            assert team.lease_next_action(exc.code) == exc.next_action
+            assert secret not in str(exc) + exc.next_action
+            return str(exc), exc.next_action
+        expected = refused(0)
+        assert refused(1) == expected
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert list(pool.map(refused, range(2))) == [expected, expected]
+    finally:
+        monkeypatch.setattr(team_lease_custody, "os", os)
+    assert shared_bytes(repo) == before
+    with team.lease_custody(repo):
+        team.verify_lease_repository(repo)
+
+
+def test_lease_ambient_name_diagnostics_mask_nonstandard_names(repo, monkeypatch):
+    secret = "ghp_" + "b" * 36
+    key = "GIT_CONFIG_KEY_\x1b[31m" + secret + "_" + "z" * 300
+    environment = {key: "never-display-this-value"}
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        with team.lease_custody(repo):
+            pytest.fail("unsafe environment accepted")
+    label = "<non-standard Git variable name>"
+    for field in (str(caught.value), caught.value.next_action, team.lease_next_action(caught.value.code)):
+        assert label in field
+        assert secret not in field and "\x1b" not in field and "never-display-this-value" not in field
+
+
+@pytest.mark.parametrize("phase", ["custody", "verify"])
+@pytest.mark.parametrize("prefix", ["GIT_CONFIG_KEY_REDACTEDx", "GIT_CONFIG_VALUE_REDACTEDx", "GIT_CUSTOM_REDACTEDx"])
+@pytest.mark.parametrize("kind", ["github", "aws", "pem", "entropy"])
+def test_lease_ambient_embedded_credentials_are_never_displayed(repo, monkeypatch, phase, prefix, kind):
+    samples = {"github": "".join(("gh", "p_", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8")),
+               "aws": "".join(("AK", "IA", "9F8E7D6C5B4A3210")),
+               "pem": "".join(("-----BEGIN ", "RSA ", "PRIVATE KEY-----")),
+               "entropy": "".join(("aB9zQ2mL7xK4", "pR6vT1nH8jF3", "sW5cD0yG9uE2"))}
+    secret = samples[kind]
+    key = prefix + secret
+    environment = {key: "private-value"}
+    retained = prefix.startswith("GIT_CUSTOM_")
+    if retained:
+        environment.update({"GIT_PADDING_%02d" % index: "private-value" for index in range(56)})
+    label = "<non-standard Git variable name>" + (" (+56 more)" if retained else "")
+    before = shared_bytes(repo)
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    try:
+        def refused(_slot):
+            with pytest.raises(gitsafe.GitError) as caught:
+                if phase == "custody":
+                    with team.lease_custody(repo):
+                        pytest.fail("unsafe environment accepted")
+                else:
+                    team.verify_lease_repository(repo)
+            assert caught.value.code == "ambient_git_environment"
+            fields = str(caught.value), caught.value.next_action, team.lease_next_action(caught.value.code)
+            assert fields == ("Ambient Git environment refused: " + label + ".",
+                              "Unset " + label + " in the environment, then retry.",
+                              "Unset " + label + " in the environment, then retry.")
+            assert all(secret not in field and key not in field and "private-value" not in field for field in fields)
+            return fields
+        expected = refused(0)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert list(pool.map(refused, range(2))) == [expected, expected]
+        assert refused(1) == expected
+    finally:
+        monkeypatch.setattr(team_lease_custody, "os", os)
+    assert shared_bytes(repo) == before
+    with team.lease_custody(repo):
+        team.verify_lease_repository(repo)
+
+
+@pytest.mark.parametrize("key,shown", [
+    ("GIT_DIR", True), ("GIT_NAMESPACE", True), ("GIT_CONFIG_PARAMETERS", True),
+    ("GIT_NO_REPLACE_OBJECTS", True), ("PATH", True), ("HOME", True),
+    ("USERPROFILE", True), ("XDG_CONFIG_HOME", True), ("GIT_CONFIG_KEY_0", True),
+    ("GIT_CONFIG_VALUE_000001", True), ("GIT_CONFIG_KEY_123456", True),
+    ("GIT_CONFIG_KEY_1234567", False), ("GIT_CONFIG_VALUE_", False),
+    ("GIT_CONFIG_KEY_12extra", False), ("GIT_CONFIG_KEY_0\n", False),
+    ("GIT_CONFIG_VALUE_\u0661", False), ("git_dir", False),
+])
+def test_lease_ambient_only_exact_reviewed_names_are_disclosed(tmp_path, monkeypatch, key, shown):
+    environment = {key: "x" * 65537}
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        team.verify_lease_repository(tmp_path)
+    label = key if shown else "<non-standard Git variable name>"
+    assert caught.value.code == "ambient_git_environment"
+    assert str(caught.value) == "Ambient Git environment refused: " + label + "."
+    assert caught.value.next_action == "Unset " + label + " in the environment, then retry."
+
+
+def test_lease_ambient_masked_names_are_deduplicated_and_counted(repo, monkeypatch):
+    keys = ["GIT_CONFIG_KEY_bad-b", "GIT_DIR", "GIT_CONFIG_VALUE_123456", "GIT_CONFIG_KEY_bad-a"]
+    environment = dict.fromkeys(keys, "private-value")
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        with team.lease_custody(repo):
+            pytest.fail("unsafe environment accepted")
+    label = "<non-standard Git variable name>, GIT_CONFIG_VALUE_123456, GIT_DIR (+1 more)"
+    assert caught.value.code == "ambient_git_environment"
+    assert str(caught.value) == "Ambient Git environment refused: " + label + "."
+    assert caught.value.next_action == "Unset " + label + " in the environment, then retry."
+
+
+@pytest.mark.parametrize("selector", ["GIT_DIR", "GIT_CONFIG_KEY_0", "PATH"])
+def test_lease_ambient_primary_offenders_precede_retained_overflow(repo, monkeypatch, selector):
+    environment = {"GIT_A%02d" % index: "1" for index in range(56)}
+    environment[selector] = "x" * 70000 if selector == "PATH" else "private-value"
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    try:
+        def refused(_slot):
+            with pytest.raises(gitsafe.GitError) as caught:
+                team.verify_lease_repository(repo)
+            label = selector + ", <non-standard Git variable name> (+55 more)"
+            assert caught.value.code == "ambient_git_environment"
+            assert str(caught.value) == "Ambient Git environment refused: " + label + "."
+            assert caught.value.next_action == "Unset " + label + " in the environment, then retry."
+            assert team.lease_next_action(caught.value.code) == caught.value.next_action
+            return str(caught.value), caught.value.next_action
+        expected = refused(0)
+        assert refused(1) == expected
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert list(pool.map(refused, range(2))) == [expected, expected]
+    finally:
+        monkeypatch.setattr(team_lease_custody, "os", os)
+    with team.lease_custody(repo):
+        team.verify_lease_repository(repo)
+
+
+@pytest.mark.parametrize("key,selector", [("\x07", True), ("   ", False)])
+def test_lease_ambient_empty_canonical_names_are_fixed_placeholders(repo, monkeypatch, key, selector):
+    environment = {key: "x" * 70000}
+    if selector:
+        environment["GIT_DIR"] = "private-value"
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        team.verify_lease_repository(repo)
+    label = "<non-standard Git variable name>" + (", GIT_DIR" if selector else "")
+    assert caught.value.code == "ambient_git_environment"
+    assert str(caught.value) == "Ambient Git environment refused: " + label + "."
+    assert caught.value.next_action == "Unset " + label + " in the environment, then retry."
+
+
+def test_lease_ambient_environment_emptied_during_diagnostics_is_unavailable_and_retries(repo, monkeypatch):
+    class EmptyingEnvironment(dict):
+        inspections = 0
+        def items(self):
+            self.inspections += 1
+            if self.inspections > 1:
+                self.clear()
+            return super().items()
+    environment = EmptyingEnvironment(GIT_DIR="private-value")
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    try:
+        with pytest.raises(gitsafe.GitError) as caught:
+            with team.lease_custody(repo):
+                pytest.fail("changing environment accepted")
+        assert caught.value.code == "ambient_git_environment"
+        assert str(caught.value) == "Ambient Git environment refused: variable names unavailable during inspection."
+        assert caught.value.next_action == "Stabilize the Git environment, then retry."
+        assert team.lease_next_action(caught.value.code) == caught.value.next_action
+    finally:
+        monkeypatch.setattr(team_lease_custody, "os", os)
+    with team.lease_custody(repo):
+        team.verify_lease_repository(repo)
+
+
+@pytest.mark.parametrize("failure", [KeyError, RuntimeError])
+def test_lease_ambient_diagnostic_snapshot_failure_keeps_refusal_and_retry(repo, monkeypatch, failure):
+    class ChangingEnvironment(dict):
+        inspections = 0
+        def items(self):
+            self.inspections += 1
+            if self.inspections > 1:
+                raise failure("private-environment-input")
+            return super().items()
+    environment = ChangingEnvironment(GIT_DIR="private-value")
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    try:
+        with pytest.raises(gitsafe.GitError) as caught:
+            with team.lease_custody(repo):
+                pytest.fail("changing environment accepted")
+        assert caught.value.code == "ambient_git_environment"
+        assert str(caught.value) == "Ambient Git environment refused: variable names unavailable during inspection."
+        assert caught.value.next_action == "Stabilize the Git environment, then retry."
+        assert team.lease_next_action(caught.value.code) == caught.value.next_action
+    finally:
+        monkeypatch.setattr(team_lease_custody, "os", os)
+    with team.lease_custody(repo):
+        team.verify_lease_repository(repo)
+
+
+def test_lease_ambient_unbounded_key_is_not_parsed(repo, monkeypatch):
+    key = "GIT_CONFIG_KEY_" + "x" * 65537
+    calls = []
+    def forbidden_formatter(names):
+        calls.append(tuple(names))
+        pytest.fail("lease diagnostics reached the shared redacting formatter")
+    monkeypatch.setattr(team_lease_custody, "gitsafe_policy", SimpleNamespace(format_ambient_names=forbidden_formatter))
+    monkeypatch.setattr(team_lease_custody, "os", SimpleNamespace(**{**vars(os), "environ": {key: "private-value"}}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        with team.lease_custody(repo):
+            pytest.fail("oversized name accepted")
+    assert caught.value.code == "ambient_git_environment"
+    assert str(caught.value) == "Ambient Git environment refused: <non-standard Git variable name>."
+    assert caught.value.next_action == "Unset <non-standard Git variable name> in the environment, then retry."
+    assert calls == []
+
+
+@pytest.mark.parametrize("key", ENV_REDIRECTS)
+@pytest.mark.parametrize("ambient", [False, True])
+@pytest.mark.parametrize("destination", ["HEAD", "packed-refs", "index"])
+@pytest.mark.parametrize("worker", [False, True], ids=["direct", "executor"])
+def test_runner_environment_redirects_refuse_before_spawn(repo, monkeypatch, key, ambient, destination, worker):
+    with new_store(repo) as store:
+        before, calls, real = shared_bytes(repo), [], subprocess.Popen
+        def record(argv, **kwargs):
+            calls.append(tuple(argv))
+            return real(argv, **kwargs)
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+        value = os.devnull if key == "GIT_CONFIG" else str(repo / ".git" / destination)
+        with monkeypatch.context() as scoped:
+            if ambient:
+                scoped.setenv(key, value)
+            with pytest.raises(tg.GitRefusal) as caught:
+                if worker:
+                    with ThreadPoolExecutor(max_workers=1) as pool:
+                        pool.submit(store._run, ["version"], extra_env=None if ambient else {key: value}).result(timeout=5)
+                else:
+                    store._run(["version"], extra_env=None if ambient else {key: value})
+            assert caught.value.code == ("ambient_git_environment" if ambient else "git_custody_refused") and not calls
+            if ambient:
+                assert key in caught.value.next_action
+        assert shared_bytes(repo) == before
+        assert store._run(["version"]).returncode == 0
+
+
+@pytest.mark.parametrize("key,style", [(key, "redirect") for key in ENV_REDIRECTS] +
+    [("GIT_TRACE", "disabled"), ("GIT_DIR", "hook"), ("GIT_INDEX_FILE", "hook"), ("GIT_TRACE_MYSTERY", "unknown-trace")])
+@pytest.mark.usefixtures("strict_program")
+def test_runner_ambient_redirect_before_entry_refuses_and_retries(repo, monkeypatch, key, style):
+    before, calls, real = shared_bytes(repo), [], subprocess.Popen
+    def record(argv, **kwargs):
+        calls.append(argv)
+        return real(argv, **kwargs)
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+    with monkeypatch.context() as scoped:
+        value = "0" if style == "disabled" else str(repo / ".git" / ("index" if key == "GIT_INDEX_FILE" else "")) if style == "hook" else os.devnull if key == "GIT_CONFIG" else str(repo / ".git/HEAD")
+        scoped.setenv(key, value)
+        with pytest.raises(tg.GitRefusal) as caught:
+            with new_store(repo, require_program=False):
+                pytest.fail("ambient redirect was accepted")
+        name = "GIT_TRACE*" if style == "unknown-trace" else key
+        assert caught.value.code == "ambient_git_environment" and name in caught.value.next_action and not calls
+        assert "secret" not in str(caught.value) + caught.value.next_action
+    assert shared_bytes(repo) == before
+    if strict_program_guard(optional=True):
+        with new_store(repo) as store:
+            assert store._run(["version"]).returncode == 0
+
+
+@pytest.mark.parametrize("native_crlf", [False, True])
+def test_snapshot_calculations_use_explicit_native_eol(native_crlf):
+    from aegis_core import team_git_snapshot as snapshot
+    values = dict.fromkeys(("text", "crlf", "eol", "ident", "working-tree-encoding"), b"unspecified")
+    values["text"] = b"set"
+    settings = snapshot.conversion_settings(b"core.eol\nnative\0")
+    assert snapshot.eol_rule(values, settings, native_crlf=native_crlf) == (
+        "text", native_crlf, False, None)
+
+
+@pytest.mark.parametrize("field,value", [("GIT_AUTHOR_NAME", "bad\x01name"), ("GIT_AUTHOR_EMAIL", "a\nb"),
+    ("GIT_COMMITTER_NAME", "bad\u2028name"), ("GIT_COMMITTER_DATE", "1700000000 +9999")])
+def test_runner_refuses_unvalidated_identity_before_spawn(repo, monkeypatch, field, value):
+    tree = git(repo, "rev-parse", "HEAD^{tree}").decode().strip()
+    parent = git(repo, "rev-parse", "HEAD").decode().strip()
+    with new_store(repo) as store:
+        calls, real = [], subprocess.Popen
+        def record(argv, **kwargs):
+            calls.append(argv)
+            return real(argv, **kwargs)
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+        identity = tg._identity(IDENTITY)
+        identity[field] = value
+        with pytest.raises(tg.GitRefusal) as caught:
+            store._run(["commit-tree", tree, "-p", parent], stdin=b"message\n", extra_env=identity)
+        assert caught.value.code == "git_custody_refused" and not calls
+        assert store._run(["commit-tree", tree, "-p", parent], stdin=b"message\n", extra_env=tg._identity(IDENTITY)).returncode == 0
+
+
+@pytest.mark.parametrize("command", ["hash-object", "merge-tree"])
+def test_runner_config_redirect_cannot_hide_driver_preflight(repo, monkeypatch, command):
+    head = git(repo, "rev-parse", "HEAD").decode().strip()
+    git(repo, "config", "merge.hostile.driver", "false")
+    with new_store(repo) as store:
+        calls, real = [], subprocess.Popen
+        def record(argv, **kwargs):
+            calls.append(tuple(argv))
+            return real(argv, **kwargs)
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+        args = ["hash-object", "-w", "--stdin", "--path=x"] if command == "hash-object" else ["merge-tree", "--write-tree", "-z", head, head]
+        with pytest.raises(tg.GitRefusal) as caught:
+            store._run(args, stdin=b"x" if command == "hash-object" else None, extra_env={"GIT_CONFIG": os.devnull})
+        assert caught.value.code == "git_custody_refused" and not calls
+
+
+@pytest.mark.parametrize("field", ["scratch", "unproved-scratch", "services", "_lane_binding"])
+def test_runner_scratch_replacement_refuses_before_spawn(repo, monkeypatch, field):
+    class Unproved:
+        def __eq__(self, other):
+            pytest.fail("unproved replacement was compared")
+    @tg._lane_operation
+    def operation(store, *, _runner=None):
+        calls = []
+        def forbidden(*args, **kwargs):
+            calls.append(args)
+            pytest.fail("replacement reached Popen")
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": forbidden}))
+        values = {"scratch": store.index_path.parent, "unproved-scratch": Unproved(), "services": object(), "_lane_binding": None}
+        from aegis_core.errors import AegisError
+        with pytest.raises(AegisError) as caught:
+            replace(_runner, **{"scratch" if field == "unproved-scratch" else field: values[field]}).run(["read-tree", "--empty"])
+        assert caught.value.code == "git_custody_refused" and not calls
+    with new_store(repo) as store:
+        before = shared_bytes(repo)
+        operation(store)
+        assert shared_bytes(repo) == before
+
+
+def test_runner_default_object_writes_are_private(repo):
+    @tg._lane_operation
+    def operation(store, *, _runner=None):
+        result = _runner.run(["hash-object", "-w", "--stdin", "--path=private.txt"], stdin=b"private only\n")
+        oid = result.stdout.decode().strip()
+        assert result.returncode == 0 and store.object(oid, "blob") == b"private only\n"
+        assert not (repo / ".git/objects" / oid[:2] / oid[2:]).exists()
+    with new_store(repo) as store:
+        operation(store)
+
+
+def test_runner_unknown_index_selector_refuses_before_spawn(repo, monkeypatch):
+    @tg._lane_operation
+    def operation(store, *, _runner=None):
+        calls, real = [], subprocess.Popen
+        def record(argv, **kwargs):
+            calls.append(argv)
+            return real(argv, **kwargs)
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+        with pytest.raises(gitsafe.GitError) as caught:
+            _runner.run(["ls-files", "--stage", "--debug", "-z"], real_index="true")
+        assert caught.value.code == "git_custody_refused" and not calls
+    with new_store(repo) as store:
+        operation(store)
+
+
+@pytest.mark.parametrize("scenario", ["remove-attributes", "safecrlf", "nanoseconds", "device", "inode", "uid", "gid", "mtime", "racy-timestamp"])
+def test_snapshot_stat_clean_blob_matches_git_add(repo, tmp_path, scenario):
+    context = make_store(repo)
+    oracle = tmp_path / "oracle"
+    git(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    for target in (repo, oracle):
+        git(target, "config", "core.autocrlf", "false")
+        git(target, "config", "core.trustctime", "false")
+        if scenario not in ("remove-attributes", "safecrlf"):
+            commit(target, "clean.txt", b"one\r\ntwo\r\n")
+        else:
+            (target / ".gitattributes").write_bytes(b"*.txt text working-tree-encoding=UTF-16LE\n")
+            git(target, "add", ".gitattributes")
+            commit(target, "clean.txt", "one\r\ntwo\r\n".encode("utf-16le"))
+        os.utime(target / "clean.txt", ns=(1000000000000000000, 1000000000000000000))
+        git(target, "update-index", "--refresh")
+        if scenario == "remove-attributes":
+            git(target, "rm", "--cached", ".gitattributes")
+            (target / ".gitattributes").unlink()
+        elif scenario == "safecrlf":
+            git(target, "config", "core.safecrlf", "true")
+        elif scenario == "nanoseconds":
+            (target / ".gitattributes").write_bytes(b"*.txt text\n")
+            os.utime(target / "clean.txt", ns=(1000000000000000000, 1000000000000000001))
+        elif scenario == "racy-timestamp":
+            (target / ".gitattributes").write_bytes(b"*.txt text\n")
+            os.utime(target / ".git/index", ns=(1000000000500000000, 1000000000500000000))
+        else:
+            import hashlib
+            (target / ".gitattributes").write_bytes(b"*.txt text\n")
+            index = target / ".git/index"
+            raw, position = bytearray(index.read_bytes()), 12
+            assert raw[:8] == b"DIRC\0\0\0\2"
+            offset = {"device": 16, "inode": 20, "uid": 28, "gid": 32, "mtime": 8}[scenario]
+            for _ in range(int.from_bytes(raw[8:12], "big")):
+                end = raw.index(0, position + 62)
+                if raw[position + 62:end] == b"clean.txt":
+                    original = int.from_bytes(raw[position + offset:position + offset + 4], "big")
+                    raw[position + offset:position + offset + 4] = ((original + 1) & 0xffffffff).to_bytes(4, "big")
+                position += ((end + 1 - position + 7) // 8) * 8
+            raw[-20:] = hashlib.sha1(raw[:-20]).digest()
+            index.write_bytes(raw)
+    git(oracle, "add", "-A")
+    expected = git(oracle, "write-tree").decode().strip()
+    with context as store:
+        for _ in range(2):
+            if scenario in ("nanoseconds", "device", "racy-timestamp"):
+                with pytest.raises(tg.GitRefusal) as caught:
+                    tg.snapshot_tree(store)
+                assert caught.value.code == "index_stat_unprovable"
+                assert caught.value.next_action == "Run `git update-index --refresh` in the worktree, then retry."
+            else:
+                assert tg.snapshot_tree(store) == expected
+        if scenario in ("nanoseconds", "device", "racy-timestamp"):
+            for target in (repo, oracle):
+                (target / "clean.txt").write_bytes(b"a changed size\r\n")
+            git(oracle, "add", "-A")
+            assert tg.snapshot_tree(store) == git(oracle, "write-tree").decode().strip()
+
+
+@pytest.mark.parametrize("key,value", [("core.eol", "CRLF"), ("core.eol", None), ("core.eol", "unknown"), ("core.checkStat", "MINIMAL")])
+def test_snapshot_config_value_parity(repo, tmp_path, key, value):
+    context = make_store(repo)
+    oracle = tmp_path / "oracle"
+    git(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    for target in (repo, oracle):
+        if value is None:
+            with (target / ".git/config").open("a", encoding="utf-8") as stream:
+                stream.write("\n[core]\n eol\n")
+        else:
+            git(target, "config", key, value)
+        (target / ".gitattributes").write_bytes(b"*.txt text\n")
+        (target / "new.txt").write_bytes(b"one\r\ntwo\r\n")
+    git(oracle, "add", "-A")
+    with context as store:
+        assert tg.snapshot_tree(store) == git(oracle, "write-tree").decode().strip()
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("empty_prior", [False, True])
+def test_snapshot_zero_size_racy_sentinel_matches_git_add(repo, tmp_path, native, empty_prior):
+    import hashlib
+    context = make_store(repo)
+    oracle = tmp_path / "oracle"
+    git(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    for target in (repo, oracle):
+        git(target, "config", "core.autocrlf", "false")
+        git(target, "config", "core.trustctime", "false")
+        git(target, "config", "index.version", "2")
+        if native:
+            (target / ".gitattributes").write_bytes(b"*.txt text working-tree-encoding=UTF-16LE\n")
+            git(target, "add", ".gitattributes")
+        commit(target, "sentinel.txt", b"" if empty_prior else "nonempty\r\n".encode("utf-16le") if native else b"nonempty\n")
+        os.utime(target / "sentinel.txt", ns=(1000000000000000000, 1000000000000000000))
+        git(target, "update-index", "--refresh")
+        index = target / ".git/index"
+        raw, position = bytearray(index.read_bytes()), 12
+        assert raw[:8] == b"DIRC\0\0\0\2"
+        for _ in range(int.from_bytes(raw[8:12], "big")):
+            end = raw.index(0, position + 62)
+            if raw[position + 62:end] == b"sentinel.txt":
+                raw[position + 36:position + 40] = b"\0" * 4
+            position += ((end + 1 - position + 7) // 8) * 8
+        raw[-20:] = hashlib.sha1(raw[:-20]).digest()
+        index.write_bytes(raw)
+        (target / "sentinel.txt").write_bytes(b"")
+        os.utime(target / "sentinel.txt", ns=(1000000000000000000, 1000000000000000000))
+    git(oracle, "add", "-A")
+    expected = git(oracle, "write-tree").decode().strip()
+    with context as store:
+        before = shared_bytes(repo)
+        for _ in range(2):
+            tree = tg.snapshot_tree(store)
+            assert tree == expected and store.read_blob(tree, "sentinel.txt") == b""
+        assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("shape", ["value", "count", "name"])
+@pytest.mark.usefixtures("strict_program")
+def test_store_entry_environment_bounds_have_public_refusal_and_retry(repo, monkeypatch, shape):
+    calls, real = [], subprocess.Popen
+    def record(argv, **kwargs):
+        calls.append(argv)
+        return real(argv, **kwargs)
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+    environment = dict(os.environ)
+    if shape == "value":
+        environment["AEGIS_OVERSIZED"] = "x" * 65537
+    elif shape == "name":
+        environment["X" * 257] = "x"
+    else:
+        environment.update({"AEGIS_ENV_%d" % n: "x" for n in range(513)})
+    monkeypatch.setattr(gitsafe_run, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    with pytest.raises(tg.GitRefusal) as caught:
+        with new_store(repo, require_program=False):
+            pytest.fail("oversized environment was accepted")
+    actions = {"value": "Reduce every environment value to at most 65,536 characters, then retry.",
+               "count": "Reduce the environment to at most 512 variables, then retry.",
+               "name": "Shorten every environment variable name to at most 256 characters, then retry."}
+    assert caught.value.code == "ambient_environment_too_large" and caught.value.next_action == actions[shape] and not calls
+    if shape == "value":
+        environment["AEGIS_OVERSIZED"] = "x" * 65536
+    elif shape == "name":
+        environment["X" * 256] = environment.pop("X" * 257)
+    else:
+        for key in list(environment):
+            if key.startswith("AEGIS_ENV_"):
+                del environment[key]
+        environment.update({"AEGIS_ENV_%d" % n: "x" for n in range(512 - len(environment))})
+    if strict_program_guard(optional=True):
+        with new_store(repo) as store:
+            assert store._run(["version"]).returncode == 0
+    monkeypatch.setattr(gitsafe_run, "os", os)
+    if strict_program_guard(optional=True):
+        with new_store(repo) as store:
+            assert store._run(["version"]).returncode == 0
+
+
+def strict_request(repo, scratch, args, entry, *, stdin=None, env=None):
+    """Exercise both public strict initialization paths, with an owned envelope."""
+    strict_program_guard()
+    with gitsafe.custody(scratch=scratch, strict_lane=True):
+        if entry == "run":
+            return gitsafe.run(args, repo, stdin=stdin, _env=env)
+        envelope = gitsafe.lane_runner(repo, scratch).environment(env, args=args)
+        argv = [gitsafe.custody_program(repo), *gitsafe_run.DEFAULT_HARDENING, *gitsafe_run._LANE_OPTIONS, *args]
+        return gitsafe_run.capture(argv, cwd=repo, env=envelope, stdin=stdin, timeout=10)
+
+
+@pytest.mark.parametrize("entry", ["run", "capture"])
+@pytest.mark.parametrize("worker", [False, True], ids=["direct", "executor"])
+def test_fresh_strict_runner_binds_common_objects_and_keeps_writes_private(repo, tmp_path, monkeypatch, entry, worker):
+    scratch = tmp_path / "strict-scratch"
+    scratch.mkdir(mode=0o700)
+    (scratch / "objects").mkdir()
+    head = git(repo, "rev-parse", "HEAD").decode().strip()
+    tree = git(repo, "rev-parse", "HEAD^{tree}").decode().strip()
+    before, calls, real = shared_bytes(repo), [], subprocess.Popen
+    def record(argv, **kwargs):
+        calls.append((tuple(argv), dict(kwargs["env"])))
+        return real(argv, **kwargs)
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+    def invoke(args, **kwargs):
+        return strict_request(repo, scratch, args, entry, **kwargs)
+    if worker:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            answers = [future.result(timeout=10) for future in
+                       [pool.submit(invoke, ["cat-file", "-t", head]) for _ in range(2)]]
+    else:
+        answers = [invoke(["cat-file", "-t", head])]
+    assert all(answer.returncode == 0 and answer.stdout == b"commit\n" for answer in answers)
+    made = invoke(["commit-tree", tree, "-p", head], stdin=b"private commit\n", env=tg._identity(IDENTITY))
+    assert made.returncode == 0
+    oid = made.stdout.decode().strip()
+    assert invoke(["cat-file", "-t", oid]).stdout == b"commit\n"
+    assert not (repo / ".git/objects" / oid[:2] / oid[2:]).exists()
+    targets = [env for argv, env in calls if "cat-file" in argv or "commit-tree" in argv]
+    assert targets and all(env["GIT_OBJECT_DIRECTORY"] == str(scratch / "objects")
+                           and "GIT_ALTERNATE_OBJECT_DIRECTORIES" in env for env in targets)
+    assert shared_bytes(repo) == before
+
+
+def test_cold_lane_runner_common_binding_is_atomic_across_workers(repo, tmp_path, monkeypatch):
+    strict_program_guard()
+    scratch = tmp_path / "cold-scratch"
+    scratch.mkdir(mode=0o700)
+    (scratch / "objects").mkdir()
+    runner = gitsafe.lane_runner(repo, scratch)
+    head = git(repo, "rev-parse", "HEAD").decode().strip()
+    calls, real = [], subprocess.Popen
+    def record(argv, **kwargs):
+        calls.append(tuple(argv))
+        return real(argv, **kwargs)
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(runner.run, ["cat-file", "-t", head]) for _ in range(2)]
+        answers = [future.result(timeout=10) for future in futures]
+    assert all(answer.returncode == 0 and answer.stdout == b"commit\n" for answer in answers)
+    assert runner.run(["cat-file", "-t", head]).stdout == b"commit\n"
+    assert len(calls) == 3 and all("cat-file" in argv for argv in calls)
+
+
+@pytest.mark.parametrize("entry", ["run", "capture"])
+@pytest.mark.parametrize("code", ["git_failed", "git_timeout", "os-error", "path-error"])
+def test_fresh_strict_binding_failure_preserves_code_and_retries(repo, tmp_path, monkeypatch, entry, code):
+    scratch = tmp_path / "failing-scratch"
+    scratch.mkdir(mode=0o700)
+    (scratch / "objects").mkdir()
+    head = git(repo, "rev-parse", "HEAD").decode().strip()
+    fail, calls, real_popen = [True], [], subprocess.Popen
+    def record(argv, **kwargs):
+        if fail[0] and tuple(argv[-2:]) == ("rev-parse", "--git-common-dir"):
+            if code == "os-error":
+                raise OSError("Metadata fixture I/O failure.")
+            if code == "path-error":
+                raise RuntimeError("Metadata fixture resolution failure.")
+            raise gitsafe.GitError("Metadata fixture refusal.", code=code, process_started=False)
+        calls.append(argv)
+        return real_popen(argv, **kwargs)
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+    before = shared_bytes(repo)
+    with pytest.raises(gitsafe.GitError) as caught:
+        strict_request(repo, scratch, ["cat-file", "-t", head], entry)
+    assert caught.value.code == ("git_failed" if code.endswith("-error") else code)
+    assert not any("cat-file" in argv for argv in calls)
+    fail[0] = False
+    assert strict_request(repo, scratch, ["cat-file", "-t", head], entry).stdout == b"commit\n"
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_linked_worktree_symlink_scratch_cannot_name_common_git_dir(repo, tmp_path, monkeypatch):
+    make_store(repo)
+    linked = tmp_path / "linked"
+    git(repo, "worktree", "add", "--detach", str(linked), "HEAD")
+    common, alias = repo / ".git", tmp_path / "scratch-alias"
+    common.chmod(0o700)
+    symlink_or_skip(common, alias)
+    before, calls, real = shared_bytes(repo), [], subprocess.Popen
+    def record(argv, **kwargs):
+        calls.append(argv)
+        return real(argv, **kwargs)
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+    with pytest.raises(tg.GitRefusal) as caught:
+        with tg.GitStore(linked, alias):
+            pytest.fail("common Git directory was accepted as scratch")
+    assert caught.value.code == "unsafe_scratch" and not any("read-tree" in argv for argv in calls)
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_ambient_refusal_is_deterministic_and_lists_every_exact_key(repo, tmp_path):
+    scratch = tmp_path / "hash-scratch"
+    scratch.mkdir(mode=0o700)
+    (scratch / "objects").mkdir()
+    script = """import json,sys
+from pathlib import Path
+from aegis_core import gitsafe
+try:
+    gitsafe.lane_runner(Path(sys.argv[1]), Path(sys.argv[2])).run(['version'])
+except gitsafe.GitError as exc:
+    print(json.dumps([exc.code,str(exc),getattr(exc,'next_action',None)],ensure_ascii=True))
+"""
+    keys = ["GIT_DIR", "GIT_INDEX_FILE", "GIT_PREFIX", "GIT_TRACE", "GIT_TRACE_MYSTERY", "GIT_TRACE_OTHER"]
+    environment = {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_")}
+    environment.update({key: "0" for key in keys})
+    answers = []
+    for seed in ("1", "2", "3", "4", "5", "6"):
+        result = subprocess.run([sys.executable, "-B", "-c", script, str(repo), str(scratch)],
+            cwd=Path(__file__).resolve().parents[3], env={**environment, "PYTHONHASHSEED": seed},
+            check=True, capture_output=True, timeout=15)
+        answers.append(result.stdout)
+    assert len(set(answers)) == 1
+    code, message, action = json.loads(answers[0])
+    assert code == "ambient_git_environment" and "GIT_TRACE*" in message + action
+    for field in (message, action):
+        assert all(key in field for key in keys)
+        assert [field.index(key) for key in sorted(keys)] == sorted(field.index(key) for key in keys)
+        assert "GIT_TRACE* (GIT_TRACE_MYSTERY)" in field and "GIT_TRACE* (GIT_TRACE_OTHER)" in field
+        assert "GIT_TRACE* (GIT_DIR" not in field and "GIT_TRACE* (GIT_TRACE)" not in field
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX environment keys are case-sensitive")
+@pytest.mark.usefixtures("strict_program")
+def test_ambient_lowercase_key_refuses_with_its_real_spelling(repo, monkeypatch):
+    environment = {**os.environ, "git_dir": "not-a-repository"}
+    monkeypatch.setattr(gitsafe_run, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    with pytest.raises(tg.GitRefusal) as caught:
+        with new_store(repo, require_program=False):
+            pytest.fail("lowercase redirect was accepted")
+    assert caught.value.code == "ambient_git_environment"
+    assert "git_dir" in caught.value.next_action and "GIT_DIR" not in caught.value.next_action
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_ambient_key_diagnostics_canonicalize_and_redact_before_display(repo, monkeypatch):
+    secret = "ghp_" + "a" * 24
+    key = "GIT_TRACE_\x1b[31m" + secret
+    environment = {**os.environ, key: "never-display-this-value"}
+    monkeypatch.setattr(gitsafe_run, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.lane_runner(repo, repo.parent / "refused-scratch")
+    for field in (str(caught.value), caught.value.next_action):
+        assert "GIT_TRACE*" in field and "[REDACTED_VCS_TOKEN]" in field
+        assert secret not in field and "\x1b" not in field and "never-display-this-value" not in field
+
+
+@pytest.mark.parametrize("failure", [KeyError, RuntimeError])
+@pytest.mark.usefixtures("strict_program")
+def test_ambient_environment_disappearing_during_snapshot_has_a_public_refusal(repo, monkeypatch, failure):
+    class ChangingEnvironment:
+        def __len__(self):
+            return 1
+        def items(self):
+            raise failure("private environment data")
+    calls = []
+    def forbidden(*args, **kwargs):
+        calls.append(args)
+        pytest.fail("unstable environment reached a process")
+    environment_type = gitsafe_run._ENVIRON_TYPE
+    monkeypatch.setattr(gitsafe_run, "_ENVIRON_TYPE", ChangingEnvironment)
+    monkeypatch.setattr(gitsafe_run, "os", SimpleNamespace(**{**vars(os), "environ": ChangingEnvironment()}))
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": forbidden}))
+    try:
+        with pytest.raises(gitsafe.GitError) as caught:
+            gitsafe.lane_runner(repo, repo.parent / "refused-scratch")
+        assert caught.value.code == "ambient_environment_changed" and not calls
+        assert caught.value.next_action == "Stabilize the environment, then retry."
+        assert "private environment data" not in str(caught.value) + caught.value.next_action
+    finally:
+        monkeypatch.setattr(gitsafe_run, "_ENVIRON_TYPE", environment_type)
+        monkeypatch.setattr(gitsafe_run, "os", os)
+        monkeypatch.setattr(gitsafe_run, "subprocess", subprocess)
+    if strict_program_guard(optional=True):
+        with new_store(repo) as store:
+            assert store._run(["version"]).returncode == 0
+
+
+def test_issued_runner_real_index_is_correct_on_the_first_call(repo, tmp_path):
+    strict_program_guard()
+    scratch = tmp_path / "issued-scratch"
+    scratch.mkdir(mode=0o700)
+    (scratch / "objects").mkdir()
+    expected = git(repo, "ls-files", "--stage", "--debug", "-z")
+    assert expected and not (scratch / "index").exists()
+    runner = gitsafe.lane_runner(repo, scratch)
+    first = runner.run(["ls-files", "--stage", "--debug", "-z"], real_index=True)
+    assert first.returncode == 0 and first.stdout == expected
+    assert runner.run(["ls-files", "--stage", "--debug", "-z"]).stdout == b""
+    assert runner.run(["ls-files", "--stage", "--debug", "-z"], real_index=True).stdout == expected
+
+
+@pytest.mark.parametrize("entry", ["lane_runner", "run", "publish", "store"])
+@pytest.mark.usefixtures("strict_program")
+def test_missing_fenced_git_refuses_before_discovery_and_retries(repo, tmp_path, monkeypatch, entry):
+    calls, real = [], subprocess.Popen
+    def record(argv, **kwargs):
+        calls.append(tuple(argv))
+        return real(argv, **kwargs)
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+    lookup = gitsafe.custody_program
+    monkeypatch.setattr("aegis_core.gitsafe.custody_program", lambda cwd: None)
+    try:
+        with pytest.raises(gitsafe.GitError) as caught:
+            if entry == "run":
+                with gitsafe.custody(scratch=tmp_path, strict_lane=True):
+                    gitsafe.run(["version"], repo)
+            elif entry == "store":
+                with new_store(repo, require_program=False):
+                    pytest.fail("unavailable Git was accepted")
+            else:
+                runner = gitsafe.lane_runner(repo, tmp_path)
+                if entry == "publish":
+                    runner.publish(b"")
+        assert caught.value.code == "git_custody_refused" and not calls
+    finally:
+        monkeypatch.setattr("aegis_core.gitsafe.custody_program", lookup)
+    if strict_program_guard(optional=True):
+        with new_store(repo) as store:
+            assert store._run(["version"]).returncode == 0
+
+
+def test_direct_capture_accepts_an_issued_envelope(repo, tmp_path):
+    strict_program_guard()
+    scratch = tmp_path / "envelope-scratch"
+    scratch.mkdir(mode=0o700)
+    (scratch / "objects").mkdir()
+    runner = gitsafe.lane_runner(repo, scratch)
+    runner.paths()
+    head = git(repo, "rev-parse", "HEAD").decode().strip()
+    args = ["cat-file", "-t", head]
+    environment = runner.environment(args=args)
+    argv = [gitsafe.custody_program(repo), *gitsafe_run.DEFAULT_HARDENING, *gitsafe_run._LANE_OPTIONS, *args]
+    with gitsafe.custody(scratch=scratch, strict_lane=True):
+        result = gitsafe_run.capture(argv, cwd=repo, env=environment, stdin=None, timeout=10)
+    assert result.returncode == 0 and result.stdout == b"commit\n"
+
+
+def test_cold_publish_uses_private_destination_and_explicit_shared_publication(repo, tmp_path):
+    strict_program_guard()
+    scratch, donor = tmp_path / "publish-scratch", tmp_path / "donor"
+    scratch.mkdir(mode=0o700)
+    (scratch / "objects").mkdir()
+    donor.mkdir()
+    git(donor, "init", "-q", "-b", "main")
+    oid = git(donor, "hash-object", "-w", "--stdin", data=b"private published blob\n").strip()
+    pack = git(donor, "pack-objects", "--stdout", data=oid + b"\n")
+    runner = gitsafe.lane_runner(repo, scratch)
+    before = shared_bytes(repo)
+    result = runner.publish(pack)
+    assert result.returncode == 0
+    assert shared_bytes(repo) == before
+    assert runner.run(["cat-file", "blob", oid.decode()]).stdout == b"private published blob\n"
+    assert runner.publish(pack, shared=True).returncode == 0
+    assert (repo / ".git/objects" / oid[:2].decode() / oid[2:].decode()).is_file()
+
+
+@pytest.mark.parametrize("entry", ["run", "capture", "execute", "update_ref", "empty_update_ref", "lane_runner", "publish", "store"])
+@pytest.mark.usefixtures("strict_program")
+def test_relative_cwd_public_routes_share_the_git_error_hierarchy(repo, tmp_path, entry):
+    if entry == "capture":
+        strict_program_guard()
+    scratch = tmp_path / "relative-scratch"
+    scratch.mkdir(mode=0o700)
+    (scratch / "objects").mkdir()
+    head = git(repo, "rev-parse", "HEAD").decode().strip()
+    with gitsafe.custody(scratch=scratch, strict_lane=True):
+        with pytest.raises(gitsafe.GitError) as caught:
+            if entry == "run":
+                gitsafe.run(["version"], ".")
+            elif entry == "capture":
+                gitsafe_run.capture([gitsafe.custody_program(repo), *gitsafe_run.DEFAULT_HARDENING,
+                    *gitsafe_run._LANE_OPTIONS, "version"], cwd=".", env={}, stdin=None, timeout=10)
+            elif entry == "execute":
+                gitsafe_run.execute(["version"], ".", executable=gitsafe.git_executable,
+                    legacy_runner=subprocess.run, error=gitsafe.GitError, environ=os.environ,
+                    timeout=10, stdin=None, hardening=gitsafe_run.DEFAULT_HARDENING, env=None, tty=False)
+            elif entry in ("update_ref", "empty_update_ref"):
+                gitsafe.update_ref(".", "refs/aegis/relative", head if entry == "update_ref" else None, None)
+            elif entry == "lane_runner":
+                gitsafe.lane_runner(".", scratch)
+            elif entry == "publish":
+                gitsafe.lane_runner(".", scratch).publish(b"")
+            else:
+                with tg.GitStore(".", scratch):
+                    pytest.fail("relative store was accepted")
+    if entry == "store":
+        assert caught.value.code == "invalid_repository"
+    else:
+        assert caught.value.code == "git_custody_refused"
+        assert caught.value.next_action == "Use the lane Git APIs or the CAS fast-forward writer."
+
+
+RUNTIME_BYPASSES = {
+    "keyword": "gitsafe.run(args=bad, cwd=root)",
+    "bare-import": "from aegis_core.gitsafe import run\nrun(bad, root)",
+    "module-alias": "import aegis_core.gitsafe as g\ng.run(bad, root)",
+    "checked-keyword": "gitsafe.run_checked(args=bad, cwd=root)",
+    "starred": "gitsafe.run([*bad], root)",
+    "positional-hardening": "gitsafe.run(['version', ref, oid], root, 10, None, ['update-ref', '-m'])",
+    "same-line": "argv = ['version']; argv[:] = bad; gitsafe.run(argv, root)",
+    "local-import-shadow": "def first():\n from aegis_core import gitsafe as g\n g.run(bad, root)\ndef other():\n import math as g\nfirst()",
+    "transport-callback": "gitsafe_run.checked(bad, root, runner=gitsafe.run, error=ValueError, git_error=gitsafe.GitError, timeout=10, stdin=None)",
+    "loop-carried": "argv = ['version']\nfor index in range(2):\n if index: gitsafe.run(argv, root)\n argv = bad",
+    "for-binding": "for argv in (bad,):\n gitsafe.run(argv, root)",
+    "with-binding": "with nullcontext(bad) as argv:\n gitsafe.run(argv, root)",
+    "walrus-binding": "if (argv := bad):\n gitsafe.run(argv, root)",
+    "parameter-shadow": "argv = ['version']\ndef send(argv):\n gitsafe.run(argv, root)\nsend(bad)",
+    "alias-slice": "argv = ['version']\nalias = argv\nalias[:] = bad\ngitsafe.run(argv, root)",
+    "cross-function": "argv = ['version']\ndef change():\n argv[:] = bad\nchange()\ngitsafe.run(argv, root)",
+    "git-helper": "argv = ['version']\ndef _git(argv):\n return gitsafe.run(argv, root)\n_git(bad)",
+    "config-override": "gitsafe.run(['-c', 'core.hooksPath=evil', 'version'], root)",
+    "root-override": "gitsafe.run(['-C', '.', 'version'], root)",
+    "unknown-command": "gitsafe.run(['unknown-command'], root)",
+    "raw-capture": "gitsafe_run.capture([gitsafe.git_executable(), *gitsafe_run.DEFAULT_HARDENING, *bad], cwd=root, env=dict(os.environ), stdin=None, timeout=10)",
+    "kwargs-forward": "options = {'args': bad, 'cwd': root}\ngitsafe.run(**options)",
+    "callable-alias": "module = gitsafe\nrunner = module.run\nrunner(bad, root)",
+    "partial": "from functools import partial\npartial(gitsafe.run, args=bad, cwd=root)()",
+    "getattr": "getattr(gitsafe, 'run')(bad, root)",
+    "bad-environment": "gitsafe.run(['version'], root, _env={1: object()})",
+    "bad-cwd": "gitsafe.run(['version'], object())",
+}
+
+
+@pytest.mark.parametrize("form", sorted(RUNTIME_BYPASSES))
+def test_strict_custody_refuses_runtime_rebinding_before_spawn(repo, tmp_path, monkeypatch, form):
+    from contextlib import nullcontext
+    oid = git(repo, "rev-parse", "HEAD").decode().strip()
+    spawns = []
+    def forbidden(argv, **kwargs):
+        spawns.append(argv)
+        pytest.fail("unapproved command reached the spawn boundary")
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": forbidden}))
+    namespace = dict(gitsafe=gitsafe, gitsafe_run=gitsafe_run, root=repo, oid=oid,
+                     ref="refs/heads/main", bad=["update-ref", "refs/heads/main", oid],
+                     os=os, nullcontext=nullcontext)
+    with gitsafe.custody(scratch=tmp_path, strict_lane=True):
+        with pytest.raises(gitsafe.GitError) as caught:
+            exec(RUNTIME_BYPASSES[form], namespace)
+        assert caught.value.code == "git_custody_refused"
+        assert caught.value.next_action == "Use the lane Git APIs or the CAS fast-forward writer."
+        assert not spawns
+
+
+def test_strict_custody_is_inherited_and_legacy_custody_stays_unchanged(repo, tmp_path, monkeypatch):
+    calls, real = [], subprocess.Popen
+    def record(argv, **kwargs):
+        calls.append(argv)
+        return real(argv, **kwargs)
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+    oid = git(repo, "rev-parse", "HEAD").decode().strip()
+    with gitsafe.custody(scratch=tmp_path, strict_lane=True):
+        with gitsafe.custody(scratch=tmp_path, strict_lane=False):
+            with pytest.raises(gitsafe.GitError) as caught:
+                gitsafe.run(["update-ref", "refs/heads/main", oid], repo)
+            assert caught.value.code == "git_custody_refused"
+            assert not calls
+    with gitsafe.custody(scratch=tmp_path):
+        assert gitsafe.run(["update-ref", "refs/aegis/legacy", oid], repo).returncode == 0
+    assert len(calls) == 1
+
+
+def test_strict_cas_exemption_is_single_use_and_never_leaks(repo, tmp_path, monkeypatch):
+    strict_program_guard()
+    parent = git(repo, "rev-parse", "HEAD").decode().strip()
+    new = commit(repo, "next", b"next\n")
+    calls, real = [], subprocess.Popen
+    def record(argv, **kwargs):
+        calls.append(argv)
+        return real(argv, **kwargs)
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+    with gitsafe.custody(scratch=tmp_path, strict_lane=True):
+        assert gitsafe.update_ref(repo, "refs/heads/lane/runtime", parent, None) == "updated"
+        assert gitsafe.update_ref(repo, "refs/heads/lane/runtime", new, parent) == "updated"
+        assert gitsafe.update_ref(repo, "refs/heads/lane/runtime", new, parent) == "already"
+        assert sum("update-ref" in a for a in calls) == 2
+        calls.clear()
+        with pytest.raises(gitsafe.GitError) as caught:
+            gitsafe.run(["update-ref", "--no-deref", "-z", "--stdin"], repo,
+                        stdin=b"update refs/heads/lane/runtime\0" + parent.encode() + b"\0" + new.encode() + b"\0")
+        assert caught.value.code == "git_custody_refused"
+        assert not calls
+
+
+def test_strict_mode_is_context_local_during_concurrent_legacy_work(repo, tmp_path, monkeypatch):
+    ready, release = Event(), Event()
+    calls, real = [], subprocess.Popen
+    def record(argv, **kwargs):
+        calls.append((gitsafe_run.strict_active(), argv))
+        return real(argv, **kwargs)
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+    def strict_worker():
+        with gitsafe.custody(scratch=tmp_path, strict_lane=True):
+            ready.set()
+            assert release.wait(5), "legacy control never released the worker"
+            with pytest.raises(gitsafe.GitError) as caught:
+                gitsafe.run(["update-ref", "refs/heads/main", "0" * 40], repo)
+            return caught.value.code
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(strict_worker)
+        try:
+            assert ready.wait(5), "strict worker never entered custody"
+            with gitsafe.custody(scratch=tmp_path):
+                assert gitsafe.run(["version"], repo).returncode == 0
+        finally:
+            release.set()
+        assert future.result(timeout=5) == "git_custody_refused"
+    assert len(calls) == 1 and calls[0][0] is False
+
+
+def test_cas_grant_is_consumed_before_popen_callback(repo, tmp_path, monkeypatch):
+    strict_program_guard()
+    oid = git(repo, "rev-parse", "HEAD").decode().strip()
+    calls, denied, real = [], [], subprocess.Popen
+    def record(argv, **kwargs):
+        calls.append(argv)
+        if "update-ref" in argv:
+            source = kwargs["stdin"]
+            transaction = source.read()
+            source.seek(0)
+            before = len(calls)
+            with pytest.raises(gitsafe.GitError) as caught:
+                gitsafe.run(["update-ref", "--no-deref", "-z", "--stdin"], repo, stdin=transaction)
+            assert caught.value.code == "git_custody_refused"
+            assert len(calls) == before
+            denied.append(True)
+        return real(argv, **kwargs)
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+    with gitsafe.custody(scratch=tmp_path, strict_lane=True):
+        assert gitsafe.update_ref(repo, "refs/aegis/callback", oid, None) == "updated"
+    assert denied == [True]
+
+
+def test_all_public_lane_work_uses_explicit_runner(repo, monkeypatch):
+    context = make_store(repo)
+    parent = git(repo, "rev-parse", "HEAD").decode().strip()
+    calls, bound, real, capture = [], [], subprocess.Popen, gitsafe_run.capture
+    def record(argv, **kwargs):
+        calls.append((gitsafe_run.strict_active(), argv))
+        return real(argv, **kwargs)
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+    def observed(*args, **kwargs):
+        bound.append((kwargs.get("_lane"), args[0]))
+        return capture(*args, **kwargs)
+    monkeypatch.setattr(gitsafe_run, "capture", observed)
+    with context as store:
+        (repo / "new").write_bytes(b"new\n")
+        tree = tg.snapshot_tree(store)
+        head = tg.commit_tested(store, tree, parent, "test", IDENTITY)
+        assert store.read_blob(tree, "new") == b"new\n"
+        assert tg.plan_merge(store, parent, head).status == "clean"
+        assert tg.plan_pick(store, parent, (head,), IDENTITY).status == "clean"
+        assert tg.cas_fast_forward(store, "refs/heads/lane/strict", None, head) == "updated"
+    assert calls and len(calls) == len(bound)
+    bootstrap = [(runner, argv) for runner, argv in bound if runner is None]
+    assert len(bootstrap) == 4 and all("rev-parse" in argv for _, argv in bootstrap)
+    assert all(isinstance(runner, gitsafe_run.LaneRunner) for runner, _ in bound if runner is not None)
+
+
+def test_strict_argv_bounds_precede_expansion_and_input_scratch(repo, tmp_path, monkeypatch):
+    class Unbounded(list):
+        def __iter__(self):
+            pytest.fail("unproved argv was expanded")
+    def forbidden(*args, **kwargs):
+        pytest.fail("refusal allocated process input or started a process")
+    monkeypatch.setattr(gitsafe_run, "tempfile", SimpleNamespace(**{**vars(tempfile), "TemporaryFile": forbidden}))
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": forbidden}))
+    with gitsafe.custody(scratch=tmp_path, strict_lane=True):
+        for argv in (Unbounded(), ["version"] * 513, ["version", "x" * 16385]):
+            with pytest.raises(gitsafe.GitError) as caught:
+                gitsafe.run(argv, repo, stdin=b"input")
+            assert caught.value.code == "git_custody_refused"
+
+
+def test_capture_freezes_validated_argv_and_environment_before_input_preparation(repo, tmp_path, monkeypatch):
+    strict_program_guard()
+    calls, real = [], subprocess.Popen
+    def record(argv, **kwargs):
+        calls.append((tuple(argv), kwargs["env"].get("HOME")))
+        assert "update-ref" not in argv, "argv changed after the runtime check"
+        return real(argv, **kwargs)
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+    with gitsafe.custody(scratch=tmp_path, strict_lane=True):
+        assert gitsafe.run(["version"], repo).returncode == 0
+        argv = list(next(argv for argv, _ in calls if argv[-1] == "version"))
+        environment = gitsafe.lane_runner(repo, tmp_path).environment(args=("version",))
+        calls.clear()
+        original_home = environment.get("HOME")
+        def mutate(*args, **kwargs):
+            argv[-1:] = ["update-ref", "refs/heads/main", "0" * 40]
+            environment["HOME"] = "after"
+            return tempfile.TemporaryFile(*args, **kwargs)
+        monkeypatch.setattr(gitsafe_run, "tempfile", SimpleNamespace(**{**vars(tempfile), "TemporaryFile": mutate}))
+        result = gitsafe_run.capture(argv, cwd=repo, env=environment, stdin=b"input", timeout=10)
+    assert result.returncode == 0
+    assert "update-ref" in argv and environment["HOME"] == "after"
+    targets = [(argv, home) for argv, home in calls if argv[-1] == "version"]
+    assert len(targets) == 1 and targets[0][1] == original_home
+
+
+def patch_lane_run(monkeypatch, replacement):
+    """Mock the bound external-process adapter with a statically known target."""
+    original = gitsafe_run.LaneRunner.run
+    def call(runner, *args, **kwargs):
+        return replacement(original.__get__(runner), *args, **kwargs)
+    monkeypatch.setattr(gitsafe_run.LaneRunner, "run", call)
+    return lambda: monkeypatch.setattr(gitsafe_run.LaneRunner, "run", original)
+
+
+def patch_lane_objects(monkeypatch, replacement):
+    """Mock the bound external-process adapter with a statically known target."""
+    original = gitsafe_run.LaneRunner.read_private_objects
+    def call(runner, *args, **kwargs):
+        return replacement(original.__get__(runner), *args, **kwargs)
+    monkeypatch.setattr(gitsafe_run.LaneRunner, "read_private_objects", call)
+    return lambda: monkeypatch.setattr(gitsafe_run.LaneRunner, "read_private_objects", original)
+
+
+
+
+@pytest.fixture
+def repo(tmp_path):
+    path = tmp_path / "repo"
+    path.mkdir()
+    git(path, "init", "-q", "-b", "main")
+    commit(path, "x", b"base\n")
+    return path
+
+
+def refs(repo):
+    return git(repo, "show-ref")
+
+
+def test_snapshot_preserves_first_dirty_path_and_all_shared_bytes(repo):
+    context = make_store(repo)  # Guard before creating a POSIX-only filename.
+    (repo / "x").write_bytes(b"changed\n")
+    (repo / "space name\nnext").write_bytes(b"new\n")
+    before = shared_bytes(repo)
+    with context as store:
+        tree = tg.snapshot_tree(store)
+        assert store.read_blob(tree, "x") == b"changed\n"
+        assert store.read_blob(tree, "space name\nnext") == b"new\n"
+        assert tg.snapshot_tree(store) == tree
+    assert shared_bytes(repo) == before
+
+
+def test_snapshot_deletion_and_index_independence(repo):
+    git(repo, "rm", "--cached", "x")
+    before = shared_bytes(repo)
+    with make_store(repo) as store:
+        assert store.read_blob(tg.snapshot_tree(store), "x") == b"base\n"
+        (repo / "x").unlink()
+        tree = tg.snapshot_tree(store)
+        assert store._run(["ls-tree", "-r", tree]).stdout == b""
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("direction", ["file-to-directory", "directory-to-file"])
+def test_snapshot_records_file_directory_replacements_and_retries(repo, direction):
+    context = make_store(repo)
+    if direction == "directory-to-file":
+        (repo / "a").mkdir()
+        commit(repo, "a/b", b"old child")
+        (repo / "a/b").unlink()
+        (repo / "a").rmdir()
+        (repo / "a").write_bytes(b"new leaf")
+        wanted = "a"
+    else:
+        commit(repo, "a", b"old leaf")
+        (repo / "a").unlink()
+        (repo / "a").mkdir()
+        (repo / "a/b").write_bytes(b"new leaf")
+        wanted = "a/b"
+    before = shared_bytes(repo)
+    with context as store:
+        tree = tg.snapshot_tree(store)
+        assert store.read_blob(tree, wanted) == b"new leaf"
+        assert tg.snapshot_tree(store) == tree
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permits colon and backslash filenames")
+@pytest.mark.parametrize("name", ["C:secret", "bad\\name"])
+def test_snapshot_and_blob_read_accept_posix_filename_characters(repo, name):
+    context = make_store(repo)
+    (repo / name).write_bytes(b"legal path")
+    with context as store:
+        assert store.read_blob(tg.snapshot_tree(store), name) == b"legal path"
+
+
+def test_snapshot_platform_refusal(repo, monkeypatch):
+    monkeypatch.setattr(tg, "descriptor_support", lambda: False)
+    with new_store(repo) as store, pytest.raises(tg.GitRefusal) as caught:
+        tg.snapshot_tree(store)
+    assert caught.value.code == "unsupported_platform"
+
+
+def test_snapshot_size_cap_precedes_read(repo, monkeypatch):
+    monkeypatch.setattr(tg, "MAX_FILE_BYTES", 2)
+    with make_store(repo) as store, pytest.raises(tg.GitRefusal) as caught:
+        tg.snapshot_tree(store)
+    assert caught.value.code == "size_limit"
+
+
+def symlink_or_skip(target, link):
+    try:
+        link.symlink_to(target, target_is_directory=target.is_dir())
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+
+
+def test_snapshot_refuses_symlink_parent(repo, tmp_path):
+    (repo / "dir").mkdir()
+    commit(repo, "dir/file", b"inside")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "file").write_bytes(b"secret")
+    (repo / "dir/file").unlink()
+    (repo / "dir").rmdir()
+    symlink_or_skip(outside, repo / "dir")
+    with make_store(repo) as store, pytest.raises(tg.GitRefusal) as caught:
+        tg.snapshot_tree(store)
+    assert caught.value.code == "unsafe_path"
+    assert "secret" not in str(caught.value)
+
+
+def test_deterministic_unsigned_commit_and_cas_retry(repo):
+    parent = git(repo, "rev-parse", "HEAD").decode().strip()
+    git(repo, "branch", "lane/test")
+    git(repo, "config", "commit.gpgsign", "true")
+    before = shared_bytes(repo)
+    with make_store(repo) as store:
+        tree = tg.snapshot_tree(store)
+        first = tg.commit_tested(store, tree, parent, "fixed\n", IDENTITY)
+        assert tg.commit_tested(store, tree, parent, "fixed\n", IDENTITY) == first
+        assert b"gpgsig" not in store._run(["cat-file", "commit", first]).stdout
+        assert shared_bytes(repo) == before
+        assert tg.cas_fast_forward(store, "refs/heads/lane/test", parent, first) == "updated"
+        assert tg.cas_fast_forward(store, "refs/heads/lane/test", parent, first) == "already"
+    assert git(repo, "show", "lane/test:x") == b"base\n"
+
+
+@pytest.mark.parametrize("ref", ["refs/heads/main", "refs/tags/no", "HEAD", "refs/heads/lane/../main"])
+def test_ref_allowlist_refuses_without_effects(repo, ref):
+    parent = git(repo, "rev-parse", "HEAD").decode().strip()
+    before = shared_bytes(repo)
+    with new_store(repo) as store, pytest.raises(tg.GitRefusal) as caught:
+        tg.cas_fast_forward(store, ref, parent, parent)
+    assert caught.value.code == "ref_not_allowed"
+    assert shared_bytes(repo) == before
+
+
+def test_cas_mismatch_and_non_fast_forward_have_zero_effects(repo):
+    first = git(repo, "rev-parse", "HEAD").decode().strip()
+    second = commit(repo, "x", b"second")
+    git(repo, "branch", "lane/test", second)
+    before = shared_bytes(repo)
+    with new_store(repo) as store:
+        for old, new, code in [(first, first, "cas_mismatch"), (second, first, "not_fast_forward")]:
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.cas_fast_forward(store, "refs/heads/lane/test", old, new)
+            assert caught.value.code == code
+    assert shared_bytes(repo) == before
+
+
+def test_concurrent_cas_has_one_winner(repo):
+    parent = git(repo, "rev-parse", "HEAD").decode().strip()
+    git(repo, "branch", "lane/race")
+    with new_store(repo) as store:
+        tree = git(repo, "rev-parse", "HEAD^{tree}").decode().strip()
+        heads = [tg.commit_tested(store, tree, parent, message, IDENTITY) for message in ("one", "two")]
+        def move(head):
+            try:
+                return tg.cas_fast_forward(store, "refs/heads/lane/race", parent, head)
+            except tg.GitRefusal as exc:
+                return exc.code
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(move, heads))
+        assert sorted(results) == ["cas_mismatch", "updated"]
+
+
+def test_planners_merge_pick_revert_and_reland(repo):
+    base = git(repo, "rev-parse", "HEAD").decode().strip()
+    git(repo, "checkout", "-qb", "topic")
+    source = commit(repo, "feature", b"feature\n")
+    git(repo, "checkout", "-q", "main")
+    tip = commit(repo, "other", b"other\n")
+    before = refs(repo)
+    with new_store(repo) as store:
+        plan = tg.plan_merge(store, tip, source)
+        assert plan.status == "clean"
+        expected = git(repo, "merge-tree", "--write-tree", tip, source).decode().splitlines()[0]
+        assert plan.tree == expected
+        merge = tg.commit_tested(store, plan.tree, (tip, source), "merge", IDENTITY)
+        reverted = tg.plan_revert(store, merge, merge)
+        assert reverted.tree == git(repo, "rev-parse", tip + "^{tree}").decode().strip()
+        revert_commit = tg.commit_tested(store, reverted.tree, merge, "revert", IDENTITY)
+        picked = tg.plan_pick(store, revert_commit, (merge,), IDENTITY)
+        assert picked.status == "clean" and len(picked.commits) == 1
+        assert picked.tree == plan.tree
+        assert picked.commits[0] != source
+        text = store._run(["cat-file", "commit", picked.commits[0]]).stdout
+        assert ("(cherry picked from commit " + source + ")").encode() in text
+        assert tg.plan_pick(store, revert_commit, (merge,), IDENTITY) == picked
+    assert refs(repo) == before
+
+
+def test_conflict_reports_paths_and_never_moves_refs(repo):
+    git(repo, "checkout", "-qb", "topic")
+    source = commit(repo, "x", b"topic\n")
+    git(repo, "checkout", "-q", "main")
+    tip = commit(repo, "x", b"main\n")
+    before = shared_bytes(repo)
+    with new_store(repo) as store:
+        for plan in (tg.plan_merge(store, tip, source), tg.plan_pick(store, tip, (source,), IDENTITY)):
+            assert plan.status == "conflict" and plan.conflicts == ("x",)
+            assert not plan.commits
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("message", ["bad\0message", "x" * (tg.MAX_MESSAGE_BYTES + 1), "ok\nAegis-Approve: yes"],
+                         ids=["nul", "oversized", "approval"])
+def test_commit_message_refusals(repo, message):
+    with new_store(repo) as store, pytest.raises(tg.GitRefusal) as caught:
+        tg.commit_tested(store, "0" * 40, "0" * 40, message, IDENTITY)
+    assert caught.value.code == "invalid_message"
+
+
+@pytest.mark.parametrize("separator", ["\n", "\r", "\x85", "\u2028", "\u2029"],
+                         ids=["lf", "cr", "nel", "line-separator", "paragraph-separator"])
+def test_identity_refuses_multiline(repo, separator):
+    with new_store(repo) as store, pytest.raises(tg.GitRefusal) as caught:
+        tg.commit_tested(store, "0" * 40, "0" * 40, "ok", tg.CommitIdentity("a" + separator + "b", "x@y", "1700000000 +0000"))
+    assert caught.value.code == "invalid_identity"
+
+
+def test_git_failure_is_documented_and_does_not_echo(repo, monkeypatch):
+    with new_store(repo) as store:
+        def fail(real, *args, **kwargs):
+            raise gitsafe.GitError("token=secret hostile\ntext")
+        restore = patch_lane_run(monkeypatch, fail)
+        with pytest.raises(tg.GitRefusal) as caught:
+            store._run(["version"])
+        assert caught.value.code == "git_failed"
+        assert "secret" not in str(caught.value)
+
+
+def test_single_ref_writer_and_no_force_by_construction():
+    from tests.unit.core.test_gitsafe import _run_subcommand_offenders
+    source = Path(tg.__file__).read_text(encoding="utf-8")
+    assert not _run_subcommand_offenders("aegis_core/team_git.py", source)
+    tree = ast.parse(source)
+    writers = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+               and isinstance(node.func, ast.Attribute) and node.func.attr == "cas"]
+    assert len(writers) == 1
+    assert not any(flag in source for flag in ("--force", "--force-with-lease", "+refspec"))
+
+
+@pytest.mark.parametrize("renamed", [False, True])
+@pytest.mark.parametrize("mode", ["valid", "invalid", "absent", "closed"])
+def test_cas_effect_policy_is_independent_of_name(repo, monkeypatch, renamed, mode):
+    from aegis_core import team_gitops
+    if not gitops_fds.descriptor_supported():
+        pytest.skip("effect custody requires Linux child subreaper support")
+    if renamed:
+        monkeypatch.setattr(tg.cas_fast_forward.__wrapped__, "__name__", "renamed_publish")
+    with make_store(repo) as store:
+        head = git(repo, "rev-parse", "HEAD").decode().strip()
+        journal = team_gitops.GitOpsJournal(repo / ".git")
+        seen, original = [], gitsafe_run.LaneRunner.cas
+        def observe(self, *args, **kwargs):
+            seen.append((self, self.effect_fds))
+            return original(self, *args, **kwargs)
+        monkeypatch.setattr(gitsafe_run.LaneRunner, "cas", observe)
+        with journal.record_intent(op="ref_update", lane="lane-1", request_id="policy",
+                                   expected_old=None, expected_new=head, actor="custodian-1") as receipt:
+            descriptors = receipt.inheritable_fds()
+            kwargs = {} if mode == "absent" else {"effect_fds": () if mode == "invalid" else descriptors}
+            if mode == "closed":
+                store.__exit__(None, None, None)
+            if mode in ("invalid", "closed"):
+                before = shared_bytes(repo)
+                def unexpected(*args, **kwargs):
+                    pytest.fail("refused effect policy reached process creation")
+                monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": unexpected}))
+                with pytest.raises(tg.GitRefusal) as caught:
+                    tg.cas_fast_forward(store, "refs/heads/lane/policy", None, head, **kwargs)
+                monkeypatch.setattr(gitsafe_run, "subprocess", subprocess)
+                code = "store_closed" if mode == "closed" else "invalid_effect_descriptor"
+                assert (caught.value.code, str(caught.value)) == (code, "Lane Git operation refused: " + code)
+                assert not seen and shared_bytes(repo) == before
+                if mode == "closed":
+                    store.__enter__()
+                kwargs = {"effect_fds": descriptors}
+            assert tg.cas_fast_forward(store, "refs/heads/lane/policy", None, head, **kwargs) == "updated"
+            assert seen[0][1] == (None if mode == "absent" else descriptors)
+            assert (seen[0][0] is store._lane) == (mode == "absent")
+            assert tg.cas_fast_forward(store, "refs/heads/lane/policy", None, head, **kwargs) == "already"
+            assert os.fstat(descriptors[0])
+            assert not os.get_inheritable(descriptors[0])
+        assert tg.cas_fast_forward(store, "refs/heads/lane/plain-policy", None, head) == "updated"
+        assert seen[-1] == (store._lane, None)
+
+
+def test_store_entry_policy_is_independent_of_name(repo, monkeypatch):
+    monkeypatch.setattr(tg.GitStore.__enter__.__wrapped__, "__name__", "renamed_entry")
+    with new_store(repo) as store:
+        assert store._run(["version"]).returncode == 0
+
+
+@pytest.mark.parametrize("name", ["cas_fast_forward", "__enter__", "ordinary"])
+@pytest.mark.parametrize("descriptors", [None, (), "token=PRIVATE"])
+def test_non_effect_policy_refuses_descriptors_before_spawn_and_retries(repo, monkeypatch, name, descriptors):
+    def operation(store, *, _runner=None):
+        return _runner
+    operation.__name__ = name
+    operation = tg._lane_operation(operation)
+    with new_store(repo) as store:
+        def unexpected(*args, **kwargs):
+            pytest.fail("non-effect operation reached process creation")
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": unexpected}))
+        with pytest.raises(tg.GitRefusal) as caught:
+            operation(store, effect_fds=descriptors)
+        assert (caught.value.code, str(caught.value)) == (
+            "effect_runner_refused", "Lane Git operation refused: effect_runner_refused")
+        with pytest.raises(tg.GitRefusal) as caught:
+            operation(store, _runner=store._lane)
+        assert caught.value.code == "lane_runner_required"
+        assert operation(store) is store._lane
+        store.__exit__(None, None, None)
+        with pytest.raises(tg.GitRefusal) as caught:
+            operation(store)
+        assert caught.value.code == "store_closed"
+        with pytest.raises(tg.GitRefusal) as caught:
+            operation(store, effect_fds=descriptors)
+        assert caught.value.code == "store_closed"
+        monkeypatch.setattr(gitsafe_run, "subprocess", subprocess)
+
+
+def test_renamed_cas_effect_policy_preserves_unknown_refusal(repo, monkeypatch):
+    from aegis_core import team_gitops
+    if not gitops_fds.descriptor_supported():
+        pytest.skip("effect custody requires Linux child subreaper support")
+    monkeypatch.setattr(tg.cas_fast_forward.__wrapped__, "__name__", "renamed_publish")
+    with make_store(repo) as store:
+        head = git(repo, "rev-parse", "HEAD").decode().strip()
+        attempts = []
+        def fail(self, *args, **kwargs):
+            attempts.append(self.effect_fds)
+            raise gitsafe.GitError("token=PRIVATE", code="git_timeout", process_started=True)
+        monkeypatch.setattr(gitsafe_run.LaneRunner, "cas", fail)
+        journal = team_gitops.GitOpsJournal(repo / ".git")
+        with journal.record_intent(op="ref_update", lane="lane-1", request_id="unknown-policy",
+                                   expected_old=None, expected_new=head, actor="custodian-1") as receipt:
+            descriptors = receipt.inheritable_fds()
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.cas_fast_forward(store, "refs/heads/lane/unknown-policy", None, head, effect_fds=descriptors)
+            assert (caught.value.code, str(caught.value)) == (
+                "ref_update_unknown", "Lane Git operation refused: ref_update_unknown")
+            assert attempts == [descriptors]
+            assert os.fstat(descriptors[0])
+
+
+def test_effect_policy_concurrent_calls_keep_runner_custody_local(repo, monkeypatch):
+    from aegis_core import team_gitops
+    if not gitops_fds.descriptor_supported():
+        pytest.skip("effect custody requires Linux child subreaper support")
+    with make_store(repo) as store:
+        head = git(repo, "rev-parse", "HEAD").decode().strip()
+        journal = team_gitops.GitOpsJournal(repo / ".git")
+        barrier = Barrier(2)
+        @tg._lane_operation(effect_aware=True)
+        def renamed_effect(store, *, effect_fds=None, _runner=None):
+            barrier.wait(timeout=5)
+            return _runner
+        @tg._lane_operation
+        def ordinary(store, *, _runner=None):
+            barrier.wait(timeout=5)
+            return _runner
+        with journal.record_intent(op="ref_update", lane="lane-1", request_id="concurrent-policy",
+                                   expected_old=None, expected_new=head, actor="custodian-1") as receipt:
+            descriptors = receipt.inheritable_fds()
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                effect = pool.submit(renamed_effect, store, effect_fds=descriptors)
+                plain = pool.submit(ordinary, store)
+                effect_runner, plain_runner = effect.result(timeout=15), plain.result(timeout=15)
+            assert effect_runner is not store._lane and effect_runner.effect_fds == descriptors
+            assert plain_runner is store._lane and plain_runner.effect_fds is None
+            assert os.fstat(descriptors[0])
+
+
+def test_cas_borrows_receipt_descriptors_without_retaining_them(repo, monkeypatch):
+    from aegis_core import team_gitops
+    if not gitops_fds.descriptor_supported():
+        pytest.skip("effect custody requires Linux child subreaper support")
+    with make_store(repo) as store:
+        head = git(repo, "rev-parse", "HEAD").decode().strip()
+        journal = team_gitops.GitOpsJournal(repo / ".git")
+        original, seen = gitsafe_run.LaneRunner.cas, []
+        def observe(self, *args, **kwargs):
+            seen.append(self.effect_fds)
+            return original(self, *args, **kwargs)
+        monkeypatch.setattr(gitsafe_run.LaneRunner, "cas", observe)
+        with journal.record_intent(op="ref_update", lane="lane-1", request_id="effect-1",
+                                   expected_old=None, expected_new=head, actor="custodian-1") as receipt:
+            descriptors = receipt.inheritable_fds()
+            assert tg.cas_fast_forward(store, "refs/heads/lane/effect", None, head,
+                                       effect_fds=descriptors) == "updated"
+            assert seen == [descriptors]
+            assert not os.get_inheritable(descriptors[0])
+            assert tg.cas_fast_forward(store, "refs/heads/lane/effect", None, head,
+                                       effect_fds=descriptors) == "already"
+        # An effect-bound operation must not leave a closed receipt on the store.
+        assert tg.cas_fast_forward(store, "refs/heads/lane/plain", None, head) == "updated"
+        assert seen == [descriptors, None]
+
+
+@pytest.mark.parametrize("descriptors", [(), (True,), (-1,), (999999,), "token=PRIVATE"])
+def test_cas_invalid_effect_descriptors_refuse_before_spawn_and_allow_retry(repo, monkeypatch, descriptors):
+    if not gitops_fds.descriptor_supported():
+        pytest.skip("effect custody requires Linux child subreaper support")
+    with make_store(repo) as store:
+        head = git(repo, "rev-parse", "HEAD").decode().strip()
+        before = shared_bytes(repo)
+        def unexpected(*args, **kwargs):
+            pytest.fail("invalid effect descriptors reached process creation")
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": unexpected}))
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.cas_fast_forward(store, "refs/heads/lane/effect", None, head, effect_fds=descriptors)
+        assert caught.value.code == "invalid_effect_descriptor"
+        assert str(caught.value) == "Lane Git operation refused: invalid_effect_descriptor"
+        assert shared_bytes(repo) == before
+        monkeypatch.setattr(gitsafe_run, "subprocess", subprocess)
+        assert tg.cas_fast_forward(store, "refs/heads/lane/effect", None, head) == "updated"
+
+
+def test_cas_effect_platform_probe_refuses_without_consuming_receipt(repo, monkeypatch):
+    with make_store(repo) as store:
+        head = git(repo, "rev-parse", "HEAD").decode().strip()
+        probe = gitops_fds.descriptor_supported
+        monkeypatch.setattr(gitops_fds, "descriptor_supported", lambda: False)
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.cas_fast_forward(store, "refs/heads/lane/effect", None, head, effect_fds=())
+        assert caught.value.code == "unsupported_effect_platform"
+        assert str(caught.value) == "Lane Git operation refused: unsupported_effect_platform"
+        monkeypatch.setattr(gitops_fds, "descriptor_supported", probe)
+        assert tg.cas_fast_forward(store, "refs/heads/lane/effect", None, head) == "updated"
+
+
+@pytest.mark.parametrize("code", ["git_cleanup_failed", "git_timeout", "git_output_limit", "ref_update_unknown", "git_failed"])
+@pytest.mark.parametrize("observation", ["old", "new", "winner"])
+def test_effect_cas_does_not_promote_a_visible_failure_to_success(repo, monkeypatch, code, observation):
+    from aegis_core import team_gitops
+    if not gitops_fds.descriptor_supported():
+        pytest.skip("effect custody requires Linux child subreaper support")
+    with make_store(repo) as store:
+        new = git(repo, "rev-parse", "HEAD").decode().strip()
+        winner = commit(repo, "winner", b"competing bytes")
+        ref = "refs/aegis/qual/visible-failure"
+        attempts = []
+        def fail(self, *args, **kwargs):
+            attempts.append(args)
+            if observation != "old":
+                git(repo, "update-ref", ref, new if observation == "new" else winner)
+            raise gitsafe.GitError("private error", code=code, process_started=True)
+        monkeypatch.setattr(gitsafe_run.LaneRunner, "cas", fail)
+        journal = team_gitops.GitOpsJournal(repo / ".git")
+        with journal.record_intent(op="ref_update", lane="lane-1", request_id="visible-failure",
+                                   expected_old=None, expected_new=new, actor="custodian-1") as receipt:
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.cas_fast_forward(store, ref, None, new, effect_fds=receipt.inheritable_fds())
+            assert caught.value.code == "ref_update_unknown"
+            assert str(caught.value) == "Lane Git operation refused: ref_update_unknown"
+        assert len(attempts) == 1
+
+
+@pytest.mark.parametrize("setting", ["text-auto", "autocrlf-true", "autocrlf-input", "text", "text-crlf", "binary"])
+@pytest.mark.parametrize("baseline", ["crlf", "lf", "absent", "staged-crlf"])
+def test_snapshot_matches_real_git_add_with_baseline(repo, tmp_path, setting, baseline):
+    context = make_store(repo)
+    git(repo, "config", "core.autocrlf", "false")
+    if baseline != "absent":
+        commit(repo, "line.txt", b"one\r\ntwo\r\n" if baseline == "crlf" else b"one\ntwo\n")
+    oracle = tmp_path / "oracle"
+    git(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    attributes = {"text-auto": b"line.txt text=auto\nnew.txt text=auto\n", "text": b"*.txt text\n",
+                  "text-crlf": b"*.txt text eol=crlf\n", "binary": b"*.txt -text\n"}.get(setting, b"")
+    for target in (repo, oracle):
+        git(target, "config", "core.autocrlf", setting.split("-", 1)[1] if setting.startswith("autocrlf") else "false")
+        git(target, "config", "core.safecrlf", "false")
+        (target / ".gitattributes").write_bytes(attributes)
+        if baseline == "staged-crlf":
+            oid = git(target, "hash-object", "-w", "--stdin", "--no-filters", data=b"one\r\ntwo\r\n").strip()
+            git(target, "update-index", "--cacheinfo", "100644," + oid.decode() + ",line.txt")
+        (target / "line.txt").write_bytes(b"one\r\ntwo\r\n")
+        (target / "new.txt").write_bytes(b"new\r\nfile\r\n")
+    before = shared_bytes(repo)
+    git(oracle, "add", "-A")
+    expected = git(oracle, "write-tree").decode().strip()
+    with context as store:
+        assert tg.snapshot_tree(store) == expected
+        assert tg.snapshot_tree(store) == expected
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("state", ["root-deleted", "nested-deleted", "head-only", "added-after-crlf"])
+@pytest.mark.parametrize("native", [False, True], ids=["text", "native"])
+def test_snapshot_attributes_use_real_index_and_match_git_add(repo, tmp_path, state, native):
+    context = make_store(repo)
+    git(repo, "config", "core.autocrlf", "false")
+    prefix = "nested/" if state == "nested-deleted" else ""
+    (repo / "nested").mkdir(exist_ok=True)
+    commit(repo, prefix + "file.txt", b"one\r\ntwo\r\n")
+    attr = prefix + ".gitattributes"
+    content = b"*.txt text" + (b" working-tree-encoding=UTF-16LE" if native else b"") + b"\n"
+    oracle = tmp_path / "oracle"
+    git(tmp_path, "-c", "core.autocrlf=false", "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    for target in (repo, oracle):
+        git(target, "config", "core.autocrlf", "false")
+        os.utime(target / (prefix + "file.txt"), (1000000000, 1000000000))
+        git(target, "update-index", "--refresh")
+        (target / attr).write_bytes(content)
+        git(target, "add", "--", attr)
+        git(target, "commit", "-qm", "attributes added without renormalizing content")
+        if state != "added-after-crlf":
+            git(target, "rm", "--cached", "--", attr)
+            (target / attr).unlink()
+        if state == "head-only":
+            git(target, "read-tree", "--empty")
+    if state == "added-after-crlf" and native:
+        # Native input is a legitimate checkout; its attribute context must survive conversion.
+        for target in (repo, oracle):
+            (target / (prefix + "file.txt")).write_bytes("one\r\ntwo\r\n".encode("utf-16-le"))
+    before = shared_bytes(repo)
+    git(oracle, "add", "-A")
+    expected = git(oracle, "write-tree").decode().strip()
+    with context as store:
+        assert tg.snapshot_tree(store) == expected
+        assert tg.snapshot_tree(store) == expected
+    assert shared_bytes(repo) == before
+
+
+def test_snapshot_unmerged_index_uses_ours_baseline_like_git_add(repo, tmp_path):
+    context = make_store(repo)
+    git(repo, "config", "core.autocrlf", "false")
+    ours = git(repo, "hash-object", "-w", "--stdin", data=b"ours\r\n").strip()
+    theirs = git(repo, "hash-object", "-w", "--stdin", data=b"theirs\n").strip()
+    (repo / "conflict.txt").write_bytes(b"ours\r\nresolved\r\n")
+    (repo / ".gitattributes").write_bytes(b"*.txt text=auto\n")
+    records = b"".join(b"100644 " + oid + b" " + str(stage).encode() + b"\tconflict.txt\0"
+                       for stage, oid in ((1, theirs), (2, ours), (3, theirs)))
+    git(repo, "update-index", "-z", "--index-info", data=records)
+    oracle = tmp_path / "oracle"
+    git(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    for oid, value in ((ours, b"ours\r\n"), (theirs, b"theirs\n")):
+        assert git(oracle, "hash-object", "-w", "--stdin", data=value).strip() == oid
+    git(oracle, "update-index", "-z", "--index-info", data=records)
+    for name in ("conflict.txt", ".gitattributes"):
+        (oracle / name).write_bytes((repo / name).read_bytes())
+    git(oracle, "add", "-A")
+    with context as store:
+        assert tg.snapshot_tree(store) == git(oracle, "write-tree").decode().strip()
+
+
+def test_snapshot_cleans_emulated_symlink_bytes_before_mode(repo, tmp_path):
+    context = make_store(repo)
+    oid = git(repo, "hash-object", "-w", "--stdin", data=b"old-target").decode().strip()
+    git(repo, "update-index", "--add", "--cacheinfo", "120000," + oid + ",link")
+    git(repo, "commit", "-qm", "link")
+    oracle = tmp_path / "oracle"
+    git(tmp_path, "clone", "-q", "--no-checkout", "--no-hardlinks", str(repo), str(oracle))
+    for target in (repo, oracle):
+        git(target, "config", "core.symlinks", "false")
+        if target == oracle:
+            git(target, "reset", "--hard", "HEAD")
+        (target / ".gitattributes").write_bytes(b"* text=auto\n")
+        (target / "link").write_bytes(b"new\r\ntarget\r\n")
+    git(oracle, "add", "-A")
+    with context as store:
+        expected = git(oracle, "write-tree").decode().strip()
+        assert tg.snapshot_tree(store) == expected
+        assert tg.snapshot_tree(store) == expected
+
+
+def test_stat_clean_crlf_honors_ignored_mode_and_ctime_like_git(repo, tmp_path):
+    context = make_store(repo)
+    git(repo, "config", "core.autocrlf", "false")
+    commit(repo, "file.txt", b"one\r\ntwo\r\n")
+    oracle = tmp_path / "oracle"
+    git(tmp_path, "-c", "core.autocrlf=false", "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    for target in (repo, oracle):
+        git(target, "config", "core.autocrlf", "false")
+        git(target, "config", "core.filemode", "false")
+        git(target, "config", "core.trustctime", "false")
+        os.utime(target / "file.txt", (1000000000, 1000000000))
+        git(target, "update-index", "--refresh")
+        (target / ".gitattributes").write_bytes(b"*.txt text\n")
+        git(target, "add", ".gitattributes")
+        git(target, "commit", "-qm", "attributes")
+        (target / "file.txt").chmod(0o744)
+    git(oracle, "add", "-A")
+    with context as store:
+        assert tg.snapshot_tree(store) == git(oracle, "write-tree").decode().strip()
+
+
+def test_snapshot_refuses_concurrent_index_replacement_then_retries(repo, monkeypatch):
+    context = make_store(repo)
+    (repo / "staged").write_bytes(b"owner change\n")
+    entered, release = Event(), Event()
+    def gated_read(fd, count):
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(5), "owner never released the snapshot"
+        return os.read(fd, count)
+    with context as store, ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(tg, "os", SimpleNamespace(**{**vars(os), "read": gated_read}))
+        future = executor.submit(tg.snapshot_tree, store)
+        try:
+            assert entered.wait(5), "snapshot never reached descriptor reads"
+            git(repo, "add", "staged")
+        finally:
+            release.set()
+        with pytest.raises(tg.GitRefusal) as caught:
+            future.result(timeout=5)
+        assert caught.value.code == "worktree_changed"
+        monkeypatch.setattr(tg, "os", os)
+        assert store.read_blob(tg.snapshot_tree(store), "staged") == b"owner change\n"
+
+
+@pytest.mark.parametrize("mode", ["eol", "attributes", "configured-attributes", "configured-clean-attributes"])
+def test_snapshot_reads_only_needed_crlf_baselines_and_retries_failure(repo, monkeypatch, filter_home, mode):
+    context = make_store(repo)
+    (repo / ".gitattributes").write_bytes(b"* text=auto\n")
+    for number in range(10):
+        commit(repo, "file%d" % number, ("unique %d\n" % number).encode())
+    if mode != "eol":
+        git(repo, "add", "--", ".gitattributes")
+    if mode in ("attributes", "configured-attributes"):
+        (repo / ".gitattributes").write_bytes(b"* text=auto\n# changed text settings\n")
+    configured = mode.startswith("configured-")
+    if configured:
+        git(repo, "config", "filter.other.required", "false")
+    requests = []
+    def read(real, *args, **kwargs):
+        requests.append(args[1])
+        return real(*args, **kwargs)
+    with context as store:
+        restore = patch_lane_objects(monkeypatch, read)
+        tg.snapshot_tree(store)
+        assert len(requests) == 1 and len(requests[0]) == int(configured)
+        requests.clear()
+        (repo / "file3").write_bytes(b"unique 3\r\n")
+        tree = tg.snapshot_tree(store)
+        assert len(requests) == 1 and len(requests[0]) == 1 + int(configured)
+        assert store.read_blob(tree, "file3") == b"unique 3\n"
+        restore()
+        def fail(real, *args, **kwargs):
+            raise gitsafe.GitError("never echo token=private", code="privacy_refused")
+        restore = patch_lane_objects(monkeypatch, fail)
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree(store)
+        assert caught.value.code == "privacy_refused" and "private" not in str(caught.value)
+        restore()
+        assert tg.snapshot_tree(store) == tree
+
+
+@pytest.mark.parametrize("fault", ["unterminated", "unknown-stage", "duplicate", "bad-stat", "stat-overflow", "bad-config", "unknown-flags"])
+def test_snapshot_refuses_unknown_index_or_config_protocol_and_retries(repo, monkeypatch, fault):
+    context = make_store(repo)
+    def damaged(real, args, *rest, **kwargs):
+        result = real(args, *rest, **kwargs)
+        data = result.stdout
+        if "ls-files" in args and "--debug" in args and fault != "bad-config":
+            if fault == "unterminated":
+                data = data.replace(b"\0", b"", 1)
+            elif fault == "unknown-stage":
+                data = data.replace(b" 0\t", b" 4\t", 1)
+            elif fault == "duplicate":
+                data += data
+            elif fault == "bad-stat":
+                data = data.replace(b"  ctime:", b"  secret:", 1)
+            elif fault == "unknown-flags":
+                data = data.replace(b"flags: 0", b"flags: 40000000", 1)
+            else:
+                data = data.replace(b"  size: ", b"  size: 99999999999", 1)
+        if "config" in args and "--get-regexp" in args and fault == "bad-config" and tg._CONFIG_QUERY in args:
+            data = b"core.autocrlf\nunknown-token=secret\0"
+        return subprocess.CompletedProcess(result.args, result.returncode, data, result.stderr)
+    before = shared_bytes(repo)
+    with context as store:
+        restore = patch_lane_run(monkeypatch, damaged)
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert caught.value.code in ("conversion_unavailable", "size_limit")
+            assert "secret" not in str(caught.value)
+        restore()
+        assert store.read_blob(tg.snapshot_tree(store), "x") == b"base\n"
+    assert shared_bytes(repo) == before
+
+
+def test_snapshot_matches_git_add_for_emulated_symlink(repo, tmp_path):
+    context = make_store(repo)
+    oid = git(repo, "hash-object", "-w", "--stdin", data=b"x").decode().strip()
+    git(repo, "update-index", "--add", "--cacheinfo", "120000," + oid + ",link")
+    git(repo, "commit", "-qm", "link")
+    oracle = tmp_path / "oracle"
+    git(tmp_path, "clone", "-q", "--no-checkout", "--no-hardlinks", str(repo), str(oracle))
+    git(oracle, "config", "core.symlinks", "false")
+    git(oracle, "reset", "--hard", "HEAD")
+    git(repo, "config", "core.symlinks", "false")
+    for target in (repo, oracle):
+        (target / "link").write_bytes(b"x-new-target")
+    git(oracle, "add", "-A")
+    with context as store:
+        assert tg.snapshot_tree(store) == git(oracle, "write-tree").decode().strip()
+
+
+@pytest.mark.parametrize("conversion", ["text-auto", "autocrlf", "plain"])
+def test_snapshot_process_count_is_constant_for_new_and_existing_files(repo, monkeypatch, conversion):
+    context = make_store(repo)
+    if conversion == "text-auto":
+        (repo / ".gitattributes").write_bytes(b"* text=auto\n")
+    if conversion == "autocrlf":
+        git(repo, "config", "core.autocrlf", "true")
+    calls, real = [], subprocess.Popen
+    def record(argv, **kwargs):
+        calls.append(argv)
+        return real(argv, **kwargs)
+    with context as store:
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+        tg.snapshot_tree(store)
+        small = len(calls)
+        calls.clear()
+        for number in range(100):
+            (repo / ("new%d" % number)).write_bytes(("unique %d\r\n" % number).encode())
+        first = tg.snapshot_tree(store)
+        assert len(calls) <= small + 1
+        assert not any("hash-object" in a for a in calls)
+        calls.clear()
+        assert tg.snapshot_tree(store) == first
+        assert len(calls) <= small + 1
+
+
+@pytest.mark.parametrize("attributes,auto", [(b"*.txt text=auto", "false"), (b"*.txt text", "false"),
+    (b"*.txt -text", "true"), (b"*.txt text=auto eol=lf", "false"),
+    (b"*.txt text=auto eol=crlf", "false"), (b"*.txt crlf=input", "false"), (b"", "input")])
+@pytest.mark.parametrize("payload", [b"one\r\ntwo\n", b"one\rtwo\r\n", b"a\0\r\n", b"abc\r\n\x1a",
+    b"a" * 127 + b"\x01\r\n", b"a" * 128 + b"\x01\r\n", b"", b"$Id: expanded $\r\n"])
+def test_snapshot_eol_byte_statistics_match_git_add(repo, tmp_path, attributes, auto, payload):
+    context = make_store(repo)
+    oracle = tmp_path / "oracle"
+    git(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    for target in (repo, oracle):
+        git(target, "config", "core.autocrlf", auto)
+        git(target, "config", "core.safecrlf", "false")
+        (target / ".gitattributes").write_bytes(attributes + b"\n")
+        (target / "file.txt").write_bytes(payload)
+    git(oracle, "add", "-A")
+    with context as store:
+        assert tg.snapshot_tree(store) == git(oracle, "write-tree").decode().strip()
+
+
+@pytest.mark.parametrize("autocrlf,eol,payload", [("input", "lf", b"a\r\n"),
+    ("true", "crlf", b"a\n"), ("false", "crlf", b"a\r\nb\n")])
+def test_snapshot_safecrlf_refusal_and_retry_match_git(repo, autocrlf, eol, payload):
+    context = make_store(repo)
+    git(repo, "config", "core.autocrlf", autocrlf)
+    git(repo, "config", "core.safecrlf", "true")
+    (repo / ".gitattributes").write_bytes(("*.txt text eol=" + eol + "\n").encode())
+    (repo / "file.txt").write_bytes(payload)
+    result = subprocess.run(["git", "add", "file.txt"], cwd=repo, capture_output=True)
+    assert result.returncode != 0
+    before = shared_bytes(repo)
+    with context as store:
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert caught.value.code == "conversion_unavailable"
+        git(repo, "config", "core.safecrlf", "false")
+        assert store.read_blob(tg.snapshot_tree(store), "file.txt") == payload.replace(b"\r\n", b"\n")
+    # Only the deliberate config edit may change the shared repository.
+    after = shared_bytes(repo)
+    assert {k: v for k, v in before.items() if k != "config"} == {k: v for k, v in after.items() if k != "config"}
+
+
+def test_snapshot_encoding_and_ident_keep_automatic_crlf_baseline(repo, tmp_path):
+    context = make_store(repo)
+    git(repo, "config", "core.autocrlf", "false")
+    commit(repo, "file.txt", b"one\r\n$Id$\r\n")
+    oracle = tmp_path / "oracle"
+    git(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    for target in (repo, oracle):
+        (target / ".gitattributes").write_bytes(b"file.txt text=auto ident working-tree-encoding=UTF-16LE\n")
+        (target / "file.txt").write_bytes("one\r\n$Id: expanded $\r\n".encode("utf-16-le"))
+    git(oracle, "add", "-A")
+    with context as store:
+        assert tg.snapshot_tree(store) == git(oracle, "write-tree").decode().strip()
+
+
+@pytest.mark.parametrize("failure", ["exit", "timeout-before", "timeout-after"])
+def test_snapshot_blob_batch_failure_closes_descriptors_and_retry_succeeds(repo, monkeypatch, failure):
+    context = make_store(repo)
+    (repo / "new").write_bytes(b"unique batch bytes\n")
+    failed, calls = [], []
+    opened, closed = [], []
+    def tracked_open(*args, **kwargs):
+        fd = os.open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+    def tracked_close(fd):
+        closed.append(fd)
+        os.close(fd)
+    def boundary(real, args, *rest, **kwargs):
+        calls.append(args)
+        if "unpack-objects" in args and not failed:
+            failed.append(True)
+            if failure == "exit":
+                return subprocess.CompletedProcess(args, 1, b"", b"secret input")
+            if failure == "timeout-after":
+                real(args, *rest, **kwargs)
+            raise gitsafe.GitError("secret input", code="git_timeout")
+        return real(args, *rest, **kwargs)
+    before = shared_bytes(repo)
+    with context as store:
+        restore = patch_lane_run(monkeypatch, boundary)
+        monkeypatch.setattr(tg, "os", SimpleNamespace(**{**vars(os), "open": tracked_open,
+            "close": tracked_close, "supports_dir_fd": os.supports_dir_fd | {tracked_open}}))
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree(store)
+        assert caught.value.code == ("git_failed" if failure == "exit" else "git_timeout")
+        assert "secret" not in str(caught.value)
+        assert sorted(opened) == sorted(closed)
+        assert not any("update-index" in a for a in calls)
+        assert store.read_blob(tg.snapshot_tree(store), "new") == b"unique batch bytes\n"
+        assert sorted(opened) == sorted(closed)
+    assert shared_bytes(repo) == before
+
+
+def test_snapshot_refuses_nonblob_conversion_baseline_and_recovers(repo):
+    context = make_store(repo)
+    (repo / ".gitattributes").write_bytes(b"* text=auto\n")
+    (repo / "x").write_bytes(b"base\r\n")
+    tree = git(repo, "rev-parse", "HEAD^{tree}").decode().strip()
+    git(repo, "update-index", "--cacheinfo", "100644," + tree + ",x")
+    with context as store:
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree(store)
+        assert caught.value.code == "invalid_object"
+        git(repo, "read-tree", "HEAD")
+        assert store.read_blob(tg.snapshot_tree(store), "x") == b"base\n"
+
+
+def test_snapshot_pack_budget_is_checked_before_compression_and_can_retry(repo, monkeypatch):
+    context = make_store(repo)
+    (repo / "x").unlink()
+    (repo / "new").write_bytes(b"a" * 100)
+    def unexpected(*args):
+        pytest.fail("compression allocated before the pack budget check")
+    before = shared_bytes(repo)
+    with context as store:
+        monkeypatch.setattr(tg, "MAX_SNAPSHOT_BYTES", 128)
+        monkeypatch.setattr(team_git_snapshot, "zlib", SimpleNamespace(compress=unexpected))
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree(store)
+        assert caught.value.code == "size_limit"
+        monkeypatch.setattr(tg, "MAX_SNAPSHOT_BYTES", 128 * 1024 * 1024)
+        import zlib
+        monkeypatch.setattr(team_git_snapshot, "zlib", zlib)
+        assert store.read_blob(tg.snapshot_tree(store), "new") == b"a" * 100
+    assert shared_bytes(repo) == before
+
+
+def test_repository_programs_never_run(repo, tmp_path):
+    if os.name != "posix":
+        pytest.skip("shell marker executable requires POSIX")
+    marker = tmp_path / "executed"
+    script = tmp_path / "marker.sh"
+    script.write_text("#!/bin/sh\necho ran > '" + str(marker) + "'\ncat\n", encoding="utf-8")
+    script.chmod(0o700)
+    hooks = repo / ".git/hooks"
+    for name in ("pre-commit", "post-commit", "reference-transaction"):
+        hook = hooks / name
+        hook.write_bytes(script.read_bytes())
+        hook.chmod(0o700)
+    for key in ("filter.hostile.clean", "filter.hostile.smudge", "core.fsmonitor"):
+        git(repo, "config", key, str(script))
+    (repo / ".gitattributes").write_bytes(b"* filter=hostile\n")
+    parent = git(repo, "rev-parse", "HEAD").decode().strip()
+    with make_store(repo) as store:
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree(store)
+        assert caught.value.code == "conversion_unavailable"
+        (repo / ".gitattributes").write_bytes(b"* text\n")
+        git(repo, "-c", "core.fsmonitor=false", "add", "--", ".gitattributes")
+        tree = tg.snapshot_tree(store)
+        head = tg.commit_tested(store, tree, parent, "safe", IDENTITY)
+        assert tg.plan_merge(store, parent, head).status == "clean"
+        assert tg.cas_fast_forward(store, "refs/heads/lane/safe", None, head) == "updated"
+    assert not marker.exists()
+
+
+def test_repository_merge_driver_is_refused(repo):
+    git(repo, "config", "merge.hostile.driver", "must-never-run")
+    parent = git(repo, "rev-parse", "HEAD").decode().strip()
+    with new_store(repo) as store, pytest.raises(tg.GitRefusal) as caught:
+        tg.plan_merge(store, parent, parent)
+    assert caught.value.code == "repository_merge_driver"
+
+
+@pytest.mark.parametrize("status,output,code", [(0, b"", "merge_unavailable"),
+    (0, b"malformed", "repository_merge_driver"), (1, b"malformed", "merge_unavailable")])
+def test_indeterminate_driver_listing_never_allows_merge(repo, monkeypatch, status, output, code):
+    parent = git(repo, "rev-parse", "HEAD").decode().strip()
+    def listing(real, args, *rest, **kwargs):
+        if any("^merge" in arg for arg in args):
+            return subprocess.CompletedProcess(args, status, output, b"")
+        return real(args, *rest, **kwargs)
+    with new_store(repo) as store:
+        restore = patch_lane_run(monkeypatch, listing)
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.plan_merge(store, parent, parent)
+        assert caught.value.code == code
+
+
+def test_snapshot_applies_git_text_conversion_and_retries(repo):
+    context = make_store(repo)
+    (repo / ".gitattributes").write_bytes(b"*.txt text eol=crlf\n")
+    (repo / "line.txt").write_bytes(b"first\r\nsecond\r\n")
+    before = shared_bytes(repo)
+    with context as store:
+        tree = tg.snapshot_tree(store)
+        assert store.read_blob(tree, "line.txt") == b"first\nsecond\n"
+        assert tg.snapshot_tree(store) == tree
+    assert shared_bytes(repo) == before
+
+
+def test_snapshot_refuses_external_conversion_before_execution_and_can_retry(repo, monkeypatch):
+    context = make_store(repo)
+    git(repo, "config", "filter.lfs.clean", "must-never-run")
+    git(repo, "config", "filter.lfs.required", "true")
+    (repo / ".gitattributes").write_bytes(b"x filter=lfs\n")
+    calls, real = [], gitsafe.run
+    def record(args, *rest, **kwargs):
+        calls.append(args)
+        return real(args, *rest, **kwargs)
+    with context as store:
+        monkeypatch.setattr(tg, "gitsafe", SimpleNamespace(**{**vars(gitsafe), "run": record}))
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert caught.value.code == "conversion_unavailable"
+        assert not any("hash-object" in args for args in calls)
+        (repo / ".gitattributes").write_bytes(b"x text\n")
+        git(repo, "add", "--", ".gitattributes")
+        assert store.read_blob(tg.snapshot_tree(store), "x") == b"base\n"
+
+
+@pytest.fixture
+def filter_home(tmp_path, monkeypatch):
+    home = tmp_path / "filter-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    return home
+
+
+def filter_git(home):
+    environment = filter_git_env(home)
+    def run(repo, *args, data=None):
+        return git(repo, *args, data=data, env=environment)
+    return run
+
+
+@pytest.mark.parametrize("placement,attribute", [
+    (placement, attribute) for placement in ("root", "nested")
+    for attribute in (b"filter=lfs", b"filter=lfs text=auto", b"-filter text=auto", b"!filter", b"filter")
+])
+@pytest.mark.parametrize("tracked", [False, True])
+def test_snapshot_unconfigured_filter_matches_real_git_add(repo, tmp_path, filter_home, attribute, placement, tracked):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    prefix = "nested/" if placement == "nested" else ""
+    if tracked:
+        (repo / "nested").mkdir()
+        commit(repo, prefix + "sample.bin", b"old\n", env=filter_git_env(filter_home))
+    oracle = tmp_path / "oracle"
+    run(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    payload = b"one\r\ntwo\r\n"
+    for target in (repo, oracle):
+        run(target, "config", "--file", str(target / ".git/config"), "core.autocrlf", "false")
+        run(target, "config", "--file", str(target / ".git/config"), "core.safecrlf", "false")
+        (target / "nested").mkdir(exist_ok=True)
+        attr = target / (prefix + ".gitattributes")
+        attr.write_bytes(b"*.bin " + attribute + b"\n")
+        run(target, "add", "--", prefix + ".gitattributes")
+        (target / (prefix + "sample.bin")).write_bytes(payload)
+        listing = subprocess.run(["git", "config", "--get-regexp", r"^filter\."],
+            cwd=target, capture_output=True, check=False, env=filter_git_env(filter_home))
+        assert listing.returncode == 1 and not listing.stdout
+    run(oracle, "add", "-A")
+    expected = run(oracle, "write-tree").decode().strip()
+    before = shared_bytes(repo)
+    with context as store:
+        for _ in range(2):
+            tree = tg.snapshot_tree(store)
+            assert tree == expected
+            assert store.read_blob(tree, prefix + "sample.bin") == (
+                payload.replace(b"\r\n", b"\n") if b"text=auto" in attribute else payload)
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("key", [None, "filter.lfs"], ids=["no-key", "nondriver-key"])
+@pytest.mark.parametrize("attributes", [b"*.bin filter=lfs text=auto\n",
+    b"\xef\xbb\xbf[attr]quiet text\n*.bin quiet\n"], ids=["lfs", "bom-macro"])
+def test_snapshot_zero_driver_worktree_attribute_sources_match_git_add(repo, tmp_path, filter_home, key, attributes):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    oracle = tmp_path / "oracle"
+    run(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    for target in (repo, oracle):
+        run(target, "config", "--file", str(target / ".git/config"), "core.autocrlf", "false")
+        if key:
+            run(target, "config", "--file", str(target / ".git/config"), key, "must-never-run")
+        (target / ".gitattributes").write_bytes(attributes)
+        (target / "sample.bin").write_bytes(b"one\r\n")
+    run(oracle, "add", "-A")
+    expected = run(oracle, "write-tree").decode().strip()
+    before = shared_bytes(repo)
+    with context as store:
+        for _ in range(2):
+            if attributes.startswith(b"\xef\xbb\xbf"):
+                with pytest.raises(tg.GitRefusal) as caught:
+                    tg.snapshot_tree(store)
+                assert caught.value.code == "conversion_unavailable"
+            else:
+                tree = tg.snapshot_tree(store)
+                assert tree == expected
+                assert store.read_blob(tree, "sample.bin") == b"one\n"
+        if attributes.startswith(b"\xef\xbb\xbf"):
+            for target in (repo, oracle):
+                (target / ".gitattributes").write_bytes(attributes[3:])
+            run(oracle, "add", "-A")
+            assert tg.snapshot_tree(store) == run(oracle, "write-tree").decode().strip()
+    assert shared_bytes(repo) == before
+
+
+def test_snapshot_required_filter_without_driver_is_refused_but_neutralized_hash_succeeds(repo, filter_home):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    run(repo, "config", "--file", str(repo / ".git/config"), "filter.lfs.required", "true")
+    (repo / ".gitattributes").write_bytes(b"*.bin filter=lfs\n")
+    run(repo, "add", "--", ".gitattributes")
+    (repo / "sample.bin").write_bytes(b"unconverted\n")
+    oracle = subprocess.run(["git", "add", "-A"], cwd=repo, capture_output=True, check=False, env=filter_git_env(filter_home))
+    assert oracle.returncode == 128
+    assert b"clean filter 'lfs' failed" in oracle.stderr
+    before = shared_bytes(repo)
+    with context as store:
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert caught.value.code == "conversion_unavailable"
+        hashed = store._run(["hash-object", "-w", "--stdin", "--path=sample.bin"], stdin=b"unconverted\n")
+        assert hashed.stdout.strip() == run(repo, "hash-object", "--stdin", "--no-filters", data=b"unconverted\n").strip()
+        assert shared_bytes(repo) == before
+        run(repo, "config", "--file", str(repo / ".git/config"), "--unset", "filter.lfs.required")
+        (repo / ".gitattributes").write_bytes(b"*.bin -filter\n")
+        run(repo, "add", "--", ".gitattributes")
+        retry_before = shared_bytes(repo)
+        assert store.read_blob(tg.snapshot_tree(store), "sample.bin") == b"unconverted\n"
+    assert shared_bytes(repo) == retry_before
+
+
+@pytest.mark.parametrize("configured,attributes", [(False, True), (True, True), (True, False)],
+    ids=["zero-driver", "configured-filter", "configured-attribute-free"])
+def test_snapshot_unconfigured_filter_process_count(repo, monkeypatch, filter_home, configured, attributes):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    if attributes:
+        (repo / ".gitattributes").write_bytes(b"*.bin filter=lfs\n")
+        run(repo, "add", "--", ".gitattributes")
+    if configured:
+        run(repo, "config", "--file", str(repo / ".git/config"), "filter.lfs.clean", "must-never-run")
+    calls, real = [], subprocess.Popen
+    def record(argv, **kwargs):
+        calls.append(argv)
+        return real(argv, **kwargs)
+    with context as store:
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+        counts, observations = [], []
+        for count in (1, 1000):
+            for number in range(count):
+                (repo / ("sample%d.bin" % number)).write_bytes(b"raw\r\n")
+            calls.clear()
+            try:
+                tg.snapshot_tree(store)
+                status = "accepted"
+            except tg.GitRefusal as exc:
+                status = exc.code
+            counts.append(len(calls))
+            observations.append((sum(tuple(a[-5:]) == ("config", "--null", "--name-only", "--get-regexp", r"^filter\.")
+                                     for a in calls), sum("check-attr" in a for a in calls)))
+            print("filter=lfs configured=%s attributes=%s files=%d spawns=%d status=%s" % (
+                configured, attributes, count, len(calls), status))
+            assert status == ("conversion_unavailable" if configured and attributes else "accepted")
+        assert counts[1] <= counts[0] + 1
+        assert observations == ([(1, 0)] if configured and attributes else [(2, 1)]) * 2
+        if configured and attributes:
+            assert counts == [6, 6]
+
+
+@pytest.mark.parametrize("scope", ["repo", "global", "repo-include", "global-include"])
+@pytest.mark.parametrize("key,value", [("clean", "must-never-run"), ("smudge", ""),
+    ("process", "must-never-run"), ("required", "false"), ("required", "invalid"), ("other", "false")])
+def test_snapshot_any_configured_filter_key_refuses_and_recovers(repo, tmp_path, filter_home, scope, key, value):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    (repo / ".gitattributes").write_bytes(b"x filter=lfs\n")
+    run(repo, "add", "--", ".gitattributes")
+    if scope.endswith("include"):
+        config = tmp_path / "included-config"
+        run(repo, "config", "--file", str(config), "filter.lfs." + key, value)
+        run(repo, "config", "--file", str(filter_home / ".gitconfig" if scope.startswith("global") else repo / ".git/config"), "include.path", str(config))
+    else:
+        config = filter_home / ".gitconfig" if scope == "global" else repo / ".git/config"
+        run(repo, "config", "--file", str(config), "filter.lfs." + key, value)
+    before = shared_bytes(repo)
+    with context as store:
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+                "conversion_unavailable", "Lane Git operation refused: conversion_unavailable", None)
+        run(repo, "config", "--file", str(config), "--remove-section", "filter.lfs")
+        assert store.read_blob(tg.snapshot_tree(store), "x") == b"base\n"
+    after = shared_bytes(repo)
+    assert {k: v for k, v in after.items() if k != "config"} == {k: v for k, v in before.items() if k != "config"}
+
+
+@pytest.mark.parametrize("key", ["GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"])
+def test_snapshot_filter_config_redirection_is_refused_before_spawn(repo, monkeypatch, filter_home, key):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    (repo / ".gitattributes").write_bytes(b"x filter=lfs\n")
+    run(repo, "add", "--", ".gitattributes")
+    config = filter_home / "alternate-config"
+    run(repo, "config", "--file", str(config), "filter.lfs.clean", "must-never-run")
+    calls, real = [], subprocess.Popen
+    def record(argv, **kwargs):
+        calls.append(argv)
+        return real(argv, **kwargs)
+    with context as store:
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+        with monkeypatch.context() as scoped:
+            scoped.setenv(key, str(config))
+            for _ in range(2):
+                with pytest.raises(tg.GitRefusal) as caught:
+                    tg.snapshot_tree(store)
+                assert caught.value.code == "ambient_git_environment"
+        assert not calls
+        assert store.read_blob(tg.snapshot_tree(store), "x") == b"base\n"
+
+
+@pytest.mark.parametrize("status,payload", [(0, b""), (1, b"filter.lfs.clean\0"), (2, b""),
+    (0, b"filter.lfs.clean"), (0, b"\0"), (0, b"other.lfs.clean\0"),
+    (0, b"filter.lfs.\0"), (0, b"filter.lfs.123\0"), (0, b"x" * 65537)],
+    ids=["empty-success", "nonempty-absence", "failed-read", "unterminated", "empty-record",
+         "wrong-section", "empty-key", "invalid-key", "oversized"])
+def test_snapshot_filter_config_protocol_refuses_and_retries(repo, monkeypatch, filter_home, status, payload):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    (repo / ".gitattributes").write_bytes(b"x filter=lfs\n")
+    run(repo, "add", "--", ".gitattributes")
+    def damaged(real, args, *rest, **kwargs):
+        if args == ["config", "--null", "--name-only", "--get-regexp", r"^filter\."]:
+            return subprocess.CompletedProcess(args, status, payload, b"private stderr")
+        return real(args, *rest, **kwargs)
+    before = shared_bytes(repo)
+    with context as store:
+        restore = patch_lane_run(monkeypatch, damaged)
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+                "conversion_unavailable", "Lane Git operation refused: conversion_unavailable", None)
+        restore()
+        assert store.read_blob(tg.snapshot_tree(store), "x") == b"base\n"
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("fault", ["unreadable", "timeout", "oversized"])
+def test_snapshot_filter_config_transport_failure_refuses_and_retries(repo, monkeypatch, filter_home, fault):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    (repo / ".gitattributes").write_bytes(b"x filter=lfs\n")
+    run(repo, "add", "--", ".gitattributes")
+    def damaged(real, args, *rest, **kwargs):
+        if args == ["config", "--null", "--name-only", "--get-regexp", r"^filter\."]:
+            if fault == "unreadable":
+                raise OSError("private config error")
+            raise gitsafe.GitError("private config error", code="git_timeout" if fault == "timeout" else "git_output_limit")
+        return real(args, *rest, **kwargs)
+    with context as store:
+        restore = patch_lane_run(monkeypatch, damaged)
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree(store)
+        assert (caught.value.code, str(caught.value)) == (
+            "conversion_unavailable", "Lane Git operation refused: conversion_unavailable")
+        restore()
+        assert store.read_blob(tg.snapshot_tree(store), "x") == b"base\n"
+
+
+def test_snapshot_concurrent_filter_configuration_refuses_then_retries(repo, monkeypatch, filter_home):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    (repo / ".gitattributes").write_bytes(b"x filter=lfs\n")
+    run(repo, "add", "--", ".gitattributes")
+    entered, release = Event(), Event()
+    def paused(real, args, *rest, **kwargs):
+        result = real(args, *rest, **kwargs)
+        if args == ["config", "--null", "--name-only", "--get-regexp", r"^filter\."] and not entered.is_set():
+            entered.set()
+            assert release.wait(5), "snapshot was never released"
+        return result
+    with context as store, ThreadPoolExecutor(max_workers=1) as executor:
+        patch_lane_run(monkeypatch, paused)
+        future = executor.submit(tg.snapshot_tree, store)
+        try:
+            assert entered.wait(5), "snapshot never reached file capture"
+            run(repo, "config", "--file", str(repo / ".git/config"), "filter.lfs.required", "false")
+        finally:
+            release.set()
+        with pytest.raises(tg.GitRefusal) as caught:
+            future.result(timeout=5)
+        assert caught.value.code == "conversion_unavailable"
+        run(repo, "config", "--file", str(repo / ".git/config"), "--remove-section", "filter.lfs")
+        assert store.read_blob(tg.snapshot_tree(store), "x") == b"base\n"
+
+
+@pytest.mark.parametrize("prefix", ["", "nested/"])
+@pytest.mark.parametrize("name", ["!first.bin", "sample.bin"])
+@pytest.mark.parametrize("kind", ["deleted", "symlink"])
+def test_snapshot_unproven_index_filter_context_refuses_then_retries(repo, tmp_path, filter_home, prefix, name, kind):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    oracle = tmp_path / "oracle"
+    run(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    attributes = b"*.bin filter=lfs text=auto\n"
+    for target in (repo, oracle):
+        (target / "nested").mkdir()
+        attr = target / (prefix + ".gitattributes")
+        attr.write_bytes(attributes)
+        run(target, "add", "--", prefix + ".gitattributes")
+        attr.unlink()
+        if kind == "symlink":
+            source = target / "source-attributes"
+            source.write_bytes(attributes)
+            symlink_or_skip(source, attr)
+        (target / (prefix + name)).write_bytes(b"one\r\n")
+    # Refusal is permitted even when git add can complete with another context.
+    run(oracle, "add", "-A")
+    run(repo, "config", "--file", str(repo / ".git/config"), "filter.other.required", "false")
+    before = shared_bytes(repo)
+    with context as store:
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+                "conversion_unavailable", "Lane Git operation refused: conversion_unavailable", None)
+        if kind == "symlink":
+            (repo / (prefix + ".gitattributes")).unlink()
+        (repo / (prefix + ".gitattributes")).write_bytes(attributes)
+        run(repo, "config", "--file", str(repo / ".git/config"), "--remove-section", "filter.other")
+        assert store.read_blob(tg.snapshot_tree(store), prefix + name) == b"one\n"
+    after = shared_bytes(repo)
+    assert {k: v for k, v in after.items() if k != "config"} == {k: v for k, v in before.items() if k != "config"}
+
+
+@pytest.mark.parametrize("key", ["filter.other.clean", "filter.LFS.clean"])
+def test_snapshot_unrelated_configured_filter_keys_refuse(repo, tmp_path, filter_home, key):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    oracle = tmp_path / "oracle"
+    run(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    for target in (repo, oracle):
+        run(target, "config", "--file", str(target / ".git/config"), "core.autocrlf", "false")
+        run(target, "config", "--file", str(target / ".git/config"), key, "must-never-run")
+        (target / ".gitattributes").write_bytes(b"*.bin filter=lfs text=auto\n")
+        run(target, "add", "--", ".gitattributes")
+        (target / "sample.bin").write_bytes(b"one\r\n")
+    run(oracle, "add", "-A")
+    expected = run(oracle, "write-tree").decode().strip()
+    before = shared_bytes(repo)
+    with context as store:
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+                "conversion_unavailable", "Lane Git operation refused: conversion_unavailable", None)
+        run(repo, "config", "--file", str(repo / ".git/config"), "--unset", key)
+        assert tg.snapshot_tree(store) == expected
+    after = shared_bytes(repo)
+    assert {k: v for k, v in after.items() if k != "config"} == {k: v for k, v in before.items() if k != "config"}
+
+
+@pytest.mark.parametrize("source", ["captured", "indexed"])
+@pytest.mark.parametrize("macro", [b"[attr]quiet", b'"[attr]quiet"', b'"\\133attr\\135quiet"'],
+    ids=["plain", "quoted", "octal"])
+def test_snapshot_bom_macro_with_configured_driver_refuses(repo, monkeypatch, filter_home, source, macro):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    macro_bytes = b"\xef\xbb\xbf" + macro + b" text filter=lfs\n*.bin quiet\n"
+    original, captured = (macro_bytes, b"") if source == "indexed" else (b"", macro_bytes)
+    (repo / ".gitattributes").write_bytes(original)
+    run(repo, "add", "--", ".gitattributes")
+    run(repo, "config", "--file", str(repo / ".git/config"), "filter.other.required", "false")
+    (repo / "sample.bin").write_bytes(b"one\r\n")
+    def rewrite(real, args, *rest, **kwargs):
+        result = real(args, *rest, **kwargs)
+        if args[:2] == ["ls-files", "--stage"]:
+            (repo / ".gitattributes").write_bytes(captured)
+        return result
+    before = shared_bytes(repo)
+    with context as store:
+        restore = patch_lane_run(monkeypatch, rewrite)
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree(store)
+        assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+            "conversion_unavailable", "Lane Git operation refused: conversion_unavailable", None)
+        assert shared_bytes(repo) == before
+        restore()
+        run(repo, "config", "--file", str(repo / ".git/config"), "--remove-section", "filter.other")
+        if source == "captured":
+            # A clean retry supplies non-BOM bytes; --source cannot prove BOM
+            # macro parity even after configured drivers have been removed.
+            (repo / ".gitattributes").write_bytes(macro_bytes[3:])
+        assert store.read_blob(tg.snapshot_tree(store), "sample.bin") == (
+            b"one\r\n" if source == "indexed" else b"one\n")
+
+
+def test_snapshot_unmerged_attribute_stages_refuse_with_any_driver(repo, filter_home):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    hidden = run(repo, "hash-object", "-w", "--stdin", data=b"*.bin filter=hostile\n").strip()
+    ordinary = run(repo, "hash-object", "-w", "--stdin", data=b"*.bin text\n").strip()
+    records = b"".join(b"100644 " + oid + b" " + stage + b"\t.gitattributes\n"
+                       for stage, oid in ((b"1", hidden), (b"2", ordinary), (b"3", ordinary)))
+    run(repo, "update-index", "--index-info", data=records)
+    (repo / ".gitattributes").write_bytes(b"*.bin text\n")
+    (repo / "sample.bin").write_bytes(b"one\r\n")
+    run(repo, "config", "--file", str(repo / ".git/config"), "filter.other.required", "false")
+    before = shared_bytes(repo)
+    with context as store:
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert caught.value.code == "conversion_unavailable"
+        assert shared_bytes(repo) == before
+        run(repo, "config", "--file", str(repo / ".git/config"), "--remove-section", "filter.other")
+        assert store.read_blob(tg.snapshot_tree(store), "sample.bin") == b"one\n"
+
+
+@pytest.mark.parametrize("source", ["info", "configured-file"])
+@pytest.mark.parametrize("driver", ["lfs", "unspecified"])
+def test_snapshot_observed_external_filter_state_refuses_with_any_driver(repo, filter_home, source, driver):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    attr = repo / ".git/info/attributes" if source == "info" else filter_home / "attributes"
+    attr.write_bytes(b"*.bin filter=" + driver.encode() + b"\n")
+    if source == "configured-file":
+        run(repo, "config", "--file", str(repo / ".git/config"), "core.attributesFile", str(attr))
+    configured = "unspecified" if driver == "unspecified" else "other"
+    run(repo, "config", "--file", str(repo / ".git/config"), "filter." + configured + ".required", "false")
+    (repo / "sample.bin").write_bytes(b"raw\r\n")
+    before = shared_bytes(repo)
+    with context as store:
+        for _ in range(2):
+            if source == "configured-file" and driver != "unspecified":
+                assert store.read_blob(tg.snapshot_tree(store), "sample.bin") == b"raw\r\n"
+            else:
+                with pytest.raises(tg.GitRefusal) as caught:
+                    tg.snapshot_tree(store)
+                assert caught.value.code == "conversion_unavailable"
+        assert shared_bytes(repo) == before
+        run(repo, "config", "--file", str(repo / ".git/config"), "--remove-section", "filter." + configured)
+        assert store.read_blob(tg.snapshot_tree(store), "sample.bin") == b"raw\r\n"
+
+
+@pytest.mark.parametrize("prefix", ["", "nested/"], ids=["root", "nested"])
+@pytest.mark.parametrize("change", ["named", "rewrite", "blank-during-lookup", "created-after-listing", "created-after-lookup"])
+def test_snapshot_ignored_filter_attribute_rewrite_refuses(repo, monkeypatch, filter_home, prefix, change):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    (repo / "nested").mkdir()
+    (repo / ".gitignore").write_bytes(b".gitattributes\n")
+    attr = repo / (prefix + ".gitattributes")
+    hostile = b"*.bin filter=hostile\n"
+    if not change.startswith("created-"):
+        attr.write_bytes(b"*.bin filter=lfs\n" if change == "named" else
+                         hostile if change == "blank-during-lookup" else b"*.bin text\n")
+        run(repo, "check-ignore", "--", prefix + ".gitattributes")
+    run(repo, "config", "--file", str(repo / ".git/config"), "filter.hostile.required", "true")
+    (repo / (prefix + "sample.bin")).write_bytes(b"raw\r\n")
+    def rewrite(real, args, *rest, **kwargs):
+        if args[:2] == ["ls-files", "--stage"] and change in ("blank-during-lookup", "created-after-listing"):
+            attr.write_bytes(b"")
+        result = real(args, *rest, **kwargs)
+        if args[:2] == ["ls-files", "--cached"] and change == "created-after-listing":
+            attr.write_bytes(hostile)
+        if args[:2] == ["ls-files", "--stage"]:
+            attr.write_bytes(hostile)
+        return result
+    before = shared_bytes(repo)
+    with context as store:
+        restore = patch_lane_run(monkeypatch, rewrite)
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree(store)
+        assert caught.value.code == "conversion_unavailable"
+        assert shared_bytes(repo) == before
+        restore()
+        run(repo, "config", "--file", str(repo / ".git/config"), "--remove-section", "filter.hostile")
+        tree = tg.snapshot_tree(store)
+        assert store.read_blob(tree, prefix + "sample.bin") == b"raw\r\n"
+        with pytest.raises(tg.GitRefusal) as caught:
+            store.read_blob(tree, prefix + ".gitattributes")
+        assert caught.value.code == "path_missing"
+
+
+@pytest.mark.parametrize("change", ["directory-swap", "unlisted-ancestor"])
+@pytest.mark.parametrize("tracked", [False, True], ids=["ignored", "indexed"])
+def test_snapshot_transient_filter_override_refuses(repo, tmp_path, monkeypatch, filter_home, change, tracked):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    (repo / "nested/deep").mkdir(parents=True)
+    (repo / ".gitignore").write_bytes(b".gitattributes\n" if not tracked else b"")
+    attr = "nested/.gitattributes" if change == "directory-swap" else ".gitattributes"
+    (repo / attr).write_bytes(b"*.bin filter=hostile\n")
+    if tracked:
+        run(repo, "add", "--", attr)
+    run(repo, "config", "--file", str(repo / ".git/config"), "filter.hostile.required", "true")
+    (repo / "nested/deep/sample.bin").write_bytes(b"raw\r\n")
+    held, substitute = tmp_path / "held", tmp_path / "substitute"
+    substitute.mkdir()
+    (substitute / ".gitattributes").write_bytes(b"*.bin !filter\n")
+    def override(real, args, *rest, **kwargs):
+        if args[:2] != ["ls-files", "--stage"]:
+            return real(args, *rest, **kwargs)
+        if change == "directory-swap":
+            (repo / "nested").rename(held)
+            substitute.rename(repo / "nested")
+        else:
+            (repo / "nested/.gitattributes").write_bytes(b"*.bin !filter\n")
+        try:
+            return real(args, *rest, **kwargs)
+        finally:
+            if change == "directory-swap":
+                (repo / "nested").rename(substitute)
+                held.rename(repo / "nested")
+            else:
+                (repo / "nested/.gitattributes").unlink()
+    before = shared_bytes(repo)
+    with context as store:
+        restore = patch_lane_run(monkeypatch, override)
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree(store)
+        assert caught.value.code == "conversion_unavailable"
+        assert shared_bytes(repo) == before
+        restore()
+        run(repo, "config", "--file", str(repo / ".git/config"), "--remove-section", "filter.hostile")
+        assert store.read_blob(tg.snapshot_tree(store), "nested/deep/sample.bin") == b"raw\r\n"
+
+
+@pytest.mark.parametrize("prefix", ["", "nested/"], ids=["root", "nested"])
+@pytest.mark.parametrize("source", ["captured", "indexed", "ignored-candidate"])
+def test_snapshot_mixed_case_attribute_sources_refuse(repo, monkeypatch, filter_home, prefix, source):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    (repo / "nested").mkdir()
+    attr = repo / (prefix + ".GitAttributes")
+    attr.write_bytes(b"*.bin filter=hostile\n")
+    if source == "indexed":
+        run(repo, "add", "--", prefix + ".GitAttributes")
+        attr.unlink()
+    elif source == "ignored-candidate":
+        (repo / ".gitignore").write_bytes(b".GitAttributes\n")
+        def folded_open(path, *args, **kwargs):
+            return os.open(".GitAttributes" if path == ".gitattributes" else path, *args, **kwargs)
+        def folded_stat(path, *args, **kwargs):
+            return os.stat(".GitAttributes" if path == ".gitattributes" else path, *args, **kwargs)
+        process_os = SimpleNamespace(**{**vars(os), "open": folded_open, "stat": folded_stat,
+            "supports_dir_fd": os.supports_dir_fd | {folded_open, folded_stat}})
+        monkeypatch.setattr(tg, "os", process_os)
+    run(repo, "config", "--file", str(repo / ".git/config"), "filter.hostile.required", "true")
+    (repo / (prefix + "sample.bin")).write_bytes(b"raw\r\n")
+    before = shared_bytes(repo)
+    with context as store:
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree(store)
+        assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+            "conversion_unavailable", "Lane Git operation refused: conversion_unavailable", None)
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("kind", ["directory", "symlink", "fifo"])
+@pytest.mark.parametrize("tracked", [False, True], ids=["ignored", "indexed"])
+def test_snapshot_attribute_candidate_nonregular_refuses(repo, tmp_path, monkeypatch, filter_home, kind, tracked):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    if kind == "fifo" and (os.name != "posix" or not hasattr(os, "mkfifo")):
+        pytest.skip("FIFO requires POSIX")
+    (repo / ".gitignore").write_bytes(b".gitattributes\n" if not tracked else b"")
+    run(repo, "config", "--file", str(repo / ".git/config"), "filter.lfs.required", "false")
+    attr = repo / ".gitattributes"
+    if tracked:
+        attr.write_bytes(b"")
+        run(repo, "add", "--", ".gitattributes")
+    outside = tmp_path / "outside-attributes"
+    outside.write_bytes(b"never read\n")
+    def create(real, args, *rest, **kwargs):
+        result = real(args, *rest, **kwargs)
+        if args[:2] == ["ls-files", "--stage"]:
+            if tracked:
+                attr.unlink()
+            if kind == "directory":
+                attr.mkdir()
+            elif kind == "symlink":
+                symlink_or_skip(outside, attr)
+            else:
+                os.mkfifo(attr)
+        return result
+    before = shared_bytes(repo)
+    with context as store:
+        restore = patch_lane_run(monkeypatch, create)
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree(store)
+        assert caught.value.code == "conversion_unavailable"
+        assert shared_bytes(repo) == before
+        restore()
+        if kind == "directory":
+            attr.rmdir()
+        else:
+            attr.unlink()
+        assert store.read_blob(tg.snapshot_tree(store), "x") == b"base\n"
+    assert outside.read_bytes() == b"never read\n"
+
+
+def test_snapshot_case_variant_cannot_hide_distinct_fixed_name_candidate(repo, monkeypatch, filter_home):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    (repo / ".GitAttributes").write_bytes(b"# ordinary attributes\n")
+    attr = repo / ".gitattributes"
+    if attr.exists():
+        pytest.skip("requires distinct case-sensitive filenames")
+    hostile = b"*.bin filter=hostile\n"
+    attr.write_bytes(hostile)
+    (repo / ".gitignore").write_bytes(b".gitattributes\n")
+    (repo / "sample.bin").write_bytes(b"raw\r\n")
+    run(repo, "config", "--file", str(repo / ".git/config"), "filter.hostile.required", "true")
+    def blank(real, args, *rest, **kwargs):
+        if args[:2] != ["ls-files", "--stage"]:
+            return real(args, *rest, **kwargs)
+        attr.write_bytes(b"")
+        try:
+            return real(args, *rest, **kwargs)
+        finally:
+            attr.write_bytes(hostile)
+    before = shared_bytes(repo)
+    with context as store:
+        patch_lane_run(monkeypatch, blank)
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree(store)
+        assert caught.value.code == "conversion_unavailable"
+    assert shared_bytes(repo) == before
+
+
+def alias_snapshot_os(monkeypatch, aliases, reads, *, after_fixed_stat=None, unchanged_stamp=None):
+    """Simulate case aliases at the OS boundary without changing pytest's OS module."""
+    def opened(path, *args, **kwargs):
+        return os.open(aliases.get(path, path), *args, **kwargs)
+    def observed(path, *args, **kwargs):
+        result = os.stat(aliases.get(path, path), *args, **kwargs)
+        if path == ".gitattributes" and after_fixed_stat is not None:
+            after_fixed_stat()
+        return result
+    def read(fd, count):
+        data = os.read(fd, count)
+        info = os.fstat(fd)
+        key = info.st_dev, info.st_ino
+        reads[key] = reads.get(key, 0) + len(data)
+        return data
+    def held(fd):
+        info = os.fstat(fd)
+        if unchanged_stamp is not None and (info.st_dev, info.st_ino) == (unchanged_stamp.st_dev, unchanged_stamp.st_ino):
+            return SimpleNamespace(st_mode=info.st_mode, st_dev=info.st_dev, st_ino=info.st_ino,
+                st_nlink=info.st_nlink, st_uid=info.st_uid, st_gid=info.st_gid, st_size=info.st_size,
+                st_atime=info.st_atime, st_mtime=info.st_mtime, st_ctime=info.st_ctime,
+                st_atime_ns=info.st_atime_ns, st_mtime_ns=unchanged_stamp.st_mtime_ns,
+                st_ctime_ns=unchanged_stamp.st_ctime_ns)
+        return info
+    process_os = SimpleNamespace(**{**vars(os), "open": opened, "stat": observed, "read": read, "fstat": held,
+        "supports_dir_fd": os.supports_dir_fd | {opened, observed}})
+    monkeypatch.setattr(tg, "os", process_os)
+
+
+@pytest.mark.parametrize("prefix", ["", "nested/"], ids=["root", "nested"])
+@pytest.mark.usefixtures("strict_program")
+def test_snapshot_benign_case_alias_fits_unique_byte_budget(repo, tmp_path, monkeypatch, filter_home, prefix):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    oracle = tmp_path / "oracle"
+    run(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    payload, attributes = b"payload\n" * 1024, b"# ordinary attributes\n" * 64
+    for target in (repo, oracle):
+        (target / "nested").mkdir()
+        (target / "x").write_bytes(payload)
+        (target / (prefix + ".GitAttributes")).write_bytes(attributes)
+        run(target, "config", "--file", str(target / ".git/config"), "filter.lfs.required", "false")
+    for name in ("x", prefix + ".GitAttributes"):
+        run(repo, "hash-object", "-w", "--stdin", "--no-filters", data=(repo / name).read_bytes())
+    run(oracle, "add", "-A")
+    expected = run(oracle, "write-tree").decode().strip()
+    attr = repo / (prefix + ".GitAttributes")
+    identity = attr.stat().st_dev, attr.stat().st_ino
+    reads, before = {}, shared_bytes(repo)
+    with context as store:
+        alias_snapshot_os(monkeypatch, {".gitattributes": ".GitAttributes"}, reads)
+        monkeypatch.setattr(tg, "MAX_SNAPSHOT_BYTES", len(payload) + len(attributes))
+        descriptors = set(os.listdir("/proc/self/fd")) if Path("/proc/self/fd").is_dir() else None
+        tree = tg.snapshot_tree(store)
+        assert tree == expected
+        assert store.read_blob(tree, prefix + ".GitAttributes") == attributes
+        assert reads[identity] == 2 * len(attributes)
+        if descriptors is not None:
+            assert set(os.listdir("/proc/self/fd")) == descriptors
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_snapshot_ancestor_case_alias_fits_unique_byte_budget(repo, monkeypatch, filter_home):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    folder = repo / "Nested"
+    folder.mkdir()
+    attributes = b"# ordinary attributes\n" * 64
+    (folder / ".gitattributes").write_bytes(attributes)
+    (folder / "one.bin").write_bytes(b"one\n")
+    (folder / "two.bin").write_bytes(b"two\n")
+    (repo / ".gitignore").write_bytes(b".gitattributes\n")
+    run(repo, "config", "--file", str(repo / ".git/config"), "filter.lfs.required", "false")
+    names = ("x", ".gitignore", "Nested/one.bin", "Nested/two.bin", "Nested/.gitattributes")
+    budget = sum((repo / name).stat().st_size for name in names)
+    for name in names:
+        run(repo, "hash-object", "-w", "--stdin", "--no-filters", data=(repo / name).read_bytes())
+    def listing(real, args, *rest, **kwargs):
+        result = real(args, *rest, **kwargs)
+        if args[:2] == ["ls-files", "--cached"]:
+            # A case-insensitive Git listing can retain index and worktree spellings.
+            return subprocess.CompletedProcess(result.args, result.returncode,
+                b"x\0.gitignore\0nested/one.bin\0Nested/two.bin\0", result.stderr)
+        return result
+    identity = (folder / ".gitattributes").stat()
+    key = identity.st_dev, identity.st_ino
+    reads, before = {}, shared_bytes(repo)
+    with context as store:
+        alias_snapshot_os(monkeypatch, {"nested": "Nested"}, reads)
+        patch_lane_run(monkeypatch, listing)
+        monkeypatch.setattr(tg, "MAX_SNAPSHOT_BYTES", budget)
+        tree = tg.snapshot_tree(store)
+        assert store.read_blob(tree, "nested/one.bin") == b"one\n"
+        assert store.read_blob(tree, "Nested/two.bin") == b"two\n"
+        assert reads[key] == 2 * len(attributes)
+        with pytest.raises(tg.GitRefusal) as caught:
+            store.read_blob(tree, "Nested/.gitattributes")
+        assert caught.value.code == "path_missing"
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_snapshot_distinct_case_files_are_read_and_charged_separately(repo, monkeypatch, filter_home):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    mixed, fixed = repo / ".GitAttributes", repo / ".gitattributes"
+    mixed.write_bytes(b"# ordinary mixed attributes\n")
+    if fixed.exists():
+        pytest.skip("requires distinct case-sensitive filenames")
+    fixed.write_bytes(b"# ordinary fixed attributes\n")
+    (repo / ".gitignore").write_bytes(b".gitattributes\n")
+    run(repo, "config", "--file", str(repo / ".git/config"), "filter.lfs.required", "false")
+    names = ("x", ".gitignore", ".GitAttributes", ".gitattributes")
+    budget = sum((repo / name).stat().st_size for name in names)
+    for name in names:
+        run(repo, "hash-object", "-w", "--stdin", "--no-filters", data=(repo / name).read_bytes())
+    reads, before = {}, shared_bytes(repo)
+    with context as store:
+        alias_snapshot_os(monkeypatch, {}, reads)
+        monkeypatch.setattr(tg, "MAX_SNAPSHOT_BYTES", budget - 1)
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree(store)
+        assert caught.value.code == "size_limit"
+        reads.clear()
+        monkeypatch.setattr(tg, "MAX_SNAPSHOT_BYTES", budget)
+        tree = tg.snapshot_tree(store)
+        for attr in (mixed, fixed):
+            info = attr.stat()
+            assert reads[(info.st_dev, info.st_ino)] == info.st_size
+        assert store.read_blob(tree, ".GitAttributes") == mixed.read_bytes()
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("change", ["mtime", "restored-mtime", "equal-stamps"])
+@pytest.mark.usefixtures("strict_program")
+def test_snapshot_alias_uses_held_fd_metadata_after_path_stat_race(repo, monkeypatch, filter_home, change):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    attr = repo / ".GitAttributes"
+    hostile = b"*.bin filter=hostile\n"
+    benign = b"#" + b"x" * (len(hostile) - 2) + b"\n"
+    attr.write_bytes(benign)
+    original = attr.stat()
+    run(repo, "config", "--file", str(repo / ".git/config"), "filter.hostile.required", "false")
+    for name in ("x", ".GitAttributes"):
+        run(repo, "hash-object", "-w", "--stdin", "--no-filters", data=(repo / name).read_bytes())
+    def rewrite():
+        attr.write_bytes(hostile)
+        stamp = original.st_mtime_ns + (1000000000 if change == "mtime" else 0)
+        os.utime(attr, ns=(original.st_atime_ns, stamp))
+    reads, before = {}, shared_bytes(repo)
+    with context as store:
+        alias_snapshot_os(monkeypatch, {".gitattributes": ".GitAttributes"}, reads, after_fixed_stat=rewrite,
+            unchanged_stamp=original if change == "equal-stamps" else None)
+        extra = 0 if change == "equal-stamps" else len(hostile)
+        monkeypatch.setattr(tg, "MAX_SNAPSHOT_BYTES", (repo / "x").stat().st_size + len(benign) + extra)
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree(store)
+        assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+            "conversion_unavailable", "Lane Git operation refused: conversion_unavailable", None)
+        assert reads[(original.st_dev, original.st_ino)] == 2 * len(hostile)
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_snapshot_ancestor_alias_equal_stamp_rewrite_refuses(repo, monkeypatch, filter_home):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    folder = repo / "Nested"
+    folder.mkdir()
+    attr = folder / ".gitattributes"
+    hostile = b"*.bin filter=hostile\n"
+    benign = b"#" + b"x" * (len(hostile) - 2) + b"\n"
+    attr.write_bytes(benign)
+    original = attr.stat()
+    (folder / "one.bin").write_bytes(b"one\n")
+    (folder / "two.bin").write_bytes(b"two\n")
+    (repo / ".gitignore").write_bytes(b".gitattributes\n")
+    run(repo, "config", "--file", str(repo / ".git/config"), "filter.hostile.required", "false")
+    def listing(real, args, *rest, **kwargs):
+        result = real(args, *rest, **kwargs)
+        if args[:2] == ["ls-files", "--cached"]:
+            return subprocess.CompletedProcess(result.args, result.returncode,
+                b"x\0.gitignore\0nested/one.bin\0Nested/two.bin\0", result.stderr)
+        return result
+    observed = []
+    def rewrite_second_alias():
+        observed.append(True)
+        if len(observed) == 2:
+            attr.write_bytes(hostile)
+            os.utime(attr, ns=(original.st_atime_ns, original.st_mtime_ns))
+    names = ("x", ".gitignore", "Nested/one.bin", "Nested/two.bin", "Nested/.gitattributes")
+    budget = sum((repo / name).stat().st_size for name in names)
+    for name in names:
+        run(repo, "hash-object", "-w", "--stdin", "--no-filters", data=(repo / name).read_bytes())
+    reads, before = {}, shared_bytes(repo)
+    with context as store:
+        alias_snapshot_os(monkeypatch, {"nested": "Nested"}, reads,
+            after_fixed_stat=rewrite_second_alias, unchanged_stamp=original)
+        patch_lane_run(monkeypatch, listing)
+        monkeypatch.setattr(tg, "MAX_SNAPSHOT_BYTES", budget)
+        descriptors = set(os.listdir("/proc/self/fd")) if Path("/proc/self/fd").is_dir() else None
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree(store)
+        assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+            "conversion_unavailable", "Lane Git operation refused: conversion_unavailable", None)
+        assert len(observed) == 2 and attr.read_bytes() == hostile
+        assert reads[(original.st_dev, original.st_ino)] == 2 * len(hostile)
+        if descriptors is not None:
+            assert set(os.listdir("/proc/self/fd")) == descriptors
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("ignored", [False, True], ids=["listed", "ignored"])
+def test_snapshot_attribute_candidate_bytes_are_charged_once(repo, monkeypatch, filter_home, ignored):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    attr = repo / ".gitattributes"
+    attr.write_bytes(b"# ordinary attributes\n")
+    payload = b"payload\n" * 1024
+    (repo / "x").write_bytes(payload)
+    (repo / ".gitignore").write_bytes(b".gitattributes\n" if ignored else b"")
+    run(repo, "config", "--file", str(repo / ".git/config"), "filter.lfs.required", "false")
+    budget = sum((repo / name).stat().st_size for name in ("x", ".gitignore", ".gitattributes"))
+    for name in ("x", ".gitignore", ".gitattributes"):
+        run(repo, "hash-object", "-w", "--stdin", "--no-filters", data=(repo / name).read_bytes())
+    calls, reads = [], []
+    identity = (attr.stat().st_dev, attr.stat().st_ino)
+    def record(path, *args, **kwargs):
+        if path == ".gitattributes":
+            calls.append(path)
+        return os.open(path, *args, **kwargs)
+    def record_read(fd, count):
+        observed = os.fstat(fd)
+        if (observed.st_dev, observed.st_ino) == identity:
+            reads.append(count)
+        return os.read(fd, count)
+    process_os = SimpleNamespace(**{**vars(os), "open": record, "read": record_read,
+        "supports_dir_fd": os.supports_dir_fd | {record}})
+    before = shared_bytes(repo)
+    with context as store:
+        monkeypatch.setattr(tg, "os", process_os)
+        monkeypatch.setattr(tg, "MAX_SNAPSHOT_BYTES", budget - 1)
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree(store)
+        assert caught.value.code == "size_limit"
+        if ignored:
+            # Sources are now captured before payloads; the payload refuses
+            # its remaining budget before any payload allocation.
+            assert reads and calls == [".gitattributes"]
+        calls.clear()
+        monkeypatch.setattr(tg, "MAX_SNAPSHOT_BYTES", budget)
+        tree = tg.snapshot_tree(store)
+        assert calls == [".gitattributes"]
+        assert store.read_blob(tree, "x") == payload
+        if ignored:
+            with pytest.raises(tg.GitRefusal) as caught:
+                store.read_blob(tree, ".gitattributes")
+            assert caught.value.code == "path_missing"
+        else:
+            assert store.read_blob(tree, ".gitattributes") == attr.read_bytes()
+    assert shared_bytes(repo) == before
+
+
+def test_snapshot_attribute_candidate_path_limit_precedes_open(repo, monkeypatch, filter_home):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    run(repo, "config", "--file", str(repo / ".git/config"), "filter.lfs.required", "false")
+    calls = []
+    def record(path, *args, **kwargs):
+        if path == ".gitattributes":
+            calls.append(path)
+        return os.open(path, *args, **kwargs)
+    process_os = SimpleNamespace(**{**vars(os), "open": record, "supports_dir_fd": os.supports_dir_fd | {record}})
+    before = shared_bytes(repo)
+    with context as store:
+        monkeypatch.setattr(tg, "os", process_os)
+        monkeypatch.setattr(tg, "MAX_PATH_BYTES", len(b".gitattributes") - 1)
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree(store)
+        assert caught.value.code == "conversion_unavailable" and calls == []
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_snapshot_attribute_candidates_are_deduplicated_without_driver_gate(repo, monkeypatch, filter_home, configured):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    (repo / ".gitignore").write_bytes(b".gitattributes\n")
+    folders = (repo, repo / "a", repo / "a/b", repo / "a/c")
+    for folder in folders:
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / ".gitattributes").write_bytes(b"# ordinary attributes\n")
+        (folder / "sample.bin").write_bytes(b"raw\r\n")
+    if configured:
+        run(repo, "config", "--file", str(repo / ".git/config"), "filter.lfs.required", "false")
+    calls = []
+    def record(path, *args, **kwargs):
+        if path == ".gitattributes":
+            observed = os.fstat(kwargs["dir_fd"])
+            calls.append((observed.st_dev, observed.st_ino))
+        return os.open(path, *args, **kwargs)
+    process_os = SimpleNamespace(**{**vars(os), "open": record, "supports_dir_fd": os.supports_dir_fd | {record}})
+    before = shared_bytes(repo)
+    with context as store:
+        monkeypatch.setattr(tg, "os", process_os)
+        tree = tg.snapshot_tree(store)
+        expected = [(folder.stat().st_dev, folder.stat().st_ino) for folder in folders]
+        assert sorted(calls) == sorted(expected)
+        assert store.read_blob(tree, "a/b/sample.bin") == b"raw\r\n"
+        with pytest.raises(tg.GitRefusal) as caught:
+            store.read_blob(tree, "a/b/.gitattributes")
+        assert caught.value.code == "path_missing"
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("failure", [errno.ENOENT, errno.ENOTDIR, errno.EACCES], ids=["missing", "not-directory", "unreadable"])
+def test_snapshot_attribute_candidate_errors_close_descriptors(repo, monkeypatch, filter_home, failure):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    if not Path("/proc/self/fd").is_dir():
+        pytest.skip("descriptor accounting requires procfs")
+    folder = repo / "nested"
+    folder.mkdir()
+    (folder / "sample.bin").write_bytes(b"raw\r\n")
+    identity = (folder.stat().st_dev, folder.stat().st_ino)
+    run(repo, "config", "--file", str(repo / ".git/config"), "filter.lfs.required", "false")
+    calls = []
+    def damaged(path, *args, **kwargs):
+        if path == ".gitattributes":
+            observed = os.fstat(kwargs["dir_fd"])
+            if (observed.st_dev, observed.st_ino) == identity:
+                calls.append(path)
+                raise OSError(failure, "never echo private path text")
+        return os.stat(path, *args, **kwargs)
+    process_os = SimpleNamespace(**{**vars(os), "stat": damaged, "supports_dir_fd": os.supports_dir_fd | {damaged}})
+    before = shared_bytes(repo)
+    with context as store:
+        monkeypatch.setattr(tg, "os", process_os)
+        descriptors = set(os.listdir("/proc/self/fd"))
+        if failure == errno.EACCES:
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+                "conversion_unavailable", "Lane Git operation refused: conversion_unavailable", None)
+        else:
+            assert store.read_blob(tg.snapshot_tree(store), "nested/sample.bin") == b"raw\r\n"
+        assert calls == [".gitattributes"]
+        assert set(os.listdir("/proc/self/fd")) == descriptors
+        monkeypatch.setattr(tg, "os", os)
+        assert store.read_blob(tg.snapshot_tree(store), "nested/sample.bin") == b"raw\r\n"
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("count,depth,limit", [(1, 3, 2), (500, 20, 10000)], ids=["small", "depth20"])
+@pytest.mark.usefixtures("strict_program")
+def test_snapshot_attribute_candidate_prefixes_can_exceed_path_count(repo, monkeypatch, filter_home, count, depth, limit):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    names = ["/".join(["d" + str(index)] * depth) + "/sample.bin" for index in range(count)]
+    for name in names:
+        path = repo / name
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"raw\r\n")
+    assert count + 1 <= limit < count * depth + 1
+    run(repo, "config", "--file", str(repo / ".git/config"), "filter.lfs.required", "false")
+    run(repo, "add", "-A")
+    expected = run(repo, "write-tree").decode().strip()
+    before = shared_bytes(repo)
+    with context as store:
+        monkeypatch.setattr(tg, "MAX_PATHS", limit)
+        assert tg.snapshot_tree(store) == expected
+        assert store.read_blob(expected, names[-1]) == b"raw\r\n"
+        run(repo, "config", "--file", str(repo / ".git/config"), "--remove-section", "filter.lfs")
+        assert tg.snapshot_tree(store) == expected
+    after = shared_bytes(repo)
+    assert {k: v for k, v in after.items() if k != "config"} == {k: v for k, v in before.items() if k != "config"}
+
+
+@pytest.mark.parametrize("source", ["captured", "indexed", "ignored"])
+@pytest.mark.parametrize("attributes", [b'"file name.txt" text eol=lf\n',
+    b'"\\133attr\\135quiet" text eol=lf\n"file name.txt" quiet\n'], ids=["quoted-pattern", "escaped-text-macro"])
+@pytest.mark.usefixtures("strict_program")
+def test_snapshot_quoted_attributes_with_driver_match_git_add(repo, tmp_path, filter_home, source, attributes):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    oracle = tmp_path / "oracle"
+    run(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    for target in (repo, oracle):
+        run(target, "config", "--file", str(target / ".git/config"), "filter.lfs.required", "true")
+        (target / ".gitattributes").write_bytes(attributes)
+        if source == "indexed":
+            run(target, "add", "--", ".gitattributes")
+            (target / ".gitattributes").write_bytes(b"*.txt text eol=lf\n")
+        elif source == "ignored":
+            (target / ".gitignore").write_bytes(b".gitattributes\n")
+        (target / "file name.txt").write_bytes(b"one\r\n")
+    run(oracle, "add", "-A")
+    expected = run(oracle, "write-tree").decode().strip()
+    before = shared_bytes(repo)
+    with context as store:
+        tree = tg.snapshot_tree(store)
+        assert tree == expected
+        assert store.read_blob(tree, "file name.txt") == b"one\n"
+    assert shared_bytes(repo) == before
+
+
+def test_snapshot_global_lfs_driver_without_filter_attributes_matches_git_add(repo, tmp_path, filter_home):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    for key, value in (("clean", "must-never-run"), ("smudge", "must-never-run"),
+                       ("process", "must-never-run"), ("required", "true")):
+        run(repo, "config", "--file", str(filter_home / ".gitconfig"), "filter.lfs." + key, value)
+    oracle = tmp_path / "oracle"
+    run(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    for target in (repo, oracle):
+        (target / "nested").mkdir()
+        (target / "nested/sample.bin").write_bytes(b"raw\r\n")
+    run(oracle, "add", "-A")
+    expected = run(oracle, "write-tree").decode().strip()
+    before = shared_bytes(repo)
+    with context as store:
+        assert tg.snapshot_tree(store) == expected
+        assert tg.snapshot_tree(store) == expected
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("token", [b"-filter", b"!filter", b"filter=unset", b"filter=unspecified",
+    b"filter=lfs", b"[attr]quiet text"], ids=["minus", "bang", "unset", "unspecified", "named", "macro"])
+def test_snapshot_clean_attribute_tokens_refuse_with_any_driver(repo, filter_home, token):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    data = token + b"\n" if token.startswith(b"[attr]") else b"unmatched.bin " + token + b"\n"
+    (repo / ".gitattributes").write_bytes(data)
+    run(repo, "add", "--", ".gitattributes")
+    run(repo, "config", "--file", str(repo / ".git/config"), "filter.other.smudge", "")
+    before = shared_bytes(repo)
+    with context as store:
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert caught.value.code == "conversion_unavailable"
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("initial,replacement", [
+    ("named", value) for value in ("missing", "configured", "suppressed", "macro")
+] + [("unspecified", value) for value in ("configured", "suppressed", "macro")]
+  + [("restored-index", "configured")])
+def test_snapshot_concurrent_attribute_disappearance_refuses_then_retries(repo, monkeypatch, filter_home, initial, replacement):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    attributes = b"*.bin filter=lfs text=auto\n" if initial == "named" else b"*.bin text\n"
+    if initial == "restored-index":
+        attributes = b"*.bin filter=lfs text=auto\n"
+    run(repo, "config", "--file", str(repo / ".git/config"), "filter.hostile.required", "true")
+    (repo / ".gitattributes").write_bytes(b"*.bin filter=hostile\n" if initial == "restored-index" else attributes)
+    run(repo, "add", "--", ".gitattributes")
+    (repo / ".gitattributes").write_bytes(attributes)
+    (repo / "sample.bin").write_bytes(b"one\r\n")
+    entered, release = Event(), Event()
+    def paused(real, args, *rest, **kwargs):
+        result = real(args, *rest, **kwargs)
+        if args[:2] == ["ls-files", "--stage"] and not entered.is_set():
+            entered.set()
+            assert release.wait(5), "attribute capture was never released"
+        return result
+    before = shared_bytes(repo)
+    with context as store, ThreadPoolExecutor(max_workers=1) as executor:
+        patch_lane_run(monkeypatch, paused)
+        future = executor.submit(tg.snapshot_tree, store)
+        try:
+            assert entered.wait(5), "snapshot never reached attribute capture"
+            if replacement == "missing":
+                (repo / ".gitattributes").unlink()
+            else:
+                rewritten = {"configured": b"*.bin filter=hostile\n", "suppressed": b"*.bin !filter\n",
+                             "macro": b"[attr]quiet text\n*.bin quiet\n"}[replacement]
+                (repo / ".gitattributes").write_bytes(rewritten)
+        finally:
+            release.set()
+        with pytest.raises(tg.GitRefusal) as caught:
+            future.result(timeout=5)
+        assert caught.value.code == "conversion_unavailable"
+        assert shared_bytes(repo) == before
+        (repo / ".gitattributes").write_bytes(attributes)
+        run(repo, "add", "--", ".gitattributes")
+        run(repo, "config", "--file", str(repo / ".git/config"), "--remove-section", "filter.hostile")
+        retry_before = shared_bytes(repo)
+        assert store.read_blob(tg.snapshot_tree(store), "sample.bin") == b"one\n"
+    assert shared_bytes(repo) == retry_before
+
+
+@pytest.mark.parametrize("driver", ["clean", "required"])
+@pytest.mark.parametrize("change", ["deleted", "rewritten"])
+@pytest.mark.parametrize("override", [b"-filter", b"!filter", b"filter=unset",
+    b"!filter\n[attr]quiet text"], ids=["unset", "unspecified", "literal-unset", "macro"])
+def test_snapshot_dirty_nested_filter_override_refuses_then_retries(repo, tmp_path, filter_home, driver, change, override):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    oracle = tmp_path / "oracle"
+    run(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    nested = b"*.bin " + override + b"\n"
+    for target in (repo, oracle):
+        (target / "nested").mkdir()
+        (target / ".gitattributes").write_bytes(b"*.bin filter=hostile\n")
+        (target / "nested/.gitattributes").write_bytes(nested)
+        run(target, "add", "--", ".gitattributes", "nested/.gitattributes")
+        run(target, "config", "--file", str(target / ".git/config"), "filter.hostile." + driver,
+            "true" if driver == "required" else "printf FILTERED")
+        (target / "nested/sample.bin").write_bytes(b"raw\r\n")
+    before = shared_bytes(repo)
+    with context as store:
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree(store)
+        assert caught.value.code == "conversion_unavailable"
+        for target in (repo, oracle):
+            if change == "deleted":
+                (target / "nested/.gitattributes").unlink()
+            else:
+                (target / "nested/.gitattributes").write_bytes(b"*.bin !filter\n# rewritten\n")
+        reference = subprocess.run(["git", "add", "-A"], cwd=oracle, env=filter_git_env(filter_home),
+            capture_output=True, check=False)
+        assert reference.returncode == (128 if change == "deleted" and driver == "required" else 0)
+        if change == "deleted" and driver == "clean":
+            assert run(oracle, "show", ":nested/sample.bin") == b"FILTERED"
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+                "conversion_unavailable", "Lane Git operation refused: conversion_unavailable", None)
+        (repo / "nested/.gitattributes").write_bytes(nested)
+        run(repo, "config", "--file", str(repo / ".git/config"), "--remove-section", "filter.hostile")
+        assert store.read_blob(tg.snapshot_tree(store), "nested/sample.bin") == b"raw\r\n"
+    after = shared_bytes(repo)
+    assert {k: v for k, v in after.items() if k != "config"} == {k: v for k, v in before.items() if k != "config"}
+
+
+@pytest.mark.parametrize("original", [
+    b"*.bin -filter text\n", b"*.bin !filter text\n", b"*.bin filter=unset text\n",
+    b"*.bin filter=unspecified text\n", b"[attr]quiet text\n*.bin quiet\n",
+    b'"[attr]quiet" text\n*.bin quiet\n', b'"\\133attr\\135quiet" text filter=lfs\n*.bin quiet\n',
+], ids=["minus", "bang", "literal-unset", "literal-unspecified", "macro", "quoted-macro", "escaped-macro"])
+def test_snapshot_dirty_index_attribute_tokens_refuse_then_retry(repo, tmp_path, filter_home, original):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    oracle = tmp_path / "oracle"
+    run(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    for target in (repo, oracle):
+        (target / ".gitattributes").write_bytes(original)
+        run(target, "add", "--", ".gitattributes")
+        (target / "sample.bin").write_bytes(b"one\r\n")
+    run(oracle, "add", "-A")
+    expected = run(oracle, "write-tree").decode().strip()
+    (repo / ".gitattributes").write_bytes(b"*.bin text\n")
+    run(repo, "config", "--file", str(repo / ".git/config"), "filter.other.required", "false")
+    before = shared_bytes(repo)
+    with context as store:
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert caught.value.code == "conversion_unavailable"
+        (repo / ".gitattributes").write_bytes(original)
+        run(repo, "config", "--file", str(repo / ".git/config"), "--remove-section", "filter.other")
+        assert tg.snapshot_tree(store) == expected
+    after = shared_bytes(repo)
+    assert {k: v for k, v in after.items() if k != "config"} == {k: v for k, v in before.items() if k != "config"}
+
+
+@pytest.mark.parametrize("source", ["captured", "indexed"])
+@pytest.mark.parametrize("mention", [b"# filter mentioned in a comment\n", b"# [attr] mentioned in a comment\n",
+    b'"name filter=notes" text\n'], ids=["filter-comment", "macro-comment", "quoted-pattern"])
+def test_snapshot_attribute_byte_mentions_refuse_with_driver_and_match_git_without_drivers(repo, tmp_path, filter_home, source, mention):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    oracle = tmp_path / "oracle"
+    run(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    original, captured = (mention, b"*.bin text\n") if source == "indexed" else (b"*.bin text\n", mention)
+    for target in (repo, oracle):
+        run(target, "config", "--file", str(target / ".git/config"), "core.autocrlf", "false")
+        (target / ".gitattributes").write_bytes(original)
+        run(target, "add", "--", ".gitattributes")
+        (target / ".gitattributes").write_bytes(captured)
+        (target / "sample.bin").write_bytes(b"one\r\n")
+        run(target, "config", "--file", str(target / ".git/config"), "filter.other.required", "false")
+    run(oracle, "add", "-A")
+    expected = run(oracle, "write-tree").decode().strip()
+    before = shared_bytes(repo)
+    with context as store:
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert caught.value.code == "conversion_unavailable"
+        assert shared_bytes(repo) == before
+        run(repo, "config", "--file", str(repo / ".git/config"), "--remove-section", "filter.other")
+        assert tg.snapshot_tree(store) == expected
+        assert tg.snapshot_tree(store) == expected
+    after = shared_bytes(repo)
+    assert {k: v for k, v in after.items() if k != "config"} == {k: v for k, v in before.items() if k != "config"}
+
+
+@pytest.mark.parametrize("prefix", [b"\x0b", b"\x0c"], ids=["vertical-tab", "form-feed"])
+@pytest.mark.parametrize("source", ["captured", "indexed"])
+def test_snapshot_control_before_quote_cannot_hide_filter_bytes(repo, monkeypatch, filter_home, prefix, source):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    ordinary, hostile = b"*.bin text\n", prefix + b'"*.bin filter=hostile\n'
+    (repo / ".gitattributes").write_bytes(hostile if source == "indexed" else ordinary)
+    run(repo, "add", "--", ".gitattributes")
+    (repo / ".gitattributes").write_bytes(ordinary)
+    name = os.fsdecode(prefix + b'"sample.bin')
+    (repo / name).write_bytes(b"one\r\n")
+    run(repo, "config", "--file", str(repo / ".git/config"), "filter.hostile.required", "true")
+    def rewrite(real, args, *rest, **kwargs):
+        result = real(args, *rest, **kwargs)
+        if args[:2] == ["ls-files", "--stage"] and source == "captured":
+            (repo / ".gitattributes").write_bytes(hostile)
+        return result
+    before = shared_bytes(repo)
+    with context as store:
+        restore = patch_lane_run(monkeypatch, rewrite)
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree(store)
+        assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+            "conversion_unavailable", "Lane Git operation refused: conversion_unavailable", None)
+        assert shared_bytes(repo) == before
+        restore()
+        run(repo, "config", "--file", str(repo / ".git/config"), "--remove-section", "filter.hostile")
+        assert store.read_blob(tg.snapshot_tree(store), name) == (b"one\r\n" if source == "captured" else b"one\n")
+
+
+@pytest.mark.parametrize("attributes", [b"*.bin filter=lfs text=auto\n", b"[attr]quiet text\n*.bin quiet\n"],
+    ids=["filter", "macro"])
+def test_snapshot_worktree_only_attribute_rules_refuse_until_drivers_removed(repo, tmp_path, filter_home, attributes):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    oracle = tmp_path / "oracle"
+    run(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    for target in (repo, oracle):
+        (target / ".gitattributes").write_bytes(attributes)
+        (target / "sample.bin").write_bytes(b"one\r\n")
+    run(oracle, "add", "-A")
+    expected = run(oracle, "write-tree").decode().strip()
+    run(repo, "config", "--file", str(repo / ".git/config"), "filter.other.required", "false")
+    before = shared_bytes(repo)
+    with context as store:
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert caught.value.code == "conversion_unavailable"
+        assert shared_bytes(repo) == before
+        run(repo, "add", "--", ".gitattributes")
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree(store)
+        assert caught.value.code == "conversion_unavailable"
+        run(repo, "config", "--file", str(repo / ".git/config"), "--remove-section", "filter.other")
+        staged = shared_bytes(repo)
+        assert tg.snapshot_tree(store) == expected
+    assert shared_bytes(repo) == staged
+
+
+@pytest.mark.parametrize("driver", ["unset", "unspecified"])
+def test_snapshot_configured_filter_sentinel_names_refuse_and_retry(repo, tmp_path, filter_home, driver):
+    run = filter_git(filter_home)
+    context = make_store(repo)
+    oracle = tmp_path / "oracle"
+    run(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    for target in (repo, oracle):
+        run(target, "config", "--file", str(target / ".git/config"), "filter." + driver + ".clean", "printf replaced")
+        (target / ".gitattributes").write_bytes(b"x filter=" + driver.encode() + b"\n")
+        run(target, "add", "--", ".gitattributes")
+        (target / "x").write_bytes(b"changed\n")
+    run(oracle, "add", "-A")
+    assert run(oracle, "show", ":x") == b"replaced"
+    with context as store:
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert caught.value.code == "conversion_unavailable"
+        run(repo, "config", "--file", str(repo / ".git/config"), "--remove-section", "filter." + driver)
+        assert store.read_blob(tg.snapshot_tree(store), "x") == b"changed\n"
+
+
+def test_snapshot_parity_ignores_host_system_and_custom_xdg_filters(repo, tmp_path, filter_home):
+    make_store(repo)
+    run = filter_git(filter_home)
+    system = filter_home / "host-system-config"
+    xdg = filter_home / "host-xdg"
+    (xdg / "git").mkdir(parents=True)
+    for config in (system, xdg / "git/config"):
+        run(repo, "config", "--file", str(config), "filter.lfs.required", "true")
+    oracle = tmp_path / "oracle"
+    run(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    for target in (repo, oracle):
+        run(target, "config", "--file", str(target / ".git/config"), "core.autocrlf", "false")
+        (target / ".gitattributes").write_bytes(b"*.bin filter=lfs\n")
+        run(target, "add", "--", ".gitattributes")
+        (target / "sample.bin").write_bytes(b"raw\r\n")
+    reference_env = {**filter_git_env(filter_home), "GIT_CONFIG_SYSTEM": str(system)}
+    controls = ({**reference_env, "GIT_CONFIG_NOSYSTEM": "0"},
+                {**reference_env, "XDG_CONFIG_HOME": str(xdg)},
+                {**reference_env, "GIT_CONFIG_NOSYSTEM": "0", "XDG_CONFIG_HOME": str(xdg)})
+    for environment in controls:
+        control = subprocess.run(["git", "add", "-A"], cwd=oracle, env=environment,
+            capture_output=True, check=False)
+        assert control.returncode == 128 and b"clean filter 'lfs' failed" in control.stderr
+    git(oracle, "add", "-A", env=reference_env)
+    expected = git(oracle, "write-tree", env=reference_env).decode().strip()
+    code = """from pathlib import Path
+import sys
+from aegis_core import team_git as tg
+from tests.helpers_team_git import new_store
+with new_store(Path(sys.argv[1])) as store:
+    assert store.env['GIT_CONFIG_NOSYSTEM'] == '1'
+    assert 'XDG_CONFIG_HOME' not in store.env
+    tree = tg.snapshot_tree(store)
+    assert store.read_blob(tree, 'sample.bin') == b'raw\\r\\n'
+    print(tree)
+"""
+    before = shared_bytes(repo)
+    child = subprocess.run([sys.executable, "-c", code, str(repo)],
+        env={**os.environ, "XDG_CONFIG_HOME": str(xdg)}, capture_output=True, check=True, timeout=30)
+    assert child.stdout.decode().strip() == expected
+    assert shared_bytes(repo) == before
+
+
+def test_snapshot_clean_lfs_tree_matches_git_without_git_lfs_on_path(repo, tmp_path, filter_home):
+    make_store(repo)
+    run = filter_git(filter_home)
+    binary = filter_home / "bin"
+    binary.mkdir()
+    symlink_or_skip(Path(shutil.which("git")), binary / "git")
+    oracle = tmp_path / "oracle"
+    run(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    for target in (repo, oracle):
+        (target / ".gitattributes").write_bytes(b"*.bin filter=lfs\n")
+        run(target, "add", "--", ".gitattributes")
+        (target / "sample.bin").write_bytes(b"raw\r\n")
+    run(oracle, "add", "-A")
+    expected = run(oracle, "write-tree").decode().strip()
+    code = """from pathlib import Path
+import shutil, sys
+from aegis_core import team_git as tg
+from tests.helpers_team_git import new_store
+assert shutil.which('git-lfs') is None
+with new_store(Path(sys.argv[1])) as store:
+    tree = tg.snapshot_tree(store)
+    assert store.read_blob(tree, 'sample.bin') == b'raw\\r\\n'
+    print(tree)
+"""
+    before = shared_bytes(repo)
+    child = subprocess.run([sys.executable, "-c", code, str(repo)], env={**os.environ, "PATH": str(binary)},
+        capture_output=True, check=True, timeout=30)
+    assert child.stdout.decode().strip() == expected
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("mode,configured,expected", [(0o654, True, b"100644"), (0o744, False, b"100644")])
+def test_snapshot_uses_owner_execute_bit_and_core_filemode(repo, mode, configured, expected):
+    context = make_store(repo)
+    (repo / "x").chmod(mode)
+    git(repo, "config", "core.filemode", str(configured).lower())
+    with context as store:
+        tree = tg.snapshot_tree(store)
+        assert store._run(["ls-tree", tree, "--", "x"]).stdout.split()[0] == expected
+
+
+def test_snapshot_batches_index_and_reuses_existing_blobs(repo, monkeypatch):
+    context = make_store(repo)
+    for number in range(30):
+        (repo / ("file%d" % number)).write_bytes(b"same existing blob\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "many files")
+    calls, real = [], subprocess.Popen
+    def record(argv, **kwargs):
+        calls.append(argv)
+        return real(argv, **kwargs)
+    with context as store:
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+        tree = tg.snapshot_tree(store)
+        assert sum("update-index" in a for a in calls) == 1
+        assert not any("hash-object" in a for a in calls)
+        calls.clear()
+        assert tg.snapshot_tree(store) == tree
+        assert sum("update-index" in a for a in calls) == 1
+
+
+def test_publication_batches_all_objects(repo, monkeypatch):
+    context = make_store(repo)
+    parent = git(repo, "rev-parse", "HEAD").decode().strip()
+    calls, real = [], subprocess.Popen
+    def record(argv, **kwargs):
+        calls.append(argv)
+        return real(argv, **kwargs)
+    with context as store:
+        for number in range(12):
+            (repo / ("new%d" % number)).write_bytes(("new%d" % number).encode())
+        head = tg.commit_tested(store, tg.snapshot_tree(store), parent, "many objects", IDENTITY)
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+        assert tg.cas_fast_forward(store, "refs/heads/lane/batch", None, head) == "updated"
+        assert sum("pack-objects" in a for a in calls) == 1
+        assert sum("unpack-objects" in a for a in calls) == 1
+        assert not any("hash-object" in a for a in calls)
+        assert sum("--batch-check" in a for a in calls) == 2
+    assert git(repo, "rev-parse", "refs/heads/lane/batch").decode().strip() == head
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX pipe select")
+def test_custody_waits_for_pipe_readiness_instead_of_fixed_poll(repo, monkeypatch):
+    import select
+    waits = []
+    def blocking(read, write, errors, timeout):
+        waits.append(timeout)
+        return select.select(read, write, errors, timeout)
+    monkeypatch.setattr(gitsafe_run, "select", SimpleNamespace(select=blocking))
+    with new_store(repo) as store:
+        assert store._run(["version"]).returncode == 0
+    assert waits and all(timeout > 0 for timeout in waits)
+
+
+@pytest.mark.parametrize("planner", ["merge", "pick", "revert"])
+def test_global_merge_driver_is_refused_before_merge_tree(repo, tmp_path, monkeypatch, planner):
+    parent = git(repo, "rev-parse", "HEAD").decode().strip()
+    side = commit(repo, "side", b"side\n")
+    tree = git(repo, "rev-parse", "HEAD^{tree}").decode().strip()
+    merged = git(repo, "commit-tree", tree, "-p", parent, "-p", side,
+                 data=b"merge\n").decode().strip()
+    config = tmp_path / "global-config"
+    script, marker = repo / "child-script", tmp_path / "driver-executed"
+    script.write_text('echo ran > "' + marker.as_posix() + '"\n', encoding="utf-8")
+    git(repo, "config", "--file", str(config), "merge.hostile.driver",
+        'sh "' + script.as_posix() + '" %O %A %B')
+    (repo / ".gitattributes").write_bytes(b"x merge=hostile\n")
+    calls, real = [], subprocess.Popen
+    def observed(args, **kwargs):
+        calls.append(args)
+        return real(args, **kwargs)
+    home = tmp_path / "home"
+    home.mkdir()
+    shutil.copyfile(config, home / ".gitconfig")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": observed}))
+    with new_store(repo) as store:
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                if planner == "merge":
+                    tg.plan_merge(store, parent, side)
+                elif planner == "pick":
+                    tg.plan_pick(store, parent, [side], IDENTITY)
+                else:
+                    tg.plan_revert(store, merged, merged)
+            assert caught.value.code == "repository_merge_driver"
+    assert not any("merge-tree" in args for args in calls)
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("command", ["update-ref", "symbolic-ref", "branch", "tag", "notes",
+    "replace", "fast-import", "push", "fetch", "reflog", "pack-refs", "gc", "config-write"])
+@pytest.mark.parametrize("prefix", [[], ["-c", "aegis.test=value"], ["-C", "."]])
+def test_store_dispatcher_refuses_ref_writers_before_git(repo, monkeypatch, command, prefix):
+    with new_store(repo) as store:
+        before = shared_bytes(repo)
+        def unexpected(*args, **kwargs):
+            pytest.fail("ref writer reached Git outside cas_fast_forward")
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": unexpected}))
+        argv = [*prefix, command] if command != "config-write" else [*prefix, "config", "aegis.x", "y"]
+        dispatch = store._run
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                dispatch(argv)
+            assert caught.value.code == "git_custody_refused"
+        assert shared_bytes(repo) == before
+
+
+def test_parent_rename_race_cannot_read_external_bytes(repo, tmp_path, monkeypatch):
+    if not tg.descriptor_support():
+        pytest.skip("requires descriptor-relative opens")
+    (repo / "dir").mkdir()
+    commit(repo, "dir/file", b"inside")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "file").write_bytes(b"secret")
+    # Establish capability before installing the race.
+    symlink_or_skip(outside, repo / "probe")
+    (repo / "probe").unlink()
+    real_open, raced, directories = os.open, [], []
+    def swapping_open(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        if path == "dir":
+            directories.append(path)
+            # The first open captures attributes. Race the payload's held
+            # directory descriptor on the second open.
+            if len(directories) == 2:
+                raced.append(True)
+                (repo / "dir").rename(repo / "old-dir")
+                (repo / "dir").symlink_to(outside, target_is_directory=True)
+        return fd
+    monkeypatch.setattr(tg, "os", SimpleNamespace(**{**vars(os), "open": swapping_open,
+        "supports_dir_fd": os.supports_dir_fd | {swapping_open}}))
+    with make_store(repo) as store:
+        tree = tg.snapshot_tree(store)
+        assert store.read_blob(tree, "dir/file") == b"inside"
+    assert raced
+
+
+def test_descriptor_cleanup_on_read_failure_and_retry(repo, monkeypatch):
+    context = make_store(repo)
+    (repo / "x").write_bytes(b"dirty payload\n")
+    opened, closed = [], []
+    real_open, real_close = os.open, os.close
+    def track_open(*args, **kwargs):
+        fd = real_open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+    def track_close(fd):
+        closed.append(fd)
+        return real_close(fd)
+    def fail_read(*args):
+        raise OSError("private input")
+    monkeypatch.setattr(tg, "os", SimpleNamespace(**{**vars(os), "open": track_open, "close": track_close,
+        "read": fail_read, "supports_dir_fd": os.supports_dir_fd | {track_open}}))
+    with context as store:
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree(store)
+        assert caught.value.code == "path_unreadable"
+        monkeypatch.setattr(tg, "os", SimpleNamespace(**{**vars(os), "open": track_open, "close": track_close,
+            "supports_dir_fd": os.supports_dir_fd | {track_open}}))
+        assert sorted(opened) == sorted(closed)
+        assert store.read_blob(tg.snapshot_tree(store), "x") == b"dirty payload\n"
+    assert sorted(opened) == sorted(closed)
+
+
+def test_lost_lane_ref_ack_is_observed_without_retry(repo, monkeypatch):
+    parent = git(repo, "rev-parse", "HEAD").decode().strip()
+    real_popen, writes = subprocess.Popen, []
+    def lost_ack(argv, **kwargs):
+        result = real_popen(argv, **kwargs)
+        if "update-ref" in argv:
+            writes.append(argv)
+            original_wait = result.wait
+            def wait(*args, **kw):
+                original_wait(*args, **kw)
+                raise subprocess.TimeoutExpired(argv, 10)
+            result.wait = wait
+        return result
+    with new_store(repo) as store:
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": lost_ack}))
+        assert tg.cas_fast_forward(store, "refs/heads/lane/lost", None, parent) == "already"
+        assert len(writes) == 1
+
+
+@pytest.mark.parametrize("namespace", ["refs/heads/lane/outcome", "refs/aegis/qual/outcome"])
+@pytest.mark.parametrize("failure", ["nonzero", "git_cleanup_failed", "git_output_limit", "git_failed"])
+@pytest.mark.parametrize("observation", ["old", "new", "winner"])
+def test_cas_classifies_failed_acknowledgments_and_never_retries(repo, monkeypatch, namespace, failure, observation):
+    new = git(repo, "rev-parse", "HEAD").decode().strip()
+    winner = commit(repo, "winner", b"competing commit")
+    real, writes = gitsafe_run.capture, []
+    def fail(args, **kwargs):
+        if "update-ref" not in args:
+            return real(args, **kwargs)
+        writes.append(args)
+        if observation != "old":
+            git(repo, "update-ref", namespace, new if observation == "new" else winner)
+        if failure == "nonzero":
+            return subprocess.CompletedProcess(args, 1, b"", b"private error")
+        raise gitsafe.GitError("private error", code=failure, process_started=True)
+    with new_store(repo) as store:
+        monkeypatch.setattr(gitsafe_run, "capture", fail)
+        if observation == "new":
+            assert tg.cas_fast_forward(store, namespace, None, new) == "already"
+        else:
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.cas_fast_forward(store, namespace, None, new)
+            expected = "cas_mismatch" if observation == "winner" else (
+                "ref_update_failed" if failure == "nonzero" else "ref_update_unknown")
+            assert caught.value.code == expected
+            assert "private" not in str(caught.value)
+        assert len(writes) == 1
+        monkeypatch.setattr(gitsafe_run, "capture", real)
+        if observation == "old" and failure == "nonzero":
+            assert tg.cas_fast_forward(store, namespace, None, new) == "updated"
+        elif observation == "new":
+            assert tg.cas_fast_forward(store, namespace, None, new) == "already"
+
+
+@pytest.mark.parametrize("ref", ["refs/heads/lane/spawn", "refs/aegis/qual/spawn"])
+def test_cas_spawn_failure_is_definite_and_can_be_retried(repo, monkeypatch, ref):
+    new = git(repo, "rev-parse", "HEAD").decode().strip()
+    real, attempts = subprocess.Popen, []
+    def refuse_spawn(argv, **kwargs):
+        if "update-ref" in argv:
+            attempts.append(argv)
+            raise OSError("private spawn failure")
+        return real(argv, **kwargs)
+    with new_store(repo) as store:
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": refuse_spawn}))
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.cas_fast_forward(store, ref, None, new)
+        assert caught.value.code == "ref_update_failed"
+        assert "private" not in str(caught.value)
+        assert len(attempts) == 1
+        monkeypatch.setattr(gitsafe_run, "subprocess", subprocess)
+        assert tg.cas_fast_forward(store, ref, None, new) == "updated"
+
+
+def test_ref_symbolic_target_is_never_written(repo):
+    parent = git(repo, "rev-parse", "HEAD").decode().strip()
+    git(repo, "symbolic-ref", "refs/heads/lane/link", "refs/heads/main")
+    before = shared_bytes(repo)
+    with new_store(repo) as store, pytest.raises(tg.GitRefusal) as caught:
+        tg.cas_fast_forward(store, "refs/heads/lane/link", parent, parent)
+    assert caught.value.code == "ref_unreadable"
+    assert shared_bytes(repo) == before
+
+
+def test_conflict_display_is_canonical_then_redacted_then_truncated(repo, monkeypatch):
+    parent = git(repo, "rev-parse", "HEAD").decode().strip()
+    secret_path = b"token=\x1b[31msecret\x1b[0m" + b"z" * 300
+    def conflict(real, args, *other, **kwargs):
+        if "merge-tree" in args:
+            return subprocess.CompletedProcess(args, 1, parent.encode() + b"\0" + secret_path + b"\0\0", b"")
+        return real(args, *other, **kwargs)
+    with new_store(repo) as store:
+        restore = patch_lane_run(monkeypatch, conflict)
+        plan = tg.plan_merge(store, parent, parent)
+    assert len(plan.conflicts[0]) <= 240
+    assert "secret" not in plan.conflicts[0] and "\x1b" not in plan.conflicts[0]
+
+
+def test_aegis_delegate_must_not_retry_unknown_write(repo, monkeypatch):
+    """ADR G3: a failed acknowledgment never authorizes a repeated write."""
+    parent = git(repo, "rev-parse", "HEAD").decode().strip()
+    real_popen, writes = subprocess.Popen, []
+    def timeout(argv, **kwargs):
+        if "update-ref" in argv:
+            writes.append(argv)
+            raise subprocess.TimeoutExpired(argv, 10)
+        return real_popen(argv, **kwargs)
+    with new_store(repo) as store:
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": timeout}))
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.cas_fast_forward(store, "refs/aegis/qual/test", None, parent)
+        assert caught.value.code == "ref_update_unknown"
+        assert len(writes) == 1
+
+
+def test_aegis_delegate_must_keep_required_hardening(repo, monkeypatch):
+    """ADR G6 hardening reaches every custody helper and the delegated write."""
+    parent = git(repo, "rev-parse", "HEAD").decode().strip()
+    real_popen, writes, calls = subprocess.Popen, [], []
+    def recording(argv, **kwargs):
+        calls.append(argv)
+        if "update-ref" in argv:
+            writes.append(argv)
+        return real_popen(argv, **kwargs)
+    with new_store(repo) as store:
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": recording}))
+        assert tg.cas_fast_forward(store, "refs/aegis/qual/test", None, parent) == "updated"
+    assert len(writes) == 1
+    assert calls
+    assert all("gc.auto=0" in argv and "maintenance.auto=false" in argv for argv in calls)
+
+
+def test_refusal_code_is_preserved_by_public_planner_and_cas(repo, monkeypatch):
+    parent = git(repo, "rev-parse", "HEAD").decode().strip()
+    with new_store(repo) as store:
+        def refuse(real, *args, **kwargs):
+            raise gitsafe.GitError("private hostile text", code="privacy_refused")
+        restore = patch_lane_run(monkeypatch, refuse)
+        for operation in (lambda: tg.plan_merge(store, parent, parent),
+                          lambda: tg.cas_fast_forward(store, "refs/heads/lane/x", None, parent)):
+            with pytest.raises(tg.GitRefusal) as caught:
+                operation()
+            assert caught.value.code == "privacy_refused"
+            assert "hostile" not in str(caught.value)
+
+
+def test_invalid_ref_identity_precedes_every_git_call(repo, monkeypatch):
+    parent = git(repo, "rev-parse", "HEAD").decode().strip()
+    with new_store(repo) as store:
+        def unexpected(*args, **kwargs):
+            pytest.fail("invalid ref caused a git call")
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": unexpected}))
+        for ref in ("refs/heads/lane/../main", "refs/heads/lane/x.lock", "refs/heads/lane/x@{bad"):
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.cas_fast_forward(store, ref, parent, parent)
+            assert caught.value.code == "ref_not_allowed"
+
+
+def test_snapshot_includes_staged_ignored_additions_without_changing_index(repo):
+    (repo / ".gitignore").write_bytes(b"ignored\n")
+    (repo / "ignored").write_bytes(b"explicitly tracked\n")
+    git(repo, "add", "-f", "ignored")
+    before = shared_bytes(repo)
+    with make_store(repo) as store:
+        assert store.read_blob(tg.snapshot_tree(store), "ignored") == b"explicitly tracked\n"
+    assert shared_bytes(repo) == before
+
+
+def test_malformed_parent_header_returns_refusal_without_echo(repo):
+    parent = git(repo, "rev-parse", "HEAD").decode().strip()
+    tree = git(repo, "rev-parse", "HEAD^{tree}").strip()
+    malformed = b"tree " + tree + b"\nparent \xffhostile\nauthor A <a@b> 1 +0000\n\nmessage\n"
+    source = git(repo, "hash-object", "--literally", "-w", "-t", "commit", "--stdin", data=malformed).decode().strip()
+    with new_store(repo) as store:
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.plan_pick(store, parent, (source,), IDENTITY)
+        assert caught.value.code == "invalid_object"
+        assert "hostile" not in str(caught.value)
+
+
+def test_snapshot_aggregate_cap_precedes_file_read(repo, monkeypatch):
+    monkeypatch.setattr(tg, "MAX_SNAPSHOT_BYTES", 2)
+    def forbidden_read(*args):
+        pytest.fail("over-limit file was read")
+    monkeypatch.setattr(tg, "os", SimpleNamespace(**{**vars(os), "read": forbidden_read}))
+    with make_store(repo) as store, pytest.raises(tg.GitRefusal) as caught:
+        tg.snapshot_tree(store)
+    assert caught.value.code == "size_limit"
+
+
+def test_disappearance_after_identity_check_refuses_then_retry_succeeds(repo, monkeypatch):
+    context = make_store(repo)
+    real_open = os.open
+    def disappear(path, flags, *args, **kwargs):
+        if path == "x":
+            (repo / "x").unlink()
+        return real_open(path, flags, *args, **kwargs)
+    with context as store:
+        monkeypatch.setattr(tg, "os", SimpleNamespace(**{**vars(os), "open": disappear,
+            "supports_dir_fd": os.supports_dir_fd | {disappear}}))
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree(store)
+        assert caught.value.code == "worktree_changed"
+        monkeypatch.setattr(tg, "os", os)
+        (repo / "x").write_bytes(b"restored")
+        assert store.read_blob(tg.snapshot_tree(store), "x") == b"restored"
+
+
+@pytest.mark.usefixtures("strict_program")
+def test_invalid_root_identity_precedes_git_or_metadata(repo, monkeypatch):
+    def unexpected(*args, **kwargs):
+        pytest.fail("invalid identity caused a git invocation")
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": unexpected}))
+    for root in (repo / ".." / "repo", Path("relative"), "invalid\0root"):
+        with pytest.raises(tg.GitRefusal) as caught:
+            with tg.GitStore(root, repo.parent):
+                pass
+        assert caught.value.code == "invalid_repository"
+
+
+def test_publish_budget_is_enforced_before_payload_capture(repo, monkeypatch):
+    parent = git(repo, "rev-parse", "HEAD").decode().strip()
+    tree = git(repo, "rev-parse", "HEAD^{tree}").decode().strip()
+    calls = []
+    real_popen = subprocess.Popen
+    def record(argv, **kwargs):
+        calls.append(argv)
+        return real_popen(argv, **kwargs)
+    with new_store(repo) as store:
+        head = tg.commit_tested(store, tree, parent, "private commit", IDENTITY)
+        monkeypatch.setattr(tg, "MAX_SNAPSHOT_BYTES", 1)
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.cas_fast_forward(store, "refs/heads/lane/budget", None, head)
+        assert caught.value.code == "git_object_limit"
+        # Validation reads the commit once; publication must refuse at metadata,
+        # before capturing a second copy beyond its remaining aggregate budget.
+        assert sum(tuple(argv[-3:]) == ("cat-file", "commit", head) for argv in calls) == 1
+    assert gitsafe.read_ref(repo, "refs/heads/lane/budget") is None
+
+
+def test_mainline_revert_tree_matches_porcelain_on_a_later_tip(repo):
+    git(repo, "checkout", "-qb", "topic")
+    commit(repo, "x", b"feature\n")
+    git(repo, "checkout", "-q", "main")
+    commit(repo, "other", b"mainline\n")
+    git(repo, "merge", "--no-ff", "-qm", "merge", "topic")
+    merge = git(repo, "rev-parse", "HEAD").decode().strip()
+    tip = commit(repo, "later", b"keep this later change\n")
+    before = shared_bytes(repo)
+    with new_store(repo) as store:
+        plan = tg.plan_revert(store, tip, merge)
+        assert plan.status == "clean"
+    assert shared_bytes(repo) == before
+    git(repo, "revert", "--no-commit", "-m", "1", merge)
+    assert plan.tree == git(repo, "write-tree").decode().strip()
+
+
+def test_closed_store_refuses_every_public_operation_before_git(repo, monkeypatch):
+    oid = git(repo, "rev-parse", "HEAD").decode().strip()
+    with new_store(repo) as store:
+        pass
+    def unexpected(*args, **kwargs):
+        pytest.fail("closed store invoked Git")
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": unexpected}))
+    operations = (lambda: store._run(["version"]), lambda: store.object(oid, "commit"),
+        lambda: store.read_blob(oid, "x"), lambda: tg.snapshot_tree(store),
+        lambda: tg.commit_tested(store, oid, oid, "message", IDENTITY),
+        lambda: tg.cas_fast_forward(store, "refs/heads/lane/x", None, oid),
+        lambda: tg.plan_merge(store, oid, oid), lambda: tg.plan_pick(store, oid, (oid,), IDENTITY),
+        lambda: tg.plan_revert(store, oid, oid))
+    for operation in operations:
+        with pytest.raises(tg.GitRefusal) as caught:
+            operation()
+        assert caught.value.code == "store_closed"
+
+
+@pytest.mark.parametrize("path", ["../secret", "C:secret", "bad\\name", "\ud800"],
+                         ids=["parent", "drive", "backslash", "surrogate"])
+def test_object_path_identity_refuses_before_git(repo, monkeypatch, path):
+    if os.name != "nt" and path in ("C:secret", "bad\\name"):
+        pytest.skip("these are valid POSIX names, covered by the acceptance test")
+    oid = git(repo, "rev-parse", "HEAD^{tree}").decode().strip()
+    with new_store(repo) as store:
+        def unexpected(*args, **kwargs):
+            pytest.fail("invalid object path invoked Git")
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": unexpected}))
+        with pytest.raises(tg.GitRefusal) as caught:
+            store.read_blob(oid, path)
+        assert caught.value.code == "unsafe_path"
+
+
+def test_lone_surrogate_is_refused_even_when_fsencode_accepts_it(repo, monkeypatch):
+    oid = git(repo, "rev-parse", "HEAD^{tree}").decode().strip()
+    with new_store(repo) as store:
+        monkeypatch.setattr(tg, "os", SimpleNamespace(**{**vars(os),
+            "fsencode": lambda value: value.encode("utf-8", "surrogatepass")}))
+        def unexpected(*args, **kwargs):
+            pytest.fail("lone surrogate reached Git")
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": unexpected}))
+        with pytest.raises(tg.GitRefusal) as caught:
+            store.read_blob(oid, "\ud800")
+        assert caught.value.code == "unsafe_path"
+
+
+@pytest.mark.parametrize("cap", ["bad", True, -1], ids=["text", "boolean", "negative"])
+def test_bad_object_budget_returns_refusal(repo, cap):
+    oid = git(repo, "rev-parse", "HEAD").decode().strip()
+    with new_store(repo) as store, pytest.raises(tg.GitRefusal) as caught:
+        store.object(oid, "commit", max_bytes=cap)
+    assert caught.value.code == "invalid_object"
+
+
+def test_snapshot_has_one_index_writer_and_can_retry_after_busy(repo, monkeypatch):
+    context = make_store(repo)
+    entered, release = Event(), Event()
+    def pause_read(fd, size):
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(3), "snapshot read was never released"
+        return os.read(fd, size)
+    monkeypatch.setattr(tg, "os", SimpleNamespace(**{**vars(os), "read": pause_read}))
+    with context as store, ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(tg.snapshot_tree, store)
+        try:
+            assert entered.wait(3), "snapshot did not reach the read boundary"
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert caught.value.code == "store_busy"
+        finally:
+            release.set()
+        tree = first.result(timeout=3)
+        assert tg.snapshot_tree(store) == tree
+
+
+def test_descriptor_close_failure_still_closes_all_and_releases_index(repo, monkeypatch):
+    context = make_store(repo)
+    (repo / "dir").mkdir()
+    commit(repo, "dir/file", b"nested")
+    opened, closed = [], []
+    def track_open(*args, **kwargs):
+        fd = os.open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+    def fail_once_close(fd):
+        os.close(fd)
+        closed.append(fd)
+        if len(closed) == 1:
+            raise OSError("never display close input")
+    monkeypatch.setattr(tg, "os", SimpleNamespace(**{**vars(os), "open": track_open, "close": fail_once_close,
+        "supports_dir_fd": os.supports_dir_fd | {track_open}}))
+    try:
+        with context as store:
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert caught.value.code == "descriptor_cleanup_failed"
+            assert sorted(opened) == sorted(closed)
+            monkeypatch.setattr(tg, "os", os)
+            assert store.read_blob(tg.snapshot_tree(store), "dir/file") == b"nested"
+    finally:
+        for fd in opened:
+            if fd not in closed:
+                os.close(fd)
+
+
+def test_ignored_untracked_secret_stays_out_of_snapshot_and_publication(repo, tmp_path):
+    context = make_store(repo)
+    parent = commit(repo, ".env", b"TOKEN=old\n")
+    oracle = tmp_path / "oracle"
+    git(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    for target in (repo, oracle):
+        git(target, "rm", "--cached", "--", ".env")
+        (target / ".gitignore").write_bytes(b".env\n")
+        (target / ".env").write_bytes(b"TOKEN=new-secret\n")
+    git(oracle, "add", "-A")
+    expected = git(oracle, "write-tree").decode().strip()
+    before = shared_bytes(repo)
+    with context as store:
+        for _ in range(2):
+            tree = tg.snapshot_tree(store)
+            assert tree == expected
+            with pytest.raises(tg.GitRefusal) as caught:
+                store.read_blob(tree, ".env")
+            assert caught.value.code == "path_missing"
+        new = tg.commit_tested(store, tree, parent, "safe snapshot", IDENTITY)
+        assert tg.cas_fast_forward(store, "refs/aegis/no-secret", None, new) == "updated"
+        assert tg.cas_fast_forward(store, "refs/aegis/no-secret", None, new) == "already"
+    assert b".env" not in git(repo, "ls-tree", "-r", new)
+    secret = gitsafe.blob_id(b"TOKEN=new-secret\n")
+    assert subprocess.run(["git", "cat-file", "-e", secret], cwd=repo, capture_output=True).returncode != 0
+    assert before["index"] == shared_bytes(repo)["index"]
+
+
+@pytest.mark.parametrize("setting", ["autocrlf", "safecrlf", "filemode", "symlinks", "trustctime"])
+@pytest.mark.parametrize("value", [None, "", "true", "false"], ids=["valueless", "empty", "true", "false"])
+def test_snapshot_git_boolean_config_semantics(repo, tmp_path, setting, value):
+    context = make_store(repo)
+    git(repo, "config", "core.autocrlf", "false")
+    commit(repo, "file.txt", b"one\r\n")
+    oracle = tmp_path / "oracle"
+    git(tmp_path, "-c", "core.autocrlf=false", "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    for target in (repo, oracle):
+        git(target, "config", "core.autocrlf", "false")
+        with (target / ".git/config").open("a") as config:
+            config.write("\n[core]\n\t" + setting + ("" if value is None else " = " + value) + "\n")
+        (target / "file.txt").write_bytes(b"one\r\nchanged\r\n")
+        (target / "file.txt").chmod(0o744)
+    git(oracle, "add", "-A")
+    expected = git(oracle, "write-tree").decode().strip()
+    with context as store:
+        assert tg.snapshot_tree(store) == expected
+        assert tg.snapshot_tree(store) == expected
+
+
+@pytest.mark.parametrize("setting,value", [("autocrlf", "INPUT"), ("safecrlf", "WARN")])
+def test_snapshot_git_special_config_values_are_case_insensitive(repo, tmp_path, setting, value):
+    context = make_store(repo)
+    oracle = tmp_path / "oracle"
+    git(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    for target in (repo, oracle):
+        git(target, "config", "core." + setting, value)
+        (target / "new.txt").write_bytes(b"one\r\n")
+    git(oracle, "add", "-A")
+    with context as store:
+        assert tg.snapshot_tree(store) == git(oracle, "write-tree").decode().strip()
+
+
+def test_snapshot_intent_to_add_has_no_conversion_baseline(repo, tmp_path):
+    context = make_store(repo)
+    oracle = tmp_path / "oracle"
+    git(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    for target in (repo, oracle):
+        (target / ".gitattributes").write_bytes(b"* text=auto\n")
+        (target / "new.txt").write_bytes(b"new\r\ncontent\r\n")
+        git(target, "add", "-N", "--", "new.txt")
+    before = shared_bytes(repo)
+    git(oracle, "add", "-A")
+    with context as store:
+        expected = git(oracle, "write-tree").decode().strip()
+        assert tg.snapshot_tree(store) == expected
+        assert tg.snapshot_tree(store) == expected
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("flag", ["assume-unchanged", "skip-worktree"])
+def test_snapshot_unsupported_index_flags_have_action_and_recover(repo, flag):
+    context = make_store(repo)
+    git(repo, "update-index", "--" + flag, "--", "x")
+    before = shared_bytes(repo)
+    with context as store:
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert caught.value.code == "index_flags_unsupported"
+            assert caught.value.next_action == "Clear assume-unchanged and skip-worktree flags, then retry."
+        assert shared_bytes(repo) == before
+        git(repo, "update-index", "--no-" + flag, "--", "x")
+        assert store.read_blob(tg.snapshot_tree(store), "x") == b"base\n"
+
+
+@pytest.mark.parametrize("stages", [(1, 3), (1,), (3,)])
+def test_snapshot_unmerged_mode_uses_first_available_stage(repo, tmp_path, stages):
+    context = make_store(repo)
+    git(repo, "config", "core.filemode", "false")
+    oid = git(repo, "hash-object", "-w", "--stdin", data=b"old\r\n").strip()
+    records = b"".join(b"100755 " + oid + b" " + str(stage).encode() + b"\tconflict.txt\0" for stage in stages)
+    git(repo, "update-index", "-z", "--index-info", data=records)
+    (repo / ".gitattributes").write_bytes(b"*.txt text=auto\n")
+    (repo / "conflict.txt").write_bytes(b"old\r\nresolved\r\n")
+    oracle = tmp_path / "oracle"
+    git(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    git(oracle, "config", "core.filemode", "false")
+    git(oracle, "hash-object", "-w", "--stdin", data=b"old\r\n")
+    git(oracle, "update-index", "-z", "--index-info", data=records)
+    (oracle / ".gitattributes").write_bytes(b"*.txt text=auto\n")
+    (oracle / "conflict.txt").write_bytes(b"old\r\nresolved\r\n")
+    git(oracle, "add", "-A")
+    expected = git(oracle, "write-tree").decode().strip()
+    with context as store:
+        assert tg.snapshot_tree(store) == expected
+        assert tg.snapshot_tree(store) == expected
+
+
+def test_snapshot_minimal_stat_ignores_ctime_like_git_add(repo, tmp_path):
+    import hashlib
+    context = make_store(repo)
+    git(repo, "config", "core.autocrlf", "false")
+    commit(repo, "file.txt", b"one\r\ntwo\r\n")
+    oracle = tmp_path / "oracle"
+    git(tmp_path, "-c", "core.autocrlf=false", "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    for target in (repo, oracle):
+        git(target, "config", "core.autocrlf", "false")
+        git(target, "config", "core.filemode", "false")
+        git(target, "config", "core.trustctime", "true")
+        git(target, "config", "core.checkStat", "minimal")
+        git(target, "config", "index.version", "2")
+        os.utime(target / "file.txt", (1000000000, 1000000000))
+        git(target, "update-index", "--refresh")
+        (target / ".gitattributes").write_bytes(b"*.txt text\n")
+        git(target, "add", "--", ".gitattributes")
+        git(target, "commit", "-qm", "attributes")
+        # Make a deterministic ctime-only cache mismatch without sleeping.
+        index = target / ".git/index"
+        raw = bytearray(index.read_bytes())
+        assert raw[:8] == b"DIRC\0\0\0\2"
+        count, position = int.from_bytes(raw[8:12], "big"), 12
+        for _ in range(count):
+            end = raw.index(0, position + 62)
+            if raw[position + 62:end] == b"file.txt":
+                raw[position:position + 4] = (1).to_bytes(4, "big")
+            position += ((end + 1 - position + 7) // 8) * 8
+        raw[-20:] = hashlib.sha1(raw[:-20]).digest()
+        index.write_bytes(raw)
+    git(oracle, "add", "-A")
+    with context as store:
+        expected = git(oracle, "write-tree").decode().strip()
+        assert tg.snapshot_tree(store) == expected
+        assert tg.snapshot_tree(store) == expected
+
+
+@pytest.mark.parametrize("native", [False, True], ids=["text", "native"])
+def test_snapshot_and_read_allow_leading_dash_after_option_boundary(repo, tmp_path, native):
+    context = make_store(repo)
+    oracle = tmp_path / "oracle"
+    git(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    for target in (repo, oracle):
+        (target / ".gitattributes").write_bytes(b"*.txt text\n" + (b"*.txt working-tree-encoding=UTF-16LE\n" if native else b""))
+        (target / "-file.txt").write_bytes("one\r\n".encode("utf-16-le") if native else b"one\r\n")
+        git(target, "add", "--", "-file.txt", ".gitattributes")
+        git(target, "commit", "-qm", "dash path")
+        (target / "-file.txt").write_bytes("changed\r\n".encode("utf-16-le") if native else b"changed\r\n")
+    git(oracle, "add", "-A")
+    with context as store:
+        expected = git(oracle, "write-tree").decode().strip()
+        assert tg.snapshot_tree(store) == expected
+        assert store.read_blob(expected, "-file.txt") == b"changed\n"
+        assert tg.snapshot_tree(store) == expected
+
+
+LANE_BYPASSES = {**RUNTIME_BYPASSES,
+    "transport-callback": "gitsafe_run.checked(bad, root, runner=gitsafe.run, error=ValueError, git_error=git_error, timeout=10, stdin=None)",
+    "bare-import": "run = gitsafe.run\nrun(bad, root)",
+    "module-alias": "g = gitsafe\ng.run(bad, root)",
+    "local-import-shadow": "def first():\n g = gitsafe\n g.run(bad, root)\ndef other():\n import math as g\nfirst()",
+    "raw-capture": "gitsafe.run([gitsafe_program, *gitsafe_run.DEFAULT_HARDENING, *bad], root)",
+}
+STATIC_LANE_FORBIDDEN = {
+    "direct-writer-helper": "gitsafe_run.lane_update_ref(root, ref, new, old)",
+    "other-operation-cas": "def snapshot(store, _runner=None):\n _require_runner(_runner)\n return _runner.cas(ref, new, old)",
+    "parameter-module": "def send(g):\n return g.run(argv, root)",
+    "unproved-runner": "def send(runner):\n return runner.run(argv, root)",
+    "rebound-runner": "def send(_runner):\n _require_runner(_runner)\n _runner = supplied\n return _runner.run(argv, root)",
+    "other-facade-helper": "def send(g):\n return g.read_blob(root, rev, path)",
+    "call": "gitsafe.run(['update-ref', ref, oid], root)",
+    "checked-call": "gitsafe.run_checked(['commit'], root)",
+    "symbolic": "gitsafe.run(['symbolic-ref', ref, other], root)",
+    "thread-target": "Thread(target=gitsafe.run, args=(argv, root))",
+    "executor-target": "executor.submit(gitsafe.run, argv, root)",
+    "callback-value": "send(gitsafe.run)",
+    "attribute-local": "runner = gitsafe.run",
+    "transport-callback": "gitsafe_run.update_once(root, ref, new, old, command, runner=gitsafe.run)",
+    "transport-execute": "gitsafe_run.execute(argv, root)",
+    "transport-capture": "gitsafe_run.capture(argv, cwd=root)",
+    "transport-checked": "gitsafe_run.checked(argv, root, runner=gitsafe.run)",
+    "bare-import": "from aegis_core.gitsafe import run as runner\nrunner(argv, root)",
+    "module-alias": "import aegis_core.gitsafe as g\ng.run(argv, root)",
+    "transport-alias": "import aegis_core.gitsafe_run as r\nr.capture(argv, cwd=root)",
+    "factory": "runner = gitsafe.lane_runner(root, scratch)",
+    "constructor": "runner = gitsafe_run.LaneRunner(root, scratch, services)",
+    "constructor-value": "spawn(gitsafe_run.LaneRunner)",
+    "module-forward": "send(gitsafe)",
+}
+
+
+@pytest.mark.parametrize("form", sorted(STATIC_LANE_FORBIDDEN))
+@pytest.mark.parametrize("module", sorted(LANE_MODULES), ids=lambda module: Path(module).stem)
+def test_lane_structure_refuses_every_unrestricted_reference(form, module):
+    from tests.unit.core.test_gitsafe import _run_subcommand_offenders
+    assert _run_subcommand_offenders(module, STATIC_LANE_FORBIDDEN[form])
+
+
+@pytest.mark.parametrize("worker", ["direct", "thread", "executor"])
+@pytest.mark.parametrize("form", sorted(LANE_BYPASSES))
+def test_injected_lane_runner_refuses_rebinding_across_workers(repo, monkeypatch, form, worker):
+    from contextlib import nullcontext
+    context = new_store(repo)
+    oid = git(repo, "rev-parse", "HEAD").decode().strip()
+    @tg._lane_operation
+    def operation(store, *, _runner=None):
+        spawns = []
+        def forbidden(argv, **kwargs):
+            spawns.append(argv)
+            pytest.fail("unapproved command reached Popen")
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": forbidden}))
+        namespace = dict(gitsafe=_runner, gitsafe_run=gitsafe_run, root=repo, oid=oid,
+                         ref="refs/heads/main", bad=["update-ref", "refs/heads/main", oid],
+                         os=os, nullcontext=nullcontext, gitsafe_program=gitsafe.git_executable(), git_error=gitsafe.GitError)
+        def call():
+            with pytest.raises(gitsafe.GitError) as caught:
+                exec(LANE_BYPASSES[form], namespace)
+            assert caught.value.code == "git_custody_refused"
+            assert caught.value.next_action == "Use the lane Git APIs or the CAS fast-forward writer."
+            return caught.value.code
+        if worker == "executor":
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                assert pool.submit(call).result(timeout=5) == "git_custody_refused"
+        elif worker == "thread":
+            result = []
+            thread = Thread(target=lambda: result.append(call()))
+            thread.start()
+            thread.join(timeout=5)
+            assert not thread.is_alive() and result == ["git_custody_refused"]
+        else:
+            call()
+        assert not spawns
+    with context as store:
+        operation(store)
+
+
+@pytest.mark.parametrize("command", ["update-ref", "symbolic-ref", "commit"])
+@pytest.mark.parametrize("worker", ["thread", "executor"])
+def test_lane_runner_forwarded_as_thread_target_remains_closed(repo, monkeypatch, command, worker):
+    context = new_store(repo)
+    @tg._lane_operation
+    def operation(store, *, _runner=None):
+        calls, results = [], []
+        def forbidden(*args, **kwargs):
+            calls.append(args)
+            pytest.fail("ref writer reached Popen")
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": forbidden}))
+        # This local gitsafe name is the explicitly injected object, never the facade.
+        gitsafe = _runner
+        def submit():
+            try:
+                gitsafe.run([command], repo)
+            except AegisError as exc:
+                results.append(exc.code)
+        if worker == "thread":
+            thread = Thread(target=submit)
+            thread.start()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+        else:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                pool.submit(submit).result(timeout=5)
+        assert results == ["git_custody_refused"] and not calls
+    from aegis_core.errors import AegisError
+    with context as store:
+        operation(store)
+
+
+def test_uninjected_lane_function_refuses_before_any_spawn(repo, monkeypatch):
+    context = new_store(repo)
+    with context as store:
+        def forbidden(*args, **kwargs):
+            pytest.fail("uninjected operation started a process")
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": forbidden}))
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree.__wrapped__(store)
+        assert caught.value.code == "lane_runner_required"
+
+
+@pytest.mark.parametrize("args", [["read-tree", "--empty"], ["update-index", "-z", "--index-info"]])
+@pytest.mark.parametrize("index", ["absent", "real", "ref", "private"])
+def test_lane_index_writes_require_exact_private_index(repo, monkeypatch, args, index):
+    context = new_store(repo)
+    @tg._lane_operation
+    def operation(store, *, _runner=None):
+        calls, real = [], subprocess.Popen
+        def record(argv, **kwargs):
+            calls.append(tuple(argv))
+            return real(argv, **kwargs)
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+        env = {} if index == "absent" else {"GIT_INDEX_FILE": str(store.index_path) if index == "real" else str(repo / ".git/refs/heads/main") if index == "ref" else store.env["GIT_INDEX_FILE"]}
+        if index == "absent":
+            assert _runner.run(args, repo, stdin=b"", _env=env).returncode == 0
+            assert len(calls) == 1
+        else:
+            with pytest.raises(gitsafe.GitError) as caught:
+                _runner.run(args, repo, stdin=b"", _env=env)
+            assert caught.value.code == "git_custody_refused" and not calls
+        assert _runner.run(["version"], repo).returncode == 0
+    with context as store:
+        before = shared_bytes(repo)
+        operation(store)
+        assert shared_bytes(repo) == before
+
+
+def test_lane_write_tree_cannot_touch_the_real_index(repo, monkeypatch):
+    context = new_store(repo)
+    @tg._lane_operation
+    def operation(store, *, _runner=None):
+        calls, real = [], subprocess.Popen
+        def record(argv, **kwargs):
+            calls.append(argv)
+            return real(argv, **kwargs)
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+        with pytest.raises(gitsafe.GitError) as caught:
+            _runner.run(["write-tree"], repo, _env={"GIT_INDEX_FILE": str(store.index_path)})
+        assert caught.value.code == "git_custody_refused" and not calls
+    with context as store:
+        operation(store)
+
+
+def test_lane_runner_worker_cas_is_local_and_cannot_lend_a_write_grant(repo, monkeypatch):
+    context = new_store(repo)
+    first = git(repo, "rev-parse", "HEAD").decode().strip()
+    second = commit(repo, "later", b"next\n")
+    @tg._lane_operation
+    def operation(store, *, _runner=None):
+        ready, release = Event(), Event()
+        calls, real = [], subprocess.Popen
+        def record(argv, **kwargs):
+            calls.append(argv)
+            if "update-ref" in argv:
+                with pytest.raises(gitsafe.GitError) as denied:
+                    _runner.run(["update-ref", "--no-deref", "-z", "--stdin"], repo, stdin=b"same shape")
+                assert denied.value.code == "git_custody_refused"
+            return real(argv, **kwargs)
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+        def worker():
+            assert not gitsafe_run.strict_active()
+            ready.set()
+            assert release.wait(5), "worker was not released"
+            assert _runner.run(["version"]).returncode == 0
+            assert _runner.cas("refs/heads/lane/worker", first, None) == "updated"
+            return _runner.cas("refs/heads/lane/worker", second, first)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(worker)
+            try:
+                assert ready.wait(5), "worker did not start"
+                with pytest.raises(gitsafe.GitError) as denied:
+                    _runner.run(["symbolic-ref", "refs/heads/main", "refs/heads/lane/worker"])
+                assert denied.value.code == "git_custody_refused"
+            finally:
+                release.set()
+            assert future.result(timeout=5) == "updated"
+        assert _runner.cas("refs/heads/lane/worker", second, first) == "already"
+        assert sum("update-ref" in argv for argv in calls) == 2
+    with context as store:
+        operation(store)
+
+
+def test_lane_object_request_bounds_precede_custom_iteration(repo, monkeypatch):
+    class Unproved(list):
+        def __iter__(self):
+            pytest.fail("unproved object request was iterated")
+    @tg._lane_operation
+    def operation(store, *, _runner=None):
+        def forbidden(*args, **kwargs):
+            pytest.fail("invalid object request reached Popen")
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": forbidden}))
+        for request in (Unproved(), ["0" * 40] * 20001):
+            with pytest.raises(gitsafe.GitError) as caught:
+                _runner.read_private_objects(repo, request, max_bytes=1024, max_object_bytes=1024,
+                                             env=store.env, scratch=store.scratch)
+            assert caught.value.code == "invalid_object"
+    with new_store(repo) as store:
+        operation(store)
+
+
+def test_lane_runner_cannot_be_supplied_by_a_public_caller(repo, monkeypatch):
+    with new_store(repo) as store:
+        def forbidden(*args, **kwargs):
+            pytest.fail("caller-supplied runner reached Popen")
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": forbidden}))
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.plan_merge(store, "0" * 40, "0" * 40, _runner=object())
+        assert caught.value.code == "lane_runner_required"
+
+
+@pytest.mark.parametrize("encoding,codec", [
+    ("UTF-8", "utf-8"), ("UTF-16", "utf-16"), ("UTF-16LE", "utf-16-le"),
+    ("UTF-16BE", "utf-16-be"), ("UTF-32", "utf-32"), ("UTF-32LE", "utf-32-le"),
+    ("UTF-32BE", "utf-32-be"), ("ASCII", "ascii"), ("ISO-8859-1", "latin-1"),
+    ("CP1252", "cp1252"), ("SHIFT_JIS", "shift_jis"),
+])
+def test_native_encoding_uses_index_only_attributes_like_git_add(repo, tmp_path, encoding, codec):
+    context = make_store(repo)
+    oracle = tmp_path / "oracle"
+    git(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    for target in (repo, oracle):
+        (target / ".gitattributes").write_bytes(("*.txt text working-tree-encoding=" + encoding + "\n").encode())
+        (target / "!first.txt").write_bytes("one\r\ntwo\r\n".encode(codec))
+        git(target, "add", "--", ".gitattributes", "!first.txt")
+        git(target, "commit", "-qm", "encoded")
+        (target / ".gitattributes").unlink()
+        text = {"ASCII": "changed", "ISO-8859-1": "café", "CP1252": "€ café", "SHIFT_JIS": "日本語ソ"}.get(encoding, "changed é 日本語 😀")
+        (target / "!first.txt").write_bytes((text + "\r\ntwo\r\n").encode(codec))
+    git(oracle, "add", "-A")
+    expected = git(oracle, "write-tree").decode().strip()
+    before = shared_bytes(repo)
+    with context as store:
+        assert tg.snapshot_tree(store) == expected
+        assert store.read_blob(expected, "!first.txt") == (text + "\ntwo\n").encode("utf-8")
+        assert tg.snapshot_tree(store) == expected
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("encoding,payload", [
+    ("UTF-16", b"one\r\n"), ("UTF-16LE", b"\xff\xfeo\0n\0e\0"),
+    ("UTF-16BE", b"\xfe\xff\0o\0n\0e"),
+    ("UTF-32", b"one\r\n"), ("UTF-32LE", b"\xff\xfe\0\0o\0\0\0"),
+    ("UTF-32BE", b"\0\0\xfe\xff\0\0\0o"), ("ASCII", b"\xff"),
+])
+def test_native_encoding_invalid_bom_and_bytes_refuse_then_retry(repo, encoding, payload):
+    context = make_store(repo)
+    (repo / ".gitattributes").write_bytes(("*.txt text working-tree-encoding=" + encoding + "\n").encode())
+    (repo / "bad.txt").write_bytes(payload)
+    assert subprocess.run(["git", "add", "--", "bad.txt"], cwd=repo, capture_output=True).returncode != 0
+    with context as store:
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert caught.value.code in ("conversion_unavailable", "git_failed")
+        codec = {"UTF-16": "utf-16", "UTF-16LE": "utf-16-le", "UTF-16BE": "utf-16-be",
+                 "UTF-32": "utf-32", "UTF-32LE": "utf-32-le", "UTF-32BE": "utf-32-be", "ASCII": "ascii"}[encoding]
+        (repo / "bad.txt").write_bytes("valid\r\n".encode(codec))
+        assert store.read_blob(tg.snapshot_tree(store), "bad.txt") == b"valid\n"
+
+
+@pytest.mark.parametrize("bridge", ["checked", "completed"])
+def test_explicit_lane_transport_bridge_keeps_failed_worker_results_typed(repo, bridge):
+    @tg._lane_operation
+    def operation(store, *, _runner=None):
+        def query():
+            with pytest.raises(gitsafe.GitError) as caught:
+                if bridge == "checked":
+                    gitsafe_run.checked(["cat-file", "blob", "0" * 40], repo, runner=_runner.run,
+                        error=ValueError, git_error=gitsafe.GitError, timeout=10, stdin=None)
+                else:
+                    gitsafe_run.completed(["cat-file", "blob", "0" * 40], repo, runner=_runner.run, error=ValueError)
+            assert caught.value.code == "git_failed"
+            assert "00000000" not in str(caught.value)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(query).result(timeout=5)
+    with new_store(repo) as store:
+        operation(store)
+
+
+def test_stat_clean_file_predating_native_attributes_is_kept_like_git_add(repo, tmp_path):
+    context = make_store(repo)
+    git(repo, "config", "core.autocrlf", "false")
+    commit(repo, "old.txt", b"one\r\ntwo\r\n")
+    oracle = tmp_path / "oracle"
+    git(tmp_path, "-c", "core.autocrlf=false", "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    for target in (repo, oracle):
+        os.utime(target / "old.txt", (1000000000, 1000000000))
+        git(target, "update-index", "--refresh")
+        (target / ".gitattributes").write_bytes(b"*.txt text working-tree-encoding=UTF-16LE\n")
+        git(target, "add", "--", ".gitattributes")
+        git(target, "commit", "-qm", "native attributes without renormalization")
+    git(oracle, "add", "-A")
+    with context as store:
+        expected = git(oracle, "write-tree").decode().strip()
+        assert tg.snapshot_tree(store) == expected
+        assert store.read_blob(expected, "old.txt") == b"one\r\ntwo\r\n"
+
+
+@pytest.mark.parametrize("encoding,codec", [("ISO-8859-1", "latin-1"), ("CP1252", "cp1252"), ("SHIFT_JIS", "shift_jis")])
+def test_native_finite_legacy_codepages_match_git_for_every_valid_unit(repo, tmp_path, encoding, codec):
+    context = make_store(repo)
+    units = [bytes((value,)) for value in range(256)]
+    if codec == "shift_jis":
+        units.extend(bytes((lead, trail)) for lead in (*range(0x81, 0xa0), *range(0xe0, 0xf0)) for trail in range(0x40, 0xfd))
+    valid = []
+    for unit in units:
+        try:
+            if unit.decode(codec).encode(codec) == unit:
+                valid.append(unit)
+        except UnicodeError:
+            pass
+    payload = b"\n".join(valid) + b"\n"
+    oracle = tmp_path / "oracle"
+    git(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    for target in (repo, oracle):
+        (target / ".gitattributes").write_bytes(("*.txt text working-tree-encoding=" + encoding + "\n").encode())
+        (target / "all.txt").write_bytes(payload)
+    git(oracle, "add", "-A")
+    with context as store:
+        expected = git(oracle, "write-tree").decode().strip()
+        assert tg.snapshot_tree(store) == expected
+        assert tg.snapshot_tree(store) == expected
+
+
+@pytest.mark.parametrize("status,payload", [(0, b""), (1, b"filter.secret.clean\0"), (0, b"filter.secret.clean"), (2, b"")])
+def test_lane_filter_observation_is_closed_and_retryable(repo, monkeypatch, status, payload):
+    parent = git(repo, "rev-parse", "HEAD").decode().strip()
+    def invalid(real, args, *rest, **kwargs):
+        if args == ["config", "--null", "--name-only", "--get-regexp", r"^filter\."]:
+            return subprocess.CompletedProcess(args, status, payload, b"")
+        return real(args, *rest, **kwargs)
+    calls, popen = [], subprocess.Popen
+    def record(argv, **kwargs):
+        calls.append(argv)
+        return popen(argv, **kwargs)
+    with new_store(repo) as store:
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+        restore = patch_lane_run(monkeypatch, invalid)
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.plan_merge(store, parent, parent)
+            assert caught.value.code == "merge_unavailable"
+            assert "secret" not in str(caught.value)
+        assert not any("merge-tree" in argv for argv in calls)
+        restore()
+        assert tg.plan_merge(store, parent, parent).status == "clean"
+
+
+@pytest.mark.parametrize("drivers", [50, 80])
+def test_lane_filter_options_deduplicate_and_bound_before_target_spawn(repo, monkeypatch, drivers):
+    parent = git(repo, "rev-parse", "HEAD").decode().strip()
+    config = repo / ".git/config"
+    original = config.read_bytes()
+    with config.open("a") as output:
+        for index in range(drivers):
+            output.write('\n[filter "d%d"]\nclean = forbidden\nsmudge = forbidden\nprocess = forbidden\nrequired = false\n' % index)
+    calls, real = [], subprocess.Popen
+    def record(argv, **kwargs):
+        calls.append(argv)
+        return real(argv, **kwargs)
+    with new_store(repo) as store:
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+        if drivers == 50:
+            assert tg.plan_merge(store, parent, parent).status == "clean"
+            assert len(calls) == 4
+        else:
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.plan_merge(store, parent, parent)
+            assert caught.value.code == "git_custody_refused"
+            assert not any("merge-tree" in argv for argv in calls)
+        config.write_bytes(original)
+        assert tg.plan_merge(store, parent, parent).status == "clean"
+
+
+def test_native_decode_checks_remaining_snapshot_budget_before_utf8_allocation(repo, monkeypatch):
+    import codecs
+    context = make_store(repo)
+    (repo / ".gitattributes").write_bytes(b"*.txt text working-tree-encoding=ISO-8859-1\n")
+    (repo / "!first.txt").write_bytes(b"\xe9" * 8)  # Eight input bytes become sixteen UTF-8 bytes.
+    original_limit = tg.MAX_SNAPSHOT_BYTES
+    class NoAllocation(str):
+        def encode(self, *args, **kwargs):
+            pytest.fail("UTF-8 payload was allocated beyond the remaining snapshot budget")
+    def decoder(name):
+        implementation = codecs.getincrementaldecoder(name)
+        class Observed:
+            def __init__(self):
+                self.decoder = implementation()
+            def decode(self, *args, **kwargs):
+                return NoAllocation(self.decoder.decode(*args, **kwargs))
+        return Observed
+    with context as store:
+        before = shared_bytes(repo)
+        monkeypatch.setattr(tg, "MAX_SNAPSHOT_BYTES", 9)
+        monkeypatch.setattr(team_git_snapshot, "codecs", SimpleNamespace(**{**vars(codecs), "getincrementaldecoder": decoder}))
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree(store)
+        assert caught.value.code == "size_limit"
+        assert shared_bytes(repo) == before
+        monkeypatch.setattr(team_git_snapshot, "codecs", codecs)
+        monkeypatch.setattr(tg, "MAX_SNAPSHOT_BYTES", original_limit)
+        assert store.read_blob(tg.snapshot_tree(store), "!first.txt") == b"\xc3\xa9" * 8
+
+
+def test_snapshot_and_planner_golden_bytes(repo):
+    """Captured on the pre-extraction tree; history is built entirely in this test."""
+    context = make_store(repo)
+    def fixed_git(*args, data=None):
+        return subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
+            "-c", "commit.gpgsign=false", *args], cwd=str(repo), input=data,
+            env={**os.environ, "GIT_AUTHOR_DATE": IDENTITY.date, "GIT_COMMITTER_DATE": IDENTITY.date},
+            capture_output=True, check=True).stdout
+    def fixed_commit(name, data):
+        (repo / name).write_bytes(data)
+        fixed_git("add", "--", name)
+        fixed_git("commit", "-qm", "change " + name)
+        return fixed_git("rev-parse", "HEAD").decode().strip()
+    initial_tree = fixed_git("rev-parse", "HEAD^{tree}").decode().strip()
+    root = fixed_git("commit-tree", initial_tree, data=b"base\n").decode().strip()
+    fixed_git("update-ref", "refs/heads/main", root)
+    fixed_git("checkout", "-qb", "golden-topic")
+    source = fixed_commit("feature", b"feature\n")
+    fixed_git("checkout", "-q", "main")
+    tip = fixed_commit("other", b"other\n")
+    before = shared_bytes(repo)
+    with context as store:
+        snapshot = tg.snapshot_tree(store)
+        merged = tg.plan_merge(store, tip, source)
+        picked = tg.plan_pick(store, tip, (source,), IDENTITY)
+        merge = tg.commit_tested(store, merged.tree, (tip, source), "merge", IDENTITY)
+        reverted = tg.plan_revert(store, merge, merge)
+        actual = {
+            "snapshot": snapshot,
+            "snapshot_blob": store.read_blob(snapshot, "x").hex(),
+            "merge": [merged.status, merged.tree, list(merged.commits), list(merged.conflicts)],
+            "pick": [picked.status, picked.tree, list(picked.commits), list(picked.conflicts)],
+            "pick_commit": store.object(picked.commits[0], "commit").hex(),
+            "commit": merge,
+            "revert": [reverted.status, reverted.tree, list(reverted.commits), list(reverted.conflicts)],
+        }
+        expected = {'commit': 'e7ae790b13bac87c73d5caf95ef21ab1c232feb7',
+         'merge': ['clean', '7ecad3fab41ff45bb35913f238f56b25c11dd98b', [], []],
+         'pick': ['clean',
+                  '7ecad3fab41ff45bb35913f238f56b25c11dd98b',
+                  ['1ef42fc33e0816926d8231115ed5ce68e8c913a2'],
+                  []],
+         'pick_commit': '7472656520376563616433666162343166663435626233353931336632333866353662323563313164643938620a706172656e7420643564653663303963383062393935636563646138336464303966366635643332373830643536630a617574686f72204c616e65203c6c616e65406578616d706c652e636f6d3e2031373030303030303030202b303030300a636f6d6d6974746572204c616e65203c6c616e65406578616d706c652e636f6d3e2031373030303030303030202b303030300a0a6368616e676520666561747572650a0a28636865727279207069636b65642066726f6d20636f6d6d69742032643137663833393264356562316636373130313531613331373134316439646666353865306632290a',
+         'revert': ['clean', '8bf5247e7864759605db9fa80cdf4842cb9d5098', [], []],
+         'snapshot': '8bf5247e7864759605db9fa80cdf4842cb9d5098',
+         'snapshot_blob': '626173650a'}
+        assert actual == expected
+        assert tg.snapshot_tree(store) == snapshot
+        assert tg.plan_pick(store, tip, (source,), IDENTITY) == picked
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("fault,code", [
+    ("config-malformed", "conversion_unavailable"),
+    ("config-oversized", "conversion_unavailable"),
+    ("index-malformed", "conversion_unavailable"),
+    ("index-oversized", "size_limit"),
+    ("external-filter", "conversion_unavailable"),
+    ("invalid-encoding", "conversion_unavailable"),
+])
+def test_snapshot_conversion_refusal_golden_bytes_and_retry(repo, monkeypatch, fault, code):
+    context = make_store(repo)
+    if fault == "external-filter":
+        git(repo, "config", "filter.hostile.clean", "must-never-run")
+    if fault in ("external-filter", "invalid-encoding"):
+        attribute = b"filter=hostile" if fault == "external-filter" else b"working-tree-encoding=unknown"
+        (repo / ".gitattributes").write_bytes(b"x text " + attribute + b"\n")
+        (repo / "x").write_bytes(b"changed\r\n")
+    def damaged(real, args, *rest, **kwargs):
+        result = real(args, *rest, **kwargs)
+        data = result.stdout
+        if "--get-regexp" in args and tg._CONFIG_QUERY in args:
+            if fault == "config-malformed":
+                data = b"core.autocrlf\nhostile\0"
+            elif fault == "config-oversized":
+                data = b"x" * 4097
+        if "ls-files" in args and "--debug" in args:
+            if fault == "index-malformed":
+                data = data.replace(b" 0\t", b" 4\t", 1)
+            elif fault == "index-oversized":
+                data = b"\0" * (tg.MAX_PATHS * 3 + 1)
+        return subprocess.CompletedProcess(result.args, result.returncode, data, result.stderr)
+    before = shared_bytes(repo)
+    with context as store:
+        restore = patch_lane_run(monkeypatch, damaged)
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+                code, "Lane Git operation refused: " + code, None)
+        restore()
+        if fault in ("external-filter", "invalid-encoding"):
+            (repo / ".gitattributes").write_bytes(b"x text\n")
+        assert store.read_blob(tg.snapshot_tree(store), "x") == (
+            b"changed\n" if fault in ("external-filter", "invalid-encoding") else b"base\n")
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("entry,code", [
+    ("object", "invalid_oid"), ("read_blob", "unsafe_path"),
+    ("commit_tested", "invalid_message"), ("cas_fast_forward", "ref_not_allowed"),
+    ("plan_merge", "invalid_oid"), ("plan_pick", "invalid_picks"), ("plan_revert", "invalid_oid"),
+])
+@pytest.mark.parametrize("case", ["malformed", "oversized"])
+def test_public_refusal_golden_bytes(repo, entry, code, case):
+    head = git(repo, "rev-parse", "HEAD").decode().strip()
+    tree = git(repo, "rev-parse", "HEAD^{tree}").decode().strip()
+    oid = None if case == "malformed" else "a" * 65
+    path = "../hostile" if case == "malformed" else "x" * (tg.MAX_PATH_BYTES + 1)
+    message = None if case == "malformed" else "x" * (tg.MAX_MESSAGE_BYTES + 1)
+    ref = "refs/heads/main" if case == "malformed" else "refs/heads/lane/" + "x" * 241
+    sources = None if case == "malformed" else [head] * (tg.MAX_PICKS + 1)
+    before = shared_bytes(repo)
+    with new_store(repo) as store:
+        operations = {
+            "object": lambda: store.object(oid, "commit"),
+            "read_blob": lambda: store.read_blob(tree, path),
+            "commit_tested": lambda: tg.commit_tested(store, tree, head, message, IDENTITY),
+            "cas_fast_forward": lambda: tg.cas_fast_forward(store, ref, head, head),
+            "plan_merge": lambda: tg.plan_merge(store, oid, head),
+            "plan_pick": lambda: tg.plan_pick(store, head, sources, IDENTITY),
+            "plan_revert": lambda: tg.plan_revert(store, head, oid),
+        }
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                operations[entry]()
+            assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+                code, "Lane Git operation refused: " + code, None)
+        assert store.object(head, "commit").startswith(b"tree ")
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("attack", ["bom-rewrite", "rewrite", "directory-swap", "ancestor-transient"])
+def test_snapshot_attribute_context_matches_captured_bytes_or_refuses(repo, tmp_path, monkeypatch, attack):
+    context = make_store(repo)
+    folder = repo / "nested/deep"
+    folder.mkdir(parents=True)
+    attr = repo / (".gitattributes" if attack == "bom-rewrite" else "nested/.gitattributes")
+    original = (b"\xef\xbb\xbf[attr]quiet text\n*.bin quiet\n" if attack == "bom-rewrite"
+                else b"*.bin text\n")
+    attr.write_bytes(original)
+    (folder / "sample.bin").write_bytes(b"one\r\n")
+    held, substitute = tmp_path / "held", tmp_path / "substitute"
+    substitute.mkdir()
+    (substitute / ".gitattributes").write_bytes(b"*.bin -text\n")
+    def race(real, args, *rest, **kwargs):
+        if args[:1] != ["check-attr"] or "--cached" in args:
+            return real(args, *rest, **kwargs)
+        if attack == "directory-swap":
+            (repo / "nested").rename(held)
+            substitute.rename(repo / "nested")
+        elif attack == "ancestor-transient":
+            (folder / ".gitattributes").write_bytes(b"*.bin -text\n")
+        try:
+            result = real(args, *rest, **kwargs)
+        finally:
+            if attack == "directory-swap":
+                (repo / "nested").rename(substitute)
+                held.rename(repo / "nested")
+            elif attack == "ancestor-transient":
+                (folder / ".gitattributes").unlink()
+        if attack in ("bom-rewrite", "rewrite"):
+            attr.write_bytes(b"*.bin -text\n")
+        return result
+    before = shared_bytes(repo)
+    with context as store:
+        restore = patch_lane_run(monkeypatch, race)
+        for _ in range(2):
+            attr.write_bytes(original)
+            try:
+                tree = tg.snapshot_tree(store)
+            except tg.GitRefusal as exc:
+                assert (exc.code, str(exc), exc.next_action) == (
+                    "conversion_unavailable", "Lane Git operation refused: conversion_unavailable", None)
+            else:
+                assert store.read_blob(tree, "nested/deep/sample.bin") == b"one\n"
+                assert store.read_blob(tree, attr.relative_to(repo).as_posix()) == original
+        restore()
+        attr.write_bytes(b"*.bin text\n")
+        assert store.read_blob(tg.snapshot_tree(store), "nested/deep/sample.bin") == b"one\n"
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("layout", ["depth20", "prefix-siblings", "control-siblings"])
+def test_snapshot_attribute_candidate_directory_opens_are_linear(repo, monkeypatch, filter_home, layout):
+    context = make_store(repo)
+    run = filter_git(filter_home)
+    depth = 20
+    names = (["/".join(["deep"] * depth) + "/sample.bin"] if layout == "depth20"
+             else ["a/z/sample.bin", "a-/sample.bin"])
+    if layout == "control-siblings":
+        names.insert(0, "\x01a/z/sample.bin")
+    directories = set()
+    for name in names:
+        payload = repo / name
+        payload.parent.mkdir(parents=True, exist_ok=True)
+        payload.write_bytes(b"one\r\n")
+        parts = name.split("/")[:-1]
+        directories.update("/".join(parts[:index]) for index in range(1, len(parts) + 1))
+    run(repo, "config", "--file", str(repo / ".git/config"), "filter.lfs.required", "false")
+    opened = []
+    def record(path, flags, *args, **kwargs):
+        if kwargs.get("dir_fd") is not None and flags & os.O_DIRECTORY:
+            opened.append(path)
+        return os.open(path, flags, *args, **kwargs)
+    process_os = SimpleNamespace(**{**vars(os), "open": record,
+        "supports_dir_fd": os.supports_dir_fd | {record}})
+    before = shared_bytes(repo)
+    with context as store:
+        monkeypatch.setattr(tg, "os", process_os)
+        for _ in range(2):
+            opened.clear()
+            assert store.read_blob(tg.snapshot_tree(store), names[-1]) == b"one\r\n"
+            # One traversal reads the payload; one opens each attribute directory.
+            assert len(opened) <= sum(name.count("/") for name in names) + len(directories)
+    assert shared_bytes(repo) == before
+
+
+def test_snapshot_attribute_metadata_limit_precedes_source_open_and_retries(repo, monkeypatch):
+    context = make_store(repo)
+    git(repo, "read-tree", "--empty")
+    (repo / "nested").mkdir()
+    (repo / ".gitignore").write_bytes(b".gitattributes\n")
+    (repo / ".gitattributes").write_bytes(b"# root\n")
+    (repo / "nested/.gitattributes").write_bytes(b"# nested\n")
+    (repo / "nested/sample.bin").write_bytes(b"one\r\n")
+    frame = len(b"100644 ") + 64 + len(b"\t\0")
+    budget = sum(len(path) + frame for path in (b".gitattributes", b"nested/.gitattributes"))
+    calls = []
+    def record(path, *args, **kwargs):
+        if path == ".gitattributes":
+            calls.append(path)
+        return os.open(path, *args, **kwargs)
+    process_os = SimpleNamespace(**{**vars(os), "open": record,
+        "supports_dir_fd": os.supports_dir_fd | {record}})
+    before = shared_bytes(repo)
+    with context as store:
+        monkeypatch.setattr(tg, "os", process_os)
+        monkeypatch.setattr(tg, "MAX_RESPONSE_BYTES", budget - 1)
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree(store)
+        assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+            "size_limit", "Lane Git operation refused: size_limit", None)
+        assert calls == []
+        monkeypatch.setattr(tg, "MAX_RESPONSE_BYTES", budget)
+        tree = tg.snapshot_tree(store)
+        assert calls == [".gitattributes", ".gitattributes"]
+        assert store.read_blob(tree, "nested/sample.bin") == b"one\r\n"
+    assert shared_bytes(repo) == before
+
+
+def test_snapshot_attribute_alias_stamp_disagreement_refuses_without_drivers(repo, monkeypatch, filter_home):
+    context = make_store(repo)
+    first, second = b"*.bin text\n", b"*.bin -text\n"
+    width = max(len(first), len(second))
+    first, second = first.ljust(width, b"\n"), second.ljust(width, b"\n")
+    attr = repo / ".GitAttributes"
+    attr.write_bytes(first)
+    observed = attr.stat()
+    identity = observed.st_dev, observed.st_ino
+    (repo / "sample.bin").write_bytes(b"one\r\n")
+    reads, before = {}, shared_bytes(repo)
+    def rewrite():
+        attr.write_bytes(second)
+    with context as store:
+        alias_snapshot_os(monkeypatch, {".gitattributes": ".GitAttributes"}, reads,
+            after_fixed_stat=rewrite, unchanged_stamp=observed)
+        descriptors = set(os.listdir("/proc/self/fd")) if Path("/proc/self/fd").is_dir() else None
+        for _ in range(2):
+            attr.write_bytes(first)
+            reads.clear()
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+                "conversion_unavailable", "Lane Git operation refused: conversion_unavailable", None)
+            assert reads[identity] == 2 * width
+            if descriptors is not None:
+                assert set(os.listdir("/proc/self/fd")) == descriptors
+        attr.write_bytes(first)
+        reads.clear()
+        alias_snapshot_os(monkeypatch, {".gitattributes": ".GitAttributes"}, reads)
+        tree = tg.snapshot_tree(store)
+        assert reads[identity] == 2 * width
+        assert store.read_blob(tree, "sample.bin") == b"one\n"
+        assert store.read_blob(tree, ".GitAttributes") == first
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("failure", [errno.ENOENT, errno.ENOTDIR, errno.EACCES, errno.ELOOP],
+                         ids=["missing", "not-directory", "unreadable", "symlink-loop"])
+def test_snapshot_attribute_directory_errors_close_and_retry(repo, monkeypatch, filter_home, failure):
+    context = make_store(repo)
+    run = filter_git(filter_home)
+    (repo / "nested").mkdir()
+    (repo / "nested/sample.bin").write_bytes(b"one\r\n")
+    run(repo, "config", "--file", str(repo / ".git/config"), "filter.lfs.required", "false")
+    calls, opened = [], set()
+    def damaged(path, flags, *args, **kwargs):
+        if path == "nested" and flags & os.O_DIRECTORY:
+            calls.append(path)
+            if len(calls) == 1:
+                raise OSError(failure, "private input never echoed")
+        fd = os.open(path, flags, *args, **kwargs)
+        opened.add(fd)
+        return fd
+    def close(fd):
+        os.close(fd)
+        opened.remove(fd)
+    process_os = SimpleNamespace(**{**vars(os), "open": damaged, "close": close,
+        "supports_dir_fd": os.supports_dir_fd | {damaged}})
+    before = shared_bytes(repo)
+    with context as store:
+        monkeypatch.setattr(tg, "os", process_os)
+        if failure in (errno.ENOENT, errno.ENOTDIR):
+            assert store.read_blob(tg.snapshot_tree(store), "nested/sample.bin") == b"one\r\n"
+        else:
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+                "conversion_unavailable", "Lane Git operation refused: conversion_unavailable", None)
+        assert len(calls) == (2 if failure in (errno.ENOENT, errno.ENOTDIR) else 1) and not opened
+        assert store.read_blob(tg.snapshot_tree(store), "nested/sample.bin") == b"one\r\n"
+        assert not opened
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("version", [b"git version 2.39.5\n", b"unrecognized\n", b"x" * 257],
+                         ids=["old", "malformed", "oversized"])
+def test_snapshot_source_version_refuses_before_capture_and_retries(repo, monkeypatch, version):
+    context = make_store(repo)
+    queries = []
+    def old(real, args, *rest, **kwargs):
+        if args == ["version"]:
+            return subprocess.CompletedProcess(args, 0, version, b"")
+        if args[:1] == ["check-attr"]:
+            queries.append(args)
+        return real(args, *rest, **kwargs)
+    before = shared_bytes(repo)
+    with context as store:
+        restore = patch_lane_run(monkeypatch, old)
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+                "conversion_unavailable", "Lane Git operation refused: conversion_unavailable",
+                "Install Git 2.40 or newer, then retry the snapshot.")
+        assert queries == []
+        restore()
+        assert store.read_blob(tg.snapshot_tree(store), "x") == b"base\n"
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("fault", ["none", "short", "option", "upper", "extra", "attrs", "cached", "real-index", "other-command-config"])
+def test_snapshot_source_query_closed_grammar_and_environment(repo, monkeypatch, fault):
+    context = make_store(repo)
+    tree = git(repo, "rev-parse", "HEAD^{tree}").decode().strip()
+    names = ["filter", "text", "eol", "ident", "working-tree-encoding", "crlf"]
+    args = ["check-attr", "-z", "--stdin", "--source", tree, *names]
+    malformed = list(args)
+    if fault == "short":
+        malformed[4] = tree[:12]
+    elif fault == "option":
+        malformed[4] = "--cached"
+    elif fault == "upper":
+        malformed[4] = "A" * 40
+    elif fault == "extra":
+        malformed.append("x")
+    elif fault == "attrs":
+        malformed[-1] = "arbitrary"
+    elif fault == "cached":
+        malformed[3] = "--cached"
+    calls, real = [], subprocess.Popen
+    def record(argv, **kwargs):
+        calls.append((tuple(argv), dict(kwargs["env"])))
+        return real(argv, **kwargs)
+    with context as store:
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+        if fault != "none":
+            with pytest.raises(tg.GitRefusal) as caught:
+                request = ["version"] if fault == "other-command-config" else malformed
+                options = ("-c", "core.attributesFile=") if fault == "other-command-config" else ()
+                store._run(request, stdin=b"x\0", real_index=fault == "real-index", options=options)
+            assert caught.value.code == "git_custody_refused" and calls == []
+        result = store._run(args, stdin=b"x\0")
+        assert result.stdout == b"".join(b"x\0" + name.encode() + b"\0unspecified\0" for name in names)
+        assert len(calls) == 1
+        argv, env = calls[0]
+        assert "core.attributesFile=" in argv and env["GIT_ATTR_NOSYSTEM"] == "1"
+        assert env["GIT_INDEX_FILE"] == str(store.scratch / "index")
+
+
+def test_snapshot_attribute_policy_requires_source_tree():
+    names = ("filter", "text", "eol", "ident", "working-tree-encoding", "crlf")
+    assert not gitsafe_policy.read_shape(("check-attr", "-z", "--stdin", *names))
+    assert gitsafe_policy.read_shape(("check-attr", "-z", "--stdin", "--source", "a" * 40, *names))
+
+
+@pytest.mark.parametrize("phase", ["version", "check-attr", "filters"])
+@pytest.mark.parametrize("failure", ["os-error", "git_failed", "git_timeout", "git_output_limit", "git_cleanup_failed"])
+def test_snapshot_attribute_observation_failure_refuses_and_retries(repo, monkeypatch, phase, failure):
+    context = make_store(repo)
+    def failed(real, args, *rest, **kwargs):
+        if args[:1] == [phase] or phase == "filters" and args[-1:] == [r"^filter\."]:
+            if failure == "os-error":
+                raise OSError(errno.EACCES, "private token=never-echo")
+            raise gitsafe.GitError("private token=never-echo", code=failure)
+        return real(args, *rest, **kwargs)
+    before = shared_bytes(repo)
+    with context as store:
+        restore = patch_lane_run(monkeypatch, failed)
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+                "conversion_unavailable", "Lane Git operation refused: conversion_unavailable", None)
+        restore()
+        assert store.read_blob(tg.snapshot_tree(store), "x") == b"base\n"
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("placement", ["listed", "ignored", "index-fallback"])
+@pytest.mark.parametrize("info_override", [False, True])
+def test_snapshot_source_tree_is_exact_and_user_attributes_are_inert(repo, monkeypatch, filter_home, placement, info_override):
+    context = make_store(repo)
+    run = filter_git(filter_home)
+    (repo / "nested").mkdir()
+    root, nested = b"*.bin text\r\n# preserve source bytes\r\n", b"*.bin text eol=lf\n"
+    (repo / ".gitattributes").write_bytes(root)
+    (repo / "nested/.gitattributes").write_bytes(nested)
+    (repo / "nested/sample.bin").write_bytes(b"one\r\n")
+    (repo / "external.txt").write_bytes(b"user source must be inert\r\n")
+    external = filter_home / "attributes"
+    external.write_bytes(b"*.txt text\n")
+    run(repo, "config", "--file", str(repo / ".git/config"), "core.attributesFile", str(external))
+    if placement == "ignored":
+        (repo / ".gitignore").write_bytes(b".gitattributes\n")
+    elif placement == "index-fallback":
+        run(repo, "add", "--", "nested/.gitattributes")
+        (repo / "nested/.gitattributes").unlink()
+    if info_override:
+        (repo / ".git/info/attributes").write_bytes(b"*.bin -text\n")
+    queries = []
+    def source(real, args, *rest, **kwargs):
+        if args[:1] == ["check-attr"]:
+            assert args[:4] == ["check-attr", "-z", "--stdin", "--source"]
+            assert kwargs.get("real_index") is False
+            queries.append(args[4])
+        return real(args, *rest, **kwargs)
+    before = shared_bytes(repo)
+    with context as store:
+        patch_lane_run(monkeypatch, source)
+        for _ in range(2):
+            tree = tg.snapshot_tree(store)
+            assert store.read_blob(tree, "nested/sample.bin") == (b"one\r\n" if info_override else b"one\n")
+            assert store.read_blob(tree, "external.txt") == b"user source must be inert\r\n"
+            source_tree = queries[-2] if placement == "index-fallback" else queries[-1]
+            rows = store._run(["ls-tree", "-r", source_tree]).stdout.splitlines()
+            assert [row.partition(b"\t")[2] for row in rows] == [b".gitattributes", b"nested/.gitattributes"]
+            assert store.read_blob(source_tree, ".gitattributes") == root
+            assert store.read_blob(source_tree, "nested/.gitattributes") == nested
+            if placement == "index-fallback":
+                rows = store._run(["ls-tree", "-r", queries[-1]]).stdout.splitlines()
+                assert [row.partition(b"\t")[2] for row in rows] == [b".gitattributes"]
+                assert store.read_blob(queries[-1], ".gitattributes") == root
+        assert len(queries) == (4 if placement == "index-fallback" else 2)
+        assert len(set(queries)) == (2 if placement == "index-fallback" else 1)
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("failure", ["unsupported", "malformed", "wrong-attribute"])
+def test_snapshot_source_protocol_refuses_and_retries(repo, monkeypatch, failure):
+    context = make_store(repo)
+    def broken(real, args, *rest, **kwargs):
+        if args[:1] != ["check-attr"]:
+            return real(args, *rest, **kwargs)
+        if failure == "unsupported":
+            return subprocess.CompletedProcess(args, 129, b"", b"private token=never-echo")
+        result = real(args, *rest, **kwargs)
+        data = b"x\0" if failure == "malformed" else result.stdout.replace(b"\0text\0", b"\0other\0")
+        return subprocess.CompletedProcess(result.args, 0, data, result.stderr)
+    before = shared_bytes(repo)
+    with context as store:
+        restore = patch_lane_run(monkeypatch, broken)
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+                "conversion_unavailable", "Lane Git operation refused: conversion_unavailable", None)
+        restore()
+        assert store.read_blob(tg.snapshot_tree(store), "x") == b"base\n"
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("source", ["listed", "ignored", "index-fallback"])
+@pytest.mark.parametrize("attributes", [
+    b"#\0\n*.bin text\n",
+    b"# comment\0\n*.bin text eol=lf\n",
+    b"*.bin -text\n#\0\n*.bin text\n",
+    b"*.bin text\0",
+    b"*.bin text".ljust(2047, b" ") + b"\r\n",
+    b"*.bin text".ljust(2048, b" ") + b"\n",
+    b"*.bin text".ljust(2049, b" "),
+], ids=["nul-comment", "argon-nul-comment", "nul-later-line", "nul-terminal", "crlf-2047", "lf-2048", "unterminated-2049"])
+def test_snapshot_attribute_parser_disagreements_refuse_and_retry(repo, monkeypatch, filter_home, source, attributes):
+    context = make_store(repo)
+    git(repo, "config", "core.autocrlf", "false")
+    attr = repo / ".gitattributes"
+    attr.write_bytes(attributes)
+    (repo / "sample.bin").write_bytes(b"one\r\n")
+    if source == "ignored":
+        (repo / ".gitignore").write_bytes(b".gitattributes\n")
+    elif source == "index-fallback":
+        git(repo, "add", "--", ".gitattributes")
+        attr.unlink()
+    before = shared_bytes(repo)
+    with context as store:
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+                "conversion_unavailable", "Lane Git operation refused: conversion_unavailable", None)
+            assert shared_bytes(repo) == before
+        attr.write_bytes(b"*.bin text\n")
+        if source == "index-fallback":
+            git(repo, "add", "--", ".gitattributes")
+        retry_before = shared_bytes(repo)
+        assert store.read_blob(tg.snapshot_tree(store), "sample.bin") == b"one\n"
+    assert shared_bytes(repo) == retry_before
+
+
+@pytest.mark.parametrize("attributes", [
+    b"*.bin text".ljust(2047, b" ") + b"\n",
+    b"*.bin text".ljust(2046, b" ") + b"\r\n",
+    b"*.bin text".ljust(2046, b" ") + b"\r",
+], ids=["lf-2047", "crlf-2046", "terminal-cr-2046"])
+def test_snapshot_attribute_line_boundary_matches_git_add(repo, tmp_path, filter_home, attributes):
+    context = make_store(repo)
+    oracle = tmp_path / "oracle"
+    git(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    for target in (repo, oracle):
+        git(target, "config", "core.autocrlf", "false")
+        (target / ".gitattributes").write_bytes(attributes)
+        (target / "sample.bin").write_bytes(b"one\r\n")
+    git(oracle, "add", "-A")
+    expected = git(oracle, "write-tree").decode().strip()
+    before = shared_bytes(repo)
+    with context as store:
+        for _ in range(2):
+            tree = tg.snapshot_tree(store)
+            assert tree == expected
+            assert store.read_blob(tree, "sample.bin") == b"one\n"
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("prefix", ["", "nested/"], ids=["root", "nested"])
+@pytest.mark.parametrize("state", ["untracked", "tracked-after", "tracked-before"])
+def test_snapshot_deleted_attribute_context_matches_git_add_or_refuses(repo, tmp_path, filter_home, prefix, state):
+    context = make_store(repo)
+    oracle = tmp_path / "oracle"
+    git(tmp_path, "clone", "-q", "--no-hardlinks", str(repo), str(oracle))
+    name = prefix + ("!sample.bin" if state == "tracked-before" else "sample.bin")
+    attr_name = prefix + ".gitattributes"
+    for target in (repo, oracle):
+        (target / "nested").mkdir()
+        git(target, "config", "core.autocrlf", "false")
+        if prefix:
+            (target / ".gitattributes").write_bytes(b"*.bin text\n")
+        (target / attr_name).write_bytes(b"*.bin -text\n" if prefix else b"*.bin text\n")
+        if state != "untracked":
+            (target / name).write_bytes(b"initial\r\n")
+        git(target, "add", "-A")
+        (target / attr_name).unlink()
+        (target / name).write_bytes(b"changed\r\n")
+    git(oracle, "add", "-A")
+    expected = git(oracle, "write-tree").decode().strip()
+    before = shared_bytes(repo)
+    with context as store:
+        for _ in range(2):
+            try:
+                tree = tg.snapshot_tree(store)
+            except tg.GitRefusal as exc:
+                assert state != "tracked-before"
+                assert (exc.code, str(exc), exc.next_action) == (
+                    "conversion_unavailable", "Lane Git operation refused: conversion_unavailable", None)
+            else:
+                assert tree == expected
+            assert shared_bytes(repo) == before
+        (repo / attr_name).write_bytes(b"*.bin text\n")
+        assert store.read_blob(tg.snapshot_tree(store), name) == b"changed\n"
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+def test_snapshot_attribute_mid_open_disappearance_refuses_and_retries(repo, monkeypatch, filter_home, indexed):
+    context = make_store(repo)
+    attr = repo / ".gitattributes"
+    attr.write_bytes(b"*.bin text\n")
+    if indexed:
+        git(repo, "add", "--", ".gitattributes")
+    (repo / "sample.bin").write_bytes(b"one\r\n")
+    def disappear(path, *args, **kwargs):
+        if path == ".gitattributes":
+            attr.unlink()
+        return os.open(path, *args, **kwargs)
+    process_os = SimpleNamespace(**{**vars(os), "open": disappear,
+        "supports_dir_fd": os.supports_dir_fd | {disappear}})
+    before = shared_bytes(repo)
+    with context as store:
+        monkeypatch.setattr(tg, "os", process_os)
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree(store)
+        assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+            "conversion_unavailable", "Lane Git operation refused: conversion_unavailable", None)
+        monkeypatch.setattr(tg, "os", os)
+        attr.write_bytes(b"*.bin text\n")
+        assert store.read_blob(tg.snapshot_tree(store), "sample.bin") == b"one\n"
+    assert shared_bytes(repo) == before
+
+
+def test_snapshot_listed_and_unlisted_ancestor_alias_charge_physical_source_once(repo, monkeypatch, filter_home):
+    context = make_store(repo)
+    folder = repo / "Nested"
+    folder.mkdir()
+    attributes = b"# ordinary attributes\n" * 32
+    attr = folder / ".gitattributes"
+    attr.write_bytes(attributes)
+    payload = b"x" * len(attributes)
+    names = ["one.bin", "two.bin"] + ["p%d.bin" % index for index in range(5)]
+    for name in names:
+        (folder / name).write_bytes(payload)
+    for data in (attributes, payload):
+        git(repo, "hash-object", "-w", "--stdin", "--no-filters", data=data)
+    paths = ["nested/.gitattributes", "nested/one.bin", "Nested/two.bin"] + ["nested/" + name for name in names[2:]]
+    def listing(real, args, *rest, **kwargs):
+        result = real(args, *rest, **kwargs)
+        if args[:2] == ["ls-files", "--cached"]:
+            return subprocess.CompletedProcess(result.args, result.returncode,
+                b"x\0" + b"".join(path.encode() + b"\0" for path in paths), result.stderr)
+        return result
+    observed = attr.stat()
+    identity = observed.st_dev, observed.st_ino
+    budget = len(attributes) + len(names) * len(payload) + len(b"base\n")
+    reads, before = {}, shared_bytes(repo)
+    with context as store:
+        alias_snapshot_os(monkeypatch, {"nested": "Nested"}, reads)
+        patch_lane_run(monkeypatch, listing)
+        monkeypatch.setattr(tg, "MAX_SNAPSHOT_BYTES", budget - 1)
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree(store)
+        assert caught.value.code == "size_limit"
+        monkeypatch.setattr(tg, "MAX_SNAPSHOT_BYTES", budget)
+        reads.clear()
+        tree = tg.snapshot_tree(store)
+        assert reads[identity] == 2 * len(attributes)
+        for path in paths[1:]:
+            assert store.read_blob(tree, path) == payload
+    assert shared_bytes(repo) == before
+
+
+def stage_missing_attribute_sources(repo, names, data):
+    for name in names:
+        path = repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    oid = git(repo, "hash-object", "-w", "--stdin", "--no-filters", data=data).strip()
+    records = b"".join(b"100644 " + oid + b"\t" + name.encode() + b"\n" for name in names)
+    git(repo, "update-index", "--index-info", data=records)
+    for name in names:
+        (repo / name).unlink()
+    return oid.decode("ascii")
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_snapshot_deleted_attribute_fallback_uses_one_deduplicated_batch(repo, monkeypatch, filter_home, configured):
+    context = make_store(repo)
+    names = ["d%d/.gitattributes" % index for index in range(1000)]
+    oid = stage_missing_attribute_sources(repo, names, b"# ordinary source\n")
+    git(repo, "hash-object", "-w", "--stdin", "--no-filters", data=b"one\r\n")
+    if configured:
+        git(repo, "config", "filter.unused.required", "false")
+    calls, requests, counts, active, real = [], [], [], [False], subprocess.Popen
+    def record(argv, **kwargs):
+        if active[0]:
+            calls.append(tuple(argv))
+            if "cat-file" in argv and argv[argv.index("cat-file") + 1] == "blob":
+                pytest.fail("index attribute fallback must use one bounded batch, not per-path cat-file")
+        return real(argv, **kwargs)
+    def batch(real, *args, **kwargs):
+        requests.append(tuple(args[1]))
+        return real(*args, **kwargs)
+    with context as store:
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+        patch_lane_objects(monkeypatch, batch)
+        for count in (1, 1000):
+            git(repo, "read-tree", "--empty")
+            records = b"".join(b"100644 " + oid.encode() + b"\t" + name.encode() + b"\n" for name in names[:count])
+            git(repo, "update-index", "--index-info", data=records)
+            (repo / "d0/sample.bin").write_bytes(b"one\r\n")
+            before = shared_bytes(repo)
+            for _ in range(2):
+                calls.clear()
+                requests.clear()
+                active[0] = True
+                try:
+                    tree = tg.snapshot_tree(store)
+                finally:
+                    active[0] = False
+                assert requests == [(oid,)]
+                assert sum("--batch" in argv for argv in calls) == 1
+                counts.append((count, len(calls)))
+                assert shared_bytes(repo) == before
+                assert store.read_blob(tree, "d0/sample.bin") == b"one\r\n"
+    assert max(value for count, value in counts if count == 1000) <= max(value for count, value in counts if count == 1) + 1
+    print("GM5AC R3 fallback native processes", counts)
+
+
+def test_snapshot_attribute_file_cap_refuses_at_boundary_and_retries(repo, monkeypatch, filter_home):
+    context = make_store(repo)
+    data = b"*.bin text\n"
+    (repo / ".gitattributes").write_bytes(data)
+    (repo / "sample.bin").write_bytes(b"one\r\n")
+    before = shared_bytes(repo)
+    with context as store:
+        monkeypatch.setattr(team_git_snapshot, "MAX_ATTRIBUTE_FILE_BYTES", len(data))
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree(store)
+        assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+            "conversion_unavailable", "Lane Git operation refused: conversion_unavailable", None)
+        monkeypatch.setattr(team_git_snapshot, "MAX_ATTRIBUTE_FILE_BYTES", len(data) + 1)
+        assert store.read_blob(tg.snapshot_tree(store), "sample.bin") == b"one\n"
+    assert shared_bytes(repo) == before
+
+
+def test_snapshot_fallback_batch_preserves_per_path_budget_and_retry(repo, monkeypatch, filter_home):
+    context = make_store(repo)
+    data = b"# ordinary source\n"
+    stage_missing_attribute_sources(repo, ["a/.gitattributes", "b/.gitattributes"], data)
+    (repo / "a/sample.bin").write_bytes(b"one\r\n")
+    git(repo, "hash-object", "-w", "--stdin", "--no-filters", data=b"one\r\n")
+    before = shared_bytes(repo)
+    with context as store:
+        monkeypatch.setattr(tg, "MAX_SNAPSHOT_BYTES", 2 * len(data) - 1)
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.snapshot_tree(store)
+        assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+            "size_limit", "Lane Git operation refused: size_limit", None)
+        budget = 2 * len(data) + len(b"one\r\n") + len(b"base\n")
+        monkeypatch.setattr(tg, "MAX_SNAPSHOT_BYTES", budget)
+        assert store.read_blob(tg.snapshot_tree(store), "a/sample.bin") == b"one\r\n"
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("fault,code", [
+    ("git_failed", "git_failed"), ("git_timeout", "git_timeout"),
+    ("git_output_limit", "git_output_limit"), ("git_cleanup_failed", "git_cleanup_failed"),
+    ("git_object_limit", "size_limit"), ("missing", "invalid_object"), ("wrong-kind", "invalid_object"),
+])
+def test_snapshot_fallback_batch_failures_are_stable_and_retry(repo, monkeypatch, filter_home, fault, code):
+    context = make_store(repo)
+    oid = stage_missing_attribute_sources(repo, ["nested/.gitattributes"], b"sample.bin text\n")
+    (repo / "nested/sample.bin").write_bytes(b"one\r\n")
+    def fail(real, *args, **kwargs):
+        if fault == "missing":
+            return {}
+        if fault == "wrong-kind":
+            return {oid: ("tree", b"private token=never-echo")}
+        raise gitsafe.GitError("private token=never-echo", code=fault)
+    before = shared_bytes(repo)
+    with context as store:
+        restore = patch_lane_objects(monkeypatch, fail)
+        descriptors = set(os.listdir("/proc/self/fd")) if Path("/proc/self/fd").is_dir() else None
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+                code, "Lane Git operation refused: " + code, None)
+            if descriptors is not None:
+                assert set(os.listdir("/proc/self/fd")) == descriptors
+        restore()
+        (repo / "nested/.gitattributes").write_bytes(b"sample.bin text\n")
+        assert store.read_blob(tg.snapshot_tree(store), "nested/sample.bin") == b"one\n"
+    assert shared_bytes(repo) == before
+
+
+def test_snapshot_fallback_batch_refuses_concurrent_index_change_and_retries(repo, monkeypatch, filter_home):
+    context = make_store(repo)
+    oid = stage_missing_attribute_sources(repo, ["nested/.gitattributes"], b"sample.bin text\n")
+    (repo / "nested/sample.bin").write_bytes(b"one\r\n")
+    entered, release = Event(), Event()
+    def paused(real, *args, **kwargs):
+        result = real(*args, **kwargs)
+        if oid in args[1] and not entered.is_set():
+            entered.set()
+            assert release.wait(5), "fallback batch was never released"
+        return result
+    with context as store, ThreadPoolExecutor(max_workers=1) as pool:
+        restore = patch_lane_objects(monkeypatch, paused)
+        future = pool.submit(tg.snapshot_tree, store)
+        try:
+            assert entered.wait(5), "snapshot never reached fallback batch"
+            git(repo, "read-tree", "--empty")
+            changed = shared_bytes(repo)
+        finally:
+            release.set()
+        with pytest.raises(tg.GitRefusal) as caught:
+            future.result(timeout=5)
+        assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+            "worktree_changed", "Lane Git operation refused: worktree_changed", None)
+        assert shared_bytes(repo) == changed
+        restore()
+        assert store.read_blob(tg.snapshot_tree(store), "nested/sample.bin") == b"one\r\n"
+    assert shared_bytes(repo) == changed
+
+
+def test_snapshot_source_query_supports_sha256_objects(repo, tmp_path):
+    make_store(repo)
+    target = tmp_path / "sha256"
+    target.mkdir()
+    git(target, "init", "-q", "-b", "main", "--object-format=sha256")
+    commit(target, "x", b"base\n")
+    oracle = tmp_path / "oracle"
+    git(tmp_path, "clone", "-q", "--no-hardlinks", str(target), str(oracle))
+    for root in (target, oracle):
+        (root / ".gitattributes").write_bytes(b"*.txt text\n")
+        (root / "sample.txt").write_bytes(b"one\r\n")
+    git(oracle, "add", "-A")
+    expected = git(oracle, "write-tree").decode().strip()
+    before = shared_bytes(target)
+    with make_store(target) as store:
+        for _ in range(2):
+            tree = tg.snapshot_tree(store)
+            assert tree == expected and len(tree) == 64
+            assert store.read_blob(tree, "sample.txt") == b"one\n"
+    assert shared_bytes(target) == before
+
+
+@pytest.mark.parametrize("shape", ["direct", "merge", "repeated"])
+def test_pick_reads_each_source_once_per_operation(repo, monkeypatch, shape):
+    git(repo, "checkout", "-qb", "pick-topic")
+    first = commit(repo, "first", b"first\n")
+    second = commit(repo, "second", b"second\n")
+    git(repo, "checkout", "-q", "main")
+    tip = commit(repo, "other", b"other\n")
+    sources = (first, second) if shape != "repeated" else (first, first)
+    if shape == "merge":
+        git(repo, "merge", "--no-ff", "-qm", "merge topic", second)
+        sources = (git(repo, "rev-parse", "HEAD").decode().strip(),)
+    wanted = set(sources) | ({first, second} if shape == "merge" else set())
+    with new_store(repo) as store:
+        calls, real = [], subprocess.Popen
+        def record(argv, **kwargs):
+            calls.append(tuple(argv))
+            return real(argv, **kwargs)
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+        results = []
+        for _ in range(2):
+            calls.clear()
+            results.append(tg.plan_pick(store, tip, sources, IDENTITY))
+            reads = {oid: sum(argv[-3:] == ("cat-file", "commit", oid) for argv in calls) for oid in wanted}
+            print("GM5D pick", shape, json.dumps({"launches": len(calls), "source_reads": sorted(reads.values())}))
+            assert results[-1].status == "clean" and len(results[-1].commits) == 2
+            assert all(count == 1 for count in reads.values())
+        assert results[0] == results[1]
+
+
+@pytest.mark.parametrize("message", [b"\xff", b"x\0y", b"Aegis-Approve: yes", b"x" * tg.MAX_MESSAGE_BYTES],
+                         ids=["utf8", "nul", "approval", "oversized"])
+@pytest.mark.parametrize("conflict", [False, True])
+def test_pick_cached_message_refusal_stays_after_conflict_and_retries(repo, message, conflict):
+    git(repo, "checkout", "-qb", "message-topic")
+    valid = commit(repo, "x", b"topic\n")
+    raw = git(repo, "cat-file", "commit", valid).split(b"\n\n", 1)[0] + b"\n\n" + message
+    source = git(repo, "hash-object", "-w", "--literally", "-t", "commit", "--stdin", data=raw).decode().strip()
+    git(repo, "checkout", "-q", "main")
+    tip = commit(repo, "x" if conflict else "other", b"main\n")
+    before = shared_bytes(repo)
+    with new_store(repo) as store:
+        for _ in range(2):
+            if conflict:
+                assert tg.plan_pick(store, tip, (source,), IDENTITY) == tg.Plan("conflict", conflicts=("x",))
+            else:
+                with pytest.raises(tg.GitRefusal) as caught:
+                    tg.plan_pick(store, tip, (source,), IDENTITY)
+                assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+                    "invalid_message", "Lane Git operation refused: invalid_message", None)
+        assert tg.plan_pick(store, tip, (valid,), IDENTITY).status == ("conflict" if conflict else "clean")
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("state", ["clean", "dirty", "uncertain"])
+def test_snapshot_stat_shortcut_payload_counts_and_retry(repo, monkeypatch, state):
+    context = make_store(repo)
+    git(repo, "config", "core.autocrlf", "false")
+    os.utime(repo / "x", ns=(1000000000000000000, 1000000000000000000))
+    git(repo, "update-index", "--refresh")
+    if state == "dirty":
+        (repo / "x").write_bytes(b"dirty payload\n")
+    elif state == "uncertain":
+        os.utime(repo / "x", ns=(1000000000000000000, 1000000000000000001))
+    identity = (repo / "x").stat()
+    with context as store:
+        reads, calls, real = [], [], subprocess.Popen
+        def read(fd, size):
+            observed = os.fstat(fd)
+            data = os.read(fd, size)
+            if (observed.st_dev, observed.st_ino) == (identity.st_dev, identity.st_ino):
+                reads.append(len(data))
+            return data
+        def record(argv, **kwargs):
+            calls.append(tuple(argv))
+            return real(argv, **kwargs)
+        monkeypatch.setattr(tg, "os", SimpleNamespace(**{**vars(os), "read": read}))
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": record}))
+        trees = []
+        for _ in range(2):
+            reads.clear()
+            calls.clear()
+            trees.append(tg.snapshot_tree(store))
+            print("GM5D snapshot", state, json.dumps({"launches": len(calls), "payload_reads": len(reads), "payload_bytes": sum(reads)}))
+            assert (len(reads) == 0) == (state == "clean")
+        assert trees[0] == trees[1]
+        assert store.read_blob(trees[0], "x") == (b"dirty payload\n" if state == "dirty" else b"base\n")
+
+
+@pytest.mark.parametrize("confirmation", [False, None], ids=["dirty", "indeterminate"])
+def test_snapshot_stat_skip_disagreement_refuses_and_retries(repo, monkeypatch, confirmation):
+    context = make_store(repo)
+    os.utime(repo / "x", ns=(1000000000000000000, 1000000000000000000))
+    git(repo, "update-index", "--refresh")
+    expected = git(repo, "rev-parse", "HEAD^{tree}").decode().strip()
+    before = shared_bytes(repo)
+    reached, resume, observations = Event(), Event(), []
+    real = team_git_snapshot.index_clean
+    def disagree(*args):
+        observations.append(args[1])
+        reached.set()
+        assert resume.wait(5), "stat-clean confirmation was never released"
+        return confirmation
+    with context as store:
+        monkeypatch.setattr(team_git_snapshot, "index_clean", disagree)
+        for _ in range(2):
+            reached.clear()
+            resume.clear()
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(tg.snapshot_tree, store)
+                try:
+                    assert reached.wait(5), "snapshot never reached stat-clean confirmation"
+                    with pytest.raises(tg.GitRefusal) as busy:
+                        tg.snapshot_tree(store)
+                    assert busy.value.code == "store_busy"
+                finally:
+                    resume.set()
+                with pytest.raises(tg.GitRefusal) as caught:
+                    future.result(timeout=5)
+                assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+                    "worktree_changed", "Lane Git operation refused: worktree_changed", None)
+        assert len(observations) == 2
+        monkeypatch.setattr(team_git_snapshot, "index_clean", real)
+        assert tg.snapshot_tree(store) == expected
+        assert tg.snapshot_tree(store) == expected
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("over_wire", [False, True], ids=["under-wire-budget", "over-wire-budget"])
+def test_snapshot_stat_clean_auto_baseline_boundary(repo, tmp_path, filter_home, over_wire):
+    context = make_store(repo)
+    git(repo, "config", "core.autocrlf", "false")
+    git(repo, "rm", "-q", "x")
+    size = 16777200 if over_wire else 16777140
+    names = [f"file{number}" for number in range(8)]
+    for number, name in enumerate(names):
+        payload = (bytes((65 + number,)) * 2 + b"\r\n") * (size // 4)
+        assert len(payload) == size
+        (repo / name).write_bytes(payload)
+        del payload
+        os.utime(repo / name, ns=(1000000000000000000, 1000000000000000000))
+    git(repo, "add", "--", *names)
+    git(repo, "update-index", "--refresh")
+    (repo / ".gitattributes").write_bytes(b"* text=auto\n")
+    total = size * len(names)
+    wire = total + len(names) * (40 + 34)
+    assert total + len(b"* text=auto\n") < tg.MAX_SNAPSHOT_BYTES
+    assert (wire > tg.MAX_SNAPSHOT_BYTES) == over_wire
+    environment = {**filter_git_env(filter_home), "GIT_INDEX_FILE": str(tmp_path / "oracle-index")}
+    def oracle_tree():
+        shutil.copyfile(repo / ".git" / "index", tmp_path / "oracle-index")
+        git(repo, "add", "-A", env=environment)
+        return git(repo, "write-tree", env=environment).decode().strip()
+    expected = oracle_tree()
+    if over_wire:
+        git(repo, "rm", "--cached", "-q", "--", names[-1], env=environment)
+        recovered = git(repo, "write-tree", env=environment).decode().strip()
+    before = shared_bytes(repo)
+    with context as store:
+        for _ in range(2):
+            if over_wire:
+                with pytest.raises(tg.GitRefusal) as caught:
+                    tg.snapshot_tree(store)
+                assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+                    "git_object_limit", "Lane Git operation refused: git_object_limit", None)
+            else:
+                assert tg.snapshot_tree(store) == expected
+        if over_wire:
+            (repo / names[-1]).unlink()
+            assert tg.snapshot_tree(store) == recovered
+    assert shared_bytes(repo) == before
+    print("GM5D R2 baseline boundary", json.dumps({"over_wire": over_wire, "file_bytes": size,
+        "snapshot_bytes": total + len(b"* text=auto\n"), "wire_bytes": wire}))
+
+
+@pytest.mark.parametrize("fault,code", [
+    ("missing", "invalid_object"), ("malformed", "invalid_object"),
+    ("wrong-kind", "invalid_object"), ("bad-hash", "invalid_object"), ("bad-framing", "invalid_object"),
+    ("object-limit", "git_object_limit"), ("aggregate-limit", "git_object_limit"),
+    ("git_failed", "git_failed"), ("git_timeout", "git_timeout"),
+    ("git_output_limit", "git_output_limit"), ("git_cleanup_failed", "git_cleanup_failed"),
+])
+def test_snapshot_stat_clean_auto_baseline_refusals_and_retry(repo, monkeypatch, filter_home, fault, code):
+    context = make_store(repo)
+    git(repo, "config", "core.autocrlf", "false")
+    names = [f"file{number}" for number in range(9)]
+    for number, name in enumerate(names):
+        (repo / name).write_bytes(("value %d\r\n" % number).encode())
+    git(repo, "add", "--", *names)
+    for name in ["x", *names]:
+        os.utime(repo / name, ns=(1000000000000000000, 1000000000000000000))
+    git(repo, "update-index", "--refresh")
+    (repo / ".gitattributes").write_bytes(b"* text=auto\n")
+    source_oids = {row.split()[1] for row in git(repo, "ls-files", "--stage", "--", *names).splitlines()}
+    calls = []
+    def damaged(real, args, *rest, **kwargs):
+        calls.append(tuple(args))
+        if args == ["cat-file", "--batch"] and fault.startswith("git_"):
+            raise gitsafe.GitError("never echo token=private", code=fault)
+        result = real(args, *rest, **kwargs)
+        data = result.stdout
+        if (args == ["cat-file", "--batch-check"]
+                and set(kwargs.get("stdin", b"").splitlines()) == source_oids):
+            if fault == "malformed":
+                data = b"invalid header\n"
+            elif fault in ("missing", "wrong-kind", "object-limit", "aggregate-limit"):
+                rows = data.splitlines()
+                if fault == "aggregate-limit":
+                    rows = [row.split()[0] + b" blob " + str(tg.MAX_OBJECT_BYTES).encode() for row in rows]
+                else:
+                    oid, _, size = rows[0].split()
+                    rows[0] = (oid + b" missing" if fault == "missing" else
+                               oid + b" tree " + size if fault == "wrong-kind" else
+                               oid + b" blob " + str(tg.MAX_OBJECT_BYTES + 1).encode())
+                data = b"\n".join(rows) + b"\n"
+        elif args == ["cat-file", "--batch"]:
+            if fault == "bad-framing":
+                data = data[:-1]
+            elif fault == "bad-hash":
+                start = data.index(b"\n") + 1
+                data = data[:start] + bytes((data[start] ^ 1,)) + data[start + 1:]
+        return subprocess.CompletedProcess(result.args, result.returncode, data, result.stderr)
+    before = shared_bytes(repo)
+    with context as store:
+        restore = patch_lane_run(monkeypatch, damaged)
+        for _ in range(2):
+            calls.clear()
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+                code, "Lane Git operation refused: " + code, None)
+            # Only the attribute context was built; no payload index is written.
+            assert calls.count(("read-tree", "--empty")) == 1
+            if fault in ("missing", "malformed", "object-limit", "aggregate-limit"):
+                assert ("cat-file", "--batch") not in calls
+        restore()
+        tree = tg.snapshot_tree(store)
+        assert store.read_blob(tree, "file0") == b"value 0\r\n"
+        assert tg.snapshot_tree(store) == tree
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("automatic", [False, True], ids=["stat-shortcut", "auto-read-fallback"])
+def test_snapshot_stat_skip_revalidates_descriptor_and_releases_busy_store(repo, monkeypatch, automatic):
+    context = make_store(repo)
+    if automatic:
+        (repo / ".gitattributes").write_bytes(b"x text=auto\n")
+    os.utime(repo / "x", ns=(1000000000000000000, 1000000000000000000))
+    git(repo, "update-index", "--refresh")
+    identity = (repo / "x").stat()
+    reached, resume, probes = Event(), Event(), []
+    def fstat(fd):
+        observed = os.fstat(fd)
+        if (observed.st_dev, observed.st_ino) == (identity.st_dev, identity.st_ino):
+            probes.append(fd)
+            if len(probes) == 2:
+                reached.set()
+                assert resume.wait(5)
+                return os.fstat(fd)
+        return observed
+    with context as store:
+        monkeypatch.setattr(tg, "os", SimpleNamespace(**{**vars(os), "fstat": fstat}))
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(tg.snapshot_tree, store)
+            try:
+                assert reached.wait(5)
+                with pytest.raises(tg.GitRefusal) as busy:
+                    tg.snapshot_tree(store)
+                assert busy.value.code == "store_busy"
+                (repo / "x").write_bytes(b"concurrent replacement bytes\n")
+            finally:
+                resume.set()
+            with pytest.raises(tg.GitRefusal) as changed:
+                future.result(timeout=5)
+            assert changed.value.code == "worktree_changed"
+        for fd in set(probes):
+            with pytest.raises(OSError) as closed:
+                os.fstat(fd)
+            assert closed.value.errno == errno.EBADF
+        assert store.read_blob(tg.snapshot_tree(store), "x") == b"concurrent replacement bytes\n"
+
+
+def test_snapshot_stat_clean_attribute_bytes_are_always_read(repo, monkeypatch):
+    context = make_store(repo)
+    commit(repo, ".gitattributes", b"# harmless\n")
+    git(repo, "config", "filter.unused.clean", "must-never-run")
+    for name in ("x", ".gitattributes"):
+        os.utime(repo / name, ns=(1000000000000000000, 1000000000000000000))
+    git(repo, "update-index", "--refresh")
+    attribute = (repo / ".gitattributes").stat()
+    reads = []
+    def read(fd, size):
+        observed = os.fstat(fd)
+        data = os.read(fd, size)
+        if (observed.st_dev, observed.st_ino) == (attribute.st_dev, attribute.st_ino):
+            reads.append(data)
+        return data
+    with context as store:
+        monkeypatch.setattr(tg, "os", SimpleNamespace(**{**vars(os), "read": read}))
+        tree = tg.snapshot_tree(store)
+        assert b"".join(reads) == b"# harmless\n"
+        assert tree == git(repo, "rev-parse", "HEAD^{tree}").decode().strip()
+
+
+def test_snapshot_control_byte_boundaries_match_git_add(repo, tmp_path):
+    context = make_store(repo)
+    (repo / ".gitattributes").write_bytes(b"*.txt text=auto\n")
+    for value in range(256):
+        for index, payload in enumerate((bytes((value,)), b"a" * 127 + bytes((value,)),
+                b"a" * 128 + bytes((value,)), b"a" * 255 + bytes((value,)) * 2,
+                b"a\r\n" + bytes((value,)) + b"\r\n", b"a\r" + bytes((value,)),
+                b"a\0" + bytes((value,)), bytes((value,)) + b"\x1a")):
+            (repo / f"sample-{value}-{index}.txt").write_bytes(payload)
+    environment = {**filter_git_env(tmp_path), "GIT_INDEX_FILE": str(tmp_path / "oracle-index")}
+    git(repo, "read-tree", "HEAD", env=environment)
+    git(repo, "add", "-A", env=environment)
+    expected = git(repo, "write-tree", env=environment).decode().strip()
+    with context as store:
+        assert tg.snapshot_tree(store) == expected
+        assert tg.snapshot_tree(store) == expected
+
+
+@pytest.mark.parametrize("code,action", [
+    ("conversion_unavailable", None), ("size_limit", None),
+    ("index_flags_unsupported", "Clear assume-unchanged and skip-worktree flags, then retry."),
+    ("index_stat_unprovable", "Run `git update-index --refresh` in the worktree, then retry."),
+])
+def test_snapshot_refusal_actions_golden_bytes(code, action):
+    refusal = tg.GitRefusal(code)
+    assert isinstance(refusal, gitsafe.GitError)
+    assert type(refusal).__module__ == "aegis_core.team_git"
+    assert (refusal.code, str(refusal), refusal.next_action) == (
+        code, "Lane Git operation refused: " + code, action)
+
+
+# Captured through each public caller on the original module as well as its extraction.
+# The external adapter may return any stable code; native branch coverage above
+# separately proves when each refusal is selected, including retry and races.
+GOLDEN_REFUSAL_CODES = (
+    "cas_mismatch", "conversion_unavailable", "descriptor_cleanup_failed", "git_failed",
+    "index_flags_unsupported", "index_stat_unprovable", "invalid_identity", "invalid_message",
+    "invalid_object", "invalid_oid", "invalid_parent", "invalid_picks", "invalid_repository",
+    "lane_runner_required", "merge_unavailable", "not_fast_forward", "not_merge", "path_missing",
+    "path_unreadable", "pick_not_fresh", "ref_not_allowed", "ref_unreadable", "ref_update_failed",
+    "ref_update_unknown", "size_limit", "store_busy", "store_closed", "unsafe_index", "unsafe_path",
+    "unsafe_scratch", "unsupported_file", "unsupported_platform", "worktree_changed",
+)
+
+
+@pytest.mark.parametrize("entry", ["snapshot_tree", "object", "read_blob", "commit_tested",
+    "cas_fast_forward", "plan_merge", "plan_pick", "plan_revert"])
+def test_public_caller_refusal_matrix_golden_bytes(repo, monkeypatch, entry):
+    context = make_store(repo)
+    head = git(repo, "rev-parse", "HEAD").decode().strip()
+    tree = git(repo, "rev-parse", "HEAD^{tree}").decode().strip()
+    code = [None]
+    def unavailable(*args, **kwargs):
+        raise gitsafe.GitError("hostile token=secret", code=code[0], next_action="Recover boundary.")
+    with context as store:
+        operations = {
+            "snapshot_tree": lambda: tg.snapshot_tree(store),
+            "object": lambda: store.object(head, "commit"),
+            "read_blob": lambda: store.read_blob(tree, "x"),
+            "commit_tested": lambda: tg.commit_tested(store, tree, head, "message", IDENTITY),
+            "cas_fast_forward": lambda: tg.cas_fast_forward(store, "refs/heads/lane/x", head, head),
+            "plan_merge": lambda: tg.plan_merge(store, head, head),
+            "plan_pick": lambda: tg.plan_pick(store, head, (head,), IDENTITY),
+            "plan_revert": lambda: tg.plan_revert(store, head, head),
+        }
+        run, read = gitsafe_run.LaneRunner.run, gitsafe_run.LaneRunner.read_private_object
+        monkeypatch.setattr(gitsafe_run.LaneRunner, "run", unavailable)
+        monkeypatch.setattr(gitsafe_run.LaneRunner, "read_private_object", unavailable)
+        for value in GOLDEN_REFUSAL_CODES:
+            code[0] = value
+            action = {
+                "index_flags_unsupported": "Clear assume-unchanged and skip-worktree flags, then retry.",
+                "index_stat_unprovable": "Run `git update-index --refresh` in the worktree, then retry.",
+            }.get(value, "Recover boundary.")
+            with pytest.raises(tg.GitRefusal) as caught:
+                operations[entry]()
+            assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+                value, "Lane Git operation refused: " + value, action)
+        monkeypatch.setattr(gitsafe_run.LaneRunner, "run", run)
+        monkeypatch.setattr(gitsafe_run.LaneRunner, "read_private_object", read)
+        assert store.object(head, "commit").startswith(b"tree ")
+
+
+def _attribute_oid_calls(monkeypatch):
+    """Count attribute OID hashing through the snapshot module's own reference."""
+    calls, lock = [], Lock()
+    real = team_git_snapshot.object_id
+
+    def counted(data, oid_length=40, kind="blob"):
+        with lock:
+            calls.append((id(data), oid_length))
+        return real(data, oid_length, kind)
+
+    monkeypatch.setattr(team_git_snapshot, "object_id", counted)
+    return calls, real
+
+
+def _attribute_body_calls(sources, oid_length):
+    """Count body refusals without patching the helper."""
+    seen, previous = [], sys.getprofile()
+    code = team_git_snapshot._attribute_body.__code__
+
+    def observed(frame, event, _arg):
+        if event == "call" and frame.f_code is code:
+            seen.append(id(frame.f_locals["data"]))
+        if previous is not None:
+            previous(frame, event, _arg)
+
+    sys.setprofile(observed)
+    try:
+        produced = team_git_snapshot.attribute_entries(sources, oid_length)
+    finally:
+        sys.setprofile(previous)
+    return produced, seen
+
+
+def test_attribute_entries_memoizes_validated_body_and_oid_by_identity(monkeypatch):
+    """One call validates and hashes each retained bytes object once and emits every path."""
+    calls, real = _attribute_oid_calls(monkeypatch)
+    assert team_git_snapshot.attribute_entries({}, 40) == []
+    assert calls == []
+    mutable = bytearray(b"*.c text\n")
+    mutable_sources = {b"b/.gitattributes": mutable, b"a/.gitattributes": mutable}
+    mutable_entries = team_git_snapshot.attribute_entries(mutable_sources, 40)
+    assert [path for path, mode, oid, data in mutable_entries] == [
+        b"a/.gitattributes", b"b/.gitattributes"]
+    assert all(mode == "100644" and data is mutable and oid == real(bytes(mutable), 40)
+               for _, mode, oid, data in mutable_entries)
+    assert calls == [(id(mutable), 40), (id(mutable), 40)]
+    body = b"*.bin text\r\n" + (b"z" * (team_git_snapshot.MAX_ATTRIBUTE_LINE_BYTES - 1)) + b"\n"
+    alias = bytes(bytearray(body))
+    assert alias == body and alias is not body
+    sources = {b"z/.gitattributes": body, b"a/.gitattributes": body, b"m/.gitattributes": alias}
+    calls.clear()
+    entries = team_git_snapshot.attribute_entries(sources, 40)
+    assert [path for path, mode, oid, data in entries] == [
+        b"a/.gitattributes", b"m/.gitattributes", b"z/.gitattributes"]
+    assert [mode for _, mode, _, _ in entries] == ["100644", "100644", "100644"]
+    assert entries[0][3] is body and entries[2][3] is body and entries[1][3] is alias
+    assert entries[0][2] == entries[2][2] == real(body, 40)
+    assert entries[1][2] == real(alias, 40)
+    assert calls == [(id(body), 40), (id(alias), 40)]
+    wide = {b"d%03d/.gitattributes" % index: body for index in range(64)}
+    calls.clear()
+    wide_entries = team_git_snapshot.attribute_entries(wide, 64)
+    assert len(wide_entries) == 64
+    assert [path for path, _, _, _ in wide_entries] == sorted(wide)
+    assert {oid for _, _, oid, _ in wide_entries} == {real(body, 64)}
+    assert all(data is body and len(oid) == 64 for _, _, oid, data in wide_entries)
+    assert calls == [(id(body), 64)]
+    calls.clear()
+    retried, validated = _attribute_body_calls(sources, 40)
+    assert retried == entries
+    assert calls == [(id(body), 40), (id(alias), 40)]
+    assert validated == [id(body), id(alias)]
+    calls.clear()
+    barrier = Barrier(2)
+    shared = {b"p%02d/.gitattributes" % index: body for index in range(8)}
+
+    def once(_slot):
+        barrier.wait(5)
+        return team_git_snapshot.attribute_entries(shared, 40)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        concurrent = list(pool.map(once, (0, 1)))
+    assert concurrent[0] == concurrent[1]
+    assert len(concurrent[0]) == 8
+    assert {oid for _, _, oid, _ in concurrent[0]} == {real(body, 40)}
+    assert calls == [(id(body), 40), (id(body), 40)]
+    _, validated_again = _attribute_body_calls({b"a/.gitattributes": mutable, b"b/.gitattributes": mutable}, 40)
+    assert validated_again == [id(mutable), id(mutable)]
+
+
+@pytest.mark.parametrize("fault", ["nul", "bom", "long-line", "later-line", "exact-line", "file-cap"])
+def test_attribute_entries_malformed_body_refuses_before_hash_and_retries(monkeypatch, fault):
+    calls, real = _attribute_oid_calls(monkeypatch)
+    limit = team_git_snapshot.MAX_ATTRIBUTE_LINE_BYTES
+    original_cap = team_git_snapshot.MAX_ATTRIBUTE_FILE_BYTES
+    if fault == "nul":
+        body = b"*.bin text\n\0marker-value"
+    elif fault == "bom":
+        body = b"\xef\xbb\xbf*.bin text\n"
+    elif fault == "long-line":
+        body = b"x" * limit
+    elif fault == "later-line":
+        body = b"ok\n" + (b"y" * limit)
+    elif fault == "exact-line":
+        body = (b"z" * limit) + b"\n"
+    else:
+        body = b"*.bin text\n"
+        monkeypatch.setattr(team_git_snapshot, "MAX_ATTRIBUTE_FILE_BYTES", len(body))
+    good = b"*.ok text\r\n" + (b"q" * (limit - 1)) + b"\n"
+    sources = {b"a/.gitattributes": good, b"m/.gitattributes": body, b"z/.gitattributes": body}
+    with pytest.raises(tg.GitRefusal) as caught:
+        team_git_snapshot.attribute_entries(sources, 40)
+    assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+        "conversion_unavailable", "Lane Git operation refused: conversion_unavailable", None)
+    assert type(caught.value).__module__ == "aegis_core.team_git"
+    rendered = str(caught.value)
+    assert "marker-value" not in rendered and "gitattributes" not in rendered
+    assert body.decode("latin-1") not in rendered
+    assert calls == []
+    if fault == "file-cap":
+        monkeypatch.setattr(team_git_snapshot, "MAX_ATTRIBUTE_FILE_BYTES", original_cap)
+    calls.clear()
+    retried = team_git_snapshot.attribute_entries(
+        {b"b/.gitattributes": good, b"a/.gitattributes": good}, 40)
+    assert [(path, mode, oid, data is good) for path, mode, oid, data in retried] == [
+        (b"a/.gitattributes", "100644", real(good, 40), True),
+        (b"b/.gitattributes", "100644", real(good, 40), True)]
+    assert calls == [(id(good), 40)]

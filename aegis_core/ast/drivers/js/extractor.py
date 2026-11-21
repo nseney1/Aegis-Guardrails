@@ -299,8 +299,7 @@ class Extractor:
         position = bisect_right(self.decorator_ends, index - 1) - 1
         while position >= 0:
             start, end, name = self.decorators[position]
-            between = self.tokens[end + 1:index]
-            if any(t.value in (';', '{', '}') for t in between):
+            if any(self.tokens[i].value in (';', '{', '}') for i in range(end + 1, index)):
                 break
             names.append(name)
             index, position = start, position - 1

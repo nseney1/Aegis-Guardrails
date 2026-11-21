@@ -1,6 +1,6 @@
 """Tests for Git worktree hook resolution and installation (BUG-082).
 
-Ensures that soma init and soma doctor properly locate the hooks directory
+Ensures that aegis init and aegis doctor properly locate the hooks directory
 when running inside a Git worktree (.git is a file, not a directory).
 """
 from __future__ import annotations
@@ -11,9 +11,7 @@ from pathlib import Path
 from aegis_cli.doctor import _check_precommit_hook
 from aegis_cli.init import (
     _AEGIS_HOOK_START,
-    _SOMA_HOOK_START,
     AEGIS_HOOK_FORMAT,
-    SOMA_HOOK_FORMAT,
     install_hook,
 )
 from aegis_core.workspace.hooks import resolve_git_hooks_dir
@@ -107,8 +105,8 @@ class TestWorktreeHookInstallation:
         assert installed is True
         assert expected_hook.is_file()
         content = expected_hook.read_text(encoding="utf-8")
-        assert _AEGIS_HOOK_START in content or _SOMA_HOOK_START in content
-        assert AEGIS_HOOK_FORMAT in content or SOMA_HOOK_FORMAT in content
+        assert _AEGIS_HOOK_START in content or _AEGIS_HOOK_START in content
+        assert AEGIS_HOOK_FORMAT in content or AEGIS_HOOK_FORMAT in content
         assert os.access(expected_hook, os.X_OK)
 
     def test_doctor_detects_precommit_hook_in_worktree(self, tmp_path: Path):

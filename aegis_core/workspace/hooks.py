@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from aegis_core.workspace.binding import git_discovery_paths
+
 
 def _git_dirs_at(curr: Path) -> tuple[Path, Path] | None:
     """(git_dir, git_common_dir) named by ``curr/.git`` (directory or gitfile), unvalidated."""
@@ -51,18 +53,14 @@ def _find_git_dirs(root: Path) -> tuple[Path | None, Path | None]:
     the root-anchored hook resolution relies on it. An ancestor's ``.git`` only counts
     when git would accept it as a repository; otherwise a stray empty ``/tmp/.git`` or
     ``$HOME/.git`` turns every directory below it into a git workspace that git itself
-    does not recognize, and the walk continues upward as git's discovery does.
+    does not recognize, and the walk continues upward as git's discovery does,
+    stopping before GIT_CEILING_DIRECTORIES ancestors.
     """
     start = root.resolve()
-    curr = start
-    while True:
+    for curr in git_discovery_paths(start):
         found = _git_dirs_at(curr)
         if found is not None and (curr == start or _is_git_repository(*found)):
             return found
-        parent = curr.parent
-        if parent == curr:
-            break
-        curr = parent
     return None, None
 
 

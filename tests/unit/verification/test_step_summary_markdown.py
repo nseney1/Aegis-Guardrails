@@ -1,6 +1,6 @@
 """R-checks-37: the step summary renders finding text from the pull request as inert data. Every
 value sits in a CommonMark code span (the one inline form in which nothing is parsed), one table
-row per finding with one cell per column, so no heading, link, image or HTML comes from the data."""
+row per finding with one rule per column, so no heading, link, image or HTML comes from the data."""
 from __future__ import annotations
 
 import re
@@ -43,7 +43,7 @@ def _outside_spans(text: str) -> str:
 
 
 def _columns(row: str, escapes: bool) -> list:
-    """The cells of a GFM table row: ``escapes`` honours a backslash before any character (cmark-gfm),
+    """The rules of a GFM table row: ``escapes`` honours a backslash before any character (cmark-gfm),
     otherwise only ``\\|`` is an escaped pipe (the naive reading)."""
     body = row.strip()[1:-1] if row.strip().startswith("|") and row.strip().endswith("|") else row
     cols, cur, i = [], "", 0
@@ -109,8 +109,65 @@ def _unverified(reason: str) -> dict:
 @pytest.mark.parametrize("value", sorted(HOSTILE.values()) + ["![beacon](x) <img src=x> [approved](y)"],
                          ids=sorted(HOSTILE) + ["beacon-img-link"])
 def test_the_coverage_unverified_reason_renders_as_data(value):
-    """The reason can be the last line of the pull request's pytest stderr: it is data, not Markdown."""
+    """The reason can be pytest stderr; public summaries show only a fixed category."""
     summary = format_github_step_summary(_unverified(value))
     assert _outside_spans(summary) == _outside_spans(format_github_step_summary(_unverified(HARMLESS)))
     assert all(ch == "\n" or ch.isprintable() for ch in summary)
-    assert "### Diff Coverage: UNVERIFIED (`harmless`)" in format_github_step_summary(_unverified(HARMLESS))
+    assert "### Diff Coverage: UNVERIFIED (`other`)" in format_github_step_summary(_unverified(HARMLESS))
+
+
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("raw_verdict", [False, True])
+def test_strict_missing_driver_is_explained_without_rewriting_evidence(strict, raw_verdict):
+    import json
+
+    from aegis_cli.formatters.report import (
+        format_layer1_json_payload, format_sarif_report, github_annotation_lines, layer1_report_document,
+    )
+    from aegis_core.verification import ToolEvidence
+    from aegis_core.verification.ast_checks import NO_DRIVER_NOTE_TOOL
+    from aegis_core.verification.runner import format_summary, gate_verdict
+
+    evidence = ToolEvidence(NO_DRIVER_NOTE_TOOL, "src/app.kt", raw_verdict, "no_driver:.kt", language="unknown")
+    passed = gate_verdict([evidence], strict=strict)
+    assert passed is (raw_verdict and not strict)
+    summary = format_summary([evidence], strict=strict)
+    document = layer1_report_document(passed, [("src/app.kt", evidence)], [], strict,
+                                      checkpoint_info=[{"check": "pairing", "message": "pairing note", "file": "test.kt"}])
+    assert document["layer1"][0]["verdict"] is raw_verdict
+    assert document["layer1"][0]["detail"] == "no_driver:.kt"
+    assert format_layer1_json_payload(passed, ["src/app.kt"], [evidence], summary)["layer1"] == document["layer1"]
+    markdown = format_github_step_summary(document)
+    annotations = "\n".join(github_annotation_lines(document))
+    run = json.loads(format_sarif_report(document))["runs"][0]
+    assert run["results"] == []
+    notifications = run["invocations"][0]["toolExecutionNotifications"]
+    assert {"level": "note", "message": {"text": "pairing note"}} in notifications
+    if strict and raw_verdict:
+        assert "strict" in markdown.lower() and "no-driver" in markdown
+        assert "No findings reported" not in markdown
+        assert "::error title=" in annotations and "strict" in annotations.lower()
+        assert any(n["level"] == "error" and "strict" in n["message"]["text"].lower() for n in notifications)
+    elif raw_verdict:
+        assert "PASSED" in markdown and "::error" not in annotations
+        assert not any(n["level"] == "error" for n in notifications)
+
+
+def test_strict_cli_exports_name_the_cause_and_keep_sarif_unanchored(tmp_path, capsys):
+    import json
+
+    from aegis_cli.cli import main
+    from tests.unit.core.test_no_driver_m1 import _rule
+
+    _rule(tmp_path)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src/app.kt").write_text("danger()", encoding="utf-8")
+    args = ["check", "--workspace", str(tmp_path), "src/app.kt", "--strict"]
+    assert main([*args, "--format", "github"]) == 1
+    annotations = capsys.readouterr().out
+    assert "::error" in annotations and "strict" in annotations.lower() and "no-driver" in annotations
+    assert main([*args, "--format", "sarif"]) == 1
+    run = json.loads(capsys.readouterr().out)["runs"][0]
+    assert run["results"] == []
+    assert any("strict" in n["message"]["text"].lower()
+               for n in run["invocations"][0]["toolExecutionNotifications"])

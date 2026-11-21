@@ -449,11 +449,16 @@ def parse_python_ast(
     except SyntaxError as exc:
         raise ValueError(f"Failed to parse Python AST for {resolved_path}: {exc}") from exc
 
-    visitor = _PythonASTVisitor(file_path=resolved_path, bindings=_import_bindings(tree))
+    return normalize_python_ast(tree, resolved_path)
+
+
+def normalize_python_ast(tree: ast.AST, file_path: str) -> NormalizedAST:
+    """Normalize an already parsed Python tree without reading or parsing source."""
+    visitor = _PythonASTVisitor(file_path=file_path, bindings=_import_bindings(tree))
     visitor.walk(tree)
 
     return NormalizedAST(
-        file_path=resolved_path,
+        file_path=file_path,
         language="python",
         definitions=tuple(visitor.definitions),
         call_sites=tuple(visitor.call_sites),

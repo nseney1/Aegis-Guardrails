@@ -1,0 +1,102 @@
+{
+  "actors": {
+    "coordinator-1": {
+      "cap_seconds": 3600,
+      "generation": 1,
+      "profile": {
+        "effort": "max",
+        "filesystem": "workspace-write",
+        "model": "fixture-model",
+        "tier": "ultrafast",
+        "tools": []
+      },
+      "role": "coordinator"
+    },
+    "operator-1": {
+      "cap_seconds": 3600,
+      "generation": 1,
+      "profile": {
+        "effort": "max",
+        "filesystem": "workspace-write",
+        "model": "fixture-model",
+        "tier": "ultrafast",
+        "tools": []
+      },
+      "role": "operator"
+    },
+    "operator-2": {
+      "cap_seconds": 3600,
+      "generation": 2,
+      "profile": {
+        "effort": "max",
+        "filesystem": "workspace-write",
+        "model": "fixture-model",
+        "tier": "ultrafast",
+        "tools": []
+      },
+      "role": "operator"
+    },
+    "reviewer-1": {
+      "cap_seconds": 3600,
+      "generation": 1,
+      "profile": {
+        "effort": "max",
+        "filesystem": "workspace-write",
+        "model": "fixture-model",
+        "tier": "ultrafast",
+        "tools": []
+      },
+      "role": "reviewer"
+    },
+    "root-1": {
+      "cap_seconds": 3600,
+      "generation": 1,
+      "profile": {
+        "effort": "max",
+        "filesystem": "read-only",
+        "model": "fixture-model",
+        "tier": "ultrafast",
+        "tools": [
+          "read",
+          "decide",
+          "attest"
+        ]
+      },
+      "role": "root"
+    },
+    "router-1": {
+      "cap_seconds": 3600,
+      "generation": 1,
+      "profile": {
+        "effort": "medium",
+        "filesystem": "workspace-write",
+        "model": "fixture-model",
+        "tier": "ultrafast",
+        "tools": []
+      },
+      "role": "router"
+    }
+  },
+  "authority": [
+    {
+      "path": "/fixture/legacy/retained-evidence.json",
+      "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    }
+  ],
+  "current": {
+    "coordinator": "coordinator-1",
+    "operator": "operator-1",
+    "reviewer": "reviewer-1",
+    "root": "root-1",
+    "router": "router-1"
+  },
+  "schema": "aegis.lifecycle-policy/v1",
+  "source": {
+    "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "dirty_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "successors": {
+    "operator-1": "operator-2"
+  }
+}

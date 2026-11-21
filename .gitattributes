@@ -1,3 +1,23 @@
 /.github/fixtures/ac24/** text eol=lf
 /.github/fixtures/go-functional/** text eol=lf
 /.github/scripts/p6_noadmin.py text eol=lf
+
+# Foundation evidence and its pinned producers are hashed as exact bytes.
+/tests/fixtures/hierarchy_native_foundation/** text eol=lf
+/docs/hierarchy-dogfood.md text eol=lf
+/docs/hierarchy-native-protocol.md text eol=lf
+/docs/hierarchy-watch-bridge.md text eol=lf
+/docs/hierarchy-watch-supervisor.md text eol=lf
+/tests/integration/test_hierarchy_delivery.py text eol=lf
+/tests/integration/test_hierarchy_lifecycle.py text eol=lf
+/tests/integration/test_hierarchy_native_protocol.py text eol=lf
+/tests/integration/test_hierarchy_operator.py text eol=lf
+/tests/integration/test_hierarchy_watch_bridge.py text eol=lf
+/tests/integration/test_hierarchy_watch_supervisor.py text eol=lf
+/tools/hierarchy_lifecycle.py text eol=lf
+/tools/hierarchy_mailbox.py text eol=lf
+/tools/hierarchy_native_protocol.py text eol=lf
+/tools/hierarchy_operator.py text eol=lf
+/tools/hierarchy_wake.py text eol=lf
+/tools/hierarchy_watch_bridge.py text eol=lf
+/tools/hierarchy_watch_supervisor.py text eol=lf

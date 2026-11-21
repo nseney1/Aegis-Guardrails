@@ -13,6 +13,9 @@ from aegis_core.regression import check_ci_regressions
 from aegis_core.verification.language_tests import LanguageTestPlan
 from aegis_core.verification.test_outcomes import RunOutcome
 from tests import helpers_humangate as hg
+from tests.unit.core import test_language_tests
+
+native_project = test_language_tests.project
 
 
 @pytest.fixture
@@ -212,6 +215,111 @@ def test_go_package_and_subtest_identity_comes_from_real_tool_output(project, tm
     assert selection.plan.available, selection.plan.detail
     assert selection.belongs(("example.test/identity/a", "TestX/child"), "a/x_test.go")
     assert not selection.belongs(("example.test/identity/b", "TestX/child"), "a/x_test.go")
+
+
+@pytest.fixture
+def go_metadata_selection(native_project, monkeypatch):
+    from aegis_core.verification import regression_identity
+
+    workspace, snapshot = native_project["workspace"], native_project["snapshot"]
+    driver = native_project["tools"] / "ast_driver.py"
+    driver.write_text(
+        "import json,sys\n"
+        "print(json.dumps({'version':'1.0','language':'go','file_path':sys.argv[1],"
+        "'definitions':[{'name':'TestA','kind':'function','line':2}],"
+        "'call_sites':[],'imports':[]}))\n", encoding="utf-8")
+    config = native_project["home"] / ".aegis"
+    config.mkdir()
+    (config / "config.json").write_text(json.dumps({
+        "v": 1, "drivers": {"go": f'"{sys.executable}" "{driver}"'}}), encoding="utf-8")
+    (snapshot / "pkg/a_test.go").write_text("package pkg\nfunc TestA() {}\n")
+    row = json.dumps({"Dir": str(snapshot / "pkg"), "ImportPath": "example/pkg", "TestGoFiles": ["a_test.go"]})
+
+    def select(raw):
+        # Supply metadata command output while keeping public selection and ownership real.
+        monkeypatch.setattr(regression_identity, "_metadata", lambda *args: raw)
+        return regression_identity.prepare_native_selection(
+            workspace, snapshot, "go", ["pkg/a_test.go"], scratch=native_project["scratch"] / "selection")
+
+    return select, row
+
+
+@pytest.mark.parametrize("raw", ["", " \t\r\n\v\f\x1c\x85\u00a0\u2003\u2028\u3000"])
+def test_go_metadata_empty_stream_keeps_missing_package_refusal(go_metadata_selection, raw):
+    select, _row = go_metadata_selection
+    selection = select(raw)
+    assert selection.plan.reason == "test_ids_unmapped" and selection.owners == ()
+    assert selection.plan.detail == "test_ids_unmapped: Go package metadata missing or ambiguous"
+
+
+@pytest.mark.parametrize("suffix,detail", [
+    ("{", "Expecting property name enclosed in double quotes: line 2 column 2"),
+    ("garbage", "Expecting value: line 2 column 1"),
+])
+def test_go_metadata_valid_prefix_never_hides_malformed_tail(go_metadata_selection, suffix, detail):
+    select, row = go_metadata_selection
+    selection = select(row + "\n" + suffix)
+    assert selection.plan.reason == "test_ids_unmapped" and selection.owners == ()
+    position = len(row + "\n") + (1 if suffix == "{" else 0)
+    assert selection.plan.detail == f"{detail} (char {position})"
+
+
+def test_go_metadata_malformed_first_record_keeps_exact_error(go_metadata_selection):
+    select, _row = go_metadata_selection
+    selection = select("{")
+    assert selection.plan.reason == "test_ids_unmapped" and selection.owners == ()
+    assert selection.plan.detail == "Expecting property name enclosed in double quotes: line 1 column 2 (char 1)"
+
+
+def test_go_metadata_valid_prefix_never_hides_invalid_record(go_metadata_selection):
+    select, row = go_metadata_selection
+    selection = select(row + "\n{}")
+    assert selection.plan.reason == "test_ids_unmapped" and selection.owners == ()
+    assert selection.plan.detail == "test_ids_unmapped: invalid Go package metadata"
+
+
+@pytest.mark.parametrize("whitespace", ["", " \t\r\n", "\v\f\x1c\x85\u00a0\u2003\u2028\u3000"])
+def test_go_metadata_preserves_whitespace_and_complete_ownership(go_metadata_selection, whitespace):
+    select, row = go_metadata_selection
+    other = json.dumps({"Dir": "unselected", "ImportPath": "example/other"})
+    selection = select(whitespace + other + whitespace + row + whitespace)
+    assert selection.plan.available, selection.plan.detail
+    assert selection.owners == (("pkg/a_test.go", (("example/pkg", "TestA"),)),)
+    assert [(test.file, test.package, test.name) for test in selection.plan.go_tests] == [
+        ("pkg/a_test.go", "example/pkg", "TestA")]
+
+
+@pytest.mark.parametrize("count", [10000, 10001])
+def test_go_metadata_record_limit_is_preserved(go_metadata_selection, count):
+    select, row = go_metadata_selection
+    other = json.dumps({"Dir": "unselected", "ImportPath": "example/other"})
+    selection = select(row + ("\n" + other) * (count - 1))
+    if count == 10000:
+        assert selection.plan.available, selection.plan.detail
+        assert selection.belongs(("example/pkg", "TestA"), "pkg/a_test.go")
+    else:
+        assert selection.plan.reason == "test_ids_unmapped" and selection.owners == ()
+        assert selection.plan.detail == "test_ids_unmapped: too many package metadata records"
+
+
+def test_go_metadata_large_stream_does_not_copy_remaining_suffixes(go_metadata_selection):
+    class SliceCountingText(str):
+        slices = 0
+        copied_characters = 0
+
+        def __getitem__(self, key):
+            if isinstance(key, slice):
+                self.slices += 1
+                self.copied_characters += len(range(*key.indices(len(self))))
+            return super().__getitem__(key)
+
+    select, row = go_metadata_selection
+    other = json.dumps({"Dir": "unselected", "ImportPath": "example/other", "TestGoFiles": ["unused_test.go"]})
+    raw = SliceCountingText(" \n" + (other + "\n") * 4999 + row + "\t\n")
+    selection = select(raw)
+    assert selection.plan.available, selection.plan.detail
+    assert selection.owners == (("pkg/a_test.go", (("example/pkg", "TestA"),)),)
+    assert raw.slices == 0, f"{raw.slices} slices addressed {raw.copied_characters} characters"
 
 
 @pytest.mark.parametrize("head,base,reason", [

@@ -25,8 +25,6 @@ from aegis_cli.hooks.management import (
     CURRENT_HOOK_FORMAT_VERSION,
     _AEGIS_HOOK_END,
     _AEGIS_HOOK_START,
-    _SOMA_HOOK_END,
-    _SOMA_HOOK_START,
     generate_hook_block,
     hook_status,
     install_hook,
@@ -36,10 +34,10 @@ pytestmark = pytest.mark.skipif(os.name == "nt", reason="runs the hook with /bin
 
 AEGIS_ROOT = Path(aegis_cli.__file__).resolve().parent.parent
 
-OLD_BLOCK = (f"{_SOMA_HOOK_START}\n"
-             "# Installed by soma init — runs deterministic quality checks before commit.\n"
-             "soma checkpoint --pre-commit\n"
-             f"{_SOMA_HOOK_END}\n")
+OLD_BLOCK = (f"{_AEGIS_HOOK_START}\n"
+             "# Installed by aegis init — runs deterministic quality checks before commit.\n"
+             "aegis checkpoint --pre-commit\n"
+             f"{_AEGIS_HOOK_END}\n")
 
 
 def _not_found(path) -> str:
@@ -155,7 +153,7 @@ def test_check_failure_propagates_and_stops_the_hook(tmp_path):
 
 def test_block_names_no_path_or_repo_relative_interpreter():
     block = generate_hook_block("/opt/py/bin/python3", import_root="/opt/site")
-    for unsafe in ("command -v", "$PWD", ".venv", "VIRTUAL_ENV", "soma"):
+    for unsafe in ("command -v", "$PWD", ".venv", "VIRTUAL_ENV"):
         assert unsafe not in block
     assert f"aegis-hook-format: {CURRENT_HOOK_FORMAT_VERSION}" in block
     run_lines = [ln.strip() for ln in block.splitlines() if "check --hook" in ln]
@@ -189,7 +187,6 @@ def test_reinstall_replaces_an_old_block_and_runs_it_first(tmp_path):
     install_hook(project, python="/usr/bin/python3")
     text = hook.read_text(encoding="utf-8")
     assert text.count(_AEGIS_HOOK_START) == 1 and text.count(_AEGIS_HOOK_END) == 1
-    assert _SOMA_HOOK_START not in text
     assert text.startswith("#!/bin/sh\n" + _AEGIS_HOOK_START + "\n")
     assert text.endswith(_AEGIS_HOOK_END + "\necho user-before\n\necho user-after\n")
     assert "check --hook" in text
@@ -201,7 +198,7 @@ def test_reinstall_replaces_an_old_block_and_runs_it_first(tmp_path):
 def test_unterminated_block_is_left_alone(tmp_path):
     project = bare_repo(tmp_path / "p")
     hook = project / ".git" / "hooks" / "pre-commit"
-    broken = "#!/bin/sh\n" + _SOMA_HOOK_START + "\nsoma checkpoint --pre-commit\necho mine\n"
+    broken = "#!/bin/sh\n" + _AEGIS_HOOK_START + "\naegis checkpoint --pre-commit\necho mine\n"
     hook.write_text(broken, encoding="utf-8")
     install_hook(project, python="/usr/bin/python3")
     assert hook.read_text(encoding="utf-8") == broken
@@ -273,7 +270,7 @@ def test_doctor_flags_every_earlier_format_as_outdated(tmp_path, capsys, version
     assert "aegis hook install" in capsys.readouterr().out
 
 
-def test_doctor_flags_unversioned_soma_block(tmp_path, capsys):
+def test_doctor_flags_unversioned_aegis_block(tmp_path, capsys):
     from aegis_cli.doctor import _check_precommit_hook
 
     project = bare_repo(tmp_path / "p")

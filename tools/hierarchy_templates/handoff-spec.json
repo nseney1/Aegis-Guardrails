@@ -1,0 +1,20 @@
+{
+  "schema": "aegis.hierarchy-handoff/v1",
+  "host": "REPLACE_WITH_NEW_HOST",
+  "session": "REPLACE_WITH_NEW_SESSION",
+  "outgoing_stopped": true,
+  "entries": [
+    {
+      "root": "/absolute/initiative-a/mailbox",
+      "endpoint": "a/front-door",
+      "completed_checks": ["Root verified the outgoing session stopped."],
+      "evidence_dir": "/absolute/initiative-a/handoff-evidence",
+      "delivery_dir": "/absolute/initiative-a/delivery"
+    },
+    {
+      "root": "/absolute/initiative-b/mailbox",
+      "endpoint": "b/front-door",
+      "completed_checks": ["Root verified the outgoing session stopped."]
+    }
+  ]
+}

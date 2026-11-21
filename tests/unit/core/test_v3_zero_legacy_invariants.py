@@ -11,6 +11,7 @@ literals are rows of the legacy-vocabulary ratchet (tests/contract/test_legacy_r
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import pytest
@@ -52,7 +53,8 @@ class TestV3RuleAndToolNamespaces:
 
     def test_mcp_tools_registered_strictly_under_aegis_namespace(self) -> None:
         tool_names = [t["name"] for t in TOOL_DEFINITIONS]
-        assert len(tool_names) == 5
+        contract = json.loads((REPO_ROOT / "tests" / "contract" / "mcp_tools.json").read_text(encoding="utf-8"))
+        assert sorted(tool_names) == sorted(tool["name"] for tool in contract["tools"])
         assert all(name.startswith("aegis_") for name in tool_names), tool_names
         assert set(_TOOL_HANDLERS.keys()) == set(tool_names)
 

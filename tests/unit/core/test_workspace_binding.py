@@ -8,9 +8,14 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+from argparse import Namespace
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import pytest
+
+from tests.conftest import symlink_or_skip
 
 from aegis_core.errors import WorkspaceNotFoundError
 from aegis_core.workspace.binding import (
@@ -631,3 +636,296 @@ def test_cli_a_target_through_a_symlink_loop_is_a_workspace_error_or_itself(home
         assert "cannot be resolved" in str(exc)
     else:  # Python 3.13+ resolves a loop leniently: the target names itself
         assert not (root / ".aegis").is_dir()
+
+
+# Contract before WORKSPACE-DIAGNOSTIC-CORE: compare actual resolver sentences to
+# adapter output, rather than copying a third set of sentence templates here.
+_MCP_WORDING_REASONS = {
+    "pin_conflicts_with_host_root": "pin_conflicts_with_host_root",
+    "pin_conflicts_with_registry": "pin_conflicts_with_registry",
+    "host_root_conflicts_with_registry": "host_root_conflicts_with_registry",
+    "host_root_conflicts_with_registry_outside": "host_root_conflicts_with_registry",
+    "ambiguous_host_roots": "ambiguous_host_roots",
+    "cwd_conflicts_with_registry": "cwd_conflicts_with_registry",
+    "ambiguous_registry_selection": "ambiguous_registry_selection",
+    "host_roots_not_governed": "host_roots_not_governed",
+    "no_workspace": "no_workspace",
+    "pin_missing": "pin_missing",
+    "pin_missing_directory": "pin_missing",
+    "pin_not_a_workspace": "pin_not_a_workspace",
+    "pin_denied": "pin_denied",
+    "pin_denied_root": "pin_denied",
+}
+_CLI_HOLD_REASONS = {"pin_conflicts_with_target", "pin_conflicts_with_cwd"}
+
+
+@pytest.fixture
+def wording_paths(home, tmp_path):
+    a = _governed(_git_marker(tmp_path / "a"))
+    b = _governed(_git_marker(tmp_path / "b"))
+    plain = _git_marker(tmp_path / "plain")
+    for root in (a, b):
+        (root / "shared.py").write_text("", encoding="ascii")
+    # Ordinary temp files suffice except for the guarded resolution-error cases.
+    _registry(home, [a, b])
+    return a, b, plain
+
+
+def _wording_resolution_path(where):
+    loop = where / "unresolvable"
+    symlink_or_skip(loop, loop)
+    try:
+        loop.resolve()
+    except (OSError, RuntimeError):
+        return loop
+    pytest.skip("non-strict path resolution does not reject symlink loops")
+
+
+def _mcp_wording_inputs(case, home, paths):
+    a, b, plain = paths
+    host = lambda *roots: [Attested("mcp_roots", str(root)) for root in roots]
+    cases = {
+        "pin_conflicts_with_host_root": {"pin": str(a), "attested": host(b, plain)},
+        "pin_conflicts_with_registry": {"pin": str(a), "files": [str(b / "new.py")]},
+        "host_root_conflicts_with_registry": {"attested": host(a), "files": [str(b / "new.py")]},
+        "host_root_conflicts_with_registry_outside": {"attested": host(plain), "files": [str(b / "new.py")]},
+        "ambiguous_host_roots": {"attested": host(a, b)},
+        "cwd_conflicts_with_registry": {"cwd": plain, "files": ["shared.py"]},
+        "ambiguous_registry_selection": {"files": ["shared.py"]},
+        "host_roots_not_governed": {"attested": host(plain)},
+        "no_workspace": {},
+        "pin_missing": {"pin": str(plain / "unresolvable")},
+        "pin_missing_directory": {"pin": str(a / "shared.py")},
+        "pin_not_a_workspace": {"pin": str(plain)},
+        "pin_denied": {"pin": str(home)},
+        "pin_denied_root": {"pin": home.anchor},
+    }
+    # The cwd must be governed but lack shared.py, while both registered roots
+    # contain it. This also checks the comma-separated candidates sentence.
+    if case == "cwd_conflicts_with_registry":
+        _governed(plain)
+    inputs = {"cwd": home, "registry": read_registry(), **cases[case]}
+    if case == "pin_missing":
+        inputs["pin"] = str(_wording_resolution_path(plain))
+    return inputs
+
+
+def _wording_environment(pin):
+    env = dict(os.environ)
+    env.pop("AEGIS_WORKSPACE", None)
+    env.pop("AEGIS_MANAGER_CONFIG", None)
+    env.pop("AEGIS_MANAGER_CONFIG_SHA256", None)
+    if pin:
+        env["AEGIS_WORKSPACE"] = pin
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[3])
+    return env
+
+
+@contextmanager
+def _wording_mcp_server(inputs):
+    import aegis_mcp.server as server
+
+    saved = {name: getattr(server, name) for name in server.fresh_state()}
+    try:
+        server._start(_wording_environment(inputs.get("pin")))
+        server._server_cwd = str(inputs["cwd"])
+        yield server
+    finally:
+        for name, value in saved.items():
+            setattr(server, name, value)
+
+
+@pytest.mark.parametrize("fail", [False, True], ids=["success", "assertion-failure"])
+def test_mcp_wording_restores_every_connection_field(home, wording_paths, fail):
+    import aegis_mcp.server as server
+
+    saved = {name: getattr(server, name) for name in server.fresh_state()}
+    inputs = _mcp_wording_inputs("pin_denied_root", home, wording_paths)
+    for _ in range(2):
+        expected = pytest.raises(AssertionError, match="^wording assertion failed$") if fail else nullcontext()
+        with expected:
+            with _wording_mcp_server(inputs) as connection:
+                assert connection._workspace_error.reason == "pin_denied"
+                for name in server.fresh_state():
+                    setattr(server, name, object())
+                if fail:
+                    raise AssertionError("wording assertion failed")
+        for name, value in saved.items():
+            assert getattr(server, name) is value, name
+
+
+@pytest.mark.parametrize("case,stdio", [
+    pytest.param(case, False, id=case) for case in _MCP_WORDING_REASONS
+] + [pytest.param("pin_conflicts_with_host_root", True, id="stdio-pin_conflicts_with_host_root")])
+def test_mcp_binding_wording_equals_resolver(home, wording_paths, case, stdio):
+    inputs = _mcp_wording_inputs(case, home, wording_paths)
+    canonical = resolve_binding(**inputs)
+    assert canonical.reason == _MCP_WORDING_REASONS[case]
+    frames = [{"jsonrpc": "2.0", "id": 0, "method": "initialize",
+               "params": {"clientInfo": {"name": "codex-mcp-client", "version": "1"}}}]
+    roots = {item.path: {} for item in inputs.get("attested", ())}
+    for req_id in (1, 2):  # A retry must retain both the reason and full wording.
+        frames.append({
+            "jsonrpc": "2.0", "id": req_id, "method": "tools/call",
+            "params": {"name": "aegis_list_rules", "arguments": {"files": inputs.get("files", [])},
+                       "_meta": {"x-codex-turn-metadata": {"workspaces": roots}}},
+        })
+    if stdio:
+        # Keep the real entry point, framing and environment-read path covered.
+        run = subprocess.run(
+            [sys.executable, "-m", "aegis_mcp"], cwd=inputs["cwd"], env=_wording_environment(inputs.get("pin")),
+            input="".join(json.dumps(frame) + "\n" for frame in frames),
+            text=True, capture_output=True, timeout=15,
+        )
+        assert run.returncode == 0, run.stderr
+        responses = {frame["id"]: frame for frame in map(json.loads, run.stdout.splitlines()) if "id" in frame}
+    else:
+        with _wording_mcp_server(inputs) as server:
+            responses = {}
+            for frame in frames:
+                response = server.handle_request(frame)
+                if response is not None and "id" in response:
+                    responses[response["id"]] = response
+    for req_id in (1, 2):
+        response = responses[req_id]
+        result = response["result"]
+        assert result["isError"] is True
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["binding"]["reason"] == canonical.reason
+        assert payload["binding"]["message"] == canonical.message, case
+        assert payload["binding"]["message"] != "workspace binding refused", case
+        if canonical.status != "unbound":
+            assert payload["error"] == canonical.message, case
+
+
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("case", [
+    "pin_conflicts_with_target", "pin_conflicts_with_cwd", "pin_missing_directory",
+    "pin_not_a_workspace", "pin_denied", "pin_denied_root", "home", "root",
+    "pin_resolution", "target_resolution",
+])
+def test_cli_binding_wording_equals_resolver(home, wording_paths, monkeypatch, capsys, case, json_mode):
+    import aegis_cli.cli as cli
+
+    a, b, plain = wording_paths
+    pin, explicit, cwd = None, None, plain
+    if case in _CLI_HOLD_REASONS:
+        pin = str(a)
+        if case == "pin_conflicts_with_target":
+            explicit = str(b)
+        else:
+            cwd = b
+    elif case in ("home", "root"):
+        explicit = str(home) if case == "home" else home.anchor
+    elif case.endswith("resolution"):
+        target = _wording_resolution_path(plain)
+        if case == "pin_resolution":
+            pin = str(target)
+        else:
+            explicit = str(target)
+    else:
+        pin = {"pin_missing_directory": str(a / "shared.py"), "pin_not_a_workspace": str(plain),
+               "pin_denied": str(home), "pin_denied_root": home.anchor}[case]
+    with pytest.raises((WorkspaceHold, WorkspaceNotFoundError)) as caught:
+        resolve_cli_root(explicit=explicit, cwd=cwd, pin=pin)
+    canonical = caught.value
+    expected = str(canonical)
+    if case.endswith("resolution"):
+        # binding.py:_cli_path includes the OS-error suffix; scan deliberately
+        # omits that untrusted suffix, preserving exactly this fixed sentence.
+        prefix = "AEGIS_WORKSPACE " if pin else "--workspace "
+        expected = prefix + (pin or explicit) + " cannot be resolved"
+        cause = canonical.__cause__
+        assert isinstance(cause, OSError)
+        assert canonical.binding.kind == case
+        assert str(canonical) == expected + ": " + str(cause.__cause__ or cause)
+    argv = ["scan", "app.py"]
+    if explicit:
+        argv += ["--workspace", explicit]
+    if json_mode:
+        argv.append("--json")
+
+    class LaunchPath(type(Path())):
+        @classmethod
+        def cwd(cls):
+            return cwd
+
+    # Only the two OS inputs vary; resolution and the public entry point run in full.
+    monkeypatch.setattr("aegis_cli.cli.Path", LaunchPath)
+    monkeypatch.setattr("aegis_core.config.env_workspace", lambda: pin)
+    for _ in range(2):
+        assert cli.main(argv) == 2
+        captured = capsys.readouterr()
+        if isinstance(canonical, WorkspaceHold) and json_mode:
+            payload = json.loads(captured.out)
+            assert captured.err == ""
+            assert payload["reason"] == canonical.binding.reason
+            assert payload["message"] == canonical.binding.message
+        else:
+            assert captured.out == ""
+            prefix = f"Hold ({canonical.binding.reason}): " if isinstance(canonical, WorkspaceHold) else "Error: "
+            assert captured.err == prefix + expected + "\n", case
+        assert "workspace binding refused" not in captured.out + captured.err, case
+
+
+@pytest.mark.parametrize("json_mode", [False, True], ids=["text", "json"])
+def test_cli_binding_wording_subprocess(home, wording_paths, json_mode):
+    a, b, plain = wording_paths
+    with pytest.raises(WorkspaceHold) as caught:
+        resolve_cli_root(explicit=str(b), cwd=plain, pin=str(a))
+    canonical = caught.value.binding
+    argv = ["scan", "app.py", "--workspace", str(b)] + (["--json"] if json_mode else [])
+    run = subprocess.run([sys.executable, "-m", "aegis_cli", *argv], cwd=plain,
+                         env=_wording_environment(str(a)), text=True, capture_output=True, timeout=15)
+    assert run.returncode == 2
+    if json_mode:
+        assert run.stderr == ""
+        assert json.loads(run.stdout)["message"] == canonical.message
+    else:
+        assert run.stdout == ""
+        assert run.stderr == f"Hold ({canonical.reason}): {canonical.message}\n"
+
+
+def test_binding_wording_matrix_covers_every_resolver_reason():
+    from aegis_core.workspace.binding import REASONS
+
+    assert set(REASONS) == set(_MCP_WORDING_REASONS.values()) | _CLI_HOLD_REASONS
+
+
+@pytest.mark.parametrize("case", ["pin_missing_directory", "pin_denied", "pin_not_a_workspace",
+                                  "no_workspace", "ambiguous_host_roots"])
+def test_undeclared_reason_is_refused_at_construction(home, wording_paths, monkeypatch, case):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.workspace import binding
+
+    inputs = _mcp_wording_inputs(case, home, wording_paths)
+    reason = _MCP_WORDING_REASONS[case]
+    declared = binding.REASONS
+    monkeypatch.setattr("aegis_core.workspace.binding.REASONS", declared - {reason})
+    for _ in range(2):
+        with pytest.raises(ValueError, match="^undeclared workspace binding reason$"):
+            resolve_binding(**inputs)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(resolve_binding, **inputs) for _ in range(3)]
+        for future in futures:
+            with pytest.raises(ValueError, match="^undeclared workspace binding reason$"):
+                future.result(timeout=10)
+    monkeypatch.setattr("aegis_core.workspace.binding.REASONS", declared)
+    assert resolve_binding(**inputs).reason == reason
+
+
+def test_cli_preserves_core_pin_missing_sentence(home, wording_paths, capsys):
+    import aegis_cli.cli as cli
+
+    inputs = _mcp_wording_inputs("pin_missing", home, wording_paths)
+    canonical = resolve_binding(**inputs)
+    assert canonical.reason == "pin_missing"
+    # The CLI's own _cli_path normally raises a different sentence (covered
+    # above). Exercise the formatter with the shared resolver's real refusal to
+    # also pin its "which cannot be resolved" template without patching a caller.
+    args = Namespace(command="scan", _workspace_pin=inputs["pin"])
+    for _ in range(2):
+        assert cli._DefaultErrorPolicy().workspace_error(args, WorkspaceNotFoundError(canonical.message, binding=canonical)) == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == "Error: " + canonical.message + "\n"

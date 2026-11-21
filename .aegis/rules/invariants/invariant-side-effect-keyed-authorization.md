@@ -29,9 +29,9 @@ exemption needs a negative test that sends every alias of a guarded argument.
 ## Incident (v4 Citadel review)
 
 - The receipt gate for `aegis_capture_insight` (aegis_mcp/server.py) inspected
-  only `scaffold_wall`/`scaffold_invariant`/`scaffold_rule`, but the insight
-  writer created gate-tier `.aegis/rules/walls/*.md` whenever `wall_id` was
-  present, and `normalize_tool_call` mapped `rule_id` to `wall_id`. A receiptless
+  only scaffold flags, but the insight writer also accepted an identifier alias
+  that created gate-tier rules. Argument normalization mapped `rule_id` to that
+  unchecked identifier. A receiptless
   call with `rule_id='pwn'` created an attacker-controlled gate rule.
 - The `telemetry_keys` check of `aegis_report_outcome` was made vacuous by an
   always-true `or os.path.isdir(workspace)` disjunct, so receiptless fitness

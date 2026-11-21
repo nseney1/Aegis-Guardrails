@@ -31,9 +31,7 @@ from aegis_cli import NO_HOME_MESSAGE
 from aegis_cli.base import AegisCommand, CommandCategory, host_option, unwritable
 from aegis_cli.hooks import (  # noqa: F401 — re-exported for tests/unit/core/test_worktree_hooks.py
     AEGIS_HOOK_FORMAT,
-    SOMA_HOOK_FORMAT,
     _AEGIS_HOOK_START,
-    _SOMA_HOOK_START,
     install_hook,
 )
 from aegis_cli.init_views import (
@@ -187,6 +185,8 @@ class RemovedOption(argparse.Action):
         self.pointer = pointer
 
     def __call__(self, parser, namespace, values, option_string=None):
+        if getattr(parser, "_error_policy", None) is not None:
+            parser._error_policy()
         print(f"{parser.prog} {self.option_strings[0]} was removed in v4: {self.pointer}", file=sys.stderr)
         parser.exit(2)
 
@@ -216,7 +216,7 @@ def _with_surfaces(host_ids: Sequence[str]) -> str:
 # ── The CI floor ─────────────────────────────────────────────────────────────
 
 
-def _ci_step(root: Path, write: bool, dry_run: bool) -> "Step":
+def _ci_step(root: Path, write: bool, dry_run: bool, workflow: str) -> "Step":
     """The CI workflow: with ``write`` (--ci) ``.github/workflows/aegis.yml`` is created
     unless a file is there; without it nothing is written, and the step says whether a
     workflow already runs aegis check (``present``) or init should print one (``suggested``,
@@ -231,7 +231,7 @@ def _ci_step(root: Path, write: bool, dry_run: bool) -> "Step":
                                                       "aegis check")
         return Step(CI_WORKFLOW_LABEL, "suggested", "no GitHub Actions workflow runs aegis check; "
                                                     "aegis init --ci writes one",
-                    names=[f.relative_to(root).as_posix() for f in files])
+                    names=[f.relative_to(root).as_posix() for f in files], workflow=workflow)
     for directory in (root / ".github", workflows):
         label = directory.relative_to(root).as_posix()
         if directory.is_symlink():
@@ -243,9 +243,7 @@ def _ci_step(root: Path, write: bool, dry_run: bool) -> "Step":
             raise InstallError(f"{label}: resolves outside the repository; aegis init --ci writes the workflow only "
                                "inside it. Re-run without --ci.")
     dest = workflows / "aegis.yml"
-    from aegis_cli.language_capabilities import needs_go_setup
-
-    data = ci_workflow(go_enabled=needs_go_setup(root)).encode("utf-8")
+    data = workflow.encode("utf-8")
     if os.path.lexists(dest):
         try:
             same = not dest.is_symlink() and dest.is_file() and dest.read_bytes() == data
@@ -359,7 +357,7 @@ def hook_refusal(root: Path, *, removing: bool = False) -> Optional[str]:
         return f"{target} is not UTF-8 text; Aegis cannot edit it"
     except OSError as exc:
         return f"{target} cannot be read ({exc.strerror or exc})"
-    if _AEGIS_HOOK_START not in content and _SOMA_HOOK_START not in content:
+    if _AEGIS_HOOK_START not in content:
         reason = None if removing else unwritable(target.parent)
         return f"{reason}, so the hook cannot be {verb}" if reason else None
     if shared:
@@ -381,8 +379,9 @@ def hook_refusal(root: Path, *, removing: bool = False) -> Optional[str]:
 
 def _config_hosts(root: Path, selected: List[str], dry_run: bool, report: Report) -> Step:
     """Add the selected hosts to ``.aegis/config.json`` (``{"v": 1}`` when none)."""
-    from aegis_core.config import ConfigError, RepoConfig, update_repo_config
+    from aegis_core.config import ConfigError, MAX_CONFIG_BYTES, RepoConfig, update_repo_config
     from aegis_core.errors import PathTraversalError
+    from aegis_core.workspace.confinement import read_confined_bytes
     from aegis_core.workspace.layout import WorkspaceLayout
 
     layout = WorkspaceLayout(root)
@@ -401,8 +400,8 @@ def _config_hosts(root: Path, selected: List[str], dry_run: bool, report: Report
             return
         data["hosts"] = ordered_hosts(list(current or []) + selected)
 
-    before = layout.config_file.read_bytes() if layout.config_file.is_file() else None
     try:
+        before = read_confined_bytes(root, layout.config_file, error_type=InstallError, max_bytes=MAX_CONFIG_BYTES)
         if dry_run:
             current = RepoConfig.load(root)
             data: Dict[str, Any] = {"hosts": list(current.hosts)} if before is not None else {}
@@ -413,9 +412,13 @@ def _config_hosts(root: Path, selected: List[str], dry_run: bool, report: Report
         else:
             hosts = update_repo_config(root, change).get("hosts", [])
             result = "created" if before is None else (
-                "unchanged" if layout.config_file.read_bytes() == before else "updated")
+                "unchanged" if read_confined_bytes(root, layout.config_file, error_type=InstallError, max_bytes=MAX_CONFIG_BYTES) == before else "updated")
+    except InstallError as exc:
+        raise InstallError(str(exc).removesuffix("; no rule, config.json or .aegis/.gitignore was changed")) from exc
     except PathTraversalError as exc:
         raise InstallError(str(exc)) from exc
+    except OSError as exc:
+        raise InstallError("cannot read .aegis/config.json") from exc
     except ConfigError as exc:
         report.warn(f"{exc}; left unchanged. Fix it, then rerun aegis init.")
         return Step(CONFIG_LABEL, "kept", str(exc))
@@ -628,7 +631,7 @@ def _steps(ctx: _Context, dry_run: bool, actions: Optional[List[Step]] = None) -
     actions.append(_claude_shim(ctx, dry_run))
     if ctx.skills:
         actions.extend(_skills_steps(ctx, dry_run))
-    actions.append(_ci_step(root, ctx.ci, dry_run))
+    actions.append(_ci_step(root, ctx.ci, dry_run, ci_workflow(go_enabled="go" in drivers)))
 
     if not ctx.no_hooks:
         _hook_steps(root, dry_run, actions)
@@ -679,10 +682,7 @@ def _announce(report: Report, root: Path, selected: List[str], detected: List[st
         report.say(f"  Detected language(s): {', '.join(k.title() for k in sorted(languages))}")
     else:
         report.say("  Project type: unknown (rules are language-agnostic)")
-    from aegis_cli.language_capabilities import capability_lines, runner_suggestion
-
-    for line in capability_lines(root, languages) + runner_suggestion(root):
-        report.say(line)
+    report.language_guidance(root, languages)
     if selected:
         report.say(f"  Hosts: {_with_surfaces(selected)}")
     else:

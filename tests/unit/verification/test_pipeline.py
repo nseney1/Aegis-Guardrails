@@ -1,4 +1,4 @@
-"""Test suite for soma_core/verification/pipeline.py conforming to strict checkpoint conventions."""
+"""Test suite for aegis_core/verification/pipeline.py conforming to strict checkpoint conventions."""
 from __future__ import annotations
 
 import json

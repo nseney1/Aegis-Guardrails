@@ -1,0 +1,130 @@
+{
+  "cases": [
+    {
+      "case_id": "legacy-unassociated-intent",
+      "kind": "legacy",
+      "observable": "exact frozen request/journal/receipt/checkpoint replay and unchanged bytes",
+      "requires": []
+    },
+    {
+      "case_id": "legacy-expired-approval",
+      "kind": "legacy",
+      "observable": "exact frozen request/journal/receipt/checkpoint replay and unchanged bytes",
+      "requires": []
+    },
+    {
+      "case_id": "lost-submit-reply",
+      "kind": "coupled",
+      "observable": "one original intent/association/start; replyloss UNKNOWN never resubmit",
+      "requires": [
+        "actualN4_source_and_fault_API"
+      ]
+    },
+    {
+      "case_id": "launcher-exit-reconnect",
+      "kind": "coupled",
+      "observable": "call child exit does not kill work; reconnect same immutable handle",
+      "requires": [
+        "actualN4_persistent_broker"
+      ]
+    },
+    {
+      "case_id": "operator-succession",
+      "kind": "coupled",
+      "observable": "predecessor denied; current successor reobserves only original association",
+      "requires": [
+        "actualN4_N5_source_freeze"
+      ]
+    },
+    {
+      "case_id": "expiry-and-cap",
+      "kind": "coupled",
+      "observable": "new starts refuse; original expiry/cap never renewed",
+      "requires": [
+        "actualN4_original_deadline"
+      ]
+    },
+    {
+      "case_id": "revocation-race",
+      "kind": "coupled",
+      "observable": "denial orders with actual issuance; fixture read-to-Popen gap not nativeproof",
+      "requires": [
+        "canonical_actual_issuance_fence"
+      ]
+    },
+    {
+      "case_id": "cancel-uncertainty",
+      "kind": "coupled",
+      "observable": "one cancel attempt; ACK/reapedcallchild is not payload quiescence",
+      "requires": [
+        "actualN4_owned_descendant_receipt"
+      ]
+    },
+    {
+      "case_id": "late-conflicting-terminal",
+      "kind": "coupled",
+      "observable": "immutable prior receipt and same intent; late/conflicting replies cannot settle",
+      "requires": [
+        "actualN4_N5_source_freeze"
+      ]
+    },
+    {
+      "case_id": "foreign-handles",
+      "kind": "coupled",
+      "observable": "wrong source/association/endpoint/thread/turn refuses; zero foreign signals",
+      "requires": [
+        "actualN4_fresh_canonical_handle"
+      ]
+    },
+    {
+      "case_id": "strict-frame-coupling",
+      "kind": "coupled",
+      "observable": "malformed/oversized/duplicate/deep/nonfinite actual broker frames refuse; no standalonecodec rerun",
+      "requires": [
+        "actualN4_N2_wire_freeze"
+      ]
+    },
+    {
+      "case_id": "original-job-mapping",
+      "kind": "coupled",
+      "observable": "no turnid/GATES.job correlation; missing mapping remains dependency held",
+      "requires": [
+        "original_job_claim_recipe_binding_producer"
+      ]
+    },
+    {
+      "case_id": "unknown-retains-capacity",
+      "kind": "coupled",
+      "observable": "UNKNOWN never releases/resubmits; original ledger reservation unchanged",
+      "requires": [
+        "original_job_binding_and_workspace_source"
+      ]
+    },
+    {
+      "case_id": "exact-settlement-witness",
+      "kind": "coupled",
+      "observable": "release only exact original result/receipt/source/claim+ownedquiescence independent witness",
+      "requires": [
+        "original_job_settlement_producer"
+      ]
+    },
+    {
+      "case_id": "unsupported-process-visibility",
+      "kind": "coupled",
+      "observable": "evidence_error/UNKNOWN preserved without guessed PID identity",
+      "requires": [
+        "actualN5_public_projection"
+      ]
+    },
+    {
+      "case_id": "competing-calls",
+      "kind": "coupled",
+      "observable": "one original attempt; no seconddispatch queue",
+      "requires": [
+        "actualN4_N2_canonical_transaction"
+      ]
+    }
+  ],
+  "provenance": "reconstructed compatibility fixtures, not captured historical execution or native qualification",
+  "schema": "aegis.foundation-case-matrix/v1"
+}

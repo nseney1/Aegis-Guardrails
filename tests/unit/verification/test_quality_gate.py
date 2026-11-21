@@ -9,12 +9,49 @@ Verifies the deterministic AST and file-matching quality gate checks:
 import sys
 import textwrap
 
+import pytest
+
+from aegis_core.verification import quality_gate
+
 REPO_ROOT = str(next(p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").exists()))
 sys.path.insert(0, REPO_ROOT)
 
 from aegis_core.verification import ToolEvidence
 
 from aegis_core.verification.quality_gate import check_assertion_density, check_no_bare_pass
+
+
+@pytest.mark.parametrize("source", [
+    "def test_real():\n    assert True\n",
+    "def test_missing():\n    value = 1\n",
+    "def test_stub():\n    pass\n",
+    'async def test_stub():\n    "docstring"\n    ...\n',
+    "@pytest.fixture\ndef test_fixture():\n    pass\n",
+    "if HAVE_ENV:\n    def test_env():\n        assert True\n"
+    "else:\n    def test_env():\n        pytest.skip('unavailable')\n",
+])
+def test_paired_quality_evidence_matches_public_wrappers(tmp_path, source):
+    path = tmp_path / "test_pair.py"
+    path.write_text(source, encoding="utf-8")
+    filename = str(path)
+    assert quality_gate.check_test_quality(filename) == (
+        check_assertion_density(filename), check_no_bare_pass(filename),
+    )
+
+
+@pytest.mark.parametrize("name", [
+    "check_test_quality", "check_assertion_density", "check_no_bare_pass",
+])
+def test_quality_public_checks_preserve_input_errors(tmp_path, name):
+    filename = str(tmp_path / "test_invalid.py")
+    check = getattr(quality_gate, name)
+    with pytest.raises(FileNotFoundError) as error:
+        check(filename)
+    assert error.value.filename == filename
+    Path(filename).write_text("def test_broken(:\n", encoding="utf-8")
+    with pytest.raises(SyntaxError) as error:
+        check(filename)
+    assert (error.value.filename, error.value.lineno) == (filename, 1)
 
 
 class TestCheckAssertionDensity:

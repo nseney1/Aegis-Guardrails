@@ -37,14 +37,16 @@ One policy, applied everywhere:
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import os
 import threading
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from aegis_core.match import first_match, is_test_path, matching_files
-from aegis_core.rule_inventory import RuleInventory, RuleInventoryEntry, inventory_rules
+from aegis_core.rule_inventory import (
+    MAX_RULE_BYTES, RuleInventory, RuleInventoryEntry, classification_prefix, inventory_rules,
+)
 from aegis_core.taxonomy import DIR_RULE_TYPES, RULE_TYPES, legacy_rule_type
 from aegis_core.workspace import as_workspace
 from aegis_core.workspace.layout import RULES_RELDIR
@@ -65,6 +67,7 @@ __all__ = [
     "is_legacy_key",
     "load_rules",
     "lf_digest",
+    "rule_path_id",
     "validate_rule_names",
     "workspace_root",
 ]
@@ -173,6 +176,7 @@ class Rule:
     error: Optional[str] = None
     legacy_keys: Tuple[str, ...] = ()  # derived counters and retired keys the file still has
     raw: bytes = field(default=b"", repr=False, compare=False)
+    size: Optional[int] = field(default=None, repr=False, compare=False)  # Original size for refused oversized records.
 
     @property
     def ok(self) -> bool:
@@ -310,6 +314,9 @@ def _stem(relative: str) -> str:
     return os.path.splitext(relative.rsplit("/", 1)[-1])[0]
 
 
+rule_path_id = _stem
+
+
 def _target_paths_error(value: Any) -> Optional[str]:
     if value is None or isinstance(value, str):
         return None
@@ -395,25 +402,26 @@ def _parse(entry: RuleInventoryEntry, rule_type: Optional[str], directory: str) 
     )
 
 
-def _looks_like_rule(rule: Rule, any_frontmatter: bool = False) -> bool:
+def _looks_like_rule(rule: Rule, any_frontmatter: bool = False, include_identity: bool = False) -> bool:
     # A file with no frontmatter at all is a note. Frontmatter that cannot be read may
-    # hold any key, so it counts as a rule; so does any frontmatter in a v3 type
-    # directory, where v3 served every file as a rule of that directory's type.
+    # hold any key, so it counts as a rule. Type-name directories reject any metadata;
+    # generic directories recognize identity keys while title-only notes stay ignored.
     if rule.error == _NO_FRONTMATTER:
         return False
     if any_frontmatter or not rule.ok:
         return True
-    return any(key in rule.meta for key in _RULE_SIGNAL_KEYS)
+    keys = _RULE_SIGNAL_KEYS + (("id", "enforcement") if include_identity else ())
+    return any(key in rule.meta for key in keys)
 
 
 def _unserved(
     entry: RuleInventoryEntry, directory: str, why: str, fix: str, ignored: bool = True,
-    any_frontmatter: bool = False,
+    any_frontmatter: bool = False, include_identity: bool = False,
 ) -> Tuple[Optional[Rule], Optional[Ignored]]:
     """A markdown file the loader never serves: an error record when it looks like a rule;
     otherwise an ``Ignored`` record, or nothing when ``ignored`` is False (a README)."""
     rule = _parse(entry, None, directory)
-    if _looks_like_rule(rule, any_frontmatter):
+    if _looks_like_rule(rule, any_frontmatter, include_identity):
         message = f"not served: {why} ({fix})"
         if not rule.ok:
             message = f"{message}; {rule.error}"
@@ -448,7 +456,8 @@ def _classify(entry: RuleInventoryEntry, parts: List[str]) -> Tuple[Optional[Rul
         fix = f"a v3 type directory: aegis migrate moves its rules to {RULES_RELDIR}/{RULE_TYPES[legacy].directory}/"
         return _unserved(entry, parts[0], f"{parts[0]}/ is not a rule type directory", fix,
                          any_frontmatter=True) + (None,)
-    return _unserved(entry, parts[0], f"{parts[0]}/ is not a rule type directory", expected) + (None,)
+    return _unserved(entry, parts[0], f"{parts[0]}/ is not a rule type directory", expected,
+                     include_identity=True) + (None,)
 
 
 def load_rules(workspace: Any, inventory: Optional[RuleInventory] = None) -> RuleSet:
@@ -469,10 +478,22 @@ def load_rules(workspace: Any, inventory: Optional[RuleInventory] = None) -> Rul
         parts = relative[len(prefix):].split("/")
         if any(p.startswith(".") for p in parts[:-1]):
             continue  # a hidden directory (.archive) keeps rules out of service on purpose
+        original = entry
+        oversized = entry.size > MAX_RULE_BYTES
+        if oversized:
+            data = entry.prefix or entry.content[:MAX_RULE_BYTES + 1]
+            bounded = classification_prefix(data)
+            data = data if bounded is None else bounded
+            entry = replace(entry, content=data, size=len(data))
         rule, skipped, rule_type = _classify(entry, parts)
         if rule_type is not None:
             rule = _parse(entry, rule_type, parts[0])
         if rule is not None:
+            if oversized:
+                message = f"{original.size} bytes exceeds the {MAX_RULE_BYTES} byte limit (too_large)"
+                if rule.error and _UNTERMINATED in rule.error:
+                    message += "; " + _UNTERMINATED
+                rule = replace(rule, error=message, digest=original.digest, body="", raw=b"", size=original.size)
             loaded.append(rule)
         if skipped is not None:
             ignored.append(skipped)
@@ -490,8 +511,7 @@ def load_rules(workspace: Any, inventory: Optional[RuleInventory] = None) -> Rul
             message = f"duplicate rule id {rule_id!r} (also {others})"
             if rule.error:
                 message = f"{message}; {rule.error}"
-            loaded[i] = Rule(rule.id, rule.path, rule.type, rule.meta, rule.body, rule.digest, message,
-                             rule.legacy_keys, rule.raw)
+            loaded[i] = replace(rule, error=message)
     return RuleSet(tuple(loaded), tuple(ignored), snapshot.fingerprint)
 
 

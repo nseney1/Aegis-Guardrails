@@ -5,6 +5,7 @@ Real git repositories in tmp dirs; a corrupt object is a forged loose object on 
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import subprocess
@@ -502,6 +503,125 @@ def test_reading_the_base_of_a_clean_tree_costs_two_git_calls_with_an_origin(tmp
 
 
 @needs_git
+@pytest.mark.parametrize("extra_bytes", [1, 128])
+def test_oversized_reviewed_blob_and_working_tree_share_bounded_fingerprint(tmp_path, extra_bytes):
+    from aegis_core.packs import MAX_RULE_BYTES
+    from aegis_core.rules import RuleCache
+
+    repo = make_repo(tmp_path)
+    text = rule_text("inv-a")
+    text += "x" * (MAX_RULE_BYTES + extra_bytes - len(text.encode("utf-8")))
+    repo.write(path_of("inv-a"), text)
+    commit = repo.commit("review an oversized rule")
+    repo.git("update-ref", "refs/remotes/origin/main", commit)
+    working = load_rules(repo.root)
+    cache = RuleCache()
+    for _ in range(2):
+        view = rule_integrity.effective(repo.root, cache)
+        assert view.ruleset.fingerprint == working.fingerprint
+        assert view.unreviewed == ()
+        rule = next(rule for rule in view.ruleset.rules if rule.id == "inv-a")
+        assert not rule.ok and "too_large" in rule.error
+        assert rule.raw == b"" and rule.body == ""
+
+
+@needs_git
+@pytest.mark.parametrize("change", ["deleted", "replaced", "oversized_replaced", "neighbor"])
+def test_oversized_reviewed_rule_refusal_survives_composition_and_ci(tmp_path, change):
+    from aegis_core.rule_inventory import MAX_RULE_BYTES
+    from aegis_core.rules import RuleCache
+
+    repo = make_repo(tmp_path)
+    original = rule_text("inv-a") + "x" * MAX_RULE_BYTES
+    repo.write(path_of("inv-a"), original)
+    base = repo.commit("review an oversized rule")
+    repo.git("update-ref", "refs/heads/main", base)
+    repo.git("update-ref", "refs/remotes/origin/main", base)
+    target = repo.root / path_of("inv-a")
+    if change == "deleted":
+        target.unlink()
+    elif change == "replaced":
+        repo.write(path_of("inv-a"), rule_text("inv-a"))
+    elif change == "oversized_replaced":
+        repo.write(path_of("inv-a"), original.replace("# The title", "# New title") + "z")
+    else:
+        repo.write(path_of("trap-a", "trap"), rule_text("trap-a", "trap", "advisory", body="# New advice"))
+    repo.commit("change working rules")
+    cache = RuleCache()
+    for _ in range(2):
+        view = rule_integrity.effective(repo.root, cache)
+        refused = [rule for rule in view.ruleset.rules if not rule.ok and "too_large" in rule.error]
+        assert refused, "composition lost the oversized reviewed refusal"
+        result = scan_mod.scan(repo.root, ["src/app.py"])
+        assert result["status"] == "FAIL"
+        assert any("too_large" in row["error"] for row in result["rule_errors"])
+        report = rule_integrity.check_ci(repo.root, "main")
+        assert report.rules_checked == 1
+        if change == "neighbor":
+            assert report.passed and report.weakenings == ()
+        else:
+            assert not report.passed and report.approval is None
+            assert [(row.rule, row.code) for row in report.weakenings] == [("inv-a", "deleted")]
+    repo.write(path_of("inv-a"), original)
+    retried = rule_integrity.effective(repo.root, cache)
+    assert any(not rule.ok and "too_large" in rule.error for rule in retried.ruleset.rules)
+
+
+@needs_git
+@needs_signing
+@pytest.mark.parametrize("replacement", [False, True], ids=["deleted", "replaced"])
+def test_oversized_reviewed_change_requires_a_valid_signed_approval(tmp_path, replacement):
+    from aegis_core.rule_inventory import MAX_RULE_BYTES
+
+    key, pub = hg.keygen(tmp_path / "keys", "human")
+    repo = make_repo(tmp_path, signer_pub=pub)
+    repo.write(path_of("inv-a"), rule_text("inv-a") + "x" * MAX_RULE_BYTES)
+    base = repo.commit("review oversized invariant")
+    repo.git("update-ref", "refs/heads/main", base)
+    if replacement:
+        repo.write(path_of("inv-a"), rule_text("inv-a"))
+    else:
+        (repo.root / path_of("inv-a")).unlink()
+    repo.commit("change reviewed invariant")
+    report = rule_integrity.check_ci(repo.root, "main")
+    assert not report.passed and report.approval is None
+    approve(repo, key)
+    report = rule_integrity.check_ci(repo.root, "main")
+    assert report.passed and report.approval.valid
+    assert [(row.rule, row.code) for row in report.weakenings] == [("inv-a", "deleted")]
+
+
+@needs_git
+@pytest.mark.parametrize("surface", ["composition", "ci"])
+def test_oversized_reviewed_duplicate_records_keep_their_path_identity(tmp_path, surface):
+    from aegis_core.rule_inventory import MAX_RULE_BYTES
+
+    repo = make_repo(tmp_path)
+    original = path_of("inv-a")
+    duplicate = ".aegis/rules/gates/inv-a.md"
+    text = rule_text("inv-a") + "x" * MAX_RULE_BYTES
+    for path in (original, duplicate):
+        repo.write(path, text)
+    base = repo.commit("review oversized duplicate records")
+    repo.git("update-ref", "refs/heads/main", base)
+    repo.git("update-ref", "refs/remotes/origin/main", base)
+    if surface == "composition":
+        repo.write(path_of("trap-a", "trap"), rule_text("trap-a", "trap", "advisory", body="# New advice"))
+        view = rule_integrity.effective(repo.root)
+        refused = [rule for rule in view.ruleset.rules if rule.size is not None]
+        assert {rule.path for rule in refused} == {original, duplicate}
+        assert all(not rule.ok and "too_large" in rule.error for rule in refused)
+    else:
+        (repo.root / original).unlink()
+        repo.commit("delete one oversized duplicate")
+        for _ in range(2):
+            report = rule_integrity.check_ci(repo.root, "main")
+            assert report.rules_checked == 2
+            assert not report.passed and report.approval is None
+            assert [(row.path, row.code) for row in report.weakenings] == [(original, "deleted")]
+
+
+@needs_git
 def test_the_base_rules_are_parsed_once_per_anchor_and_working_tree(tmp_path, monkeypatch):
     repo = make_repo(tmp_path)
     repo.write(path_of("trap-a", "trap"), rule_text("trap-a", "trap", "advisory", body="# Softer\n\nEdited.\n"))
@@ -642,6 +762,40 @@ def test_a_spy_at_the_git_boundary_does_not_bypass_the_base_caches(tmp_path, mon
 
 
 # ── the CI check ─────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("mode", [None, "none", "review", "signature"])
+@pytest.mark.parametrize("with_rows", [False, True])
+def test_owner_review_wire_keys_keep_one_type_on_retry_and_concurrent_reads(mode, with_rows):
+    from aegis_core.approval_policy import Policy
+
+    rows = (Weakening("approval_mode_lowered", target, ".aegis/config.json", "ordinary")
+            for target in ("develop", "main"))
+    report = rule_integrity.CiReport("base", "head", "base", 1, (), None,
+        approval_policy=Policy(mode, "main"), owner_review_required=tuple(rows) if with_rows else ())
+    baseline = rule_integrity.CiReport("base", "head", "base", 1, (), None,
+        approval_policy=Policy(mode, "main")).as_dict()
+
+    def render(_):
+        document = report.as_dict()
+        assert document["schema"] == "aegis.rule_integrity/v1"
+        if mode is None:
+            assert "owner_review_required" not in document
+        else:
+            assert document["owner_review_required"] is (mode == "review")
+        if with_rows:
+            findings = document.pop("owner_review_findings")
+            assert [row["rule"] for row in findings] == ["develop", "main"]
+            assert all(set(row) == {"code", "rule", "path", "message"} and
+                       all(isinstance(value, str) for value in row.values()) for row in findings)
+        else:
+            assert "owner_review_findings" not in document
+        return {key: value for key, value in document.items() if key != "checked_at"}
+
+    expected = {key: value for key, value in baseline.items() if key != "checked_at"}
+    assert render(0) == render(1) == expected
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(render, range(6))) == [expected] * 6
+
 
 @needs_git
 def test_the_report_names_the_range_and_counts_the_binding_rules(tmp_path, capsys):

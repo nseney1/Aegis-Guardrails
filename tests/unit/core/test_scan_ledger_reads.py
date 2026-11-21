@@ -1,8 +1,8 @@
 """One ledger read per call (R-structure-5, R-evidence-19): totals, credits and T4 events of a
 ``for_rules`` call come from one snapshot; only ``record_exposure``'s locked dedup read is separate.
 
-Read-only opens of the ledger file are counted at ``storage._open_regular`` (the one opener every
-ledger reader uses), so the count is the same on every OS. Nothing is timed.
+View and exposure-row opens are counted at ``storage._open_regular`` on every OS.
+Keyed-index opens are covered separately by test_scan_spawn_budget. Nothing is timed.
 """
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import time
+from types import SimpleNamespace
 from typing import Callable, Dict, List
 
 import pytest
@@ -102,7 +104,39 @@ def _mcp_scan(root: Path, session: str = "s1") -> Dict:
 
 def test_an_mcp_scan_reads_the_ledger_at_most_twice_and_once_when_its_exposures_are_kept(ws, monkeypatch):
     assert _reads(monkeypatch, ws, lambda: _mcp_scan(ws)) <= 2
+    assert _reads(monkeypatch, ws, lambda: _mcp_scan(ws)) <= 2
+    from aegis_core import credit_memo
+    if not credit_memo.filesystem_clock_supported():
+        assert _reads(monkeypatch, ws, lambda: _mcp_scan(ws)) == 2
+        return
+    path = ledger.ledger_path(ws)
+    old = time.time_ns() - 10_000_000_000
+    os.utime(path, ns=(old, old))
+    initial = path.stat()
+
+    def settled_generation(info):
+        if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) != (
+                initial.st_dev, initial.st_ino, initial.st_size, initial.st_mtime_ns, initial.st_ctime_ns):
+            return info
+        fields = {name: getattr(info, name) for name in dir(info) if name.startswith("st_")}
+        fields["st_ctime_ns"] = old
+        return SimpleNamespace(**fields)
+
+    for module in (storage, credit_memo, ledger):
+        monkeypatch.setattr(module, "os", SimpleNamespace(**dict(vars(module.os),
+            stat=lambda *a, **kw: settled_generation(os.stat(*a, **kw)),
+            lstat=lambda *a, **kw: settled_generation(os.lstat(*a, **kw)),
+            fstat=lambda fd: settled_generation(os.fstat(fd)))))
+    assert _reads(monkeypatch, ws, lambda: _mcp_scan(ws)) <= 2
     assert _reads(monkeypatch, ws, lambda: _mcp_scan(ws)) == 1
+
+
+def test_an_mcp_scan_without_filesystem_clock_keeps_locked_reads(ws, monkeypatch):
+    from aegis_core import credit_memo
+
+    monkeypatch.setattr(credit_memo, "filesystem_clock_supported", lambda: False)
+    for _ in range(3):
+        assert _reads(monkeypatch, ws, lambda: _mcp_scan(ws)) == 2
 
 
 def test_fitness_reads_the_ledger_once_and_not_at_all_from_a_view(ws, monkeypatch):
@@ -165,7 +199,7 @@ def test_every_t4_event_arm_reads_as_before(ws):
         _row(event="exposure", rule="unknown-rule", session="s9", host="h", paths=[], rev=None),
     ])
     with open(ledger.ledger_path(ws), "a", encoding="utf-8", newline="\n") as fh:
-        fh.write(json.dumps({"cell": "trap-b", "signal": "success", "source": "mcp", "timestamp": "2026-10-08T00:00:00Z",
+        fh.write(json.dumps({"rule_id": "trap-b", "signal": "success", "source": "mcp", "timestamp": "2026-10-08T00:00:00Z",
                              "event_id": "v1-alias"}) + "\n")
     now = parse_utc("2026-10-20T00:00:00Z")
     got = {rid: (f.triggers, f.tp, f.fp, f.caught, f.leaked, f.contested, f.eligible_sessions, f.adjudicated_n)

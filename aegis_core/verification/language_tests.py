@@ -253,8 +253,10 @@ def run_language_snapshot(plan: LanguageTestPlan, snapshot: Path, workspace: Pat
                 return RunOutcome(plan.language, "repo-runner" if plan.language == "ts" else "aegis", 124, timed_out=True,
                                   incomplete_errors=frozenset({"deadline_exceeded"}))
             status = testexec.run_tests(command, snapshot, env, timeout, scratch / "unused-pytest.xml", output)
+            deadline_errors = frozenset({"deadline_exceeded"} if status.timed_out and deadline is not None
+                                        and timeout < plan.timeout_s else ())
             outcome = RunOutcome(plan.language, "repo-runner" if plan.language == "ts" else "aegis",
-                                 status.exit, status.timed_out)
+                                 status.exit, status.timed_out, incomplete_errors=deadline_errors)
             text = _read(output)
             markers = {"go": ("module lookup disabled", "missing go.sum entry for module providing package"),
                        "rust": ("no matching package named", "failed to download"),
@@ -276,6 +278,8 @@ def run_language_snapshot(plan: LanguageTestPlan, snapshot: Path, workspace: Pat
                         outcome.build_errors, outcome.collection_errors, outcome.incomplete_errors,
                         outcome.conflict_errors, outcome.mapping_errors)):
                 outcome = replace(outcome, incomplete_errors=frozenset({"no_tests_collected"}))
+            if deadline_errors:
+                outcome = replace(outcome, incomplete_errors=outcome.incomplete_errors | deadline_errors)
         return outcome
     except _Unavailable as exc:
         return _unavailable(plan, exc.reason, exc.detail, outcome)

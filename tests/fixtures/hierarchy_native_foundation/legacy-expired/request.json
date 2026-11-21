@@ -1,0 +1,4 @@
+{
+  "raw": "{\n \"authority\": \"legacy-expired-approval\",\n \"continuation\": {\n  \"expires_at\": \"2000-01-01T00:00:00Z\",\n  \"max_starts\": 1,\n  \"members\": []\n },\n \"id\": \"legacy-expired-approval\",\n \"next_decision\": \"review retained failure evidence\",\n \"operation\": \"targeted-tests\",\n \"owner\": \"engine/coordinator\",\n \"paths\": [\n  \"/fixture/engine/tests\"\n ],\n \"phase\": \"validation\",\n \"prerequisites\": [],\n \"schema\": \"aegis.lifecycle-request/v1\",\n \"source\": {\n  \"commit\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"dirty_sha256\": \"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\n  \"tree\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"\n },\n \"team\": \"engine\",\n \"version\": 1\n}\n",
+  "sha256": "7dfe9fab248d36523ef82e584388c5adb167038d7d3209cca3700f533bc764a7"
+}

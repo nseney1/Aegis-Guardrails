@@ -226,10 +226,10 @@ def _mutation_project(root: Path, source: str, suite: str, test_code: bytes) -> 
     ("mylib/verification/runner.py", "tests/unit/verification/test_layer1.py"),
     ("nested/aegis_core/verification/runner.py", "tests/unit/verification/test_layer1.py"),
     ("aegis_core_extra/verification/runner.py", "tests/unit/verification/test_layer1.py"),
-    ("soma_core/verification/runner.py", "tests/unit/verification/test_layer1.py"),
+    ("foreign_core/verification/runner.py", "tests/unit/verification/test_layer1.py"),
     ("nested/aegis_mcp/handlers/governance.py", "tests/unit/mcp/test_mcp_handlers.py"),
     ("prefixaegis_mcp/handlers/governance.py", "tests/unit/mcp/test_mcp_handlers.py"),
-    ("soma_mcp/handlers/governance.py", "tests/unit/mcp/test_mcp_handlers.py"),
+    ("foreign_mcp/handlers/governance.py", "tests/unit/mcp/test_mcp_handlers.py"),
     ("nested/aegis_core/skills/catalog.py", "tests/unit/core/test_skills.py"),
 ])
 def test_foreign_paths_do_not_select_aegis_mutation_suites(tmp_path: Path, source: str, suite: str):
@@ -272,7 +272,7 @@ def test_generic_sources_still_select_their_matching_tests(tmp_path: Path, sourc
     ]
 
 
-@pytest.mark.parametrize("source", ["nested/aegis_cli/scan.py", "soma_cli/scan.py"])
+@pytest.mark.parametrize("source", ["nested/aegis_cli/scan.py", "foreign_cli/scan.py"])
 def test_foreign_package_names_do_not_prioritize_aegis_test_homes(tmp_path: Path, source: str):
     module = source[:-3].replace("/", ".")
     test = f"from {module} import main\ndef test_double():\n    assert main(2) == 4\n".encode("utf-8")

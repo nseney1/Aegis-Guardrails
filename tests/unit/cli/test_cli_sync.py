@@ -15,6 +15,97 @@ from aegis_cli.cli import main
 from aegis_core.telemetry_engine import ledger
 
 
+@pytest.mark.parametrize("plain, tty", [(True, True), (False, False), (False, True)])
+def test_public_sync_warning_badges_respect_output_context(ws, monkeypatch, capsys, plain, tty):
+    import sys
+
+    monkeypatch.delenv("TERM", raising=False)
+    path = ws / ".aegis" / "rules" / "traps" / "nowhere.md"
+    path.write_text("---\nid: nowhere\nhypothesis: h\n---\nB\n", encoding="utf-8")
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: tty)
+    assert main(["sync", *(["--plain"] if plain else [])]) == 0
+    output = capsys.readouterr().out
+    if plain or not tty:
+        assert "[WARN] nowhere: applies to no file" in output
+        assert not any(icon in output for icon in ("✅", "❌", "⚠", "ℹ"))
+    else:
+        assert "⚠️  nowhere: applies to no file" in output
+
+
+@pytest.mark.parametrize("plain, tty", [(True, True), (False, False)])
+def test_sync_error_and_advisory_paths_keep_plain_badges(ws, monkeypatch, capsys, plain, tty):
+    import sys
+
+    traps = ws / ".aegis" / "rules" / "traps"
+    caller_name = "⚠️  caller ✅.md"
+    (traps / caller_name).write_text("---\nid: [x\n---\n", encoding="utf-8")
+    (ws / ".aegis" / "rules" / "note.md").write_text("A caller's note\n", encoding="utf-8")
+    (ws / ".aegis" / "config.json").write_text('{"v":1,"expiry":{"days":7}}', encoding="utf-8")
+    with ledger.ledger_path(ws).open("ab") as handle:
+        handle.write(b"not json\n")
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: tty)
+    assert main(["sync", "--apply", *(["--plain"] if plain else [])]) == 1
+    output = capsys.readouterr().out
+    assert f"[FAIL] .aegis/rules/traps/{caller_name}:" in output
+    assert "[WARN] .aegis/rules/note.md:" in output
+    assert "[WARN] The ledger is incomplete" in output
+    assert "[FAIL] not applied:" in output
+    assert "[INFO] expiry.days" in output
+    assert "⚠️" not in output.replace(caller_name, "")
+
+
+@pytest.mark.parametrize("failure", ["refusal", "pr-error"])
+def test_sync_keeps_long_next_actions_and_redacts_diagnostics(tmp_path, monkeypatch, capsys, failure):
+    import argparse
+    import shutil
+    from types import SimpleNamespace
+    from aegis_cli.sync import run_sync
+    from aegis_core import gitsafe
+    from tests import helpers_syncpr as hs
+
+    if shutil.which("git") is None:
+        pytest.skip("git is required for the public sync PR flow")
+    home = tmp_path / "home"
+    home.mkdir()
+    for name in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(name, str(home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for name in ("GIT_CONFIG_GLOBAL", "CLAUDE_CONFIG_DIR", "CODEX_HOME"):
+        monkeypatch.delenv(name, raising=False)
+    repo = hs.make(tmp_path)
+    credential = "ghp_" + "A" * 20 + "\x1b[31m" + "B" * 16
+    action = "set branch.main.remote to origin or push the branch yourself"
+    diagnostic = "diagnostic detail " * 30 + credential + "; " + action
+    assert 300 < len(diagnostic) < 4096
+    calls = []
+
+    def gh(argv, cwd=None):
+        calls.append(list(argv))
+        return SimpleNamespace(returncode=1, stdout="", stderr=diagnostic)
+
+    if failure == "refusal":
+        real_run = gitsafe.run
+
+        def git_boundary(argv, *args, **kwargs):
+            if argv == ["config", "--get", "branch.main.remote"]:
+                raise gitsafe.GitError(diagnostic)
+            return real_run(argv, *args, **kwargs)
+
+        monkeypatch.setattr(gitsafe, "run", git_boundary)
+    before = repo.rule_path.read_bytes()
+    assert run_sync(argparse.Namespace(_root=repo.root, pr=True, plain=True), gh_runner=gh) == 1
+    output = capsys.readouterr().out
+    assert action in output
+    assert "REDACTED" in output and "A" * 10 not in output and "B" * 10 not in output
+    assert "\x1b" not in output
+    if failure == "refusal":
+        assert "[FAIL] no pull request opened:" in output
+        assert not calls and repo.rule_path.read_bytes() == before
+    else:
+        assert "[FAIL] PR creation failed:" in output
+        assert len(calls) == 1 and calls[0][:2] == ["pr", "create"]
+
+
 def _rule(ws: Path, directory: str, rule_type: str, rule_id: str) -> Path:
     path = ws / ".aegis" / "rules" / directory / f"{rule_id}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -186,7 +277,7 @@ def test_rules_that_apply_to_no_file_are_named(ws, capsys):
     (ws / ".aegis" / "rules" / "traps" / "nowhere.md").write_text("---\nid: nowhere\nhypothesis: h\n---\nB\n", encoding="utf-8")
 
     assert main(["sync"]) == 0
-    assert "⚠️  nowhere: applies to no file (no target_paths)" in capsys.readouterr().out
+    assert "[WARN] nowhere: applies to no file (no target_paths)" in capsys.readouterr().out
 
     assert main(["sync", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["untargeted"] == [{"id": "nowhere", "path": ".aegis/rules/traps/nowhere.md"}]

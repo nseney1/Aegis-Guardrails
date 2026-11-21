@@ -119,3 +119,10 @@ def test_render_escapes_table_cells(gen):
     }
     text = gen.render(cli, {"tools": []})
     assert "| `--y` | `Y` |  | one \\| two three |" in text
+
+
+def test_reference_distinguishes_manager_scope_and_repository_mcp(gen, snapshots):
+    text = gen.render(*snapshots)
+    assert "The manager `workspace` namespace requires `--config` and refuses `--workspace`." in text
+    assert "This section describes repository mode." in text
+    assert "manager_mcp_tools.json" in text

@@ -147,7 +147,7 @@ RUST_DRIVER = "must-not-execute-legacy-rust-driver"
 @pytest.mark.parametrize("interpreter", ["python3", "python"])
 def test_python_driver_runs_when_interpreter_name_is_not_on_path(tmp_path, monkeypatch, interpreter):
     """A python.org install on Windows has no python3.exe (#144); the driver
-    must still run, using the interpreter that is running soma."""
+    must still run, using the interpreter that is running aegis."""
     empty_bin = tmp_path / "empty-bin"
     empty_bin.mkdir()
     monkeypatch.setenv("PATH", str(empty_bin))

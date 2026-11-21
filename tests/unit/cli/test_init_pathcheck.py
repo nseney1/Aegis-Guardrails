@@ -1,4 +1,4 @@
-"""Unit tests for soma init proactive PATH guidance integration."""
+"""Unit tests for aegis init proactive PATH guidance integration."""
 from __future__ import annotations
 
 import argparse
@@ -10,7 +10,7 @@ from aegis_cli.init import run_init
 
 
 class TestInitPathGuidance:
-    def test_init_displays_path_hint_when_soma_missing_from_path(
+    def test_init_displays_path_hint_when_aegis_missing_from_path(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ):
         target = tmp_path / "project"
@@ -19,7 +19,7 @@ class TestInitPathGuidance:
         # Monkeypatch build_hint in aegis_cli.pathcheck to return a simulated diagnostic
         monkeypatch.setattr(
             "aegis_cli.pathcheck.build_hint",
-            lambda **kwargs: "ℹ️  'soma' was installed to ~/.local/bin, which is not on your zsh PATH.\n      export PATH=\"$HOME/.local/bin:$PATH\"",
+            lambda **kwargs: "ℹ️  'aegis' was installed to ~/.local/bin, which is not on your zsh PATH.\n      export PATH=\"$HOME/.local/bin:$PATH\"",
         )
 
         args = argparse.Namespace(
@@ -35,16 +35,16 @@ class TestInitPathGuidance:
         assert ret == 0
 
         captured = capsys.readouterr().out
-        assert "ℹ️  'soma' was installed to ~/.local/bin, which is not on your zsh PATH." in captured
+        assert "ℹ️  'aegis' was installed to ~/.local/bin, which is not on your zsh PATH." in captured
         assert "export PATH=\"$HOME/.local/bin:$PATH\"" in captured
 
-    def test_init_silent_when_soma_already_on_path(
+    def test_init_silent_when_aegis_already_on_path(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ):
         target = tmp_path / "project2"
         target.mkdir()
 
-        # Monkeypatch build_hint to return None (meaning soma is already on PATH)
+        # Monkeypatch build_hint to return None (meaning aegis is already on PATH)
         monkeypatch.setattr("aegis_cli.pathcheck.build_hint", lambda **kwargs: None)
 
         args = argparse.Namespace(

@@ -1,0 +1,149 @@
+{
+  "aegis_cli/doctor.py": {
+    ".claude": 5,
+    ".codex": 0,
+    "/usr/bin/python3": 0,
+    "CLAUDE_CONFIG_DIR": 0,
+    "CODEX_HOME": 0
+  },
+  "aegis_cli/doctor_base.py": {
+    ".claude": 9,
+    ".codex": 1,
+    "/usr/bin/python3": 0,
+    "CLAUDE_CONFIG_DIR": 3,
+    "CODEX_HOME": 1
+  },
+  "aegis_cli/doctor_findings.py": {
+    ".claude": 3,
+    ".codex": 0,
+    "/usr/bin/python3": 0,
+    "CLAUDE_CONFIG_DIR": 0,
+    "CODEX_HOME": 0
+  },
+  "aegis_cli/doctor_repair.py": {
+    ".claude": 1,
+    ".codex": 0,
+    "/usr/bin/python3": 0,
+    "CLAUDE_CONFIG_DIR": 0,
+    "CODEX_HOME": 0
+  },
+  "aegis_cli/hooks/registrar.py": {
+    ".claude": 4,
+    ".codex": 5,
+    "/usr/bin/python3": 0,
+    "CLAUDE_CONFIG_DIR": 2,
+    "CODEX_HOME": 2
+  },
+  "aegis_cli/hooks/runtime.py": {
+    ".claude": 0,
+    ".codex": 2,
+    "/usr/bin/python3": 0,
+    "CLAUDE_CONFIG_DIR": 0,
+    "CODEX_HOME": 0
+  },
+  "aegis_cli/init.py": {
+    ".claude": 1,
+    ".codex": 0,
+    "/usr/bin/python3": 0,
+    "CLAUDE_CONFIG_DIR": 0,
+    "CODEX_HOME": 0
+  },
+  "aegis_cli/package.py": {
+    ".claude": 2,
+    ".codex": 0,
+    "/usr/bin/python3": 0,
+    "CLAUDE_CONFIG_DIR": 0,
+    "CODEX_HOME": 0
+  },
+  "aegis_cli/skills_sync.py": {
+    ".claude": 2,
+    ".codex": 0,
+    "/usr/bin/python3": 0,
+    "CLAUDE_CONFIG_DIR": 0,
+    "CODEX_HOME": 0
+  },
+  "aegis_core/inference_provider.py": {
+    ".claude": 1,
+    ".codex": 0,
+    "/usr/bin/python3": 0,
+    "CLAUDE_CONFIG_DIR": 0,
+    "CODEX_HOME": 0
+  },
+  "aegis_core/insights/capture.py": {
+    ".claude": 1,
+    ".codex": 1,
+    "/usr/bin/python3": 0,
+    "CLAUDE_CONFIG_DIR": 2,
+    "CODEX_HOME": 2
+  },
+  "aegis_core/packaging.py": {
+    ".claude": 3,
+    ".codex": 0,
+    "/usr/bin/python3": 0,
+    "CLAUDE_CONFIG_DIR": 0,
+    "CODEX_HOME": 0
+  },
+  "tools/hierarchy_container_verify.py": {
+    ".claude": 1,
+    ".codex": 1,
+    "/usr/bin/python3": 0,
+    "CLAUDE_CONFIG_DIR": 0,
+    "CODEX_HOME": 0
+  },
+  "tools/hierarchy_jobs.py": {
+    ".claude": 1,
+    ".codex": 1,
+    "/usr/bin/python3": 0,
+    "CLAUDE_CONFIG_DIR": 1,
+    "CODEX_HOME": 1
+  },
+  "tools/hierarchy_launcher.py": {
+    ".claude": 4,
+    ".codex": 0,
+    "/usr/bin/python3": 0,
+    "CLAUDE_CONFIG_DIR": 8,
+    "CODEX_HOME": 0
+  },
+  "tools/hierarchy_native_probe.py": {
+    ".claude": 0,
+    ".codex": 20,
+    "/usr/bin/python3": 0,
+    "CLAUDE_CONFIG_DIR": 0,
+    "CODEX_HOME": 52
+  },
+  "tools/hierarchy_provision.py": {
+    ".claude": 0,
+    ".codex": 1,
+    "/usr/bin/python3": 0,
+    "CLAUDE_CONFIG_DIR": 0,
+    "CODEX_HOME": 0
+  },
+  "tools/hierarchy_root.py": {
+    ".claude": 6,
+    ".codex": 0,
+    "/usr/bin/python3": 0,
+    "CLAUDE_CONFIG_DIR": 0,
+    "CODEX_HOME": 0
+  },
+  "tools/hierarchy_team.py": {
+    ".claude": 3,
+    ".codex": 3,
+    "/usr/bin/python3": 0,
+    "CLAUDE_CONFIG_DIR": 13,
+    "CODEX_HOME": 13
+  },
+  "tools/hierarchy_templates/native-probe-attempt.py": {
+    ".claude": 0,
+    ".codex": 0,
+    "/usr/bin/python3": 0,
+    "CLAUDE_CONFIG_DIR": 0,
+    "CODEX_HOME": 1
+  },
+  "tools/hierarchy_wake.py": {
+    ".claude": 1,
+    ".codex": 0,
+    "/usr/bin/python3": 0,
+    "CLAUDE_CONFIG_DIR": 0,
+    "CODEX_HOME": 0
+  }
+}

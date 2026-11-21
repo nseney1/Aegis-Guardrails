@@ -1,4 +1,4 @@
-"""aegis_core.config: one repo file, one user file, four environment variables (D10, D11)."""
+"""aegis_core.config: central repository/user configuration and environment variables (D10, D11)."""
 from __future__ import annotations
 
 import ast
@@ -66,6 +66,11 @@ def test_repo_config_v1_keys(ws: Path):
     assert config.warnings == ()
 
 
+def test_approvals_is_a_known_repository_key_validated_only_by_policy_consumers():
+    assert RepoConfig.parse({"approvals": {"*": "none"}}).warnings == ()
+    assert RepoConfig.parse({"approvals": {"*": "bad"}}).warnings == ()
+
+
 def test_repo_config_cannot_name_commands(ws: Path):
     _repo(ws, {
         "v": 1,
@@ -96,7 +101,7 @@ def test_unknown_keys_are_counted_never_echoed(ws: Path):
     ({"jit": {"max_tokens": -1}}, "'jit.max_tokens'"),
     ({"jit": {"max_tokens": True}}, "'jit.max_tokens'"),
     ({"expiry": {"days": "soon"}}, "'expiry.days'"),
-    ({"expiry": {"per_type": {"wall": 3}}}, "'expiry.per_type'"),
+    ({"expiry": {"per_type": {"unsupported": 3}}}, "'expiry.per_type'"),
     ({"ast": {"packaged_drivers": ["../x"]}}, "'ast.packaged_drivers'"),
     ({"ast": []}, "'ast'"),
 ])
@@ -314,7 +319,7 @@ def _env_mappings(tree: ast.AST):
 
 def test_only_config_reads_aegis_environment_variables():
     """D11 ratchet: AEGIS_* and the cut config variables are read in aegis_core/config.py only."""
-    banned_prefixes = ("AEGIS_", "RULE_EXPIRY", "CELL_TELOMERE", "SOMA_")
+    banned_prefixes = ("AEGIS_", "RULE_EXPIRY")
     offenders = []
     for pkg in ("aegis_core", "aegis_cli", "aegis_mcp", "aegis_sdk"):
         for path in sorted((ROOT / pkg).rglob("*.py")):
@@ -382,3 +387,37 @@ def test_update_leaves_an_unreadable_config_alone(ws: Path):
 def test_user_coverage_language_config_is_a_known_key():
     config = UserConfig.parse({"v": 1, "coverage": {"languages": {"ts": {"command": ["node", "runner.mjs"]}}}})
     assert config.warnings == ()
+
+
+@pytest.mark.parametrize("environment,expected", [
+    ({}, None),
+    ({"AEGIS_MANAGER_CONFIG_SHA256": "a" * 64}, None),
+    ({"AEGIS_MANAGER_CONFIG": ""}, ("", "")),
+    ({"AEGIS_MANAGER_CONFIG": "  "}, ("  ", "")),
+    ({"AEGIS_MANAGER_CONFIG": "/manager.json"}, ("/manager.json", "")),
+    ({"AEGIS_MANAGER_CONFIG": "/manager.json", "AEGIS_MANAGER_CONFIG_SHA256": "a" * 64},
+     ("/manager.json", "a" * 64)),
+])
+def test_manager_registration_environment_preserves_explicit_invalid_selection(environment, expected):
+    from aegis_core.config import env_manager_registration
+
+    assert env_manager_registration(environment) == expected
+
+
+def test_manager_registration_environment_reads_process_only_without_explicit_mapping(monkeypatch):
+    from aegis_core.config import env_manager_registration
+
+    monkeypatch.setenv("AEGIS_MANAGER_CONFIG", "/selected.json")
+    monkeypatch.setenv("AEGIS_MANAGER_CONFIG_SHA256", "b" * 64)
+    assert env_manager_registration() == ("/selected.json", "b" * 64)
+    assert env_manager_registration({}) is None
+
+
+def test_manager_registration_environment_builder_round_trips_without_repository_pin():
+    from aegis_core.config import env_manager_registration, manager_registration_env
+
+    path = Path("/reviewed/manager.json")
+    configured = manager_registration_env(path, "c" * 64)
+    assert configured == {"AEGIS_MANAGER_CONFIG": str(path), "AEGIS_MANAGER_CONFIG_SHA256": "c" * 64}
+    assert set(configured) <= set(ENV_VARS)
+    assert env_manager_registration(configured) == (str(path), "c" * 64)

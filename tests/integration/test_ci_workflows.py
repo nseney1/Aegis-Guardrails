@@ -19,7 +19,7 @@ yaml = pytest.importorskip("yaml")
 REPO_ROOT = str(next(p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").exists()))
 GITHUB = os.path.join(REPO_ROOT, ".github")
 WORKFLOWS = os.path.join(GITHUB, "workflows")
-WORKFLOW_FILES = ("validate.yml", "publish.yml", "aegis-governance.yml")
+WORKFLOW_FILES = ("validate.yml", "publish.yml", "aegis-governance.yml", "wave-tests.yml")
 SHA_REF = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
 PINNED_LINE = re.compile(r"uses:\s*[^@\s]+@[0-9a-f]{40}\s+#\s*v\d+\.\d+\.\d+\s*$")
 
@@ -53,12 +53,97 @@ def _step_using(job, prefix):
 
 FULL_VALIDATION = "github.event_name != 'pull_request' || github.base_ref != 'develop'"
 WAVE_PR = "github.event_name == 'pull_request' && github.base_ref == 'develop'"
+INTEGRATION_BRANCH = "feature/manager-workspace-prototype"
+
+
+def _condition_allows(condition, context):
+    """Evaluate this workflow's small condition subset, with prerequisites successful."""
+    if condition is None or condition == "always()":
+        return True
+    if " || " in condition:
+        return any([_condition_allows(part, context) for part in condition.split(" || ")])
+    if " && " in condition:
+        return all([_condition_allows(part, context) for part in condition.split(" && ")])
+    match = re.fullmatch(r"([a-z_.]+) (==|!=) '([^']*)'", condition)
+    assert match is not None, f"Unsupported workflow condition: {condition}"
+    key, operator, value = match.groups()
+    assert key in context, f"Unsupported workflow context: {key}"
+    equal = context[key] == value
+    return equal if operator == "==" else not equal
+
+
+def test_integration_lane_pull_requests_do_not_trigger_validate():
+    triggers = _triggers(_load("validate.yml"))
+    assert triggers["pull_request"] == {"branches": ["main", "develop", "release/**"]}
+    assert INTEGRATION_BRANCH not in triggers["pull_request"]["branches"]
+
+
+def test_integration_push_change_preserves_other_triggers():
+    triggers = _triggers(_load("validate.yml"))
+    assert {key: value for key, value in triggers.items() if key not in ("push", "pull_request")} == {
+        "workflow_call": None,
+        "workflow_dispatch": None,
+        "schedule": [{"cron": "17 4 * * *"}],
+    }
+
+
+def test_integration_push_runs_every_develop_job_and_step_condition():
+    """Eligibility only: upstream jobs and preceding steps are assumed successful."""
+    workflow = _load("validate.yml")
+    assert INTEGRATION_BRANCH in _triggers(workflow)["push"]["branches"]
+    jobs = workflow["jobs"]
+    assert set(jobs) == {
+        "dependency-audit", "build-wheel", "test-fast", "aegis-check", "validate", "test-windows", "verdict",
+    }
+    matrix = jobs["validate"]["strategy"]["matrix"]
+    validate_legs = [
+        (os_name, version) for os_name in matrix["os"] for version in matrix["python-version"]
+        if {"os": os_name, "python-version": version} not in matrix["exclude"]
+    ]
+    validate_legs += [(leg["os"], leg["python-version"]) for leg in matrix["include"]]
+    assert sorted(validate_legs) == [
+        ("macos-latest", "3.11"), ("macos-latest", "3.9"),
+        ("ubuntu-24.04", "3.9"), ("ubuntu-latest", "3.11"),
+    ]
+    assert jobs["validate"]["runs-on"] == "${{ matrix.os }}"
+    windows_matrix = jobs["test-windows"]["strategy"]["matrix"]
+    assert windows_matrix == {"python-version": ["3.9", "3.12"]}
+    assert jobs["test-windows"]["runs-on"] == "windows-latest"
+    legs = [(name, job["runs-on"], None) for name, job in jobs.items()
+            if name not in ("validate", "test-windows")]
+    legs += [("validate", os_name, version) for os_name, version in validate_legs]
+    legs += [("test-windows", "windows-latest", version) for version in windows_matrix["python-version"]]
+    assert len(legs) == 11
+    runner_os = {"ubuntu-latest": "Linux", "ubuntu-24.04": "Linux",
+                 "macos-latest": "macOS", "windows-latest": "Windows"}
+    for name, runner, version in legs:
+        job = jobs[name]
+        contexts = [{"github.event_name": "push", "github.base_ref": "",
+                     "github.ref": "refs/heads/" + branch, "github.ref_name": branch,
+                     "runner.os": runner_os[runner]}
+                    for branch in ("develop", INTEGRATION_BRANCH)]
+        eligible = [_condition_allows(job.get("if"), context) for context in contexts]
+        assert eligible == [True, True], (name, runner, version)
+        needs = job.get("needs", [])
+        if isinstance(needs, str):
+            needs = [needs]
+        for dependency in needs:
+            assert all(_condition_allows(jobs[dependency].get("if"), context) for context in contexts)
+        outcomes = [[_condition_allows(step.get("if"), context) for step in job["steps"]]
+                    for context in contexts]
+        assert outcomes[0] == outcomes[1], (name, runner, version)
+        skipped = set()
+        if name == "aegis-check":
+            skipped.add("Fetch wave pull request head as data")
+        if name == "validate" and runner_os[runner] != "Linux":
+            skipped.update(("Install bubblewrap", "Prove bubblewrap runs"))
+        assert outcomes[1] == [step.get("name") not in skipped for step in job["steps"]], (name, runner, version)
 
 
 def test_wave_prs_keep_governance_while_full_validation_runs_on_develop_and_downstream():
     workflow = _load("validate.yml")
     triggers = _triggers(workflow)
-    assert triggers["push"]["branches"] == ["main", "develop", "release/**"]
+    assert triggers["push"]["branches"] == ["main", "develop", "release/**", INTEGRATION_BRANCH]
     assert triggers["pull_request"]["branches"] == ["main", "develop", "release/**"]
     assert {"workflow_call", "workflow_dispatch"} <= set(triggers)
     jobs = workflow["jobs"]
@@ -88,19 +173,155 @@ def test_wave_prs_keep_governance_while_full_validation_runs_on_develop_and_down
     assert governance == {"pull_request_target": {"branches": ["main", "develop", "release/**"]}}
 
 
+def test_wave_tests_run_pull_requests_into_develop_without_secrets():
+    """Owner decision 2026-11-05: execute tests on wave PRs, with nothing to leak."""
+    workflow = _load("wave-tests.yml")
+    assert _triggers(workflow) == {"pull_request": {"branches": ["develop"]}}
+    assert workflow["permissions"] == {"contents": "read"}
+    text = _read("wave-tests.yml")
+    for forbidden in ("${{ secrets", "github.token", "GH_TOKEN", "pull_request_target", "id-token",
+                      "actions/cache", "upload-artifact"):
+        assert forbidden not in text, forbidden
+    for job in workflow["jobs"].values():
+        assert "permissions" not in job, "jobs inherit the read-only token"
+        for checkout in _step_using(job, "actions/checkout"):
+            assert checkout["with"]["persist-credentials"] is False
+        for setup in _step_using(job, "actions/setup-python"):
+            assert "cache" not in setup.get("with", {}), "no cache a pull request could poison"
+    # PRs into main and release/** keep the full Validate run; wave PRs keep its
+    # base-sourced required check (see the test above).
+    assert "main" not in _triggers(workflow)["pull_request"]["branches"]
+
+
 @pytest.mark.parametrize("expected,actual,passed", [
     ("skipped", "skipped", True), ("success", "success", True),
     ("skipped", "success", False), ("success", "skipped", False),
     ("success", "failure", False), ("skipped", "cancelled", False),
 ])
 def test_required_check_rejects_unexpected_upstream_results(expected, actual, passed):
-    step = _load("validate.yml")["jobs"]["aegis-check"]["steps"][0]
-    argv = shlex.split(step["run"])
-    env = dict(os.environ, EXPECTED_RESULT=expected, NEEDS_JSON=json.dumps({"build-wheel": {"result": actual}}))
-    proc = subprocess.run([sys.executable, *argv[1:]], env=env, capture_output=True, text=True, timeout=10)
+    proc = _run_upstream_gate(expected, {"build-wheel": {"result": actual}, FAST_JOB: {"result": "success"}})
     assert (proc.returncode == 0) is passed, proc.stderr
     if not passed:
         assert "build-wheel" in proc.stderr and "Unexpected upstream job results" in proc.stderr
+
+
+FAST_JOB = "test-fast"
+
+
+def _run_upstream_gate(expected, needs):
+    step = _load("validate.yml")["jobs"]["aegis-check"]["steps"][0]
+    argv = shlex.split(step["run"])
+    fixed = {k: v for k, v in step.get("env", {}).items() if "${{" not in str(v)}
+    env = dict(os.environ, **fixed, EXPECTED_RESULT=expected, NEEDS_JSON=json.dumps(needs))
+    return subprocess.run([sys.executable, *argv[1:]], env=env, capture_output=True, text=True, timeout=10)
+
+
+# A wave PR skips the full matrix but must still pass the fast leg; every other run needs both.
+@pytest.mark.parametrize("expected,fast,passed", [
+    ("skipped", "success", True), ("success", "success", True),
+    ("skipped", "skipped", False), ("skipped", "failure", False), ("skipped", "cancelled", False),
+    ("success", "failure", False), ("skipped", None, False),
+])
+def test_required_check_needs_the_fast_leg_to_succeed_on_every_run(expected, fast, passed):
+    needs = {"build-wheel": {"result": expected}}
+    if fast is not None:
+        needs[FAST_JOB] = {"result": fast}
+    proc = _run_upstream_gate(expected, needs)
+    assert (proc.returncode == 0) is passed, proc.stderr
+    if not passed:
+        assert FAST_JOB in proc.stderr and "Unexpected upstream job results" in proc.stderr
+
+
+def _fast_job():
+    return _load("validate.yml")["jobs"][FAST_JOB]
+
+
+def _runs(job):
+    return [s.get("run", "") for s in job.get("steps", [])]
+
+
+def _index(job, *needles):
+    found = [i for i, run in enumerate(_runs(job)) if all(n in run for n in needles)]
+    assert len(found) == 1, (needles, found)
+    return found[0]
+
+
+def _packages(run):
+    return sorted(word for word in run.split() if "==" in word)
+
+
+def test_wave_prs_run_the_fast_linux_leg_with_a_read_only_token_and_no_secrets():
+    workflow = _load("validate.yml")
+    assert "pull_request_target" not in _triggers(workflow)
+    job = workflow["jobs"][FAST_JOB]
+    # No `if` and no `needs`: build-wheel and dependency-audit skip on wave PRs, and the verdict
+    # needs this job to succeed on push and dispatch too.
+    assert "if" not in job and "needs" not in job
+    assert job["runs-on"] == "ubuntu-latest"
+    assert job.get("permissions", {"contents": "read"}) == {"contents": "read"}
+    assert isinstance(job.get("timeout-minutes"), int) and job["timeout-minutes"] <= 60
+    text = yaml.safe_dump(job)
+    # Any spelling of a secret or the workflow token: secrets.X, secrets['X'], toJSON(secrets),
+    # github.token, github['token'].
+    assert not re.search(r"\bsecrets\b|github\s*(\.|\[)\s*'?token|GH_TOKEN", text), text
+    assert not {"environment", "container", "services"} & set(job)
+    assert [s["with"]["python-version"] for s in _step_using(job, "actions/setup-python")] == ["3.11"]
+    checkout = _step_using(job, "actions/checkout")
+    assert len(checkout) == 1 and checkout[0]["with"] == {"fetch-depth": 0, "persist-credentials": False}
+    for step in job["steps"]:
+        assert not step.get("continue-on-error") and "if" not in step, step
+        assert "|| true" not in step.get("run", ""), step
+    assert FAST_JOB in workflow["jobs"]["aegis-check"]["needs"]
+
+
+def test_the_fast_leg_runs_the_whole_suite_with_xdist_from_its_own_venv():
+    job = _fast_job()
+    # The runner context is not available to job-level env, so a step exports the venv path.
+    export = _index(job, 'echo "VENV=$RUNNER_TEMP/ci-venv" >> "$GITHUB_ENV"')
+    venv = _index(job, 'python -m venv "$VENV"')
+    assert export < venv
+    install = _index(job, '"$VENV/bin/pip" install pytest==')
+    package = _index(job, '"$VENV/bin/pip" install .')
+    lint = _index(job, 'make lint PYTHON="$VENV/bin/python"')
+    suite = _index(job, 'make test PYTHON="$VENV/bin/python"')
+    assert venv < install < package < lint < suite
+    validate_install = next(s["run"] for s in _load("validate.yml")["jobs"]["validate"]["steps"]
+                            if s.get("name") == INSTALL_STEP)
+    packages = _packages(_runs(job)[install])
+    assert packages == _packages(validate_install.splitlines()[0]) and "pytest-xdist==3.6.1" in packages
+    assert _runs(job)[suite].strip() == 'make test PYTHON="$VENV/bin/python"'
+    for flag in ("--deselect", " -k ", " -m ", "--ignore"):
+        assert flag not in _runs(job)[suite]
+    assert _index(job, "grep -rnI '/home/'") > package
+
+
+def _bubblewrap_probe():
+    from tests.integration.test_hierarchy_jobs import BUBBLEWRAP_PROBE
+    return shlex.join(BUBBLEWRAP_PROBE)
+
+
+@pytest.mark.parametrize("name", [FAST_JOB, "validate"])
+def test_linux_legs_install_bubblewrap_and_prove_it_runs_before_the_suite(name):
+    job = _load("validate.yml")["jobs"][name]
+    install = _index(job, "apt-get", "install -y --no-install-recommends bubblewrap")
+    # A transient mirror error must not fail a wave PR's required check.
+    assert _runs(job)[install].count("-o Acquire::Retries=3") == 2
+    probe = _index(job, _bubblewrap_probe())
+    suite = _index(job, "make test")
+    assert install < probe < suite
+    steps = job["steps"]
+    # Ubuntu 23.10 and later block unprivileged user namespaces through AppArmor; without
+    # lifting that, the probe fails and the eight bubblewrap job tests would skip silently.
+    assert "kernel.apparmor_restrict_unprivileged_userns=0" in steps[probe]["run"]
+    if name == "validate":
+        assert steps[install].get("if") == steps[probe].get("if") == "runner.os == 'Linux'"
+    assert not steps[probe].get("continue-on-error") and "|| true" not in steps[probe]["run"]
+
+
+def test_the_full_matrix_also_runs_nightly_and_on_dispatch():
+    triggers = _triggers(_load("validate.yml"))
+    assert "workflow_dispatch" in triggers
+    assert len(triggers["schedule"]) == 1 and len(triggers["schedule"][0]["cron"].split()) == 5
 
 
 def test_wave_governance_cannot_be_skipped_while_keeping_the_required_check():
@@ -235,8 +456,8 @@ def test_build_and_audit_tools_are_version_pinned():
     """Tools that touch release bytes or gate them are installed at exact versions."""
     text = _read("validate.yml")
     for tool in ("build", "pip-audit"):
-        lines = [l for l in text.splitlines()
-                 if re.search(rf"pip install\b.*\b{re.escape(tool)}\b", l)]
+        lines = [line for line in text.splitlines()
+                 if re.search(rf"pip install\b.*\b{re.escape(tool)}\b", line)]
         assert lines, f"no pip install line for {tool}"
         for line in lines:
             assert re.search(rf"\b{re.escape(tool)}==\d+(\.\d+)+\b", line), line
@@ -515,7 +736,7 @@ def test_the_governance_workflow_never_checks_out_or_runs_pull_request_code():
 # --- R-trust-17: check --ci runs on every event its job runs on ------------------------------
 # A condition on the step (say, pull requests only) would let a push or dispatch run of the same
 # job name pass on the pull request's head commit without comparing anything, and doctor no longer
-# counts such a job as the required Aegis check (human_gate._skip_why). A run with nothing to compare
+# counts such a job as the required Aegis check (workflow_jobs.skip_why). A run with nothing to compare
 # says so instead of PASSED (aegis_cli.check).
 
 @pytest.mark.parametrize("text", [lambda: _read("validate.yml"),

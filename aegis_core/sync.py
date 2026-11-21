@@ -471,7 +471,8 @@ def _open_pr(plan: Dict[str, Any], branch: str, commit: str, title: str, body: s
     try:
         # --no-signed: push.gpgSign would run the signing program gpg.format and gpg.*.program choose.
         res = gitsafe.run(["push", "--porcelain", "--no-verify", "--no-signed", remote,
-                           f"refs/heads/{branch}:refs/heads/{branch}"], top, timeout=_PUSH_TIMEOUT, _hardening=_PUSH_HARDENING)
+                           f"refs/heads/{branch}:refs/heads/{branch}"], top, timeout=_PUSH_TIMEOUT,
+                          _hardening=_PUSH_HARDENING, _env={"GIT_ALLOW_PROTOCOL": "https:ssh:file"})
     except gitsafe.GitError as exc:  # git never answered: the remote may have taken the branch before that
         error: Optional[str] = (f"push to {remote} did not finish ({exc}); {remote} may already hold the branch {branch}: "
                                 "check it there before running sync --pr again")

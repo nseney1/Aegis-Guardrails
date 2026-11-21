@@ -8,8 +8,10 @@ import sys
 from typing import Any, Mapping, Optional
 
 from aegis_core.taxonomy import RULE_TYPES
+from aegis_cli import sanitize_display
+from aegis_core.redaction import TOKEN_REDACTIONS, redact_command_secrets
 
-__all__ = ["ANSI_ESCAPE_RE", "OutputContext", "strip_ansi"]
+__all__ = ["ANSI_ESCAPE_RE", "OutputContext", "strip_ansi", "diagnostic_text"]
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
@@ -36,6 +38,16 @@ _RULE_TYPE_STYLES: dict[str, tuple[str, ...]] = {
 def strip_ansi(text: str) -> str:
     """Remove all ANSI SGR escape sequences from text."""
     return ANSI_ESCAPE_RE.sub("", text)
+
+
+def diagnostic_text(text: str, limit: int = 80) -> str:
+    """Bound input, canonicalize, redact credentials, then truncate for display."""
+    if len(text) > 65536:
+        return "[diagnostic omitted: too_large]"
+    canonical = sanitize_display(text, max_len=None)
+    for pattern, replacement in TOKEN_REDACTIONS:
+        canonical = pattern.sub(replacement, canonical)
+    return sanitize_display(redact_command_secrets(canonical), max_len=limit)
 
 
 @dataclass(frozen=True)
@@ -108,6 +120,10 @@ class OutputContext:
         if self.emoji_enabled:
             return self.style(f"ℹ {label}", "cyan")
         return self.style(f"[{label}]", "cyan")
+
+    def diagnostic_badge(self, icon: str, label: str) -> str:
+        """Select an application-authored icon without transforming diagnostic content."""
+        return icon if self.emoji_enabled else f"[{label}]"
 
     def color_fitness(self, score: float) -> str:
         formatted = f"{score:.2f}"

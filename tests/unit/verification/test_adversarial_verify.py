@@ -1,5 +1,5 @@
 from pathlib import Path
-"""TDD tests for immune_verify.py — AUDITED ground truth.
+"""TDD tests for safety_verify.py — AUDITED ground truth.
 
 Audit findings applied:
 - test_includes_docstrings: was TAUTOLOGICAL, now checks docstring content only
@@ -195,7 +195,7 @@ class TestParsing:
             {
                 "category": "persistence_gap",
                 "claim": "Epoch persisted at L217",
-                "evidence_file": "cell_promote.py",
+                "evidence_file": "rule_promote.py",
                 "evidence_line": 217,
                 "tests_covering": ["test_idempotent"],
             }
@@ -206,7 +206,7 @@ class TestParsing:
         c = claims[0]
         assert c.category == RiskCategory.PERSISTENCE_GAP
         assert c.claim == "Epoch persisted at L217"
-        assert c.evidence_file == "cell_promote.py"
+        assert c.evidence_file == "rule_promote.py"
         assert c.evidence_line == 217
         assert c.tests_covering == ["test_idempotent"]
 
@@ -261,13 +261,13 @@ class TestEndToEnd:
             {
                 "category": "persistence_gap",
                 "claim": "Epoch persisted at L217",
-                "evidence_file": "cell_promote.py",
+                "evidence_file": "rule_promote.py",
                 "evidence_line": 217,
                 "tests_covering": ["test_idempotent"],
             }
         ]
         evidence = [
-            ToolEvidence("persistence_checker", "cell_promote.py:fitness",
+            ToolEvidence("persistence_checker", "rule_promote.py:fitness",
                          True, "All keys serialized"),
         ]
 

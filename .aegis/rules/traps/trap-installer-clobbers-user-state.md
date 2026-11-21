@@ -29,11 +29,10 @@ release.
 
 ## Incident (v4 Citadel review)
 
-- `aegis init --mcp` and `McpAdapter` registered the same server twice (`aegis`
-  and `soma`), spawning two processes that double-counted session-close fitness.
+- `aegis init --mcp` and `McpAdapter` registered the same server under two names, spawning two processes that double-counted session-close fitness.
 - `McpAdapter.install` overwrote a non-strict-JSON `.mcp.json` and a customized
   `aegis` env, and pinned `AEGIS_WORKSPACE` to the adapter workspace rather than
-  `project_root`; uninstall deleted a foreign `soma` entry.
+  `project_root`; uninstall deleted a foreign server entry.
 - `--portable` and `--mcp-only` were read through `getattr` but never registered
   in the parser. `init` silently seeded `.aegis/rules` and `manifest.json`, and
   `--force` overwrote them. `detect_platform` ranked `CLAUDE.md` above `.cursor`.

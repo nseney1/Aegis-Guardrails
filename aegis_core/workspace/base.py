@@ -1,4 +1,4 @@
-"""Strongly-typed Workspace value object for Soma (Layer 0 Core).
+"""Strongly-typed Workspace value object for Aegis (Layer 0 Core).
 
 Implements os.PathLike[str] for seamless interoperability with open(),
 Path(), and os.path routines. Strictly zero-dependency (Python standard library only).

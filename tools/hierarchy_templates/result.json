@@ -1,0 +1,12 @@
+{
+  "source_revision": "REPLACE_WITH_FULL_TESTED_COMMIT_ID",
+  "source_tree": "REPLACE_WITH_FULL_TESTED_TREE_ID",
+  "checks": [
+    {
+      "check": "affected-behavior-tests",
+      "outcome": "not_run",
+      "reference": "REPLACE_WITH_SOURCE_BOUND_RESULT_REFERENCE"
+    }
+  ],
+  "lane_check": "REPLACE_WITH_COMMITTED_LANE_CHECK_REFERENCE"
+}
