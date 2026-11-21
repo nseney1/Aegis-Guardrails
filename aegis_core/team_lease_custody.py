@@ -168,10 +168,9 @@ def _owned_directory(info, *, private=False, owner=True):
 
 @contextmanager
 def _directory(path):
-    # Same-package borrowing, also used by team_gitops: storage owns the parent
-    # descriptor, walks every ancestor without links, and closes on every exit.
+    # Storage owns the descriptor and closes it when the confined context exits.
     with storage_confined.confined_file(path, (".git",)) as handle:
-        yield handle._parent
+        yield handle.parent_fd
 
 
 def _child(directory, name, stack):
