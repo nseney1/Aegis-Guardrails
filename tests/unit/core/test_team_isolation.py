@@ -46,13 +46,35 @@ def observe(paths, homes, *, marker=None, protected_names=None):
     return result
 
 
-def check(value, **options):
-    inputs = dict(observer=observe, owner_homes=lambda: dict.fromkeys(
+def _inputs(**options):
+    values = dict(observer=observe, owner_homes=lambda: dict.fromkeys(
         ("explicit", "ambient", "password"), HOME), owner_uid=0, owner_gid=0, cpu_count=4,
         platform="linux", host_table=TABLE, source=SOURCE)
-    inputs.update(options)
+    values.update(options)
+    return values
+
+
+def check(value, **options):
     raw = value if type(value) is bytes else json.dumps(value).encode()
-    return core.check(raw, **inputs)
+    return core.check(raw, **_inputs(**options))
+
+
+def direct(value, **options):
+    return core.check(value, **_inputs(**options))
+
+
+def refused_as(code):
+    return {"status": "refused", "code": code, "reason": mounts.REFUSALS[code],
+            "next_action": {"actor": "operator", "command": mounts.REFUSALS[code]}}
+
+
+def _same_object(value, snapshot):
+    assert value == snapshot
+    if type(value) is dict:
+        assert all(value[key] is snapshot[key] for key in value)
+
+
+HOST = {"status": "ok", "mode": "host", "isolation": None, "mounts": [], "create_argv": None}
 
 
 @pytest.fixture
@@ -192,8 +214,92 @@ def test_invalid_inspection_envelope_has_no_container_dependencies(raw):
                  inspector=unexpected) == {"status": "mismatch", "mismatches": ["inspect"]}
 
 
-def test_run_core_refuses_host_specific_aliases():
-    assert check(b'{"codex_home":"/unused","claude_home":"/unused"}').get("code") == "team_run_fields"
+def _without_containers(**options):
+    def unexpected(*args, **kwargs):
+        pytest.fail("inert aliases reached a container dependency")
+
+    options.setdefault("observer", unexpected)
+    options.setdefault("owner_homes", unexpected)
+    return options
+
+
+def test_legacy_aliases_are_inert_for_host_and_container_inputs():
+    """Bytes and direct dicts share one field policy and never take the caller's object."""
+    families = (
+        {"codex_home": "/unused"},
+        {"claude_home": "/unused"},
+        {"codex_home": "/unused", "claude_home": ""},
+        {"codex_home": None, "claude_home": False},
+        {"codex_home": {"nested": [1, "ok"]}, "claude_home": 0},
+        {"codex_home": "h" * 16384, "claude_home": "/unused"},
+        {"isolation": {"mode": "host"}, "schema": "aegis.team-run/v2",
+         "codex_home": "/unused", "claude_home": "/unused"},
+        {"schema": "aegis.team-run/v1", "claude_home": "/unused"},
+    )
+    for value in families:
+        owned = dict(value)
+        assert direct(owned, platform="win32", **_without_containers()) == HOST
+        _same_object(owned, value)
+        assert check(value, platform="win32", **_without_containers()) == HOST
+    raw = b'{"codex_home":"/unused","claude_home":"/unused"}'
+    assert check(raw, platform="win32", **_without_containers()) == HOST
+    assert direct(raw, platform="win32", **_without_containers()) == HOST
+
+    bare = dict(config(), isolation=dict(ISOLATION), recipes={"python": PREFIX + "/bin/python"})
+    expected = check(bare)
+    for extra in ({}, {"codex_home": "/unused"}, {"claude_home": "/unused"},
+                  {"codex_home": "/unused", "claude_home": "/unused"}):
+        aliased = dict(bare, **extra)
+        isolation, recipes = aliased["isolation"], aliased["recipes"]
+        assert direct(aliased) == expected == check(aliased)
+        assert aliased["isolation"] is isolation and aliased["recipes"] is recipes
+        assert "/unused" not in json.dumps(expected)
+
+
+def test_ignored_alias_failures_keep_the_caller_and_then_retry():
+    junk = {"codex_home": "/unused", "not-a-field": "marker"}
+    schema = {"claude_home": "/unused", "schema": "nope"}
+    oversized = {"codex_home": "m" * 16385}
+    wide = {"claude_home": 1 << 129}
+    chunk = "y" * 16384
+    bulky = {"codex_home": [chunk] * (mounts.MAX_DOCUMENT_BYTES // 16384 + 1)}
+    duplicate = b'{"codex_home":"/a","codex_home":"/marker"}'
+    cases = (
+        (junk, "team_run_fields"), (schema, "team_run_schema"), (oversized, "document_size"),
+        (wide, "document_size"), (bulky, "document_size"), (duplicate, "document_invalid"),
+        ([], "document_invalid"),
+    )
+    for value, code in cases:
+        snapshot = dict(value) if type(value) is dict else list(value) if type(value) is list else value
+        assert direct(value) == refused_as(code)
+        assert check(value) == refused_as(code)
+        rendered = json.dumps(direct(value))
+        assert "marker" not in rendered and "m" * 40 not in rendered and "y" * 40 not in rendered
+        _same_object(value, snapshot)
+    odd = {1: "marker"}
+    assert direct(odd) == refused_as("document_invalid")
+    _same_object(odd, {1: "marker"})
+    assert "marker" not in json.dumps(direct(odd))
+    assert direct({"codex_home": "m" * 16384}) == HOST
+    assert check(config())["status"] == "ok"
+    assert direct(dict(config()))["status"] == "ok"
+
+
+def test_aliased_documents_remain_caller_owned_under_concurrency():
+    shared = dict(config(), isolation=dict(ISOLATION), codex_home="/unused", claude_home="/unused")
+    recipes = shared["recipes"]
+    expected = check({key: value for key, value in shared.items()
+                      if key not in ("codex_home", "claude_home")})
+    assert expected["status"] == "ok"
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(lambda _: direct(shared), range(6))) == [expected] * 6
+    assert shared["codex_home"] == "/unused" and shared["claude_home"] == "/unused"
+    assert shared["recipes"] is recipes
+    bad = {"codex_home": "m" * 16385, "claude_home": "/unused"}
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(lambda _: direct(bad)["code"], range(6))) == ["document_size"] * 6
+    assert bad["codex_home"] == "m" * 16385
+    assert direct(dict(config()))["status"] == "ok"
 
 
 @pytest.mark.parametrize("value", ["{}", "1" * 200], ids=["encoded-object", "digits"])

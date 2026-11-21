@@ -70,9 +70,10 @@ def test_check_refusals_and_retry(store, capsys, content, expected):
 
 
 @pytest.mark.parametrize("value", ["{}", "1" * 200], ids=["encoded-object", "digits"])
-def test_check_refuses_non_object_configs_at_file_boundary(store, capsys, monkeypatch, value):
+def test_check_passes_confined_bytes_and_refuses_non_objects(store, capsys, monkeypatch, value):
     path = store / "config.json"
-    path.write_text(json.dumps(value), encoding="utf-8")
+    encoded = json.dumps(value).encode("utf-8")
+    path.write_bytes(encoded)
     calls = []
     check = adapter.core.check
 
@@ -83,10 +84,11 @@ def test_check_refuses_non_object_configs_at_file_boundary(store, capsys, monkey
     monkeypatch.setattr(adapter, "core", SimpleNamespace(**{**vars(adapter.core), "check": record}))
     status, result = invoke(store, capsys, "--config", str(path))
     assert status == 1 and result["code"] == "document_invalid"
-    assert not calls
-    path.write_text("{}", encoding="utf-8")
+    assert value not in json.dumps(result)
+    assert calls == [encoded]
+    path.write_bytes(b"{}")
     assert invoke(store, capsys, "--config", str(path))[0] == 0
-    assert calls == [{}]
+    assert calls == [encoded, b"{}"]
 
 
 @pytest.mark.parametrize("component", ["parent", "leaf"])
@@ -326,7 +328,43 @@ def test_host_file_reads_survive_unavailable_container_observation(store, capsys
     monkeypatch.setattr(adapter, "descriptor_supported", lambda: False)
     assert invoke(store, capsys, "--config", str(config))[1]["code"] == "unsupported_platform"
     config.write_text('{"codex_home":"/unused","claude_home":"/unused"}', encoding="utf-8")
-    assert invoke(store, capsys, "--config", str(config))[0] == 0
+    status, plan = invoke(store, capsys, "--config", str(config))
+    assert status == 0
+    assert plan == {"create_argv": None, "isolation": None, "mode": "host", "mounts": [], "status": "ok"}
+    assert "/unused" not in json.dumps(plan)
+
+
+def test_cli_bounds_ignored_aliases_and_keeps_host_and_container_plans(mount_inputs, capsys):
+    store = mount_inputs
+    host = store / "host.json"
+    marker = "untrusted-alias"
+    host.write_bytes(b'{"codex_home":"/a","codex_home":"/' + marker.encode("ascii") + b'"}')
+    code, result = invoke(store, capsys, "--config", str(host))
+    assert code == 1 and result["code"] == "document_invalid"
+    assert marker not in json.dumps(result)
+    host.write_text(json.dumps({"codex_home": "/unused", marker: True}), encoding="utf-8")
+    code, result = invoke(store, capsys, "--config", str(host))
+    assert code == 1 and result["code"] == "team_run_fields"
+    assert marker not in json.dumps(result)
+    host.write_text(json.dumps({"claude_home": "Q" * 16385}), encoding="utf-8")
+    code, result = invoke(store, capsys, "--config", str(host))
+    assert code == 1 and result["code"] == "document_size"
+    assert "Q" * 80 not in json.dumps(result)
+    host.write_text(json.dumps({"codex_home": "/unused", "claude_home": ""}), encoding="utf-8")
+    status, plan = invoke(store, capsys, "--config", str(host))
+    assert status == 0
+    assert plan == {"create_argv": None, "isolation": None, "mode": "host", "mounts": [], "status": "ok"}
+
+    config, _ = container_inputs(store)
+    status, bare = invoke(store, capsys, "--config", str(config))
+    assert status == 0 and bare["mode"] == "container", bare
+    body = json.loads(config.read_text(encoding="utf-8"))
+    body["codex_home"] = "/unused"
+    body["claude_home"] = "/unused"
+    config.write_text(json.dumps(body), encoding="utf-8")
+    status, aliased = invoke(store, capsys, "--config", str(config))
+    assert status == 0 and aliased == bare
+    assert "/unused" not in json.dumps(aliased)
 
 
 def test_unicode_mount_spelling_survives_every_display_field(mount_inputs, capsys):

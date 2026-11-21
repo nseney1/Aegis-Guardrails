@@ -47,12 +47,8 @@ def _read_document(value):
 
 
 def _read_config(path):
-    config = mounts.load_document(_read_document(path))
-    mounts.require(type(config) is dict, "document_invalid")
-    # These legacy home aliases do not change the container's run homes.
-    config.pop("codex_home", None)
-    config.pop("claude_home", None)
-    return config
+    """Confined document bytes. Core bounds that document once and applies field policy."""
+    return _read_document(path)
 
 
 def _identity(info):

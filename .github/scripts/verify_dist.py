@@ -143,7 +143,79 @@ def _canonical_component(part):
 
 def _destination_key(key):
     """Case-folded destination. Windows installs these as one path."""
-    return "/".join(unicodedata.normalize("NFC", part).casefold() for part in key.split("/"))
+    return _fold_key(key)
+
+
+def _component_parent(parts, index):
+    """Folded path of the components before index. The root parent is empty."""
+    return _fold_key("/".join(parts[:index]))
+
+
+def _component_claim(parts, directory, state):
+    """Compare one member with the per-parent index. Do not mutate state.
+
+    Each destination component has one spelling and one kind. An explicit
+    directory needs a descendant that already admitted that directory.
+    """
+    index = state.get("components") or {}
+    absent = False
+    for offset, part in enumerate(parts):
+        parent = _component_parent(parts, offset)
+        folded = _fold_part(part)
+        leaf = offset == len(parts) - 1
+        kind = "file" if leaf and not directory else "directory"
+        explicit = bool(leaf and directory)
+        slot = index.get(parent, {}).get(folded)
+        if slot is None:
+            if directory:
+                absent = True
+            continue
+        spelling, previous_kind, previous_explicit = slot
+        if spelling != part or previous_kind != kind:
+            return "duplicate"
+        if kind == "file" or (explicit and previous_explicit):
+            return "duplicate"
+    if absent:
+        return "absent"
+    return "ok"
+
+
+def _record_components(parts, directory, state):
+    """Record spelling, kind and explicit-directory state under each parent."""
+    index = state.setdefault("components", {})
+    for offset, part in enumerate(parts):
+        parent = _component_parent(parts, offset)
+        folded = _fold_part(part)
+        leaf = offset == len(parts) - 1
+        kind = "file" if leaf and not directory else "directory"
+        explicit = bool(leaf and directory)
+        children = index.setdefault(parent, {})
+        slot = children.get(folded)
+        if slot is None:
+            children[folded] = (part, kind, explicit)
+            continue
+        spelling, previous_kind, previous_explicit = slot
+        children[folded] = (spelling, previous_kind, previous_explicit or explicit)
+
+
+def _explicit_directories_have_descendants(state):
+    """Every explicit directory component has an admitted child."""
+    index = state.get("components") or {}
+    for parent, children in index.items():
+        for folded, (_spelling, kind, explicit) in children.items():
+            if not explicit or kind != "directory":
+                continue
+            child_key = folded if parent == "" else parent + "/" + folded
+            if not index.get(child_key):
+                return False
+    return True
+
+
+def _refuse_orphan_directories(archive_kind, state):
+    """A directory entry with no admitted descendant is refused."""
+    if _explicit_directories_have_descendants(state):
+        return
+    fail("unexpected " + archive_kind + " member: directory")
 
 
 def _bounded_digest(value):
@@ -176,7 +248,7 @@ def public_text(value):
 
 
 def _admission_state():
-    return {"root": None, "names": set(), "ancestors": set(),
+    return {"root": None, "names": set(), "components": {},
             "templates": set(), "info_roots": set()}
 
 
@@ -184,9 +256,10 @@ def admit_member(archive_kind, name, effective_name, member_type, size, state,
                  compressed_size=0, extra=b"", mode=0):
     """The only member admission: (a) names, (b) shape, (c) refusals, (d) allowlists.
 
-    Adapters visit files before directories, so directory permission is derived
-    solely from files already admitted by this function in this archive.
-    No archive member is ignored; the only success result is 'admitted'.
+    Adapters visit files before directories. Each folded component is indexed
+    under its parent with one spelling, one kind and an explicit-directory flag.
+    A directory entry is admitted only when a file already recorded that
+    component. No archive member is ignored; the only success result is 'admitted'.
     """
     forbidden = "forbidden " + archive_kind + " member: "
     unexpected = "unexpected " + archive_kind + " member: "
@@ -266,9 +339,13 @@ def admit_member(archive_kind, name, effective_name, member_type, size, state,
     # (d) A directory inherits permission only from an already admitted file;
     # that file has passed these same location and allowlist rules. The sdist
     # deliberately has no whole-tree file allowlist beyond (a)-(c).
+    # Implied directories and explicit entries share one per-parent index.
     info = re.fullmatch(r"aegis_guardrails-[A-Za-z0-9_.+!-]+\.dist-info", parts[0])
+    claim = _component_claim(parts, directory, state)
+    if claim == "duplicate":
+        fail("duplicate " + archive_kind + " member: " + public_text(name))
     if directory:
-        allowed = key in state["ancestors"]
+        allowed = claim == "ok"
     elif archive_kind == "sdist":
         allowed = True
     elif location == _TEMPLATE_LOCATION:
@@ -282,15 +359,14 @@ def admit_member(archive_kind, name, effective_name, member_type, size, state,
                    location == _TEAM_TEMPLATES_LOCATION)
     if not allowed:
         fail(unexpected + public_text(name))
-    # (e) All checks completed. Only admitted files can grant ancestry.
+    # (e) All checks completed. Record the member and its components together.
     state["names"].add(key)
     state.setdefault("folded", set()).add(_destination_key(key))
-    if not directory:
-        state["ancestors"].update("/".join(parts[:i]) for i in range(1, len(parts)))
-        if archive_kind == "wheel":
-            state["templates"].update({logical} & TEMPLATES)
-            if info:
-                state["info_roots"].add(parts[0])
+    _record_components(parts, directory, state)
+    if not directory and archive_kind == "wheel":
+        state["templates"].update({logical} & TEMPLATES)
+        if info:
+            state["info_roots"].add(parts[0])
     return "admitted"
 
 
@@ -322,6 +398,7 @@ def check_wheel(path):
                                  mode=stat.S_IMODE(unix))
                     if name.endswith(".dist-info/METADATA"):
                         metadata.append(source.read(METADATA_LIMIT))
+            _refuse_orphan_directories("wheel", state)
             if state["templates"] != TEMPLATES:
                 shown = ", ".join(public_text(item) for item in sorted(state["templates"] ^ TEMPLATES))
                 fail("wheel template allowlist mismatch: " + shown)
@@ -423,6 +500,7 @@ def check_sdist(path):
                 permission = member.mode if isinstance(member.mode, int) else None
                 admit_member("sdist", member.name, member.name, member.type, member.size, state,
                              mode=stat.S_IMODE(permission) if permission is not None else -1)
+            _refuse_orphan_directories("sdist", state)
     except (tarfile.TarError, OSError, EOFError, ValueError) as exc:
         fail("invalid sdist: " + public_text(str(exc)))
 
