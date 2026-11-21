@@ -260,6 +260,167 @@ def test_rust_attributed_struct_fields_keep_duplicate_and_update_errors(fields, 
     assert raised.value.reason == 'syntax'
 
 
+_FIELD_ATTRIBUTE_TEXT = {
+    'none': '',
+    'one': ' #[allow(unused)]',
+    'nested': ' #[cfg_attr(all(), allow(unused))]',
+    'comment': ' #[allow(unused /* note */)] /* field */',
+}
+
+
+def _attributed_field_source(kind, attribute):
+    text = _FIELD_ATTRIBUTE_TEXT[attribute]
+    if kind == 'struct':
+        expression = 'consume(Config { a: 1,' + text + ' b: inner() })'
+    elif kind == 'enum':
+        expression = 'consume(Choice::Named { a: 1,' + text + ' b: inner() })'
+    else:
+        expression = 'consume((1,' + text + ' inner()))'
+    return 'fn run() { ' + expression + '; }'
+
+
+def _call_snapshot(tree):
+    return [(call.target, call.kind, dict(call.args)) for call in tree.call_sites]
+
+
+def _expected_field_calls(kind):
+    if kind == 'tuple':
+        # Tuple fields stay positional. The outer call does not lift named fields.
+        return [('consume', None, {'#0': '<expr>'}), ('inner', None, {})]
+    target = 'Config' if kind == 'struct' else 'Choice::Named'
+    named = {'a': '1', 'b': '<expr>'}
+    return [
+        ('consume', None, {'#0': '<expr>', 'a': '1', 'b': '<expr>'}),
+        (target, 'construct', named),
+        ('inner', None, {}),
+    ]
+
+
+@pytest.mark.parametrize('kind', ['struct', 'enum', 'tuple'])
+@pytest.mark.parametrize('attribute', ['none', 'one', 'nested', 'comment'])
+def test_rust_field_attributes_stay_indexed_across_revisit(kind, attribute):
+    """One parse visits named fields twice, and a second parse repeats those facts."""
+    from aegis_core.ast.drivers.rust import parse
+
+    source = _attributed_field_source(kind, attribute)
+    expected = _expected_field_calls(kind)
+    first = _call_snapshot(parse(source, 'src/lib.rs'))
+    again = _call_snapshot(parse(source, 'src/lib.rs'))
+    assert first == expected
+    assert again == first
+    if kind == 'tuple':
+        assert first[0][2] == {'#0': '<expr>'}
+        assert all(call_kind != 'construct' for _target, call_kind, _args in first)
+        return
+    named = {'a': '1', 'b': '<expr>'}
+    outer_named = {key: value for key, value in first[0][2].items() if key != '#0'}
+    assert outer_named == first[1][2] == named
+
+
+def test_rust_same_parse_revisit_keeps_stacked_and_inner_attributes():
+    """Stacked and inner attributes stay skipped on the argument visit and the constructor visit."""
+    from aegis_core.ast.drivers.rust import parse
+
+    named = {'a': '1', 'b': '<expr>', 'c': '2'}
+    struct_source = (
+        'fn run() { consume(Config { a: 1, #[allow(unused)] #[cfg(test)] b: inner(), '
+        '#![deny(dead_code)] c: 2 }); }'
+    )
+    enum_source = (
+        'fn run() { consume(Choice::Named { a: 1, #[allow(unused)] #[cfg(test)] b: inner(), '
+        '#![deny(dead_code)] c: 2 }); }'
+    )
+    tuple_source = (
+        'fn run() { consume((1, #[allow(unused)] #[cfg(test)] inner(), '
+        '#![deny(dead_code)] other())); }'
+    )
+    struct_expected = [
+        ('consume', None, {'#0': '<expr>', 'a': '1', 'b': '<expr>', 'c': '2'}),
+        ('Config', 'construct', named),
+        ('inner', None, {}),
+    ]
+    enum_expected = [
+        ('consume', None, {'#0': '<expr>', 'a': '1', 'b': '<expr>', 'c': '2'}),
+        ('Choice::Named', 'construct', named),
+        ('inner', None, {}),
+    ]
+    tuple_expected = [
+        ('consume', None, {'#0': '<expr>'}),
+        ('inner', None, {}),
+        ('other', None, {}),
+    ]
+    for _ in range(2):
+        struct_calls = _call_snapshot(parse(struct_source, 'src/lib.rs'))
+        enum_calls = _call_snapshot(parse(enum_source, 'src/lib.rs'))
+        tuple_calls = _call_snapshot(parse(tuple_source, 'src/lib.rs'))
+        assert struct_calls == struct_expected
+        assert {key: value for key, value in struct_calls[0][2].items() if key != '#0'} == struct_calls[1][2]
+        assert enum_calls == enum_expected
+        assert {key: value for key, value in enum_calls[0][2].items() if key != '#0'} == enum_calls[1][2]
+        assert tuple_calls == tuple_expected
+        assert all(call_kind != 'construct' for _target, call_kind, _args in tuple_calls)
+
+
+@pytest.mark.parametrize('kind,attribute,detail', [
+    ('struct', 'broken', 'invalid attribute'),
+    ('enum', 'broken', 'invalid attribute'),
+    ('tuple', 'broken', 'invalid attribute'),
+    ('struct', 'empty', 'invalid struct field'),
+    ('enum', 'empty', 'invalid struct field'),
+    ('struct', 'hash', 'invalid struct field'),
+    ('struct', 'unclosed', 'mismatched delimiter'),
+])
+def test_rust_attribute_index_failures_refuse_without_a_raw_exception(kind, attribute, detail):
+    from aegis_core.ast.driver_errors import ASTDriverError
+    from aegis_core.ast.drivers.rust import parse
+
+    bodies = {
+        'broken': ' a: 1, #[ ] b: inner()',
+        'empty': ' a: 1, #[allow(unused)]',
+        'hash': ' a: 1, # b: 2',
+        'unclosed': ' a: 1, #[allow(unused b: 2',
+    }
+    if kind == 'tuple':
+        expression = 'Foo(1, #[ ] inner())'
+    elif kind == 'enum':
+        expression = 'Choice::Named {' + bodies[attribute] + ' }'
+    else:
+        expression = 'Config {' + bodies[attribute] + ' }'
+    source = 'fn run() { ' + expression + '; }'
+    for _ in range(2):
+        with pytest.raises(ASTDriverError, match='^' + detail + ' at line 1$') as raised:
+            parse(source, 'src/lib.rs')
+        assert raised.value.reason == 'syntax'
+
+
+def test_rust_attribute_index_parses_are_isolated_across_threads():
+    from concurrent.futures import ThreadPoolExecutor
+
+    from aegis_core.ast.driver_errors import ASTDriverError
+    from aegis_core.ast.drivers.rust import parse
+
+    sources = [_attributed_field_source(kind, attribute)
+               for kind in ('struct', 'enum', 'tuple')
+               for attribute in _FIELD_ATTRIBUTE_TEXT]
+    refusal = 'fn run() { Config { a: 1, #[ ] b: inner() }; }'
+
+    def accept(source):
+        return _call_snapshot(parse(source, 'src/lib.rs'))
+
+    def refuse(source):
+        try:
+            parse(source, 'src/lib.rs')
+        except ASTDriverError as exc:
+            return exc.reason, str(exc)
+        return 'raw', 'no refusal'
+
+    baseline = [accept(source) for source in sources]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for _ in range(2):
+            assert list(pool.map(accept, sources)) == baseline
+            assert list(pool.map(refuse, [refusal] * 4)) == [('syntax', 'invalid attribute at line 1')] * 4
+
+
 @pytest.mark.parametrize('source,targets', [
     ('''fn run(value: Choice) { match value {
         #[cfg(any())] Choice::Named { #[cfg(any())] hidden, shown, .. }

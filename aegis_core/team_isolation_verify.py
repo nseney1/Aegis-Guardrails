@@ -16,7 +16,7 @@ from aegis_core.team_isolation_mounts import (
     BASE_ENV_ALLOWLIST, ENGINE_ENV_KEYS, ENV_NAME, LINUX_ID_LIMIT,
     NETWORK_MODE, absolute_path, bounded_value, container_env, cpus_limit, engine,
     home_folders, host_policy, image, load_document, memory_bytes, mount_rows, pids_limit,
-    read_isolation, require as require_refusal, validate_mounts,
+    assess_expected_mounts, read_isolation, require as require_refusal, validate_mounts,
 )
 from aegis_core.team_isolation_refusal import IsolationRefusal
 
@@ -31,6 +31,8 @@ NAMESPACE_REQUESTS = (("--pid", "PidMode", "pid_mode", "private"),
                       ("--ipc", "IpcMode", "ipc_mode", "private"),
                       ("--userns", "UsernsMode", "userns_mode", "keep-id"),
                       ("--network", "NetworkMode", "network_mode", NETWORK_MODE))
+# expected_plan rechecks row shape only. verify passes the rows assess already qualified.
+_UNASSESSED = object()
 
 
 def require(condition, message):
@@ -138,7 +140,7 @@ def _fingerprint_record(value):
         for key, digest in value.items())
 
 
-def _validated_expected(expected, host_table, mount_context=None):
+def _validated_expected(expected, host_table, assessed_mounts=_UNASSESSED):
     """One side-effect-free contract for the existing comparison record; never repair unknown into absence.
 
     Return a normalized copy or ordered field errors before observing/equating any actual container fields.
@@ -170,9 +172,13 @@ def _validated_expected(expected, host_table, mount_context=None):
     if expected.get("read_only") is not True:
         bad.add("read_only")
     try:
-        checked["mounts"] = mount_rows(expected.get("mounts"))
-        if mount_context is not None:
-            checked["mounts"] = validate_mounts(checked["mounts"], **mount_context)
+        if assessed_mounts is _UNASSESSED:
+            checked["mounts"] = mount_rows(expected.get("mounts"))
+        elif assessed_mounts is None:
+            bad.add("mounts")
+        else:
+            # Rows already qualified for this verify call. Do not open another cache.
+            checked["mounts"] = assessed_mounts
     except IsolationRefusal as exc:
         if exc.code not in ("mount_rows", "unsafe_mount", "mount_overlap"):
             raise
@@ -600,13 +606,13 @@ def _environment_matches(config, expected):
     return True
 
 
-def _verify(inspect_json, expected, host_table, mount_context):
+def _verify(inspect_json, expected, host_table, assessed_mounts):
     """Named mismatches in stable order. Unknown metadata is ignored; malformed required fields refuse.
 
     The expected image_info comes from an image inspect by digest: pinned environment value fingerprints and
     platform identity. No matching witness waives contradictory values or access declarations.
     """
-    expected, errors = _validated_expected(expected, host_table, mount_context)
+    expected, errors = _validated_expected(expected, host_table, assessed_mounts)
     if errors:
         return errors
     actual = _inspection(inspect_json)
@@ -689,11 +695,12 @@ def verify(inspect_json, expected, *, host_table, home, observed, owner_uid, pri
     bounded_value(inspect_json)
     bounded_value(expected)
     host_table = host_policy(host_table)
-    mount_context = dict(home=home, observed=observed, owner_uid=owner_uid,
-                         private_gids=private_gids, owner_homes=owner_homes,
-                         protected_names=host_table.protected_names)
-    # Qualify context even if expected has no mount field. Row/schema/policy
-    # errors are aggregated below; missing or changed observations still refuse.
-    validate_mounts([], **mount_context)
-    return _verify(inspect_json, expected, host_table, mount_context)
+    # Qualify even if expected has no mount field. Structural row errors are
+    # aggregated below; missing or changed observations still refuse. The cache
+    # stays inside assess_expected_mounts and is not returned.
+    rows, structural = assess_expected_mounts(
+        expected.get("mounts") if isinstance(expected, dict) else None,
+        home=home, observed=observed, owner_uid=owner_uid, private_gids=private_gids,
+        owner_homes=owner_homes, protected_names=host_table.protected_names)
+    return _verify(inspect_json, expected, host_table, None if structural is not None else rows)
 

@@ -25,6 +25,7 @@ from aegis_cli import sanitize_display
 from aegis_cli.base import CommandCategory, AegisCommand
 from aegis_cli.rule_lint_cmd import add_lint_parser, run_lint, workspace_refusal as lint_workspace_refusal
 from aegis_core.errors import WorkspaceNotFoundError
+from aegis_core.insights.records import DECISIONS
 from aegis_core.lifecycle.creation import MAX_RULE_BODY_BYTES, validate_rule_body
 from aegis_core.primitives import utc_stamp
 from aegis_core.taxonomy import CANONICAL_RULE_TYPES
@@ -723,7 +724,7 @@ class RuleCommand(AegisCommand):
 
         p_ins_rev = ins_sub.add_parser("review", parents=[common],
                                        help="List insights with their top-3 neighbours or record a decision on some")
-        p_ins_rev.add_argument("--decision", choices=["propose", "reject", "snooze", "merge-into-rule", "noise", "confirm"],
+        p_ins_rev.add_argument("--decision", choices=DECISIONS,
                                default=None, help="Record a review decision on the insights --insight names "
                                                   "(reject also needs --reason; confirm names unconfirmed suggestions)")
         p_ins_rev.add_argument("--insight", dest="insight_ids", action="append", default=None, metavar="ID",
