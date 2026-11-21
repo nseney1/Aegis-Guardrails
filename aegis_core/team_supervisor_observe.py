@@ -185,7 +185,7 @@ def _workspace_observations(root, now, floor, user_root=None):
         root = _root(root)
         with storage_confined.confined_file(root, _ANCHOR) as handle:
             identity = _identity(handle.parent_stat())
-            disk = _disk(handle._parent, floor)
+            disk = _disk(handle.parent_fd, floor)
             reason = _lease_budget(root, identity)
             if reason is not None:
                 writer, audit = _writer(_unknown(reason)), _unknown(reason)
