@@ -2267,34 +2267,49 @@ def test_exact_budget_with_an_empty_first_subdirectory_has_no_false_cap(tmp_path
     assert "scan_capped" not in _codes(report)
 
 
-def test_scratch_duplicate_closes_when_the_anchor_context_fails(tmp_path, monkeypatch):
+def test_scratch_duplicate_closes_on_exit_failure_and_on_successful_retry(tmp_path, monkeypatch):
     if not doctor_git_observe.descriptor_support():
         pytest.skip("directory descriptors unsupported")
-    borrowed = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
     duplicates = []
+    fail_exit = True
 
     def duplicate(fd):
+        assert fd == borrowed
         owned = os.dup(fd)
         duplicates.append(owned)
         return owned
 
     @contextmanager
-    def failing_anchor(*args):
-        yield types.SimpleNamespace(_parent=borrowed)
-        raise doctor_git_observe.ConfinedFileError("io")
+    def anchor(*args):
+        yield types.SimpleNamespace(parent_fd=borrowed)
+        if fail_exit:
+            raise doctor_git_observe.ConfinedFileError("io")
 
-    monkeypatch.setattr(doctor_git_observe, "os", types.SimpleNamespace(**{**vars(os), "dup": duplicate}))
-    monkeypatch.setattr(doctor_git_observe, "_confined", failing_anchor)
+    def validate(root, fd, dev, ino):
+        assert fd == duplicates[-1] and fd != borrowed
+        assert not os.get_inheritable(fd)
+        original = os.fstat(borrowed)
+        assert (dev, ino) == (original.st_dev, original.st_ino)
+        return "/held-test-scratch"
+
+    monkeypatch.setattr(doctor_git_observe, "os", types.SimpleNamespace(
+        **{**vars(doctor_git_observe.os), "dup": duplicate}))
+    monkeypatch.setattr(doctor_git_observe, "_confined", anchor)
+    monkeypatch.setattr(doctor_git_observe, "_scratch_ok", validate)
     monkeypatch.setattr(doctor_git_observe, "_scratch_env", lambda: {"AEGIS_SCRATCH": str(tmp_path)})
     monkeypatch.setattr(doctor_git, "_run_git", lambda *args: "git_missing")
     monkeypatch.setattr(doctor_git_observe, "walk", lambda *args: None)
+    borrowed = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        report = doctor_git.collect(tmp_path, tier="A", now=10)
-        assert "scratch_unsupported" in _codes(report)
-        assert len(duplicates) == 1
-        with pytest.raises(OSError) as error:
-            os.fstat(duplicates[0])
-        assert error.value.errno == 9
+        for count, code in enumerate(("scratch_unsupported", "scratch_outside"), start=1):
+            report = doctor_git.collect(tmp_path, tier="A", now=10)
+            assert code in _codes(report)
+            assert len(duplicates) == count
+            with pytest.raises(OSError) as error:
+                os.fstat(duplicates[-1])
+            assert error.value.errno == errno.EBADF
+            os.fstat(borrowed)
+            fail_exit = False
     finally:
         os.close(borrowed)
         for fd in duplicates:
@@ -2302,6 +2317,49 @@ def test_scratch_duplicate_closes_when_the_anchor_context_fails(tmp_path, monkey
                 os.close(fd)
             except OSError:
                 pass
+
+
+def test_disk_walk_refuses_closed_parent_and_retries_with_public_borrow(tmp_path, monkeypatch):
+    if not doctor_git_observe.descriptor_support():
+        pytest.skip("directory descriptors unsupported")
+    (tmp_path / "leaf").touch()
+    real_confined, real_identity = doctor_git_observe._confined, doctor_git_observe._directory_identity
+    _quiet_tree(monkeypatch)
+    closed, scans, stats = True, [], []
+
+    @contextmanager
+    def confined(*args):
+        with real_confined(*args) as handle:
+            if not closed:
+                yield types.SimpleNamespace(parent_fd=handle.parent_fd, parent_stat=handle.parent_stat)
+                return
+        yield handle
+
+    def scan(fd):
+        assert isinstance(fd, int)
+        scans.append(fd)
+        return os.scandir(fd)
+
+    def inspect(path, *args, **kwargs):
+        if path == "leaf":
+            stats.append((kwargs["dir_fd"], kwargs["follow_symlinks"]))
+        return os.stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(doctor_git, "_run_git", lambda *args: "git_missing")
+    monkeypatch.setattr(doctor_git_observe, "_confined", confined)
+    monkeypatch.setattr(doctor_git_observe, "_directory_identity", real_identity)
+    monkeypatch.setattr(doctor_git_observe, "_scandir", scan)
+    monkeypatch.setattr(doctor_git_observe, "os", types.SimpleNamespace(
+        **{**vars(doctor_git_observe.os), "stat": inspect}))
+    assert "unreadable_path" in _codes(doctor_git.collect(tmp_path, tier="A", now=10))
+    assert not scans and not stats
+
+    closed = False
+    assert "unreadable_path" not in _codes(doctor_git.collect(tmp_path, tier="A", now=10))
+    assert len(scans) == 1 and stats == [(scans[0], False)]
+    with pytest.raises(OSError) as error:
+        os.fstat(scans[0])
+    assert error.value.errno == errno.EBADF
 
 
 def test_missing_descriptor_binding_refuses_a_replaced_scratch(tmp_path, monkeypatch):
