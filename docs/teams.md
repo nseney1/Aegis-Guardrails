@@ -22,6 +22,8 @@ These surfaces are in the tree. This page is the entry; the linked pages are the
 | Message codec | `aegis msg` plus `aegis_msg_read` and `aegis_msg_write` | [Delivery over MCP](how-it-works.md#delivery-over-mcp) |
 | Product mailbox | `aegis team mail send` and `aegis team mail read` over `aegis_core.team_mailbox`; `aegis team mail doctor` over `aegis_core.team_mailbox_doctor` | [Mail and board](#mail-and-board) |
 | Team board | `aegis team board` configures, reads and inspects the board over `aegis_core.team_board` | [Mail and board](#mail-and-board) |
+| Container isolation | `aegis team isolation check` plans from an absolute team-run file or compares an inspection; it does not start a container | [Container isolation](teams-container-isolation.md) |
+| Source pages | `aegis_core.team_source` serves pinned object pages from an owner-selected root; refusals are fixed envelopes | [Architecture](architecture.md#where-to-read-next) |
 | Session wake | `aegis_core.team_session_wake` validates the profile binding and attempts a turn for unread mail | [Session wakes](#session-wakes) |
 | Codex stdio wire | `aegis_core.team_native_wire.ProtocolClient` launches no process; the caller owns and reaps the process and transfers both pipe streams to the client, which closes them on `close()` or a terminal protocol error; cancel through `client.close()` and never close or reuse the streams directly | [Architecture](architecture.md#where-to-read-next) |
 | Workspace ledger | `aegis_core.team_workspace_store` and `aegis_core.team_workspace_display`; `tools/hierarchy_workspace.py` stays outside the wheel | [Architecture](architecture.md#where-to-read-next) |
@@ -33,7 +35,7 @@ These surfaces are in the tree. This page is the entry; the linked pages are the
 | Proposals and lint | proposal records, including source `mine`; `aegis rule lint` reports and exits 0 | [Proposals and rule lint](how-it-works.md#proposals-and-rule-lint) |
 | Supervisor | profile-driven pauses and backoff | [Supervisor profile](teams-supervisor.md) |
 
-`aegis_core.merge_queue.MergeQueue` checks qualification for the exact landing tree. Automatic landing remains separate work. `revalidate` refuses `issued_unresolved` while an issued record or cleanup is set. `check_issued` refuses `issued_unresolved` when that issued checkpoint conflicts or results remain. `tools/hierarchy_templates/` is outside the wheel. The wheel includes `job-recipes.json` and `role-registry.json` under `aegis_core/team_templates/`. `team_roles.registry` reads the role registry. [Absorption](teams-absorption.md) describes the package boundary for templates that are not moved yet.
+`aegis_core.merge_queue.MergeQueue` checks qualification for the exact landing tree. Automatic landing remains separate work. `revalidate` refuses `issued_unresolved` while an issued record or cleanup is set. `check_issued` refuses `issued_unresolved` when that issued checkpoint conflicts or results remain. A refusal's `next_action` names the custodian and a fixed recovery text, and it echoes no transport text. `tools/hierarchy_templates/` is outside the wheel. The wheel includes `job-recipes.json` and `role-registry.json` under `aegis_core/team_templates/`. `team_roles.registry` reads the role registry. An `invalid_registry` refusal keeps that reason; a missing field, a field type or routes puts the matching repair in `next_action`. [Absorption](teams-absorption.md) describes the package boundary for templates that are not moved yet.
 
 Snapshots refuse `unsupported_platform` unless `descriptor_support` is true: `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `stat` and `readlink`. The work queue refuses `unsupported_platform`, and the proposal store refuses `unsupported`, unless `storage.confined_descriptor_supported` is true: `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `mkdir`, `link`, `rename`, `unlink` and `stat`. That function does not use `readlink`. Both probes are false when `os.name` is not `posix`, so Windows fails them. Neither function tests for macOS.
 
@@ -61,7 +63,7 @@ recorded as `failed_to_start` or `start_incomplete`, with the reasons in the
 runner calls `check_settlement_processes` on settlement and recovery before it
 treats a stopped job as finished, and refuses while the recorded process group
 still has members. The small-change dispatcher calls `check_stopped` before it
-accepts a completed retained job. Start with the
+accepts a completed retained job. Under a host plan, a handoff checkpoint keeps open-work briefs, the last touching brief, briefs listed in `entries[].briefs`, and the last inherited brief when none qualifies; without a plan, briefs carry forward unchanged. Start with the
 [runtime guide](agent-hierarchies.md) and the
 [team-run prerequisites and configuration](hierarchy-team.md#prerequisites).
 
@@ -81,7 +83,7 @@ includes `O_NOFOLLOW`, `O_DIRECTORY`, descriptor-relative `open`, `mkdir`,
 `link`, `unlink`, `stat` and `rmdir`, and `scandir` on a directory descriptor.
 After successful argument parsing and workspace resolution, missing descriptor
 support yields `unsupported_platform` for mail send, mail read and every board
-command, and `MD_PLATFORM` for mail doctor.
+command, and `MD_PLATFORM` for mail doctor. A malformed option before `mail` or `board` is a fixed usage refusal (exit 2) and does not echo the caller's tokens. A board write waits up to 5.0 seconds for the board lock, then refuses `busy` if the lock is still held. A post or disposition refuses `rate_limited` when that endpoint already has 30 actions in the last 60 seconds: the refusal tells the caller to wait for the window and writes nothing.
 
 ### Session wakes
 
