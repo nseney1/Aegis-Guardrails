@@ -283,7 +283,7 @@ def test_projection_cursor_and_expansion_parity(store, capsys):
                                        ("missing", "E_REF"), ("budget", "E_LIMIT")])
 def test_read_integrity_and_budget_refusals(case, code, store):
     rid = store.write(GOLDENS[0]["record"])
-    filename = store.root / (rid + ".json")
+    filename = store.root / rid[:2] / (rid + ".json")
     if case == "hash":
         filename.write_bytes(filename.read_bytes().replace(b"writer", b"reader"))
     elif case == "oversize":
@@ -630,7 +630,8 @@ def test_ambiguous_host_roots_dispatch_gives_launch_pin_guidance(action, tmp_pat
     text, failed = call("write", kind="text", content=CONTENT)
     assert not failed, text
     record = json.loads(text)
-    assert (roots[0] / ".aegis" / "state" / "messages" / (record["id"] + ".json")).is_file()
+    rid = record["id"]
+    assert (roots[0] / ".aegis" / "state" / "messages" / rid[:2] / (rid + ".json")).is_file()
     assert not (roots[1] / ".aegis" / "state").exists()
 
 
