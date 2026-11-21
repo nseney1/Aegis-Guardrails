@@ -25,6 +25,7 @@ from tests.helpers_reviewed_sources import (
 )
 
 from aegis_core import insights as core_insights
+import aegis_core.insights.review as insight_review
 from aegis_core.errors import PathTraversalError
 from aegis_core.primitives import real_path
 from aegis_core.gitsafe_policy import LOCAL_ENV
@@ -300,6 +301,232 @@ def test_round8_inventory_bounds_refuse_before_copy_then_recover(tmp_path, monke
     assert read_insight_rows(workspace, home=home) == before
     monkeypatch.setattr("aegis_core.insights.capture.MAX_INSIGHT_ITEMS", maximum)
     assert record_hook_prompt("cli", payload, workspace=workspace, home=home)
+
+
+# One closed field policy and one decision enumeration. The six-value literal, the
+# field-policy dict and the 4096 bound are defined in records.py; capture and review import them.
+_CLOSED_DECISIONS = ("propose", "reject", "snooze", "merge-into-rule", "noise", "confirm")
+
+
+def _insight_package():
+    return REPO / "aegis_core" / "insights"
+
+
+def _insight_source_files(root):
+    """Package sources by the closed module list. Path.glob is a live-tree census."""
+    names = ("__init__.py", *(f"{name}.py" for name in INSIGHT_MODULES))
+    return [root / name for name in names if (root / name).is_file()]
+
+
+def _decision_enumeration_sites(root):
+    found = []
+    for path in _insight_source_files(root):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Tuple) or len(node.elts) != len(_CLOSED_DECISIONS):
+                continue
+            if all(isinstance(elt, ast.Constant) and elt.value == expected
+                   for elt, expected in zip(node.elts, _CLOSED_DECISIONS)):
+                found.append(path.name + ":" + str(node.lineno))
+    return found
+
+
+def _module_dict_assignments(root, name):
+    found = []
+    for path in _insight_source_files(root):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            targets = node.targets if isinstance(node, ast.Assign) else (
+                [node.target] if isinstance(node, ast.AnnAssign) else [])
+            value = node.value if isinstance(node, (ast.Assign, ast.AnnAssign)) else None
+            if isinstance(value, ast.Dict) and any(isinstance(target, ast.Name) and target.id == name
+                                                   for target in targets):
+                found.append(path.name + ":" + str(node.lineno))
+    return found
+
+
+def _module_constant_assignments(root, name):
+    found = []
+    for path in _insight_source_files(root):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant) and any(
+                    isinstance(target, ast.Name) and target.id == name for target in node.targets):
+                found.append(path.name + ":" + str(node.lineno))
+    return found
+
+
+def _policy_ids(count):
+    if count == 0:
+        return []
+    return ["ins-" + "a" * 12] * count
+
+
+def test_the_decision_enumeration_and_field_policy_have_one_owner():
+    """The insight writers share records.DECISIONS and records.INSIGHT_FIELD_POLICIES."""
+    root = _insight_package()
+    assert [site.split(":")[0] for site in _decision_enumeration_sites(root)] == ["records.py"]
+    assert [site.split(":")[0] for site in _module_dict_assignments(root, "INSIGHT_FIELD_POLICIES")] == ["records.py"]
+    assert [site.split(":")[0] for site in _module_constant_assignments(root, "MAX_INSIGHT_ITEMS")] == ["records.py"]
+    from aegis_core.insights import capture, review
+    from aegis_core.insights import records
+
+    assert records.DECISIONS == _CLOSED_DECISIONS
+    assert review.DECISIONS is records.DECISIONS
+    assert capture._IDENTITY_ENUMS["decision"] is records.DECISIONS
+    assert capture.INSIGHT_FIELD_POLICIES is records.INSIGHT_FIELD_POLICIES
+    assert capture.MAX_INSIGHT_ITEMS == records.MAX_INSIGHT_ITEMS == 4096
+    assert set(review._RULING_DECISIONS) <= set(records.DECISIONS)
+    assert set(records.__all__) >= {"DECISIONS", "INSIGHT_FIELD_POLICIES", "MAX_INSIGHT_ITEMS"}
+    for name in ("capture.py", "review.py"):
+        tree = ast.parse((root / name).read_text(encoding="utf-8"), filename=name)
+        imported = [node.module for node in ast.walk(tree)
+                    if isinstance(node, ast.ImportFrom) and node.module == "aegis_core.insights.records"]
+        assert imported == ["aegis_core.insights.records"], name
+
+
+def test_record_decision_validates_the_id_list_once(tmp_path, monkeypatch):
+    """Success and refusal each apply the id policy once; a refusal does not append."""
+    from aegis_core.redaction import RedactionRefusal
+
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    workspace.mkdir()
+    seen = []
+    real = insight_review.clean_insight_row
+
+    def counting(row, *, workspace):
+        if "insight_ids" in row:
+            seen.append((tuple(row), len(row["insight_ids"])))
+        return real(row, workspace=workspace)
+
+    monkeypatch.setattr(insight_review, "clean_insight_row", counting)
+    ids = _policy_ids(4096)
+    row = record_decision(workspace, decision="confirm", insight_ids=ids, home=home)
+    assert len(seen) == 1
+    assert "event" in seen[0][0] and seen[0][1] == 4096
+    assert row["insight_ids"] == ids and row["insight_ids"] is not ids
+    assert read_insight_rows(workspace, home=home) == [row]
+    record_decision(workspace, decision="noise", insight_ids=ids, home=home)
+    assert len(seen) == 2
+    before = read_insight_rows(workspace, home=home)
+    seen.clear()
+    with pytest.raises(RedactionRefusal, match="^invalid$") as refusal:
+        record_decision(workspace, decision="reject", insight_ids=["not-an-id"], home=home)
+    assert refusal.value.code == "invalid"
+    assert "not-an-id" not in str(refusal.value)
+    assert len(seen) == 1 and "event" in seen[0][0]
+    assert read_insight_rows(workspace, home=home) == before
+
+
+@pytest.mark.parametrize("writer", ["capture", "review"])
+@pytest.mark.parametrize("count", [0, 1, 4096, 4097])
+@pytest.mark.parametrize("decision", [*_CLOSED_DECISIONS, "unknown"])
+def test_insight_writers_share_the_closed_policy(tmp_path, writer, count, decision):
+    """Each writer accepts the six decisions through the 4096 bound and refuses the rest."""
+    from aegis_core.insights import capture
+    from aegis_core.redaction import RedactionRefusal
+
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    workspace.mkdir()
+    ids = _policy_ids(count)
+    known = decision in _CLOSED_DECISIONS
+    if writer == "capture":
+        payload = {"decision": decision, "insight_ids": ids}
+        if not known:
+            with pytest.raises(RedactionRefusal, match="^invalid$") as refusal:
+                capture.clean_insight_row(payload, workspace=workspace)
+            assert refusal.value.code == "invalid"
+            assert decision not in str(refusal.value)
+        elif count > 4096:
+            with pytest.raises(RedactionRefusal, match="^too_large$") as refusal:
+                capture.clean_insight_row(payload, workspace=workspace)
+            assert refusal.value.code == "too_large"
+            assert str(refusal.value) == "too_large"
+        else:
+            cleaned = capture.clean_insight_row(payload, workspace=workspace)
+            assert cleaned == {"decision": decision, "insight_ids": list(ids)}
+            assert cleaned["insight_ids"] is not ids
+            assert capture.clean_insight_row(cleaned, workspace=workspace) == cleaned
+        assert read_insight_rows(workspace, home=home) == []
+        return
+    if not known:
+        with pytest.raises(RedactionRefusal, match="^invalid$") as refusal:
+            record_decision(workspace, decision=decision, insight_ids=ids, home=home)
+        assert refusal.value.code == "invalid"
+        assert str(refusal.value) == "invalid"
+        assert decision not in str(refusal.value)
+    elif count == 0:
+        with pytest.raises(ValueError, match="^" + decision + " needs at least one insight id$"):
+            record_decision(workspace, decision=decision, insight_ids=ids, home=home)
+    elif count > 4096:
+        with pytest.raises(RedactionRefusal, match="^too_large$") as refusal:
+            record_decision(workspace, decision=decision, insight_ids=ids, home=home)
+        assert refusal.value.code == "too_large"
+        assert str(refusal.value) == "too_large"
+    else:
+        row = record_decision(workspace, decision=decision, insight_ids=ids, home=home)
+        assert row["event"] == "decision" and row["decision"] == decision
+        assert row["insight_ids"] == list(ids) and row["insight_ids"] is not ids
+        assert capture.clean_insight_row(row, workspace=workspace) == row
+        assert read_insight_rows(workspace, home=home) == [row]
+        return
+    assert read_insight_rows(workspace, home=home) == []
+
+
+def test_record_decision_refusal_leaves_storage_then_retry_and_concurrent_writes(tmp_path):
+    """A refusal writes nothing; a later accept and concurrent accepts all land whole."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from aegis_core.redaction import RedactionRefusal
+
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    workspace.mkdir()
+    with pytest.raises(RedactionRefusal, match="^too_large$") as refusal:
+        record_decision(workspace, decision="confirm", insight_ids=_policy_ids(4097), home=home)
+    assert refusal.value.code == "too_large"
+    with pytest.raises(ValueError, match="^noise needs at least one insight id$"):
+        record_decision(workspace, decision="noise", insight_ids=[], home=home)
+    with pytest.raises(ValueError, match="^propose needs at least one insight id$"):
+        record_decision(workspace, decision="propose", insight_ids=[" "] * 4096, home=home)
+    with pytest.raises(ValueError, match="^reject needs at least one insight id$"):
+        record_decision(workspace, decision="reject", insight_ids=("  ", "\t"), home=home)
+    with pytest.raises(RedactionRefusal, match="^invalid$") as refusal:
+        record_decision(workspace, decision="confirm\npropose", insight_ids=_policy_ids(1), home=home)
+    assert refusal.value.code == "invalid"
+    assert "propose" not in str(refusal.value)
+    secret = "not-an-id\nsecret"
+    with pytest.raises(RedactionRefusal, match="^invalid$") as refusal:
+        record_decision(workspace, decision="snooze", insight_ids=[secret], home=home)
+    assert refusal.value.code == "invalid"
+    assert "secret" not in str(refusal.value)
+    assert read_insight_rows(workspace, home=home) == []
+
+    first = record_decision(workspace, decision="confirm", insight_ids=("ins-" + "b" * 12,), home=home)
+    assert first["insight_ids"] == ["ins-" + "b" * 12]
+
+    def accept(index):
+        decision = _CLOSED_DECISIONS[index % len(_CLOSED_DECISIONS)]
+        return record_decision(workspace, decision=decision, insight_ids=["ins-" + format(index, "012x")], home=home)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        accepted = list(pool.map(accept, range(6)))
+
+    def refuse(index):
+        try:
+            record_decision(workspace, decision="unknown", insight_ids=_policy_ids(1), home=home)
+        except RedactionRefusal as exc:
+            return exc.code
+        return "wrote"
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        refused = list(pool.map(refuse, range(4)))
+    assert refused == ["invalid"] * 4
+    stored = read_insight_rows(workspace, home=home)
+    assert stored[0] == first
+    assert {tuple(row["insight_ids"]) for row in stored} == {tuple(first["insight_ids"]), *(
+        tuple(row["insight_ids"]) for row in accepted)}
+    assert len(stored) == 7
+    assert {row["decision"] for row in stored} == set(_CLOSED_DECISIONS)
 
 
 def _round8h_control_source(split, tail, placement=None, preceding=""):
@@ -2211,7 +2438,7 @@ def test_an_insight_without_tokens_matches_nothing_and_raises_nothing(tmp_path: 
     assert {e["id"]: e["neighbours"] for e in review["insights"]} == {row["id"]: []}
 
 
-# ── R-structure-32: insights is a package of four modules with the module's surface ──
+# ── R-structure-32: insights package modules and the module's surface ──
 
 # aegis_core.insights.__all__ on the w14 merge commit (e7e61536), when insights was one module. One
 # string: listed names would count as uses in test_every_name_in_insights_all_is_used_outside_the_module.
@@ -2229,7 +2456,7 @@ W14_DEFINED = tuple("""
     RECURRENCE_ALARM_COUNT REJECTION_RESURFACE_COUNT
 """.split())
 # Each module may import only the ones before it; none imports the package itself.
-INSIGHT_MODULES = ("keys", "capture", "review", "recurrence")
+INSIGHT_MODULES = ("keys", "records", "capture", "review", "recurrence")
 
 
 def unresolved_exports(module) -> list:
@@ -2318,9 +2545,10 @@ def _module_tricks(source: str) -> list:
 
 
 def test_the_package_is_layered_and_its_init_is_plain():
-    """Given the package, When its modules are parsed, Then keys imports no sibling, capture only
-    keys, review only those two and recurrence only those three, none imports the package; the
-    __init__ has an __all__, and no file serves names lazily or swaps a module object."""
+    """Given the package, When its modules are parsed, Then keys and records import no sibling,
+    capture only keys and records, review only those three and recurrence only earlier modules,
+    none imports the package; the __init__ has an __all__, and no file serves names lazily or
+    swaps a module object."""
     pkg = REPO / "aegis_core" / "insights"
     sources = {name: (pkg / f"{name}.py").read_text(encoding="utf-8") for name in INSIGHT_MODULES}
     assert layering_violations(sources) == []

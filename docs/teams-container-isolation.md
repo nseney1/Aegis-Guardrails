@@ -1,8 +1,38 @@
 # Optional Teams container isolation
 
-C1 supplies a library and a read-only planning/verification CLI. It does not yet change `aegis team`, start a
-container, check engine availability, or build an image. Team config/init integration arrives in C3 and run
-lifecycle integration in C4. Missing isolation keeps host mode, which requires no owner-home lookup.
+`aegis team isolation check` reads a team run configuration to plan a container or compare engine
+inspection data against that plan. Missing isolation keeps host mode, which requires no owner-home
+lookup. Team config/init integration arrives in C3 and run lifecycle integration in C4.
+
+## Check a plan or an inspection
+
+```sh
+aegis team isolation check --config /absolute/path/team-run.json --json
+aegis team isolation check --config /absolute/path/team-run.json --inspect /absolute/path/inspect.json --json
+```
+
+Both inputs must be regular files with absolute paths and no symlink components. Each document is
+limited to 1 MiB. The check decodes the configuration once and requires a JSON object. It accepts
+the legacy team-run fields and refuses unknown top-level or recipe fields. A present isolation
+section requires `aegis.team-run/v2`. Host mode requires
+confined file reads. Container mode additionally requires Linux descriptor and ACL observation.
+
+The plan reports `status`, `mode`, `isolation`, `mounts` and `create_argv`. A container plan also reports
+`run`. Mount and ACL checks sample held descriptors and refuse changed observations. Host runtime
+homes and additional host credential exclusions come from the same qualified Teams registry.
+The baseline credential exclusions apply even when host rows omit owner folders. The display
+preserves safe pathname spellings. When argv fields are redacted or shortened, the response includes
+`create_argv_display_only: true`. Recompute an operational plan before running an engine.
+
+With `--inspect`, the CLI decodes one JSON object or a list containing one object before observing
+mounts or invoking the engine. Other valid JSON shapes return the `inspect` mismatch. The configured
+engine's `image inspect` runs for the configured digest. The CLI selects an executable from an absolute
+PATH entry outside the workspace. The file and each path component must be root- or owner-owned
+and free of group or other write permissions. Symlinks are refused. The CLI uses a held descriptor
+at launch. Image inspection has a 30-second timeout and a 1 MiB stdout limit. The result includes
+`status` and the named `mismatches`. Exit status is 0 for a plan or verified match, 1 for a mismatch or
+operational refusal, and 2 for invalid usage. Operational refusals report a fixed `code`, `reason` and
+`next_action` in JSON.
 
 ## Prerequisites
 
@@ -13,8 +43,9 @@ lifecycle integration in C4. Missing isolation keeps host mode, which requires n
 - A run folder, project clone, runtime source, Python/venv prefix and live checkouts with no symlink components.
   A mount must not equal or contain any owner home: the supplied home, environment HOME or password-database home.
   Changing HOME does not hide the password-database home. Mounts overlapping an existing secret path under any
-  owner home refuse in either direction (equal to, inside or containing): `.claude`, `.codex`, `.ssh`, `.gnupg`,
-  `.config`, `.aws`, `.kube`, `.docker`, `.netrc` and `.git-credentials`. Dangling secret symlinks protect their
+  owner home refuse in either direction (equal to, inside or containing). The baseline covers
+  `.aws`, `.claude`, `.claude.json`, `.codeium`, `.codex`, `.config`, `.copilot`, `.cursor`, `.docker`,
+  `.gemini`, `.git-credentials`, `.gnupg`, `.kiro`, `.kube`, `.netrc` and `.ssh`. Dangling secret symlinks protect their
   resolved targets too. Named entries are probed with `lstat`; only confirmed absence is treated as missing.
   Unreadable or failed secret metadata refuses, including when an owner home cannot be searched. Planning never
   creates or enumerates secret paths. Source-symlink and inferred-venv marker checks also refuse metadata errors

@@ -83,6 +83,7 @@ _NEXT = {
     "exists": "Read the current history before retrying with a new identifier.",
     "closed": "Open a new mailbox context.",
     "invalid_record": "Reconcile the input and stored history against the mailbox schema.",
+    "rate_limited": "Wait for the rate window to pass before retrying the post or disposition.",
     "scope": "choose a permitted route and message role for this endpoint",
     "binding": "refresh the connection from the current acknowledged endpoint binding",
     "reference": "Use a validated existing message or record reference.",

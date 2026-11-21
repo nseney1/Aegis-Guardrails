@@ -3631,7 +3631,7 @@ def test_lint_check7_reports_a_cold_draft_and_retries(tmp_path, monkeypatch, cap
     expected = {
         kept: "scan simulation: selected in all profiles",
         edited: "not evaluated: candidate differs from scan snapshot",
-        cold: "scan simulation: selected in all profiles",
+        cold: "scan simulation: would be selected in all profiles at cold start",
     }
     assert rows() == expected
     assert rows() == expected
@@ -3644,7 +3644,7 @@ def test_lint_check7_reports_a_cold_draft_and_retries(tmp_path, monkeypatch, cap
     assert run_rule(args) == 0
     payload = json.loads(capsys.readouterr().out)
     check7 = [item["message"] for item in payload["results"][0]["findings"] if item["check"] == 7]
-    assert check7 == ["scan simulation: selected in all profiles"]
+    assert check7 == ["scan simulation: would be selected in all profiles at cold start"]
 
     def unavailable(*_args, **_kwargs):
         raise OSError("UNTRUSTED\nsecret")
@@ -3674,7 +3674,7 @@ def test_lint_check7_cold_verdict_does_not_depend_on_sibling_drafts(tmp_path):
         return scan_simulation_row(lint.lint_workspace(root, [draft])[0])
 
     expected = row()
-    assert expected == "scan simulation: selected in all profiles"
+    assert expected == "scan simulation: would be selected in all profiles at cold start"
     for rule_id in ("a", "b"):
         path, text = _cold_rule(rule_id, "gate")
         repo.write(path, text)
