@@ -107,11 +107,11 @@ def pid_namespace(*, confined_file=None, readlink=None):
     link = os.readlink if readlink is None else readlink
     with identity_errors():
         with opener(Path("/proc"), ("self",)) as handle:
-            own_pid = link("self", dir_fd=handle._parent)
+            own_pid = link("self", dir_fd=handle.parent_fd)
             if own_pid != str(os.getpid()):
                 raise IdentityError("invalid")
         with opener(Path("/proc"), (own_pid, "ns", "pid")) as handle:
-            namespace = link("pid", dir_fd=handle._parent)
+            namespace = link("pid", dir_fd=handle.parent_fd)
         if (type(namespace) is not str or len(namespace) > 26
                 or re.fullmatch(r"pid:\[[0-9]{1,20}\]", namespace) is None):
             raise IdentityError("invalid")
