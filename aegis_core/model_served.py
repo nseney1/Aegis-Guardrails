@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-import json
 import os
 import re
 
@@ -55,18 +54,15 @@ def _anchored_io_supported():
             {"open", "stat", "rename", "unlink"} <= {fn.__name__ for fn in os.supports_dir_fd})
 
 
-def _line_size(row):
-    # Only bounded, validated read_decisions rows plus a fixed five-token block enter here.
-    return len(json.dumps(row, sort_keys=True, ensure_ascii=True, allow_nan=False,
-                          separators=(",", ":"))) + 1
-
-
 def observe_served(path, decision_id, served):
     """Append and return a status-free receipt for an existing decision.
 
     Refuse invalid_decision_id, invalid_served (including a missing fallback
     reason or a reason for an unchanged identity), or unknown_decision_id.
     Line/history caps and anchored I/O use model_select's existing refusal codes.
+    The id is found, checked against this served block and published from one
+    locked snapshot. A generation that no longer contains the id refuses
+    unknown_decision_id and is never admitted as a launch.
     Read/append failures retain that API's lock and descriptor I/O behavior.
     Every refusal before publication preserves the decision log's bytes.
     """
@@ -77,30 +73,14 @@ def observe_served(path, decision_id, served):
     served = dict(served)
     if not _anchored_io_supported():
         raise model_select.ModelSelectionError("anchored_io_unavailable")
-    original, count, size = None, 0, 0
-    rows = model_select.read_decisions(path)
-    try:
-        for row in rows:
-            count += 1
-            size += _line_size(row)
-            if original is None and row["decision_id"] == decision_id:
-                original = row
-    finally:
-        rows.close()
-    if original is None:
-        raise model_select.ModelSelectionError("unknown_decision_id")
-    if not _reason_matches(served, original["choice"]):
-        raise model_select.ModelSelectionError("invalid_served")
-    record = {**original, "outcome": {"served": served}}
-    length = _line_size(record)
-    if length > model_select.MAX_LINE_BYTES:
-        raise model_select.ModelSelectionError("decision_line_too_large")
-    if count + 1 > model_select.MAX_HISTORY_RECORDS or size + length > model_select.MAX_HISTORY_BYTES:
-        raise model_select.ModelSelectionError(_HISTORY_LIMIT)
-    # Immutable decision identity survives additive peers between read and append.
-    # append_decision revalidates the complete resulting history under its own lock.
-    model_select.append_decision(path, record)
-    return record
+
+    def prepare(original):
+        # The choice belongs to the snapshot about to be published.
+        if not _reason_matches(served, original["choice"]):
+            raise model_select.ModelSelectionError("invalid_served")
+        return {**original, "outcome": {"served": served}}
+
+    return model_select.append_decision(path, None, known_decision=decision_id, prepare=prepare)
 
 
 def served_of(rows, decision_id):

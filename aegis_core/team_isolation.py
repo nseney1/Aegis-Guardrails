@@ -9,12 +9,14 @@ from aegis_core.team_isolation_verify import container_name, container_user, exp
 __all__ = ["build_image_argv", "check", "create_argv", "exec_argv", "image_inspect_argv",
            "inspect_argv", "rm_argv", "stop_argv"]
 
+# Legacy home aliases are bounded with the document, then ignored. They do not select run homes.
+_IGNORED_RUN_FIELDS = frozenset(("codex_home", "claude_home"))
 _RUN_FIELDS = frozenset({
     "schema", "run", "project", "source", "recipes", "python_prefix", "live_checkouts", "isolation",
     # Recognized fields of the full legacy run document, unused for isolation.
     "base", "branch", "initiative", "roles", "lanes", "limits", "preflight", "team",
     "base_tree", "min_free_gb", "loop", "lease_ttl_seconds", "hosts",
-})
+}) | _IGNORED_RUN_FIELDS
 _RECIPE_FIELDS = frozenset({"keep", "commit_identity", "template", "python"})
 _SCHEMA = "aegis.team-run/v2"
 
@@ -99,7 +101,11 @@ def build_image_argv(engine, *, context, containerfile, tag):
 
 
 def _read_run(config):
-    """Bound the legacy v2 input before interpreting its closed isolation schema."""
+    """Bound the whole document, then ignore inert home aliases, before the closed schema.
+
+    Bytes use the preflight ingress. Direct dicts use the same field policy and
+    their own budget walk. Neither form mutates the caller's object.
+    """
     if type(config) is bytes:
         config = mount_policy.load_document(config)
         mount_policy.require(type(config) is dict, "document_invalid")
@@ -107,6 +113,8 @@ def _read_run(config):
         mount_policy.require(type(config) is dict, "document_invalid")
         mount_policy.bounded_value(config)
     mount_policy.require(config.keys() <= _RUN_FIELDS, "team_run_fields")
+    if not _IGNORED_RUN_FIELDS.isdisjoint(config):
+        config = {key: value for key, value in config.items() if key not in _IGNORED_RUN_FIELDS}
     if "isolation" in config:
         mount_policy.require(type(config["isolation"]) is dict, "isolation_object")
         mount_policy.require(config.get("schema") == _SCHEMA, "team_run_schema")
