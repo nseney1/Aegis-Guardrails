@@ -1,6 +1,7 @@
 """Unit tests for aegis_core.insights edge cases, security boundaries, and clustering."""
 from __future__ import annotations
 
+import argparse
 import ast
 import errno
 import hashlib
@@ -383,6 +384,85 @@ def test_the_decision_enumeration_and_field_policy_have_one_owner():
         imported = [node.module for node in ast.walk(tree)
                     if isinstance(node, ast.ImportFrom) and node.module == "aegis_core.insights.records"]
         assert imported == ["aegis_core.insights.records"], name
+
+
+def _insight_review_decision_action(parser):
+    """The wired ``aegis rule insight review --decision`` action and its parser."""
+    node = parser
+    for name in ("rule", "insight", "review"):
+        subparsers = [action for action in node._actions if isinstance(action, argparse._SubParsersAction)]
+        assert len(subparsers) == 1, name
+        node = subparsers[0].choices[name]
+    found = [action for action in node._actions if action.dest == "decision" and "--decision" in action.option_strings]
+    assert len(found) == 1
+    return found[0], node
+
+
+def _decision_enumeration_literals(path, expected):
+    """Collections of string constants that repeat the six insight decisions."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            continue
+        values = []
+        for element in node.elts:
+            if not isinstance(element, ast.Constant) or not isinstance(element.value, str):
+                values = None
+                break
+            values.append(element.value)
+        if values is not None and len(values) == len(expected) and set(values) == set(expected):
+            found.append(path.name + ":" + str(node.lineno))
+    return found
+
+
+def test_rule_cli_insight_review_decision_set_equals_the_owner():
+    """The review parser's accepted --decision set is records.DECISIONS, not a second copy.
+
+    Help renders that same tuple. A value outside it, including a multi-line one, is a usage
+    refusal (exit 2) and does not stick: the same parser then accepts every owner decision.
+    Concurrent readers see the one owner tuple.
+    """
+    import io
+    import threading
+    from contextlib import redirect_stderr
+
+    from aegis_cli.cli import _build_parser
+    from aegis_core.insights import records
+
+    parser = _build_parser(prog="aegis")
+    action, review = _insight_review_decision_action(parser)
+    assert action.choices is records.DECISIONS
+    assert tuple(action.choices) == _CLOSED_DECISIONS
+    assert _decision_enumeration_literals(REPO / "aegis_cli" / "rule.py", records.DECISIONS) == []
+    assert ("{%s}" % ",".join(records.DECISIONS)) in review.format_help()
+
+    def refuse(value):
+        with redirect_stderr(io.StringIO()):
+            with pytest.raises(SystemExit) as caught:
+                parser.parse_args(["rule", "insight", "review", "--decision", value])
+        assert caught.value.code == 2
+
+    refuse("unknown")
+    refuse("propose\nreject")
+    refuse("PROPOSE")
+    for decision in records.DECISIONS:
+        namespace = parser.parse_args(["rule", "insight", "review", "--decision", decision])
+        assert namespace.decision == decision
+
+    seen = []
+    barrier = threading.Barrier(2)
+
+    def read():
+        barrier.wait()
+        seen.append(action.choices)
+
+    threads = [threading.Thread(target=read), threading.Thread(target=read)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert [item is records.DECISIONS for item in seen] == [True, True]
 
 
 def test_record_decision_validates_the_id_list_once(tmp_path, monkeypatch):
