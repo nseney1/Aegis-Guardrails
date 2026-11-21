@@ -1,7 +1,9 @@
 """Served receipts through public selection, observation and replay surfaces."""
 import copy
+import errno
 import json
 import os
+import stat
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -414,3 +416,153 @@ def test_unsupported_platform_refusal_is_preserved_with_probe_disabled(tmp_path,
     with pytest.raises(selection.ModelSelectionError, match="^anchored_io_unavailable$"):
         core.observe_served(tmp_path / "receipts.jsonl", original["decision_id"], fallback())
     assert list(tmp_path.iterdir()) == []
+
+
+def test_rotation_cannot_republish_a_suppressed_first_launch(tmp_path, original, scenario, monkeypatch):
+    """A receipt must name a decision in the generation that receives it.
+
+    Wiping the log after lookup is the cooperating rotation. An empty generation
+    would otherwise admit this not_launched first row as a fresh launch.
+    """
+    path = make_store(tmp_path, original)
+    selection.append_decision(path, {**original, "outcome": {"launch_status": "not_launched"}})
+    preserved = path.read_bytes()
+    real_append = selection.append_decision
+    state = {"rotate": True}
+
+    def rotate_then_append(log_path, record=None, **kwargs):
+        if state["rotate"]:
+            log_path.write_bytes(b"")
+            log_path.chmod(0o600)
+        return real_append(log_path, record, **kwargs)
+
+    monkeypatch.setattr(selection, "append_decision", rotate_then_append)
+    for _ in range(2):
+        with pytest.raises(selection.ModelSelectionError, match="^unknown_decision_id$"):
+            core.observe_served(path, original["decision_id"], fallback())
+    assert path.read_bytes() == b""
+    assert not list(tmp_path.glob(".model-select-*"))
+    state["rotate"] = False
+    path.write_bytes(preserved)
+    path.chmod(0o600)
+    result = core.observe_served(path, original["decision_id"], fallback())
+    rows = list(selection.read_decisions(path))
+    assert result == observation(original, fallback())
+    assert rows[-1] == result
+    assert sum(choose(scenario, rows)["counts_before"].values()) == 0
+
+
+def test_changed_generation_refuses_receipt_before_rename(tmp_path, original, monkeypatch):
+    path = make_store(tmp_path, original)
+    selection.append_decision(path, {**original, "outcome": {"launch_status": "not_launched"}})
+    state = {"swapped": False}
+
+    def swap_on_sync(descriptor):
+        # The file fsync runs after the snapshot is taken and before the generation check.
+        os.fsync(descriptor)
+        if state["swapped"]:
+            return
+        replacement = tmp_path / "replacement"
+        replacement.write_bytes(b"")
+        replacement.chmod(0o600)
+        replacement.replace(path)
+        state["swapped"] = True
+
+    monkeypatch.setattr(selection, "os", SimpleNamespace(**{**vars(os), "fsync": swap_on_sync}))
+    with pytest.raises(selection.ModelSelectionError, match="^stale_decision$"):
+        core.observe_served(path, original["decision_id"], fallback())
+    monkeypatch.setattr(selection, "os", os)
+    assert state["swapped"]
+    assert path.read_bytes() == b""
+    assert not list(tmp_path.glob(".model-select-*"))
+    assert not (tmp_path / "replacement").exists()
+
+    def refuse(_):
+        with pytest.raises(selection.ModelSelectionError, match="^unknown_decision_id$"):
+            core.observe_served(path, original["decision_id"], fallback())
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(refuse, range(2)))
+    refuse(None)
+    assert path.read_bytes() == b""
+
+
+def test_directory_flush_failure_leaves_visible_receipt_and_closed_descriptors(
+        tmp_path, original, scenario, monkeypatch):
+    path = make_store(tmp_path, original)
+    selection.append_decision(path, {**original, "outcome": {"launch_status": "not_launched"}})
+    opened = []
+
+    def fail_directory_fsync(descriptor):
+        os.fsync(descriptor)
+        opened.append(descriptor)
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError(errno.EIO, "directory flush failed")
+
+    monkeypatch.setattr(selection, "os", SimpleNamespace(**{**vars(os), "fsync": fail_directory_fsync}))
+    with pytest.raises(OSError, match="directory flush failed") as raised:
+        core.observe_served(path, original["decision_id"], fallback())
+    monkeypatch.setattr(selection, "os", os)
+    assert raised.value.errno == errno.EIO
+    assert opened
+    for descriptor in opened:
+        with pytest.raises(OSError) as closed:
+            os.fstat(descriptor)
+        assert closed.value.errno == errno.EBADF
+    assert not list(tmp_path.glob(".model-select-*"))
+    rows = list(selection.read_decisions(path))
+    assert rows[-1] == observation(original, fallback())
+    again = core.observe_served(path, original["decision_id"], fallback())
+    rows = list(selection.read_decisions(path))
+    assert again == rows[-1] == observation(original, fallback())
+    assert sum(choose(scenario, rows)["counts_before"].values()) == 0
+
+
+def test_receipt_fdopen_failure_closes_descriptor_and_retries(tmp_path, original, scenario, monkeypatch):
+    path = make_store(tmp_path, original)
+    selection.append_decision(path, {**original, "outcome": {"launch_status": "not_launched"}})
+    before = path.read_bytes()
+    fdopen, fsync, synced, failed = os.fdopen, os.fsync, [], []
+
+    def track_sync(descriptor):
+        fsync(descriptor)
+        synced.append(descriptor)
+
+    def fail_probe(descriptor, *args, **kwargs):
+        if synced:
+            failed.append(descriptor)
+            raise OSError(errno.EIO, "probe stream unavailable")
+        return fdopen(descriptor, *args, **kwargs)
+
+    monkeypatch.setattr(selection, "os", SimpleNamespace(
+        **{**vars(os), "fdopen": fail_probe, "fsync": track_sync}))
+    with pytest.raises(OSError, match="probe stream unavailable") as raised:
+        core.observe_served(path, original["decision_id"], fallback())
+    monkeypatch.setattr(selection, "os", os)
+    assert raised.value.errno == errno.EIO
+    assert len(failed) == 1
+    with pytest.raises(OSError) as closed:
+        os.fstat(failed[0])
+    assert closed.value.errno == errno.EBADF
+    assert path.read_bytes() == before
+    assert not list(tmp_path.glob(".model-select-*"))
+    result = core.observe_served(path, original["decision_id"], fallback())
+    rows = list(selection.read_decisions(path))
+    assert result == rows[-1] == observation(original, fallback())
+    assert sum(choose(scenario, rows)["counts_before"].values()) == 0
+
+
+def test_corrupt_snapshot_refuses_receipt_without_publication(tmp_path, original):
+    path = make_store(tmp_path, original)
+    raw = path.read_bytes() + b"{broken}\n"
+    path.write_bytes(raw)
+
+    def refuse(_):
+        with pytest.raises(selection.ModelSelectionError, match="^invalid_history$"):
+            core.observe_served(path, original["decision_id"], fallback())
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(refuse, range(2)))
+    refuse(None)
+    assert path.read_bytes() == raw
+    assert not list(tmp_path.glob(".model-select-*"))

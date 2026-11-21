@@ -1,9 +1,7 @@
 """Serial queue contracts using test-owned history and real qualification records."""
-import ast
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, replace
-from inspect import getsource
 from itertools import permutations, product
 import json
 import os
@@ -525,22 +523,114 @@ def test_model_json_checkpoint_reopens_receipts_and_archive(rig, phase, has_resu
     assert restarted.hosted_result(receipt.commit, passed=True, attempt=4) == "stale"
 
 
-def model_cleanup_resolutions():
+# Test-owned durable strings and outcomes. Coverage is compared with the model's
+# named declaration; these literals are not read from the validator source.
+DURABLE_CLEANUP_OUTCOMES = {
+    "issuing": "not_applied",
+    "aborted": "not_applied",
+    "done": "already",
+    "not_applied": "not_applied",
+    "released": "released",
+}
+UNKNOWN_CLEANUP_RESOLUTIONS = ("unknown", "done\n", "not_applied\r", "issuing aborted", "ISSUING", "")
+
+
+def _synthetic_entry(lane, parents=()):
+    commit, tree = "a" * 40, "b" * 40
+    reviews = tuple(mq.Review(session, commit, tree, "ACCEPT", True)
+                    for session in ("reviewer-1", "reviewer-2"))
+    return mq.QueueEntry(lane, "writer", commit, reviews, parents=tuple(parents))
+
+
+def _validated_state(entries, cleanup=None, serial=0):
     from aegis_core import merge_queue_model as model
 
-    # The accepted values are inline in the model validator. Require the source
-    # predicate so a change to its shape cannot silently empty the test matrix.
-    predicate, = (
-        node for node in ast.walk(ast.parse(getsource(model.validate_state)))
-        if isinstance(node, ast.Compare) and len(node.ops) == 1
-        and isinstance(node.ops[0], ast.NotIn) and ast.unparse(node.left) == "record.resolution"
-    )
-    values = ast.literal_eval(predicate.comparators[0])
-    assert values
-    return values
+    state = model.QueueState("integration", model.REQUIRED_LEGS, ("linux-3.12",),
+                             entries=tuple(entries), cleanup=cleanup, serial=serial)
+    return model.validate_state(state, "integration", model.REQUIRED_LEGS, ("linux-3.12",),
+                                model.MAX_ENTRIES)
 
 
-@pytest.mark.parametrize("resolution", model_cleanup_resolutions())
+def _cleanup_state(resolution, result=None):
+    from aegis_core import merge_queue_model as model
+
+    entry = _synthetic_entry("a")
+    landing = model.Landing("ready", "a", "c" * 40, entry.head, "b" * 40, issuance=1)
+    record = model.IssuedRecord(entry, landing, result=result, resolution=resolution,
+                                ref=model.pin_ref("integration", landing), expected=entry.head)
+    return _validated_state((entry,), record, serial=1)
+
+
+def test_cleanup_resolution_declaration_matches_independent_recovery_table():
+    """Invariant: the durable resolution declaration and the test-owned table agree."""
+    from aegis_core import merge_queue_model as model
+
+    declared = getattr(model, "CLEANUP_RESOLUTIONS", None)
+    assert type(declared) is tuple and declared
+    assert len(set(declared)) == len(declared)
+    assert set(declared) == set(DURABLE_CLEANUP_OUTCOMES)
+    for value in declared:
+        assert type(value) is str and value == value.strip() and "\n" not in value and "\r" not in value
+        assert " " not in value
+
+
+def test_validate_state_pins_declared_cleanup_resolutions_and_refuses_unknown():
+    """Unknown and multi-line resolutions are refused whole; a declared value retries."""
+    from aegis_core import merge_queue_model as model
+
+    for resolution in DURABLE_CLEANUP_OUTCOMES:
+        for result in (None, model.HostedResult("a" * 40, True, 3)):
+            state = _cleanup_state(resolution, result)
+            assert state.cleanup.resolution == resolution
+            assert state.cleanup.result == result
+    for resolution in UNKNOWN_CLEANUP_RESOLUTIONS:
+        for result in (None, model.HostedResult("a" * 40, True, 3)):
+            refused("state_unavailable", lambda resolution=resolution, result=result:
+                    _cleanup_state(resolution, result))
+            repaired = _cleanup_state("issuing", result)
+            assert repaired.cleanup.resolution == "issuing"
+            assert repaired.cleanup.result == result
+
+
+def test_validate_state_rejects_pending_cycles_and_keeps_external_parents():
+    """One cycle check: enqueue root is parent_cycle; full restore is state_unavailable."""
+    from aegis_core import merge_queue_model as model
+
+    solo = _synthetic_entry("solo", ("outside",))
+    left = _synthetic_entry("left", ("right",))
+    right = _synthetic_entry("right", ("left",))
+    diamond_d = _synthetic_entry("d")
+    diamond_b = _synthetic_entry("b", ("d",))
+    diamond_c = _synthetic_entry("c", ("d", "outside"))
+    diamond_a = _synthetic_entry("a", ("b", "c"))
+    acyclic = {"solo": solo, "d": diamond_d, "b": diamond_b, "c": diamond_c, "a": diamond_a}
+    snapshot = dict(acyclic)
+
+    model.check_acyclic(_synthetic_entry("fresh", ("outside",)), acyclic)
+    refused("parent_cycle", lambda: model.check_acyclic(_synthetic_entry("right", ("left",)),
+                                                        {"left": left}))
+    hidden = {"loop-a": _synthetic_entry("loop-a", ("loop-b",)),
+              "loop-b": _synthetic_entry("loop-b", ("loop-a",))}
+    refused("parent_cycle", lambda: model.check_acyclic(_synthetic_entry("child", ("loop-a",)), hidden))
+    model.check_acyclic(_synthetic_entry("child", ("outside",)), dict(hidden))
+    assert acyclic == snapshot
+
+    _validated_state((solo, diamond_d, diamond_b, diamond_c, diamond_a))
+    _validated_state(())
+    refused("state_unavailable", lambda: _validated_state((solo, left, right)))
+    refused("state_unavailable", lambda: _validated_state((
+        _synthetic_entry("a", ("b",)), _synthetic_entry("b", ("c",)), _synthetic_entry("c", ("a",)))))
+    refused("state_unavailable", lambda: _validated_state((_synthetic_entry("a", ("a",)),)))
+    chain = tuple(_synthetic_entry("n%d" % index, (("n%d" % (index + 1),) if index < 4 else ("n0",)))
+                  for index in range(5))
+    refused("state_unavailable", lambda: _validated_state((solo,) + chain))
+    repaired = _validated_state((solo, left, replace(right, parents=("outside",))))
+    assert {item.lane for item in repaired.entries} == {"solo", "left", "right"}
+    refused("state_unavailable", lambda: model.check_acyclic(None, {"left": left, "right": right}))
+    model.check_acyclic(None, {item.lane: item for item in repaired.entries})
+
+
+@pytest.mark.parametrize("resolution", list(DURABLE_CLEANUP_OUTCOMES))
 @pytest.mark.parametrize("has_result", [False, True], ids=["without-result", "with-result"])
 def test_model_json_checkpoint_recovers_every_cleanup_resolution(rig, resolution, has_result):
     original = queue(rig)
@@ -572,13 +662,8 @@ def test_model_json_checkpoint_recovers_every_cleanup_resolution(rig, resolution
     def acknowledge(active):
         return active.observe_landed(rig.store, receipt, read_target=lambda _: receipt.commit)
 
-    recover, expected = {
-        "issuing": (reconcile, "not_applied"),
-        "aborted": (reconcile, "not_applied"),
-        "done": (acknowledge, "already"),
-        "not_applied": (reconcile, "not_applied"),
-        "released": (withdraw, "released"),
-    }[resolution]
+    expected = DURABLE_CLEANUP_OUTCOMES[resolution]
+    recover = {"not_applied": reconcile, "already": acknowledge, "released": withdraw}[expected]
     if resolution != "issuing":
         backend.fail = "cleanup-before"
         refused("state_unavailable", lambda: recover(original))
@@ -608,6 +693,272 @@ def test_model_json_checkpoint_recovers_every_cleanup_resolution(rig, resolution
     else:
         assert recover(restarted) == "already"
     assert git(rig.repo, "for-each-ref", "--format=%(objectname)", "refs/aegis/merge-queue/") == b""
+
+
+@pytest.mark.parametrize("has_result", [False, True], ids=["without-result", "with-result"])
+def test_unknown_cleanup_resolution_reopen_refuses_and_declared_retry_recovers(rig, has_result):
+    """Reopen refuses unknown input whole; a declared resolution retries the saved result."""
+    original = queue(rig)
+    backend = rig.backends[original]
+    passing(rig)
+    candidate = prepare(original, rig)
+    backend.fail = "issue-before"
+    refused("state_unavailable", lambda: issue(original, rig, candidate))
+    backend.fail = None
+    original = fresh_queue(rig, backend=backend, initialize=False)
+    receipt = original.issued
+    if has_result:
+        assert original.hosted_result(receipt.commit, passed=True, attempt=3) == "pending"
+    saved_result = mq.HostedResult(receipt.commit, True, 3) if has_result else None
+    assert backend.state.cleanup.resolution == "issuing"
+    assert backend.state.cleanup.result == saved_result
+
+    def reopen(active_backend):
+        fresh_queue(rig, backend=active_backend, initialize=False)
+
+    for unknown in UNKNOWN_CLEANUP_RESOLUTIONS:
+        backend.state = replace(backend.state, cleanup=replace(backend.state.cleanup, resolution=unknown))
+        recovered = json_round_trip_backend(backend)
+        assert recovered.state.cleanup.resolution == unknown
+        assert recovered.state.cleanup.result == saved_result
+        refused("state_unavailable", lambda recovered=recovered: reopen(recovered))
+        assert recovered.state.cleanup.resolution == unknown
+
+    backend.state = replace(backend.state, cleanup=replace(backend.state.cleanup, resolution="done\n"))
+    recovered = json_round_trip_backend(backend)
+    barrier = Barrier(2)
+
+    def concurrent(_):
+        barrier.wait(timeout=10)
+        try:
+            reopen(recovered)
+            return "opened"
+        except mq.QueueRefused as exc:
+            return exc.code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sorted(pool.map(concurrent, (0, 1))) == ["state_unavailable", "state_unavailable"]
+    assert recovered.state.cleanup.resolution == "done\n"
+    assert recovered.state.cleanup.result == saved_result
+
+    recovered.state = replace(recovered.state, cleanup=replace(recovered.state.cleanup, resolution="issuing"))
+    restarted = fresh_queue(rig, backend=recovered, initialize=False)
+    assert restarted.issued == receipt
+    refused("landing_unconfirmed", lambda: restarted.reconcile_not_landed(
+        rig.store, receipt, read_target=lambda _: receipt.tip, read_outcome=lambda _: "pending"))
+    assert restarted.issued == receipt
+    assert restarted.reconcile_not_landed(
+        rig.store, receipt, read_target=lambda _: receipt.tip,
+        read_outcome=lambda _: "not_applied") == "not_applied"
+    assert restarted.issued is None
+    refused("stale_candidate", lambda: restarted.reconcile_not_landed(
+        rig.store, receipt, read_target=lambda _: receipt.tip, read_outcome=lambda _: "not_applied"))
+
+
+# Resolutions that are not in the durable declaration. Built directly so recovery
+# is tested without validate_state rewriting or refusing them first.
+UNDECLARED_CLEANUP_RESOLUTIONS = ("retry", "forced")
+
+
+def _issuing_checkpoint(rig):
+    """Settled issuing cleanup from a lost issuance reply. The caller plants resolutions."""
+    original = queue(rig)
+    backend = rig.backends[original]
+    passing(rig)
+    candidate = prepare(original, rig)
+    backend.fail = "issue-before"
+    refused("state_unavailable", lambda: issue(original, rig, candidate))
+    backend.fail = None
+    receipt = original.issued
+    baseline = backend.state
+    assert baseline.cleanup.resolution == "issuing"
+    assert receipt == baseline.cleanup.landing
+    # The lost reply left the test journal dirty. The planted record is the settled checkpoint.
+    backend.dirty = False
+    backend.pending.clear()
+    return backend, baseline, receipt
+
+
+def _bind_direct_cleanup(rig, backend, baseline, resolution, result=None):
+    """Install cleanup.resolution on a live queue without calling validate_state."""
+    planted = replace(baseline, reconciliation_required=baseline.reconciliation_required or backend.dirty,
+                      cleanup=replace(baseline.cleanup, resolution=resolution, result=result))
+    backend.state = planted
+    opened = mq.MergeQueue("integration")
+    opened._storage = backend.port()
+    opened._state = planted
+    opened._repo = rig.store.repo
+    rig.backends[opened] = backend
+    return opened
+
+
+def _recovery_snapshot(rig, active, backend):
+    cleanup = active._state.cleanup
+    return (cleanup.resolution, cleanup.result, tuple(item.lane for item in active._state.entries),
+            dict(backend.lanes), dict(backend.commits), active._target_checked, active._faulted,
+            git(rig.repo, "rev-parse", cleanup.ref).decode().strip())
+
+
+def test_direct_undeclared_cleanup_resolution_refuses_without_reopen(rig, monkeypatch):
+    """An undeclared resolution built past validate_state refuses at recovery and does not reopen."""
+    from aegis_core import merge_queue_model as model
+
+    backend, baseline, receipt = _issuing_checkpoint(rig)
+    real_validate = model.validate_state
+    validations = []
+
+    def reject_validation(*args, **kwargs):
+        validations.append(args)
+        raise mq.QueueRefused("state_unavailable")
+
+    monkeypatch.setattr(mq.model, "validate_state", reject_validation)
+
+    def recover_all(active):
+        refused("state_unavailable", lambda: active.withdraw(
+            receipt.lane, expected_head=rig.head, store=rig.store,
+            read_target=lambda _: receipt.tip, read_outcome=lambda _: "not_applied"))
+        refused("state_unavailable", lambda: active.observe_landed(
+            rig.store, receipt, read_target=lambda _: receipt.commit))
+        refused("state_unavailable", lambda: active.reconcile_not_landed(
+            rig.store, receipt, read_target=lambda _: receipt.tip, read_outcome=lambda _: "not_applied"))
+
+    for resolution in UNDECLARED_CLEANUP_RESOLUTIONS:
+        for result in (None, mq.HostedResult(receipt.commit, True, 3)):
+            planted = replace(baseline, cleanup=replace(baseline.cleanup, resolution=resolution, result=result))
+            refused("state_unavailable", lambda planted=planted: real_validate(
+                planted, "integration", model.REQUIRED_LEGS, ("linux-3.12",), model.MAX_ENTRIES))
+            opened = _bind_direct_cleanup(rig, backend, baseline, resolution, result)
+            before = _recovery_snapshot(rig, opened, backend)
+            recover_all(opened)
+            assert validations == []
+            assert _recovery_snapshot(rig, opened, backend) == before
+            assert opened.issued == receipt
+            assert opened.prepare(rig.store, read_target=lambda _: rig.base,
+                                  read_mode=lambda *args: "none", identity=IDENTITY,
+                                  now=100).status == "reconciliation-required"
+            assert opened._state.cleanup.resolution == resolution
+            assert opened._state.cleanup.result == result
+
+    concurrent = _bind_direct_cleanup(rig, backend, baseline, "retry", mq.HostedResult(receipt.commit, True, 3))
+    before = _recovery_snapshot(rig, concurrent, backend)
+    barrier = Barrier(3)
+
+    def attack(kind):
+        barrier.wait(timeout=10)
+        try:
+            if kind == "withdraw":
+                concurrent.withdraw(receipt.lane, expected_head=rig.head, store=rig.store,
+                                    read_target=lambda _: receipt.tip, read_outcome=lambda _: "not_applied")
+            elif kind == "acknowledge":
+                concurrent.observe_landed(rig.store, receipt, read_target=lambda _: receipt.commit)
+            else:
+                concurrent.reconcile_not_landed(rig.store, receipt, read_target=lambda _: receipt.tip,
+                                                read_outcome=lambda _: "not_applied")
+            return "opened"
+        except mq.QueueRefused as exc:
+            return exc.code
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert sorted(pool.map(attack, ("withdraw", "acknowledge", "reconcile"))) == ["state_unavailable"] * 3
+    assert validations == []
+    assert _recovery_snapshot(rig, concurrent, backend) == before
+    assert concurrent.issued == receipt
+
+    restart = _bind_direct_cleanup(rig, backend, baseline, "retry")
+    before = _recovery_snapshot(rig, restart, backend)
+    refused("state_unavailable", lambda: restart.restore_target(
+        rig.store, mq.HostedResult(rig.base, True), read_target=lambda _: rig.base))
+    assert _recovery_snapshot(rig, restart, backend) == before
+    assert restart.issued == receipt
+    assert restart.prepare(rig.store, read_target=lambda _: rig.base,
+                           read_mode=lambda *args: "none", identity=IDENTITY,
+                           now=100).status == "reconciliation-required"
+    refused("state_unavailable", lambda: restart.withdraw(
+        receipt.lane, expected_head=rig.head, store=rig.store,
+        read_target=lambda _: receipt.tip, read_outcome=lambda _: "not_applied"))
+    assert validations == []
+
+    repaired = _bind_direct_cleanup(rig, backend, baseline, "issuing")
+    refused("landing_unconfirmed", lambda: repaired.reconcile_not_landed(
+        rig.store, receipt, read_target=lambda _: receipt.tip, read_outcome=lambda _: "pending"))
+    assert repaired.issued == receipt
+    assert repaired.reconcile_not_landed(
+        rig.store, receipt, read_target=lambda _: receipt.tip,
+        read_outcome=lambda _: "not_applied") == "not_applied"
+    assert repaired.issued is None
+    assert validations == []
+
+
+def test_recovery_dispatch_keys_match_declaration_and_reach_each_handler(rig, monkeypatch):
+    """Every declared resolution reaches the one dispatch handler for the independent outcome."""
+    from aegis_core import merge_queue_model as model
+
+    declared = model.CLEANUP_RESOLUTIONS
+    assert tuple(mq._CLEANUP_RECOVERY) == declared
+    assert set(mq._CLEANUP_RECOVERY) == set(DURABLE_CLEANUP_OUTCOMES)
+    assert len(mq._CLEANUP_RECOVERY) == len(declared)
+    backend, baseline, receipt = _issuing_checkpoint(rig)
+    validations = []
+
+    def reject_validation(*args, **kwargs):
+        validations.append(args)
+        raise mq.QueueRefused("state_unavailable")
+
+    monkeypatch.setattr(mq.model, "validate_state", reject_validation)
+    git(rig.repo, "update-ref", baseline.cleanup.ref, baseline.cleanup.expected)
+
+    def reconcile(active, outcome="not_applied"):
+        return active.reconcile_not_landed(rig.store, receipt, read_target=lambda _: receipt.tip,
+                                           read_outcome=lambda _: outcome)
+
+    def acknowledge(active):
+        return active.observe_landed(rig.store, receipt, read_target=lambda _: receipt.commit)
+
+    def release(active):
+        return active.withdraw(receipt.lane, expected_head=rig.head, store=rig.store,
+                              read_target=lambda _: receipt.tip, read_outcome=lambda _: "not_applied")
+
+    wrong = _bind_direct_cleanup(rig, backend, baseline, "done")
+    refused("stale_candidate", lambda: reconcile(wrong))
+    refused("request_conflict", lambda: release(wrong))
+    assert wrong._state.cleanup.resolution == "done"
+    held = _bind_direct_cleanup(rig, backend, baseline, "not_applied")
+    refused("stale_candidate", lambda: acknowledge(held))
+    refused("request_conflict", lambda: release(held))
+    assert held._state.cleanup.resolution == "not_applied"
+
+    failed = _bind_direct_cleanup(rig, backend, baseline, "done")
+    backend.fail = "cleanup-before"
+    refused("state_unavailable", lambda: acknowledge(failed))
+    backend.fail = None
+    assert failed._state.cleanup.resolution == "done"
+    assert failed._faulted is True
+    retried = _bind_direct_cleanup(rig, backend, baseline, "done")
+    assert acknowledge(retried) == "already"
+    assert retried.issued is None
+
+    runners = {"abort": reconcile, "acknowledge": acknowledge, "settle": reconcile, "release": release}
+    for resolution in declared:
+        git(rig.repo, "update-ref", baseline.cleanup.ref, baseline.cleanup.expected)
+        opened = _bind_direct_cleanup(rig, backend, baseline, resolution)
+        handler = mq._CLEANUP_RECOVERY[resolution]
+        if resolution in ("issuing", "aborted"):
+            assert handler == mq._CLEANUP_RECOVERY["issuing"] == mq._CLEANUP_RECOVERY["aborted"]
+            refused("landing_unconfirmed", lambda opened=opened: reconcile(opened, "pending"))
+            assert opened.issued == receipt
+            assert opened._state.cleanup.resolution == resolution
+        else:
+            # A finish-only handler must not rewrite the resolution before the failing save.
+            backend.fail = "cleanup-before"
+            refused("state_unavailable", lambda opened=opened, handler=handler: runners[handler](opened))
+            backend.fail = None
+            assert opened._state.cleanup.resolution == resolution
+            assert opened._faulted is True
+            git(rig.repo, "update-ref", baseline.cleanup.ref, baseline.cleanup.expected)
+            opened = _bind_direct_cleanup(rig, backend, baseline, resolution)
+        assert runners[handler](opened) == DURABLE_CLEANUP_OUTCOMES[resolution]
+        assert opened.issued is None
+    assert validations == []
 
 
 @pytest.mark.parametrize("phase", ["empty", "queued", "issued", "cleanup", "completed"])
@@ -1346,6 +1697,102 @@ def test_parent_cycles_are_rejected_and_retry_keeps_existing_order(rig):
     assert prepare(q, rig).status == "blocked-by-parent"
     q.enqueue(rig.store, entry(rig, lane="b"))
     assert prepare(q, rig).lane == "b"
+
+
+def test_enqueue_cycle_refuses_and_open_prefix_restores(rig):
+    """Admission refuses parent_cycle; an open external prefix reopens and then retries."""
+    passing(rig, legs=("linux-3.12",))
+    q = fresh_queue(rig)
+    first = entry(rig, lane="a", parents=("c",))
+    second = entry(rig, lane="b", parents=("a",))
+    closing = entry(rig, lane="c", parents=("b",))
+    assert q.enqueue(rig.store, first) == "queued"
+    assert q.enqueue(rig.store, second) == "queued"
+    refused("parent_cycle", lambda: q.enqueue(rig.store, closing))
+    refused("parent_cycle", lambda: q.enqueue(rig.store, closing))
+    assert {item.lane for item in rig.backends[q].state.entries} == {"a", "b"}
+
+    restarted = fresh_queue(rig, backend=rig.backends[q], initialize=False)
+    assert prepare(restarted, rig).status == "blocked-by-parent"
+    before = rig.backends[restarted].state
+    barrier = Barrier(2)
+
+    def close(_):
+        barrier.wait(timeout=10)
+        try:
+            return restarted.enqueue(rig.store, closing)
+        except mq.QueueRefused as exc:
+            return exc.code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sorted(pool.map(close, (0, 1))) == ["parent_cycle", "parent_cycle"]
+    assert rig.backends[restarted].state == before
+    opened = replace(closing, parents=())
+    assert restarted.enqueue(rig.store, opened) == "queued"
+    assert restarted.enqueue(rig.store, opened) == "already"
+    assert prepare(restarted, rig).lane == "c"
+    assert {item.lane for item in rig.backends[restarted].state.entries} == {"a", "b", "c"}
+
+
+def test_restart_refuses_cyclic_checkpoint_and_retries_acyclic_graph(rig):
+    """A durable cycle is state_unavailable; repairing it reopens the external parents."""
+    passing(rig, legs=("linux-3.12",))
+    q = fresh_queue(rig)
+    keep = entry(rig, lane="keep", parents=("outside",))
+    assert q.enqueue(rig.store, keep) == "queued"
+    restarted = fresh_queue(rig, backend=rig.backends[q], initialize=False)
+    assert restarted.enqueue(rig.store, keep) == "already"
+    assert prepare(restarted, rig).status == "blocked-by-parent"
+
+    backend = rig.backends[q]
+    left = entry(rig, lane="left", parents=("right",))
+    right = entry(rig, lane="right", parents=("left",))
+    backend.state = replace(backend.state, entries=(keep, left, right))
+    recovered = json_round_trip_backend(backend)
+    before = recovered.state
+    barrier = Barrier(2)
+
+    def reopen(_):
+        barrier.wait(timeout=10)
+        try:
+            fresh_queue(rig, backend=recovered, initialize=False)
+            return "opened"
+        except mq.QueueRefused as exc:
+            return exc.code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sorted(pool.map(reopen, (0, 1))) == ["state_unavailable", "state_unavailable"]
+    refused("state_unavailable", lambda: fresh_queue(rig, backend=recovered, initialize=False))
+    assert recovered.state == before
+
+    recovered.state = replace(recovered.state, entries=(keep, left, replace(right, parents=("new",))))
+    repaired = fresh_queue(rig, backend=recovered, initialize=False)
+    assert {item.lane for item in rig.backends[repaired].state.entries} == {"keep", "left", "right"}
+    joining = entry(rig, lane="new", parents=("left",))
+    refused("parent_cycle", lambda: repaired.enqueue(rig.store, joining))
+    assert repaired.enqueue(rig.store, replace(joining, parents=())) == "queued"
+    assert prepare(repaired, rig).lane == "new"
+
+
+def test_reloaded_cycle_refuses_issued_check_until_repaired_restart(rig):
+    """check_issued reloads through the same restore validation as restart."""
+    q = queue(rig)
+    passing(rig)
+    receipt = issue(q, rig, prepare(q, rig))
+    backend = rig.backends[q]
+    record = backend.state.issued
+    left = entry(rig, lane="left", parents=("right",))
+    right = entry(rig, lane="right", parents=("left",))
+    backend.state = replace(backend.state, entries=(record.entry, left, right))
+    refused("state_unavailable", lambda: q.check_issued(
+        rig.store, receipt, read_target=lambda _: rig.base, read_mode=lambda *args: "none", now=100))
+    refused("state_unavailable", lambda: q.check_issued(
+        rig.store, receipt, read_target=lambda _: rig.base, read_mode=lambda *args: "none", now=100))
+    backend.state = replace(backend.state, entries=(record.entry, left, replace(right, parents=("outside",))))
+    restarted = fresh_queue(rig, backend=backend, initialize=False)
+    restarted.restore_target(rig.store, mq.HostedResult(rig.base, True), read_target=lambda _: rig.base)
+    assert restarted.check_issued(rig.store, receipt, read_target=lambda _: rig.base,
+                                  read_mode=lambda *args: "none", now=100) is True
 
 
 @pytest.mark.parametrize("kwargs", [

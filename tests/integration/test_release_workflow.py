@@ -2259,3 +2259,261 @@ def test_wheel_smoke_refuses_when_source_can_shadow_site_packages():
     proc = subprocess.run([sys.executable, SMOKE], capture_output=True,
                           text=True, timeout=60, env=env, cwd=REPO_ROOT)
     assert proc.returncode == 1 and "-I" in proc.stderr
+
+
+def _namespace_entries(kind, rows):
+    """Archive members for one per-parent namespace case. No host symlinks."""
+    prefix = "release/" if kind == "sdist" else ""
+    file_mode = stat.S_IFREG if kind == "wheel" else tarfile.REGTYPE
+    dir_mode = stat.S_IFDIR if kind == "wheel" else tarfile.DIRTYPE
+    entries = []
+    for path, shape in rows:
+        directory = shape == "directory"
+        name = prefix + path
+        if directory and not name.endswith("/"):
+            name += "/"
+        payload = b"" if directory else b"payload"
+        entries.append((name, dir_mode if directory else file_mode, payload))
+    return entries
+
+
+def _namespace_shown(kind, path, shape):
+    """The name verify_dist echoes. Zip keeps one directory slash; tar does not."""
+    name = ("release/" if kind == "sdist" else "") + path
+    if shape == "directory" and kind == "wheel" and not name.endswith("/"):
+        name += "/"
+    return name
+
+
+def _assert_namespace_message(dist, message):
+    """Both release commands refuse with one canonical line and do not write sums."""
+    recorded = _verify("record", str(dist))
+    assert not (dist / "SHA256SUMS").exists(), recorded.stderr
+    _write_sums(dist)
+    verified = _verify("verify", str(dist))
+    expected = "verify_dist: " + message + "\n"
+    assert recorded.returncode == 1 and recorded.stderr == expected, recorded.stderr
+    assert verified.returncode == 1 and verified.stderr == expected, verified.stderr
+    assert "Traceback" not in recorded.stderr
+
+
+def _component_file_conflict_cases():
+    """Pairs whose full folded paths differ. The collision is one component."""
+    rows = (
+        ("spelling", "aegis_core/Foo/a.py", "aegis_core/foo/b.py", ("wheel", "sdist")),
+        ("kind", "aegis_core/foo.py", "aegis_core/foo.py/bar.py", ("wheel", "sdist")),
+        ("kind-case", "aegis_core/Foo.py", "aegis_core/foo.py/bar.py", ("wheel", "sdist")),
+        ("deep", "aegis_core/foo/Bar/a.py", "aegis_core/foo/bar/b.py", ("wheel", "sdist")),
+        ("template", "aegis_core/team_templates/Roles/a.json",
+         "aegis_core/team_templates/roles/b.json", ("wheel", "sdist")),
+        ("sdist-tree", "guide/Foo/a.txt", "guide/foo/b.txt", ("sdist",)),
+    )
+    cases = []
+    ids = []
+    for label, left, right, kinds in rows:
+        for kind in kinds:
+            cases.append((kind, left, right))
+            ids.append(kind + "-" + label)
+    return tuple(cases), tuple(ids)
+
+
+_COMPONENT_FILE_CONFLICTS, _COMPONENT_FILE_CONFLICT_IDS = _component_file_conflict_cases()
+
+
+@pytest.mark.parametrize("kind,left,right", _COMPONENT_FILE_CONFLICTS, ids=_COMPONENT_FILE_CONFLICT_IDS)
+def test_per_parent_namespace_refuses_conflicting_files(tmp_path, kind, left, right):
+    """Each parent has one spelling and one kind, in either member order."""
+    for index, (first, second) in enumerate(((left, right), (right, left))):
+        root = tmp_path / str(index)
+        root.mkdir()
+        rows = ((first, "file"), (second, "file"))
+        shown = _namespace_shown(kind, second, "file")
+        dist = _admission_dist(root, kind, _namespace_entries(kind, rows))
+        _assert_namespace_message(dist, "duplicate " + kind + " member: " + shown)
+
+
+@pytest.mark.parametrize("kind", ["wheel", "sdist"])
+@pytest.mark.parametrize("order", ["file-first", "directory-first"])
+def test_per_parent_namespace_refuses_explicit_directory_spelling(tmp_path, kind, order):
+    file_row = ("aegis_core/team_templates/roles/probe.json", "file")
+    dir_row = ("aegis_core/team_templates/Roles", "directory")
+    rows = (file_row, dir_row) if order == "file-first" else (dir_row, file_row)
+    shown = _namespace_shown(kind, dir_row[0], "directory")
+    dist = _admission_dist(tmp_path, kind, _namespace_entries(kind, rows))
+    _assert_namespace_message(dist, "duplicate " + kind + " member: " + shown)
+
+
+@pytest.mark.parametrize("kind", ["wheel", "sdist"])
+@pytest.mark.parametrize("order", ["parent-first", "child-first"])
+def test_per_parent_namespace_requires_directory_descendant(tmp_path, kind, order):
+    parent = ("aegis_core/team_templates/roles", "directory")
+    child = ("aegis_core/team_templates/roles/sub", "directory")
+    rows = (parent, child) if order == "parent-first" else (child, parent)
+    shown = _namespace_shown(kind, rows[0][0], "directory")
+    dist = _admission_dist(tmp_path, kind, _namespace_entries(kind, rows))
+    _assert_namespace_message(dist, "unexpected " + kind + " member: " + shown)
+
+
+def _component_accept_cases():
+    rows = (
+        ("siblings", (
+            ("aegis_core/foo/a.py", "file"),
+            ("aegis_core/foo/b.py", "file"),
+        ), ("wheel", "sdist")),
+        ("explicit-dir", (
+            ("aegis_core/foo/a.py", "file"),
+            ("aegis_core/foo", "directory"),
+        ), ("wheel", "sdist")),
+        ("template-dir", (
+            ("aegis_core/team_templates/roles/probe.json", "file"),
+            ("aegis_core/team_templates/roles", "directory"),
+        ), ("wheel", "sdist")),
+        ("nested", (
+            ("aegis_core/team_templates/roles/sub/probe.json", "file"),
+            ("aegis_core/team_templates/roles", "directory"),
+            ("aegis_core/team_templates/roles/sub", "directory"),
+        ), ("wheel", "sdist")),
+        ("sdist-siblings", (
+            ("guide/foo/a.txt", "file"),
+            ("guide/foo/b.txt", "file"),
+        ), ("sdist",)),
+    )
+    cases = []
+    ids = []
+    for label, tree, kinds in rows:
+        for kind in kinds:
+            cases.append((kind, tree))
+            ids.append(kind + "-" + label)
+    return tuple(cases), tuple(ids)
+
+
+_COMPONENT_ACCEPT_CASES, _COMPONENT_ACCEPT_IDS = _component_accept_cases()
+
+
+@pytest.mark.parametrize("kind,tree", _COMPONENT_ACCEPT_CASES, ids=_COMPONENT_ACCEPT_IDS)
+def test_per_parent_namespace_accepts_consistent_members(tmp_path, kind, tree):
+    """Implicit parents, explicit directories and every member order both install."""
+    import itertools
+
+    for index, ordered in enumerate(itertools.permutations(tree)):
+        root = tmp_path / str(index)
+        root.mkdir()
+        dist = _admission_dist(root, kind, _namespace_entries(kind, ordered))
+        _assert_both_admission_commands(dist, True)
+
+
+@pytest.mark.parametrize("kind", ["wheel", "sdist"])
+def test_per_parent_namespace_retries_and_stays_isolated(tmp_path, kind):
+    from concurrent.futures import ThreadPoolExecutor
+
+    good_root, bad_root = tmp_path / "good", tmp_path / "bad"
+    good_root.mkdir()
+    bad_root.mkdir()
+    good = _admission_dist(good_root, kind, _namespace_entries(kind, (
+        ("aegis_core/foo/a.py", "file"),)))
+    bad = _admission_dist(bad_root, kind, _namespace_entries(kind, (
+        ("aegis_core/foo/a.py", "file"),
+        ("aegis_core/Foo/b.py", "file"),
+    )))
+    shown = _namespace_shown(kind, "aegis_core/Foo/b.py", "file")
+    expected = "verify_dist: duplicate " + kind + " member: " + shown + "\n"
+    assert _verify("record", str(good)).returncode == 0
+    assert _verify("record", str(good)).returncode == 0
+    _write_sums(bad)
+    preserved = (bad / "SHA256SUMS").read_bytes()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for command in ("record", "verify"):
+            accepted, refused = pool.map(
+                lambda dist, command=command: _verify(command, str(dist)), (good, bad))
+            assert accepted.returncode == 0, accepted.stderr
+            assert refused.returncode == 1 and refused.stderr == expected, refused.stderr
+            assert "Traceback" not in refused.stderr
+            assert (bad / "SHA256SUMS").read_bytes() == preserved
+    pattern = "*.whl" if kind == "wheel" else "*.tar.gz"
+    next(bad.glob(pattern)).write_bytes(next(good.glob(pattern)).read_bytes())
+    for command in ("record", "verify"):
+        retried = _verify(command, str(bad))
+        assert retried.returncode == 0, retried.stderr
+
+
+@pytest.mark.parametrize("kind", ["wheel", "sdist"])
+def test_component_index_records_spelling_kind_and_explicit_state(distribution_verifier, kind):
+    prefix = "release/" if kind == "sdist" else ""
+    file_type = stat.S_IFREG if kind == "wheel" else tarfile.REGTYPE
+    dir_type = stat.S_IFDIR if kind == "wheel" else tarfile.DIRTYPE
+    file_name = prefix + "aegis_core/team_templates/roles/probe.json"
+    other_name = prefix + "aegis_core/team_templates/roles/other.json"
+    dir_name = prefix + "aegis_core/team_templates/roles" + ("/" if kind == "wheel" else "")
+    state = distribution_verifier._admission_state()
+    assert distribution_verifier.admit_member(
+        kind, file_name, file_name, file_type, 2, state, mode=0o644) == "admitted"
+    parent = distribution_verifier._fold_key(prefix + "aegis_core/team_templates")
+    assert state["components"][parent]["roles"] == ("roles", "directory", False)
+    assert distribution_verifier.admit_member(
+        kind, other_name, other_name, file_type, 2, state, mode=0o644) == "admitted"
+    assert state["components"][parent]["roles"] == ("roles", "directory", False)
+    assert distribution_verifier.admit_member(
+        kind, dir_name, dir_name, dir_type, 0, state, mode=0) == "admitted"
+    assert state["components"][parent]["roles"] == ("roles", "directory", True)
+    leaf_parent = distribution_verifier._fold_key(prefix + "aegis_core/team_templates/roles")
+    assert state["components"][leaf_parent]["probe.json"] == ("probe.json", "file", False)
+    root_part = "release" if kind == "sdist" else "aegis_core"
+    assert state["components"][""][distribution_verifier._fold_part(root_part)] == (
+        root_part, "directory", False)
+
+
+@pytest.mark.parametrize("first,second", [
+    ("aegis_core/foo.py", "aegis_core/foo.py/bar.py"),
+    ("aegis_core/Foo/a.py", "aegis_core/foo/b.py"),
+], ids=["kind-conflict", "spelling-conflict"])
+def test_component_conflict_does_not_mutate_admission_state(
+        distribution_verifier, capsys, first, second):
+    import copy
+
+    state = distribution_verifier._admission_state()
+    assert distribution_verifier.admit_member(
+        "wheel", first, first, stat.S_IFREG, 1, state, mode=0o644) == "admitted"
+    snapshot = copy.deepcopy(state)
+    with pytest.raises(SystemExit) as error:
+        distribution_verifier.admit_member(
+            "wheel", second, second, stat.S_IFREG, 1, state, mode=0o644)
+    assert error.value.code == 1
+    assert state == snapshot
+    assert capsys.readouterr().err == "verify_dist: duplicate wheel member: " + second + "\n"
+
+
+def test_component_index_threads_do_not_share_state(distribution_verifier):
+    from concurrent.futures import ThreadPoolExecutor
+
+    def walk(pair):
+        first, second = pair
+        state = distribution_verifier._admission_state()
+        admitted = distribution_verifier.admit_member(
+            "wheel", first, first, stat.S_IFREG, 1, state, mode=0o644)
+        try:
+            distribution_verifier.admit_member(
+                "wheel", second, second, stat.S_IFREG, 1, state, mode=0o644)
+        except SystemExit as error:
+            return admitted, error.code, set(state["names"])
+        return admitted, 0, set(state["names"])
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        good, bad = pool.map(walk, (
+            ("aegis_core/foo/a.py", "aegis_core/foo/b.py"),
+            ("aegis_core/Foo/a.py", "aegis_core/foo/b.py"),
+        ))
+    assert good == ("admitted", 0, {"aegis_core/foo/a.py", "aegis_core/foo/b.py"})
+    assert bad[0] == "admitted" and bad[1] == 1
+    assert bad[2] == {"aegis_core/Foo/a.py"}
+
+
+def test_explicit_directory_missing_descendant_is_refused(distribution_verifier, capsys):
+    state = {"components": {"": {"roles": ("roles", "directory", True)}}}
+    with pytest.raises(SystemExit) as error:
+        distribution_verifier._refuse_orphan_directories("wheel", state)
+    assert error.value.code == 1
+    assert capsys.readouterr().err == "verify_dist: unexpected wheel member: directory\n"
+    state["components"]["roles"] = {"probe.json": ("probe.json", "file", False)}
+    distribution_verifier._refuse_orphan_directories("sdist", state)
+    assert capsys.readouterr().err == ""
+    distribution_verifier._refuse_orphan_directories("wheel", {"components": {}})
