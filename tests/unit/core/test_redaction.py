@@ -75,6 +75,7 @@ REVIEWED_REDACTION_IMPORTERS = frozenset({
     "aegis_core/team_profile_display.py",
     "aegis_core/team_qualify.py",
     "aegis_core/team_queue.py",
+    "aegis_core/team_review_copy.py",
     "aegis_core/team_session_wake.py",
     "aegis_core/team_supervisor.py",
     "aegis_core/team_supervisor_observe.py",

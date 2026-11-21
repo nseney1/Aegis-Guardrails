@@ -221,7 +221,7 @@ Lease lane paths for parallel agents (claim, renew, transfer, release, gc, list,
 
 Leases under refs/aegis/lanes/<lane> declare which paths a lane works on. A lease is cooperative conflict input, not a lock, not an identity and not proof that an agent is alive: claims of different lanes can race, and owner and role are display labels. The backstops are the post-lane gate (aegis check --lane) and aegis team metrics.
 
-Category: Daily Workflow & Verification. Subcommands: `board`, `claim`, `config`, `doctor`, `gc`, `hosts`, `list`, `mail`, `metrics`, `model`, `queue`, `release`, `renew`, `status`, `transfer`.
+Category: Daily Workflow & Verification. Subcommands: `board`, `claim`, `config`, `doctor`, `gc`, `hosts`, `isolation`, `list`, `mail`, `metrics`, `model`, `queue`, `release`, `renew`, `status`, `transfer`.
 
 ### `aegis team board`
 
@@ -374,6 +374,21 @@ Read capacity advice: status \| usage \| check HOST KIND. KIND: writer, review, 
 | `hosts_action` | `[VERB]` |  | status, check or usage |
 | `host` | `[HOST]` |  | Declared host alias (see status --json) |
 | `kind` | `[KIND]` |  | Job kind or declared role/lens |
+
+### `aegis team isolation`
+
+Plan or verify team container isolation
+
+Subcommands: `check`.
+
+### `aegis team isolation check`
+
+Read an isolation plan or check engine inspection data
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--config` | `CONFIG` |  | Absolute path to a bounded team-run.json |
+| `--inspect` | `INSPECT` |  | Absolute path to bounded container inspection JSON |
 
 ### `aegis team list`
 

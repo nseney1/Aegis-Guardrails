@@ -159,11 +159,14 @@ def _mailbox_writer(root):
         raise
 
 
-def _placed_mailbox(root, state_path):
-    try:
-        mailbox = hm.Mailbox(root)
-    except ValueError:
-        raise SubscriptionError("MAILBOX") from None
+def _placed_mailbox(root, state_path, mailbox=None):
+    if mailbox is None:
+        try:
+            mailbox = hm.Mailbox(root)
+        except ValueError:
+            raise SubscriptionError("MAILBOX") from None
+    elif Path(mailbox.root) != Path(root):
+        raise SubscriptionError("MAILBOX")
     try:
         mailbox.outside_mailbox(state_path, "subscription state directory")
     except ValueError:
@@ -308,21 +311,36 @@ def notice_id(subscriber, hashes):
     return "notice-" + hm.digest([subscriber, sorted(hashes)])
 
 
-def _reference(mailbox, record):
+def _record_bytes(mailbox, record):
+    """Read one record by descriptor. The size limit is applied before the body is kept."""
     path = _path(record["path"])
     try:
         relative = path.relative_to(mailbox.root)
     except ValueError:
         raise SubscriptionError("MAILBOX") from None
     with _directory(mailbox.root / relative.parent) as directory:
-        raw = _read(directory, relative.name, hm.MAX_BYTES)
-    _verify_record(raw, record)
+        return _read(directory, relative.name, hm.MAX_BYTES)
+
+
+def _reference_from_verified(record, digest):
+    """Build a reference from an envelope the caller already verified.
+
+    The digest is that caller's hash of the verified bytes. This does not parse.
+    """
     message = record["message"]
     reference = {key: message[key] for key in ("message_id", "type", "from", "to")}
-    reference["sha256"] = hashlib.sha256(raw).hexdigest()
+    reference["sha256"] = digest
     if message["type"] in {"brief", "dispatch"}:
         reference["brief"] = message["brief"]
     return reference
+
+
+def _reference(mailbox, record, raw=None):
+    """Verify, then build. Callers that have not verified keep this path."""
+    if raw is None:
+        raw = _record_bytes(mailbox, record)
+    _verify_record(raw, record)
+    return _reference_from_verified(record, hashlib.sha256(raw).hexdigest())
 
 
 def _verify_record(raw, record):
@@ -499,9 +517,14 @@ def _subscriber(mailbox, records, directory, state_path, entry, now):
     seen = set(cursor["seen"])
     for record in records.values():
         if matches(entry, record["message"], records):
-            reference = _reference(mailbox, record)
-            if reference["sha256"] not in seen:
-                candidates[reference["sha256"]] = reference
+            # Bind the re-read bytes to the envelope before the seen check.
+            # A file replaced with an older seen body must refuse, not disappear.
+            # Only the reference build is skipped, and it uses this digest.
+            raw = _record_bytes(mailbox, record)
+            _verify_record(raw, record)
+            digest = hashlib.sha256(raw).hexdigest()
+            if digest not in seen:
+                candidates[digest] = _reference_from_verified(record, digest)
     if len(candidates) > hm.MAX_RECORDS:
         raise SubscriptionError("LIMIT")
     candidates = [candidates[key] for key in sorted(candidates)]
@@ -527,7 +550,7 @@ def _display(value):
     return redact_insight_text(sanitize_display(value, max_len=None), max_len=8192)[:400]
 
 
-def notify(root, state_dir, subscriptions, *, now=None):
+def notify(root, state_dir, subscriptions, *, now=None, mailbox=None):
     """Run one pass. State is owner-controlled and within the mailbox parent for HM briefs.
 
     The state lock serializes all subscribers in this state directory; HM's writer
@@ -547,7 +570,7 @@ def notify(root, state_dir, subscriptions, *, now=None):
     except ValueError:
         raise SubscriptionError("PATH") from None
     try:
-        mailbox = _placed_mailbox(root, state_path)
+        mailbox = _placed_mailbox(root, state_path, mailbox)
         with _directory(source.parent) as parent:
             config_raw = _read(parent, source.name, MAX_CONFIG)
             configuration = _json(config_raw, "INVALID")

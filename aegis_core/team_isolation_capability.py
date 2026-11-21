@@ -11,6 +11,8 @@ from types import SimpleNamespace
 
 from aegis_core.diagnostic_messages import receipt_value
 from aegis_core.primitives import DuplicateKeyError, json_preflight, strict_loads
+from aegis_core.team_isolation_refusal import CAPABILITY_CODES, REFUSALS, IsolationRefusal
+from aegis_core.team_isolation_refusal import finish as _finish, refusal as _refusal
 
 __all__ = [
     "MAX_DOCUMENT_BYTES",
@@ -35,7 +37,6 @@ MAX_NODES = 8192
 MAX_STRING = 4096
 MAX_ATOM = 64
 _BASE_IDS = ("prohibited-tool", "outside-write", "outside-edit", "outside-read", "prohibited-mcp")
-_VERDICTS = {"resolved", "match", "exceeds", "planned", "pass", "fail"}
 _RESOLUTION_CODES = {
     "invalid_role", "invalid_host_mapping", "invalid_mcp_tools", "invalid_file_tools",
     "invalid_prohibited_call_tools", "uncovered_prohibited_calls", "prohibited_capability",
@@ -79,53 +80,12 @@ _DECISION_ADAPTER = "decision"
 _LIMIT_REASONS = {"size", "string", "nodes", "container", "nesting", "atom"}
 _INPUT_ERRORS = (ValueError, TypeError, UnicodeError, RecursionError, KeyError, AttributeError, IndexError)
 
-REFUSALS = {
-    "unknown_field": "isolation document contains an unknown field",
-    "unknown_role": "isolation document role is not in the injected vocabulary",
-    "unknown_host": "isolation document host is not in the injected host table",
-    "oversized": "isolation document exceeds its size limit",
-    "invalid_encoding": "isolation document is not valid UTF-8",
-    "missing_vocabulary": "isolation capability report requires an injected role vocabulary",
-    "missing_host_table": "isolation capability report requires an injected host table",
-    "invalid_table": "injected role or host table is malformed",
-    "invalid_document": "isolation document is malformed",
-    "ambiguous": "isolation document is ambiguous",
-    "invalid_host_mapping": "host capability mapping is malformed",
-    "invalid_mcp_tools": "provisioned MCP tools are malformed",
-    "invalid_file_tools": "provisioned file tools are malformed",
-    "invalid_prohibited_call_tools": "prohibited-call mapping is malformed",
-    "uncovered_prohibited_calls": "prohibited calls are not covered by the injected mapping",
-    "prohibited_capability": "resolved capabilities include a prohibited call",
-    "invalid_resolution": "capability resolution is malformed",
-    "invalid_catalog": "served capability catalog is malformed",
-    "incomplete_catalog": "served capability catalog is incomplete",
-    "invalid_probe_plan": "capability probe plan is malformed",
-    "invalid_observations": "capability probe observations are malformed",
-    "incomplete_observations": "capability probe observations are incomplete",
-    "inconclusive_observations": "capability probe observations are inconclusive",
-}
 
 def present_text(value):
     """Bound, canonicalize, redact, then clip through the shared receipt projection."""
     if type(value) is not str:
         return ""
     return receipt_value(value)
-
-class IsolationRefusal(ValueError):
-    """Fixed input-free refusal. code and next_action are safe to display."""
-
-    def __init__(self, code):
-        if code not in REFUSALS:
-            code = "invalid_document"
-        super().__init__(REFUSALS[code])
-        self.code = code
-        self.next_action = {"actor": "operator", "command": present_text(REFUSALS[code])}
-
-def _refusal(code, **fields):
-    refusal = IsolationRefusal(code)
-    body = {"status": "refused", "code": refusal.code, "next_action": dict(refusal.next_action)}
-    body.update(fields)
-    return body
 
 def _guard(function):
     def wrapped(*args, **kwargs):
@@ -138,19 +98,6 @@ def _guard(function):
     wrapped.__name__ = function.__name__
     wrapped.__doc__ = function.__doc__
     return wrapped
-
-def _finish(result):
-    if type(result) is dict and result.get("status") in _VERDICTS:
-        return result
-    code = result.get("code") if type(result) is dict else None
-    if code == "invalid_role":
-        code = "unknown_role"
-    fields = {}
-    if type(result) is dict:
-        for key in ("prohibited_calls", "uncovered_calls", "extras", "missing", "attempts"):
-            if key in result:
-                fields[key] = result[key]
-    return _refusal(code, **fields)
 
 def _name(value):
     # Length is checked before scanning characters. Newlines are refused, not joined.
@@ -651,7 +598,7 @@ def _compared(resolved, served_normalized, prohibited_call_tools, vocab):
         return _comparison("unknown", code, uncovered=uncovered)
     if status in ("unknown", "refused"):
         refusal = resolved.get("code")
-        kept = refusal if _name(refusal) and (refusal in REFUSALS or refusal in _RESOLUTION_CODES) else "invalid_resolution"
+        kept = refusal if _name(refusal) and (refusal in CAPABILITY_CODES or refusal in _RESOLUTION_CODES) else "invalid_resolution"
         return _comparison("unknown", kept, uncovered=uncovered)
     expected = _names(resolved.get("capabilities"), capabilities=True)
     if status != "resolved" or expected is None:
