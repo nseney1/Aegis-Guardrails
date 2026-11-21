@@ -8146,7 +8146,7 @@ PROCESS_PATCH_LIMITS = {
     'tests/unit/core/test_lifecycle_write_safety.py': 2,
     'tests/unit/core/test_locking.py': 2,
     'tests/unit/core/test_manager_store.py': 6,
-    'tests/unit/core/test_message_codec.py': 55,
+    'tests/unit/core/test_message_codec.py': 54,
     'tests/unit/core/test_model_select.py': 17,
     'tests/unit/core/test_pathlookup.py': 1,
     'tests/unit/core/test_primitives.py': 6,
