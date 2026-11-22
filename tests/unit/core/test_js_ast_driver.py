@@ -727,3 +727,362 @@ def test_a_block_after_a_type_operator_word_cannot_hide_calls(source, path):
     with pytest.raises(JSLexError) as error:
         parse(source, path)
     assert error.value.reason == 'unsupported_lexical_context:brace'
+
+
+def _call_targets(source, path, compact):
+    from aegis_core.ast.drivers.js.extractor import Extractor
+
+    return [node.target for node in Extractor(source, path, compact=compact).run().call_sites]
+
+
+def _lex_reason(source, path, compact):
+    from aegis_core.ast.drivers.js.extractor import Extractor
+    from aegis_core.ast.drivers.js.tokenizer import JSLexError
+
+    with pytest.raises(JSLexError) as error:
+        Extractor(source, path, compact=compact)
+    return error.value.reason
+
+
+# A class body holds no statements, so a control word or `class` before `(` there names a method.
+@pytest.mark.parametrize('source', [
+    'class A { public if(): void { eval(code) } }',
+    'class A { public if(): as { eval(code) } }',
+    'class A { m() {} if(): void { eval(code) } }',
+    'class A { x = y\n  if(): void { eval(code) } }',
+    'class A { private static while(): void { eval(code) } }',
+    'class A { public class(): void { eval(code) } }',
+    'class A { m() {}\n  class() { eval(code) } }',
+    'const C = class { m() {} for(): void { eval(code) } };',
+    # Control words and classes keep their meaning inside methods, static blocks and field initializers.
+    'class A { m() { if (x) { eval(code) } } }',
+    'class A { static { while (x) { eval(code) } } }',
+    'class A { f = () => { if (x) { eval(code) } } }',
+    'class A { f = class { m() { eval(code) } } }',
+])
+@pytest.mark.parametrize('path', ['fixture.ts', 'fixture.tsx'])
+@pytest.mark.parametrize('compact', [True, False])
+def test_a_keyword_method_name_keeps_the_method_body_calls(source, path, compact):
+    assert _call_targets(source, path, compact)[-1:] == ['eval']
+
+
+@pytest.mark.parametrize('source', [
+    'class A { m() {}\n  switch() { eval(code) } }',
+    'class A { m() {}\n  class() { eval(code) } }',
+])
+@pytest.mark.parametrize('compact', [True, False])
+def test_a_keyword_method_name_keeps_the_method_body_calls_in_javascript(source, compact):
+    assert _call_targets(source, 'fixture.js', compact)[-1:] == ['eval']
+
+
+# TypeScript never continues `as` or `satisfies` across a line break, so a new line that starts
+# with them after an unfinished field starts a new member.
+@pytest.mark.parametrize('source', [
+    'class A { x = y\n  as(): void { eval(code) } }',
+    'class A { x = y\n  as(): satisfies { eval(code) } }',
+    'class A { x = y\n  satisfies(): void { eval(code) } }',
+    'class A { x = y\n  as<T>(): void { eval(code) } }',
+    'class A { x = y\n  as?(): void { eval(code) } }',
+    'class A { x = y\n  as /* c */ (): void { eval(code) } }',
+    'class A { x = y\n  \\u0061s(): void { eval(code) } }',
+    'class A { x = y\n  as\n  *g(): void { eval(code) } }',
+    'class A { x = y\n  as\n  [k](): void { eval(code) } }',
+])
+@pytest.mark.parametrize('path', ['fixture.ts', 'fixture.tsx'])
+@pytest.mark.parametrize('compact', [True, False])
+def test_a_line_starting_with_as_after_a_field_starts_a_member(source, path, compact):
+    assert _call_targets(source, path, compact)[-1:] == ['eval']
+
+
+# In .tsx a generic signature `<T>(x: T) => T` inside any type reads like a JSX element whose text
+# starts with `(`; code up to a matching `</T>` would be read as JSX text, so such an element fails closed.
+@pytest.mark.parametrize('source', [
+    'let a: { f: <T>(x: T) => T } = b; eval(code) //</T>}',
+    'type A = { f: <T>(x: T) => T }; eval(code) //</T>}',
+    'let a: A | { f: <T>(x: T) => T } = b; eval(code) //</T>}',
+    'let a: Array<{ f: <T>(x: T) => T }> = b; eval(code) //</T>}>',
+    'interface I { a?: { f: <T>(x: T) => T } } eval(code) //</T>}}',
+    'function f(a?: { g: <T>(x: T) => T }) {} eval(code) //</T>})',
+    'type A = { <T>(x: T) }; eval(code) //</T>}',
+    'type A = { new <T>(x: T): T }; eval(code) //</T>}',
+    'type A = { f: <T = string>(x: T) => T }; eval(code) //</T>}',
+    'let f: <T> (x: T) => T = g; eval(code) //</T>',
+    'let f: <T>\n(x: T) => T = g; eval(code) //</T>',
+    'type A = { f: <T extends { a: 1 }>(x: T) => T }; eval(code) //</T>}',
+    "type A = { f: <T extends 'a' = 'a'>(x: T) => T }; eval(code) //</T>}",
+    'type A = { f: <T, U = {}>(x: T) => T }; eval(code) //</T>}',
+    # Comments are whitespace in a type.
+    'let a: A | { f: <T>/*c*/(x: T) => T } = b; eval(code) //</T>}',
+    'let a: A | { f: <T>//c\n(x: T) => T } = b; eval(code) //</T>}',
+    'let a: A | { f: <T>\n/*c*/\n(x: T) => T } = b; eval(code) //</T>}',
+    'let a: A | { f: <T //c\n>(x: T) => T } = b; eval(code) //</T>}',
+    'let a: A | { <T>/*c*/(x: T): T } = b; eval(code) //</T>}',
+    # The tag ends at a `>` inside a comment in its head; U+FEFF is whitespace in a type.
+    'let a: A | { f: <T/*>*/>(x: T) => T } = b; eval(code) //</T>}',
+    'let a: A | { f: <T\ufeff>(x: T) => T } = b; eval(code) //</T>}',
+    'let a: A | { f: <T>\ufeff(x: T) => T } = b; eval(code) //</T>}',
+    # Quoted types and comments cannot close the parameters early; nor can a chain of call signatures.
+    "let a: A | { f: <T>(x: ')<') => T } = b; eval(code) //</T>}",
+    'let a: A | { f: <T>(x: "){") => T } = b; eval(code) //</T>}',
+    'let a: A | { f: <T>(x /* )< */: T) => T } = b; eval(code) //</T>}',
+    'let a: A | { f: <T>(x: `)<`) => T } = b; eval(code) //</T>}',
+    'type A = { <T>(x: T)\n  <U>(y: U) }; eval(code) //</U></T>}',
+    # JSX text that cannot be told apart from a signature fails closed too.
+    "const x = <b>(don't)</b>; eval(code)",
+    'const x = <b>(1) item</b>; eval(code)',
+    'const x = <b>(' + 'a' * 5000 + ')</b>; eval(code)',
+])
+@pytest.mark.parametrize('compact', [True, False])
+def test_a_tsx_element_whose_text_starts_like_a_signature_fails_closed(source, compact):
+    # Inside an annotation or type alias literal the type literal rule may refuse the `<` first.
+    assert _lex_reason(source, 'fixture.tsx', compact) in (
+        'unsupported_lexical_context:tsx_generic_or_jsx', 'unsupported_lexical_context:tsx_type_literal_angle')
+
+
+@pytest.mark.parametrize('source', [
+    'const x = <b>{eval(code)}</b>',
+    'const x = <b>text (x)</b>; eval(code)',
+    'const x = <b><i>x</i>(y)</b>; eval(code)',
+    'const x = <b />; eval(code)',
+    'const x = <b a="(" />; eval(code)',
+    # An element with attributes is JSX even when its text starts with `(`.
+    'const x = <a title="x,y">(hi)</a>; eval(code)',
+    'const x = <b className="c">(optional)</b>; eval(code)',
+    'const x = <b disabled>(optional)</b>; eval(code)',
+    'const x = <b a={<i />}>(optional)</b>; eval(code)',
+    # So is parenthesized text followed by a child element or expression, and a name no type parameter has.
+    'const x = <b>(optional)</b>; eval(code)',
+    'const x = <b> (x)</b>; eval(code)',
+    'const x = <b>\n  (x)\n</b>; eval(code)',
+    'const x = <span>({count})</span>; eval(code)',
+    'const x = <b>(a "(b)")</b>; eval(code)',
+    'const x = <b>(<i>x</i>)</b>; eval(code)',
+    'const x = <b>(x){y}</b>; eval(code)',
+    'const x = <a href="http://x">(hi)</a>; eval(code)',
+    'const x = <Foo.Bar>(hi) there</Foo.Bar>; eval(code)',
+    'const x = <my-tag>(hi) there</my-tag>; eval(code)',
+    'const x = <svg:g>(hi) there</svg:g>; eval(code)',
+    'const x = <span className="extends">(x) y</span>; eval(code)',
+])
+@pytest.mark.parametrize('compact', [True, False])
+def test_jsx_that_cannot_be_a_generic_signature_is_still_read(source, compact):
+    assert _call_targets(source, 'fixture.tsx', compact)[-1:] == ['eval']
+
+
+# `case` and `default` labels exist only directly inside a switch body.
+@pytest.mark.parametrize('source', [
+    'case { eval(code) }',
+    'default { eval(code) }',
+    'if (x) { case 1: eval(code) }',
+    'switch (x) { case 1: { case 2: eval(code) } }',
+    'switch (x) {} case 1: eval(code)',
+    'switch (x) {} if (y) { case 1: eval(code) }',
+    # A switch head that is not followed by its body does not make a later block a switch body.
+    'switch (a)\nfoo(); { case { eval(code) } }',
+    'switch (a);\nif (b) { case { eval(code) } }',
+    'switch (a)\nfoo()\nwhile (b) { case { eval(code) } }',
+])
+@pytest.mark.parametrize('path', ['fixture.ts', 'fixture.js'])
+@pytest.mark.parametrize('compact', [True, False])
+def test_case_outside_a_switch_body_fails_closed(source, path, compact):
+    assert _lex_reason(source, path, compact) == 'unsupported_lexical_context:case_outside_switch'
+
+
+@pytest.mark.parametrize('source', [
+    'switch (x) { case 1: { break } case 2: eval(code) }',
+    'switch (x) { case 1: f()\n  case 2: eval(code) }',
+    'switch (a) { case 1: switch (b) { case 2: eval(code) } default: }',
+    'switch ({ a: 1 }.a) { default: eval(code) }',
+    'switch (x) /* c */ { case 1: eval(code) }',
+    'switch (x)\n{ case 1: eval(code) }',
+    'class A { m() {}\n  case() { eval(code) } }',
+    'class A { public case() {} m() { eval(code) } }',
+    'class A { default() { eval(code) } }',
+    'const o = { case: eval(code) }',
+    'obj.case(eval(code))',
+    'export default { a: eval(code) }',
+])
+@pytest.mark.parametrize('path', ['fixture.ts', 'fixture.js'])
+@pytest.mark.parametrize('compact', [True, False])
+def test_case_and_default_keep_their_other_meanings(source, path, compact):
+    assert _call_targets(source, path, compact)[-1:] == ['eval']
+
+# In an object or type literal `case` and `default` after a line break are member names.
+@pytest.mark.parametrize('source', [
+    'type T = {\n  a: string\n  case: number\n}; eval(code)',
+    'type T = {\n  a: string\n  default: number\n}; eval(code)',
+    'interface I {\n  a: string\n  case: number\n} eval(code)',
+])
+@pytest.mark.parametrize('path', ['fixture.ts', 'fixture.tsx'])
+@pytest.mark.parametrize('compact', [True, False])
+def test_case_and_default_members_after_a_line_break_are_names(source, path, compact):
+    assert _call_targets(source, path, compact)[-1:] == ['eval']
+
+
+# A `{` after a type operator word opens a type literal only in a type position. Otherwise the word may be an
+# identifier, or follow a line break after ASI, and the `{` opens a block that tsc's error recovery still emits.
+@pytest.mark.parametrize('source', [
+    'x = y is { eval(code) }',
+    'x = is { eval(code) }',
+    'x = y; is { eval(code) }',
+    'x = y; readonly { eval(code) }',
+    'x = readonly { eval(code) }',
+    'x = c ? a : readonly { eval(code) }',
+    'x = { a: readonly { eval(code) } }',
+    'y; x = readonly { eval(code) }',
+    'x = as readonly { eval(code) }',
+    'x = const satisfies { eval(code) }',
+    'as { eval(code) }',
+    'function f() { return as { eval(code) } }',
+    'if (c) as { eval(code) }',
+    '{} as { eval(code) }',
+    'x = !as { eval(code) }',
+    'x = c ? a : b is { eval(code) }',
+    'x = c ? (a) : b is { eval(code) }',
+    'let a: v is { eval(code) }',
+    'x = (v): 1 is { eval(code) }',
+    'x = asserts v is { eval(code) }',
+    'f((y) => v is { eval(code) })',
+    # A line break before the word, a binary `>` or a prefix `!`.
+    'x = y\nas { eval(code) }',
+    'x = y\nsatisfies { eval(code) }',
+    'x = y\nextends { eval(code) }',
+    'f()\nas { eval(code) }',
+    'x = 1\nas { eval(code) }',
+    'x = y!\nas { eval(code) }',
+    'x = a > as { eval(code) }',
+    'x = a >> satisfies { eval(code) }',
+    'x = a\n!as { eval(code) }',
+    'a < b; x = c > as { eval(code) }',
+    'x = f(a < b) > as { eval(code) }',
+    'if (a < b) x = c > as { eval(code) }',
+    'x = (a < b) > satisfies { eval(code) }',
+    'f(a < b)(c > as { eval(code) })',
+    'a < b\nx = c > as { eval(code) }',
+    'type\nX = readonly { eval(code) }',
+    # Valid TypeScript the lexer cannot place in a type: these still fail closed.
+    'type V<T> = void extends { a: 1 } ? 1 : 2; eval(code)',
+    'type G = (v: unknown) => v is { a: 1 }; eval(code)',
+])
+@pytest.mark.parametrize('path', ['fixture.ts', 'fixture.tsx'])
+@pytest.mark.parametrize('compact', [True, False])
+def test_a_brace_after_a_type_operator_word_outside_a_type_position_fails_closed(source, path, compact):
+    assert _lex_reason(source, path, compact) == 'unsupported_lexical_context:brace'
+
+
+@pytest.mark.parametrize('source', [
+    'const a = { k: 1 } as { k: number }; eval(code)',
+    'const a = { k: f(1) } as { k: number }; eval(code)',
+    'const a = f(x) as { k: number }; eval(code)',
+    'const a = x! as { k: number }; eval(code)',
+    'const a = y++ as { k: number }; eval(code)',
+    "const a = 'k' as { k: number }; eval(code)",
+    'const a = 1 as { k: number }; eval(code)',
+    'const a = /x/ as { k: number }; eval(code)',
+    'const a = `t` as { k: number }; eval(code)',
+    'const a = [1] satisfies { k: number }[]; eval(code)',
+    'const f = function () {} as { a: 1 }; eval(code)',
+    'const C = class {} as { a: 1 }; eval(code)',
+    'const v = y as const satisfies { a: 1 }; eval(code)',
+    'const a = b as readonly { c: 1 }[]; eval(code)',
+    'function g(v): asserts v is { a: 1 } {} eval(code)',
+    'const h = (v): v is { a: 1 } => true; eval(code)',
+    'const h = (v): asserts v is { a: 1 } => {}; eval(code)',
+    'type A = Array<readonly { a: 1 }>; eval(code)',
+    'type U = X | readonly { a: 1 }[]; eval(code)',
+    'type P<T> = T extends { a?: infer M } ? M : never; eval(code)',
+    'type Q<T> = NonNullable<T> extends {\n  a: infer A;\n} ? A : never; eval(code)',
+    'type R<T> = Array<Array<T>> extends { a: 1 } ? 1 : 2; eval(code)',
+    'type Q2<T> = Map<string, (x: T) => void> extends { a: 1 } ? 1 : 2; eval(code)',
+    'type Q3<T> = Map<K, { a: Array<T> }> extends { a: 1 } ? 1 : 2; eval(code)',
+    'const v = a < b > as { k: 1 }; eval(code)',
+    'type X2<T = string> = readonly { a: T }[]; eval(code)',
+    'type S<T> = T extends readonly { a: 1 }[] ? 1 : 2; eval(code)',
+    'type X = readonly { a: 1 }[]; eval(code)',
+    'type X<T> = readonly { a: T }[]; eval(code)',
+    'type X = { a: readonly { b: string }[] }; eval(code)',
+    'type X<T> = { a: T extends 1 ? 2 : readonly { b: 1 }[] }; eval(code)',
+    'let x: { a: readonly { b: 1 }[] } = y; eval(code)',
+    'function f(a?: readonly { b: string }[]) {} eval(code)',
+    'interface I { a?: readonly { b: 1 }[] } eval(code)',
+    'class C { a?: readonly { b: 1 }[] } eval(code)',
+    'class C { a: readonly { b: 1 }[] } eval(code)',
+    'interface I { a: readonly { b: 1 }[] } eval(code)',
+    'const o = { f: (v): v is { a: 1 } => true }; eval(code)',
+    'const o = { f: (): readonly { a: 1 }[] => [] }; eval(code)',
+    # Flags left by an earlier statement do not hide a later annotation.
+    'class A { public case() {} }\nlet a: readonly { b: 1 }[] = c; eval(code)',
+    'x;\nconst f = (): readonly { a: 1 }[] => []; eval(code)',
+    'x;\n(): readonly { a: 1 }[] => []; eval(code)',
+])
+@pytest.mark.parametrize('path', ['fixture.ts', 'fixture.tsx'])
+@pytest.mark.parametrize('compact', [True, False])
+def test_a_type_literal_after_a_type_operator_in_a_type_position_keeps_following_calls(source, path, compact):
+    assert _call_targets(source, path, compact)[-1:] == ['eval']
+
+
+# A colon as the first token is no annotation and must not reach past the start of the token list.
+@pytest.mark.parametrize('source', [':', ': x', ':{}'])
+@pytest.mark.parametrize('path', ['fixture.ts', 'fixture.tsx'])
+@pytest.mark.parametrize('compact', [True, False])
+def test_a_leading_colon_is_lexed_without_an_index_error(source, path, compact):
+    assert _call_targets(source, path, compact) == []
+
+# A long run of postfix operators before a type operator is walked without recursion.
+@pytest.mark.parametrize('compact', [True, False])
+def test_a_long_postfix_run_before_a_type_operator_does_not_recurse(compact):
+    assert _call_targets('y = x' + '!' * 5000 + ' as { a: 1 }; eval(code)', 'fixture.ts', compact)[-1:] == ['eval']
+
+
+# A line break that ends a statement (ASI) starts a new one, so a label or `default:` there labels the
+# block after it, which must be read as code.
+@pytest.mark.parametrize('source', [
+    'switch (x) {\n  case 1:\n    f()\n  default: { eval(code) }\n}',
+    'switch (x) {\n  case 1:\n    f()\n  default:\n    { eval(code) }\n}',
+    'x = 1\nfoo: { eval(code) }',
+    'f()\nfoo: { eval(code) }',
+    'x = a\n// c\nfoo: { eval(code) }',
+    'x = y++\nfoo: { eval(code) }',
+    'x = function () {}\nfoo: { eval(code) }',
+    'function g() {\n  return\n  foo: { eval(code) }\n}',
+    'function* g() {\n  yield\n  foo: { eval(code) }\n}',
+    'await: { eval(code) }',
+    'yield: { eval(code) }',
+    'let: { eval(code) }',
+    'if (c) {\n  x = 1\n  foo: { eval(code) }\n}',
+])
+@pytest.mark.parametrize('path', ['fixture.js', 'fixture.ts', 'fixture.tsx'])
+@pytest.mark.parametrize('compact', [True, False])
+def test_a_label_after_a_line_break_labels_a_block(source, path, compact):
+    assert _call_targets(source, path, compact)[-1:] == ['eval']
+
+
+@pytest.mark.parametrize('source', [
+    'x = 1\nfoo: { const e = <b>{eval(code)}</b> }',
+    'switch (x) {\n  case 1:\n    f()\n  default: {\n    const e = <b>{eval(code)}</b>\n  }\n}',
+])
+@pytest.mark.parametrize('compact', [True, False])
+def test_a_label_after_a_line_break_is_no_tsx_annotation(source, compact):
+    assert _call_targets(source, 'fixture.tsx', compact)[-1:] == ['eval']
+
+
+@pytest.mark.parametrize('source', ['x\ndefault: { eval(code) }', 'f()\ndefault { eval(code) }'])
+@pytest.mark.parametrize('path', ['fixture.js', 'fixture.ts'])
+@pytest.mark.parametrize('compact', [True, False])
+def test_default_after_a_line_break_outside_a_switch_fails_closed(source, path, compact):
+    assert _lex_reason(source, path, compact) == 'unsupported_lexical_context:case_outside_switch'
+
+
+# A colon after a line break inside an object, a ternary, a type or a class member is no label.
+@pytest.mark.parametrize('source,path', [
+    ('const o = {\n  a: 1,\n  b: { c: eval(code) }\n}', 'fixture.js'),
+    ('x = c\n  ? a\n  : { k: eval(code) }', 'fixture.js'),
+    ('const f = (\n  a,\n  b\n) => { eval(code) }', 'fixture.js'),
+    ('type A = {\n  a: number\n  b: { c: readonly { d: 1 }[] }\n}; eval(code)', 'fixture.ts'),
+    ('interface I {\n  a: number\n  b: readonly { c: 1 }[]\n} eval(code)', 'fixture.ts'),
+    ('class A {\n  x = 1\n  y: readonly { a: 1 }[] = z\n  m() { eval(code) }\n}', 'fixture.ts'),
+    ('function f(\n  a: number,\n  b: readonly { c: 1 }[]\n) { eval(code) }', 'fixture.ts'),
+])
+@pytest.mark.parametrize('compact', [True, False])
+def test_a_colon_after_a_line_break_in_an_object_type_or_class_is_no_label(source, path, compact):
+    assert _call_targets(source, path, compact)[-1:] == ['eval']

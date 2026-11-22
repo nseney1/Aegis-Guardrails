@@ -6,16 +6,19 @@ from pathlib import PurePosixPath
 from typing import NamedTuple
 
 from aegis_core.ast.driver_errors import ASTDriverError
+from aegis_core.ast.drivers.js.jsx import JSXScanner
+from aegis_core.ast.drivers.js.typescript import TypePositions
 from aegis_core.ast.drivers.js.values import (
+    MAX_DEPTH,
     decode_string,
     identifier_part,
     identifier_start,
+    line_breaks,
     unicode_escape,
 )
 
 __all__ = ['MAX_DEPTH', 'MAX_SOURCE_BYTES', 'JSLexError', 'Token', 'tokenize']
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
-MAX_DEPTH = 256
 _IDENT = re.compile(r'[A-Za-z_$][A-Za-z0-9_$]*')
 _D = r'\d(?:_?\d)*'
 _NUMBER = re.compile(r'(?:0[xX][0-9a-fA-F](?:_?[0-9a-fA-F])*n?|0[bB][01](?:_?[01])*n?|0[oO][0-7](?:_?[0-7])*n?|(?:0|[1-9](?:_?\d)*)(?:\.(?:' + _D + r')?)?(?:[eE][+-]?' + _D + r')?n?|\.' + _D + r'(?:[eE][+-]?' + _D + r')?)')
@@ -56,14 +59,6 @@ _PLAIN_PROPERTY = r'(?:\.\.\.' + _PLAIN_REF + r'|(?:[A-Za-z_$][A-Za-z0-9_$]*|' +
 _FLAT_OBJECT = re.compile(r'{[ \t]*(?:' + _PLAIN_PROPERTY + r'(?:[ \t]*,[ \t]*' + _PLAIN_PROPERTY + r')*[ \t]*(?:,[ \t]*)?)?}')
 _CONST_ENUM = re.compile(r'[ \t\r\n\f\v]+enum(?![\w$\\])')
 _PLAIN_QUOTED_MATCH = re.compile(_PLAIN_QUOTED)
-# Characters a JSX attribute list may contain; a TSX generic built only from them is also a JSX tag.
-_JSX_ATTRIBUTE_RUN = re.compile(r'[A-Za-z0-9_$.,:\-\[\]|& \t\r\n\f\v]*')
-_JSX_CLOSING_NAME = re.compile(r'</\s*([A-Za-z_$][A-Za-z0-9_$]*)')
-_JSX_TYPE_ARGUMENT = frozenset('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_$.,[]|& \t\r\n')
-
-
-def line_breaks(text):
-    return text.count('\n') + text.count('\r') - text.count('\r\n') + text.count('\u2028') + text.count('\u2029')
 
 
 class JSLexError(ASTDriverError):
@@ -86,7 +81,7 @@ class Token(NamedTuple):
 _TOKEN_NEW = tuple.__new__
 
 
-class Lexer:
+class Lexer(JSXScanner, TypePositions):
     def __init__(self, source, path, *, compact=False):
         self.source, self.path, self.i, self.line = source, path, 0, 1
         self.compact = compact
@@ -97,7 +92,7 @@ class Lexer:
         self.class_fields = {}
         self.module_clause, self.type_angles = None, 0
         self.label_pending, self.case_pending, self.ternaries = False, False, {}
-        self.jsx_tag, self.jsx_closing, self.jsx_return = '', False, 'code'
+        self.jsx_tag, self.jsx_closing, self.jsx_return, self.jsx_head = '', False, 'code', 0
         extension = PurePosixPath(path).suffix.lower()
         self.typescript = extension in ('.ts', '.tsx', '.mts', '.cts')
         self.jsx_allowed = extension in ('.jsx', '.tsx', '.js', '.mjs', '.cjs')
@@ -106,12 +101,20 @@ class Lexer:
         self.arrow_close, self.closing_names = None, None
         # (end of the `(` run, `)` count or -1) of the last failed transparent-group attempt.
         self.group_skip = (-1, -1)
-        self.generator_pending, self.body_generator, self.class_kind = None, False, None
+        self.generator_pending, self.body_generator, self.class_kind, self.annotation_at = None, False, None, -1
         # Frame depths: generator parameters/bodies, strict class bodies, concise arrows, for-statement heads, TS type literals.
         self.generator_frames, self.strict_frames, self.arrow_markers, self.for_heads, self.type_literals = set(), set(), set(), set(), set()
+        # Switch bodies, switch heads still open, and (depth, token index) of the `)` that closed the last head.
+        self.switch_frames, self.switch_heads, self.switch_close = set(), set(), None
 
     def error(self, reason, offset=None, line=None):
         raise JSLexError(reason, self.line if line is None else line, self.i if offset is None else offset)
+
+    def line_break(self, begin, end):
+        return _LINE_END.search(self.source, begin, end) is not None
+
+    def syntax_word(self, word):
+        return word in _SYNTAX_WORDS
 
     def emit(self, kind, value, begin, line, role=''):
         self.tokens.append(_TOKEN_NEW(Token, (kind, value, line, begin, self.i, role, None)))
@@ -190,7 +193,7 @@ class Lexer:
                 if syntax_word:
                     self.after_word(value)
                 else:
-                    self.label_pending, self.expr, self.statement = self.statement and role != 'reference', False, False
+                    self.label_pending, self.expr, self.statement = (self.statement or self.colon_next() and self.asi_start()) and role != 'reference', False, False
                     self.declaration_prefix, self.previous = False, value.rsplit('.', 1)[-1] if dotted else value
                 if end != match_end:
                     return
@@ -604,8 +607,33 @@ class Lexer:
 
     def class_member_line(self, word):
         depth = len(self.frames)
-        if self.class_fields.get(depth) and not self.expr and self.tokens and self.tokens[-1].line < self.line and word not in ('in', 'instanceof', 'as', 'satisfies'):
+        # A new line ends a field unless it continues the initializer; TS never continues `as` or `satisfies`
+        # across a line break, so `x = y` + `as(): T {}` is a method.
+        if self.class_fields.get(depth) and not self.expr and self.tokens and self.tokens[-1].line < self.line and word not in ('in', 'instanceof'):
             self.class_fields[depth] = False
+
+    def colon_next(self):
+        """Whether a `:` follows the word just read (whitespace and comments aside): only then can it be a label."""
+        return self.source.startswith(':', self.after_trivia(self.i))
+
+    def asi_start(self):
+        """Whether the word just emitted starts a statement because a line break ended the previous one (ASI).
+
+        Labels and `default:` there (`f()` + `foo: { … }`) must still read the block after them as code.
+        """
+        tokens, before = self.tokens, len(self.tokens) - 2
+        while before >= 0 and tokens[before].kind == 'comment':
+            before -= 1
+        if before < 0 or tokens[before].line == tokens[-1].line:
+            return False
+        if self.frames and not (self.frames[-1][1] == 'block' or self.frames[-1][1].startswith('function_')):
+            return False
+        return (self.line_break(tokens[before].end, tokens[-1].start)
+                and (tokens[before].value in ('return', 'yield') or self.operand_end(before)))
+
+    def class_body(self):
+        """Directly inside a class body and outside a field initializer, where no statement can start."""
+        return bool(self.frames) and self.frames[-1][1] in ('class_decl', 'class_expr') and not self.class_fields.get(len(self.frames))
 
     def identifier_role(self):
         if self.frames and self.frames[-1][1] == 'module':
@@ -625,8 +653,14 @@ class Lexer:
         if self.tokens[-1].role in ('module_binding', 'property_name'):
             self.expr, self.statement, self.previous = False, False, word
             return
-        self.label_pending = self.statement and word not in _NON_LABEL
-        if word == 'case' or (word == 'default' and self.previous != 'export' and self.statement):
+        start = self.statement or (word == 'default' or self.colon_next()) and self.asi_start()
+        # `await`, `yield` and `let` are labels in scripts: `await: { … }`.
+        self.label_pending = start and (word not in _NON_LABEL or word in _CONTEXTUAL_OPERANDS)
+        # `case` and `default` label only a switch body; in a class body `case() {}` names a method.
+        if (word == 'case' or (word == 'default' and self.previous != 'export' and start)) and not self.class_body():
+            # In an object or type literal it is a member name after ASI: `type T = {` + `a: string` + `case: number }`.
+            if len(self.frames) not in self.switch_frames and not (self.frames and self.frames[-1][1] == 'object'):
+                self.error('unsupported_lexical_context:case_outside_switch')
             self.case_pending = True
         if word in ('import', 'export') and self.statement:
             self.module_clause = word
@@ -638,13 +672,14 @@ class Lexer:
             while cursor < len(self.source) and self.source[cursor].isspace():
                 cursor += 1
             type_declaration = cursor < len(self.source) and self.source[cursor] not in '.?(=;,[!'
-        if word in _CONTROL and self.previous not in ('.', '?.'):
+        member = (word in _CONTROL or word == 'class') and self.class_body()  # `public if() {}` names a method
+        if word in _CONTROL and self.previous not in ('.', '?.') and not member:
             self.control = True
             self.expr, self.statement = True, False
         elif word == 'function':
             self.function = (self.statement or self.declaration_prefix, len(self.frames))
             self.expr, self.statement = True, False
-        elif word == 'class' or type_declaration:
+        elif word == 'class' and not member or type_declaration:
             self.class_pending = (self.statement or self.declaration_prefix or self.decorator_prefix, len(self.frames), word)
             self.decorator_prefix = False
             self.expr, self.statement = True, False
@@ -729,6 +764,8 @@ class Lexer:
             self.mode, self.expr, self.statement, self.previous = 'code', True, False, '${'
 
     def brace_role(self):
+        if self.typescript and (self.annotation_at == len(self.tokens) - 1 or self.previous == '=' and self.type_alias_value(len(self.tokens) - 1)):
+            self.type_literals.add(len(self.frames) + 1)  # `let a: { … }` or `type A = { … }`; its role is unchanged
         if self.previous == 'static' and self.frames and self.frames[-1][1].startswith('class'):
             return 'block'
         if self.control and self.previous == 'catch':
@@ -754,10 +791,9 @@ class Lexer:
             return 'block'
         if self.expr:
             return 'object'
-        if (self.typescript and self.previous in ('as', 'satisfies', 'extends', 'readonly', 'is') and self.tokens[-1].value == self.previous
-                and self.tokens[-1].line == self.line and (len(self.tokens) < 2 or self.tokens[-2].value not in ('.', '?.') and self.tokens[-2].kind != 'comment')):
+        if self.type_operator_brace():
             self.type_literals.add(len(self.frames) + 1)  # a TS type literal: `x as { a: T }`, `T extends { a: T }`
-            return 'object'  # `x.as`, or a newline or comment next to the word, may be an ASI block: fail closed below
+            return 'object'
         self.error('unsupported_lexical_context:brace')
 
     def punctuation(self, operator=None):
@@ -803,7 +839,7 @@ class Lexer:
             if not self.frames or self.frames[-1][0] != ch:
                 self.error('syntax:unbalanced_delimiter')
             _, role, resume = self.frames.pop()
-            if role.startswith('parameters_') or self.generator_frames or self.strict_frames or self.for_heads or self.arrow_markers or self.type_literals:
+            if role.startswith('parameters_') or self.generator_frames or self.strict_frames or self.for_heads or self.arrow_markers or self.type_literals or self.switch_frames or self.switch_heads:
                 self.close_context(role)
             if role in ('class_decl', 'class_expr'):
                 del self.class_fields[len(self.frames) + 1]
@@ -812,7 +848,7 @@ class Lexer:
             if role == 'function_arrow':
                 self.arrow_close = (len(self.tokens), self.i)
             if role == 'jsx_expression':
-                self.mode, self.jsx_tag, self.jsx_return, self.jsx_closing = resume
+                self.mode, self.jsx_tag, self.jsx_return, self.jsx_closing, self.jsx_head = resume
             elif role == 'interpolation':
                 self.mode = resume
             if role.startswith('parameters_'):
@@ -863,6 +899,14 @@ class Lexer:
         depth = len(self.frames)
         if role == 'control' and self.previous == 'for':
             self.for_heads.add(depth)
+        if role == 'control' and self.previous == 'switch':
+            self.switch_heads.add(depth)
+        elif ch == '{' and self.switch_close and self.switch_close[0] == depth:
+            before = len(self.tokens) - 2  # the `{` is tokens[-1]; its body must follow the head's `)` directly
+            while before >= 0 and self.tokens[before].kind == 'comment':
+                before -= 1
+            if self.switch_close[1] == before:
+                self.switch_frames.add(depth)
         if role.startswith('parameters_') and self.generator_pending == depth - 1:
             self.generator_frames.add(depth)
             self.generator_pending = None
@@ -884,6 +928,10 @@ class Lexer:
         self.for_heads.discard(depth)
         self.arrow_markers.discard(depth)
         self.type_literals.discard(depth)
+        self.switch_frames.discard(depth)
+        if role == 'control' and depth in self.switch_heads:
+            self.switch_heads.discard(depth)
+            self.switch_close = (depth, len(self.tokens))  # the index the closing `)` is about to take
 
     def after_operator(self, operator):
         depth = len(self.frames)
@@ -893,102 +941,14 @@ class Lexer:
             self.arrow_markers.discard(depth)
         if operator == '=' and self.module_clause == 'import':
             self.module_clause = None  # TS `import name = Namespace.member` has no module body.
-
-    def jsx_candidate(self):
-        source, start = self.source, self.i + 1
-        if start < len(source) and source[start].isspace():
-            self.error('unsupported_lexical_context:jsx_angle')
-        if start >= len(source) or not (identifier_start(source[start]) or source[start] == '>'):
-            return False
-        if self.tsx:
-            head = _JSX_ATTRIBUTE_RUN.match(source, start)
-            text = head[0]
-            generic = ',' in text or 'extends' in text.split() or text.startswith('const ')
-            if generic and head.end() < len(source) and source[head.end()] == '>':
-                if self.closing_names is None:
-                    self.closing_names = {match[1] for match in _JSX_CLOSING_NAME.finditer(source)}
-                if text.split()[0].rstrip(',') in self.closing_names:
-                    self.error('unsupported_lexical_context:tsx_generic_or_jsx')
-                return False
-        return True
-
-    def jsx_type_arguments(self):
-        begin, line, depth = self.i, self.line, 0
-        while self.i < len(self.source):
-            ch = self.source[self.i]
-            if ch in '<>':
-                depth += 1 if ch == '<' else -1
-                if depth + len(self.frames) + len(self.jsx_elements) > MAX_DEPTH:
-                    self.error('limit:depth')
-            elif ch not in _JSX_TYPE_ARGUMENT:
-                self.error('unsupported_lexical_context:jsx_type_argument')
-            self.i += 1
-            if depth == 0:
-                self.line += line_breaks(self.source[begin:self.i])
-                self.emit('jsx', self.source[begin:self.i], begin, line)
-                return
-        self.error('syntax:unterminated_jsx_type_argument', begin, line)
-
-    def begin_jsx(self, return_mode):
-        begin, line = self.i, self.line
-        self.jsx_closing = self.source.startswith('</', self.i)
-        self.i += 2 if self.jsx_closing else 1
-        start = self.i
-        while self.i < len(self.source) and (identifier_part(self.source[self.i]) or self.source[self.i] in '.:-'):
-            self.i += 1
-        self.jsx_tag, self.jsx_return = self.source[start:self.i], return_mode
-        self.emit('jsx', self.source[begin:self.i], begin, line)
-        self.mode = 'jsx_tag'
-
-    def jsx(self):
-        source, begin, line = self.source, self.i, self.line
-        ch = source[self.i]
-        if ch == '<' and self.mode == 'jsx_tag' and self.tsx:
-            self.jsx_type_arguments()
-        elif ch == '{':
-            self.i += 1
-            self.emit('punct', '{', begin, line, 'jsx_expression')
-            # Keep the enclosing tag's state: a JSX element inside the expression overwrites it.
-            self.push('}', 'jsx_expression', (self.mode, self.jsx_tag, self.jsx_return, self.jsx_closing))
-            self.mode, self.expr, self.statement, self.previous = 'code', True, False, '{'
-        elif self.mode == 'jsx_text':
-            if ch == '<':
-                self.begin_jsx('jsx_text')
-            else:
-                while self.i < len(source) and source[self.i] not in '<{':
-                    self.i += 1
-                self.line += line_breaks(source[begin:self.i])
-                self.emit('jsx', source[begin:self.i], begin, line)
-        elif ch in '\"\'':
-            quote = ch
-            self.i += 1
-            while self.i < len(source) and source[self.i] != quote:
-                self.i += 1
-            if self.i >= len(source):
-                self.error('syntax:unterminated_jsx_attribute')
-            self.i += 1
-            self.line += line_breaks(source[begin:self.i])
-            self.emit('jsx', source[begin:self.i], begin, line)
-        elif ch == '>' or source.startswith('/>', self.i):
-            self_closing = ch == '/'
-            self.i += 2 if self_closing else 1
-            if self.jsx_closing:
-                if not self.jsx_elements or self.jsx_elements[-1][0] != self.jsx_tag:
-                    self.error('syntax:mismatched_jsx_tag')
-                _, self.mode = self.jsx_elements.pop()
-            elif self_closing:
-                self.mode = self.jsx_return
-            else:
-                if len(self.jsx_elements) + len(self.frames) >= MAX_DEPTH:
-                    self.error('limit:depth')
-                self.jsx_elements.append((self.jsx_tag, self.jsx_return))
-                self.mode = 'jsx_text'
-            self.emit('jsx', source[begin:self.i], begin, line)
-            self.expr, self.statement, self.previous = False, False, 'jsx'
-        else:
-            self.line += ch in '\r\n\u2028\u2029' and not (ch == '\n' and self.i and source[self.i - 1] == '\r')
-            self.i += 1
-            self.emit('jsx', ch, begin, line)
+        if operator == ':' and self.typescript and len(self.tokens) > 1:
+            # An annotation colon: not a ternary, label or case colon (a class body has no labels; `a?:` is optional,
+            # and any colon in a type literal is a type), and not an object key unless it follows a method's `)`.
+            tokens, in_type = self.tokens, depth in self.type_literals
+            label = (self.label_pending and tokens[-2].kind == 'identifier' or self.case_pending) and not self.class_body()
+            annotation = (in_type or tokens[-2].value == '?' or not self.ternaries.get(depth)) and not label and (
+                in_type or not self.frames or self.frames[-1][1] != 'object' or tokens[-2].value == ')')
+            self.annotation_at = len(tokens) - 1 if annotation else -1  # the index of this colon token
 
 
 def tokenize(source: str, path: str = 'fixture.ts', *, compact: bool = False) -> list[Token]:
