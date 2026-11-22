@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from collections import OrderedDict
+from copy import deepcopy
 import json
-import os
 from pathlib import Path
 import sys
 from threading import Lock
@@ -20,83 +19,51 @@ from hierarchy_workspace import Store  # noqa: E402
 
 
 class _MailboxReader:
-    """Keep binding and locking inside public read callables."""
+    """Serialize reads and retain only the authority and the latest diagnostics."""
+
     def __init__(self, mailbox):
-        read_lock = Lock()
-        with read_lock:
-            index = MailboxIndex(mailbox, mode="shadow")
+        self._mailbox = mailbox
+        self._reader_lock = Lock()
+        self._diagnostics = ([], None, [])
 
-        def read_messages():
-            with read_lock:
-                return index.messages()
-
-        def read_message(message_id):
-            with read_lock:
-                return index.get(message_id)
-
-        def read_mode():
-            with read_lock:
-                return index.mode
-
-        def read_divergence():
-            with read_lock:
-                return index.last_divergence
-
-        def read_reconciliation():
-            with read_lock:
-                return index.last_reconciliation
-
-        def read_changes():
-            with read_lock:
-                return index.content_changed
-
-        self.read_messages = read_messages
-        self.read_message = read_message
-        self.read_mode = read_mode
-        self.read_divergence = read_divergence
-        self.read_reconciliation = read_reconciliation
-        self.read_changes = read_changes
+    def _read(self, read):
+        with self._reader_lock:
+            self._diagnostics = ([], None, [])
+            index = MailboxIndex(self._mailbox, mode="shadow")
+            try:
+                return read(index)
+            finally:
+                self._diagnostics = deepcopy((index.last_divergence, index.last_reconciliation, index.content_changed))
 
     def messages(self):
-        return self.read_messages()
+        return self._read(lambda index: index.messages())
 
     def get(self, message_id):
-        return self.read_message(message_id)
+        return self._read(lambda index: index.get(message_id))
 
     @property
     def mode(self):
-        return self.read_mode()
+        return "shadow"
 
     @property
     def last_divergence(self):
-        return self.read_divergence()
+        with self._reader_lock:
+            return deepcopy(self._diagnostics[0])
 
     @property
     def last_reconciliation(self):
-        return self.read_reconciliation()
+        with self._reader_lock:
+            return deepcopy(self._diagnostics[1])
 
     @property
     def content_changed(self):
-        return self.read_changes()
-
-
-_MAILBOX_READERS = OrderedDict()
-_MAILBOX_READERS_LOCK = Lock()
+        with self._reader_lock:
+            return deepcopy(self._diagnostics[2])
 
 
 def mailbox_reader(mailbox):
-    """Reuse locked shadow state only for this exact Mailbox authority."""
-    # The retained index owns mailbox, keeping its identity live until eviction.
-    key = (mailbox.root, os.getpid(), id(mailbox))
-    with _MAILBOX_READERS_LOCK:
-        reader = _MAILBOX_READERS.get(key)
-        if reader is None:
-            if len(_MAILBOX_READERS) >= 16:
-                _MAILBOX_READERS.popitem(last=False)
-            reader = _MailboxReader(mailbox)
-            _MAILBOX_READERS[key] = reader
-        _MAILBOX_READERS.move_to_end(key)
-        return reader
+    """Construct a shadow reader for this mailbox authority."""
+    return _MailboxReader(mailbox)
 
 
 PROVIDER_SCHEMA = "aegis.provider-recovery/v1"

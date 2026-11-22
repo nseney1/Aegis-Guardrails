@@ -1,4 +1,4 @@
-"""Reader-local shadow reuse keeps current pinned outcomes and diagnostics."""
+"""Repeated facade calls rebuild shadow state and keep the current pinned outcomes."""
 from concurrent.futures import ThreadPoolExecutor
 import importlib
 import json
@@ -8,32 +8,24 @@ import weakref
 
 import pytest
 
+from tests.helpers_mailbox_index import SHADOW_READERS, make_mailbox, publish
 
-READERS = ("hierarchy_jobs", "hierarchy_sweep", "hierarchy_provision", "hierarchy_provider_recovery")
 
-
-@pytest.fixture(params=READERS)
+@pytest.fixture(params=[name for name, reads in SHADOW_READERS.items() if reads])
 def reader(request):
     return importlib.import_module("tools." + request.param)
 
 
-def make_mailbox(root):
-    import hierarchy_mailbox as hm
-
-    endpoints = {"a/front-door": {}, "a/orchestrator": {}, "a/lane/review": {"kind": "reviewer"}}
-    hm.initialize(root, {"schema": "aegis.hierarchy-pilot/v1", "writer_limit": 3,
-                         "endpoints": endpoints, "counterparts": []})
-    mailbox = hm.Mailbox(root)
-    for endpoint in endpoints:
-        mailbox.bind({"endpoint": endpoint, "host": "test-host", "session": endpoint,
-                      "expected_generation": 0})
-    return mailbox
-
-
-def publish(mailbox, identifier="seed"):
-    mailbox.publish({"message_id": identifier, "from": "a/orchestrator", "to": "a/lane/review",
-                     "host": "test-host", "session": "a/orchestrator", "binding_generation": 1,
-                     "type": "info", "body": "original body"})
+@pytest.mark.parametrize("name", SHADOW_READERS)
+def test_factory_returns_fresh_readers_without_retaining_them(name, tmp_path):
+    module = importlib.import_module("tools." + name)
+    mailbox = make_mailbox(tmp_path / "mailbox")
+    first = module.mailbox_reader(mailbox)
+    second = module.mailbox_reader(mailbox)
+    assert first is not second
+    retired = weakref.ref(first)
+    del first
+    assert retired() is None
 
 
 def read(index, api):
@@ -48,18 +40,16 @@ def assert_fresh_parity(reader, mailbox, index, api):
     assert index.last_divergence == expected.last_divergence
 
 
-def test_factory_reuses_each_path_and_keeps_readers_independent(reader, tmp_path):
+def test_factory_keeps_authorities_and_owners_independent(reader, tmp_path):
     import hierarchy_mailbox as hm
 
     mailbox = make_mailbox(tmp_path / "mailbox")
     index = reader.mailbox_reader(mailbox)
     assert index.mode == "shadow"
-    assert reader.mailbox_reader(mailbox) is index
     assert reader.mailbox_reader(hm.Mailbox(mailbox.root)) is not index
     other = make_mailbox(tmp_path / "other")
     assert reader.mailbox_reader(other) is not index
-    assert reader.mailbox_reader(mailbox) is index
-    for name in READERS:
+    for name in SHADOW_READERS:
         if name != reader.__name__.split(".")[-1]:
             assert importlib.import_module("tools." + name).mailbox_reader(mailbox) is not index
 
@@ -88,13 +78,11 @@ def test_reused_reader_revalidates_changes_and_recovers(reader, tmp_path, api, c
         with pytest.raises(ValueError) as expected:
             read(reader.MailboxIndex(mailbox, mode="shadow"), api)
         for _ in range(2):
-            assert reader.mailbox_reader(mailbox) is index
             assert reader.mailbox_reader(hm.Mailbox(mailbox.root)) is not index
             with pytest.raises(type(expected.value)) as actual:
                 read(index, api)
             assert str(actual.value) == str(expected.value)
         path.write_bytes(original)
-    assert reader.mailbox_reader(mailbox) is index
     assert reader.mailbox_reader(hm.Mailbox(mailbox.root)) is not index
     for _ in range(2):
         assert_fresh_parity(reader, mailbox, index, api)
@@ -131,7 +119,6 @@ def test_reuse_preserves_shadow_retry_and_divergence(reader, tmp_path, api, chan
     assert result == (expected if api == "messages" else expected.get("absent" if api == "missing" else "seed"))
     assert changes
     assert bool(current_index.last_divergence) == (change == "rewrite" and api != "missing")
-    assert reader.mailbox_reader(mailbox) is index
     assert reader.mailbox_reader(hm.Mailbox(mailbox.root)) is not index
     assert_fresh_parity(reader, hm.Mailbox(mailbox.root), index, api)
 
@@ -152,7 +139,6 @@ def test_reuse_uses_the_current_mailbox_authority(reader, tmp_path):
     assert refusing is not index
     with pytest.raises(ValueError, match="^current authority refused$"):
         refusing.messages()
-    assert reader.mailbox_reader(mailbox) is index
     assert reader.mailbox_reader(hm.Mailbox(mailbox.root)) is not index
     assert_fresh_parity(reader, mailbox, index, "messages")
 
@@ -179,7 +165,6 @@ def test_reuse_revalidates_a_reloaded_manifest_and_recovers(reader, tmp_path):
         current_index.messages()
     assert str(actual.value) == str(expected.value)
     manifest.write_bytes(original)
-    assert reader.mailbox_reader(mailbox) is index
     assert reader.mailbox_reader(hm.Mailbox(mailbox.root)) is not index
     assert_fresh_parity(reader, hm.Mailbox(mailbox.root), index, "messages")
 
@@ -192,30 +177,40 @@ def test_unsupported_descriptor_probe_still_revalidates(reader, tmp_path, monkey
     index.messages()
     path = Path(mailbox.messages()["seed"]["path"])
     path.write_bytes(path.read_bytes().replace(b"original body", b"portable body"))
-    assert reader.mailbox_reader(mailbox) is index
     assert_fresh_parity(reader, mailbox, index, "messages")
 
 
-def test_factory_creation_is_shared_across_concurrent_callers(reader, tmp_path):
+def test_second_call_uses_current_content_without_cross_call_change_facts(reader, tmp_path):
     mailbox = make_mailbox(tmp_path / "mailbox")
+    publish(mailbox)
+    facade = reader.mailbox_reader(mailbox)
+    assert facade.messages() == mailbox.messages()
+    path = Path(mailbox.messages()["seed"]["path"])
+    path.write_bytes(path.read_bytes().replace(b"original body", b"updated body"))
+    assert_fresh_parity(reader, mailbox, facade, "messages")
+    assert facade.content_changed == []
+
+
+@pytest.mark.parametrize("name", SHADOW_READERS)
+def test_concurrent_factories_read_independently(name, tmp_path):
+    module = importlib.import_module("tools." + name)
+    mailbox = make_mailbox(tmp_path / "mailbox")
+    publish(mailbox)
+    expected = mailbox.messages()
     callers = Barrier(3)
 
     def concurrent(_):
+        reader = module.mailbox_reader(mailbox)
         callers.wait(timeout=5)
-        return reader.mailbox_reader(mailbox)
+        return reader, reader.messages(), reader.get("seed")
 
     with ThreadPoolExecutor(max_workers=3) as pool:
-        indexes = list(pool.map(concurrent, range(12)))
-    assert all(index is indexes[0] for index in indexes)
-
-
-def test_reader_cache_does_not_retain_unbounded_mailboxes(reader, tmp_path):
-    oldest = reader.mailbox_reader(make_mailbox(tmp_path / "oldest"))
-    retired = weakref.ref(oldest)
-    del oldest
-    for number in range(40):
-        reader.mailbox_reader(make_mailbox(tmp_path / ("mailbox-%d" % number)))
-    assert retired() is None
+        outcomes = list(pool.map(concurrent, range(3)))
+    assert len({reader for reader, _, _ in outcomes}) == len(outcomes)
+    indexed = module.MailboxIndex(mailbox, mode="indexed")
+    for _, first, repeated in outcomes:
+        assert first == expected == indexed.messages()
+        assert repeated == expected["seed"] == indexed.get("seed")
 
 
 @pytest.mark.parametrize("api", ["messages", "get", "missing"])
@@ -301,14 +296,3 @@ def test_same_authority_serializes_complete_shadow_reads(reader, tmp_path, first
     assert hm.encoded(results["first"]) == hm.encoded(read(reader.MailboxIndex(authority, mode="shadow"), first_api))
     assert hm.encoded(results["second"]) == hm.encoded(read(reader.MailboxIndex(authority, mode="shadow"), second_api))
     assert_fresh_parity(reader, authority, index, "messages")
-
-
-def test_authority_cache_evicts_before_retaining_a_seventeenth_reader(reader, tmp_path):
-    import hierarchy_mailbox as hm
-
-    mailbox = make_mailbox(tmp_path / "mailbox")
-    authorities = [hm.Mailbox(mailbox.root) for _ in range(17)]
-    retained = [weakref.ref(reader.mailbox_reader(authority)) for authority in authorities]
-    assert retained[0]() is None
-    assert all(reference() is not None for reference in retained[1:])
-    assert reader.mailbox_reader(authorities[-1]) is retained[-1]()
