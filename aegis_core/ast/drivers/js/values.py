@@ -7,12 +7,17 @@ import re
 import unicodedata
 
 UNKNOWN = '<expr>'
+MAX_DEPTH = 256
 _ESCAPE = {'n': '\n', 'r': '\r', 't': '\t', 'b': '\b', 'f': '\f', 'v': '\v', '0': '\0'}
 _UNICODE = re.compile(r'\\u(?:\{([0-9a-fA-F]{1,6})\}|([0-9a-fA-F]{4}))')
 _IDENTIFIER_VALUES = {'true': 'True', 'false': 'False', 'null': 'None', 'undefined': UNKNOWN,
                       'NaN': UNKNOWN, 'Infinity': UNKNOWN, 'True': UNKNOWN, 'False': UNKNOWN, 'None': UNKNOWN}
 _NON_JSON_ESCAPE = re.compile(r'\\(?:[^"\\/bfnrtu]|u(?![0-9a-fA-F]{4}))')
 _JSON_CONTROL = re.compile(r'[\x00-\x1f]')
+
+
+def line_breaks(text):
+    return text.count('\n') + text.count('\r') - text.count('\r\n') + text.count('\u2028') + text.count('\u2029')
 
 
 def identifier_value(value):
