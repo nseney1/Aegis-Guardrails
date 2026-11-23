@@ -15,11 +15,12 @@ from pathlib import Path
 import subprocess
 import sys
 
+from aegis_core.git_path_codec import MAX_PATH_BYTES as GITFILE_MAX_BYTES, path_text
+from aegis_core.gitsafe_policy import GitError
 from aegis_core.primitives import key_within, real_key, real_path, sanitize_display
 from aegis_core.redaction import redact_command_secrets
 
 GIT_TIMEOUT = 60
-GITFILE_MAX_BYTES = 1024 * 1024
 REVIEWED_ROOTS = ("aegis_cli", "aegis_core", "aegis_mcp", "aegis_sdk", "tests", ".github/scripts")
 _ACTIVE_CENSUSES = getattr(sys, "_aegis_reviewed_source_censuses", [])
 _AUTHORITY = getattr(sys, "_aegis_reviewed_source_authority", {"paths": {}, "history": {}})
@@ -282,16 +283,11 @@ def git(cwd: Path, *args: str):
             # Linked worktrees and submodules use one bounded gitdir pointer line.
             with git_dir.open("rb") as marker:
                 data = marker.read(GITFILE_MAX_BYTES + 1)
-            if len(data) > GITFILE_MAX_BYTES:
-                raise ValueError("oversized Git marker")
-            line = data.removesuffix(b"\n").removesuffix(b"\r")
-            if (not line.startswith(b"gitdir: ") or not line[8:]
-                    or any(char in line for char in (b"\n", b"\r", b"\0"))):
-                raise ValueError("invalid Git marker")
-            git_dir = (cwd / os.fsdecode(line[8:])).resolve(strict=True)
+            pointer = path_text(data, gitfile=True)
+            git_dir = (cwd / pointer).resolve(strict=True)
             if not git_dir.is_dir():
                 raise ValueError("invalid Git directory")
-    except (OSError, ValueError, RuntimeError):
+    except (GitError, OSError, ValueError, RuntimeError):
         raise subprocess.CalledProcessError(128, command, output=b"", stderr=b"invalid Git marker\n") from None
     _check_git_census_targets(cwd, args, _census_callers())
     command[1] = f"--git-dir={git_dir}"

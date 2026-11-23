@@ -423,10 +423,14 @@ def _read_record(directory, name, limit):
 
 
 def _record_path(data, parent, prefix=b""):
-    data = data.removesuffix(b"\n").removesuffix(b"\r")
-    if not data.startswith(prefix) or not data[len(prefix):].strip() or any(c in data for c in (b"\0", b"\n", b"\r")):
+    from aegis_core.git_path_codec import path_text
+    if prefix not in (b"", b"gitdir:"):
         raise ValueError()
-    return os.path.normpath(os.path.join(parent, os.fsdecode(data[len(prefix):].strip())))
+    try:
+        value = path_text(data, gitfile=bool(prefix), record=True)
+    except AegisError:
+        raise ValueError() from None
+    return os.path.normpath(os.path.join(parent, value))
 
 
 def _root_facts(root, cwd, stack, expected):
