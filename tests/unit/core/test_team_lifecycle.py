@@ -633,9 +633,17 @@ def bootstrap(journal, core):
                 "profile_sha256": core.digest(actor["profile"]), "channel_instance_sha256": core.digest(channel),
                 "approved_plan_sha256": runtime.approved_plan_ref["sha256"], "reservation_sequence": sequence,
                 "expires_monotonic_ns": 1000000000}
-    class Guard:
+    class GenesisGuard:
+        def __init__(self, reservations):
+            self.rows = [copy.deepcopy(reservation.witness) for reservation in reservations]
+
         def require_reserved_genesis_current(self):
             pass
+
+        def reserved_genesis_rows(self):
+            return copy.deepcopy(self.rows)
+
+    class Guard:
         def require_initial_identity_current(self, *args):
             pass
         def require_initial_creation_current(self, *args):
@@ -645,8 +653,8 @@ def bootstrap(journal, core):
     class Authority:
         owned_runtime = runtime
         @contextmanager
-        def bootstrap_fence(self, *args):
-            yield Guard()
+        def bootstrap_fence(self, owned_runtime, approved_plan_ref, reservations):
+            yield GenesisGuard(reservations)
     port = SimpleNamespace(HostAuthority=Authority, ReservedEnrollment=Reservation,
                            InitialCreationGuard=Guard, HostAuthorityError=HostError)
     reservations = tuple(Reservation(cid, i) for i, cid in enumerate(sorted(p["actors"]), 1))
