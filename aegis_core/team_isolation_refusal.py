@@ -1,6 +1,14 @@
-"""Stable, input-free isolation refusals for planning and capability checks."""
+"""Stable, input-free isolation refusals for planning and capability checks.
 
-__all__ = ["CAPABILITY_CODES", "REFUSALS", "IsolationRefusal", "finish", "refusal"]
+Plan responses share one projection. Capability responses stay on refusal() and
+finish() and do not carry a human reason or an input stage.
+"""
+
+__all__ = [
+    "CAPABILITY_CODES", "DOCUMENT_CODES", "LAUNCHER_ENVIRONMENT_REASON", "PLAN_STAGES",
+    "REFUSALS", "STAGED_PLAN_KEYS", "UNSTAGED_PLAN_KEYS", "IsolationRefusal",
+    "finish", "plan_response", "plan_text", "refusal", "with_document_stage",
+]
 
 _CAPABILITY_REFUSALS = {
     "unknown_field": "isolation document contains an unknown field",
@@ -72,21 +80,81 @@ REFUSALS = {
 }
 
 
+# Closed document inputs. TA-6d agrees this additive plan field and these values.
+DOCUMENT_CODES = frozenset(("document_invalid", "document_read", "document_size"))
+PLAN_STAGES = frozenset(("config", "container-inspection", "image-inspection"))
+UNSTAGED_PLAN_KEYS = frozenset(("status", "code", "reason", "next_action"))
+STAGED_PLAN_KEYS = frozenset(("status", "code", "reason", "next_action", "stage"))
+_LAUNCHER_ENVIRONMENT_NOTE = "launcher_environment"
+LAUNCHER_ENVIRONMENT_REASON = "Retry from a clean launcher environment."
+
+
+def _valid_stage(code, stage):
+    return type(stage) is str and stage in PLAN_STAGES and code in DOCUMENT_CODES
+
+
 class IsolationRefusal(ValueError):
     """Stable code string, fixed human message and structured next action."""
 
     status = "refused"
     exit_code = 1
 
-    def __init__(self, code):
+    def __init__(self, code, *, stage=None, note=None):
         if type(code) is not str or code not in REFUSALS:
             code = "internal"
-        self.message = REFUSALS[code]
+            stage = None
+            note = None
+        if code != "image_inspect" or type(note) is not str or note != _LAUNCHER_ENVIRONMENT_NOTE:
+            note = None
+        self.note = note
+        self.message = LAUNCHER_ENVIRONMENT_REASON if note is not None else REFUSALS[code]
         self.code = self.reason = code
+        self.stage = stage if _valid_stage(code, stage) else None
         if code == "invalid_arguments":
             self.exit_code = 2
         self.next_action = {"actor": "operator", "command": self.message}
         super().__init__(code)
+
+
+def with_document_stage(error, stage):
+    """Attribute a document refusal to the input handled by this boundary."""
+    if isinstance(error, IsolationRefusal):
+        code = getattr(error, "code", None)
+        if type(code) is str and _valid_stage(code, stage):
+            return IsolationRefusal(code, stage=stage)
+    return error
+
+
+def plan_response(error):
+    """One projection for core, CLI and parser errors. Stage is present only for a document input."""
+    if isinstance(error, IsolationRefusal):
+        refusal = IsolationRefusal(getattr(error, "code", None),
+                                   stage=getattr(error, "stage", None), note=getattr(error, "note", None))
+    else:
+        refusal = IsolationRefusal("internal")
+    body = {"status": refusal.status, "code": refusal.code, "reason": refusal.message,
+            "next_action": refusal.next_action}
+    if refusal.stage is not None:
+        body["stage"] = refusal.stage
+    return body
+
+
+def plan_text(body):
+    """Render single-line operator text from the closed refusal catalog."""
+    internal = "internal — " + REFUSALS["internal"]
+    if type(body) is not dict:
+        return internal
+    code, reason = body.get("code"), body.get("reason")
+    if type(code) is not str or code not in REFUSALS or type(reason) is not str:
+        return internal
+    if reason != REFUSALS[code] and (code != "image_inspect" or reason != LAUNCHER_ENVIRONMENT_REASON):
+        return internal
+    if "stage" not in body:
+        return code + " — " + reason
+    stage = body["stage"]
+    if not _valid_stage(code, stage):
+        return internal
+    return code + " — " + reason + " (" + stage + ")"
 
 
 _VERDICT_CODES = {

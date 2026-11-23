@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import uuid
 
 from aegis_core import gitsafe, gitsafe_run, storage_confined
+from aegis_core.git_path_codec import path_text
 from aegis_core.primitives import sanitize_display
 from aegis_core.redaction import redact_insight_text
 from aegis_core.team_review_files import strict_json as _strict_json
@@ -311,17 +312,6 @@ def _invoke(ports, planned, arguments):
 def _git(repository, arguments, ports, planned, limit):
     argv, env, spawn = _invoke(ports, planned, arguments)
     return _command(repository, argv, env, spawn, GIT_TIMEOUT_SECONDS, limit)
-def _one_line(raw, reason):
-    raw = raw.removesuffix(b"\n").removesuffix(b"\r")
-    if len(raw) > MAX_PATH_BYTES or any(byte in raw for byte in b"\n\r\0"):
-        raise ReviewRefusal(reason)
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeError:
-        raise ReviewRefusal("encoding") from None
-    if _broken(text):
-        raise ReviewRefusal(reason)
-    return text
 def _object_id(raw, reason, side):
     raw = raw.removesuffix(b"\n")
     if len(raw) != 40 or any(byte not in b"0123456789abcdef" for byte in raw):
@@ -340,7 +330,11 @@ def _exact_side(repository, side, commit, expected, ports, planned):
     return {"commit": commit, "tree": tree}
 def _repository_top(repository, ports, planned):
     code, raw = _git(repository, ("rev-parse", "--show-toplevel"), ports, planned, MAX_PATH_BYTES)
-    top = Path(_one_line(raw.strip(), "unsafe_path")) if code == 0 and raw.strip() else None
+    try:
+        # Command framing removes one LF. Path validation rejects remaining line breaks.
+        top = _absolute_path(path_text(raw)) if code == 0 else None
+    except gitsafe.GitError as error:
+        raise ReviewRefusal("encoding" if error.code == "git_path_encoding" else "unsafe_path") from None
     code, _raw = _git(repository, ("rev-parse", "--git-dir"), ports, planned, MAX_PATH_BYTES)
     if code != 0:
         raise ReviewRefusal("not_repository")

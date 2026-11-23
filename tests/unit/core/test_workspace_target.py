@@ -1059,19 +1059,20 @@ def test_all_git_calls_have_bounded_capture_and_a_shared_budget(target_repo, mon
 
     real_run, budgets = gitsafe.run, []
 
+    from aegis_core.pathlookup_gitcache import bound_ordinary_root
+
+    armed = os.path.normcase(os.fspath(target_repo.root))
+
     def run(args, root, **kwargs):
         assert gitsafe.custody_active()
-        assert pathlookup.ordinary_root.get() == str(target_repo.root)
+        assert pathlookup.ordinary_root.get() == armed
         budgets.append(kwargs["timeout"])
         return real_run(args, root, **kwargs)
 
     monkeypatch.setattr(gitsafe, "run", run)
-    token = pathlookup.ordinary_root.set(str(target_repo.root))
-    try:
+    with bound_ordinary_root(target_repo.root):
         doc = observe_target(WorkspaceBinding("bound", target_repo.root, "cli_workspace", "operator"))
-        assert pathlookup.ordinary_root.get() == str(target_repo.root)
-    finally:
-        pathlookup.ordinary_root.reset(token)
+        assert pathlookup.ordinary_root.get() == armed
     assert doc["status"] == "observed"
     assert len(budgets) == 5 and all(0 < later < earlier for earlier, later in zip(budgets, budgets[1:]))
 
