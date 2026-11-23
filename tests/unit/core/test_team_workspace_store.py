@@ -2344,3 +2344,292 @@ def test_two_threads_on_one_store_own_their_cleanup_warning(tmp_path, monkeypatc
         assert "hunter2" not in repr(result)
         assert store.load().seq == 4
     assert not (root / ".write.lock").exists()
+
+
+def _declared_initiative():
+    """Caller-owned nested lists. Admission must not keep these objects."""
+    return {"id": "alpha", "project": "project", "repository": "repo", "priority": 1,
+            "target_branch": "main", "touched_paths": ["src/alpha.py"], "blocked_by": ["later"],
+            "checkouts": [Path.cwd().as_posix()], "lanes": ["lane-alpha"]}
+
+
+def _spoil_lists(data, marker):
+    data["lanes"].append(marker)
+    data["touched_paths"].append(marker)
+    data["checkouts"].append(marker)
+    data["blocked_by"].append(marker)
+
+
+def test_direct_apply_owns_register_update_and_release_data():
+    """Register, update and release copy nested caller data before retaining it.
+
+    A typed refusal leaves the live row and the caller's objects untouched. After
+    admission, mutating the caller's containers leaves the same row objects holding
+    the admitted lanes, paths and evidence.
+    """
+    ledger = workspace.Ledger()
+    ledger.apply(event(1, "init", dict(LIMITS)))
+    indexes = _mapping_ids(ledger)
+    declared = _declared_initiative()
+    lanes = declared["lanes"]
+    paths = declared["touched_paths"]
+    bad = _declared_initiative()
+    bad["lanes"] = "not-a-list"
+    with pytest.raises(WorkspaceRefusal) as error:
+        ledger.apply(event(2, "register", bad))
+    assert_refusal(error, "invalid_record")
+    assert "not-a-list" not in str(error.value)
+    assert bad["lanes"] == "not-a-list"
+    assert ledger.seq == 1 and ledger.initiatives == {}
+    _same_mappings(ledger, indexes)
+    cyclic = {"id": "alpha"}
+    cyclic["lanes"] = [cyclic]
+    with pytest.raises(WorkspaceRefusal) as error:
+        workspace.apply_register(ledger, cyclic, event(2, "register", cyclic))
+    assert_refusal(error, "invalid_record")
+    assert ledger.seq == 1 and ledger.initiatives == {}
+    assert cyclic["lanes"][0] is cyclic
+
+    registered = event(2, "register", declared)
+    ledger.apply(registered)
+    row = ledger.initiative("alpha")
+    assert ledger.initiative("alpha") is row
+    assert row["lanes"] == ["lane-alpha"] and row["lanes"] is not lanes
+    assert row["touched_paths"] is not paths
+    assert row["checkouts"] is not declared["checkouts"]
+    assert row["blocked_by"] is not declared["blocked_by"]
+    assert declared["lanes"] is lanes
+
+    def spoil_register():
+        _spoil_lists(declared, "from-caller")
+        _spoil_lists(registered["data"], "from-event")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(spoil_register).result(timeout=5)
+    assert ledger.initiative("alpha") is row
+    assert row["lanes"] == ["lane-alpha"]
+    assert row["touched_paths"] == ["src/alpha.py"]
+    assert row["checkouts"] == [Path.cwd().as_posix()]
+    assert row["blocked_by"] == ["later"]
+    _same_mappings(ledger, indexes)
+
+    bad_update = {"initiative": "alpha", "source": "owner", "state": "nope",
+                  "lanes": ["lane-alpha", "lane-beta"]}
+    with pytest.raises(WorkspaceRefusal) as error:
+        ledger.apply(event(3, "update", bad_update))
+    assert_refusal(error, "invalid_record")
+    assert "nope" not in str(error.value)
+    assert ledger.seq == 2 and ledger.initiative("alpha") is row
+    assert row["state"] == "active" and row["lanes"] == ["lane-alpha"]
+    update = {"initiative": "alpha", "source": "owner", "priority": 2,
+              "lanes": ["lane-alpha", "lane-beta"],
+              "touched_paths": ["src/alpha.py", "src/beta.py"],
+              "checkouts": [Path.cwd().as_posix()], "blocked_by": []}
+    update_lanes = update["lanes"]
+    updated = event(3, "update", update)
+    ledger.apply(updated)
+    assert ledger.initiative("alpha") is row
+    assert row["priority"] == 2
+    assert row["lanes"] == ["lane-alpha", "lane-beta"] and row["lanes"] is not update_lanes
+    assert row["touched_paths"] == ["src/alpha.py", "src/beta.py"]
+    assert row["touched_paths"] is not update["touched_paths"]
+    assert row["blocked_by"] is not update["blocked_by"]
+    update["lanes"].append("from-caller")
+    updated["data"]["touched_paths"].append("from-event")
+    assert row["lanes"] == ["lane-alpha", "lane-beta"]
+    assert row["touched_paths"] == ["src/alpha.py", "src/beta.py"]
+
+    request_data = {"initiative": "alpha", "request_id": "req-00000004", "kind": "writer", "holder": "one"}
+    ledger.apply(event(4, "request", request_data))
+    request = ledger.request("req-00000004")
+    assert request["reserved_paths"] == ["src/alpha.py", "src/beta.py"]
+    assert request["reserved_paths"] is not row["touched_paths"]
+    row["touched_paths"].append("live-only")
+    assert request["reserved_paths"] == ["src/alpha.py", "src/beta.py"]
+    ledger.apply(event(5, "grant", {"request_id": request["request_id"]}))
+    assert ledger.request("req-00000004") is request and request["state"] == "granted"
+
+    evidence = _evidence()
+    original_evidence = dict(evidence)
+    bad_release = {"request_id": request["request_id"], "evidence": {**evidence, "sha256": "zz"}}
+    with pytest.raises(WorkspaceRefusal) as error:
+        ledger.apply(event(6, "release", bad_release))
+    assert_refusal(error, "invalid_record")
+    assert "zz" not in str(error.value)
+    assert ledger.seq == 5 and ledger.request("req-00000004") is request
+    assert request["state"] == "granted" and "evidence" not in request
+    release = {"request_id": request["request_id"], "evidence": evidence}
+    released = event(6, "release", release)
+    ledger.apply(released)
+    assert ledger.request("req-00000004") is request
+    assert request["state"] == "released"
+    assert request["evidence"] == original_evidence
+    assert request["evidence"] is not evidence
+    assert request["evidence"] is not released["data"]["evidence"]
+    evidence["path"] = evidence["path"] + "/caller"
+    evidence["note"] = "from-caller"
+    released["data"]["evidence"]["sha256"] = "f" * 64
+    assert request["evidence"] == original_evidence
+    assert set(request["evidence"]) == {"path", "sha256"}
+    _same_mappings(ledger, indexes)
+
+
+def _contended_append(store, other, ledger, root, kind, data):
+    """A second writer is refused; the retry then publishes one owned event."""
+    history = _event_bytes(root)
+    seq = ledger.seq
+    with ThreadPoolExecutor(max_workers=1) as pool, other.lock():
+        attempt = pool.submit(store.append, ledger, kind, data)
+        with pytest.raises(WorkspaceRefusal) as error:
+            attempt.result(timeout=5)
+    assert_refusal(error, "busy")
+    assert "secret" not in str(error.value)
+    assert ledger.seq == seq
+    assert _event_bytes(root) == history
+    appended = store.append(ledger, kind, data)
+    assert appended["seq"] == seq + 1
+    assert appended["kind"] == kind
+    assert appended["data"] is not data
+    return appended
+
+
+def test_append_owns_register_update_and_release_data(tmp_path):
+    """Durable register, update and release keep admitted bytes after caller mutation.
+
+    Contention refuses before publication. The retry writes one event. Mutating the
+    original input and the returned event on another thread leaves a fresh replay,
+    the live rows and the published lanes and evidence in agreement.
+    """
+    root = make_store(tmp_path)
+    declared = _declared_initiative()
+    with workspace.WorkspaceStore(root) as store, workspace.WorkspaceStore(root) as other:
+        ledger = store.load()
+        indexes = _mapping_ids(ledger)
+        bad = _declared_initiative()
+        bad["lanes"] = "not-a-list"
+        history = _event_bytes(root)
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.append(ledger, "register", bad)
+        assert_refusal(error, "invalid_record")
+        assert "not-a-list" not in str(error.value)
+        assert ledger.seq == 1 and ledger.initiatives == {}
+        assert bad["lanes"] == "not-a-list"
+        assert _event_bytes(root) == history
+        cyclic = _declared_initiative()
+        cyclic["blocked_by"].append(cyclic)
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.append(ledger, "register", cyclic)
+        assert_refusal(error, "invalid_record")
+        assert ledger.seq == 1 and _event_bytes(root) == history
+
+        appended = _contended_append(store, other, ledger, root, "register", declared)
+        row = ledger.initiative("alpha")
+        saved = (root / "events" / "00000002.json").read_bytes()
+        assert saved == workspace.encoded(appended) + b"\n"
+        assert row["lanes"] is not declared["lanes"]
+        assert row["lanes"] is not appended["data"]["lanes"]
+        assert row["touched_paths"] is not appended["data"]["touched_paths"]
+        assert appended["data"]["lanes"] is not declared["lanes"]
+
+        def spoil_register():
+            _spoil_lists(declared, "from-caller")
+            _spoil_lists(appended["data"], "from-result")
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(spoil_register).result(timeout=5)
+        assert (root / "events" / "00000002.json").read_bytes() == saved
+        assert b"from-caller" not in saved and b"from-result" not in saved
+        assert row is ledger.initiative("alpha")
+        assert row["lanes"] == ["lane-alpha"]
+        assert row["touched_paths"] == ["src/alpha.py"]
+        published = json.loads(saved.decode())
+        assert row["lanes"] == published["data"]["lanes"]
+        assert row["checkouts"] == published["data"]["checkouts"]
+        fresh = other.load()
+        assert fresh.seq == ledger.seq == appended["seq"] == 2
+        assert ledger_state(fresh) == ledger_state(ledger)
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.append(ledger, "register", _declared_initiative())
+        assert_refusal(error, "invalid_record")
+        assert ledger.initiative("alpha") is row and ledger.seq == 2
+        _same_mappings(ledger, indexes)
+
+        bad_update = {"initiative": "alpha", "source": "owner", "state": "nope",
+                      "lanes": ["lane-alpha", "lane-beta"]}
+        history = _event_bytes(root)
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.append(ledger, "update", bad_update)
+        assert_refusal(error, "invalid_record")
+        assert "nope" not in str(error.value)
+        assert ledger.seq == 2 and ledger.initiative("alpha") is row
+        assert row["lanes"] == ["lane-alpha"] and _event_bytes(root) == history
+        update = {"initiative": "alpha", "source": "owner", "priority": 2,
+                  "lanes": ["lane-alpha", "lane-beta"],
+                  "touched_paths": ["src/alpha.py", "src/beta.py"],
+                  "checkouts": [Path.cwd().as_posix()], "blocked_by": []}
+        appended = _contended_append(store, other, ledger, root, "update", update)
+        saved = (root / "events" / "00000003.json").read_bytes()
+        assert saved == workspace.encoded(appended) + b"\n"
+        assert row is ledger.initiative("alpha")
+        assert row["lanes"] is not update["lanes"]
+        assert row["lanes"] is not appended["data"]["lanes"]
+        assert row["touched_paths"] is not appended["data"]["touched_paths"]
+        update["lanes"].append("from-caller")
+        appended["data"]["touched_paths"].append("from-result")
+        appended["data"]["lanes"].append("from-result")
+        assert (root / "events" / "00000003.json").read_bytes() == saved
+        assert row["priority"] == 2
+        assert row["lanes"] == ["lane-alpha", "lane-beta"]
+        assert row["touched_paths"] == ["src/alpha.py", "src/beta.py"]
+        assert json.loads(saved.decode())["data"]["lanes"] == row["lanes"]
+        fresh = other.load()
+        assert fresh.seq == ledger.seq == 3
+        assert ledger_state(fresh) == ledger_state(ledger)
+        assert fresh.initiative("alpha")["lanes"] == row["lanes"]
+
+        request_data = {"initiative": "alpha", "request_id": "req-00000004", "kind": "writer", "holder": "one"}
+        store.append(ledger, "request", request_data)
+        request = ledger.request("req-00000004")
+        assert request["reserved_paths"] == ["src/alpha.py", "src/beta.py"]
+        assert request["reserved_paths"] is not row["touched_paths"]
+        store.append(ledger, "grant", {"request_id": request["request_id"]})
+        assert ledger.request("req-00000004") is request and request["state"] == "granted"
+        evidence = _evidence()
+        original_evidence = dict(evidence)
+        bad_release = {"request_id": request["request_id"], "evidence": {**evidence, "sha256": "zz"}}
+        history = _event_bytes(root)
+        with pytest.raises(WorkspaceRefusal) as error:
+            store.append(ledger, "release", bad_release)
+        assert_refusal(error, "invalid_record")
+        assert "zz" not in str(error.value)
+        assert ledger.request("req-00000004") is request
+        assert request["state"] == "granted" and "evidence" not in request
+        assert _event_bytes(root) == history
+        release = {"request_id": request["request_id"], "evidence": evidence}
+        appended = _contended_append(store, other, ledger, root, "release", release)
+        saved = (root / "events" / ("%08d.json" % appended["seq"])).read_bytes()
+        assert saved == workspace.encoded(appended) + b"\n"
+        assert ledger.request("req-00000004") is request
+        assert request["evidence"] == original_evidence
+        assert request["evidence"] is not evidence
+        assert request["evidence"] is not appended["data"]["evidence"]
+        assert appended["data"]["evidence"] is not evidence
+
+        def spoil_release():
+            evidence["path"] = evidence["path"] + "/caller"
+            evidence["note"] = "from-caller"
+            appended["data"]["evidence"]["sha256"] = "f" * 64
+            appended["data"]["evidence"]["note"] = "from-result"
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(spoil_release).result(timeout=5)
+        assert (root / "events" / ("%08d.json" % appended["seq"])).read_bytes() == saved
+        assert b"from-caller" not in saved and b"from-result" not in saved
+        assert request["evidence"] == original_evidence
+        assert json.loads(saved.decode())["data"]["evidence"] == request["evidence"]
+        fresh = other.load()
+        assert fresh.seq == ledger.seq == appended["seq"]
+        assert ledger_state(fresh) == ledger_state(ledger)
+        assert fresh.request("req-00000004")["evidence"] == original_evidence
+        assert fresh.initiative("alpha")["lanes"] == ["lane-alpha", "lane-beta"]
+        _same_mappings(ledger, indexes)
