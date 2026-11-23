@@ -74,6 +74,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_custody_checks": 1,
     "aegis_core.team_git": 0,
     "aegis_core.atomicio": 0,
+    "aegis_core.git_path_codec": 0,
     # Read-only repository facts keyed by full object ids; imports gitsafe and errors only.
     "aegis_core.gitevidence": 0,
     # The one PATH lookup of a program Aegis runs or registers (stdlib only).

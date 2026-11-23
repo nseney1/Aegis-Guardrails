@@ -19,18 +19,21 @@ def _git_dirs_at(curr: Path) -> tuple[Path, Path] | None:
         return dot_git, dot_git
     if dot_git.is_file():
         try:
-            content = dot_git.read_text(encoding="utf-8", errors="replace").strip()
-            if content.startswith("gitdir:"):
-                gitdir_path = Path(content[7:].strip())
-                if not gitdir_path.is_absolute():
-                    gitdir_path = (curr / gitdir_path).resolve()
-                commondir_file = gitdir_path / "commondir"
-                if commondir_file.is_file():
-                    common_rel = commondir_file.read_text(encoding="utf-8").strip()
-                    return gitdir_path, (gitdir_path / common_rel).resolve()
-                if gitdir_path.parent.name == "worktrees" and gitdir_path.parent.parent.is_dir():
-                    return gitdir_path, gitdir_path.parent.parent
-                return gitdir_path, gitdir_path
+            raw = dot_git.read_bytes()
+            if not raw.startswith(b"gitdir: "):
+                return None
+            from aegis_core.git_path_codec import path_text
+
+            gitdir_path = Path(path_text(raw, gitfile=True))
+            if not gitdir_path.is_absolute():
+                gitdir_path = (curr / gitdir_path).resolve()
+            commondir_file = gitdir_path / "commondir"
+            if commondir_file.is_file():
+                common_rel = path_text(commondir_file.read_bytes(), record=True)
+                return gitdir_path, (gitdir_path / common_rel).resolve()
+            if gitdir_path.parent.name == "worktrees" and gitdir_path.parent.parent.is_dir():
+                return gitdir_path, gitdir_path.parent.parent
+            return gitdir_path, gitdir_path
         except (OSError, UnicodeError, ValueError):
             pass
     return None
