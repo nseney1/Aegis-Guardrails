@@ -221,6 +221,7 @@ class MsgCommand(AegisCommand):
 
     def execute(self, args: argparse.Namespace) -> int:
         from aegis_core import message_codec as codec
+        from aegis_core.message_codec_store import store_supported
         from aegis_core.workspace.layout import is_aegis_workspace
 
         try:
@@ -237,7 +238,8 @@ class MsgCommand(AegisCommand):
                 prepared = codec.preflight_read(True, selectors=args.fields, spans=args.spans, outline=args.outline,
                                                 since=args.since, expand=args.expand, format=args.format,
                                                 max_chars=args.max_chars)
-            if not _anchored_operations_supported():
+            default_write = args.msg_action == "write" and args.store is None
+            if not _anchored_operations_supported() or (default_write and not store_supported()):
                 return emit_error(codec.CodecError("E_AUTH"), detail="platform")
             # Validate caller content before creating even the default store.
             if args.msg_action == "write":
