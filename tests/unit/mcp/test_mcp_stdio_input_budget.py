@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from aegis_core.config import ENV_MANAGER_CONFIG, ENV_MANAGER_CONFIG_SHA256
-from aegis_core import message_codec as codec, storage
+from aegis_core import message_codec as codec, message_codec_store
 from aegis_mcp import manager, server
 from tests.unit.core.test_message_codec import make_store
 
@@ -265,9 +265,9 @@ def test_valid_escaped_msg_write_at_content_limit_is_stored(message_workspace, m
 
 
 def test_escaped_msg_write_refuses_unsupported_store_with_fixed_code(message_workspace, monkeypatch, capsys):
-    # Patch this module's OS reference, not the shared os capability sets used by
-    # pytest teardown. This refusal test also runs on unsupported platforms.
-    monkeypatch.setattr(storage, "os", SimpleNamespace(**{**vars(os), "supports_dir_fd": set()}))
+    # Patch the capability probe's OS reference, not the shared os capability sets
+    # used by pytest teardown. This refusal test also runs on unsupported platforms.
+    monkeypatch.setattr(message_codec_store, "os", SimpleNamespace(**{**vars(os), "supports_dir_fd": set()}))
     content, _ = escaped_content("\x00", codec.MAX_BYTES - 1024)
     content += " " * (codec.MAX_BYTES - len(content.encode("utf-8")))
 
