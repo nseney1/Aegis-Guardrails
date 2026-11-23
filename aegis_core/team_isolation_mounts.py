@@ -15,7 +15,7 @@ import stat
 
 from aegis_core import team_host_registry
 from aegis_core.primitives import json_preflight, strict_loads
-from aegis_core.team_isolation_refusal import REFUSALS, IsolationRefusal
+from aegis_core.team_isolation_refusal import REFUSALS, IsolationRefusal, with_document_stage
 
 __all__ = [
     "IsolationRefusal", "REFUSALS", "MAX_DOCUMENT_BYTES", "LINUX_ID_LIMIT", "NETWORK_MODE", "DEFAULT_PATH",
@@ -132,8 +132,18 @@ def pids_limit(value):
     return value
 
 
-def read_isolation(raw, *, cpu_count, platform):
-    bounded_value(raw)
+def _isolation_document(raw, *, encoded):
+    """Bound one isolation config and attribute refusals at its document boundary."""
+    try:
+        if encoded:
+            return load_document(raw)
+        bounded_value(raw)
+    except IsolationRefusal as error:
+        raise with_document_stage(error, "config") from None
+    return raw
+
+
+def _validate_isolation(raw, *, cpu_count, platform):
     if raw is None:
         return None
     require(type(raw) is dict, "isolation_object")
@@ -154,8 +164,14 @@ def read_isolation(raw, *, cpu_count, platform):
                 pids=pids_limit(raw.get("pids")), allow_unqualified=unqualified)
 
 
+def read_isolation(raw, *, cpu_count, platform):
+    value = _isolation_document(raw, encoded=False)
+    return _validate_isolation(value, cpu_count=cpu_count, platform=platform)
+
+
 def load_isolation(raw, *, cpu_count, platform):
-    return read_isolation(load_document(raw), cpu_count=cpu_count, platform=platform)
+    value = _isolation_document(raw, encoded=True)
+    return _validate_isolation(value, cpu_count=cpu_count, platform=platform)
 
 
 def absolute_path(value, label=None):
