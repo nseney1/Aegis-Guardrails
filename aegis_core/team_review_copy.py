@@ -11,11 +11,13 @@ from functools import wraps
 from pathlib import Path
 import stat
 import time
+from types import SimpleNamespace
 import uuid
 
 from aegis_core import gitsafe, gitsafe_run, storage_confined
 from aegis_core.primitives import sanitize_display
 from aegis_core.redaction import redact_insight_text
+from aegis_core.team_review_files import strict_json as _strict_json
 __all__ = [
     "MAX_DIFF_BYTES", "MAX_ENTRIES", "MAX_HEADER_BYTES", "MAX_LISTING_BYTES", "MAX_LOG_BYTES",
     "MAX_MANIFEST_BYTES", "MAX_OBJECT_BYTES", "MAX_PATH_BYTES", "MAX_PROBLEMS", "MAX_SIDE_BYTES",
@@ -537,14 +539,14 @@ def _init_empty(pending_fd, ports, planned):
     code, _raw = _command(pending_fd, argv, env, spawn, SCAFFOLD_TIMEOUT_SECONDS, 4096)
     if code != 0:
         raise ReviewRefusal("scaffold_failed")
-def _hash_walk(dir_fd, prefix, digest, depth, problems):
+def _hash_walk(dir_fd, prefix, digest, depth, on_writable=None):
     if depth > MAX_WALK_DEPTH:
         raise ReviewRefusal("limit_exceeded")
     stats = [(name, os.stat(name, dir_fd=dir_fd, follow_symlinks=False)) for name in sorted(_names(dir_fd))]
     for name, info in stats:
         rel = name if not prefix else prefix + os.sep + name
-        if problems is not None and not stat.S_ISLNK(info.st_mode) and info.st_mode & 0o222:
-            problems.append(_single_line(".git/%s is writable" % rel))
+        if on_writable is not None and not stat.S_ISLNK(info.st_mode) and info.st_mode & 0o222:
+            on_writable(".git/%s is writable" % rel)
         digest.update(os.fsencode(rel) + b"\0" + str(stat.S_IFMT(info.st_mode)).encode("ascii") + b"\0")
         if stat.S_ISREG(info.st_mode):
             digest.update(_digest_at(dir_fd, name).encode("ascii"))
@@ -554,11 +556,11 @@ def _hash_walk(dir_fd, prefix, digest, depth, problems):
         if stat.S_ISDIR(info.st_mode):
             rel = name if not prefix else prefix + os.sep + name
             with _held(_open_directory(name, dir_fd)) as child:
-                _hash_walk(child, rel, digest, depth + 1, problems)
-def _scaffold_sha(pending_fd, problems=None):
+                _hash_walk(child, rel, digest, depth + 1, on_writable)
+def _scaffold_sha(pending_fd, on_writable=None):
     with _held(_open_directory(".git", pending_fd)) as fd:
         digest = hashlib.sha256()
-        _hash_walk(fd, "", digest, 0, problems)
+        _hash_walk(fd, "", digest, 0, on_writable)
         return digest.hexdigest()
 def _encoded(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("utf-8")
@@ -775,17 +777,6 @@ def _prepare_impl(repository, base, candidate, out, expect_base_tree, expect_can
             raw, diff, count = _publish(fd, repo, parent, dest, sides, entries, ports, planned, preparation, preparation_id)
     return 0, {"out": str(dest), "manifest_sha256": hashlib.sha256(raw).hexdigest(), "base": sides["base"],
                "candidate": sides["candidate"], "diff_sha256": diff, "changed_files": count}
-def _strict_json(raw):
-    def pairs(items):
-        result = {}
-        for key, value in items:
-            if key in result:
-                raise ValueError("duplicate")
-            result[key] = value
-        return result
-    def nonfinite(_value):
-        raise ValueError("nonfinite")
-    return json.loads(raw, object_pairs_hook=pairs, parse_constant=nonfinite)
 def _read_manifest(dir_fd, *, validate=True):
     try:
         fd = _open_readonly("manifest.json", dir_fd)
@@ -807,143 +798,35 @@ def _read_manifest(dir_fd, *, validate=True):
     if type(manifest) is not dict or manifest.get("schema") != SCHEMA:
         raise ReviewRefusal("not_review_copy")
     return manifest, raw
-def _file_problem(dir_fd, name, expected):
-    info = _stat_leaf(dir_fd, name)
-    if info is not None and stat.S_ISLNK(info.st_mode):
-        return [_single_line(name + " became a symlink")]
-    if info is None or not stat.S_ISREG(info.st_mode):
-        return [_single_line(name + " is missing")]
-    if _digest_at(dir_fd, name) != expected:
-        return [_single_line(name + " changed")]
-    return []
-def _listing_rows(dir_fd, side, expected, problems):
-    name = side + ".files.jsonl"
-    info = _stat_leaf(dir_fd, name)
-    if info is None or not stat.S_ISREG(info.st_mode):
-        suffix = " became a symlink" if info and stat.S_ISLNK(info.st_mode) else " is missing"
-        problems.append(_single_line(name + suffix))
-        return []
-    try:
-        fd = _open_readonly(name, dir_fd)
-    except OSError as error:
-        if error.errno in (errno.ELOOP, errno.ENOTDIR):
-            problems.append(_single_line(name + " became a symlink"))
-            return []
-        raise
-    with _held(fd):
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            problems.append(_single_line(name + " is missing"))
-            return []
-        if info.st_size > MAX_LISTING_BYTES:
-            raise ReviewRefusal("limit_exceeded")
-        raw = b"".join(_fd_chunks(fd, info.st_size))
-    if hashlib.sha256(raw).hexdigest() != expected:
-        problems.append(_single_line(name + " changed"))
-    try:
-        limit = 6 * MAX_PATH_BYTES + MAX_HEADER_BYTES
-        if sum(1 for line in _records(raw, b"\n", limit) if line) > MAX_ENTRIES:
-            raise ReviewRefusal("limit_exceeded")
-        return [_strict_json(line.decode("ascii")) for line in _records(raw, b"\n", limit) if line]
-    except (UnicodeError, ValueError):
-        raise ReviewRefusal("manifest_shape") from None
-def _walk_files(dir_fd, side, prefix, expected, problems, seen, depth):
-    if depth > MAX_WALK_DEPTH:
-        raise ReviewRefusal("limit_exceeded")
-    entries = [(name, os.stat(name, dir_fd=dir_fd, follow_symlinks=False)) for name in _names(dir_fd)]
-    for name, info in entries:
-        relative = name if not prefix else prefix + "/" + name
-        shown = side + "/" + relative
-        if stat.S_ISLNK(info.st_mode):
-            problems.append(_single_line(shown + " became a symlink"))
-        elif info.st_mode & 0o222:
-            problems.append(_single_line(shown + " is writable"))
-        if stat.S_ISDIR(info.st_mode):
-            continue
-        if len(seen) == MAX_ENTRIES:
-            raise ReviewRefusal("limit_exceeded")
-        seen.add(relative)
-        if relative not in expected:
-            problems.append(_single_line(shown + " was added"))
-        elif not stat.S_ISLNK(info.st_mode) and _digest_at(dir_fd, name) != expected[relative]:
-            problems.append(_single_line(shown + " changed"))
-    for name, info in entries:
-        if not stat.S_ISDIR(info.st_mode):
-            continue
-        relative = name if not prefix else prefix + "/" + name
-        with _held(_open_directory(name, dir_fd)) as child:
-            _walk_files(child, side, relative, expected, problems, seen, depth + 1)
-def _side_problems(dir_fd, side, expected_listing):
-    problems = []
-    rows = _listing_rows(dir_fd, side, expected_listing, problems)
-    expected = {row["path"]: row["sha256"] for row in rows
-                if type(row) is dict and type(row.get("path")) is str and type(row.get("sha256")) is str}
-    info = _stat_leaf(dir_fd, side)
-    if info is not None and stat.S_ISLNK(info.st_mode):
-        return problems + [_single_line(side + " became a symlink")]
-    if info is None or not stat.S_ISDIR(info.st_mode):
-        return problems + [_single_line(side + " is missing")]
-    if stat.S_IMODE(info.st_mode) & 0o222:
-        problems.append(_single_line(side + " is writable"))
-    seen = set()
-    with _held(_open_directory(side, dir_fd)) as child:
-        _walk_files(child, side, "", expected, problems, seen, 0)
-    return problems + [_single_line("%s/%s is missing" % (side, relative)) for relative in sorted(set(expected) - seen)]
-def _git_problems(dir_fd, manifest):
-    info = _stat_leaf(dir_fd, ".git")
-    if info is not None and stat.S_ISLNK(info.st_mode):
-        return [_single_line(".git became a symlink")]
-    if info is None or not stat.S_ISDIR(info.st_mode):
-        return [_single_line(".git is missing")]
-    if "git_scaffold_sha256" not in manifest:
-        return [_single_line("the manifest has no record of .git, so it cannot be checked")]
-    problems, modes = [], []
-    if _scaffold_sha(dir_fd, modes) != manifest["git_scaffold_sha256"]:
-        problems.append(_single_line(".git changed"))
-    if stat.S_IMODE(info.st_mode) & 0o222:
-        problems.append(_single_line(".git is writable"))
-    return problems + modes
-def _added_problems(dir_fd):
-    return [_single_line(name + " was added") for name in sorted(_names(dir_fd)) if name not in _KNOWN]
-def _hex_field(value, size):
-    if type(value) is not str or len(value) != size or any(char not in _HEX for char in value) or _broken(value):
-        raise ReviewRefusal("manifest_shape")
-    return value
-def _side_commit(manifest, side):
-    record = manifest.get(side)
-    if type(record) is not dict:
-        raise ReviewRefusal("manifest_shape")
-    return _hex_field(record.get("commit"), 40), _hex_field(record.get("listing_sha256"), 64)
-def _verify_impl(out, expect_manifest):
-    if not descriptor_support():
-        raise ReviewRefusal("unsupported_platform")
-    if expect_manifest is not None and type(expect_manifest) is not str:
-        raise ReviewRefusal("invalid_input")
-    if type(expect_manifest) is str and (len(expect_manifest) > 64 or _broken(expect_manifest)):
-        raise ReviewRefusal("invalid_input")
-    dest = _absolute_path(out)
-    with _held(_walk(dest, "not_review_copy")) as fd:
-        manifest, raw = _read_manifest(fd)
-        recorded = hashlib.sha256(raw).hexdigest()
-        base_commit, base_listing = _side_commit(manifest, "base")
-        candidate_commit, candidate_listing = _side_commit(manifest, "candidate")
-        diff_hash = _hex_field(manifest.get("diff_sha256"), 64)
-        commits_hash = _hex_field(manifest.get("commits_sha256"), 64)
-        problems = []
-        if expect_manifest is not None and recorded != expect_manifest:
-            problems.append(_single_line("manifest.json does not match the recorded hash"))
-        problems.extend(_git_problems(fd, manifest))
-        problems.extend(_file_problem(fd, "changes.diff", diff_hash))
-        problems.extend(_file_problem(fd, "commits.txt", commits_hash))
-        problems.extend(_side_problems(fd, "base", base_listing))
-        problems.extend(_side_problems(fd, "candidate", candidate_listing))
-        problems.extend(_added_problems(fd))
-    body = {"ok": not problems, "manifest_sha256": recorded, "base": base_commit,
-            "candidate": candidate_commit, "problems": problems[:MAX_PROBLEMS],
-            "problem_count": len(problems)}
-    if problems:
-        body.update(_refusal_envelope("copy_differs"))
-    return (3 if problems else 0), body
+def _verify_host():
+    return SimpleNamespace(
+        descriptor_support=descriptor_support,
+        absolute_path=_absolute_path,
+        walk=_walk,
+        held=_held,
+        read_manifest=_read_manifest,
+        single_line=_single_line,
+        broken=_broken,
+        scaffold_sha=_scaffold_sha,
+        stat_leaf=_stat_leaf,
+        digest_at=_digest_at,
+        names=_names,
+        open_directory=_open_directory,
+        open_readonly=_open_readonly,
+        records=_records,
+        read_chunks=_fd_chunks,
+        file_stat=os.stat,
+        file_fstat=os.fstat,
+        max_problems=MAX_PROBLEMS,
+        max_entries=MAX_ENTRIES,
+        max_walk_depth=MAX_WALK_DEPTH,
+        max_listing_bytes=MAX_LISTING_BYTES,
+        max_header_bytes=MAX_HEADER_BYTES,
+        max_path_bytes=MAX_PATH_BYTES,
+        known=_KNOWN,
+        refusal=ReviewRefusal,
+        refusal_envelope=_refusal_envelope,
+    )
 def _remove_impl(out, preparation_dir):
     if not descriptor_support():
         raise ReviewRefusal("unsupported_platform")
@@ -990,7 +873,8 @@ def prepare(repository, base, candidate, out, *, expect_base_tree=None, expect_c
     return _prepare_impl(repository, base, candidate, out, expect_base_tree, expect_candidate_tree, planned, ports, preparation_dir)
 @_guard
 def verify(out, *, expect_manifest=None):
-    return _verify_impl(out, expect_manifest)
+    from aegis_core.team_review_verify import verify_copy
+    return verify_copy(out, expect_manifest, _verify_host())
 @_guard
 def remove(out, *, preparation_dir=None):
     """Delete only a descriptor-bound copy recorded in the owner-private directory."""
