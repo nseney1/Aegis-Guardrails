@@ -137,7 +137,10 @@ def test_non_scan_failure_keeps_real_traceback(home, monkeypatch, capsys):
     assert captured.out == ""
     assert captured.err.startswith("Traceback (most recent call last):\n")
     assert captured.err.endswith("OSError: raw\x1bfailure\nretry\n")
-    assert ", line 629, in _finish_repository_call\n" in captured.err
+    lines = captured.err.splitlines()
+    frames = [index for index, line in enumerate(lines) if line.endswith("in _finish_repository_call")]
+    assert len(frames) == 1
+    assert lines[frames[0] + 1].lstrip() == "result = execute_tool(name, args)"
 
 
 @pytest.mark.parametrize("transport", ["direct", "stdio_dispatch"])
@@ -229,6 +232,66 @@ def _call(req_id, name, arguments, meta=None):
     if meta is not None:
         params["_meta"] = meta
     return _frame(req_id, "tools/call", params)
+
+
+@pytest.mark.parametrize("failure", ["roots", "binding"])
+def test_stdio_predispatch_failure_keeps_real_traceback(home, monkeypatch, capsys, failure):
+    if failure == "roots":
+        req_id = "aegis-roots-1"
+        frames = [
+            _init("claude-code", {"roots": {"listChanged": True}}),
+            json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            json.dumps({"jsonrpc": "2.0", "id": req_id, "result": {"roots": [{"uri": "file://["}]}}),
+        ]
+        expected_tail = "ValueError: Invalid IPv6 URL\n"
+        expected_frames = [
+            ("_handle_request", "_route_response(request)"),
+            ("_route_response", "_host_roots = tuple(dict.fromkeys(p for p in paths if p))"),
+            ("<genexpr>", "_host_roots = tuple(dict.fromkeys(p for p in paths if p))"),
+            ("<genexpr>", 'paths = (_file_uri_path(r.get("uri")) '
+             'for r in result["roots"] if isinstance(r, dict))'),
+            ("_file_uri_path", "parsed = urlparse(uri)"),
+        ]
+    else:
+        def refuse(**kwargs):
+            raise ValueError("fixture binding failure")
+
+        monkeypatch.setattr(server, "resolve_binding", refuse)
+        req_id = 1
+        frames = [_init(), _call(req_id, "aegis_list_rules", {})]
+        expected_tail = "ValueError: fixture binding failure\n"
+        expected_frames = [
+            ("_repository_call", "binding = _bind(params, args)"),
+            ("_bind", "return resolve_binding(pin=pin, attested=_attested(params), "
+             "files=files, cwd=_server_cwd, registry=_registry())"),
+            ("refuse", 'raise ValueError("fixture binding failure")'),
+        ]
+    frames.append(_frame(2, "ping"))
+    monkeypatch.setattr(server, "sys", SimpleNamespace(
+        stdin=io.StringIO("\n".join(frames) + "\n"), stdout=sys.stdout, stderr=sys.stderr,
+    ))
+    assert server.run_stdio_server() == 0
+    captured = capsys.readouterr()
+    replies = [json.loads(line) for line in captured.out.splitlines()]
+    assert len(replies) == (4 if failure == "roots" else 3)
+    assert replies[0]["id"] == 0 and "result" in replies[0]
+    if failure == "roots":
+        assert replies[1] == {"jsonrpc": "2.0", "id": req_id, "method": "roots/list"}
+    assert replies[-2:] == [
+        {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32603, "message": "Internal error"}},
+        {"jsonrpc": "2.0", "id": 2, "result": {}},
+    ]
+    assert captured.err.startswith("Traceback (most recent call last):\n")
+    assert captured.err.endswith(expected_tail)
+    lines = captured.err.splitlines()
+    traceback_frames = [
+        (line.rsplit(" in ", 1)[1], lines[index + 1].strip())
+        for index, line in enumerate(lines)
+        if line.startswith('  File "') and " in " in line
+    ]
+    assert traceback_frames[0] == ("run_stdio_server", "response = handle_request(request)")
+    start = traceback_frames.index(expected_frames[0])
+    assert traceback_frames[start:start + len(expected_frames)] == expected_frames
 
 
 def _codex_meta(*roots: Path) -> dict:
