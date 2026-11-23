@@ -16,7 +16,7 @@ from aegis_core import team_host_registry, team_isolation as core, team_isolatio
 from aegis_core.diagnostic_messages import receipt_value
 from aegis_core.pathlookup import which
 from aegis_core.storage_confined import ConfinedFileError, confined_file, descriptor_supported as file_support
-from aegis_core.team_isolation_refusal import IsolationRefusal
+from aegis_core.team_isolation_refusal import IsolationRefusal, plan_response, plan_text
 
 __all__ = ["configure_parser", "descriptor_supported", "inspect_image", "observe", "owner_homes", "run_isolation"]
 
@@ -32,23 +32,25 @@ def descriptor_supported():
             and os.stat in os.supports_follow_symlinks)
 
 
-def _read_document(value):
+def _read_document(value, stage):
     mounts.require(file_support(), "unsupported_platform")
     try:
         path = mounts.absolute_path(value)
         with confined_file("/", path.parts[1:]) as handle:
             return handle.read_bytes(mounts.MAX_DOCUMENT_BYTES)
     except IsolationRefusal:
-        raise IsolationRefusal("document_read") from None
+        raise IsolationRefusal("document_read", stage=stage) from None
     except ConfinedFileError as error:
         code = {"too_large": "document_size", "unsupported": "unsupported_platform"}.get(
             error.reason, "document_read")
-        raise IsolationRefusal(code) from None
+        if code == "unsupported_platform":
+            raise IsolationRefusal(code) from None
+        raise IsolationRefusal(code, stage=stage) from None
 
 
 def _read_config(path):
     """Confined document bytes. Core bounds that document once and applies field policy."""
-    return _read_document(path)
+    return _read_document(path, "config")
 
 
 def _identity(info):
@@ -234,7 +236,8 @@ def _read_image_output(stream, deadline):
             if not chunk:
                 return bytes(data)
             data.extend(chunk)
-            mounts.require(len(data) <= mounts.MAX_DOCUMENT_BYTES, "document_size")
+            if len(data) > mounts.MAX_DOCUMENT_BYTES:
+                raise IsolationRefusal("document_size", stage="image-inspection")
 
 
 def _pin_engine(executable, stack):
@@ -259,21 +262,28 @@ def _pin_engine(executable, stack):
         raise IsolationRefusal("engine_custody") from None
 
 
+def _launcher_refusal():
+    """Fixed recovery for a launcher environment that is refused before any engine starts."""
+    return IsolationRefusal("image_inspect", note="launcher_environment")
+
+
 def _inspection_environment(environ):
     """Registry no-host environment. A policy or encoding failure refuses before any engine is spawned."""
     try:
         environment = team_host_registry.child_environment(environ, "no-host")
     except team_host_registry.HostRefusal:
-        raise IsolationRefusal("image_inspect") from None
-    mounts.require(type(environment) is dict, "image_inspect")
+        raise _launcher_refusal() from None
+    if type(environment) is not dict:
+        raise _launcher_refusal()
     for key, value in environment.items():
-        mounts.require(type(key) is str and type(value) is str and key != "" and "=" not in key
-                       and "\x00" not in key and "\x00" not in value, "image_inspect")
+        if not (type(key) is str and type(value) is str and key != "" and "=" not in key
+                and "\x00" not in key and "\x00" not in value):
+            raise _launcher_refusal()
         try:
             os.fsencode(key)
             os.fsencode(value)
         except UnicodeError:
-            raise IsolationRefusal("image_inspect") from None
+            raise _launcher_refusal() from None
     return environment
 
 
@@ -313,10 +323,6 @@ def inspect_image(argv, *, workspace, search_path=None):
         raise IsolationRefusal("image_inspect") from None
 
 
-def _refusal(error):
-    return dict(status=error.status, code=error.code, reason=error.message, next_action=error.next_action)
-
-
 def _display_field(value):
     # Normalization can reveal or erase a credential match. Check both views
     # before preserving the original spelling, and truncate only after redaction.
@@ -345,7 +351,7 @@ def _emit(args, value):
     if args.json:
         print(json.dumps(value, sort_keys=True, ensure_ascii=True))
     elif value["status"] == "refused":
-        print(value["code"] + " — " + value["reason"], file=sys.stderr)
+        print(plan_text(value), file=sys.stderr)
     elif "mismatches" in value:
         print("Isolation verified" if not value["mismatches"] else
               "Isolation mismatches: " + ", ".join(value["mismatches"]))
@@ -363,10 +369,11 @@ def run_isolation(args):
                            platform=sys.platform, host_table=lambda: {kind: team_host_registry.entry(kind)
                                                                       for kind in team_host_registry.TEAM_HOSTS},
                            source=str(Path(__file__).absolute().parents[1]), private_groups=_private_groups,
-                           inspect=(lambda: _read_document(args.inspect)) if args.inspect is not None else None,
+                           inspect=(lambda: _read_document(args.inspect, "container-inspection"))
+                           if args.inspect is not None else None,
                            inspector=lambda argv: inspect_image(argv, workspace=args.workspace))
     except IsolationRefusal as error:
-        value = _refusal(error)
+        value = plan_response(error)
     _emit(args, value)
     return 0 if value["status"] == "ok" else 1
 
@@ -375,7 +382,7 @@ def configure_parser(sub, common, parent):
     class IsolationParser(type(parent)):
         def error(self, message):
             refusal = IsolationRefusal("invalid_arguments")
-            self._print_message(json.dumps(_refusal(refusal), sort_keys=True) + "\n", sys.stderr)
+            self._print_message(json.dumps(plan_response(refusal), sort_keys=True) + "\n", sys.stderr)
             self.exit(refusal.exit_code)
 
         def parse_known_args(self, args=None, namespace=None):
