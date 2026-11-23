@@ -52,6 +52,15 @@ permissions:
 # test-fast-measurement: test-fast-unit-rest 6516.67s run 44219204536
 # test-fast-measurement: test-fast-integration 6516.67s run 44219204536
 # test-fast-measurement: test-fast-contract 6516.67s run 44219204536
+# validate: after HOSTED-CI-LD-ENV, run 45123562730 completed the four unsharded jobs
+# in 11112s (Ubuntu 24.04/3.9), 11402s (Ubuntu latest/3.11), 12226s (macOS/3.9), and
+# 10077s (macOS/3.11). Even the shortest exceeds half the old 300-minute cap.
+# Reuse the Windows five-way pytest partition on each OS/Python pair. Keep the 360-minute
+# provisional cap until the sharded jobs have completed. Replace the pending marker with one
+# row per OS/Python/shard (including checks): <os> <version> <shard> <seconds>s run <id>.
+# Use whole job wall clocks including setup. Keep the cap at least twice the longest recorded
+# duration rounded up to minutes, with a 45-minute floor. Repartition if it would exceed 360.
+# validate-measurement: pending
 jobs:
   # Audits the resolved runtime dependencies declared in pyproject.toml.
   # pip-audit is a CI-only tool; it is not a project dependency.
@@ -480,25 +489,26 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+  # Aegis-check and verdict depend on the entire matrix. A failed shard fails
+  # validate; fail-fast is off so the other shards can report their results.
   validate:
+    name: validate (${{ matrix.leg.os }}, ${{ matrix.leg.python-version }}, ${{ matrix.shard }})
     if: github.event_name != 'pull_request' || github.base_ref != 'develop'
     needs: [build-wheel, dependency-audit]
-    timeout-minutes: 300
+    timeout-minutes: 360
     strategy:
       # One red leg must not cancel the others and hide the per-OS results.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        python-version: ['3.9', '3.11']
         # ubuntu-latest is Ubuntu 26.04, for which actions/setup-python has no 3.9 build; the oldest
         # supported Python keeps a Linux leg on the previous LTS image.
-        exclude:
-          - os: ubuntu-latest
-            python-version: '3.9'
-        include:
-          - os: ubuntu-24.04
-            python-version: '3.9'
-    runs-on: ${{ matrix.os }}
+        leg:
+          - {os: ubuntu-24.04, python-version: '3.9'}
+          - {os: ubuntu-latest, python-version: '3.11'}
+          - {os: macos-latest, python-version: '3.9'}
+          - {os: macos-latest, python-version: '3.11'}
+        shard: [unit-core-a, unit-core-b, unit-rest, integration, contract, checks]
+    runs-on: ${{ matrix.leg.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -508,7 +518,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: ${{ matrix.leg.python-version }}
           
       - name: Download wheel artifact
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -529,26 +539,29 @@ jobs:
       # wheel from outside the repo, in isolated mode, and asserts every Aegis
       # module resolves from site-packages.
       - name: Smoke-test installed wheel (source hidden)
+        if: matrix.shard == 'checks'
         shell: bash
         run: |
           SMOKE="$PWD/.github/scripts/wheel_smoke.py"
           cd "$RUNNER_TEMP" && env -u PYTHONPATH python -I "$SMOKE"
 
       - name: Lint
+        if: matrix.shard == 'checks'
         run: make lint
 
       - name: Run Layer 1 Deterministic Verification
+        if: matrix.shard == 'checks'
         run: python3 -m aegis_cli.cli check
 
       - name: Install bubblewrap
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.shard != 'checks'
         run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends bubblewrap
 
       # Same probe as tests/integration/test_hierarchy_jobs.py. The job tests skip when it fails,
       # so it runs here as a hard step. Ubuntu 23.10 and later block unprivileged user namespaces
       # through AppArmor; the sysctl lifts that for this throwaway runner.
       - name: Prove bubblewrap runs
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.shard != 'checks'
         run: |
           set -euo pipefail
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
@@ -557,10 +570,54 @@ jobs:
           bwrap --unshare-net --unshare-pid --ro-bind / / --dev /dev --proc /proc true
 
       - name: Run test suite
+        if: matrix.shard != 'checks'
         id: test
-        run: make test
+        shell: bash
+        env:
+          TEST_VALIDATE_SHARD: ${{ matrix.shard }}
+          TEST_VALIDATE_UNIT_REST: tests/unit/cli tests/unit/mcp tests/unit/sdk tests/unit/verification tests/unit/test_ac24_acceptance_audit.py tests/unit/test_ac24_acquire.py tests/unit/test_changelog.py tests/unit/test_docs_claims.py tests/unit/test_docs_links.py tests/unit/test_no_real_gh.py tests/unit/test_p6_noadmin.py tests/unit/test_pypi_state.py tests/unit/test_readme.py tests/unit/test_release_guard.py
+        run: |
+          set -euo pipefail
+          userbase="${PYTHONUSERBASE:-$(python -c 'import site; print(site.getuserbase())')}"
+          home="$(mktemp -d /tmp/aegis-test-home.XXXXXX)"
+          trap 'rm -rf "$home"' EXIT
+          HOME="$home" USERPROFILE="$home" XDG_CONFIG_HOME="$home/.config" PYTHONUSERBASE="$userbase" python - <<'PYTHON'
+          import os
+
+          def walk_failed(_error):
+              raise SystemExit("Could not enumerate validate core tests")
+
+          shard = os.environ.get("TEST_VALIDATE_SHARD")
+          if shard in ("unit-core-a", "unit-core-b"):
+              # Same basename split and pytest file patterns as the Windows core shards.
+              root = "tests/unit/core"
+              paths = []
+              if os.path.isdir(root):
+                  for directory, children, files in os.walk(root, onerror=walk_failed):
+                      children[:] = [name for name in children if name not in ("__pycache__", ".pytest_cache")]
+                      for name in files:
+                          if not (name.endswith(".py") and (name.startswith("test_") or name.endswith("_test.py"))):
+                              continue
+                          if (name <= "test_redaction.py") == (shard == "unit-core-a"):
+                              paths.append(os.path.join(directory, name).replace(os.sep, "/"))
+              paths.sort()
+          elif shard == "unit-rest":
+              paths = os.environ.get("TEST_VALIDATE_UNIT_REST", "").split()
+          elif shard in ("integration", "contract"):
+              paths = ["tests/" + shard]
+          else:
+              raise SystemExit("Invalid validate shard")
+          if not paths:
+              raise SystemExit("Validate shard has no test paths")
+
+          # Keep the normal header for the interpreter and actual xdist worker count.
+          import pytest
+
+          raise SystemExit(pytest.main(["-n", "auto", "--durations=25", "--", *paths]))
+          PYTHON
 
       - name: Check for hardcoded paths
+        if: matrix.shard == 'checks'
         run: |
           # Exclude template examples like /home/<user>/ which are privacy instructions
           if grep -rnI '/home/' rules/ skills/ docs/ README.md 2>/dev/null | grep -v '<user>' | grep -v '<username>'; then
