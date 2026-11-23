@@ -22,8 +22,9 @@ from io import BytesIO
 
 import pytest
 from conftest import symlink_or_skip
-from tests.helpers_refusal_inventory import ANY, RefusalRows, covers_refusal, history_has_prefix
+from tests.helpers_refusal_inventory import ANY, covers_refusal, history_has_prefix
 from tests.helpers_refusal_inventory import reachable_refusal_pairs as _reachable_refusal_pairs
+from tests.helpers_refusal_inventory import CLOSED_REFUSAL_TABLE, load_closed_refusal_table
 from tests.integration.test_hierarchy_mailbox import HELPER, invoke, message, pilot  # noqa: F401
 
 sys.path.insert(0, str(HELPER.parent))
@@ -4111,8 +4112,33 @@ def test_refusal_inventory_detects_a_new_codec_error_site(namespace, site, tools
                    for file, source_line, code, detail in stats["potential_refusal_sites"])
 
 
-def test_every_emitted_refusal_names_an_accepted_action(bound, monkeypatch):
-    """Public calls cover every refusal the record tools can emit, then follow it."""
+@pytest.mark.parametrize("route", ("rendered-error", "direct-return"))
+def test_public_dispatch_preserves_final_record_refusal(bound, monkeypatch, route):
+    _root, _writer, reader = bound
+    tool = "mailbox_digest"
+
+    def finish(codec, mailbox, sender, arguments, *, inbox):
+        if route == "rendered-error":
+            error = codec.CodecError("E_AUTH", detail="reference")
+            error.detail = "binding"
+            raise error
+        return {"error": {"code": "E_AUTH", "message": "direct refusal"}}, []
+
+    monkeypatch.setattr(records, "digest", finish)
+    result = data(call(reader, tool, {}))
+    table = load_closed_refusal_table(CLOSED_REFUSAL_TABLE)
+    if route == "rendered-error":
+        assert result == records_guidance.error_result(
+            codec.CodecError("E_AUTH", detail="binding"), tool=tool, max_chars=records.MAX_CHARS)
+        assert result["error"]["message"] == "endpoint binding refused"
+        assert table[(tool, "E_AUTH", "binding")] == "accepted-action"
+    else:
+        assert result == {"error": {"code": "E_AUTH", "message": "direct refusal"}}
+        assert table[(tool, "E_AUTH", "")] == "pinned-no-action"
+
+
+def test_exercised_refusals_match_closed_table_dispositions(bound, monkeypatch):
+    """Match the exercised public refusals to their exact table dispositions."""
     from aegis_core.message_codec_format import KEYS
     assert _FIELD_SELECTORS == set(KEYS)
     callback_trace, codec_trace = [], []
@@ -4832,16 +4858,26 @@ def test_every_emitted_refusal_names_an_accepted_action(bound, monkeypatch):
                 assert any(entry == tool and target.startswith("widened.") and
                            covers_refusal(emitted, (code, detail))
                            for entry, target, _file, _line, emitted in callback_trace)
+    closed_table = load_closed_refusal_table(CLOSED_REFUSAL_TABLE)
     for tool, code, detail in covered:
-        assert covers_refusal(required[tool], (code, detail))
-    symbolic = {tool: RefusalRows(row for row in rows if ANY in row) for tool, rows in required.items()}
+        assert (tool, code, detail) in closed_table
+        payload = error_result(codec.CodecError(code, detail=detail), tool=tool)
+        action = payload["error"].get("next_action")
+        kind = closed_table[(tool, code, detail)]
+        assert (kind == "accepted-action") == (action is not None)
+        if action is not None:
+            assert "\n" not in action and "\r" not in action
+    for (tool, code, detail), kind in closed_table.items():
+        payload = error_result(codec.CodecError(code, detail=detail), tool=tool)
+        action = payload["error"].get("next_action")
+        assert (kind == "accepted-action") == (action is not None)
+    # Keep the historical public-case and contributor evidence from the bounded trace.
     missing_pairs = {(tool, code, detail)
                      for tool, pairs in required.items()
                      for code, detail in pairs
-                     if (tool, code, detail) not in covered
+                     if ANY not in (code, detail) and (tool, code, detail) not in covered
                      and (tool, code, detail) not in callback_over_approximations
-                     and (tool, code, detail) not in widening_over_approximations
-                     and not covers_refusal(symbolic[tool], (code, detail))}
+                     and (tool, code, detail) not in widening_over_approximations}
     assert missing_pairs == set(), sorted(missing_pairs)
     for tool, history_message in covered_history:
         assert history_message in history_messages[tool]
