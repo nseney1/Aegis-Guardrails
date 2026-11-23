@@ -15,12 +15,15 @@ import argparse
 import json
 import sys
 import time
+from copy import copy
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from aegis_core import primitives
 from aegis_cli import sanitize_display, team_queue as queue_cli
 from aegis_cli import team_isolation as isolation_cli
+from aegis_cli import team_qualify as qualify_cli
 from aegis_cli import team_lease_output as lease_output
 from aegis_cli import team_mail as mail_cli, team_board as board_cli
 from aegis_cli.base import AegisCommand, CommandCategory
@@ -181,6 +184,7 @@ class ModelErrorPolicy:
         self.model_ready = False
         self.model_invocation = model_invocation
         self.model_errors = self.model_invocation
+        self.qualify_parsing = None
 
     def run(self, operation):
         if not self.model_invocation:
@@ -188,9 +192,15 @@ class ModelErrorPolicy:
         try:
             code = operation()
         except (SystemExit, ModelArgumentError):
+            if self.qualify_parsing is not None and self.qualify_parsing.entered:
+                raise
             code = self.output({"error": "invalid_model_arguments"})
         except (KeyboardInterrupt, Exception):
+            if self.qualify_parsing is not None and self.qualify_parsing.entered:
+                raise
             code = self.operation_error()
+        if self.qualify_parsing is not None and self.qualify_parsing.entered:
+            return code
         if self.queue_payload is not None:
             _emit(self.queue_payload)
             return code
@@ -641,6 +651,8 @@ def run_team(args: argparse.Namespace) -> int:
         return queue_cli.run_queue(args)
     if action == "isolation":
         return isolation_cli.run_isolation(args)
+    if action == "qualify":
+        return qualify_cli.run_qualify(args)
     if action == "model":
         values = {key: getattr(args, key) for key in MODEL_REQUIRED + MODEL_OPTIONAL}
         root = args.ws.root if getattr(args, "ws", None) is not None else args.workspace
@@ -695,6 +707,91 @@ def _configure_model_parser(sub, common):
     model.add_argument("--record", action="store_true", help="Atomically select and append under the history lock (60-second timeout); default preview")
 
 
+class _QualifyParsing:
+    """Track actual qualify entry while preserving the sibling parse policies."""
+
+    def __init__(self, parser):
+        self.entered = False
+        self.model_policy = None
+        outer = getattr(parser, "_error_policy", None)
+        if outer is None:
+            return
+        policy = outer
+        while policy is not None:
+            if isinstance(policy, ModelErrorPolicy):
+                policy.qualify_parsing = self
+                self.model_policy = policy
+            if isinstance(policy, queue_cli.QueueErrorPolicy):
+                policy.qualify_parsing = self
+            policy = getattr(policy, "fallback", None)
+        self.outer_parse = outer.parse
+        outer.parse = self.parse
+
+    def configure_child(self, parser, sub, common):
+        selection = self
+
+        class QualifyParser(type(parser)):
+            def error(self, message):
+                qualify_cli.refuse_usage()
+                self.exit(EXIT_USAGE)
+
+            def parse_known_args(self, args=None, namespace=None):
+                selection.entered = True
+                if selection.model_policy is not None:
+                    selection.model_policy.model_invocation = False
+                    selection.model_policy.model_errors = False
+                return super().parse_known_args(args, namespace)
+
+        factory = sub._parser_class
+        keywords = {"error_policy": None, "scan_state": parser._scan_state} if hasattr(parser, "_scan_state") else {}
+        sub._parser_class = partial(QualifyParser, **keywords)
+        try:
+            qualify_cli.configure_parser(sub, common)
+        finally:
+            sub._parser_class = factory
+
+    def parse(self, root, argv):
+        parse_known = root.parse_known_args
+
+        def parse_known_args(args=None, namespace=None):
+            values, extras = parse_known(args, namespace)
+            if self.entered and extras:
+                qualify_cli.refuse_usage()
+                root.exit(EXIT_USAGE)
+            return values, extras
+
+        root.parse_known_args = parse_known_args
+        try:
+            return self.outer_parse(root, argv)
+        finally:
+            root.parse_known_args = parse_known
+
+
+def _preserve_team_prefix_output(parser, sub):
+    """Keep the integration-base help and invalid-action text before child entry."""
+    sibling_actions = copy(sub)
+    sibling_actions.choices = {name: child for name, child in sub.choices.items() if name != "qualify"}
+    check_value = parser._check_value
+    choices = sub._choices_actions
+    sibling_help = [choice for choice in choices if choice.dest != "qualify"]
+    format_help = parser.format_help
+
+    def check_action(action, value):
+        if action is sub and value not in sub.choices:
+            action = sibling_actions
+        check_value(action, value)
+
+    def format_team_help():
+        sub._choices_actions = sibling_help
+        try:
+            return format_help()
+        finally:
+            sub._choices_actions = choices
+
+    parser._check_value = check_action
+    parser.format_help = format_team_help
+
+
 def _configure_action_parsers(sub, common, parser):
     _configure_model_parser(sub, common)
     queue_cli.configure_parser(sub, common, parser)
@@ -719,6 +816,7 @@ class TeamCommand(AegisCommand):
     def configure_parser(self, parser: argparse.ArgumentParser) -> None:
         # Malformed team prefixes may target model; non-model children restore ordinary errors.
         parser._model_errors = True
+        selection = _QualifyParsing(parser)
         common = argparse.ArgumentParser(add_help=False)
         common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
                             help="Emit machine-readable JSON output")
@@ -727,6 +825,7 @@ class TeamCommand(AegisCommand):
         common.add_argument("--workspace", type=str, default=argparse.SUPPRESS, help="Target workspace root")
         sub = parser.add_subparsers(dest="team_action", metavar="ACTION")
         _configure_action_parsers(sub, common, parser)
+        selection.configure_child(parser, sub, common)
         config = sub.add_parser("config", parents=[common], help="Inspect or initialize a layered team profile")
         config_sub = config.add_subparsers(dest="config_action")
         config_sub.add_parser("show", parents=[common], help="Show every resolved value and its layer")
@@ -813,11 +912,15 @@ class TeamCommand(AegisCommand):
                                   "aegis check --lane: origin/$GITHUB_BASE_REF, the branch origin/HEAD names, then main, "
                                   "develop or master; "
                                   "with none, the whole first-parent history)")
+        _preserve_team_prefix_output(parser, sub)
 
     def execute(self, args: argparse.Namespace) -> int:
         return run_team(args)
 
     def workspace_refusal(self, args, error):
-        if getattr(args, "team_action", None) in ("mail", "board"):
+        action = getattr(args, "team_action", None)
+        if action == "qualify":
+            return qualify_cli.workspace_refusal(args, error)
+        if action in ("mail", "board"):
             return mail_cli.workspace_refusal(args, error)
         return None

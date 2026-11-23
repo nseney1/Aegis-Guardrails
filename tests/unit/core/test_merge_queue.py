@@ -8,15 +8,20 @@ import os
 from pathlib import Path
 import pickle
 import shutil
-from threading import Barrier
+import subprocess
+from threading import Barrier, Event
 from types import SimpleNamespace
 
 import pytest
 
 from aegis_core import gitsafe_run, merge_queue as mq, merge_queue_types, team_gitops, team_qualify as qual
+from tests import helpers_team_git
 from tests.helpers_team_git import (
-    IDENTITY, commit, copy_immutable_repo, filter_git_env, git, make_store, shared_bytes, state,
+    IDENTITY, commit, copied_rig, copy_immutable_repo, git, make_store,
+    queue_seed_env, rig_template, shared_bytes, state,
 )
+from tests.unit.core.test_team_custody import rig as custody_rig
+from tests.unit.core.test_team_custody_checks import rig as custody_checks_rig
 
 
 class StateBackend:
@@ -132,22 +137,19 @@ def issue(q, rig, candidate):
                         read_mode=lambda *args: "none", identity=IDENTITY, now=100)
 
 
-def merge_queue_author_env():
-    """Pinned author dates so a fresh graph and the worker template share one id."""
-    home = Path(os.environ.get("HOME", os.path.expanduser("~")))
-    return {**filter_git_env(home), "GIT_AUTHOR_DATE": "1700000000 +0000",
-            "GIT_COMMITTER_DATE": "1700000000 +0000"}
-
-
-def build_merge_queue_graph(repo, env):
-    """The rig graph: main at ``other``, lane/a at ``head``, both children of ``base``."""
-    git(repo, "init", "-q", "-b", "main", env=env)
-    base = commit(repo, "base", b"base\n", env=env)
-    git(repo, "checkout", "-qb", "lane/a", env=env)
-    head = commit(repo, "a", b"a\n", env=env)
-    tree = git(repo, "rev-parse", "HEAD^{tree}", env=env).decode().strip()
-    git(repo, "checkout", "-q", "main", env=env)
-    other = commit(repo, "b", b"b\n", env=env)
+def build_merge_queue_graph(repo, env=None, *, run_git=git):
+    """Main at ``other``, lane/a at ``head``, both children of ``base``."""
+    pinned = queue_seed_env(repo, env)
+    run_git(repo, "init", "-q", "--object-format=sha1", "--template=", "-b", "main", env=pinned)
+    # The seed template is empty, so init does not create info/. The merge-driver
+    # test writes .git/info/attributes and needs that directory.
+    (Path(repo) / ".git" / "info").mkdir(exist_ok=True)
+    base = commit(repo, "base", b"base\n", env=pinned, run_git=run_git)
+    run_git(repo, "checkout", "-qb", "lane/a", env=pinned)
+    head = commit(repo, "a", b"a\n", env=pinned, run_git=run_git)
+    tree = run_git(repo, "rev-parse", "HEAD^{tree}", env=pinned).decode().strip()
+    run_git(repo, "checkout", "-q", "main", env=pinned)
+    other = commit(repo, "b", b"b\n", env=pinned, run_git=run_git)
     return SimpleNamespace(repo=repo, base=base, head=head, tree=tree, other=other)
 
 
@@ -158,26 +160,36 @@ def merge_queue_template(tmp_path_factory):
         pytest.skip("needs git")
     repo = tmp_path_factory.mktemp("merge-queue-template") / "repo"
     repo.mkdir()
-    template = build_merge_queue_graph(repo, merge_queue_author_env())
+    template = build_merge_queue_graph(repo)
     template.baseline = state(template)
     yield template
     assert state(template) == template.baseline
 
 
-@pytest.fixture
-def rig(tmp_path, request):
-    # Capability skip before the template exists: resolving it copies a Git graph.
-    context = make_store(tmp_path / "repo")
+def _queue_store(repo):
+    context = make_store(repo)
     if not qual.descriptor_supported():
         pytest.skip("qualification requires descriptor-relative custody")
-    template = request.getfixturevalue("merge_queue_template")
-    repo = copy_immutable_repo(template, tmp_path)
+    return context
+
+
+@contextmanager
+def _queue_rig(template, directory, context, *, copy_file=None):
+    repo = copy_immutable_repo(template, directory, copy_file=copy_file)
     with context as store:
         yield SimpleNamespace(repo=repo, store=store, base=template.base,
                               head=template.head, tree=template.tree,
                               other=template.other,
                               journal=team_gitops.GitOpsJournal(repo / ".git"), count=0,
                               backends={})
+
+
+@pytest.fixture
+def rig(tmp_path, request):
+    context = _queue_store(tmp_path / "repo")
+    template = request.getfixturevalue("merge_queue_template")
+    with _queue_rig(template, tmp_path, context) as candidate:
+        yield candidate
 
 
 @contextmanager
@@ -194,10 +206,19 @@ def sequence_stores():
         assert not scratch.exists()
 
 
+def _commit_identity(repo, oid, env):
+    """Author and committer lines from the raw commit object. One line each."""
+    raw = git(repo, "cat-file", "commit", oid, env=env)
+    authors = [line for line in raw.split(b"\n") if line.startswith(b"author ")]
+    committers = [line for line in raw.split(b"\n") if line.startswith(b"committer ")]
+    assert len(authors) == 1 and len(committers) == 1
+    return authors[0], committers[0]
+
+
 def test_fresh_graph_matches_the_immutable_template(tmp_path, merge_queue_template):
     repo = tmp_path / "repo"
     repo.mkdir()
-    built = build_merge_queue_graph(repo, merge_queue_author_env())
+    built = build_merge_queue_graph(repo)
     assert (built.base, built.head, built.tree, built.other) == (
         merge_queue_template.base, merge_queue_template.head,
         merge_queue_template.tree, merge_queue_template.other)
@@ -205,6 +226,323 @@ def test_fresh_graph_matches_the_immutable_template(tmp_path, merge_queue_templa
     assert (repo / "b").read_bytes() == b"b\n"
     assert not (repo / "a").exists()
     assert not (merge_queue_template.repo / "a").exists()
+
+
+def test_queue_seed_pins_identity_against_the_launcher_environment(tmp_path, merge_queue_template):
+    """Invariant: author, committer, and both dates are the pin, never the launcher.
+
+    A multi-line launcher value is replaced whole. Two hostile sources and a
+    concurrent rebuild share one graph id with the worker template.
+    """
+    pinned_author = b"author Test <test@example.com> 1700000000 +0000"
+    pinned_committer = b"committer Test <test@example.com> 1700000000 +0000"
+    hostile = dict(os.environ)
+    hostile.update({
+        "GIT_AUTHOR_NAME": "Launcher\nJoined",
+        "git_author_name": "lower\nname",
+        "GIT_AUTHOR_EMAIL": "launcher@example.com",
+        "GIT_AUTHOR_DATE": "1800000000 +0000",
+        "GIT_COMMITTER_NAME": "Other Person",
+        "GIT_COMMITTER_EMAIL": "other@example.com",
+        "GIT_COMMITTER_DATE": "1900000000 +0000",
+        "EMAIL": "ambient@example.com",
+    })
+    again = dict(hostile)
+    again["GIT_AUTHOR_NAME"] = "Second\rLauncher"
+    again["GIT_COMMITTER_NAME"] = "Third"
+    again["GIT_COMMITTER_DATE"] = "2000000000 +0000"
+
+    def build(name, source):
+        directory = tmp_path / name
+        directory.mkdir()
+        repo = directory / "repo"
+        repo.mkdir()
+        return build_merge_queue_graph(repo, source)
+
+    built = build("fresh", hostile)
+    retried = build("retry", again)
+    assert (built.base, built.head, built.tree, built.other) == (
+        retried.base, retried.head, retried.tree, retried.other) == (
+        merge_queue_template.base, merge_queue_template.head,
+        merge_queue_template.tree, merge_queue_template.other)
+    env = queue_seed_env(built.repo, hostile)
+    assert env["GIT_AUTHOR_NAME"] == env["GIT_COMMITTER_NAME"] == "Test"
+    assert env["GIT_AUTHOR_EMAIL"] == env["GIT_COMMITTER_EMAIL"] == "test@example.com"
+    assert env["GIT_AUTHOR_DATE"] == env["GIT_COMMITTER_DATE"] == "1700000000 +0000"
+    assert "\n" not in env["GIT_AUTHOR_NAME"] and "\r" not in env["GIT_COMMITTER_NAME"]
+    folded = [key for key in env if key.casefold() == "git_author_name"]
+    assert folded == ["GIT_AUTHOR_NAME"]
+    for oid in (built.base, built.head, built.other):
+        assert _commit_identity(built.repo, oid, env) == (pinned_author, pinned_committer)
+    for oid in (merge_queue_template.base, merge_queue_template.head, merge_queue_template.other):
+        assert _commit_identity(merge_queue_template.repo, oid,
+                                queue_seed_env(merge_queue_template.repo)) == (pinned_author, pinned_committer)
+
+    def concurrent(name):
+        return build(name, hostile if name == "left" else again)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        left, right = tuple(pool.map(concurrent, ("left", "right")))
+    assert (left.base, left.head, left.tree, left.other) == (right.base, right.head, right.tree, right.other) == (
+        built.base, built.head, built.tree, built.other)
+    assert state(merge_queue_template) == merge_queue_template.baseline
+
+
+def _hostile_launcher_source(root, object_format):
+    """Launcher home, global encoding, hash, and template. The seed must ignore them."""
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    home = root / "home"
+    home.mkdir()
+    config = home / ".gitconfig"
+    config.write_text("[i18n]\n\tcommitEncoding = ISO-8859-1\n", encoding="ascii")
+    xdg = home / ".config" / "git"
+    xdg.mkdir(parents=True)
+    (xdg / "config").write_text("[i18n]\n\tcommitEncoding = ISO-8859-1\n", encoding="ascii")
+    template = root / "hostile-template"
+    template.mkdir()
+    (template / "config").write_text("[i18n]\n\tcommitEncoding = ISO-8859-1\n", encoding="ascii")
+    (template / "description").write_text("hostile\n", encoding="ascii")
+    source = dict(os.environ)
+    source.update({
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(home / ".config"),
+        "GIT_CONFIG_GLOBAL": str(config),
+        "GIT_CONFIG_SYSTEM": str(config),
+        "GIT_CONFIG_NOSYSTEM": "0",
+        "GIT_DEFAULT_HASH": object_format,
+        "git_default_hash": "sha256",
+        "GIT_TEMPLATE_DIR": str(template),
+        "GIT_CONFIG": str(config),
+        "GIT_CONFIG_PARAMETERS": "'i18n.commitEncoding=ISO-8859-1'",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "i18n.commitEncoding",
+        "GIT_CONFIG_VALUE_0": "ISO-8859-1",
+    })
+    return source, template
+
+
+def _sha256_supported(directory, source=None, *, run_git=git):
+    """Probe an explicit object format with the same isolation as the queue seed."""
+    probe = directory / "sha256-probe"
+    probe.mkdir()
+    env = queue_seed_env(probe, source)
+    try:
+        run_git(probe, "init", "-q", "--object-format=sha256", "--template=", env=env)
+    except subprocess.CalledProcessError as error:
+        lines = error.stderr.splitlines() if error.stderr else []
+        if lines and (error.returncode, lines[0]) in {
+            (128, b"fatal: unknown hash algorithm 'sha256'"),
+            (129, b"error: unknown option `object-format=sha256'"),
+        }:
+            return False
+        raise
+    assert run_git(probe, "rev-parse", "--show-object-format", env=env).strip() == b"sha256"
+    return True
+
+
+@pytest.mark.parametrize("launcher_setting", ["attributes", "old-config", "redirect"])
+def test_queue_seed_ignores_launcher_settings_on_direct_build(
+        tmp_path, merge_queue_template, launcher_setting):
+    source, hostile_template = _hostile_launcher_source(tmp_path / "launcher", "sha1")
+    run_git = git
+    if launcher_setting == "attributes":
+        attributes = Path(source["XDG_CONFIG_HOME"]) / "git" / "attributes"
+        attributes.write_text("a working-tree-encoding=UTF-16LE\n", encoding="ascii")
+    elif launcher_setting == "old-config":
+        def git_without_config_overrides(repo, *args, data=None, env=None):
+            legacy = {key: value for key, value in env.items()
+                      if key not in {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"}}
+            return git(repo, *args, data=data, env=legacy)
+
+        # Both direct commands and the shared commit helper cross this boundary.
+        run_git = git_without_config_overrides
+    else:
+        source.update({
+            "GIT_DIR": str(tmp_path / "redirected-git"),
+            "GIT_WORK_TREE": str(hostile_template),
+            "GIT_INDEX_FILE": str(tmp_path / "redirected-index"),
+            "GIT_OBJECT_DIRECTORY": str(tmp_path / "redirected-objects"),
+            "gIt_AlTeRnAtE_oBjEcT_dIrEcToRiEs": str(tmp_path / "alternate-objects"),
+        })
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    built = build_merge_queue_graph(repo, source, run_git=run_git)
+    assert (built.base, built.head, built.tree, built.other) == (
+        merge_queue_template.base, merge_queue_template.head,
+        merge_queue_template.tree, merge_queue_template.other)
+    assert not list(tmp_path.glob("redirected-*"))
+
+
+def test_queue_seed_passes_its_environment_to_every_graph_command(tmp_path):
+    if shutil.which("git") is None:
+        pytest.skip("needs git")
+    source, _ = _hostile_launcher_source(tmp_path / "launcher", "sha256")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    expected = queue_seed_env(repo, source)
+    calls = []
+
+    def audit_git(cwd, *args, data=None, env=None):
+        assert cwd == repo and env == expected
+        calls.append(args)
+        return git(cwd, *args, data=data, env=env)
+
+    build_merge_queue_graph(repo, source, run_git=audit_git)
+    assert calls[0] == ("init", "-q", "--object-format=sha1", "--template=", "-b", "main")
+    assert [args[0] for args in calls] == [
+        "init", "add", "commit", "rev-parse", "checkout", "add", "commit", "rev-parse",
+        "rev-parse", "checkout", "add", "commit", "rev-parse",
+    ]
+
+
+def test_sha256_probe_propagates_unrelated_git_failure(tmp_path):
+    failure = subprocess.CalledProcessError(128, ["git"], stderr=b"fatal: cannot read config\n")
+
+    def failing_git(*args, **kwargs):
+        raise failure
+
+    with pytest.raises(subprocess.CalledProcessError) as caught:
+        _sha256_supported(tmp_path, run_git=failing_git)
+    assert caught.value is failure
+
+
+@pytest.mark.parametrize("returncode, stderr", [
+    (128, b"fatal: unknown hash algorithm 'sha256'\n"),
+    (129, b"error: unknown option `object-format=sha256'\nusage: git init\n"),
+], ids=["unknown-hash", "unknown-option"])
+def test_sha256_probe_reports_recognized_unsupported_git(tmp_path, returncode, stderr):
+    def unsupported_git(repo, *args, env):
+        assert args == ("init", "-q", "--object-format=sha256", "--template=")
+        assert env == queue_seed_env(repo)
+        raise subprocess.CalledProcessError(returncode, ["git"], stderr=stderr)
+
+    assert not _sha256_supported(tmp_path, run_git=unsupported_git)
+
+
+@pytest.mark.parametrize("shown", [b"sha256\n", b"sha1\n"], ids=["sha256", "wrong-format"])
+def test_sha256_probe_checks_the_created_object_format(tmp_path, shown):
+    calls = []
+
+    def probe_git(repo, *args, env):
+        calls.append(args)
+        assert env == queue_seed_env(repo)
+        return shown if args[0] == "rev-parse" else b""
+
+    if shown == b"sha256\n":
+        assert _sha256_supported(tmp_path, run_git=probe_git)
+    else:
+        with pytest.raises(AssertionError):
+            _sha256_supported(tmp_path, run_git=probe_git)
+    assert calls == [("init", "-q", "--object-format=sha256", "--template="),
+                     ("rev-parse", "--show-object-format")]
+
+
+def test_queue_seed_env_drops_launcher_hash_encoding_and_template(tmp_path):
+    """Invariant: the seed env has no launcher config, no template, and sha1."""
+    source, hostile_template = _hostile_launcher_source(tmp_path, "sha256")
+    source.update(GiT_TrAcE=str(tmp_path / "trace"), GiT_DiR=str(hostile_template),
+                  home=source["HOME"], xdg_config_home=source["XDG_CONFIG_HOME"],
+                  PATH="launcher-path", SystemRoot="launcher-system-root")
+    repo = tmp_path / "repo"
+    env = queue_seed_env(repo, source)
+    assert env["PATH"] == source["PATH"] and env["SystemRoot"] == source["SystemRoot"]
+    assert env["GIT_DEFAULT_HASH"] == "sha1"
+    assert [key for key in env if key.casefold() == "git_default_hash"] == ["GIT_DEFAULT_HASH"]
+    assert env["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert env["GIT_CONFIG_SYSTEM"] == os.devnull
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert env["GIT_ATTR_NOSYSTEM"] == "1"
+    assert Path(env["HOME"]) == tmp_path / "repo-seed-home"
+    assert Path(env["XDG_CONFIG_HOME"]) == Path(env["HOME"]) / ".config"
+    assert list(Path(env["HOME"]).iterdir()) == [Path(env["XDG_CONFIG_HOME"])]
+    assert not any(Path(env["XDG_CONFIG_HOME"]).iterdir())
+    folded = {key.casefold() for key in env}
+    assert {key for key in folded if key.startswith("git_")} == {
+        "git_author_name", "git_author_email", "git_author_date", "git_committer_name",
+        "git_committer_email", "git_committer_date", "git_config_global", "git_config_system",
+        "git_config_nosystem", "git_attr_nosystem", "git_default_hash",
+    }
+    assert "home" not in env and "xdg_config_home" not in env
+    assert env["GIT_AUTHOR_NAME"] == env["GIT_COMMITTER_NAME"] == "Test"
+    assert env["GIT_AUTHOR_DATE"] == env["GIT_COMMITTER_DATE"] == "1700000000 +0000"
+
+
+@pytest.mark.parametrize("object_format", ["sha1", "sha256"])
+def test_queue_graph_ids_ignore_launcher_hash_and_global_encoding(
+        tmp_path, merge_queue_template, object_format):
+    """Invariant: varying GIT_DEFAULT_HASH and a global i18n.commitEncoding keeps four ids.
+
+    The sha256 variant is skipped, with a stated reason, when this git cannot
+    create a sha256 repository. The commit object stays a sha1 id with no
+    encoding header.
+    """
+    source, _hostile = _hostile_launcher_source(tmp_path / "launcher", object_format)
+    attributes = Path(source["XDG_CONFIG_HOME"]) / "git" / "attributes"
+    attributes.write_text("a working-tree-encoding=UTF-16LE\n", encoding="ascii")
+    source.update(GIT_DIR=str(tmp_path / "redirected-git"),
+                  GIT_INDEX_FILE=str(tmp_path / "redirected-index"),
+                  GIT_OBJECT_DIRECTORY=str(tmp_path / "redirected-objects"))
+    if object_format == "sha256" and not _sha256_supported(tmp_path, source):
+        pytest.skip("installed git has no sha256 support")
+
+    def build(name, env):
+        repo = tmp_path / name
+        repo.mkdir()
+        return build_merge_queue_graph(repo, env)
+
+    clean = build("reference", None)
+    built = build("fresh", source)
+    retry = build("retry", source)
+    start = Barrier(2)
+
+    def concurrent(name):
+        start.wait(timeout=30)
+        return build(name, source)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        left, right = tuple(pool.map(concurrent, ("left", "right")))
+    expected = (clean.base, clean.head, clean.tree, clean.other)
+    for graph in (merge_queue_template, built, retry, left, right):
+        assert (graph.base, graph.head, graph.tree, graph.other) == expected
+    assert not list(tmp_path.glob("redirected-*"))
+    repo = built.repo
+    assert len(built.base) == 40 and len(built.tree) == 40
+    assert (repo / ".git" / "info").is_dir()
+    assert not (repo / ".git" / "description").exists()
+    env = queue_seed_env(repo, source)
+    shown = git(repo, "rev-parse", "--show-object-format", env=env).decode().strip()
+    assert shown == "sha1"
+    raw = git(repo, "cat-file", "commit", built.base, env=env)
+    assert b"\nencoding " not in raw
+    pinned_author = b"author Test <test@example.com> 1700000000 +0000"
+    pinned_committer = b"committer Test <test@example.com> 1700000000 +0000"
+    for oid in (built.base, built.head, built.other):
+        assert _commit_identity(repo, oid, env) == (pinned_author, pinned_committer)
+    assert state(merge_queue_template) == merge_queue_template.baseline
+
+
+def test_rig_capability_checks_run_before_copy_or_queue_template(tmp_path, request, monkeypatch):
+    monkeypatch.setattr(helpers_team_git, "team_git", SimpleNamespace(descriptor_support=lambda: False))
+    reason = "snapshot requires descriptor-relative no-follow opens and bound executables"
+    with pytest.raises(pytest.skip.Exception, match=reason):
+        request.getfixturevalue("rig")
+    # A source object without a repo would fail if the copy ran before the guard.
+    with pytest.raises(pytest.skip.Exception, match=reason):
+        with copied_rig(object(), tmp_path):
+            pytest.fail("unsupported platform yielded a custody rig")
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(("fixture_name", "template_name"), [
+    pytest.param("rig", "merge_queue_template", id="queue"),
+    pytest.param("custody_rig", "rig_template", id="custody"),
+    pytest.param("custody_checks_rig", "rig_template", id="custody-checks"),
+])
+def test_fixture_yields_template_bytes(request, fixture_name, template_name):
+    candidate = request.getfixturevalue(fixture_name)
+    template = request.getfixturevalue(template_name)
+    assert state(candidate) == template.baseline
 
 
 def test_failed_copy_leaves_the_template_unchanged_and_retry_matches(tmp_path, merge_queue_template):
@@ -222,6 +560,198 @@ def test_failed_copy_leaves_the_template_unchanged_and_retry_matches(tmp_path, m
     assert state(SimpleNamespace(repo=repo)) == merge_queue_template.baseline
     assert state(SimpleNamespace(repo=retried)) == merge_queue_template.baseline
     assert repo != retried
+
+
+def test_partial_copy_keeps_source_and_sibling_bytes_and_retry_matches(tmp_path, merge_queue_template):
+    """Invariant: a checked copy can fail partway without changing source bytes or another copy."""
+    sibling = copy_immutable_repo(merge_queue_template, tmp_path)
+    sibling_before = state(SimpleNamespace(repo=sibling))
+    source_base = (merge_queue_template.repo / "base").read_bytes()
+    copied = []
+
+    def copy_file(source, destination, *, follow_symlinks=True):
+        if copied:
+            raise OSError("injected partial copy failure")
+        shutil.copy2(source, destination, follow_symlinks=follow_symlinks)
+        copied.append(Path(destination))
+
+    def corrupt_base(source, destination, *, follow_symlinks=True):
+        shutil.copy2(source, destination, follow_symlinks=follow_symlinks)
+        if Path(source).name == "base":
+            Path(destination).write_bytes(b"not-the-template\n")
+
+    partial = tmp_path / "partial"
+    partial.mkdir()
+    with pytest.raises(shutil.Error):
+        copy_immutable_repo(merge_queue_template, partial, copy_file=copy_file)
+    assert copied and copied[0].is_file()
+    assert state(SimpleNamespace(repo=partial / "repo")) != merge_queue_template.baseline
+    assert (merge_queue_template.repo / "base").read_bytes() == source_base
+    assert state(merge_queue_template) == merge_queue_template.baseline
+    assert state(SimpleNamespace(repo=sibling)) == sibling_before
+    mismatched = tmp_path / "mismatched"
+    mismatched.mkdir()
+    with pytest.raises(AssertionError):
+        copy_immutable_repo(merge_queue_template, mismatched, copy_file=corrupt_base)
+    assert (mismatched / "repo" / "base").read_bytes() == b"not-the-template\n"
+    assert (merge_queue_template.repo / "base").read_bytes() == source_base
+    assert state(SimpleNamespace(repo=sibling)) == sibling_before
+    retry_dir = tmp_path / "after-failure"
+    retry_dir.mkdir()
+    retried = copy_immutable_repo(merge_queue_template, retry_dir)
+    assert state(SimpleNamespace(repo=retried)) == merge_queue_template.baseline
+    assert (retried / "base").read_bytes() == source_base
+
+
+class _FalseyCopy:
+    """A callable whose bool is false. The helper must still invoke it."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def __bool__(self):
+        return False
+
+    def __call__(self, source, destination, *, follow_symlinks=True):
+        self.calls += 1
+        return shutil.copy2(source, destination, follow_symlinks=follow_symlinks)
+
+
+def test_falsey_copy_file_is_used(tmp_path, merge_queue_template):
+    """Invariant: shutil.copy2 is selected only when copy_file is None."""
+    copier = _FalseyCopy()
+    destination = tmp_path / "falsey"
+    destination.mkdir()
+    repo = copy_immutable_repo(merge_queue_template, destination, copy_file=copier)
+    assert copier.calls > 0
+    assert state(SimpleNamespace(repo=repo)) == merge_queue_template.baseline
+    assert state(merge_queue_template) == merge_queue_template.baseline
+
+
+_INJECTED_COPY_ERROR = "injected partial copy failure"
+
+
+def _copy_that_pauses_after_first_file(release):
+    """Copy one file and wait for the sibling before injecting the copy error."""
+    entered = Event()
+    copied = {}
+
+    def copy_file(source, destination, *, follow_symlinks=True):
+        if "path" not in copied:
+            shutil.copy2(source, destination, follow_symlinks=follow_symlinks)
+            copied.update(path=Path(destination), source=Path(source))
+            entered.set()
+            assert release.wait(timeout=30), "sibling did not finish while the partial copy was pending"
+        raise OSError(_INJECTED_COPY_ERROR)
+
+    return copy_file, entered, copied
+
+
+def test_partial_copy_pause_timeout_is_not_an_injected_copy_error(tmp_path):
+    source = tmp_path / "source"
+    source.write_bytes(b"one file\n")
+    destination = tmp_path / "destination"
+    copy_file, entered, _ = _copy_that_pauses_after_first_file(
+        SimpleNamespace(wait=lambda *, timeout: False))
+    with pytest.raises(AssertionError, match="sibling did not finish"):
+        copy_file(source, destination)
+    assert entered.is_set() and destination.read_bytes() == source.read_bytes()
+
+
+@contextmanager
+def _paused_copy_failure(open_failed_rig, failed_dir, template):
+    release = Event()
+    copy_file, entered, copied = _copy_that_pauses_after_first_file(release)
+
+    def fail():
+        with open_failed_rig(copy_file) as candidate:
+            pytest.fail("partial copy yielded a rig")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(fail)
+        try:
+            assert entered.wait(timeout=30), "failing copy did not pause after its first file"
+            assert copied["path"].read_bytes() == copied["source"].read_bytes()
+            yield
+            assert not future.done(), "failing copy finished before the sibling"
+        finally:
+            release.set()
+        with pytest.raises(shutil.Error) as caught:
+            future.result(timeout=30)
+        errors, = caught.value.args
+        assert {message for _, _, message in errors} == {_INJECTED_COPY_ERROR}
+    assert copied["path"].read_bytes() == copied["source"].read_bytes()
+    assert state(SimpleNamespace(repo=failed_dir / "repo")) != template.baseline
+    assert list(failed_dir.iterdir()) == [failed_dir / "repo"]
+
+
+def test_concurrent_partial_copy_isolates_the_sibling(tmp_path, request):
+    failed_dir = tmp_path / "fail"
+    context = _queue_store(failed_dir / "repo")
+    template = request.getfixturevalue("merge_queue_template")
+    failed_dir.mkdir()
+    source_base = (template.repo / "base").read_bytes()
+    early_dir = tmp_path / "early"
+    early_dir.mkdir()
+    early = SimpleNamespace(repo=copy_immutable_repo(template, early_dir))
+    early_before = state(early)
+
+    def failing_rig(copy_file):
+        return _queue_rig(template, failed_dir, context, copy_file=copy_file)
+
+    with _paused_copy_failure(failing_rig, failed_dir, template):
+        sibling = request.getfixturevalue("rig")
+        sibling_state = state(sibling)
+        assert sibling_state == template.baseline
+        assert (template.repo / "base").read_bytes() == source_base
+    assert state(sibling) == sibling_state
+    assert state(early) == early_before
+    assert (template.repo / "base").read_bytes() == source_base
+    assert state(template) == template.baseline
+    retry_dir = tmp_path / "retry"
+    retry_dir.mkdir()
+    with _queue_rig(template, retry_dir, _queue_store(retry_dir / "repo")) as retried:
+        assert state(retried) == template.baseline
+        assert (retried.repo / "base").read_bytes() == source_base
+        scratch = retried.store.scratch
+    assert not scratch.exists()
+
+
+def test_copied_rig_partial_failure_does_not_yield_and_retry_is_isolated(tmp_path, rig_template):
+    source_base = (rig_template.repo / "src" / "a.py").read_bytes()
+    failed = tmp_path / "failed"
+    failed.mkdir()
+    sibling_dir = tmp_path / "sibling"
+    sibling_dir.mkdir()
+
+    def failing_rig(copy_file):
+        return copied_rig(rig_template, failed, copy_file=copy_file)
+
+    with ExitStack() as rigs:
+        with _paused_copy_failure(failing_rig, failed, rig_template):
+            sibling = rigs.enter_context(copied_rig(rig_template, sibling_dir))
+            sibling_bytes = (sibling.repo / "src" / "a.py").read_bytes()
+            sibling_state = state(sibling)
+            sibling_scratch = sibling.store.scratch
+            assert sibling_bytes == source_base
+            assert sibling_state == rig_template.baseline
+            assert sibling_scratch.exists()
+            assert (rig_template.repo / "src" / "a.py").read_bytes() == source_base
+
+        assert state(sibling) == sibling_state
+        assert (sibling.repo / "src" / "a.py").read_bytes() == sibling_bytes
+        assert state(rig_template) == rig_template.baseline
+        assert (rig_template.repo / "src" / "a.py").read_bytes() == source_base
+        retry_dir = tmp_path / "retry"
+        retry_dir.mkdir()
+        with copied_rig(rig_template, retry_dir) as retried:
+            assert (retried.repo / "src" / "a.py").read_bytes() == source_base
+            assert state(retried) == rig_template.baseline
+            retry_scratch = retried.store.scratch
+            assert retry_scratch != sibling_scratch
+            assert retry_scratch.exists() and sibling_scratch.exists()
+        assert not retry_scratch.exists() and sibling_scratch.exists()
+    assert not sibling_scratch.exists()
 
 
 def test_concurrent_copies_mutate_only_their_own_bytes(tmp_path, merge_queue_template):
