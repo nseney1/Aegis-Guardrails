@@ -1,6 +1,7 @@
-"""The one secret-redaction table and its entry points (L0: the standard library only).
+"""The shared secret-redaction entry points (L0).
 
-Every text Aegis persists or echoes goes through this table: the hook command log
+The table lives in redaction_patterns and is re-exported here. Text Aegis persists
+or echoes goes through it: the hook command log
 (``redact_command_secrets``, through aegis_cli.hooks.redaction), stored insight text
 (``redact_insight_text``) and the snippet of a secret finding (aegis_core.verification.scanners
 masks with ``TOKEN_REDACTIONS`` and ``is_high_entropy_secret``). URL credential removal
@@ -14,6 +15,14 @@ import math
 import re
 import unicodedata
 from typing import Any
+
+from aegis_core.redaction_patterns import (
+    CONTROL_RE,
+    CANDIDATE_TOKEN_RE, HEX_UUID_RE as _HEX_UUID_RE, HIGH_ENTROPY_MASK as _HIGH_ENTROPY_MASK,
+    PEM_TAIL as _PEM_TAIL, PII_REDACTIONS as _PII_REDACTIONS, RedactionRefusal,
+    SECRET_REDACTIONS as _SECRET_REDACTIONS, SECRET_REPLACEMENTS,
+    TEXT_REDACTIONS as _TEXT_REDACTIONS, TOKEN_REDACTIONS, URL_USERINFO_RE,
+)
 
 __all__ = [
     "CANDIDATE_TOKEN_RE",
@@ -49,64 +58,6 @@ __all__ = [
 # (at least this many characters), and a scanner finding on a longer line shows the masked token alone.
 MAX_LINE_LENGTH = 4096
 MAX_EXCERPT_CHARS = 300
-
-_NB = r"(?<![A-Za-z0-9])"
-_PEM_HEAD = r"-----BEGIN (?P<pem_label>(?:[A-Z0-9]+ ){0,4}PRIVATE KEY(?: BLOCK)?)-----"
-_PEM_TAIL = r"-----END (?:[A-Z0-9]+ ){0,4}PRIVATE KEY(?: BLOCK)?-----"
-_KEYS = ("(?:password|passwd|pwd|secret|token|api_?key|access_?key|private_?key|client_?secret|credential|"
-         "authorization|auth(?![A-Za-z]))")
-_SCHEMES = "(?:basic|digest|token|negotiate)"
-_URL_USERINFO = re.compile(
-    "(?i)((?:" + _NB + "[a-z][a-z0-9+.-]{0,31})?://[^\\s:/@]{1,128}:)[^\\s@/]{1,512}@")
-URL_USERINFO_RE = _URL_USERINFO
-# Built by concatenation, never as an rf-string: f-string formatting turns a {4,} quantifier
-# into the tuple "(4,)". Token quantifiers are bounded; PEM consumes once to its END or EOF.
-_SECRET_REDACTIONS: tuple[tuple[re.Pattern[str], str, str], ...] = tuple(
-    (re.compile(pattern), hook, text) for pattern, hook, text in (
-        # Only the BEGIN label's own END closes a key; otherwise the suffix stays untrusted. EOF matches,
-        # so repeated BEGIN markers cannot retry scans over the same unterminated body.
-        (_PEM_HEAD + r"[\s\S]*?(?:-----END (?P=pem_label)-----|\Z)", "[REDACTED_PEM]", "[REDACTED_PEM]"),
-        # The scheme is optional because Tier A blocks a bare "://user:<password>@host" too.
-        (_URL_USERINFO.pattern, r"\1[REDACTED]@",
-         r"\1[REDACTED]@"),
-        (_NB + r"eyJ[A-Za-z0-9_-]{8,512}\.[A-Za-z0-9_-]{4,1024}\.[A-Za-z0-9_-]{4,512}", "[REDACTED_JWT]",
-         "[REDACTED_JWT]"),
-        (_NB + "AKIA[0-9A-Z]{16}", "AKIA_REDACTED", "[REDACTED_AWS]"),
-        (_NB + "ASIA[0-9A-Z]{16}", "ASIA_REDACTED", "[REDACTED_AWS]"),
-        (_NB + "(?:AGPA|AIDA|AROA|ANPA|ANVA|AIPA)[0-9A-Z]{16}", "[REDACTED_AWS]", "[REDACTED_AWS]"),
-        (_NB + "ghp_[A-Za-z0-9]{20,255}", "ghp_REDACTED", "[REDACTED_VCS_TOKEN]"),
-        (_NB + "gh[ousr]_[A-Za-z0-9]{20,255}", "gh_token_REDACTED", "[REDACTED_VCS_TOKEN]"),
-        (_NB + "github_pat_[A-Za-z0-9_]{20,255}", "github_pat_REDACTED", "[REDACTED_VCS_TOKEN]"),
-        (_NB + "glpat-[A-Za-z0-9_-]{16,255}", "[REDACTED_VCS_TOKEN]", "[REDACTED_VCS_TOKEN]"),
-        (_NB + "(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{16,99}", "[REDACTED_API_KEY]", "[REDACTED_API_KEY]"),
-        (_NB + "sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,255}", "sk-REDACTED", "[REDACTED_API_KEY]"),
-        (_NB + "AIza[A-Za-z0-9_-]{25,255}", "AIzaSy_REDACTED", "[REDACTED_TOKEN]"),
-        (_NB + "(?:xox[abprs]-[A-Za-z0-9-]{10,255}|npm_[A-Za-z0-9]{20,255}|pypi-[A-Za-z0-9_-]{20,255})",
-         "[REDACTED_TOKEN]", "[REDACTED_TOKEN]"),
-        ("(?i)" + _NB + r"Bearer\s{1,8}[A-Za-z0-9._~+/=-]{16,1024}", "Bearer REDACTED", "Bearer [REDACTED]"),
-        # key=value and key: value; an Authorization scheme word is kept and its credential goes.
-        ("(?i)(" + _NB + "[A-Za-z0-9_]{0,32}" + _KEYS + "[A-Za-z0-9_]{0,32}[\"']?\\s{0,8}(?:=|:)\\s{0,8}[\"']?"
-         "(?:" + _SCHEMES + "\\s{1,8})?)(?!" + _SCHEMES + "\\b)([^\\s\"',;]{4,512})", r"\1REDACTED", r"\1[REDACTED]"),
-        # "the password is hunter2": the narrow keys only, so "the auth is broken" stays.
-        ("(?i)(" + _NB + "(?:password|passwd|pwd|secret|token|api key|private key)\\s{1,8}is\\s{1,8}[\"']?)"
-         "([^\\s\"',;]{6,512})", r"\1REDACTED", r"\1[REDACTED]"),
-    ))
-#: The hook-log form of the table: (pattern, replacement), applied in order.
-SECRET_REPLACEMENTS: list[tuple[re.Pattern[str], str]] = [(p, hook) for p, hook, _ in _SECRET_REDACTIONS]
-#: Personal data, scrubbed from stored insights only: the hook log keeps paths and addresses.
-_PII_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,255}\.[A-Za-z]{2,63}(?![A-Za-z0-9])"),
-     "[REDACTED_EMAIL]"),
-    (re.compile(r"(?<=/home/)[^/\s]{1,255}|(?<=/Users/)[^/\s]{1,255}|(?<=C:\\Users\\)[^\\\s]{1,255}"), "~user"),
-    (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "[REDACTED_IP]"),
-)
-_TEXT_REDACTIONS = tuple((p, text) for p, _, text in _SECRET_REDACTIONS) + _PII_REDACTIONS
-# The single-token rows, safe over a snippet that already carries masks: PEM spans lines, and the URL
-# userinfo and keyed rows (the ones with a backreference) rewrite whatever follows, masks included.
-TOKEN_REDACTIONS = tuple((p, text) for p, _, text in _SECRET_REDACTIONS if "\\1" not in text and text != "[REDACTED_PEM]")
-_HEX_UUID_RE = re.compile(r"^(?:[0-9a-fA-F]{7,64}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$")
-CANDIDATE_TOKEN_RE = re.compile(r"[A-Za-z0-9+_=-]{20,}")
-_HIGH_ENTROPY_MASK = "[REDACTED_HIENT]"
 
 
 def _mask_grammar():
@@ -159,67 +110,72 @@ def redact_command_secrets(cmd: str) -> str:
     return cmd
 
 
-def _bounded_head(text: str, limit: int) -> str:
+def _bounded_head(text: str, limit: int, *, on_replacements=None) -> str:
     """The whole words of ``text`` up to about ``limit`` characters. A secret cut in half
     would no longer match its pattern, so a word the cut splits is dropped, as is a trailing
-    PEM header whose END lies past the cut."""
-    raw = text[: limit + 1]
-    words = raw.split()
-    if words and not raw[-1].isspace():
-        words.pop()
-    head = " ".join(words)
+    PEM header whose END lies past the cut. Withhold an inconclusive tail candidate."""
+    from aegis_core.primitives import redact_display_secrets
+
+    # Bound allocation before any detector or display parsing.
+    raw = text[:limit + 1]
+    tail_candidates = _tail_candidates if CONTROL_RE.search(raw) is not None else None
+    raw = redact_display_secrets(raw, limit=limit + 1, extra_spans=_text_spans(raw), protected_spans=_mask_spans(raw), scan_text=_text_spans,
+                                  on_replacements=on_replacements, bound=True, tail_candidates=tail_candidates)
+    head = " ".join(raw.split())
+    # Replacements may expand a retained word. Keep the formatted head bounded
+    # too, so another pass cannot discard a new tail or split a mask atom.
+    if len(head) > limit:
+        head = head[:limit + 1]
+        last_word = re.search(r"\S+\Z", head)
+        head = head[:last_word.start()].rstrip() if last_word else head.rstrip()
     begin = head.rfind("-----BEGIN")
     # Drop the trailing incomplete block before redaction; only a whole END marker closes it.
     # The join turned newlines into single spaces.
     return head[:begin].rstrip() if begin != -1 and not re.search(_PEM_TAIL, head[begin:]) else head
 
 
-def _sub_replacements(pattern, replacement, text, on_replacements):
-    """Substitute once and report only changed spans, never matched secrets.
+def _tail_candidates(text):
+    """The deleted-view token at a joining run; genuine whitespace ends it."""
+    token = re.search(r"\S+\Z", text)
+    if token is not None:
+        yield token.start()
 
-    Only explicit backreference context stays outside a replacement interval.
-    Equal characters at a mask edge are still secret source units, not context.
-    """
+
+def _text_spans(text):
+    """Collect entropy/privacy spans before masking, on raw and both display views."""
     spans = []
+    # A home component owns addresses within it, preserving the historical
+    # final ~user spelling without matching against a replacement's bytes.
+    for pattern, replacement in sorted(_PII_REDACTIONS, key=lambda row: row[1] != "~user"):
+        spans.extend((match.start(), match.end(), replacement) for match in pattern.finditer(text)
+                     if match.group() != replacement)
+    spans.extend((match.start(), match.end(), _HIGH_ENTROPY_MASK) for match in CANDIDATE_TOKEN_RE.finditer(text)
+                 if is_high_entropy_secret(match.group()))
+    return tuple(spans)
 
-    def substitute(match):
-        before = match.group(0)
-        after = replacement(match) if callable(replacement) else match.expand(replacement)
-        if before != after:
-            start, end, payload = match.start(), match.end(), after
-            if isinstance(replacement, str) and replacement.startswith(r"\1"):
-                start = match.end(1)
-                payload = match.expand(replacement[2:])
-                if replacement.endswith("@"):
-                    end -= 1
-                    payload = payload[:-1]
-            spans.append((start, end, payload))
-        return after
 
-    out = pattern.sub(substitute, text)
-    if spans:
-        on_replacements(tuple(spans))
-    return out
+def _mask_spans(text):
+    """Carry existing mask atoms at known-span priority without changing them."""
+    return tuple((match.start(), match.end(), match.group()) for match in REDACTION_MASK_RE.finditer(text))
 
 
 def redact_insight_text(text: str, max_len: int = MAX_EXCERPT_CHARS, *, on_replacements=None) -> str:
     """Scrub secrets, PII, paths, IPs, and high-entropy tokens from insight text; past
     ``max(MAX_LINE_LENGTH, 4 * max_len)`` characters only a whole-word head is kept.
 
-    An optional callback receives ordered (start, end, replacement) tuples after
-    each substitution pass, relative to that pass's bounded input. Only changed
-    intervals are reported. Initial bounding and final whitespace/excerpt
+    An optional callback receives the union's ordered (start, end, replacement)
+    tuples relative to original bounded input, once before replacement. Only
+    changed intervals are reported. Initial bounding and final whitespace/excerpt
     formatting are not events. Callback failures propagate without a result.
     """
     if not isinstance(text, str) or not text:
         return ""
+    from aegis_core.primitives import redact_display_secrets
+
     limit = max(MAX_LINE_LENGTH, 4 * max_len)
-    out = text if len(text) <= limit else _bounded_head(text, limit)
-    for pat, repl in _TEXT_REDACTIONS:
-        out = pat.sub(repl, out) if on_replacements is None else _sub_replacements(pat, repl, out, on_replacements)
-    entropy = lambda m: _HIGH_ENTROPY_MASK if is_high_entropy_secret(m.group(0)) else m.group(0)
-    out = CANDIDATE_TOKEN_RE.sub(entropy, out) if on_replacements is None else \
-        _sub_replacements(CANDIDATE_TOKEN_RE, entropy, out, on_replacements)
+    out = (redact_display_secrets(text, limit=limit, extra_spans=_text_spans(text), protected_spans=_mask_spans(text), scan_text=_text_spans,
+                                 on_replacements=on_replacements)
+           if len(text) <= limit else _bounded_head(text, limit, on_replacements=on_replacements))
     out = " ".join(out.split())
     if max_len > 0 and len(out) > max_len:
         sliced = out[:max_len]
@@ -601,14 +557,6 @@ def guidance_field(value, separators=(), *, canonicalize):
 _CLEANER_INPUT_MAX = max(MAX_LINE_LENGTH, MAX_GUIDANCE_CHARS)
 _CLEANER_GUIDANCE_INPUT_MAX = 1024 * 1024
 _URL_CLOSERS = ")]}>.,;:!?`'\""
-
-
-class RedactionRefusal(ValueError):
-    """Shared-cleaner refusal. The message is ``invalid`` or ``too_large``, never input."""
-
-    def __init__(self, code):
-        self.code = code
-        super().__init__(code)
 
 
 # Complete ``[REDACTED...]`` atoms. Clipping and proposal parameter stripping share it.

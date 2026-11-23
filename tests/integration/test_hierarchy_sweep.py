@@ -4,13 +4,11 @@ Hosts are the fake host on PATH, which reads and replies through the real adapte
 the tools work together, not that real sessions behave this way.
 """
 from datetime import datetime, timedelta, timezone
-import errno
 import hashlib
 import inspect
 import json
 import os
 from pathlib import Path
-import select
 import shutil
 import signal
 import stat
@@ -21,10 +19,9 @@ import uuid
 
 import pytest
 
-from tests.integration.test_hierarchy_background import STUB
+from tests.helpers_mailbox_index import make_mailbox, publish
 from tests.integration.test_hierarchy_delivery import HELPER
 from tests.integration.test_hierarchy_mailbox import ROOT, git, invoke
-from tests.integration.test_hierarchy_mailbox_index_reuse import make_mailbox, publish
 from tests.integration.test_hierarchy_provision import INITIATIVE, LANES, Setup, provision
 from tests.conftest import symlink_or_skip
 
@@ -455,59 +452,77 @@ def test_a_session_with_unread_mail_is_woken_and_reads_it(fleet):
     assert "mailbox_inbox" in launched[0]["stdin"]
 
 
+
 @posix_only
 @pytest.mark.parametrize("state", ["alive", "exited", "assertion_failure", "exit_race", "permission_error"])
 def test_background_mode_holder_cleanup_only_signals_live_handles(state):
-    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
-    signals = []
+    signals, injected = [], []
 
     def signal_group(pid, sig):
-        assert holder.returncode is None and holder.poll() is None, "signalled a reaped holder"
-        assert pid == holder.pid
+        held = custody.status("holder")
+        assert held.returncode is None and pid == held.pid, "signalled a reaped holder"
         signals.append((pid, sig))
-        if state == "exit_race":
-            if holder.poll() is None:
-                holder.kill()
-            holder.wait(timeout=5)
-            raise ProcessLookupError("holder exited before group signal")
-        if state == "permission_error":
+        if state == "permission_error" and not injected:
+            injected.append(True)
             raise PermissionError("group signal denied")
         os.killpg(pid, sig)
+        if state == "exit_race" and not injected:
+            injected.append(True)
+            raise ProcessLookupError("holder exited before group signal")
 
-    try:
-        if state == "exited":
-            if holder.poll() is None:
-                holder.kill()
-            holder.wait(timeout=5)
+    with BackgroundReaderCustody(signal_group) as custody:
+        custody.start("holder", [sys.executable, "-c", "import time; time.sleep(60)"])
+        held = custody.status("holder")
         if state == "assertion_failure":
-            with pytest.raises(AssertionError, match="fixture assertion failed"):
+            with pytest.raises(AssertionError, match="^fixture assertion failed$"):
                 try:
                     raise AssertionError("fixture assertion failed")
                 finally:
-                    reap_background_mode_holder(holder, signal_group)
+                    custody.stop("holder")
+        elif state == "permission_error":
+            with pytest.raises(PermissionError, match="^group signal denied$"):
+                custody.stop("holder")
+            assert custody.status("holder").returncode is None
+            custody.stop("holder")
         else:
-            reap_background_mode_holder(holder, signal_group)
-        assert holder.returncode is not None
-        assert signals == ([] if state == "exited" else [(holder.pid, 9)])
-        reap_background_mode_holder(holder, signal_group)
-        assert signals == ([] if state == "exited" else [(holder.pid, 9)]), "retry signalled a reaped holder"
-    finally:
-        if holder.poll() is None:
-            holder.kill()
-        holder.wait(timeout=5)
+            custody.stop("holder")
+        assert custody.status("holder").returncode is not None
+        expected = [(held.pid, signal.SIGKILL)] * (2 if state == "permission_error" else 1)
+        assert signals == expected
+        custody.stop("holder")
+        assert signals == expected, "retry signalled a reaped holder"
 
 
-def reap_background_mode_holder(holder, signal_group, sig=9):
-    """Keep the OS signal boundary explicit so cleanup can be checked with real children."""
+def test_background_reader_exited_unreaped_leader_keeps_group_signal_custody():
+    import select
+
+    require_background_supervisor()
+    ready, writer = os.pipe()
+    signals = []
+
+    def signal_group(pid, sig):
+        held = custody.status("holder")
+        assert held.returncode is None and pid == held.pid
+        signals.append((pid, sig))
+        os.killpg(pid, sig)
+
     try:
-        if holder.poll() is None:
-            try:
-                signal_group(holder.pid, sig)
-            except (ProcessLookupError, PermissionError):
-                if holder.poll() is None:
-                    holder.kill()
+        with BackgroundReaderCustody(signal_group) as custody:
+            custody.start("holder", [sys.executable, "-c", "pass"], stdout=writer)
+            os.close(writer)
+            writer = None
+            assert select.select([ready], [], [], 5)[0], "child did not exit"
+            assert os.read(ready, 1) == b""
+            held = custody.status("holder")
+            assert held.returncode is None, "the exited leader must remain unreaped"
+            custody.stop("holder")
+            assert signals == [(held.pid, signal.SIGKILL)]
+            custody.stop("holder")
+            assert signals == [(held.pid, signal.SIGKILL)]
     finally:
-        holder.wait(timeout=5)
+        os.close(ready)
+        if writer is not None:
+            os.close(writer)
 
 
 @posix_only
@@ -519,468 +534,835 @@ def test_a_sweep_wake_in_background_mode_reports_the_idle_session_it_stopped(fle
     assert row["background"]["ended"] == "idle" and row["background"]["stop_confirmed"] is True, row
 
 
-def background_process_identity(pid, proc=Path("/proc")):
+def test_background_reader_fixture_has_no_linux_or_foreign_source_dependency():
+    import ast
+
+    source = inspect.getsource(background_reader_stub) + inspect.getsource(run_background_mode_sweep)
+    names = {node.id for node in ast.walk(ast.parse(source)) if isinstance(node, ast.Name)}
+    assert "STUB" not in names, "the sweep host must define its own protocol stub"
+    assert "require_background_reader_identity" not in names, "background coverage must run without Linux pidfds"
+
+
+def background_reader_stub():
+    """Independent host protocol; only the supervisor owns signalling authority."""
+    return r"""
+import json, os, stat, subprocess, sys, time, uuid
+from pathlib import Path
+state, words = Path(sys.argv[1]), sys.argv[2:]
+if words[0] == "turn":
+    identifier, mode, helper, root, endpoint, host, session, delivery = words[1:]
+    if mode == "reader":
+        frames = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                  {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                      "name": "mailbox_inbox", "arguments": {}}}]
+        subprocess.run([sys.executable, "-I", helper, "--root", root, "serve", "--endpoint", endpoint,
+                        "--host", host, "--session", session, "--generation", "1", "--delivery-dir", delivery],
+                       input="".join(json.dumps(frame) + "\n" for frame in frames),
+                       text=True, capture_output=True, check=True)
+        time.sleep(2.5)  # Stay busy across real host polls, then become idle.
+        path = state / (identifier + ".row")
+        row = json.loads(path.read_text())
+        row.update(status="idle", state="blocked")
+        temporary = path.with_suffix(".turn-tmp")
+        temporary.write_text(json.dumps(row))
+        temporary.replace(path)
+    while True:
+        time.sleep(1)
+request = state / "requests" / uuid.uuid4().hex
+temporary = request.with_suffix(".tmp")
+try:
+    payload = json.dumps(words).encode("utf-8")
+    if len(payload) > 65536:
+        sys.exit(7)
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NONBLOCK | os.O_NOFOLLOW, 0o600)
     try:
-        fields = (proc / str(pid) / "stat").read_text().rpartition(")")[2].split()
-    except (FileNotFoundError, ProcessLookupError):
-        return None
-    if len(fields) <= 19 or not fields[19].isdigit():
-        raise AssertionError("invalid process start identity")
-    return None if fields[0] in ("Z", "X") else int(fields[19])
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                sys.exit(7)
+            remaining = remaining[written:]
+    finally:
+        os.close(descriptor)
+    temporary.replace(request.with_suffix(".request"))
+except OSError:
+    sys.exit(7)
+reply = request.with_suffix(".reply")
+deadline = time.monotonic() + 10
+while not reply.exists():
+    if time.monotonic() >= deadline:
+        sys.exit(7)
+    time.sleep(0.01)
+try:
+    descriptor = os.open(reply, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 65536:
+            sys.exit(7)
+        payload = os.read(descriptor, 65537)
+        if len(payload) > 65536:
+            sys.exit(7)
+    finally:
+        os.close(descriptor)
+    response = json.loads(payload)
+    if (not isinstance(response, dict) or type(response.get("code")) is not int
+            or response["code"] not in (0, 7) or not isinstance(response.get("stdout"), str)):
+        sys.exit(7)
+    reply.unlink()
+except (OSError, ValueError, RecursionError):
+    sys.exit(7)
+print(response["stdout"], end="")
+sys.exit(response["code"])
+"""
 
 
-def background_reader_supported():
-    return sys.platform == "linux" and Path("/proc/self/stat").is_file()
 
+class BackgroundReaderCustody:
+    """The only owner of child handles, pidfds, group signals and reaping."""
 
-def require_background_reader_identity():
-    if not background_reader_supported():
-        pytest.skip("background reader cleanup needs Linux process start identities")
-    if not background_pidfd_supported():
-        raise RuntimeError("background reader cleanup requires pidfd signalling on " + sys.platform)
+    def __init__(self, signal_group=None, *, use_pidfd=None, open_pidfd=None, signal_pidfd=None):
+        import threading
+
+        self.lock = threading.RLock()
+        self._entries = {}
+        self._closed = False
+        self._signal_group = os.killpg if signal_group is None else signal_group
+        self._use_pidfd = background_pidfd_supported() if use_pidfd is None else use_pidfd
+        self._open_pidfd = open_pidfd
+        self._signal_pidfd = signal_pidfd
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def start(self, identifier, argv, **kwargs):
+        with self.lock:
+            if self._closed:
+                raise RuntimeError("background custody is closed")
+            previous = self._entries.get(identifier)
+            if previous is not None and previous["process"].returncode is None:
+                return False
+            if previous is None and len(self._entries) >= 32:
+                raise ValueError("background custody child limit")
+            child = subprocess.Popen(argv, start_new_session=True, **kwargs)
+            entry = {"process": child, "pidfd": None}
+            self._entries[identifier] = entry
+            try:
+                if self._use_pidfd:
+                    opener = os.pidfd_open if self._open_pidfd is None else self._open_pidfd
+                    entry["pidfd"] = opener(child.pid)
+            except BaseException:
+                self.stop(identifier)
+                raise
+            return True
+
+    def status(self, identifier):
+        with self.lock:
+            entry = self._entries.get(identifier)
+            if entry is None:
+                return None
+            child = entry["process"]
+            return SimpleNamespace(pid=child.pid, returncode=child.returncode, has_pidfd=entry["pidfd"] is not None)
+
+    def identifiers(self):
+        with self.lock:
+            return tuple(sorted(self._entries))
+
+    def signal_leader(self, identifier, sig):
+        with self.lock:
+            entry = self._entries[identifier]
+            child = entry["process"]
+            if child.returncode is not None:
+                return False
+            try:
+                if entry["pidfd"] is not None:
+                    sender = signal.pidfd_send_signal if self._signal_pidfd is None else self._signal_pidfd
+                    sender(entry["pidfd"], sig)
+                else:
+                    # The portable path still owns an unreaped Popen under this lock.
+                    self._signal_group(child.pid, sig)
+            except ProcessLookupError:
+                return False
+            return True
+
+    def stop(self, identifier, sig=9):
+        with self.lock:
+            entry = self._entries.get(identifier)
+            if entry is None:
+                return
+            child = entry["process"]
+            if child.returncode is None:
+                # Neither poll nor wait can release the leader between TERM and KILL.
+                signals = (signal.SIGTERM, signal.SIGKILL) if sig == signal.SIGTERM else (signal.SIGKILL,)
+                for requested in signals:
+                    if child.returncode is not None:
+                        break
+                    try:
+                        self._signal_group(child.pid, requested)
+                    except ProcessLookupError:
+                        pass
+                child.wait(timeout=5)
+            if entry["pidfd"] is not None:
+                os.close(entry["pidfd"])
+                entry["pidfd"] = None
+
+    def close(self):
+        from contextlib import ExitStack
+
+        with self.lock:
+            with ExitStack() as cleanup:
+                for identifier in self._entries:
+                    cleanup.callback(self.stop, identifier)
+            self._closed = True
 
 
 def background_pidfd_supported():
-    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
-        return False
-    try:
-        fd = os.pidfd_open(os.getpid())
-    except OSError:
-        return False
-    try:
-        signal.pidfd_send_signal(fd, 0)
-        return True
-    except OSError:
-        return False
-    finally:
-        os.close(fd)
+    return sys.platform == "linux" and hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")
 
 
-def observed_background_reader(state):
-    record = state / "reader-identity.json"
-    return json.loads(record.read_text()) if record.exists() else None
+class BackgroundReaderSupervisor:
+    """Stop the request worker before transferring its locked custody to teardown."""
 
+    def __init__(self, tmp_path, session, endpoint, signal_group=None):
+        import threading
 
-def stop_observed_background_reader(observed, signal_reader=None, identity=background_process_identity, timeout=5,
-                                    open_pidfd=None):
-    if observed is None:
-        return
-    pid, started_at = observed
-    if started_at is None:
-        return
-    require_background_reader_identity()
-    opener = os.pidfd_open if open_pidfd is None else open_pidfd
-    sender = signal.pidfd_send_signal if signal_reader is None else signal_reader
-    try:
-        fd = opener(pid)
-    except ProcessLookupError:
-        return
-    try:
-        if identity(pid) != started_at:
-            return
+        self.state = tmp_path / "background-state"
+        self.stub = tmp_path / "claude_stub.py"
+        self.session, self.endpoint = session, endpoint
+        self.custody = BackgroundReaderCustody(signal_group)
+        self.stopping = threading.Event()
+        self.thread = threading.Thread(target=self.serve)
+        self.errors = []
+        self.calls = []
+
+    def __enter__(self):
         try:
-            sender(fd, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-        if not select.select([fd], [], [], timeout)[0]:
-            raise TimeoutError("background reader did not exit")
-    finally:
-        os.close(fd)
+            self.state.mkdir()
+            (self.state / "requests").mkdir()
+            self.stub.write_text(background_reader_stub(), encoding="utf-8")
+            self.custody.start("old00000", [sys.executable, "-c", "import time; time.sleep(60)"])
+            self.save(self.row("old00000", "idle"))
+            self.thread.start()
+        except BaseException:
+            self.custody.close()
+            raise
+        return self
+
+    def read_json(self, path):
+        import time
+
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 65536:
+                raise ValueError("background frame must be a bounded regular file")
+            parts, length = [], 0
+            deadline = time.monotonic() + 1
+            while not self.stopping.is_set():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("background frame read timed out")
+                try:
+                    chunk = os.read(descriptor, min(8192, 65537 - length))
+                except BlockingIOError:
+                    self.stopping.wait(0.01)
+                    continue
+                length += len(chunk)
+                if length > 65536:
+                    raise ValueError("background frame exceeds limit")
+                if not chunk:
+                    return json.loads(b"".join(parts))
+                parts.append(chunk)
+            return None
+        finally:
+            os.close(descriptor)
+
+    def write_json(self, path, document, fail_at=None):
+        def step(name):
+            if fail_at == name:
+                raise OSError("reader publication " + name + " failed")
+
+        payload = json.dumps(document).encode("utf-8")
+        if len(payload) > 65536:
+            raise ValueError("background frame exceeds limit")
+        temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+        step("open")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NONBLOCK | os.O_NOFOLLOW, 0o600)
+        try:
+            try:
+                step("write")
+                remaining = memoryview(payload)
+                while remaining:
+                    written = os.write(descriptor, remaining)
+                    if written <= 0:
+                        raise OSError("background frame write made no progress")
+                    remaining = remaining[written:]
+            finally:
+                os.close(descriptor)
+            step("close")
+            step("rename")
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def serve(self):
+        while not self.stopping.wait(0.01):
+            for request in sorted((self.state / "requests").glob("*.request")):
+                if self.stopping.is_set():
+                    return
+                try:
+                    try:
+                        words = self.read_json(request)
+                        if words is None and self.stopping.is_set():
+                            return
+                        if (not isinstance(words, list) or not 1 <= len(words) <= 64
+                                or not all(isinstance(word, str) for word in words)):
+                            raise ValueError("background request must be a string list")
+                        response = self.dispatch(words)
+                    except (ValueError, OSError, RecursionError):
+                        response = {"code": 7, "stdout": ""}
+                    self.write_json(request.with_suffix(".reply"), response)
+                    request.unlink()
+                except BaseException as error:
+                    self.errors.append(error)
+                    self.stopping.set()
+                    return
+
+    def __exit__(self, *exc):
+        self.stopping.set()
+        self.thread.join(timeout=5)
+        if self.thread.is_alive():
+            # Custody remains held for a later close; a live worker grants no cleanup authority.
+            raise TimeoutError("background supervisor did not stop")
+        self.custody.close()
+        assert not self.errors, self.errors
+
+    def row(self, identifier, status):
+        child = self.custody.status(identifier)
+        return {"id": identifier, "sessionId": self.session, "status": status,
+                "state": "blocked" if status == "idle" else "working", "kind": "background",
+                "name": self.endpoint + "-g1", "pid": child.pid}
+
+    def save(self, row, fail_at=None):
+        self.write_json(self.state / (row["id"] + ".row"), row, fail_at)
+
+    def launch(self, words, fail_at=None):
+        if len(words) < 8:
+            return {"code": 7, "stdout": ""}
+        mode, helper, root, endpoint, host, session, delivery, record = words[:8]
+        identifier = session[:8]
+        with self.custody.lock:
+            previous = self.custody.status(identifier)
+            if previous is not None and previous.returncode is None:
+                return {"code": 7, "stdout": ""}
+            self.write_json(Path(record), {"argv": words})
+            self.custody.start(identifier, [sys.executable, str(self.stub), str(self.state), "turn", identifier, mode,
+                                          helper, root, endpoint, host, session, delivery],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                self.save(self.row(identifier, "busy"), fail_at)
+            except BaseException:
+                self.custody.stop(identifier)
+                raise
+        return {"code": 0, "stdout": identifier + "\n"}
+
+    def dispatch(self, words):
+        if words[0] != "control":
+            return self.launch(words)
+        if len(words) < 2:
+            return {"code": 7, "stdout": ""}
+        with self.custody.lock:
+            self.calls.append(words[1:])
+            self.write_json(self.state / "calls.log", self.calls)
+        if words[1] == "agents":
+            if (self.state / "fail-after-launch").exists() and len(self.custody.identifiers()) > 1:
+                return {"code": 7, "stdout": ""}
+            rows = [self.read_json(path) for path in sorted(self.state.glob("*.row"))]
+            if any(not isinstance(row, dict) or "status" not in row for row in rows):
+                return {"code": 7, "stdout": ""}
+            return {"code": 0, "stdout": json.dumps([row for row in rows if row["status"] != "stopped"])}
+        if words[1] == "stop" and len(words) == 3:
+            with self.custody.lock:
+                if self.custody.status(words[2]) is not None:
+                    self.custody.stop(words[2], signal.SIGTERM)
+                    self.save(self.row(words[2], "stopped"))
+            return {"code": 0, "stdout": ""}
+        return {"code": 7, "stdout": ""}
 
 
-@pytest.mark.parametrize("state", ["live", "gone", "reused", "exit_race", "denied", "timeout"])
-def test_background_reader_cleanup_checks_identity_and_bounds_exit(state):
-    require_background_reader_identity()
-    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
-    signals, descriptors = [], []
+def test_background_reader_shutdown_refuses_a_request_fifo_without_live_worker_cleanup(tmp_path):
+    import errno
+    import time
 
-    def open_bound(pid):
-        fd = os.pidfd_open(pid)
-        descriptors.append(fd)
-        return fd
-
-    def signal_reader(fd, sig):
-        assert holder.poll() is None
-        assert (holder.pid, background_process_identity(holder.pid)) == observed
-        signals.append((holder.pid, sig))
-        if state == "exit_race":
-            if holder.poll() is None:
-                holder.kill()
-            holder.wait(timeout=5)
-            raise ProcessLookupError("reader exited before group signal")
-        if state == "denied":
-            raise PermissionError("reader group signal denied")
-        if state != "timeout":
-            signal.pidfd_send_signal(fd, sig)
-
+    require_background_supervisor()
+    supervisor = BackgroundReaderSupervisor(tmp_path, "reader00-session", "pilot/orchestrator")
+    supervisor.__enter__()
+    request = supervisor.state / "requests" / "blocked.request"
+    reply = request.with_suffix(".reply")
+    writer = None
     try:
-        observed = (holder.pid, background_process_identity(holder.pid))
-        assert observed[1] is not None
-        if state == "gone":
-            reap_background_mode_holder(holder, os.killpg)
-        target = (holder.pid, observed[1] + 1) if state == "reused" else observed
-        if state in ("denied", "timeout"):
-            error, message = ((PermissionError, "reader group signal denied") if state == "denied"
-                              else (TimeoutError, "background reader did not exit"))
-            with pytest.raises(error, match="^" + message + "$"):
-                stop_observed_background_reader(target, signal_reader, timeout=0, open_pidfd=open_bound)
-            assert holder.poll() is None
-            reap_background_mode_holder(holder, os.killpg)
-        else:
-            stop_observed_background_reader(target, signal_reader, open_pidfd=open_bound)
-        if state == "reused":
-            assert holder.poll() is None, "a different start identity must remain untouched"
-        else:
-            holder.wait(timeout=5)
-        expected = [] if state in ("gone", "reused") else [(holder.pid, signal.SIGTERM)]
-        assert signals == expected
-        stop_observed_background_reader(target, signal_reader, open_pidfd=open_bound)
-        assert signals == expected, "cleanup retry must not signal a departed or different process"
-        for fd in descriptors:
-            with pytest.raises(OSError) as caught:
-                os.fstat(fd)
-            assert caught.value.errno == errno.EBADF
+        os.mkfifo(request)
+        deadline = time.monotonic() + 3
+        while not reply.exists():
+            try:
+                writer = os.open(request, os.O_WRONLY | os.O_NONBLOCK)
+                break
+            except OSError as error:
+                if error.errno == errno.ENOENT and reply.exists():
+                    break
+                assert error.errno == errno.ENXIO
+            assert time.monotonic() < deadline, "worker did not observe the request FIFO"
+            time.sleep(0.01)
+        supervisor.__exit__(None, None, None)
+        assert not supervisor.thread.is_alive(), "cleanup started with a live request worker"
     finally:
-        reap_background_mode_holder(holder, os.killpg)
+        if writer is not None:
+            try:
+                os.write(writer, b'["control", "stop", "old00000"]')
+            except BrokenPipeError:
+                pass
+            finally:
+                os.close(writer)
+        supervisor.thread.join(timeout=5)
+        supervisor.__exit__(None, None, None)
 
 
-def test_background_reader_cleanup_without_an_observation_does_not_signal():
-    def unexpected_signal(pid, sig):
-        raise AssertionError("an unobserved reader must not be signalled")
+def test_background_reader_control_stop_kills_a_sigterm_resistant_helper(tmp_path):
+    import select
 
-    stop_observed_background_reader(None, unexpected_signal)
-    stop_observed_background_reader((1, None), unexpected_signal)
-
-
-def test_background_reader_identity_error_closes_bound_descriptor():
-    require_background_reader_identity()
-    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
-    descriptors = []
-
-    def open_bound(pid):
-        fd = os.pidfd_open(pid)
-        descriptors.append(fd)
-        return fd
-
-    def denied_identity(pid):
-        raise PermissionError("reader identity read denied")
-
+    require_background_supervisor()
+    fifo, rescue = tmp_path / "resistant-ready", tmp_path / "rescue-helper"
+    os.mkfifo(fifo)
+    ready = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+    keepalive = None
     try:
-        observed = (child.pid, background_process_identity(child.pid))
-        with pytest.raises(PermissionError, match="^reader identity read denied$"):
-            stop_observed_background_reader(observed, identity=denied_identity, open_pidfd=open_bound)
-        assert child.poll() is None
-        for fd in descriptors:
-            with pytest.raises(OSError) as caught:
-                os.fstat(fd)
-            assert caught.value.errno == errno.EBADF
+        keepalive = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+        helper = tmp_path / "resistant-helper.py"
+        helper.write_text("import signal, time\nfrom pathlib import Path\n"
+                          "signal.signal(signal.SIGTERM, signal.SIG_IGN)\nwith Path(" + repr(str(fifo))
+                          + ").open('wb', buffering=0) as stream:\n    stream.write(b'ready\\n')\n"
+                          "    deadline = time.monotonic() + 20\n    while not Path(" + repr(str(rescue))
+                          + ").exists() and time.monotonic() < deadline:\n        time.sleep(0.01)\n")
+        try:
+            with BackgroundReaderSupervisor(tmp_path, "reader00-session", "pilot/orchestrator") as supervisor:
+                result = supervisor.launch(["reader", str(helper), str(tmp_path), "pilot/orchestrator", "claude-code",
+                                            "reader00-session", str(tmp_path), str(tmp_path / "record.json")])
+                assert result["code"] == 0
+                assert select.select([ready], [], [], 5)[0], "resistant helper did not start"
+                assert os.read(ready, 6) == b"ready\n"
+                os.close(keepalive)
+                keepalive = None
+                stopped = subprocess.run([sys.executable, str(supervisor.stub), str(supervisor.state),
+                                          "control", "stop", "reader00"], capture_output=True, text=True, timeout=15)
+                assert stopped.returncode == 0 and not stopped.stderr
+                assert select.select([ready], [], [], 5)[0], "control stop left a SIGTERM-resistant helper alive"
+                assert os.read(ready, 1) == b""
+        finally:
+            rescue.touch()
+            if keepalive is None:
+                assert select.select([ready], [], [], 5)[0], "cooperative helper rescue did not finish"
     finally:
-        reap_background_mode_holder(child, os.killpg)
+        if keepalive is not None:
+            os.close(keepalive)
+        os.close(ready)
 
 
-@pytest.mark.parametrize("state,expected", [("S", 901), ("Z", None), ("X", None)])
-def test_background_reader_identity_handles_process_names_and_exit_states(tmp_path, state, expected):
-    process = tmp_path / "123"
-    process.mkdir()
-    (process / "stat").write_text("123 (name with ) and spaces) " + " ".join([state] + ["0"] * 18 + ["901"]))
-    assert background_process_identity(123, tmp_path) == expected
+def background_supervisor_supported():
+    return os.name == "posix"
 
 
-def test_background_reader_identity_handles_missing_and_malformed_records(tmp_path):
-    assert background_process_identity(123, tmp_path) is None
-    process = tmp_path / "123"
-    process.mkdir()
-    (process / "stat").write_text("123 (short) S")
-    with pytest.raises(AssertionError, match="^invalid process start identity$"):
-        background_process_identity(123, tmp_path)
+def require_background_supervisor():
+    if not background_supervisor_supported():
+        pytest.skip("background reader supervisor requires POSIX process groups")
 
 
 def test_background_reader_identity_probe_skips_unsupported_platform(monkeypatch):
-    monkeypatch.setattr("tests.integration.test_hierarchy_sweep.background_reader_supported", lambda: False)
-    with pytest.raises(pytest.skip.Exception, match="^background reader cleanup needs Linux process start identities$"):
-        require_background_reader_identity()
+    monkeypatch.setattr("tests.integration.test_hierarchy_sweep.background_supervisor_supported", lambda: False)
+    with pytest.raises(pytest.skip.Exception, match="^background reader supervisor requires POSIX process groups$"):
+        require_background_supervisor()
 
 
-def test_background_reader_missing_pidfd_support_refuses_without_numeric_fallback(monkeypatch):
+@pytest.mark.parametrize("refusal", ["oversized", "malformed", "empty", "null", "not_strings", "too_many", "missing_stop", "symlink"])
+def test_background_reader_request_refusals_are_bounded_and_retryable(tmp_path, refusal):
+    import time
+
+    require_background_supervisor()
+    with BackgroundReaderSupervisor(tmp_path, "reader00-session", "pilot/orchestrator") as supervisor:
+        request = supervisor.state / "requests" / "invalid.request"
+        temporary = request.with_suffix(".input")
+        if refusal == "oversized":
+            temporary.write_bytes(b'["control", "agents"]' + b" " * 65537)
+        elif refusal == "symlink":
+            target = tmp_path / "valid-request.json"
+            target.write_text('["control", "agents"]')
+            symlink_or_skip(target, temporary)
+        else:
+            temporary.write_text({"malformed": "{", "empty": "[]", "null": "null", "not_strings": "[1]",
+                                  "too_many": json.dumps(["control", "agents"] + ["x"] * 63),
+                                  "missing_stop": '["control", "stop"]'}[refusal])
+        temporary.replace(request)
+        reply = request.with_suffix(".reply")
+        deadline = time.monotonic() + 3
+        while not reply.exists():
+            assert time.monotonic() < deadline, "request refusal did not arrive"
+            time.sleep(0.01)
+        assert json.loads(reply.read_text()) == {"code": 7, "stdout": ""}
+        assert supervisor.custody.identifiers() == ("old00000",)
+        assert supervisor.custody.status("old00000").returncode is None
+        result = subprocess.run([sys.executable, str(supervisor.stub), str(supervisor.state), "control", "agents"],
+                                capture_output=True, text=True, timeout=15)
+        assert result.returncode == 0 and not result.stderr
+        assert json.loads(result.stdout)[0]["id"] == "old00000"
+
+
+def test_background_reader_without_pidfd_uses_supervised_custody(monkeypatch):
+    require_background_supervisor()
     monkeypatch.setattr("tests.integration.test_hierarchy_sweep.background_pidfd_supported", lambda: False)
-    with pytest.raises(RuntimeError, match="^background reader cleanup requires pidfd signalling on " + sys.platform + "$"):
-        require_background_reader_identity()
+    with BackgroundReaderCustody() as custody:
+        custody.start("reader", [sys.executable, "-c", "import time; time.sleep(60)"])
+        assert custody.status("reader").has_pidfd is False
+        custody.stop("reader")
+        assert custody.status("reader").returncode is not None
 
-
-def publish_background_reader(state, child, fail_at=None):
-    def step(name):
-        if fail_at == name:
-            raise OSError("reader identity publication " + name + " failed")
-
-    record = state / "reader-identity.json"
-    temporary = state / "reader-identity.json.tmp"
-    try:
-        step("open")
-        stream = temporary.open("w", encoding="utf-8")
-        try:
-            step("write")
-            json.dump([child.pid, background_process_identity(child.pid)], stream)
-        finally:
-            stream.close()
-            step("close")
-        step("rename")
-        os.replace(temporary, record)
-    except BaseException:
-        reap_background_mode_holder(child, os.killpg, sig=signal.SIGTERM)
-        raise
-
-
-def exit_background_reader(signum, frame):
-    raise SystemExit(0)
-
-
-def run_background_reader_helper(argv, *, input, text, capture_output, check, pass_fds=()):
-    assert text and capture_output, "reader helper requires captured text"
-    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
-    try:
-        restore = ("import os, signal, sys; signal.pthread_sigmask(signal.SIG_SETMASK, "
-                   + repr(sorted(int(item) for item in previous)) + "); os.execv(sys.argv[1], sys.argv[1:])")
-        child = subprocess.Popen([sys.executable, "-c", restore, *argv],
-                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                 text=True, start_new_session=True, pass_fds=pass_fds)
-        with child.stdin, child.stdout, child.stderr:
-            try:
-                signal.pthread_sigmask(signal.SIG_SETMASK, previous)
-                stdout, stderr = child.communicate(input)
-            finally:
-                signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
-                reap_background_mode_holder(child, os.killpg)
-        if check and child.returncode:
-            raise subprocess.CalledProcessError(child.returncode, argv, output=stdout, stderr=stderr)
-        return subprocess.CompletedProcess(argv, child.returncode, stdout, stderr)
-    finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
 @pytest.mark.parametrize("fail_at", ["open", "write", "close", "rename"])
 def test_background_reader_publication_failure_reaps_its_unpublished_child(tmp_path, fail_at):
-    require_background_reader_identity()
-    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
-    try:
-        with pytest.raises(OSError, match="^reader identity publication " + fail_at + " failed$"):
-            publish_background_reader(tmp_path, child, fail_at)
-        assert child.poll() is not None, "unpublished reader survived publication failure"
-        assert not (tmp_path / "reader-identity.json").exists()
-    finally:
-        reap_background_mode_holder(child, os.killpg)
-    replacement = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
-    try:
-        publish_background_reader(tmp_path, replacement)
-        publish_background_reader(tmp_path, replacement)
-        assert replacement.poll() is None
-        assert observed_background_reader(tmp_path) == [replacement.pid, background_process_identity(replacement.pid)]
-    finally:
-        reap_background_mode_holder(replacement, os.killpg)
+    require_background_supervisor()
+    with BackgroundReaderSupervisor(tmp_path, "reader00-session", "pilot/orchestrator") as supervisor:
+        words = ["hang", str(HELPER), str(tmp_path), "pilot/orchestrator", "claude-code", "reader00-session",
+                 str(tmp_path), str(tmp_path / "record.json")]
+        with pytest.raises(OSError, match="^reader publication " + fail_at + " failed$"):
+            supervisor.launch(words, fail_at=fail_at)
+        assert supervisor.custody.status("reader00").returncode is not None
+        assert not supervisor.custody.status("reader00").has_pidfd
+        assert not (supervisor.state / "reader00.row").exists()
+        supervisor.launch(words)
+        assert supervisor.custody.status("reader00").returncode is None
+        supervisor.dispatch(["control", "stop", "reader00"])
+        assert supervisor.custody.status("reader00").returncode is not None
+        supervisor.dispatch(["control", "stop", "reader00"])
 
 
-def test_background_reader_real_publication_open_error_reaps_child(tmp_path):
-    require_background_reader_identity()
-    (tmp_path / "reader-identity.json.tmp").mkdir()
-    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
-    try:
-        with pytest.raises(IsADirectoryError):
-            publish_background_reader(tmp_path, child)
-        assert child.poll() is not None
-    finally:
-        reap_background_mode_holder(child, os.killpg)
+@pytest.mark.parametrize("exit_before_stop", [False, True])
+def test_background_reader_stop_uses_held_child_despite_replaced_row(tmp_path, exit_before_stop):
+    require_background_supervisor()
+    signals = []
+
+    def signal_group(pid, sig):
+        held = supervisor.custody.status("old00000")
+        assert pid == held.pid and held.returncode is None
+        signals.append((pid, sig))
+        os.killpg(pid, sig)
+
+    with BackgroundReaderCustody() as bystanders:
+        bystanders.start("bystander", [sys.executable, "-c", "import time; time.sleep(60)"])
+        bystander = bystanders.status("bystander")
+        with BackgroundReaderSupervisor(tmp_path, "reader00-session", "pilot/orchestrator", signal_group) as supervisor:
+            held = supervisor.custody.status("old00000")
+            row = json.loads((supervisor.state / "old00000.row").read_text())
+            row["pid"] = bystander.pid
+            supervisor.save(row)
+            supervisor.dispatch(["control", "stop", str(bystander.pid)])
+            assert signals == [], "a numeric request must not confer signalling authority"
+            if exit_before_stop:
+                supervisor.custody.signal_leader("old00000", signal.SIGTERM)
+                # Portable delivery also uses the held group. Count only the stop itself.
+                signals.clear()
+            supervisor.dispatch(["control", "stop", "old00000"])
+            assert supervisor.custody.status("old00000").returncode is not None
+            expected = [(held.pid, signal.SIGTERM), (held.pid, signal.SIGKILL)]
+            assert signals == expected
+            supervisor.dispatch(["control", "stop", "old00000"])
+            assert signals == expected
+            assert bystanders.signal_leader("bystander", 0)
 
 
-@pytest.mark.parametrize("stop_method", ["pidfd", "open", "write", "close", "rename"])
-def test_background_reader_pidfd_stop_reaps_helper_group_and_descendant(tmp_path, stop_method):
-    require_background_reader_identity()
-    definitions = (background_process_identity, reap_background_mode_holder,
-                   exit_background_reader, run_background_reader_helper)
-    imports = "import json, os, signal, subprocess, sys\nfrom pathlib import Path\n"
-    helper = (imports + inspect.getsource(background_process_identity) + '''
-grandchild = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-members = [[os.getpid(), background_process_identity(os.getpid())],
-           [grandchild.pid, background_process_identity(grandchild.pid)]]
-os.write(int(sys.argv[1]), (json.dumps(members) + "\\n").encode())
-grandchild.wait(timeout=60)
-''')
-    script = (imports + "\n".join(inspect.getsource(function) for function in definitions) + '''
-signal.signal(signal.SIGTERM, exit_background_reader)
-ready = int(sys.argv[1])
-run_background_reader_helper([sys.executable, "-c", sys.argv[2], str(ready)], input="", text=True,
-                             capture_output=True, check=True, pass_fds=(ready,))
-''')
-    ready_r, ready_w = os.pipe()
-    reader, members, member_fds = None, [], []
+def test_background_reader_duplicate_launch_preserves_the_owned_handle(tmp_path):
+    require_background_supervisor()
+    with BackgroundReaderSupervisor(tmp_path, "old00000-session", "pilot/orchestrator") as supervisor:
+        original = supervisor.custody.status("old00000")
+        result = supervisor.launch(["hang", str(HELPER), str(tmp_path), "pilot/orchestrator", "claude-code",
+                                    "old00000-session", str(tmp_path), str(tmp_path / "record.json")])
+        assert result == {"code": 7, "stdout": ""}
+        assert supervisor.custody.status("old00000") == original
+
+
+def test_background_reader_concurrent_launches_retain_exactly_one_child(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    require_background_supervisor()
+    with BackgroundReaderSupervisor(tmp_path, "reader00-session", "pilot/orchestrator") as supervisor:
+        argv = [sys.executable, str(supervisor.stub), str(supervisor.state), "hang", str(HELPER), str(tmp_path),
+                "pilot/orchestrator", "claude-code", "reader00-session", str(tmp_path), str(tmp_path / "record.json")]
+
+        def launch():
+            return subprocess.run(argv, capture_output=True, text=True, timeout=15)
+
+        with ThreadPoolExecutor(max_workers=2) as clients:
+            results = list(clients.map(lambda _: launch(), range(2)))
+        assert sorted(result.returncode for result in results) == [0, 7]
+        assert all(not result.stderr for result in results)
+        assert supervisor.custody.identifiers() == ("old00000", "reader00")
+        assert supervisor.custody.status("reader00").returncode is None
+    assert supervisor.custody.status("reader00").returncode is not None
+
+
+@pytest.mark.parametrize("hold_past_join", [False, True])
+def test_background_reader_concurrent_control_stop_and_teardown_share_custody(tmp_path, hold_past_join):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    require_background_supervisor()
+    entered, release, closing = threading.Event(), threading.Event(), threading.Event()
+    signals = []
+
+    def signal_group(pid, sig):
+        held = supervisor.custody.status("old00000")
+        assert held.pid == pid and held.returncode is None
+        signals.append((sig, threading.get_ident()))
+        if sig == signal.SIGTERM:
+            entered.set()
+            assert release.wait(12), "control-stop barrier was not released"
+        os.killpg(pid, sig)
+
+    supervisor = BackgroundReaderSupervisor(tmp_path, "reader00-session", "pilot/orchestrator", signal_group)
+    supervisor.__enter__()
+
+    def control_stop():
+        return subprocess.run([sys.executable, str(supervisor.stub), str(supervisor.state), "control", "stop", "old00000"],
+                              capture_output=True, text=True, timeout=15)
+
+    def close():
+        closing.set()
+        supervisor.__exit__(None, None, None)
+
     try:
-        reader = subprocess.Popen([sys.executable, "-c", script, str(ready_w), helper], pass_fds=(ready_w,),
-                                  start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        os.close(ready_w)
-        ready_w = None
-        assert select.select([ready_r], [], [], 5)[0], "helper group did not announce readiness"
-        members = json.loads(os.read(ready_r, 4096))
-        assert len(members) == 2 and all(start is not None for _, start in members)
-        assert os.getpgid(members[0][0]) == members[0][0]
-        assert os.getpgid(members[1][0]) == members[0][0]
-        for pid, start in members:
-            member_fds.append(os.pidfd_open(pid))
-            assert background_process_identity(pid) == start
-        observed = (reader.pid, background_process_identity(reader.pid))
-        if stop_method == "pidfd":
-            stop_observed_background_reader(observed)
-        else:
-            with pytest.raises(OSError, match="^reader identity publication " + stop_method + " failed$"):
-                publish_background_reader(tmp_path, reader, fail_at=stop_method)
-        reader.wait(timeout=5)
-        assert all(select.select([fd], [], [], 5)[0] for fd in member_fds), "helper group did not exit"
-        assert all(background_process_identity(pid) != start for pid, start in members)
-    finally:
-        try:
-            if reader is not None:
-                try:
-                    stop_observed_background_reader((reader.pid, background_process_identity(reader.pid)))
-                finally:
-                    reap_background_mode_holder(reader, os.killpg)
-        finally:
+        with ThreadPoolExecutor(max_workers=2) as clients:
+            stopped = clients.submit(control_stop)
             try:
-                for fd in member_fds:
-                    try:
-                        if not select.select([fd], [], [], 0)[0]:
-                            signal.pidfd_send_signal(fd, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    assert select.select([fd], [], [], 5)[0], "helper rescue did not exit"
+                assert entered.wait(5), "control stop did not acquire custody"
+                closed = clients.submit(close)
+                assert closing.wait(5), "teardown did not start"
+                if hold_past_join:
+                    with pytest.raises(TimeoutError, match="^background supervisor did not stop$"):
+                        closed.result(timeout=7)
+                    assert supervisor.thread.is_alive()
+                    assert [sig for sig, _ in signals] == [signal.SIGTERM], "live-worker teardown signalled a child"
             finally:
-                try:
-                    for fd in member_fds:
-                        os.close(fd)
-                finally:
-                    os.close(ready_r)
-                    if ready_w is not None:
-                        os.close(ready_w)
+                release.set()
+            result = stopped.result(timeout=5)
+            assert result.returncode == 0 and not result.stderr
+            if not hold_past_join:
+                closed.result(timeout=5)
+        supervisor.__exit__(None, None, None)
+        assert not supervisor.thread.is_alive()
+        assert supervisor.custody.status("old00000").returncode is not None
+        assert not supervisor.custody.status("old00000").has_pidfd
+        assert [sig for sig, _ in signals] == [signal.SIGTERM, signal.SIGKILL]
+        assert len({owner for _, owner in signals}) == 1
+        supervisor.custody.stop("old00000")
+        assert [sig for sig, _ in signals] == [signal.SIGTERM, signal.SIGKILL]
+    finally:
+        release.set()
+        supervisor.thread.join(timeout=5)
+        supervisor.__exit__(None, None, None)
 
 
-def test_background_reader_reuse_after_identity_check_never_signals_replacement():
-    require_background_reader_identity()
-    original = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
-    descriptors, replacement_signals = [], []
+@pytest.mark.parametrize("phase", ["term", "kill"])
+def test_background_reader_control_stop_refusal_retains_custody_for_retry(tmp_path, phase):
+    require_background_supervisor()
+    denied = []
+
+    def signal_group(pid, sig):
+        held = supervisor.custody.status("old00000")
+        assert held.pid == pid and held.returncode is None
+        failing = signal.SIGTERM if phase == "term" else signal.SIGKILL
+        if sig == failing and not denied:
+            denied.append(True)
+            raise PermissionError("group delivery denied")
+        os.killpg(pid, sig)
+
+    with BackgroundReaderSupervisor(tmp_path, "reader00-session", "pilot/orchestrator", signal_group) as supervisor:
+        argv = [sys.executable, str(supervisor.stub), str(supervisor.state), "control", "stop", "old00000"]
+        row = supervisor.state / "old00000.row"
+        before = row.read_bytes()
+        refused = subprocess.run(argv, capture_output=True, text=True, timeout=15)
+        assert refused.returncode == 7 and refused.stdout == "" and refused.stderr == ""
+        assert row.read_bytes() == before, "a refused stop published stopped before group termination"
+        held = supervisor.custody.status("old00000")
+        assert held.returncode is None and held.has_pidfd is background_pidfd_supported()
+        retried = subprocess.run(argv, capture_output=True, text=True, timeout=15)
+        assert retried.returncode == 0 and retried.stderr == ""
+        assert supervisor.custody.status("old00000").returncode is not None
+        assert supervisor.custody.status("old00000").has_pidfd is False
+        assert json.loads(row.read_text())["status"] == "stopped"
+
+
+@pytest.mark.parametrize("use_pidfd", [False, True])
+def test_background_reader_custody_keeps_pidfd_and_portable_delivery(tmp_path, use_pidfd):
+    import errno
+
+    require_background_supervisor()
+    if use_pidfd and not background_pidfd_supported():
+        pytest.skip("Linux pidfd signalling is unavailable")
+    descriptors, sent = [], []
 
     def open_bound(pid):
-        fd = os.pidfd_open(pid)
-        descriptors.append(fd)
-        return fd
+        descriptor = os.pidfd_open(pid)
+        descriptors.append(descriptor)
+        return descriptor
 
-    def identity_then_exit(pid):
-        result = background_process_identity(pid)
-        if original.poll() is None:
-            original.kill()
-        original.wait(timeout=5)
-        return result
+    def signal_bound(descriptor, sig):
+        assert descriptor in descriptors
+        sent.append(sig)
+        signal.pidfd_send_signal(descriptor, sig)
 
-    def signal_bound(handle, sig):
-        if handle in descriptors:
-            signal.pidfd_send_signal(handle, sig)
+    with BackgroundReaderCustody(use_pidfd=use_pidfd, open_pidfd=open_bound, signal_pidfd=signal_bound) as custody:
+        custody.start("reader", [sys.executable, "-c", "import time; time.sleep(60)"])
+        assert custody.status("reader").has_pidfd is use_pidfd
+        assert custody.signal_leader("reader", 0)
+        custody.stop("reader", signal.SIGTERM)
+        assert custody.status("reader").returncode is not None
+        assert not custody.status("reader").has_pidfd
+        custody.stop("reader")
+    assert sent == ([0] if use_pidfd else [])
+    for descriptor in descriptors:
+        with pytest.raises(OSError) as caught:
+            os.fstat(descriptor)
+        assert caught.value.errno == errno.EBADF
+
+
+@pytest.mark.parametrize("failure", ["open", "send", "exit_race"])
+def test_background_reader_pidfd_failure_never_falls_back_to_a_numeric_signal(failure):
+    import errno
+
+    require_background_supervisor()
+    if not background_pidfd_supported():
+        pytest.skip("Linux pidfd signalling is unavailable")
+    groups, descriptors = [], []
+
+    def open_bound(pid):
+        if failure == "open":
+            raise PermissionError("pidfd open denied")
+        descriptor = os.pidfd_open(pid)
+        descriptors.append(descriptor)
+        return descriptor
+
+    def signal_bound(descriptor, sig):
+        assert descriptor in descriptors
+        if failure == "send":
+            raise PermissionError("pidfd signal denied")
+        raise ProcessLookupError("reader exited during pidfd delivery")
+
+    def signal_group(pid, sig):
+        groups.append(sig)
+        os.killpg(pid, sig)
+
+    with BackgroundReaderCustody(signal_group, use_pidfd=True, open_pidfd=open_bound, signal_pidfd=signal_bound) as custody:
+        if failure == "open":
+            with pytest.raises(PermissionError, match="^pidfd open denied$"):
+                custody.start("reader", [sys.executable, "-c", "import time; time.sleep(60)"])
+            assert custody.status("reader").returncode is not None
         else:
-            # Model a numeric PID now resolving to the replacement process.
-            replacement_signals.append(sig)
+            custody.start("reader", [sys.executable, "-c", "import time; time.sleep(60)"])
+            if failure == "send":
+                with pytest.raises(PermissionError, match="^pidfd signal denied$"):
+                    custody.signal_leader("reader", signal.SIGTERM)
+            else:
+                assert custody.signal_leader("reader", signal.SIGTERM) is False
+            assert groups == [], "pidfd refusal triggered a numeric fallback"
+            assert custody.status("reader").returncode is None
+            custody.stop("reader")
+        assert not custody.status("reader").has_pidfd
+    for descriptor in descriptors:
+        with pytest.raises(OSError) as caught:
+            os.fstat(descriptor)
+        assert caught.value.errno == errno.EBADF
 
+
+def test_background_reader_cleanup_stops_the_in_flight_helper_group(tmp_path):
+    import select
+
+    require_background_supervisor()
+    fifo = tmp_path / "helper-ready"
+    os.mkfifo(fifo)
+    ready = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+    keepalive = None
     try:
-        observed = (original.pid, background_process_identity(original.pid))
-        stop_observed_background_reader(observed, signal_bound, identity=identity_then_exit, open_pidfd=open_bound)
-        assert replacement_signals == [], "numeric signal reached replacement after identity check"
-        for fd in descriptors:
-            with pytest.raises(OSError) as caught:
-                os.fstat(fd)
-            assert caught.value.errno == errno.EBADF
+        keepalive = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+        helper = tmp_path / "blocked-helper.py"
+        helper.write_text("import time\nfrom pathlib import Path\nwith Path(" + repr(str(fifo))
+                          + ").open('wb', buffering=0) as stream:\n    stream.write(b'ready\\n')\n    time.sleep(60)\n")
+        with BackgroundReaderSupervisor(tmp_path, "reader00-session", "pilot/orchestrator") as supervisor:
+            result = supervisor.launch(["reader", str(helper), str(tmp_path), "pilot/orchestrator", "claude-code",
+                                        "reader00-session", str(tmp_path), str(tmp_path / "record.json")])
+            assert result["code"] == 0
+            assert supervisor.custody.status("reader00").returncode is None
+            assert select.select([ready], [], [], 5)[0], "mailbox helper did not start"
+            assert os.read(ready, 6) == b"ready\n"
+            os.close(keepalive)
+            keepalive = None
+        assert supervisor.custody.status("reader00").returncode is not None
+        assert select.select([ready], [], [], 5)[0], "mailbox helper survived group cleanup"
+        assert os.read(ready, 1) == b"", "mailbox helper retained its writer after cleanup"
+        supervisor.custody.stop("reader00")
     finally:
-        reap_background_mode_holder(original, os.killpg)
-
-
-def background_reader_stub():
-    launch = 'row = next(row for row in rows() if row["id"] == identifier)\nrow["pid"] = child.pid'
-    assert STUB.count(launch) == 1, "background launch seam changed"
-    capture = 'publish_background_reader(Path(state), child)\n'
-    failure = '''
-if sys.argv[2:4] == ["control", "agents"]:
-    folder = Path(sys.argv[1])
-    if (folder / "fail-after-launch").exists() and (folder / "reader-identity.json").exists():
-        sys.exit(7)
-'''
-    helper_call = 'subprocess.run([sys.executable, "-I", helper,'
-    assert STUB.count(helper_call) == 1, "background helper seam changed"
-    definitions = (background_process_identity, reap_background_mode_holder, publish_background_reader,
-                   exit_background_reader, run_background_reader_helper)
-    setup = '\nif sys.argv[2] == "turn":\n    signal.signal(signal.SIGTERM, exit_background_reader)\n'
-    return ("import json, os, signal, subprocess, sys\nfrom pathlib import Path\n"
-            + "\n".join(inspect.getsource(function) for function in definitions) + setup + failure
-            + STUB.replace(launch, capture + launch).replace(helper_call, 'run_background_reader_helper([sys.executable, "-I", helper,'))
+        if keepalive is not None:
+            os.close(keepalive)
+        os.close(ready)
 
 
 @posix_only
 def test_background_mode_failure_after_reader_launch_stops_only_the_observed_reader(fleet):
-    require_background_reader_identity()
-    bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
-    state = fleet.tmp / "background-state"
-    signals = []
+    observed, signals = [], []
 
-    def signal_reader(fd, sig):
-        observed = observed_background_reader(state)
-        assert observed is not None and sig == signal.SIGTERM
-        assert background_process_identity(observed[0]) == observed[1]
-        signals.append((observed[0], sig))
-        signal.pidfd_send_signal(fd, sig)
+    with BackgroundReaderCustody() as bystanders:
+        bystanders.start("bystander", [sys.executable, "-c", "import time; time.sleep(60)"])
+        bystander = bystanders.status("bystander")
 
-    try:
+        def signal_group(pid, sig):
+            assert pid != bystander.pid, "cleanup selected an unrelated process"
+            signals.append((pid, sig))
+            os.killpg(pid, sig)
+
         with pytest.raises(RuntimeError, match="^fixture failure after reader launch$"):
-            run_background_mode_sweep(fleet, fail_after_launch=True, signal_reader=signal_reader)
-        observed = observed_background_reader(state)
-        assert observed is not None, "failure must occur after reader launch"
-        assert signals == [(observed[0], signal.SIGTERM)], "teardown must signal exactly the observed reader"
-        assert background_process_identity(observed[0]) != observed[1], "reader escaped teardown"
-        calls = [json.loads(line) for line in (state / "calls.log").read_text().splitlines()]
+            run_background_mode_sweep(fleet, fail_after_launch=True, signal_group=signal_group, observed=observed)
+        assert len(observed) == 1, "failure must occur after reader launch"
+        custody, identifier = observed[0]
+        reader = custody.status(identifier)
+        assert reader.returncode is not None, "reader escaped teardown"
+        assert (reader.pid, signal.SIGKILL) in signals
+        calls = json.loads((fleet.tmp / "background-state" / "calls.log").read_text())
         assert ["stop", "old00000"] in calls
         assert ["stop", fleet.orchestrator["session"][:8]] not in calls
-        assert bystander.poll() is None
-    finally:
-        try:
-            # Rescue the real detached child even when the regression assertion fails.
-            stop_observed_background_reader(observed_background_reader(state))
-        finally:
-            reap_background_mode_holder(bystander, os.killpg)
+        assert bystanders.signal_leader("bystander", 0)
 
 
-def run_background_mode_sweep(fleet, fail_after_launch=False, signal_reader=None):
-    require_background_reader_identity()
-    stub, state = fleet.tmp / "claude_stub.py", fleet.tmp / "background-state"
-    stub.write_text(background_reader_stub(), encoding="utf-8")
-    state.mkdir()
-    if fail_after_launch:
-        (state / "fail-after-launch").touch()
+def run_background_mode_sweep(fleet, fail_after_launch=False, signal_group=None, observed=None):
+    require_background_supervisor()
     session, endpoint = fleet.orchestrator["session"], "pilot/orchestrator"
-    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
-    try:
-        (state / "old00000.row").write_text(json.dumps({
-            "id": "old00000", "sessionId": session, "status": "idle", "state": "blocked", "kind": "background",
-            "name": endpoint + "-g1", "pid": holder.pid}))
+    with BackgroundReaderSupervisor(fleet.tmp, session, endpoint, signal_group) as supervisor:
+        if fail_after_launch:
+            (supervisor.state / "fail-after-launch").touch()
         path = Path(fleet.orchestrator["wake_profile"])
         profile = json.loads(path.read_text())
-        profile.update(mode="background", prompt_via="argv", control=[sys.executable, str(stub), str(state), "control"],
-                       argv=[sys.executable, str(stub), str(state), "reader", str(HELPER), str(fleet.root), endpoint,
-                             "claude-code", session, str(fleet.base / "delivery"), str(fleet.tmp / "stub-record.json"),
-                             "--bg", "--name", endpoint + "-g1", "--resume", session, "--"])
+        profile.update(mode="background", prompt_via="argv",
+                       control=[sys.executable, str(supervisor.stub), str(supervisor.state), "control"],
+                       argv=[sys.executable, str(supervisor.stub), str(supervisor.state), "reader", str(HELPER),
+                             str(fleet.root), endpoint, "claude-code", session, str(fleet.base / "delivery"),
+                             str(fleet.tmp / "stub-record.json"), "--bg", "--name", endpoint + "-g1",
+                             "--resume", session, "--"])
         path.write_text(json.dumps(profile))
         fleet.send("pilot/front-door", endpoint, "hello")
         row = fleet.sweep(expect=(0, 3) if fail_after_launch else 0)["rows"][0]
         if fail_after_launch:
             assert row["state"] == "refused" and row["error"] == "could not list background sessions: exit 7", row
-            observed = observed_background_reader(state)
-            assert observed is not None and observed[1] is not None
-            assert background_process_identity(observed[0]) == observed[1], "reader must be live before fixture failure"
+            assert supervisor.custody.status(session[:8]).returncode is None, "reader must be held before fixture failure"
+            if observed is not None:
+                observed.append((supervisor.custody, session[:8]))
             raise RuntimeError("fixture failure after reader launch")
-    finally:
-        try:
-            reap_background_mode_holder(holder, os.killpg)
-        finally:
-            stop_observed_background_reader(observed_background_reader(state), signal_reader)
     return row
 
 

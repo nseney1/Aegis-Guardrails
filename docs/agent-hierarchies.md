@@ -469,7 +469,24 @@ The sender calls `mailbox_publish_record`. The peer named by `to` calls `mailbox
 {"limit": 20, "after_message_id": "guide-1"}
 ```
 
-If `mailbox_digest` returns E_LIMIT because an aggregate message page does not fit, reduce limit, keep after_message_id, and read an individually oversized ordinary message through the inbox path. The inbox path is `mailbox_inbox`. One ordinary message that does not fit: read the ordinary message through the inbox path. A record view or explicit refs that do not fit: request fewer refs, or narrow fields (for example body) or outline, or use mailbox_read_record with narrower fields. That selector recovery is valid on `mailbox_digest` itself. A max_chars below the minimum record view: pass max_chars large enough for the record view, as an integer from 0 to 60000. max_chars below the page envelope: pass max_chars large enough for the digest page, as an integer from 0 to 60000. An invalid limit is not an integer from 1 to 100. An invalid max_chars is not an integer from 0 to 60000. Either invalid option refuses E_LIMIT and names that range. A history-limit refusal keeps its owner guidance. A digest refusal does not join a multi-line cursor into one line and does not echo the message body.
+Both read tools accept `fields` with dotted paths, indices, one-level `*`, and row projection such as `findings.*.{id,severity,file,line}`; at most 16 selectors, depth 8. Their `fields` schemas carry the same grammar. Publish accepts no selector option. Unknown paths refuse E_SELECTOR with the advice below.
+
+For digest E_LIMIT, follow `error.next_action` and any measured `error.retry` rather than guessing a repair. These are the contextual advice forms; a verified retry takes precedence over general budget advice. The inbox path is `mailbox_inbox`.
+
+| Refusal context | Advice from the error |
+| --- | --- |
+| Aggregate message page | reduce limit, keep after_message_id, and read an individually oversized ordinary message through the inbox path |
+| One oversized ordinary message | read the ordinary message through the inbox path |
+| Ordinary message after a planned-inbox cursor | restart mailbox_inbox from the start without after_message_id; read oldest-first pages and follow their next_after cursors until the message is retrieved |
+| Record view or explicit refs | request fewer refs, or narrow fields (for example body) or outline, or use mailbox_read_record with narrower fields |
+| Below the minimum record view | pass max_chars large enough for the record view, as an integer from 0 to 60000 |
+| Below the page envelope | pass max_chars large enough for the digest page, as an integer from 0 to 60000 |
+| Invalid limit | pass limit as an integer from 1 to 100 |
+| Invalid max_chars | pass max_chars as an integer from 0 to 60000 |
+| History limit | ask the owner to resolve the mailbox history limit |
+| Invalid selector (E_SELECTOR) | invalid selector or cursor; check grammar or re-read without since |
+
+A digest refusal does not join a multi-line cursor into one line and does not echo the message body.
 
 For a record-view budget refusal, follow `error.retry.tool` and merge `error.retry.options` into the retry request. A digest retry keeps its existing cursor and references. A `mailbox_read_record` retry retains `retry.target.collection` and its zero-based `retry.target.index` to identify the failing row. For a received message, pass `retry.options` unchanged: it includes the already authorized, bounded `message_id` and the measured `max_chars`, so later publications cannot shift the read to another row. For an explicit reference, add `ref` from the original request's `refs[retry.target.index]` to `retry.options`. Privacy refusals disclose no message identity. The adapter renders the proposed complete retry before offering it, including attribution and digest row overhead. If no candidate fits the current budget, `error.minimum_max_chars` gives a measured budget and the advice says to increase `max_chars` to at least that number. Selector and outline advice is offered only when that retry fits the current budget. Ordinary-message failures verify inbox recovery before considering any record candidate; a later record or explicit reference never replaces that recovery. The earlier repair forms above describe possible actions; the refusal selects the verified one.
 
@@ -578,6 +595,13 @@ and binds each entry in `tools/hierarchy_templates/handoff-spec.json`, reports a
 on one without hiding or blocking the others, and leaves finished entries alone when
 run again. Each successor still acknowledges separately through its own connection.
 
+With a governing host plan, the next checkpoint keeps briefs for open work, the
+last touching brief and `entries[].briefs`, so standing briefs must be relisted
+there or they silently leave the next checkpoint. The last inherited brief is
+kept when none qualifies. A standalone `draft-handoff` preview still lists every
+brief. Under a governing host plan, the preview checkpoint sha differs from
+the bound one when a brief is omitted. Without a plan, briefs carry forward unchanged.
+
 With `delivery_dir`, the draft includes every unread message ID, including messages
 that were woken but not read. The delivery status page's 100-ID display limit does
 not limit the handoff. Pending IDs and checkpoint brief references are deduplicated;
@@ -589,8 +613,12 @@ evidence that its assignment or job finished.
 Ordinary unread messages retain their hash-bound brief references in the inbox.
 The successor reads them with `include_briefs` and follows `next_after` while
 `remaining` is nonzero. Their contents stay pageable instead of accumulating in
-mandatory checkpoint metadata. Active/job, explicit and inherited checkpoint
-briefs retain their existing validation and response limits.
+mandatory checkpoint metadata. Active/job, explicit and still-carried inherited
+checkpoint briefs retain their existing validation and response limits. With a
+governing host plan, an inherited brief is carried only when it is open work,
+the last touching brief, listed in `entries[].briefs`, or the last inherited
+brief when none qualifies. Without a plan, inherited briefs carry forward
+unchanged.
 
 For a mailbox move, current carry briefs retain each open job's original full ID
 and the path and SHA-256 of its original request. Missing terminal receipts can
@@ -1032,6 +1060,17 @@ python3 tools/hierarchy_launcher.py --base /abs/base status
   launcher stops the start's process group and is recorded (`start_incomplete` once a session is known,
   else `failed_to_start`, error "the launcher was interrupted"); during the bind wait it ends the wait
   instead, and the session can still be bound with `add-role`. The start lock is released either way.
+  Other fixed start failure reasons are:
+
+  | Error | State | Operator action |
+  | --- | --- | --- |
+  | "the start reported an invalid session" | `failed_to_start` | Inspect the start logs and repair the host's session report before retrying; the reported value is not a usable binding. |
+  | "the start timed out" | `failed_to_start` without a session, `start_incomplete` with one | Inspect the start logs and host readiness, then retry when ready; adjust `start_timeout_seconds` if the start needs a longer limit. |
+  | "the start process exited unsuccessfully" | `failed_to_start` without a session, `start_incomplete` with one | Inspect the recorded `exit_code` and start logs, fix the host failure, then retry. |
+  | "the start exited without reporting a session" | `failed_to_start` | Inspect the start logs and repair session-event reporting before retrying, even though the process exited successfully. |
+
+  These outcomes leave the endpoint unbound. A session in `start_incomplete` is evidence of a partial
+  start, not a successful bind; inspect it before choosing a retry or an explicit `add-role` recovery.
 - `resume` runs `tools/hierarchy_wake.py` with the current binding's wake profile, unchanged, and
   leaves every timeout to it.
 - `stop` signals the processes whose arguments name the bound session: SIGTERM, then SIGKILL after

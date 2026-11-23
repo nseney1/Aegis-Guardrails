@@ -221,7 +221,98 @@ Lease lane paths for parallel agents (claim, renew, transfer, release, gc, list,
 
 Leases under refs/aegis/lanes/<lane> declare which paths a lane works on. A lease is cooperative conflict input, not a lock, not an identity and not proof that an agent is alive: claims of different lanes can race, and owner and role are display labels. The backstops are the post-lane gate (aegis check --lane) and aegis team metrics.
 
-Category: Daily Workflow & Verification. Subcommands: `claim`, `config`, `doctor`, `gc`, `hosts`, `list`, `metrics`, `model`, `queue`, `release`, `renew`, `status`, `transfer`.
+Category: Daily Workflow & Verification. Subcommands: `board`, `claim`, `config`, `doctor`, `gc`, `hosts`, `isolation`, `list`, `mail`, `metrics`, `model`, `queue`, `release`, `renew`, `status`, `transfer`.
+
+### `aegis team board`
+
+Configure and inspect the team board
+
+Subcommands: `add-channel`, `digest`, `grant`, `init`, `read`, `revoke`, `status`, `tombstone`, `verify`.
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--board` | `BOARD` |  | Absolute board folder; required once before or after the verb |
+
+### `aegis team board add-channel`
+
+Add a channel
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--board` | `BOARD` |  | Absolute board folder; required once before or after the verb |
+| `--request` | `REQUEST` |  | Absolute strict JSON request with no symlink components |
+
+### `aegis team board digest`
+
+List open blockers and recent posts
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--board` | `BOARD` |  | Absolute board folder; required once before or after the verb |
+| `--channel` | `CHANNEL` |  | Configured channel name |
+| `--as-of` | `AS_OF` |  | UTC expiry observation time; defaults to now |
+
+### `aegis team board grant`
+
+Grant channel access
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--board` | `BOARD` |  | Absolute board folder; required once before or after the verb |
+| `--request` | `REQUEST` |  | Absolute strict JSON request with no symlink components |
+
+### `aegis team board init`
+
+Initialize a board
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--board` | `BOARD` |  | Absolute board folder; required once before or after the verb |
+
+### `aegis team board read`
+
+Read a channel page
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--board` | `BOARD` |  | Absolute board folder; required once before or after the verb |
+| `--channel` | `CHANNEL` |  | Configured channel name |
+| `--after-post` | `AFTER_POST` |  | Continue after this post identifier |
+| `--limit` | `LIMIT` | `20` | Page size: default 20, maximum 50 |
+
+### `aegis team board revoke`
+
+Revoke channel access
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--board` | `BOARD` |  | Absolute board folder; required once before or after the verb |
+| `--request` | `REQUEST` |  | Absolute strict JSON request with no symlink components |
+
+### `aegis team board status`
+
+Show board status
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--board` | `BOARD` |  | Absolute board folder; required once before or after the verb |
+
+### `aegis team board tombstone`
+
+Remove a post as owner
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--board` | `BOARD` |  | Absolute board folder; required once before or after the verb |
+| `--request` | `REQUEST` |  | Absolute strict JSON request with no symlink components |
+
+### `aegis team board verify`
+
+Validate all events and content
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--board` | `BOARD` |  | Absolute board folder; required once before or after the verb |
 
 ### `aegis team claim`
 
@@ -284,11 +375,71 @@ Read capacity advice: status \| usage \| check HOST KIND. KIND: writer, review, 
 | `host` | `[HOST]` |  | Declared host alias (see status --json) |
 | `kind` | `[KIND]` |  | Job kind or declared role/lens |
 
+### `aegis team isolation`
+
+Plan or verify team container isolation
+
+Subcommands: `check`.
+
+### `aegis team isolation check`
+
+Read an isolation plan or check engine inspection data
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--config` | `CONFIG` |  | Absolute path to a bounded team-run.json |
+| `--inspect` | `INSPECT` |  | Absolute path to bounded container inspection JSON |
+
 ### `aegis team list`
 
 Show leases (conflict input, not liveness proof)
 
 A lease is conflict input, not liveness proof: it records which paths a lane declared and until when, not that its agent is still working. The backstops are the post-lane gate (aegis check --lane) and aegis team metrics.
+
+### `aegis team mail`
+
+Send, read and diagnose the team mailbox
+
+Subcommands: `doctor`, `read`, `send`.
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--root` | `ROOT` |  | Absolute mailbox root; required once before or after the verb |
+
+### `aegis team mail doctor`
+
+Inspect mailbox health without writes
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--root` | `ROOT` |  | Absolute mailbox root; required once before or after the verb |
+
+### `aegis team mail read`
+
+Read a bounded mailbox page
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--root` | `ROOT` |  | Absolute mailbox root; required once before or after the verb |
+| `--endpoint` | `ENDPOINT` |  | Configured recipient endpoint |
+| `--include-briefs` |  |  | Include hash-checked brief text |
+| `--binding-only` |  |  | Read only the binding and message count |
+| `--limit` | `LIMIT` |  | Page size: default 20, maximum 100 |
+| `--after` | `AFTER` |  | Continue after this received message identifier |
+| `--mark-read` |  |  | Root only: record this page after stdout flush |
+| `--delivery-dir` | `DELIVERY_DIR` |  | Existing owner-selected delivery directory for read receipts |
+| `--host` | `HOST` |  | The reading root's configured host |
+| `--session` | `SESSION` |  | The reading root's own session |
+| `--generation` | `GENERATION` |  | The reading root's binding generation |
+
+### `aegis team mail send`
+
+Publish a strict mailbox request
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--root` | `ROOT` |  | Absolute mailbox root; required once before or after the verb |
+| `--request`, `--request-file` | `REQUEST` |  | Absolute strict JSON request with no symlink components, or - for bounded stdin |
 
 ### `aegis team metrics`
 

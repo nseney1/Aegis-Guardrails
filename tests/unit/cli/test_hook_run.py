@@ -788,7 +788,11 @@ def test_a_scan_rows_time_is_read_as_strptime_reads_it(ws, capsys, stamp, counts
 # code). The bounds leave room for another Python version and platform (Windows loads msvcrt,
 # _winapi and nt-only modules), not for a new subsystem on the hook path. 29 after PATHLOOKUP-GIT-CACHE-SPLIT
 # moved the ordinary-Git cache policy out of aegis_core.pathlookup into aegis_core.pathlookup_gitcache (moved code).
-_HOOK_MODULES_MAX, _HOOK_AEGIS_MODULES_MAX = 130, 29
+# Reviewed PROPOSAL-CLEAN-DELETED-VIEW round 3c: the pattern leaf adds one module;
+# coordinator importtime measured 3.6-6.4 ms of regex compilation moved from the secret-masking module.
+# Reviewed GITSAFE-LOSSLESS-PATHS: aegis_core.git_path_codec adds one module for
+# lossless Git path decoding during busy-log event layout.
+_HOOK_MODULES_MAX, _HOOK_AEGIS_MODULES_MAX = 130, 31
 
 
 @pytest.mark.parametrize("covered", [True, False], ids=["deep-scan-row", "no-scan-row"])

@@ -1,3 +1,8 @@
 {
-  "v": 1
+  "v": 1,
+  "approvals": {
+    "main": "signature",
+    "develop": "review",
+    "*": "none"
+  }
 }

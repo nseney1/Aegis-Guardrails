@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import redirect_stderr
 from functools import partial
 import json
 
@@ -41,14 +40,6 @@ def _parser_refusal(error=None):
     return result
 
 
-class _DiscardOutput:
-    def write(self, text):
-        return len(text)
-
-    def flush(self):
-        pass
-
-
 class QueueErrorPolicy:
     """Compose queue parsing explicitly, without rewriting parser policies."""
 
@@ -60,6 +51,8 @@ class QueueErrorPolicy:
 
     def __call__(self):
         self.fallback()
+        if self.active:
+            raise QueueArgumentError()
 
     def run(self, operation):
         return self.fallback.run(operation)
@@ -80,12 +73,11 @@ class QueueErrorPolicy:
 
         diagnostic = None
         try:
-            with redirect_stderr(_DiscardOutput()):
-                args = parser.parse_args(argv)
-                raw = args.workspace
-                if raw is not None and not team_queue.valid_workspace_spelling(raw):
-                    raise QueueArgumentError()
-                return args
+            args = parser.parse_args(argv)
+            raw = args.workspace
+            if raw is not None and not team_queue.valid_workspace_spelling(raw):
+                raise QueueArgumentError()
+            return args
         except SystemExit as error:
             if error.code == 0:
                 return EXIT_OK
@@ -93,6 +85,7 @@ class QueueErrorPolicy:
             diagnostic = error
         except (self.parser_error, MsgArgumentError):
             pass
+        parser.refuse_scoped_usage()
         result = _parser_refusal(diagnostic)
         if self.output is not None:
             return self.output(result)

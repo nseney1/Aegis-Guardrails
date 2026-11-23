@@ -16,6 +16,7 @@ import sys
 
 from aegis_core.redaction import SECRET_REPLACEMENTS
 from aegis_core.storage import LockTimeoutError, file_generation, file_lock
+from aegis_core.storage_confined import ConfinedFileError, open_directory
 
 __all__ = ["MAX_LINE_BYTES", "MAX_INPUT_BYTES", "MAX_HISTORY_BYTES", "MAX_HISTORY_RECORDS",
            "ModelSelectionError", "validate_bindings", "select_model", "select_and_append",
@@ -351,19 +352,12 @@ def _json_value(value, error, depth=0, budget=None, limit=MAX_LINE_BYTES):
 def _encoded(value, limit, error, *, checked=False):
     if not checked:
         _json_value(value, error, limit=limit)
-    result = bytearray()
-    encoder = json.JSONEncoder(sort_keys=True, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
     try:
-        for chunk in encoder.iterencode(value):
-            _require(len(result) + len(chunk) <= limit,
-                     "decision_line_too_large" if limit <= MAX_LINE_BYTES else error)
-            result.extend(chunk.encode("ascii"))
+        result = json.dumps(value, sort_keys=True, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
     except (ValueError, RecursionError) as exc:
-        # Preserve semantic refusals raised by the bounded encoder above.
-        if isinstance(exc, ModelSelectionError):
-            raise
         raise ModelSelectionError(error) from exc
-    return bytes(result)
+    _require(len(result) <= limit, "decision_line_too_large" if limit <= MAX_LINE_BYTES else error)
+    return result.encode("ascii")
 
 
 def _record(record, error):
@@ -624,13 +618,8 @@ def _open_regular(path, error, cap=None):
     _safe_path(path, error)
     before = path.lstat()
     cursor, descriptor = None, None
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     try:
-        cursor = os.open(path.anchor, flags)
-        for component in path.parent.parts[1:]:
-            child = os.open(component, flags, dir_fd=cursor)
-            previous, cursor = cursor, child
-            os.close(previous)
+        cursor = open_directory(os.open, path.parent, close_fd=os.close, stat_fd=os.fstat, stat_entry=os.stat).detach()
         descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK |
                              getattr(os, "O_CLOEXEC", 0), dir_fd=cursor)
         opened = os.fstat(descriptor)
@@ -780,30 +769,16 @@ def _decision_directory(path):
     except RuntimeError as exc:
         raise ModelSelectionError("unsafe_decision_path") from exc
     _require(parent == given.parent, "unsafe_decision_path")
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-    cursor, directory = None, None
-    try:
-        cursor = _path_call(os.open, parent.anchor, flags, missing=True)
-        for component in parent.parts[1:]:
-            child = _path_call(os.open, component, flags, dir_fd=cursor)
-            previous, cursor = cursor, child
-            os.close(previous)
-        leaf = given.name or "."
-        directory = _path_call(os.open, leaf, flags, dir_fd=cursor)
-        info = os.fstat(directory)
+    def private(info):
         _require(info.st_uid == os.getuid() and not info.st_mode & 0o022, "unsafe_decision_directory")
-        visible = _path_call(os.stat, leaf, dir_fd=cursor, follow_symlinks=False)
-        _require(stat.S_ISDIR(visible.st_mode) and (visible.st_dev, visible.st_ino) ==
-                 (info.st_dev, info.st_ino) == (expected.st_dev, expected.st_ino), "unsafe_decision_path")
-        previous, cursor = cursor, None
-        os.close(previous)
-        result, directory = directory, None
-        return result
-    finally:
-        if directory is not None:
-            os.close(directory)
-        if cursor is not None:
-            os.close(cursor)
+
+    try:
+        with open_directory(os.open, given, policy=private, close_fd=os.close,
+                            stat_fd=os.fstat, stat_entry=os.stat) as held:
+            _require(held.identity == (expected.st_dev, expected.st_ino), "unsafe_decision_path")
+            return held.detach()
+    except ConfinedFileError as exc:
+        raise ModelSelectionError("unsafe_decision_path") from exc
 
 
 def _open_log(name, directory):
@@ -924,7 +899,7 @@ def _publish(path, payload, directory, snapshot=None, generation=None):
             raise cleanup_error
 
 
-def append_decision(path, record):
+def append_decision(path, record, *, known_decision=None, prepare=None):
     """Publish old bytes plus one bounded record atomically under the .lock.
 
     Any failure before rename leaves old history unchanged. History limits refuse
@@ -932,10 +907,44 @@ def append_decision(path, record):
     filename operations refuse unsafe_decision_path. Cleanup errors are chained
     under the primary failure. New decisions with stale counts_before or a stale
     previous_decision_id refuse stale_decision; use select_and_append for launches.
+    known_decision publishes prepare(original) only for an id already present in
+    the same locked snapshot. An absent id refuses unknown_decision_id and is never
+    admitted as a launch. prepare runs after that snapshot is validated; its refusal
+    leaves storage untouched. A missing log is probed before lock creation.
     """
-    payload = _line(record)
-    with _locked_log(path) as (target, directory):
-        _publish(target, payload, directory)
+    snapshot = generation = None
+    if known_decision is None:
+        payload = _line(record)
+        read = False
+    else:
+        # Refuse a bad id before any path I/O. prepare must return that same id.
+        _require(type(known_decision) is str and
+                 re.fullmatch(r"[0-9a-f]{64}", known_decision) is not None, "invalid_decision_id")
+        _require(callable(prepare), "invalid_history")
+        payload = None
+        read = True
+    with _locked_log(path, read=read) as (target, directory):
+        if known_decision is not None:
+            if directory is None:
+                raise ModelSelectionError("unknown_decision_id")
+            history = _HistoryReader(target, directory, capture=True)
+            original = None
+            try:
+                for row in history:
+                    if original is None and row["decision_id"] == known_decision:
+                        original = row
+            finally:
+                history.close()
+            if original is None:
+                raise ModelSelectionError("unknown_decision_id")
+            record = prepare(original)
+            _require(type(record) is dict and record.get("decision_id") == known_decision,
+                     "invalid_history")
+            payload = _line(record)
+            snapshot, generation = history._snapshot, history._generation
+        _publish(target, payload, directory, snapshot, generation)
+    if known_decision is not None:
+        return record
 
 
 def select_and_append(path, bindings, policy, task_kind, role_kind, *, host_kinds, subject=None, intent=None,

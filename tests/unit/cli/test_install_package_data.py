@@ -212,3 +212,65 @@ def test_dirty_checkout_wheel_excludes_bytecode_and_keeps_nested_templates(tmp_p
         names = set(archive.namelist())
         assert {"aegis_core/team_templates/" + name for name in assets} <= names
         assert not any("__pycache__" in name or name.endswith((".pyc", ".pyo", ".pyd")) for name in names)
+
+
+def _packaged_team_template_members(checkout):
+    """Files the package-data include and exclude patterns select. No git history."""
+    table = tomllib.loads((checkout / "pyproject.toml").read_text(encoding="utf-8"))["tool"]["setuptools"]
+    package = "aegis_core.team_templates"
+    root = checkout / "aegis_core" / "team_templates"
+    excludes = [str(root / pattern) for pattern in table.get("exclude-package-data", {}).get(package, [])]
+    chosen = set()
+    for pattern in table["package-data"][package]:
+        for path in glob.glob(str(root / pattern), recursive=True):
+            candidate = Path(path)
+            if not candidate.is_file():
+                continue
+            relative = candidate.relative_to(root).as_posix()
+            if any(fnmatch.fnmatch(str(candidate), exclude) for exclude in excludes):
+                continue
+            if "__pycache__" in candidate.parts or relative.endswith((".pyc", ".pyo", ".pyd")):
+                continue
+            chosen.add("aegis_core/team_templates/" + relative)
+    return chosen
+
+
+def test_verify_dist_record_matches_the_built_team_templates(tmp_path):
+    """A real wheel and sdist from a clean copy must match the verifier."""
+    executable = _wheel_builder()
+    source = tmp_path / "checkout"
+    source.mkdir()
+    for name in (*AEGIS_PACKAGES, "rules", "skills"):
+        shutil.copytree(REPO_ROOT / name, source / name,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo", "*.pyd"))
+    for name in ("pyproject.toml", "MANIFEST.in", "README.md", "LICENSE"):
+        shutil.copyfile(REPO_ROOT / name, source / name)
+    script = "from setuptools.build_meta import build_sdist, build_wheel\nbuild_wheel('dist')\nbuild_sdist('dist')\n"
+    done = subprocess.run([executable, "-I", "-c", script], cwd=source, capture_output=True, text=True, timeout=180)
+    assert done.returncode == 0, done.stderr[-2000:]
+    dist = source / "dist"
+    wheels = sorted(dist.glob("*.whl"))
+    sdists = sorted(dist.glob("*.tar.gz"))
+    assert len(wheels) == 1 and len(sdists) == 1
+    selected = _packaged_team_template_members(source)
+    assert selected
+    with zipfile.ZipFile(wheels[0]) as archive:
+        packaged = {name for name in archive.namelist() if name.startswith("aegis_core/team_templates/")}
+    assert packaged == selected
+    verify = REPO_ROOT / ".github" / "scripts" / "verify_dist.py"
+    proc = subprocess.run([executable, str(verify), "record", str(dist)],
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    lines = [line for line in proc.stdout.splitlines() if line.strip()]
+    assert len(lines) == 2
+    for line in lines:
+        digest, separator, filename = line.partition("  ")
+        assert separator == "  " and len(digest) == 64 and digest.islower()
+        assert all(char in "0123456789abcdef" for char in digest)
+        assert filename == wheels[0].name or filename == sdists[0].name
+    sums = (dist / "SHA256SUMS").read_bytes()
+    assert b"\r" not in sums
+    checked = subprocess.run([executable, str(verify), "verify", str(dist)],
+                             capture_output=True, text=True, timeout=60)
+    assert checked.returncode == 0, checked.stderr
+    assert len([line for line in checked.stdout.splitlines() if line.strip()]) == 2

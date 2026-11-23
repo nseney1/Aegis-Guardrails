@@ -132,7 +132,7 @@ def _hold_scratch(path):
     fd = None
     try:
         with _confined(Path(path), (PROBE,)) as handle:
-            parent = getattr(handle, "_parent", None)
+            parent = getattr(handle, "parent_fd", None)
             if isinstance(parent, bool) or not isinstance(parent, int) or parent < 0: raise ConfinedFileError("io")
             fd = os.dup(parent)
         os.set_inheritable(fd, False); info = os.fstat(fd)
@@ -267,7 +267,7 @@ class _Bad:
         self.name = name
 
 def _held_descriptor():
-    fd = getattr(_HELD.get(), "_parent", None)
+    fd = getattr(_HELD.get(), "parent_fd", None)
     if isinstance(fd, bool) or not isinstance(fd, int) or fd < 0:
         return None
     return fd

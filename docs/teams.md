@@ -9,6 +9,38 @@ commands supply cooperative leases and a post-lane check; they do not start agen
 worktrees. A read-only reviewer claims no paths, and its verdict applies to the
 exact tree it reviewed. Review verdicts belong in the pull request, not the ledger.
 
+## On this branch
+
+These surfaces are in the tree. This page is the entry; the linked pages are the depth.
+
+| Surface | What you can use | Depth |
+|---|---|---|
+| Repository lanes | `aegis team claim` and `aegis check --lane` | the sections below |
+| Work queue | `aegis team queue` | [Queue work for teams](#queue-work-for-teams) |
+| Model selection | `aegis team model` and the `aegis_team_model` tool; a choice requires an admitted binding | [Model selection](model-selection.md) |
+| Team profile | `aegis team config`, `aegis team doctor` and `aegis team hosts` | [Team profiles](teams-profile.md) |
+| Message codec | `aegis msg` plus `aegis_msg_read` and `aegis_msg_write` | [Delivery over MCP](how-it-works.md#delivery-over-mcp) |
+| Product mailbox | `aegis team mail send` and `aegis team mail read` over `aegis_core.team_mailbox`; `aegis team mail doctor` over `aegis_core.team_mailbox_doctor` | [Mail and board](#mail-and-board) |
+| Team board | `aegis team board` configures, reads and inspects the board over `aegis_core.team_board` | [Mail and board](#mail-and-board) |
+| Container isolation | `aegis team isolation check` plans from an absolute team-run file or compares an inspection; it does not start a container | [Container isolation](teams-container-isolation.md) |
+| Source pages | `aegis_core.team_source` serves pinned object pages from an owner-selected root; refusals are fixed envelopes | [Architecture](architecture.md#where-to-read-next) |
+| Session wake | `aegis_core.team_session_wake` validates the profile binding and attempts a turn for unread mail | [Session wakes](#session-wakes) |
+| Codex stdio wire | `aegis_core.team_native_wire.ProtocolClient` launches no process; the caller owns and reaps the process and transfers both pipe streams to the client, which closes them on `close()` or a terminal protocol error; cancel through `client.close()` and never close or reuse the streams directly | [Architecture](architecture.md#where-to-read-next) |
+| Workspace ledger | `aegis_core.team_workspace_store` and `aegis_core.team_workspace_display`; `tools/hierarchy_workspace.py` stays outside the wheel | [Architecture](architecture.md#where-to-read-next) |
+| Session stop | `aegis_core.team_session_stop`, `team_session_census` and `team_session_custody`; a stop signals only a process proven to belong to the recorded session | [Security](../SECURITY.md#teams-trust-model) |
+| Served identity | `aegis_core.model_served.observe_served` records host, model, level, family and a fallback reason; it adds no command | [Model selection](model-selection.md) |
+| Job recipes and packets | `aegis_core.team_jobs_recipes`; validation includes typed `unknown_recipe` and `invalid_packet` refusals and grants no execution authority | [Architecture](architecture.md#where-to-read-next) |
+| Hierarchy runs | `tools/hierarchy_team.py`, outside the installed wheel | [Runtime guide](agent-hierarchies.md) and [prerequisites](hierarchy-team.md#prerequisites) |
+| Git delivery | snapshot, plans, compare-and-swap publish, qualification and the publisher, as libraries | [Architecture](architecture.md#git-delivery) |
+| Proposals and lint | proposal records, including source `mine`; `aegis rule lint` reports and exits 0 | [Proposals and rule lint](how-it-works.md#proposals-and-rule-lint) |
+| Supervisor | profile-driven pauses and backoff | [Supervisor profile](teams-supervisor.md) |
+
+`aegis_core.merge_queue.MergeQueue` checks qualification for the exact landing tree. Automatic landing remains separate work. `revalidate` refuses `issued_unresolved` while an issued record or cleanup is set. `check_issued` refuses `issued_unresolved` when that issued checkpoint conflicts or results remain. A refusal's `next_action` names the custodian and a fixed recovery text, and it echoes no transport text. `tools/hierarchy_templates/` is outside the wheel. The wheel includes `job-recipes.json` and `role-registry.json` under `aegis_core/team_templates/`. `team_roles.registry` reads the role registry. An `invalid_registry` refusal keeps that reason; a missing field, a field type or routes puts the matching repair in `next_action`. [Absorption](teams-absorption.md) describes the package boundary for templates that are not moved yet.
+
+Snapshots refuse `unsupported_platform` unless `descriptor_support` is true: `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `stat` and `readlink`. The work queue refuses `unsupported_platform`, and the proposal store refuses `unsupported`, unless `storage.confined_descriptor_supported` is true: `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `mkdir`, `link`, `rename`, `unlink` and `stat`. That function does not use `readlink`. Both probes are false when `os.name` is not `posix`, so Windows fails them. Neither function tests for macOS.
+
+Qualification writes call `team_qualify.descriptor_supported` and otherwise refuse `unsupported_platform`. That function is true only when `team_git.descriptor_support` is true, `team_gitops.descriptor_supported` is true (`fcntl` is available and `storage.confined_descriptor_supported` is true), and `gitops_fds.descriptor_supported` confirms Linux subreaper support (`sys.platform` is `linux`, `os.name` is `posix`, and `prctl(37)` returns 0). The merge queue checks the snapshot and qualification probes before preparing a candidate and refuses `unsupported_platform` if either fails. Publisher activation is not wired. A separate OS principal is not in this branch (`OS-PRINCIPAL-1`). File modes do not isolate another process running as the owner.
+
 ## Setup and limits of each surface
 
 **Repository lanes** use `aegis team claim` and `aegis check --lane`, included in
@@ -25,9 +57,41 @@ authority and no native Teams enforcement. Follow the
 **Runtime team tools** are a source-checkout prototype; `tools/hierarchy_team.py`
 is outside the installed wheel. Team runs need Linux, Python 3.9+, Git, `bwrap`,
 the selected host CLI and a dedicated host login. They set up runs, start and stop
-supported CLI sessions, and inspect run status. Start with the
+supported CLI sessions, and inspect run status. Fixed start failures are
+recorded as `failed_to_start` or `start_incomplete`, with the reasons in the
+[runtime guide](agent-hierarchies.md#start-resume-and-stop-sessions). The job
+runner calls `check_settlement_processes` on settlement and recovery before it
+treats a stopped job as finished, and refuses while the recorded process group
+still has members. The small-change dispatcher calls `check_stopped` before it
+accepts a completed retained job. Under a host plan, a handoff checkpoint keeps open-work briefs, the last touching brief, briefs listed in `entries[].briefs`, and the last inherited brief when none qualifies; without a plan, briefs carry forward unchanged. Start with the
 [runtime guide](agent-hierarchies.md) and the
 [team-run prerequisites and configuration](hierarchy-team.md#prerequisites).
+
+### Mail and board
+
+`aegis team mail send` publishes a request, `aegis team mail read` reads a
+bounded page, and `aegis team mail doctor` inspects mailbox health without
+writes. The doctor is `aegis_core.team_mailbox_doctor`, folded into that command;
+it is not a separate tool. `aegis team doctor` checks the team profile. `aegis team board` can
+configure channels and access, read pages and inspect board health through
+`aegis_core.team_board`. See the
+[mail](reference.md#aegis-team-mail) and [board](reference.md#aegis-team-board)
+command sections for arguments.
+
+Mail and board require the mailbox store's POSIX descriptor support. This
+includes `O_NOFOLLOW`, `O_DIRECTORY`, descriptor-relative `open`, `mkdir`,
+`link`, `unlink`, `stat` and `rmdir`, and `scandir` on a directory descriptor.
+After successful argument parsing and workspace resolution, missing descriptor
+support yields `unsupported_platform` for mail send, mail read and every board
+command, and `MD_PLATFORM` for mail doctor. A malformed option before `mail` or `board` is a fixed usage refusal (exit 2) and does not echo the caller's tokens. A board write waits up to 5.0 seconds for the board lock, then refuses `busy` if the lock is still held. A post or disposition refuses `rate_limited` when that endpoint already has 30 actions in the last 60 seconds: the refusal tells the caller to wait for the window and writes nothing.
+
+### Session wakes
+
+`aegis_core.team_session_wake.wake` refuses a mismatched profile with
+`binding_mismatch` before starting a turn. With a valid profile, an empty inbox
+returns `nothing_unread` and a dry run with unread mail returns `dry_run`. An
+actual wake with unread mail on a supported platform refuses with `busy` if
+the endpoint is already claimed. See [Security](../SECURITY.md#repository-trust).
 
 ## Claim and finish a lane
 

@@ -7,28 +7,35 @@ Legacy checkout loading and transport registration remain in the adapters.
 from contextlib import contextmanager, ExitStack
 from copy import copy
 import errno
+from functools import partial
 import json
 import os
 from pathlib import Path
 import re
 import stat
+import time
+from typing import NamedTuple, Union
 import uuid
 
 from aegis_core import message_codec as codec_module
 from aegis_core import team_mailbox_guidance as guidance
 from aegis_core.diagnostic_messages import clip_rendered_text, guidance_value
 from aegis_core.message_codec_format import escape_char, neutral_text
+from aegis_core.message_codec_store import store_supported
 from aegis_core.message_codec_views import Renderer
 from aegis_core.team_mailbox import Mailbox
 from aegis_core.team_mailbox_primitives import (
+    render_mailbox_refusal,
     BusyError, MailboxRefusal, SLUG, fields, text, integer, require,
 )
 from aegis_core.team_mailbox_guidance import MAX_CHARS, NEXT_ACTIONS
 
-__all__ = ["Records", "RecordRefusal", "tool_specs"]
+__all__ = ["Records", "RecordRefusal", "RecordResult", "tool_specs"]
 tool_specs = guidance.tool_specs
 STUB = re.compile(r"aegis-record/1 sha256=([0-9a-f]{64}) kind=([a-z][a-z0-9.]*)")
 ROOT_MARKER = b"aegis.record-root/1\n"
+LOCK_WAIT_SECONDS = 5.0
+LOCK_POLL_SECONDS = 0.01
 
 
 class _RecordCodec:
@@ -54,6 +61,7 @@ class _RecordCodec:
 
 class RecordRefusal(MailboxRefusal):
     """Typed operational refusal retaining the codec's fixed wire envelope."""
+    advice_contract = "record_codec"
     def __init__(self, error, tool):
         self.record_error = guidance.error_result(error, tool=tool, max_chars=MAX_CHARS)
         detail = self.record_error["error"]
@@ -82,16 +90,29 @@ class _PublicationStore:
         return self.commit(path, raw)
 
 
+class RecordResult(NamedTuple):
+    """The payload and received message IDs from one successful operation."""
+    payload: Union[dict, str]
+    returned: tuple[str, ...] = ()
+
+
 class Records:
-    def __init__(self, mailbox, sender, *, inbox=None):
+    def __init__(self, mailbox, sender, *, inbox=None, monotonic=time.monotonic, sleep=time.sleep):
         fields(sender, {"from", "host", "session", "binding_generation"})
         for key in ("from", "host", "session"):
             text(sender[key], key, 256)
         integer(sender["binding_generation"], "binding generation")
         require(inbox is None or callable(inbox))
+        require(callable(monotonic) and callable(sleep))
         self.mailbox, self.sender, self.inbox = mailbox, dict(sender), inbox
+        self._wait = partial(_wait_for_lock, monotonic=monotonic, sleep=sleep)
 
-    def call(self, name, arguments):
+    def call_with_result(self, name, arguments):
+        """Return the payload and IDs together for transport delivery accounting."""
+        return self.call(name, arguments, _with_result=True)
+
+    def call(self, name, arguments, *, _with_result=False):
+        """Return the original tool payload."""
         require(supported(), reason="unsupported_platform")
         require(type(name) is str and name in (
             "mailbox_publish_record", "mailbox_read_record", "mailbox_digest"))
@@ -103,11 +124,16 @@ class Records:
             _arguments(codec, arguments, (), {"message_id", "to", "type", "kind", "content", "brief",
                 "in_reply_to", "acknowledgment", "readiness", "result", "receipt", "ref", "refs", "fields",
                 "outline", "expand", "max_chars", "after_message_id", "limit"})
-            return handlers[name](arguments)
+            result = handlers[name](arguments)
+            return result if _with_result else result.payload
+        except MailboxRefusal as error:
+            payload = render_mailbox_refusal(error)
+            pinned = guidance.pinned_record_error(codec, payload["reason"])
+            if pinned is not None:
+                raise RecordRefusal(pinned, name) from None
+            render_mailbox_refusal(error, reraise=True)
         except codec.CodecError as error:
             raise RecordRefusal(error, name) from None
-        except MailboxRefusal:
-            raise
         except RecursionError:
             raise RecordRefusal(codec.CodecError("E_FORMAT"), name) from None
         except (OSError, UnicodeError, RuntimeError):
@@ -118,37 +144,55 @@ class Records:
     def _publish_record(self, arguments):
         mailbox = self.mailbox
         mailbox.roles.authorize(mailbox.caller_role, "publish")
-        with mailbox.store.lock(mailbox.root):
+        # Acquire the owner reservation once before polling the mailbox reservation.
+        with mailbox.store.evidence_transaction(), self._wait(lambda: mailbox.store.lock(mailbox.root)):
             mailbox.refresh()
             mailbox.fence(self.sender)
-            result = publish(_RecordCodec, mailbox, self.sender, arguments)
+            result = publish(_RecordCodec, mailbox, self.sender, arguments, wait=self._wait)
         warnings = mailbox.store.drain_warnings()
         if warnings:
             result["warnings"] = result.get("warnings", []) + warnings
-        return result
+        return RecordResult(result)
 
     def _read_record(self, arguments):
         self.mailbox.refresh()
         self.mailbox.fence(self.sender, ready=False)
-        result, _returned = read(_RecordCodec, self.mailbox, self.sender, arguments)
-        return result
+        result, returned = read(_RecordCodec, self.mailbox, self.sender, arguments)
+        return RecordResult(result, tuple(returned))
 
     def _digest(self, arguments):
         self.mailbox.refresh()
         self.mailbox.fence(self.sender, ready=False)
-        result, _returned = digest(_RecordCodec, self.mailbox, self.sender, arguments, inbox=self.inbox)
-        return result
-
-
-def supported():
-    capabilities = {function.__name__ for function in os.supports_dir_fd}
-    nofollow = {function.__name__ for function in os.supports_follow_symlinks}
-    return ({"open", "mkdir", "stat", "link", "unlink", "rename", "rmdir"} <= capabilities and "stat" in nofollow and
-            hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW") and hasattr(os, "geteuid"))
+        result, returned = digest(_RecordCodec, self.mailbox, self.sender, arguments, inbox=self.inbox)
+        return RecordResult(result, tuple(returned))
 
 
 @contextmanager
-def record_store(codec, root, *, write=False, state=None):
+def _wait_for_lock(lock, *, monotonic=time.monotonic, sleep=time.sleep):
+    """Retry acquisition only, with a fresh deadline for each reservation."""
+    deadline = monotonic() + LOCK_WAIT_SECONDS
+    with ExitStack() as stack:
+        while True:
+            try:
+                lease = stack.enter_context(lock())
+            except BusyError:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise
+                sleep(min(LOCK_POLL_SECONDS, remaining))
+                if monotonic() >= deadline:
+                    raise
+            else:
+                break
+        yield lease
+
+
+def supported():
+    return store_supported(publication=True)
+
+
+@contextmanager
+def record_store(codec, root, *, write=False, state=None, wait=_wait_for_lock):
     """Bind safe descriptors; serialize store lifetime and undo our refused initialization."""
     codec.require(supported(), "E_AUTH")
     path = _store_path(codec, root)
@@ -159,45 +203,52 @@ def record_store(codec, root, *, write=False, state=None):
         for component in path.parent.parts[1:]:
             parent = os.open(component, flags, dir_fd=parent)
             stack.callback(os.close, parent)
-        lease = stack.enter_context(_publication_lock(codec, parent, ".records-store.lock")) if write else None
-        created, identity, rootfd = None, None, None
+        lease = stack.enter_context(wait(lambda: _publication_lock(codec, parent, ".records-store.lock"))) if write else None
+        created = False
+        created_identity = identity = rootfd = None
         try:
             if write:
                 try:
                     os.mkdir(path.name, mode=0o700, dir_fd=parent)
-                    created = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
                 except FileExistsError:
                     pass
+                else:
+                    created = True
+                    created_identity = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
             directory = os.open(path.name, flags, dir_fd=parent)
             stack.callback(os.close, directory)
             expected = os.fstat(directory)
             codec.require(stat.S_ISDIR(expected.st_mode) and expected.st_uid == os.geteuid()
                           and not expected.st_mode & 0o022, "E_AUTH")
+            codec.require(created_identity is None or _is_root_or_ancestor(created_identity, (expected,)), "E_AUTH")
             _check_store_identity(codec, expected, root)
             store = codec.Store(path)
             stack.callback(store.close)
             actual = os.fstat(store.fd)
             codec.require((expected.st_dev, expected.st_ino) == (actual.st_dev, actual.st_ino), "E_AUTH")
-            if write and state is not None:
-                rootfd = stack.enter_context(_directory(codec, root))
-                pending = ".pending-" + uuid.uuid4().hex
-                if _staged_exists(codec, rootfd, pending):
-                    os.unlink(pending, dir_fd=rootfd)
-                if _root_token(codec, rootfd) is None:
-                    raw = ROOT_MARKER + uuid.uuid4().hex.encode("ascii") + b"\n"
-                    fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=rootfd)
-                    try:
-                        identity = os.fstat(fd)
-                        with os.fdopen(fd, "wb", closefd=False) as stream:
-                            stream.write(raw)
-                            stream.flush()
-                            os.fsync(fd)
-                        os.link(pending, ".root-id", src_dir_fd=rootfd, dst_dir_fd=rootfd, follow_symlinks=False)
-                        os.fsync(rootfd)
-                    finally:
-                        os.close(fd)
+            # Release the inner lease before the rollback can remove a new store.
+            with ExitStack() as publishing:
+                if write and state is not None:
+                    state["publication_lease"] = publishing.enter_context(wait(lambda: _publication_lock(codec, store.fd)))
+                    rootfd = stack.enter_context(_directory(codec, root))
+                    pending = ".pending-" + uuid.uuid4().hex
+                    if _staged_exists(codec, rootfd, pending):
                         os.unlink(pending, dir_fd=rootfd)
-            yield store
+                    if _root_token(codec, rootfd) is None:
+                        raw = ROOT_MARKER + uuid.uuid4().hex.encode("ascii") + b"\n"
+                        fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=rootfd)
+                        try:
+                            identity = os.fstat(fd)
+                            with os.fdopen(fd, "wb", closefd=False) as stream:
+                                stream.write(raw)
+                                stream.flush()
+                                os.fsync(fd)
+                            os.link(pending, ".root-id", src_dir_fd=rootfd, dst_dir_fd=rootfd, follow_symlinks=False)
+                            os.fsync(rootfd)
+                        finally:
+                            os.close(fd)
+                            os.unlink(pending, dir_fd=rootfd)
+                yield store
         finally:
             if state is not None and state["uncertain"]:
                 lease["clean"] = False
@@ -211,16 +262,19 @@ def record_store(codec, root, *, write=False, state=None):
                         if current is not None and _is_root_or_ancestor(identity, (current,)):
                             os.unlink(".root-id", dir_fd=rootfd)
                             os.fsync(rootfd)
-                    if created is not None:
+                    if created:
                         try:
                             current = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
-                            if _is_root_or_ancestor(created, (current,)):
-                                os.rmdir(path.name, dir_fd=parent)  # Parent lease excludes another first publisher.
+                            if created_identity is None or _is_root_or_ancestor(created_identity, (current,)):
+                                # If the first stat failed, reconcile through the parent while peers are excluded.
+                                codec.require(stat.S_ISDIR(current.st_mode) and current.st_uid == os.geteuid()
+                                              and not current.st_mode & 0o022, "E_AUTH")
+                                os.rmdir(path.name, dir_fd=parent)
                                 os.fsync(parent)
                         except OSError as error:
                             if error.errno not in (errno.ENOENT, errno.ENOTEMPTY, errno.EEXIST):
                                 raise
-                except OSError:
+                except (OSError, codec.CodecError):
                     lease["clean"] = False
                     raise
 
@@ -343,16 +397,23 @@ def _grant_entry(codec, store, rid):
     """One bounded, no-follow index read; missing and denied IDs have the same refusal."""
     codec.require(type(rid) is str and re.fullmatch(r"[0-9a-f]{64}", rid), "E_AUTH", detail="reference")
     try:
-        fd = os.open(".grants-" + rid, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0), dir_fd=store.fd)
-        try:
-            info = os.fstat(fd)
-            codec.require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and
-                          not info.st_mode & 0o022 and info.st_size <= codec.MAX_BYTES, "E_AUTH", detail="reference")
-            with os.fdopen(fd, "rb", closefd=False) as stream:
-                raw = stream.read(codec.MAX_BYTES + 1)
-            codec.require(len(raw) == info.st_size and len(raw) <= codec.MAX_BYTES, "E_AUTH", detail="reference")
-        finally:
-            os.close(fd)
+        with store.grant_directory() as bound:
+            if bound is None:
+                return None, None
+            grantsfd, _ = bound
+            try:
+                fd = os.open(".grants-" + rid, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0), dir_fd=grantsfd)
+            except FileNotFoundError:
+                return None, None
+            try:
+                info = os.fstat(fd)
+                codec.require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and
+                              not info.st_mode & 0o022 and info.st_size <= codec.MAX_BYTES, "E_AUTH", detail="reference")
+                with os.fdopen(fd, "rb", closefd=False) as stream:
+                    raw = stream.read(codec.MAX_BYTES + 1)
+                codec.require(len(raw) == info.st_size and len(raw) <= codec.MAX_BYTES, "E_AUTH", detail="reference")
+            finally:
+                os.close(fd)
         envelope = codec.parse(raw)  # Codec preflights bytes, depth and nodes before parsing.
         entry = envelope["fields"]["value"]
         codec.require(envelope["kind"] == "record" and not envelope["body"] and
@@ -640,14 +701,14 @@ def _staged_exists(codec, directory, name):
     return True
 
 
-def _link_message(codec, pending, destination, name, state, store, changes):
+def _link_message(codec, pending, destination, name, state, grantsfd, check, changes):
     """Atomically replace each complete grant entry, then publish; undo definite failures."""
     applied, temporary, warning, staged = [], ".pending-" + uuid.uuid4().hex, False, False
     try:
         for target, raw, previous in changes:
-            if _staged_exists(codec, store.fd, temporary):
-                os.unlink(temporary, dir_fd=store.fd)
-            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=store.fd)
+            if _staged_exists(codec, grantsfd, temporary):
+                os.unlink(temporary, dir_fd=grantsfd)
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=grantsfd)
             staged = True
             try:
                 with os.fdopen(fd, "wb", closefd=False) as stream:
@@ -657,9 +718,10 @@ def _link_message(codec, pending, destination, name, state, store, changes):
             finally:
                 os.close(fd)
             applied.append((target, previous))
-            os.rename(temporary, target, src_dir_fd=store.fd, dst_dir_fd=store.fd)
+            os.rename(temporary, target, src_dir_fd=grantsfd, dst_dir_fd=grantsfd)
             staged = False
-        os.fsync(store.fd)
+        os.fsync(grantsfd)
+        check()
         try:
             os.link(pending, name, src_dir_fd=destination, dst_dir_fd=destination, follow_symlinks=False)
         except OSError:
@@ -682,14 +744,14 @@ def _link_message(codec, pending, destination, name, state, store, changes):
                 for target, previous in reversed(applied):
                     if previous is None:
                         try:
-                            os.unlink(target, dir_fd=store.fd)
+                            os.unlink(target, dir_fd=grantsfd)
                         except FileNotFoundError:
                             pass
                     else:
-                        if _staged_exists(codec, store.fd, temporary):
-                            os.unlink(temporary, dir_fd=store.fd)
+                        if _staged_exists(codec, grantsfd, temporary):
+                            os.unlink(temporary, dir_fd=grantsfd)
                         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                                     0o600, dir_fd=store.fd)
+                                     0o600, dir_fd=grantsfd)
                         staged = True
                         try:
                             with os.fdopen(fd, "wb", closefd=False) as stream:
@@ -698,29 +760,30 @@ def _link_message(codec, pending, destination, name, state, store, changes):
                                 os.fsync(fd)
                         finally:
                             os.close(fd)
-                        os.rename(temporary, target, src_dir_fd=store.fd, dst_dir_fd=store.fd)
+                        os.rename(temporary, target, src_dir_fd=grantsfd, dst_dir_fd=grantsfd)
                         staged = False
-                os.fsync(store.fd)
-            if staged and _staged_exists(codec, store.fd, temporary):
-                os.unlink(temporary, dir_fd=store.fd)
+                os.fsync(grantsfd)
+            if staged and _staged_exists(codec, grantsfd, temporary):
+                os.unlink(temporary, dir_fd=grantsfd)
         except (OSError, ValueError):
             state["uncertain"] = True
             raise
 
 
-def _commit_record(codec, mailbox, sender, value, path, raw, state):
+def _commit_record(codec, mailbox, sender, value, path, raw, state, wait):
     """Mailbox publish validates semantics before entering this I/O boundary."""
     codec.require(type(raw) is bytes and len(raw) <= codec.MAX_BYTES, "E_LIMIT")
     codec.require(path.parent == mailbox.route(sender["from"], sender["to"]), "E_AUTH")
-    rid, pending = codec.record_id(value), ".pending-" + uuid.uuid4().hex
+    pending = ".pending-" + uuid.uuid4().hex
     state["stage"] = path.parent / pending
     if _root_identity(codec, mailbox.root) is None:
         # A new root has no grants. Refuse refs and bound its default view before
         # allocating either the shared store or the root's atomic identity.
         options = _options(codec, {})
         _bounded(codec, _value_view(codec, None, sender, value, options, None), MAX_CHARS)
-    with record_store(codec, mailbox.root, write=True, state=state) as store:
-        with _publication_lock(codec, store.fd) as lease, _directory(codec, path.parent) as destination:
+    with record_store(codec, mailbox.root, write=True, state=state, wait=wait) as store:
+        lease = state["publication_lease"]
+        with _directory(codec, path.parent) as destination:
             access = _RecordAccess(codec, store, mailbox.root, sender, rollback=True)
             for reference in set(value["refs"].values()):
                 access.authorize(reference)
@@ -729,11 +792,7 @@ def _commit_record(codec, mailbox, sender, value, path, raw, state):
             options = _options(codec, {})
             _bounded(codec, _value_view(codec, store, sender, value, options, access), MAX_CHARS)
             changes = _grant_changes(codec, access, value, sender["to"])
-            try:
-                os.stat(rid + ".json", dir_fd=store.fd, follow_symlinks=False)
-                existed = True
-            except FileNotFoundError:
-                existed = False
+            publication = store.begin_publication()
             created = warning = False
             try:
                 if _staged_exists(codec, destination, pending):
@@ -749,27 +808,34 @@ def _commit_record(codec, mailbox, sender, value, path, raw, state):
                         os.fsync(fd)
                 finally:
                     os.close(fd)
-                store.write(value)
-                warning = _link_message(codec, pending, destination, path.name, state, store, changes)
+                store.write(value, publication=publication)
+                try:
+                    with store.grant_directory(publication=publication) as (grantsfd, check):
+                        try:
+                            warning = _link_message(codec, pending, destination, path.name, state, grantsfd, check, changes)
+                        except OSError:
+                            raise codec.CodecError("E_AUTH") from None
+                except (OSError, codec.CodecError):
+                    if not state["committed"]:
+                        raise
+                    state["uncertain"] = True  # The link is final. Keep both reservations for inspection.
             finally:
                 if state["uncertain"]:
                     lease["clean"] = False
                 try:
-                    if not state["committed"] and not state["uncertain"] and not existed:
-                        try:
-                            os.unlink(rid + ".json", dir_fd=store.fd)
-                        except FileNotFoundError:
-                            pass
+                    if not state["committed"] and not state["uncertain"]:
+                        store.rollback(publication)
                     if created:
                         os.unlink(pending, dir_fd=destination)
-                except OSError:
+                except (OSError, codec.CodecError):
                     lease["clean"] = False
                     if not state["committed"]:
+                        state["uncertain"] = True
                         raise
         return warning or not lease["clean"]
 
 
-def _accepted_publish(codec, mailbox, request, value):
+def _accepted_publish(codec, mailbox, request, value, wait):
     """Reuse the public mailbox validator with a per-call publication port."""
     invoked = warning = False
     state = {"committed": False, "uncertain": False}
@@ -778,7 +844,7 @@ def _accepted_publish(codec, mailbox, request, value):
         codec.require(not invoked)
         invoked = True
         try:
-            warning = _commit_record(codec, mailbox, request, value, path, raw, state)
+            warning = _commit_record(codec, mailbox, request, value, path, raw, state, wait)
         except codec.CodecError as error:
             # Preserve record codes through Mailbox.publish's ValueError normalizer.
             raise RecordRefusal(error, "mailbox_publish_record") from None
@@ -790,10 +856,10 @@ def _accepted_publish(codec, mailbox, request, value):
     view.store = _PublicationStore(mailbox.store, commit)
     result = view.publish(request)
     codec.require(invoked)
-    return warning, result.get("warnings", []), state["stage"]
+    return warning, result.get("warnings", []), state["stage"], state["uncertain"]
 
 
-def publish(codec, mailbox, sender, arguments):
+def publish(codec, mailbox, sender, arguments, *, wait=_wait_for_lock):
     required = {"message_id", "to", "type", "kind", "content"}
     optional = {"brief", "in_reply_to", "acknowledgment", "readiness", "result", "receipt"}
     _arguments(codec, arguments, required, optional)
@@ -820,11 +886,15 @@ def publish(codec, mailbox, sender, arguments):
             codec.require(all(original.get(k) == v for k, v in request.items()) and
                           set(original) - {"schema", "created_at", "authority", "verification"} == set(request))
             return {"id": codec.record_id(value), "message_id": original["message_id"]}
-    warning, warnings, stage = _accepted_publish(codec, mailbox, request, value)
+    warning, warnings, stage, cleanup_uncertain = _accepted_publish(codec, mailbox, request, value, wait)
     result = {"id": codec.record_id(value), "message_id": request["message_id"]}
     if warnings:
         result["warnings"] = warnings
-    if warning:
+    if cleanup_uncertain:
+        result["note"] = ("Message published. The owner should inspect staging and both reservations. "
+                          "Once cleanup is verified, clear an abandoned <store>/.publish.lock first, "
+                          "then an abandoned <parent>/.records-store.lock. Check history before publishing again.")
+    elif warning:
         # Redact the untrusted parent; the generated staging identifier stays usable.
         parent = guidance_value(str(stage.parent), 512)
         parent = clip_rendered_text(parent, 512)
@@ -904,7 +974,8 @@ def digest(codec, mailbox, sender, arguments, *, inbox):
                     retry["after_message_id"] = after
                 try:
                     return inbox(retry, item["message_id"], history)
-                except MailboxRefusal:
+                except MailboxRefusal as error:
+                    render_mailbox_refusal(error)
                     return None
             chosen = _options(codec, dict(arguments, **edits))
             if tool == "mailbox_read_record":

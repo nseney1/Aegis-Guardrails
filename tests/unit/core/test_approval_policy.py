@@ -433,6 +433,7 @@ def test_replacement_spans_keep_only_explicit_backreference_context():
                 end, payload = end - 1, payload[:-1]
         batches = []
         observed = redaction.redact_insight_text(value, 81920, on_replacements=batches.append)
+        # ROUND-8c drops privacy reinterpretation of this original family span.
         assert batches[0] == ((start, end, payload),), name
         assert observed == redaction.redact_insight_text(value, 81920), name
     batches = []
@@ -470,7 +471,8 @@ def test_redaction_batches_use_the_current_pass_coordinates_across_families():
         batches.append(spans)
 
     result = redact_insight_text(value, max_len=81920, on_replacements=observe)
-    assert len(batches) >= 3
+    # ROUND-6 unions all families in one pass over the original source.
+    assert len(batches) == 1
     assert result == redact_insight_text(value, max_len=81920) == " ".join(state[0].split())
     assert not any(secret in result for secret in secrets)
 
@@ -617,8 +619,15 @@ def _policy_environment(tmp_path, monkeypatch):
     home = hg.Home(tmp_path / "home")
     for name, value in home.env.items():
         monkeypatch.setenv(name, value)
-    for name in ("GITHUB_EVENT_PATH", "GITHUB_EVENT_NAME", "GITHUB_BASE_REF", "GITHUB_REF", "GITHUB_REF_NAME", "GIT_CONFIG_GLOBAL"):
-        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("GIT_CONFIG_GLOBAL", raising=False)
+
+
+def _add_overlapping_remotes(project):
+    project.git("remote", "add", "team", "/not-contacted")
+    # Git 2.51+ refuses overlapping names in `remote add`. Create the legacy
+    # configuration these tests exercise, including the usual tracking refspec.
+    project.git("config", "--local", "remote.team/fork.url", "/not-contacted")
+    project.git("config", "--local", "remote.team/fork.fetch", "+refs/heads/*:refs/remotes/team/fork/*")
 
 
 @pytest.mark.parametrize("base_policy", [None, {"main": "none", "*": "signature"},
@@ -653,8 +662,9 @@ def test_git_selector_table_agrees_across_public_commands(tmp_path, _policy_envi
     project.git("tag", "v1.2", base)
     project.git("tag", "ambiguous", older)
     project.git("branch", "ambiguous", base)
-    for remote in ("origin", "upstream", "team", "team/fork"):
+    for remote in ("origin", "upstream"):
         project.git("remote", "add", remote, "/not-contacted")
+    _add_overlapping_remotes(project)
     project.branch("work")
     project.git("branch", "--set-upstream-to=origin/main", "work")
     project.write(".github/workflows/ci.yml", "name: changed\n")
@@ -845,8 +855,7 @@ def test_remote_inventory_retry_requeries_git(tmp_path, _policy_environment, mon
 
 def test_parallel_slash_remote_checks_share_the_target_table(repo, monkeypatch):
     base = repo.git("rev-parse", "main")
-    for remote in ("team", "team/fork"):
-        repo.git("remote", "add", remote, "/not-contacted")
+    _add_overlapping_remotes(repo)
     repo.git("update-ref", "refs/remotes/team/fork/main", base)
     original, ready = gitsafe.run, Barrier(2)
     def overlap(args, *rest, **kwargs):

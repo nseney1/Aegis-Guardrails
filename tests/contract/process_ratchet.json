@@ -31,6 +31,10 @@
     "count": 1,
     "reason": "Host installation command boundary."
   },
+  "process:aegis_cli/team_isolation.py:inspect_image:subprocess.Popen": {
+    "count": 1,
+    "reason": "TA-6c bounded digest-qualified engine image inspection with DEVNULL stdin and stderr"
+  },
   "process:aegis_core/ast/batch.py:BatchDriver.__init__:subprocess.Popen": {
     "count": 1,
     "reason": "Deferred Popen type annotation for the bounded protocol-v2 lifecycle; no process starts here."
@@ -82,6 +86,18 @@
   "process:aegis_core/inference_provider.py:CommandBackend.generate:subprocess.run": {
     "count": 1,
     "reason": "Explicit user-configured model command boundary."
+  },
+  "process:aegis_core/team_native_bridge.py:ProcessBridge._run:subprocess.Popen": {
+    "count": 1,
+    "reason": "TA-3h: explicit owner-configured evidence-only provider argv; bounded correlated I/O, deadline, held cwd and WNOWAIT group cancellation; no native execution qualification."
+  },
+  "process:aegis_core/team_session_wake.py:_capture:subprocess.run": {
+    "count": 1,
+    "reason": "TA-2b: owner host control or fixed process census; fixed timeout, bounded output parsing and no shell."
+  },
+  "process:aegis_core/team_session_wake.py:start_turn:subprocess.Popen": {
+    "count": 1,
+    "reason": "TA-2b: bound owner-profile host launch with fixed prompt, descriptor cwd, private logs and new process group."
   },
   "process:aegis_core/team_supervisor_start.py:_spawn:subprocess.Popen": {
     "count": 1,

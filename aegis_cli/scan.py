@@ -30,6 +30,7 @@ from aegis_core.errors import WorkspaceError
 from aegis_core.guidance_grammar import clip_redacted
 from aegis_core.guidance_projection import (
     CONTROL_GUIDANCE, contains_control_characters, project_diagnostic,
+    projection_refusal_reason, projection_refusal_repair,
 )
 from aegis_core.hosts import GENERIC
 from aegis_core.workspace.layout import is_aegis_workspace
@@ -91,7 +92,7 @@ def run_scan(args: argparse.Namespace) -> int:
         print(json.dumps(result, indent=2, default=str))
     elif failed:
         _error(result.get("error", ""), projected=True)
-        _projection_errors(result)
+        _refusal_errors(result)
     else:
         print(_served_text(result.get("guidance", "")))
         for warning in result.get("warnings") or []:
@@ -99,18 +100,40 @@ def run_scan(args: argparse.Namespace) -> int:
     return EXIT_UNSERVED if failed else EXIT_SCANNED
 
 
-def _projection_errors(result: dict) -> None:
-    repairs = {
-        "guidance_projection_invalid_field": "Fix the field type and run `aegis rule lint <path>`.",
-        "guidance_projection_limit": "Shorten the instruction or slot expansion and run `aegis rule lint <path>`.",
-    }
-    repair = repairs.get(result.get("error"))
-    if repair is None or not result.get("rule_errors"):
-        return
-    for row in result["rule_errors"]:
-        suffix = ": " + row["error"]
-        path = _served_text(row["path"], max_len=1024 - len(suffix))
-        _error(path + suffix, projected=True)
+def _refusal_errors(result: dict) -> None:
+    """Attribute field repairs only to confirmed rows; otherwise give status advice.
+
+    Keep the core/JSON envelope unchanged. Only projection refusals need extra
+    location rows: load failures already name their files in the main error.
+    """
+    error = result.get("error", "")
+    repair = projection_refusal_repair(error)
+    confirmed_repairs = []
+    if repair is not None:
+        for row in result.get("rule_errors") or []:
+            suffix = ": " + row["error"]
+            path = _served_text(row["path"], max_len=1024 - len(suffix))
+            _error(path + suffix, projected=True)
+            field, _, reason = row["error"].partition(": ")
+            code = "guidance_projection_" + reason
+            if projection_refusal_reason(code, field) == row["error"]:
+                advice = projection_refusal_repair(code)
+                if advice is not None and advice not in confirmed_repairs:
+                    confirmed_repairs.append(advice)
+        repair = ("\n".join(confirmed_repairs) if confirmed_repairs else
+                  "Run `aegis status` to list unloadable and ignored files; once the rules load, "
+                  "fix field types or shorten fields and run `aegis rule lint <path>`, then retry `aegis scan`.")
+    elif error == "guidance_projection_budget":
+        repair = "Raise AEGIS_MAX_JIT_TOKENS and retry `aegis scan`."
+    elif error.startswith(("the rules directory cannot be read safely: ",
+                           "the user rules directory cannot be read safely: ")):
+        repair = "Remove unsafe links and restore read access to the rules directory, then run `aegis status`."
+    elif error.startswith("the reviewed (base) version of the rules cannot be read, so none is served: "):
+        repair = "Fetch the reviewed rules base and check rules.base_ref in the user config, then retry `aegis scan`."
+    elif result.get("rule_errors"):
+        repair = "Fix or move the invalid rule files and run `aegis rule lint <path>`; `aegis status` lists them."
+    else:
+        repair = "Run `aegis status` to diagnose the refusal, then retry `aegis scan`."
     print(repair, file=sys.stderr)
 
 

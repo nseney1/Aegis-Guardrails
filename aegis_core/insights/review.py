@@ -12,7 +12,9 @@ from pathlib import Path
 import re
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple
 
-from aegis_core.insights.capture import JOIN_WINDOW_S, _corroborating_hook, _row_source
+from aegis_core.insights.capture import (
+    JOIN_WINDOW_S, _corroborating_hook, _row_source, clean_insight_row,
+)
 from aegis_core.insights.keys import (
     COUNTABLE_LEVELS,
     INSIGHT_SCHEMA_VERSION,
@@ -20,6 +22,7 @@ from aegis_core.insights.keys import (
     insights_path,
     read_insight_rows,
 )
+from aegis_core.insights.records import DECISIONS, MAX_INSIGHT_ITEMS
 from aegis_core.primitives import parse_utc, utc_stamp
 from aegis_core.redaction import redact_insight_text
 from aegis_core.workspace.layout import WorkspaceLayout
@@ -42,9 +45,9 @@ REJECTION_RESURFACE_COUNT = 2
 # RULE_MATCH_SIM_WITH_PATH and any insight at RULE_MATCH_SIM; recurrence counts at RECURRENCE_SIM.
 RULE_MATCH_SIM_WITH_PATH = 0.15
 RULE_MATCH_SIM = 0.30
-DECISIONS = ("propose", "reject", "snooze", "merge-into-rule", "noise", "confirm")
 # The latest of these naming an insight decides whether review lists it (noise hides for good).
 _RULING_DECISIONS = ("propose", "merge-into-rule", "snooze", "reject")
+assert set(_RULING_DECISIONS).issubset(DECISIONS)
 
 
 def _effective_level(row: Mapping[str, Any], confirmed_ids: Set[str]) -> Optional[str]:
@@ -231,19 +234,20 @@ def record_decision(
 ) -> Dict[str, Any]:
     """A human decision on the insights it names; ``confirm`` names the suggestions a human
     confirms (and their ``kind``)."""
-    if decision not in DECISIONS:
-        raise ValueError(f"decision must be one of {list(DECISIONS)}, got {decision!r}")
-    ids = [str(i) for i in insight_ids if str(i).strip()]
-    if not ids:
+    decision = clean_insight_row({"decision": decision}, workspace=workspace)["decision"]
+    if (type(insight_ids) in (tuple, list) and len(insight_ids) <= MAX_INSIGHT_ITEMS and
+            all(type(item) is str and not item.strip() for item in insight_ids)):
         raise ValueError(f"{decision} needs at least one insight id")
     row: Dict[str, Any] = {"v": INSIGHT_SCHEMA_VERSION, "ts": utc_stamp(), "event": "decision",
-                           "decision": decision, "insight_ids": ids}
+                           "decision": decision, "insight_ids": insight_ids}
     if kind:
         row["kind"] = str(kind)
     if reason:
-        row["reason"] = redact_insight_text(str(reason))
-    if rule_id:
-        row["rule_id"] = str(rule_id)
+        row["reason"] = str(reason)
+    if rule_id is not None:
+        row["rule_id"] = rule_id
+    # The id list is checked once, inside this clean. A refusal returns before append.
+    row = clean_insight_row(row, workspace=workspace)
     _append_user_insights(insights_path(workspace, home=home), [row])
     return row
 
@@ -500,10 +504,10 @@ def _insight_proposal(
     def legacy_retry():
         # Only an existing legacy mismatch needs historical truncation. Building
         # this projection must never veto a valid current proposal or retry.
-        baseline_kind_input = " ".join(kind.split()) if len(typed_kind) > 0 else kinds[0]
+        baseline_kind_input = kind if len(typed_kind) > 0 else kinds[0]
         baseline_kind = redact_insight_text(baseline_kind_input, max_len=64)
         baseline_first = clean_text(f"{len(members)} counted correction(s) of kind `{clean_text(baseline_kind, 64).replace('`', '')}`.", 200)
-        baseline_guidance = (baseline_first,) + tuple(redact_insight_text(b.strip(), max_len=200)
+        baseline_guidance = (baseline_first,) + tuple(redact_insight_text(b, max_len=200)
                                                     for b in summary_bullets if b.strip())
         baseline_hyp = f"Prevent recurring {baseline_kind} issues in {', '.join(targets)}."
         return replace(proposal, kind=baseline_kind, hypothesis=baseline_hyp,

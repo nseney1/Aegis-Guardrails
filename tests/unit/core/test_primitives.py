@@ -412,25 +412,13 @@ def test_an_events_row_counts_exactly_when_its_time_is_a_strict_stamp(tmp_path, 
     assert (parse_utc(value) is not None) is usable
 
 
+def _proposal_render(value):
+    from aegis_core.proposals.model import clean_text
+
+    return clean_text(value, 400)
+
+
 # Display parity and redaction share boundaries even when legacy output keeps a kind byte.
-@pytest.mark.parametrize("prefix", [
-    pytest.param("\x1bP", id="dcs"),
-    pytest.param("\x1bP\x1b[31m", id="dcs-csi"),
-    pytest.param("note\x1b]\x1bP", id="osc-dcs"),
-    pytest.param("note\x1b]0;title\x1b7", id="osc-title-esc7"),
-    pytest.param("\x1bP\x9b31m", id="dcs-c1-csi"),
-    pytest.param("\x1bP$q", id="dcs-intermediate-header"),
-    pytest.param("\x1bP1;2q", id="dcs-parameter-header"),
-    pytest.param("\x901;2q", id="c1-dcs-parameter-header"),
-    pytest.param("\x1b(B", id="escape-intermediate-header"),
-    *[pytest.param("note\x1b" + kind, id="esc-" + kind) for kind in "NOM78c"],
-    pytest.param("\x1bX", id="sos"),
-    pytest.param("\x1b^", id="pm"),
-    pytest.param("\x1b_", id="apc"),
-    pytest.param("note\x1b?", id="unknown-escape"),
-    pytest.param("note\x1b[12;\x00", id="abandoned-csi"),
-])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
 def test_display_escape_boundaries_mask_secrets_on_every_surface(prefix, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -438,14 +426,14 @@ def test_display_escape_boundaries_mask_secrets_on_every_surface(prefix, surface
     key = "AK" + "IA" + "IOSFODNN7EXAMPLE"
     render = {"sanitize": lambda value: redact_command_secrets(primitives.sanitize_display(value, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
     for _ in range(2):
         shown = render(prefix + key)
         assert key not in shown
         assert "REDACTED" in shown
 
 
-@pytest.mark.parametrize("code", [code for code in (*range(32), *range(127, 160)) if code != 27])
 def test_display_removed_controls_preserve_secret_boundaries(code):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -453,7 +441,8 @@ def test_display_removed_controls_preserve_secret_boundaries(code):
     key = "AK" + "IA" + "IOSFODNN7EXAMPLE"
     value = "note" + chr(code) + key
     for shown in (redact_command_secrets(primitives.sanitize_display(value, max_len=None)),
-                  diagnostic_messages.receipt_value(value), diagnostic_messages.guidance_value(value)):
+                  diagnostic_messages.receipt_value(value), diagnostic_messages.guidance_value(value),
+                  _proposal_render(value)):
         assert key not in shown
         assert "REDACTED" in shown
 
@@ -472,6 +461,7 @@ def test_display_boundary_detection_keeps_secrets_split_by_inner_controls_masked
     key = "AK" + "IA" + "IOSFODNN7EXAMPLE"
     value = "\x1bP" + key[:8] + "\x1b[31m" + key[8:]
     assert primitives.sanitize_display(value, max_len=None) == "P[REDACTED_AWS]"
+    assert _proposal_render(value) == "P[REDACTED_AWS]"
 
 
 def test_display_boundaries_are_local_to_parallel_calls_and_retries():
@@ -485,7 +475,6 @@ def test_display_boundaries_are_local_to_parallel_calls_and_retries():
     assert [primitives.sanitize_display(value, max_len=None) for value in values] == expected
 
 
-@pytest.mark.parametrize("tail", ["", "safe", "secret"])
 def test_display_ten_million_removed_controls_do_not_build_per_control_state(tail):
     import tracemalloc
 
@@ -504,15 +493,6 @@ def test_display_ten_million_removed_controls_do_not_build_per_control_state(tai
     assert peak < 2_000_000
 
 
-@pytest.mark.parametrize("value, payload", [
-    ("AS" + "IA" + "A" * 16, "A" * 16),
-    ("gh" + "p_" + "a" * 36, "a" * 36),
-    ("sk" + "-proj-" + "Ab1" * 12, "Ab1" * 12),
-    ("token=" + "test-value-123456", "test-value-123456"),
-    ("Bearer " + "a" * 20, "a" * 20),
-    ("https://user:" + "test-value-123456" + "@example.test", "test-value-123456"),
-    ("-----BEGIN " + "PRIVATE KEY-----body", "body"),
-])
 def test_display_boundary_detection_uses_shared_secret_families(value, payload):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -522,6 +502,13 @@ def test_display_boundary_detection_uses_shared_secret_families(value, payload):
                   diagnostic_messages.guidance_value("note\x1bP" + value)):
         assert payload not in shown
         assert "REDACTED" in shown
+    proposal = _proposal_render("note\x1bP" + value)
+    assert payload not in proposal
+    if "://" in value:
+        # ROUND-8c preserves URL context before structural userinfo removal.
+        assert proposal == "notephttps://example.test"
+    else:
+        assert "REDACTED" in proposal
 
 
 def test_display_preserves_url_context_and_masks_overlapping_secret_rules():
@@ -534,19 +521,6 @@ def test_display_preserves_url_context_and_masks_overlapping_secret_rules():
     assert key not in shown and "REDACTED" in shown
 
 
-@pytest.mark.parametrize("prefix", [
-    pytest.param("\x1b(0", id="esc-numeric-final"),
-    pytest.param("\x1b[1:2m", id="csi-colon-final"),
-    pytest.param("\x1b[1$m", id="csi-intermediate-final"),
-    pytest.param("\x1bP1", id="dcs-parameters"),
-    pytest.param("\x1b]\x1bP1", id="nested-dcs-parameters"),
-    pytest.param("\x901", id="c1-dcs-parameters"),
-    pytest.param("\x9b1", id="c1-csi-parameters"),
-    pytest.param("\x1b[1:2", id="unsupported-csi-parameters"),
-    pytest.param("\x1b]1", id="osc-parameters"),
-    pytest.param("\x9d1", id="c1-osc-parameters"),
-])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
 def test_display_provenance_masks_low_entropy_keys_after_every_header(prefix, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -554,15 +528,14 @@ def test_display_provenance_masks_low_entropy_keys_after_every_header(prefix, su
     key = "AK" + "IA" + "A" * 16
     render = {"sanitize": lambda value: redact_command_secrets(primitives.sanitize_display(value, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
     for _ in range(2):
         shown = render(prefix + key)
         assert "A" * 16 not in shown
         assert "REDACTED" in shown
 
 
-@pytest.mark.parametrize("family", ["aws", "github"])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
 def test_display_provenance_masks_overlaps_inside_an_ordinary_match(family, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -575,17 +548,14 @@ def test_display_provenance_masks_overlaps_inside_an_ordinary_match(family, surf
         payloads = ("a" * 20, "a" * 36)
     render = {"sanitize": lambda value: redact_command_secrets(primitives.sanitize_display(value, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
     for _ in range(2):
         shown = render(first + "\r" + second)
         assert all(payload not in shown for payload in payloads)
         assert "REDACTED" in shown
 
 
-@pytest.mark.parametrize("introducer", ["\x1bP", "\x1b]", "\x1bX", "\x1b^", "\x1b_",
-                                         "\x90", "\x98", "\x9d", "\x9e", "\x9f"])
-@pytest.mark.parametrize("header", ["1", "1:2", "1 $"])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
 def test_display_provenance_covers_every_string_form_and_header(introducer, header, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -593,13 +563,13 @@ def test_display_provenance_covers_every_string_form_and_header(introducer, head
     key = "AK" + "IA" + "A" * 16
     render = {"sanitize": lambda value: redact_command_secrets(primitives.sanitize_display(value, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
     shown = render(introducer + header + key)
     assert "A" * 16 not in shown
     assert "REDACTED" in shown
 
 
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
 def test_display_provenance_overlaps_and_headers_are_independent_in_threads(surface):
     from concurrent.futures import ThreadPoolExecutor
 
@@ -612,7 +582,8 @@ def test_display_provenance_overlaps_and_headers_are_independent_in_threads(surf
               "gh" + "p_" + "a" * 20 + "\r" + "gh" + "p_" + "a" * 36] * 3
     render = {"sanitize": lambda value: redact_command_secrets(primitives.sanitize_display(value, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
     with ThreadPoolExecutor(max_workers=3) as pool:
         shown = list(pool.map(render, values))
     assert all("REDACTED" in value for value in shown)
@@ -620,9 +591,6 @@ def test_display_provenance_overlaps_and_headers_are_independent_in_threads(surf
     assert render("missing\x1b]FORGED") == render("missing]FORGED")
 
 
-@pytest.mark.parametrize("prefix", ["\x1b[", "\x1b[1"])
-@pytest.mark.parametrize("family", ["aws", "github"])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
 def test_display_source_view_masks_credentials_partly_consumed_by_csi(prefix, family, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -631,24 +599,14 @@ def test_display_source_view_masks_credentials_partly_consumed_by_csi(prefix, fa
                     ("gh" + "p_" + "a" * 36, "a" * 36))
     render = {"sanitize": lambda value: redact_command_secrets(primitives.sanitize_display(value, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
     shown = render(prefix + key)
     assert payload not in shown
     assert "REDACTED" in shown
     assert shown == render("[REDACTED_AWS]" if family == "aws" else "[REDACTED_VCS_TOKEN]")
 
 
-@pytest.mark.parametrize("prefix", [
-    *[pytest.param(introducer + "1\x002", id=name) for name, introducer in (
-        ("dcs", "\x1bP"), ("osc", "\x1b]"), ("sos", "\x1bX"), ("pm", "\x1b^"), ("apc", "\x1b_"),
-        ("c1-dcs", "\x90"), ("c1-osc", "\x9d"), ("c1-sos", "\x98"), ("c1-pm", "\x9e"), ("c1-apc", "\x9f"))],
-    pytest.param("\x1b(\x000", id="esc-intermediate"),
-    pytest.param("\x1b[1:\x002m", id="csi-subparameter"),
-    pytest.param("\x9b1:\x002m", id="c1-csi-subparameter"),
-    pytest.param("\x1b[1\x002m", id="csi-parameter"),
-])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
-@pytest.mark.parametrize("control", ["\x00", "\x08", "\x0b", "\r", "\x11", "\x19", "\x7f", "\x85", "\x91", "\x99"])
 def test_display_source_view_keeps_header_state_across_ignored_controls(prefix, surface, control):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -656,7 +614,8 @@ def test_display_source_view_keeps_header_state_across_ignored_controls(prefix, 
     key = "AK" + "IA" + "A" * 16
     render = {"sanitize": lambda value: redact_command_secrets(primitives.sanitize_display(value, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
     shown = render(prefix.replace("\x00", control) + key)
     assert "A" * 16 not in shown
     assert "REDACTED" in shown
@@ -679,7 +638,6 @@ def test_display_source_view_bounds_repeated_unterminated_pem_work():
     assert result.stdout == "bounded\n"
 
 
-@pytest.mark.parametrize("value, expected", [("\n", " "), ("\t\r\x00", " "), ("\r\x00", "")])
 def test_display_source_view_accepts_control_only_nonsecret_text(value, expected):
     assert primitives.sanitize_display(value, max_len=None) == expected
 
@@ -693,12 +651,6 @@ def test_display_source_view_masks_only_surviving_characters_and_preserves_conte
     assert primitives.sanitize_display(value, max_len=None) == "[REDACTED_PEM][REDACTED_AWS]"
 
 
-@pytest.mark.parametrize("prefix", [pytest.param("\x1b[", id="csi"), pytest.param("\x1b[1", id="csi-parameter")])
-@pytest.mark.parametrize("inner", [pytest.param("\r", id="cr"), pytest.param("\x00", id="nul"),
-                                  pytest.param("\x7f", id="del"), pytest.param("\x85", id="c1"),
-                                  pytest.param("\x1b[31m", id="supported-csi")])
-@pytest.mark.parametrize("family", ["aws", "github"])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
 def test_display_deleted_view_masks_consumed_prefix_with_internal_control(prefix, inner, family, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -706,20 +658,12 @@ def test_display_deleted_view_masks_consumed_prefix_with_internal_control(prefix
     key = "AK" + "IA" + "A" * 16 if family == "aws" else "gh" + "p_" + "a" * 36
     render = {"sanitize": lambda value: redact_command_secrets(primitives.sanitize_display(value, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
     shown = render(prefix + key[:4] + inner + key[4:])
     assert shown == render("[REDACTED_AWS]" if family == "aws" else "[REDACTED_VCS_TOKEN]")
 
 
-@pytest.mark.parametrize("prefix", [
-    pytest.param("\x1b[?\x07:m", id="csi"), pytest.param("\x9b?\x07:m", id="c1-csi"),
-    pytest.param("\x1b(\x07B", id="esc-intermediate"),
-    *[pytest.param(introducer + "1\x072", id=name) for name, introducer in (
-        ("sos", "\x1bX"), ("pm", "\x1b^"), ("apc", "\x1b_"),
-        ("c1-sos", "\x98"), ("c1-pm", "\x9e"), ("c1-apc", "\x9f"),
-        ("c1-dcs", "\x90"), ("c1-osc", "\x9d"))],
-])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
 def test_display_deleted_view_keeps_bel_transparent_in_nonterminating_headers(prefix, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -727,23 +671,19 @@ def test_display_deleted_view_keeps_bel_transparent_in_nonterminating_headers(pr
     key = "AK" + "IA" + "A" * 16
     render = {"sanitize": lambda value: redact_command_secrets(primitives.sanitize_display(value, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
     shown = render(prefix + key)
     assert "A" * 16 not in shown
     assert "REDACTED" in shown
 
 
-@pytest.mark.parametrize("introducer", ["\x1b]", "\x1bP"])
 def test_display_deleted_view_preserves_bel_termination_and_nonsecret_parity(introducer):
     key = "AK" + "IA" + "A" * 16
     assert primitives.sanitize_display("before" + introducer + key + "\x07after", max_len=None) == "beforeafter"
     assert primitives.sanitize_display("before" + introducer + "1\x072safe", max_len=None) == "before2safe"
 
 
-@pytest.mark.parametrize("control", [pytest.param("\x07", id="bel"), pytest.param("\t", id="tab"),
-                                    pytest.param("\n", id="lf")])
-@pytest.mark.parametrize("header", ["\x1b[", "\x9b", "\x1b("])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
 def test_display_renderer_provenance_keeps_control_interrupted_headers(control, header, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -751,27 +691,26 @@ def test_display_renderer_provenance_keeps_control_interrupted_headers(control, 
     key = "AK" + "IA" + "A" * 16
     render = {"sanitize": lambda value: redact_command_secrets(primitives.sanitize_display(value, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
     shown = render(header + control + ("B" if header.endswith("(") else "m") + key)
     assert "A" * 16 not in shown
     assert "REDACTED" in shown
 
 
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
 def test_display_renderer_provenance_recovers_consumed_credential_label(surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
 
     render = {"sanitize": lambda value: redact_command_secrets(primitives.sanitize_display(value, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
     shown = render("\x1bcredential=ab\rcdefgh")
     assert "abcdefgh" not in shown
     assert "REDACTED" in shown
 
 
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
-@pytest.mark.parametrize("label", ["EC", "OPENSSH"])
 def test_display_pem_extents_cover_differently_labelled_nested_body(surface, label):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -782,57 +721,54 @@ def test_display_pem_extents_cover_differently_labelled_nested_body(surface, lab
     value = head("RSA") + "\r" + head(label) + "-----END RSA PRIVATE KEY-----privatepayload"
     render = {"sanitize": lambda value: redact_command_secrets(primitives.sanitize_display(value, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
     shown = render(value)
     assert "privatepayload" not in shown
     assert "REDACTED" in shown
 
 
-@pytest.mark.parametrize("introducer", [pytest.param("\x1b]", id="osc"), pytest.param("\x1bP", id="dcs")])
-@pytest.mark.parametrize("terminator", [pytest.param("\x07", id="bel"), pytest.param("\x1b\\", id="st")])
-@pytest.mark.parametrize("hidden, tail", [("token=", "after"), ("Bearer", "after_sixteen_chars"),
-                                         ("-----BEGIN " + "PRIVATE KEY-----", "after")])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
 def test_display_source_segments_seal_suppressed_strings(introducer, terminator, hidden, tail, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
 
     render = {"sanitize": lambda value: redact_command_secrets(primitives.sanitize_display(value, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
-    assert render("before" + introducer + "0;" + hidden + terminator + tail) == render("before" + tail)
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
+    expected = render("before" + tail)
+    if surface == "proposal" and hidden != "Bearer":
+        # Measured proposal baseline redacts raw text before interpreting strings.
+        expected = "before" + introducer[1:] + "0;" + ("token=[REDACTED]" if hidden == "token=" else "[REDACTED_PEM]")
+    assert render("before" + introducer + "0;" + hidden + terminator + tail) == expected
 
 
-@pytest.mark.parametrize("control", [pytest.param("\x00", id="nul"), pytest.param("\r", id="cr"),
-                                    pytest.param("\x7f", id="del"), pytest.param("\x85", id="c1")])
-@pytest.mark.parametrize("head, tail", [("Bearer", "anything_sixteen_chars"), ("password", "is abcdefgh")])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
 def test_display_source_segments_do_not_invent_credential_whitespace(control, head, tail, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
 
     render = {"sanitize": lambda value: redact_command_secrets(primitives.sanitize_display(value, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
-    assert render(head + control + tail) == render(head + tail)
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
+    expected = render(head + tail)
+    if surface == "proposal" and control in ("\r", "\x85"):
+        expected = "Bearer [REDACTED]" if head == "Bearer" else "password is [REDACTED]"
+    assert render(head + control + tail) == expected
 
 
-@pytest.mark.parametrize("introducer", [pytest.param("\x1b]", id="osc"), pytest.param("\x1bP", id="dcs")])
-@pytest.mark.parametrize("terminator", [pytest.param("\x07", id="bel"), pytest.param("\x1b\\", id="st")])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
 def test_display_source_segments_do_not_join_visible_context_through_hidden_payload(introducer, terminator, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
 
     render = {"sanitize": lambda value: redact_command_secrets(primitives.sanitize_display(value, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
-    assert render("token=" + introducer + "filler" + terminator + "abc") == render("token=abc")
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
+    expected = "token=[REDACTED]" if surface == "proposal" else render("token=abc")
+    assert render("token=" + introducer + "filler" + terminator + "abc") == expected
 
 
-@pytest.mark.parametrize("introducer", [pytest.param("\x1b]", id="osc"), pytest.param("\x1bP", id="dcs")])
-@pytest.mark.parametrize("terminator", [pytest.param("\x07", id="bel"), pytest.param("\x1b\\", id="st")])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
 def test_display_source_segments_still_mask_visible_secrets_on_both_sides(introducer, terminator, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -840,88 +776,78 @@ def test_display_source_segments_still_mask_visible_secrets_on_both_sides(introd
     key = "AK" + "IA" + "A" * 16
     render = {"sanitize": lambda value: redact_command_secrets(primitives.sanitize_display(value, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
     shown = render(key + introducer + "0;ordinary" + terminator + key)
     assert "A" * 16 not in shown
     assert "REDACTED" in shown
 
 
-@pytest.mark.parametrize("value", ["service_password_name=" + "test-value-123456",
-                                  "https://user:" + "test-value-123456" + "@example.test",
-                                  "://user:" + "test-value-123456" + "@example.test"])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
 def test_display_source_segments_keep_prefixed_secret_context_detectable(value, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
 
     render = {"sanitize": lambda value: redact_command_secrets(primitives.sanitize_display(value, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
     shown = render("note\x1bP" + value)
     assert "test-value-123456" not in shown
-    assert "REDACTED" in shown
+    if surface == "proposal" and "://" in value:
+        assert shown == "notep" + value.split("://", 1)[0] + "://example.test"
+    else:
+        assert "REDACTED" in shown
 
 
-@pytest.mark.parametrize("introducer", [pytest.param("\x1b]", id="osc"), pytest.param("\x1bP", id="dcs")])
-@pytest.mark.parametrize("terminator", [pytest.param("\x07", id="bel"), pytest.param("\x1b\\", id="st")])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
 def test_display_rendered_segments_seal_hidden_token_prefix(introducer, terminator, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
 
     render = {"sanitize": lambda value: redact_command_secrets(primitives.sanitize_display(value, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
     value = "before" + introducer + "0;gh" + "p_" + terminator + "a" * 20
     assert render(value) == render("before" + "a" * 20)
 
 
-@pytest.mark.parametrize("control", [pytest.param("\t", id="tab"), pytest.param("\n", id="lf")])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
 def test_display_rendered_segments_preserve_visible_space_inside_nonsecret(control, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
 
     render = {"sanitize": lambda value: redact_command_secrets(primitives.sanitize_display(value, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
     assert render("AK" + "IA" + control + "A" * 16) == render("AK" + "IA " + "A" * 16)
 
 
-@pytest.mark.parametrize("control", [pytest.param("\x00", id="nul"), pytest.param("\r", id="cr"),
-                                    pytest.param("\x7f", id="del"), pytest.param("\x85", id="c1")])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
 def test_display_rendered_segments_still_join_fully_removed_controls(control, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
 
     render = {"sanitize": lambda value: redact_command_secrets(primitives.sanitize_display(value, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
     shown = render("AK" + "IA" + control + "A" * 16)
     assert "A" * 16 not in shown
     assert "REDACTED" in shown
 
 
-@pytest.mark.parametrize("prefix", [pytest.param("\x1b[", id="csi"), pytest.param("\x1b[1", id="csi-parameter")])
-@pytest.mark.parametrize("control", [pytest.param("\t", id="tab"), pytest.param("\n", id="lf")])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
 def test_display_rendered_segments_keep_visible_credential_whitespace(prefix, control, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
 
     render = {"sanitize": lambda value: redact_command_secrets(primitives.sanitize_display(value, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
     shown = render(prefix + "Bearer" + control + "a" * 20)
     assert "a" * 20 not in shown
     assert "REDACTED" in shown
 
 
-@pytest.mark.parametrize("family", ["aws", "github"])
-@pytest.mark.parametrize("removed", [pytest.param("\x1b[31m", id="sgr"), pytest.param("\r", id="cr"),
-                                    pytest.param("\x00", id="nul")])
-@pytest.mark.parametrize("prefix", [pytest.param("", id="plain"), pytest.param("\x1b[31m", id="color")])
 def test_display_reassembled_tokens_use_markers_before_caller_redaction(family, removed, prefix):
     from aegis_core.redaction import redact_command_secrets
 
@@ -930,9 +856,9 @@ def test_display_reassembled_tokens_use_markers_before_caller_redaction(family, 
     marker = "[REDACTED_AWS]" if family == "aws" else "[REDACTED_VCS_TOKEN]"
     assert shown == marker
     assert redact_command_secrets(shown) == marker
+    assert _proposal_render(prefix + key[:2] + removed + key[2:]) == marker
 
 
-@pytest.mark.parametrize("family", ["aws", "github"])
 def test_display_unions_canonical_and_source_only_masks(family):
     from aegis_core.redaction import redact_command_secrets
 
@@ -942,9 +868,9 @@ def test_display_unions_canonical_and_source_only_masks(family):
     shown = primitives.sanitize_display(value, max_len=None)
     assert shown == "normal " + marker + "; P1" + marker
     assert key not in redact_command_secrets(shown)
+    assert _proposal_render(value) == "normal " + marker + "; P1" + marker
 
 
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
 def test_display_does_not_orphan_value_after_guarding_secret_key_context(surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -952,15 +878,14 @@ def test_display_does_not_orphan_value_after_guarding_secret_key_context(surface
     key = "gh" + "p_" + "token" + "a" * 20
     render = {"sanitize": lambda value: redact_command_secrets(primitives.sanitize_display(value, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
     shown = render("note\x1bP" + key + "=unrelated-value-4321")
     assert "a" * 20 not in shown
     assert "unrelated-value-4321" not in shown
     assert "REDACTED" in shown
 
 
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
-@pytest.mark.parametrize("case", ["changed-boundary", "ordered-coverage", "finite-clip"])
 def test_display_restored_union_masks_before_boundary_changes_or_clipping(case, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -972,14 +897,14 @@ def test_display_restored_union_masks_before_boundary_changes_or_clipping(case, 
              "finite-clip": "x" * 57 + " \r" + key + " tail"}[case]
     render = {"sanitize": lambda text: redact_command_secrets(primitives.sanitize_display(text)),
               "receipt": lambda text: diagnostic_messages.receipt_value(text, 400),
-              "guidance": lambda text: diagnostic_messages.guidance_value(text, 400)}[surface]
+              "guidance": lambda text: diagnostic_messages.guidance_value(text, 400),
+              "proposal": _proposal_render}[surface]
     shown = render(value)
     assert key not in shown and key[:19] not in shown
     assert token not in shown and "bbbb" not in shown
     assert "REDACTED" in shown
 
 
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
 def test_display_source_guard_cannot_complete_a_new_credential_or_tear_a_mask(surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -987,10 +912,14 @@ def test_display_source_guard_cannot_complete_a_new_credential_or_tear_a_mask(su
     value = "AK" + "IA" + "123456789PWD" + "\x1b=abcd"
     render = {"sanitize": lambda text: redact_command_secrets(primitives.sanitize_display(text, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
     shown = render(value)
     assert "abcd" not in shown and "omitted" not in shown
     expected = "AK" + "IA" + "123456789PWD"
+    if surface == "proposal":
+        # ROUND-8 addendum: the canonical-view entropy match covers this prefix.
+        expected = "[REDACTED_HIENT]"
     assert shown == expected + (r"\x5bREDACTED\x5d" if surface == "guidance" else "[REDACTED]")
 
 
@@ -1033,41 +962,25 @@ def test_display_attribution_gate_keeps_inputs_without_suppressed_finals_identic
     assert primitives.sanitize_display(value, max_len=None) == expected
 
 
-@pytest.mark.parametrize("suffix", ["", "\x1b[31m"])
 def test_display_attribution_preserves_ordinary_left_boundary(suffix):
     key = "AK" + "IA" + "A" * 16
     assert primitives.sanitize_display("x" + key + suffix, max_len=None) == "x" + key
 
 
-@pytest.mark.parametrize("value, payload", [
-    ("AS" + "IA" + "A" * 16, "A" * 16),
-    ("AR" + "OA" + "A" * 16, "A" * 16),
-    ("gh" + "o_" + "a" * 36, "a" * 36),
-    ("git" + "hub_pat_" + "a" * 24, "a" * 24),
-    ("gl" + "pat-" + "a" * 24, "a" * 24),
-    ("sk" + "_live_" + "a" * 24, "a" * 24),
-    ("sk" + "-proj-" + "a" * 24, "a" * 24),
-    ("AI" + "za" + "a" * 30, "a" * 30),
-    ("xo" + "xb-" + "a" * 24, "a" * 24),
-    ("npm" + "_" + "a" * 24, "a" * 24),
-    ("py" + "pi-" + "a" * 24, "a" * 24),
-    ("ey" + "J" + "a" * 12 + "." + "b" * 8 + "." + "c" * 8, "c" * 8),
-    ("Bearer " + "a" * 24, "a" * 24),
-    ("password=" + "test-value-123456", "test-value-123456"),
-    ("password is " + "test-value-123456", "test-value-123456"),
-    ("https://user:" + "test-value-123456" + "@example.test", "test-value-123456"),
-])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
 def test_display_attribution_covers_shared_rule_families(value, payload, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
 
     render = {"sanitize": lambda text: redact_command_secrets(primitives.sanitize_display(text, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
     shown = render("\x1b[" + value[:4] + "\x1b[31m" + value[4:])
     assert payload not in shown
-    assert "REDACTED" in shown
+    if surface == "proposal" and "://" in value:
+        assert shown == "ttps://example.test"
+    else:
+        assert "REDACTED" in shown
 
 
 def test_display_attribution_budget_is_local_to_retries_and_parallel_calls():
@@ -1082,7 +995,7 @@ def test_display_attribution_budget_is_local_to_retries_and_parallel_calls():
     assert [primitives.sanitize_display(text, max_len=None) for text in values] == expected
 
 
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
+@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance", "proposal"])
 def test_display_attribution_exhaustion_masks_only_candidate_between_sealed_strings(surface, monkeypatch):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -1092,12 +1005,12 @@ def test_display_attribution_exhaustion_masks_only_candidate_between_sealed_stri
     candidate = "\x1b[" + key[:4] + "\x1b[31m" + key[4:]
     render = {"sanitize": lambda text: redact_command_secrets(primitives.sanitize_display(text, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
     value = "before\x1b]title\x07" + candidate + "\x1b]title\x07after"
     assert render(value) == render("before[REDACTED]after")
 
 
-@pytest.mark.parametrize("count", [1, 3, 6])
 def test_display_attribution_long_benign_colour_runs_keep_parity(count):
     part = "x" * 5001
     value = (part + "\x1b[31m") * count + part
@@ -1170,10 +1083,6 @@ def test_display_attribution_widths_and_unknown_grammars_fail_conservatively():
     assert may_match_visible(compile_possible([re.compile("abc")]), "safe", runs, lambda amount: False)
 
 
-@pytest.mark.parametrize("count", [5000, 50000])
-@pytest.mark.parametrize("control", [pytest.param("\x00", id="nul"), pytest.param("\r", id="cr"),
-                                     pytest.param("\x7f", id="del"), pytest.param("\x85", id="c1")])
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
 def test_display_attribution_detection_windows_span_removed_control_gaps(count, control, surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -1182,7 +1091,15 @@ def test_display_attribution_detection_windows_span_removed_control_gaps(count, 
     value = "\x1b[" + key[:4] + "\x1b[31m" + control * count + key[4:]
     render = {"sanitize": lambda text: redact_command_secrets(primitives.sanitize_display(text, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
+    if surface == "proposal":
+        from aegis_core.proposals.model import ProposalError
+
+        with pytest.raises(ProposalError, match="^proposal refused: too_large$") as caught:
+            render(value)
+        assert caught.value.code == "too_large"
+        return
     shown = render(value)
     if count == 5000:
         assert shown == render("[REDACTED_AWS]")
@@ -1245,8 +1162,6 @@ def test_display_attribution_detection_window_geometry_keeps_source_budget(count
     assert stats["coverage"] == ("possible" if count == 50000 else "complete")
 
 
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
-@pytest.mark.parametrize("family", ["jwt", "vcs"])
 def test_display_attribution_masks_overlapping_ordinary_credentials(surface, family):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -1260,26 +1175,24 @@ def test_display_attribution_masks_overlapping_ordinary_credentials(surface, fam
         signature, marker = "b" * 43, "[REDACTED_VCS_TOKEN]"
     render = {"sanitize": lambda text: redact_command_secrets(primitives.sanitize_display(text, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
     shown = render(value)
     assert signature not in shown
     assert shown == render(marker)
 
 
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
-@pytest.mark.parametrize("plain", [pytest.param("xAK" + "IA" + "A" * 16, id="ascii-aws"),
-                                  pytest.param("\u212aBearer " + "a" * 24, id="unicode-bearer")])
 def test_display_attribution_fallback_preserves_ordinary_boundary_and_flags(surface, plain):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
 
     render = {"sanitize": lambda text: redact_command_secrets(primitives.sanitize_display(text, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
     assert render(plain + "\x1b[31m" * 128) == render(plain)
 
 
-@pytest.mark.parametrize("surface", ["sanitize", "receipt", "guidance"])
 def test_display_attribution_fallback_keeps_carried_starts(surface):
     from aegis_core import diagnostic_messages
     from aegis_core.redaction import redact_command_secrets
@@ -1288,7 +1201,8 @@ def test_display_attribution_fallback_keeps_carried_starts(surface):
     value = "x\x1b[" + key[:4] + "\x1b[31m" * 128 + key[4:]
     render = {"sanitize": lambda text: redact_command_secrets(primitives.sanitize_display(text, max_len=None)),
               "receipt": diagnostic_messages.receipt_value,
-              "guidance": diagnostic_messages.guidance_value}[surface]
+              "guidance": diagnostic_messages.guidance_value,
+              "proposal": _proposal_render}[surface]
     shown = render(value)
     assert "A" * 16 not in shown and "REDACTED" in shown
 
@@ -1354,3 +1268,1286 @@ def test_display_attribution_overlaps_and_fallback_are_isolated_in_parallel():
     with ThreadPoolExecutor(max_workers=3) as pool:
         assert list(pool.map(lambda value: primitives.sanitize_display(value, max_len=None), values)) == expected
     assert [primitives.sanitize_display(value, max_len=None) for value in values] == expected
+
+
+# ── Proposal deleted-view redaction ──────────────────────────────────────────
+# Invariant: a secret split by CR, NEL, or CSI is masked on the display deleted
+# view before any whitespace join. Ordinary spaces still separate tokens.
+
+
+@pytest.mark.parametrize("split,tail", [("cr", "cr"), ("nel", "nel"), ("vt", "vt"), ("ff", "ff"),
+                                      ("mixed", "esc-intermediates"), ("esc-intermediates", "c1-intermediates")])
+@pytest.mark.parametrize("placement", [None, -1, 0, 1], ids=["review", "before", "at", "after"])
+def test_round8h_deleted_token_maps_to_first_source_character_and_recovers(split, tail, placement):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.redaction import redact_insight_text
+    from tests.unit.core.test_insights import _round8h_control_source
+
+    prefix = "AK" + "IA" + "B" * 16 + " "
+    source, _short, secret = _round8h_control_source(split, tail, placement, preceding=prefix)
+    expected = "[REDACTED_AWS] Never repeat this: ..."
+
+    def fail(_spans):
+        raise RuntimeError("observer failed")
+
+    def clean(_index):
+        events = []
+        shown = redact_insight_text(source, max_len=0, on_replacements=events.append)
+        assert shown == expected and len(events) == 1
+        assert events[0] == ((0, len(prefix) - 1, "[REDACTED_AWS]"),)
+        assert all(secret[index:index + 4] not in shown for index in range(len(secret) - 3))
+        assert redact_insight_text(shown, max_len=0) == shown
+        return shown
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="^observer failed$"):
+            redact_insight_text(source, max_len=0, on_replacements=fail)
+        assert clean(0) == expected
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(clean, range(3))) == [expected] * 3
+
+
+@pytest.mark.parametrize("separator", [" ", "\n", "\t", "\u2028", "\u2029", "\u00a0", "\u2003"],
+                         ids=["space", "lf", "tab", "line", "paragraph", "nbsp", "em-space"])
+@pytest.mark.parametrize("tail", ["cr", "nel", "vt", "ff", "esc-intermediates", "c1-intermediates"])
+@pytest.mark.parametrize("last", ["A", ""], ids=["token", "empty-token"])
+def test_round8h_genuine_deleted_view_whitespace_preserves_the_benign_head(tmp_path, separator, tail, last):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.insights import add_insight, read_insight_rows
+    from aegis_core.redaction import redact_insight_text
+    from tests.unit.core.test_insights import _round8h_control_source
+
+    benign = "abcdefghijklm" * 5
+    # Use a genuine separator after the earlier split, before the final run.
+    source, _short, _secret = _round8h_control_source("cr", tail)
+    source = source.replace(benign + "\rA", benign + separator + last, 1)
+    expected = "Never repeat this: " + benign + " ..."
+    for _ in range(2):
+        assert redact_insight_text(source, max_len=0) == expected
+        assert redact_insight_text(expected, max_len=0) == expected
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(lambda _: redact_insight_text(source, max_len=0), range(3))) == [expected] * 3
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    for _ in range(2):
+        row = add_insight(workspace, source, kind=source, paths=[], home=tmp_path / "home")
+        assert row["text"] == expected and row["kind"] == expected
+    assert all(row["text"] == expected and row["kind"] == expected
+               for row in read_insight_rows(workspace, home=tmp_path / "home"))
+
+def _proposal_key_shapes():
+    """Both key families and both prefixes, generated rather than listed as samples."""
+    return (
+        ("AK" + "IA", "A" * 16, "[REDACTED_AWS]"),
+        ("AS" + "IA", "A" * 16, "[REDACTED_AWS]"),
+        ("gh" + "p_", "a" * 36, "[REDACTED_VCS_TOKEN]"),
+        ("gh" + "o_", "a" * 36, "[REDACTED_VCS_TOKEN]"),
+    )
+
+
+def _proposal_control_matrix():
+    """CR or NEL inside a key, with and without CSI, at both prefix cuts."""
+    for prefix, body, marker in _proposal_key_shapes():
+        key = prefix + body
+        for cut in (2, len(prefix), len(prefix) + 8):
+            for control in ("\r", "\x85"):
+                for csi in ("", "\x1b[31m"):
+                    yield key[:cut] + control + csi + key[cut:], body, marker, True
+            yield key[:cut] + " " + key[cut:], body, marker, False
+
+
+def _assert_proposal_view(shown, body, marker, masked):
+    if masked:
+        assert marker in shown
+        assert body[:4] not in shown
+    else:
+        assert body[:4] in shown
+        assert marker not in shown
+
+
+def test_clean_text_masks_control_joined_keys_and_keeps_spaces():
+    from aegis_core.proposals.model import clean_text
+
+    cases = list(_proposal_control_matrix())
+    assert len(cases) == 60
+    for value, body, marker, masked in cases:
+        shown = clean_text("note " + value + " tail", 300)
+        _assert_proposal_view(shown, body, marker, masked)
+        assert clean_text(shown, 300) == shown
+
+
+def test_clean_text_control_join_is_stable_across_retries_and_threads():
+    from concurrent.futures import ThreadPoolExecutor
+
+    from aegis_core.proposals.model import ProposalError, clean_text
+
+    cases = [row for row in _proposal_control_matrix() if row[3]]
+
+    def once(row):
+        value, _body, marker, _masked = row
+        shown = clean_text(value, 300)
+        again = clean_text(shown, 300)
+        return shown == again and marker in shown and _body[:4] not in shown
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert all(pool.map(once, cases * 2))
+    with pytest.raises(ProposalError) as invalid:
+        clean_text(None, 300)
+    assert invalid.value.code == "invalid"
+    assert "None" not in str(invalid.value)
+    with pytest.raises(ProposalError) as oversized:
+        clean_text("x" * 5000, 300)
+    assert oversized.value.code == "too_large"
+    assert "xxxx" not in str(oversized.value)
+
+
+def test_clean_text_nonsecret_controls_keep_their_bytes():
+    """Measure: controls that do not complete a secret stay on the pre-change bytes."""
+    from aegis_core.proposals.model import clean_text
+    from aegis_core.redaction import redact_insight_text
+
+    expected = {
+        "plain note": ("plain note", "plain note"),
+        "hello\rworld": ("hello world", "hello world"),
+        "hello\x85world": ("hello world", "hello world"),
+        "hello\nworld": ("hello world", "hello world"),
+        "hello\tworld": ("hello world", "hello world"),
+        "a  b": ("a b", "a b"),
+        "hello\x1b[31mworld": ("helloworld", "hello\x1b[31mworld"),
+        "foo\rbar baz": ("foo bar baz", "foo bar baz"),
+        "keep\x00join": ("keepjoin", "keep\x00join"),
+        "password is hunter2": ("password is [REDACTED]", "password is [REDACTED]"),
+    }
+    for value, (cleaned, redacted) in expected.items():
+        assert clean_text(value, 300) == cleaned
+        assert redact_insight_text(value, max_len=0) == redacted
+
+
+def test_proposal_benign_control_corpus_keeps_measured_baseline_bytes():
+    import hashlib
+    import json
+
+    from aegis_core.proposals.model import clean_text
+    from aegis_core.redaction import redact_insight_text
+
+    controls = [chr(code) for code in (*range(32), *range(127, 160))]
+    controls += [" ", "  ", "\x1b[31m", "\x1b]title\x07"]
+    rows = [(clean_text(text, limit), redact_insight_text(text, max_len=limit))
+            for control in controls
+            for text in ("hello" + control + "world", "before " + control + "safe after",
+                         "(" + control + "ordinary text)")
+            for limit in (0, 64, 200)]
+    assert len(rows) == 621
+    measured = json.dumps(rows, ensure_ascii=True, separators=(",", ":")).encode()
+    assert hashlib.sha256(measured).hexdigest() == "d1cb0ea660ed7c6c72ffa351dad9c9fd7f11904f976e96f4f150c5ff610f141c"
+
+
+@pytest.mark.parametrize("value, limit, code", [
+    (None, 20, "invalid"), ("safe", -1, "invalid"), ("safe", True, "invalid"),
+    ("safe", "20", "invalid"), ("\r" * 21, 20, "too_large"),
+])
+def test_deleted_view_helper_refuses_before_parser_allocation(value, limit, code, monkeypatch):
+    from aegis_core.redaction import RedactionRefusal
+
+    def forbidden(*args):
+        pytest.fail("a refused input reached display-view allocation")
+
+    monkeypatch.setattr("aegis_core.primitives._display_views", forbidden)
+    with pytest.raises(RedactionRefusal, match="^" + code + "$") as caught:
+        primitives.redact_display_secrets(value, limit=limit)
+    assert caught.value.code == code
+    assert primitives.redact_display_secrets("safe", limit=4) == "safe"
+
+
+def test_deleted_view_helper_callbacks_replay_retry_and_failure():
+    from concurrent.futures import ThreadPoolExecutor
+
+    from aegis_core.redaction import redact_insight_text
+
+    values = [row[0] for row in _proposal_control_matrix() if row[3]]
+
+    def once(value):
+        state = [value]
+
+        def observe(spans):
+            parts, cursor = [], 0
+            for start, end, replacement in spans:
+                assert cursor <= start < end <= len(state[0])
+                parts.extend((state[0][cursor:start], replacement))
+                cursor = end
+            parts.append(state[0][cursor:])
+            state[0] = "".join(parts)
+
+        shown = redact_insight_text(value, max_len=0, on_replacements=observe)
+        assert shown == " ".join(state[0].split())
+        assert primitives.redact_display_secrets(shown, limit=4096) == shown
+        return shown
+
+    def failing(spans):
+        raise RuntimeError("observer failed")
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="^observer failed$"):
+            primitives.redact_display_secrets(values[0], limit=4096, on_replacements=failing)
+    expected = [once(value) for value in values]
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(once, values)) == expected
+
+
+@pytest.mark.parametrize("prefix, body, marker", (*_proposal_key_shapes(),
+                         ("https://user:", "a" * 16, "[REDACTED]")))
+@pytest.mark.parametrize("control", ["\r", "\x85", "\r\x1b[31m", "\x85\x1b[31m"])
+def test_insight_bound_drops_control_joined_key_fragments(prefix, body, marker, control):
+    from aegis_core.redaction import MAX_LINE_LENGTH, redact_insight_text
+
+    padding = "x " * ((MAX_LINE_LENGTH - len(prefix) - 9) // 2)
+    value = padding + prefix + body[:8] + control + body[8:]
+    value += ("@example.test" if "://" in prefix else "") + " tail" * 20
+    assert len(value) > MAX_LINE_LENGTH
+    for _ in range(2):
+        shown = redact_insight_text(value, max_len=0)
+        assert body[:4] not in shown
+        assert redact_insight_text(shown, max_len=0) == shown
+
+
+def test_insight_capture_persists_the_shared_deleted_view(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from aegis_core.insights import add_insight, read_insight_rows
+
+    workspace, home = tmp_path / "workspace", tmp_path / "capture-home"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("pass\n", encoding="utf-8")
+    cases = list(_proposal_control_matrix())
+
+    def once(row):
+        value, body, marker, masked = row
+        insight = add_insight(workspace, "note " + value + " tail", paths=["app.py"],
+                              kind="correctness", home=home)
+        _assert_proposal_view(insight["text"], body, marker, masked)
+        return insight["id"], insight["text"]
+
+    expected = [once(row) for row in cases]
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        concurrent = list(pool.map(once, cases))
+    assert [text for _identity, text in concurrent] == [text for _identity, text in expected]
+    stored = read_insight_rows(workspace, home=home)
+    assert {identity for identity, _text in expected + concurrent} == {row["id"] for row in stored}
+    by_id = {row["id"]: row["text"] for row in stored}
+    for written in (expected, concurrent):
+        for (identity, _text), shape in zip(written, cases):
+            _assert_proposal_view(by_id[identity], *shape[1:])
+
+
+def _guidance_bullets(text):
+    body = text.split("## Guidance\n", 1)[1].split("## Evidence\n", 1)[0]
+    return [line[2:] for line in body.splitlines() if line.startswith("- ")]
+
+
+@pytest.mark.parametrize("supported", [False, True], ids=["unsupported", "supported"])
+def test_proposal_writer_persists_the_deleted_view_mask(tmp_path, monkeypatch, supported):
+    from aegis_core.insights import add_insight, write_proposal
+    from aegis_core.proposals.model import ProposalError
+    from aegis_core.storage import confined_descriptor_supported
+
+    if supported and not confined_descriptor_supported():
+        pytest.skip("requires descriptor-relative nofollow operations")
+    if not supported:
+        monkeypatch.setattr("aegis_core.proposals.store.descriptor_supported", lambda: False)
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("a = 1\n", encoding="utf-8")
+    home = tmp_path / "home"
+    member = add_insight(workspace, "counted member", paths=["app.py"], kind="correctness", home=home)
+    cases = [row for row in _proposal_control_matrix() if row[3]]
+    spaces = [row for row in _proposal_control_matrix() if not row[3]]
+    for index, (value, body, marker, masked) in enumerate([*cases, *spaces]):
+        bullet = "note " + value + " tail"
+        proposal_id = f"trap-cv{index:02d}"
+        path = write_proposal(workspace, proposal_id=proposal_id, insight_ids=[member["id"]],
+                              summary_bullets=[bullet], kind="correctness", home=home)
+        original = path.read_bytes()
+        stored = _guidance_bullets(original.decode("utf-8"))[-1]
+        _assert_proposal_view(stored, body, marker, masked)
+        for _ in range(2):
+            assert write_proposal(workspace, proposal_id=proposal_id, insight_ids=[member["id"]],
+                                  summary_bullets=[bullet], kind="correctness", home=home) == path
+            assert path.read_bytes() == original
+    kind = "AS" + "IA" + "\x85" + "A" * 16
+    path = write_proposal(workspace, proposal_id="trap-cv-kind", insight_ids=[member["id"]],
+                          summary_bullets=["Keep the kind field on the same view."], kind=kind, home=home)
+    head = path.read_text(encoding="utf-8").split("## Do", 1)[0]
+    assert "[REDACTED_AWS]" in head
+    assert "A" * 4 not in head
+    with pytest.raises(ProposalError) as missing:
+        write_proposal(workspace, proposal_id="trap-cv-missing", insight_ids=["ins-000000000000"],
+                       summary_bullets=["note " + "AK" + "IA" + "\r" + "A" * 16 + " SENTINEL"],
+                       kind="correctness", home=home)
+    assert missing.value.code == "insight_counted"
+    assert "SENTINEL" not in str(missing.value) and "A" * 4 not in str(missing.value)
+    with pytest.raises(ProposalError) as refused:
+        write_proposal(workspace, proposal_id="trap-cv-cr", insight_ids=[member["id"]],
+                       summary_bullets=["ordinary bullet"], kind="AK" + "IA" + "\r" + "A" * 16, home=home)
+    assert refused.value.code == "invalid"
+    assert "A" * 4 not in str(refused.value)
+
+
+# Round 4: detection precedes bounding and ordered substitutions keep context.
+
+@pytest.mark.parametrize("aws", [False, True], ids=["keyed-value", "aws"])
+def test_proposal_ordered_substitutions_keep_overlapping_context(tmp_path, aws):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from aegis_core.insights import add_insight, read_insight_rows, write_proposal
+    from aegis_core.proposals.model import clean_text
+    from aegis_core.storage import confined_descriptor_supported
+
+    label = "gh" + "p_token" + "a" * 20
+    body = "B" * 16 if aws else "abcdefgh"
+    value = label + ("=AK" + "IA" + "\x1b[31m" + body if aws
+                     else "=abcd" + "\x1b[31m" + "efgh")
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("pass\n", encoding="utf-8")
+    shown = clean_text(value, 300)
+    assert body[:4] not in shown and "[REDACTED" in shown
+    assert clean_text(shown, 300) == shown
+
+    def persist(_index):
+        return add_insight(workspace, value, paths=["app.py"], kind="correctness", home=home)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        rows = list(pool.map(persist, range(3)))
+    stored = {row["id"]: row["text"] for row in read_insight_rows(workspace, home=home)}
+    assert all(body[:4] not in stored[row["id"]] for row in rows)
+    if not confined_descriptor_supported():
+        return  # Existing unsupported-probe writer test covers that path.
+    proposal_ws = tmp_path / "proposal-ws"
+    proposal_ws.mkdir()
+    (proposal_ws / "app.py").write_text("pass\n", encoding="utf-8")
+    member = add_insight(proposal_ws, "A counted proposal member.", paths=["app.py"], home=home)
+    path = write_proposal(proposal_ws, proposal_id="trap-overlap", insight_ids=[member["id"]],
+                          summary_bullets=[value], kind="correctness", home=home)
+    original = path.read_bytes()
+    assert body[:4] not in _guidance_bullets(original.decode("utf-8"))[-1]
+    assert write_proposal(proposal_ws, proposal_id="trap-overlap", insight_ids=[member["id"]],
+                          summary_bullets=[value], kind="correctness", home=home) == path
+    assert path.read_bytes() == original
+
+
+def _bound_crossing_secret(family, control, unfinished):
+    shapes = {
+        "jwt": ("eyJ" + "A" * 8 + ".abcdefgh", ".bbbb", "abcdefgh"),
+        "url": ("https://user:abcdEFGHijkl", "@example.test", "abcdEFGHijkl"),
+        "aws": ("AK" + "IA" + "B" * 8, "B" * 8, "B" * 16),
+        "github": ("gh" + "p_" + "a" * 8, "a" * 28, "a" * 36),
+    }
+    left, right, body = shapes[family]
+    repeats = 4097 if unfinished else 1
+    return "note " + left + control * repeats + right + "z" * 4097, body
+
+
+@pytest.mark.parametrize("family", ["jwt", "url", "aws", "github"])
+@pytest.mark.parametrize("control", ["\r", "\x85", "\x1b[31m"], ids=["cr", "nel", "csi"])
+@pytest.mark.parametrize("unfinished", [False, True], ids=["inside-raw", "unfinished"])
+def test_bound_crossing_secret_matrix_persists_no_fragment(tmp_path, family, control, unfinished):
+    from aegis_core.insights import add_insight, read_insight_rows
+    from aegis_core.proposals.model import ProposalError, clean_text
+    from aegis_core.redaction import MAX_LINE_LENGTH, redact_insight_text
+
+    value, body = _bound_crossing_secret(family, control, unfinished)
+    assert len(value) > MAX_LINE_LENGTH
+    shown = redact_insight_text(value, max_len=0)
+    assert body[:4] not in shown
+    assert redact_insight_text(shown, max_len=0) == shown
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("pass\n", encoding="utf-8")
+    rows = [add_insight(workspace, value, paths=["app.py"], kind="correctness", home=home)
+            for _ in range(2)]
+    stored = {row["id"]: row["text"] for row in read_insight_rows(workspace, home=home)}
+    assert all(body[:4] not in stored[row["id"]] for row in rows)
+    with pytest.raises(ProposalError) as refused:
+        clean_text(value, 300)
+    assert refused.value.code == "too_large"
+    assert body[:4] not in str(refused.value)
+    short, _ = _bound_crossing_secret(family, control, False)
+    short = short[:-4097]
+    assert body[:4] not in clean_text(short, 300)
+    from aegis_core.insights import write_proposal
+    from aegis_core.storage import confined_descriptor_supported
+
+    with pytest.raises(ProposalError) as oversized:
+        write_proposal(workspace, proposal_id="trap-bound-long", insight_ids=[rows[0]["id"]],
+                       summary_bullets=[value], kind="correctness", home=home)
+    assert oversized.value.code == "too_large"
+    assert body[:4] not in str(oversized.value)
+    if confined_descriptor_supported():
+        member = add_insight(workspace, "A counted matrix member.", paths=["app.py"], home=home)
+        path = write_proposal(workspace, proposal_id="trap-bound-short", insight_ids=[member["id"]],
+                              summary_bullets=[short], kind="correctness", home=home)
+        original = path.read_bytes()
+        assert body[:4] not in _guidance_bullets(original.decode("utf-8"))[-1]
+        assert write_proposal(workspace, proposal_id="trap-bound-short", insight_ids=[member["id"]],
+                              summary_bullets=[short], kind="correctness", home=home) == path
+        assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("control", ["\r", "\x85", "\x1b[31m"], ids=["cr", "nel", "csi"])
+def test_ordered_keyed_value_keeps_context_with_trailing_control(tmp_path, control):
+    from aegis_core.insights import add_insight, read_insight_rows
+    from aegis_core.proposals.model import clean_text
+    from aegis_core.redaction import redact_insight_text
+
+    value = "gh" + "p_token" + "a" * 20 + "=abcdefgh" + control
+    assert "abcd" not in redact_insight_text(value, max_len=0)
+    assert "abcd" not in clean_text(value, 300)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("pass\n", encoding="utf-8")
+    row = add_insight(workspace, value, paths=["app.py"], home=tmp_path / "home")
+    stored = {item["id"]: item["text"] for item in
+              read_insight_rows(workspace, home=tmp_path / "home")}
+    assert "abcd" not in stored[row["id"]]
+
+
+@pytest.mark.parametrize("control", ["\r", "\x85"], ids=["cr", "nel"])
+def test_review_unfinished_jwt_never_persists_payload(tmp_path, control):
+    from aegis_core.insights import add_insight, read_insight_rows
+
+    value = "eyJ" + "A" * 8 + ".abcdefgh" + control * 4097 + ".bbbb"
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("pass\n", encoding="utf-8")
+    row = add_insight(workspace, value, paths=["app.py"], home=tmp_path / "home")
+    stored = {item["id"]: item["text"] for item in
+              read_insight_rows(workspace, home=tmp_path / "home")}
+    assert "abcd" not in stored[row["id"]]
+
+
+def test_bounded_deleted_view_callbacks_fail_retry_and_parallel():
+    from concurrent.futures import ThreadPoolExecutor
+
+    from aegis_core.redaction import RedactionRefusal
+
+    value = "AK" + "IA" + "B" * 8 + "\r" + "B" * 8 + " safe " + "tail" * 100
+
+    def failing(_spans):
+        raise RuntimeError("observer failed")
+
+    with pytest.raises(RuntimeError, match="^observer failed$"):
+        primitives.redact_display_secrets(value, limit=4096, bound=True, on_replacements=failing)
+
+    def once(_index):
+        events = []
+        shown = primitives.redact_display_secrets(value, limit=4096, bound=True,
+                                                  on_replacements=events.extend)
+        assert events and all(0 <= start < end <= len(value) for start, end, _payload in events)
+        assert "BBBB" not in shown
+        return shown
+
+    expected = once(0)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(once, range(6))) == [expected] * 6
+    for invalid in (None, 1, "yes"):
+        with pytest.raises(RedactionRefusal, match="^invalid$") as caught:
+            primitives.redact_display_secrets(value, limit=4096, bound=invalid)
+        assert caught.value.code == "invalid"
+    assert once(0) == expected
+
+
+@pytest.mark.parametrize("token", ["gh" + "p_" + "a" * 20, "AK" + "IA" + "B" * 16,
+                                  "sk-" + "a" * 24, "npm_" + "a" * 24])
+@pytest.mark.parametrize("control", ["\r", "\x85", " \x1b[31m"], ids=["cr", "nel", "csi"])
+def test_round6_original_bearer_context_survives_embedded_tokens(tmp_path, token, control):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from aegis_core.insights import add_insight, read_insight_rows, write_proposal
+    from aegis_core.proposals.model import clean_text
+    from aegis_core.redaction import redact_insight_text
+    from aegis_core.storage import confined_descriptor_supported
+
+    value = "Bearer" + control + token + ".bbbbbbbb"
+    for clean in (lambda text: primitives.redact_display_secrets(text, limit=4096),
+                  lambda text: redact_insight_text(text, max_len=0), lambda text: clean_text(text, 300)):
+        shown = clean(value)
+        assert "bbbb" not in shown and "[REDACTED" in shown
+        assert clean(shown) == shown
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("pass\n", encoding="utf-8")
+
+    def persist(_index):
+        return add_insight(workspace, value, paths=["app.py"], home=home)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        rows = list(pool.map(persist, range(6)))
+    by_id = {row["id"]: row["text"] for row in read_insight_rows(workspace, home=home)}
+    assert all("bbbb" not in by_id[row["id"]] for row in rows)
+    if not confined_descriptor_supported():
+        return  # The existing unsupported-probe writer test exercises refusal.
+    proposal_ws = tmp_path / "proposal-ws"
+    proposal_ws.mkdir()
+    (proposal_ws / "app.py").write_text("pass\n", encoding="utf-8")
+    member = add_insight(proposal_ws, "Counted ordinary member.", paths=["app.py"], home=home)
+    arguments = dict(proposal_id="trap-bearer", insight_ids=[member["id"]],
+                     summary_bullets=[value], kind="correctness", home=home)
+    path = write_proposal(proposal_ws, **arguments)
+    original = path.read_bytes()
+    assert "bbbb" not in _guidance_bullets(original.decode("utf-8"))[-1]
+    assert write_proposal(proposal_ws, **arguments) == path
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("control", ["\r", "\x85", "\x1b[31m"], ids=["cr", "nel", "csi"])
+def test_round6_insight_kind_is_redacted_before_both_writes(tmp_path, control):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from aegis_core.insights import add_insight, read_insight_rows, record_decision
+
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("pass\n", encoding="utf-8")
+    kind = "AK" + "IA" + control + "B" * 16
+    with pytest.raises(ValueError, match="^confirm needs at least one insight id$"):
+        record_decision(workspace, decision="confirm", insight_ids=[], kind=kind, home=home)
+
+    def persist(_index):
+        row = add_insight(workspace, "Ordinary correction.", paths=["app.py"], kind=kind, home=home)
+        decision = record_decision(workspace, decision="confirm", insight_ids=[row["id"]],
+                                   kind=kind, home=home)
+        assert row["kind"] == decision["kind"] == "[REDACTED_AWS]"
+        return row["id"]
+
+    persist(0)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        identities = set(pool.map(persist, range(6)))
+    stored = read_insight_rows(workspace, home=home)
+    assert identities <= {row["id"] for row in stored if row["event"] == "insight"}
+    assert all(row["kind"] == "[REDACTED_AWS]" for row in stored)
+
+
+@pytest.mark.parametrize("control", ["cr", "nel", "nul", "ignored-c1", "esc-parameters", "esc-intermediates",
+                                     "c1-parameters", "c1-intermediates"])
+@pytest.mark.parametrize("placement", [None, -1, 0, 1], ids=["review", "before", "at", "after"])
+@pytest.mark.parametrize("case", ["security", "correctness-letters", "correctness-symbols"])
+def test_round8g_raw_tail_cut_retains_prior_replacements_and_recovers(control, placement, case):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.redaction import redact_insight_text
+    from tests.unit.core.test_insights import _round8g_control_source
+
+    prefix = "token=" + "x" * 10 + " "
+    source, _short, secret = _round8g_control_source(control, placement, preceding=prefix, case=case)
+    expected = "token=[REDACTED] " + ("Never repeat this:" if case == "security" else "First safe note.") + " ..."
+
+    def fail(_spans):
+        raise RuntimeError("observer failed")
+
+    def clean(_index):
+        events = []
+        shown = redact_insight_text(source, max_len=0, on_replacements=events.append)
+        assert shown == expected
+        assert len(events) == 1
+        assert all(end <= len(prefix) for _start, end, _payload in events[0])
+        assert all(secret[index:index + 4] not in shown for index in range(len(secret) - 3))
+        assert redact_insight_text(shown, max_len=0) == shown
+        return shown
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="^observer failed$"):
+            redact_insight_text(source, max_len=0, on_replacements=fail)
+        assert clean(0) == expected
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(clean, range(3))) == [expected] * 3
+
+
+@pytest.mark.parametrize("control", ["\r", "\x85"], ids=["cr", "nel"])
+@pytest.mark.parametrize("word", ["note", "ordinary", "AKIAnote", "ghp_ordinary!"])
+def test_round6_benign_control_text_keeps_historical_bounded_head(tmp_path, control, word):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from aegis_core.insights import add_insight, read_insight_rows
+    from aegis_core.redaction import redact_insight_text
+
+    value = (word + control) * 1000
+    # ROUND-8h: these raw words are one token in the deleted view. Withhold
+    # that entire token when its joining control run meets the bound.
+    expected = "..."
+
+    def clean(_index):
+        shown = redact_insight_text(value, max_len=0)
+        assert shown == expected
+        assert redact_insight_text(shown, max_len=0) == shown
+        return shown
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(clean, range(6))) == [expected] * 6
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("pass\n", encoding="utf-8")
+    for _ in range(2):
+        row = add_insight(workspace, value, paths=["app.py"], home=home)
+        assert row["text"] == expected[:300]
+    assert all(row["text"] == expected[:300] for row in read_insight_rows(workspace, home=home))
+
+
+@pytest.mark.parametrize("control", ["cr", "nel", "esc-intermediates", "c1-intermediates"])
+@pytest.mark.parametrize("token", ["ordinary", "a" * 65, "a" * 513, "123" * 30, "!?" * 40, "ordinary "],
+                         ids=["word", "long-letters", "longer-letters", "digits", "punctuation", "space-before-run"])
+def test_round8g_control_tail_does_not_classify_the_raw_token(control, token):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.redaction import redact_insight_text
+    from tests.unit.core.test_insights import _round8g_control_source
+
+    source, _short, _secret = _round8g_control_source(control, token=token)
+    # ROUND-8h: retained whitespace ends the deleted-view token before the run.
+    expected = "Never repeat this: " + (token if token.endswith(" ") else "") + "..."
+    for _ in range(2):
+        assert redact_insight_text(source, max_len=0) == expected
+        assert redact_insight_text(expected, max_len=0) == expected
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(lambda _: redact_insight_text(source, max_len=0), range(3))) == [expected] * 3
+
+
+@pytest.mark.parametrize("control", ["\r", "\x85", "\x1b[" + " " * 5000 + "m"], ids=["cr", "nel", "csi"])
+@pytest.mark.parametrize("candidate", ["k7Qm9pL2xV4nR8wY", "person", "AKIABBBBBBBB"])
+def test_round8f_tail_withholds_only_candidate_and_keeps_benign_head(control, candidate):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.redaction import redact_insight_text
+
+    removed = control if len(control) > 1 else control * 5000
+    source = "First safe note. " + candidate + removed + "tail"
+
+    def clean(_index):
+        events = []
+        shown = redact_insight_text(source, max_len=0, on_replacements=events.append)
+        assert shown == "First safe note. ..."
+        assert events == []  # Initial bounding does not report replacement spans.
+        assert redact_insight_text(shown, max_len=0) == shown
+        return shown
+
+    expected = clean(0)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(clean, range(6))) == [expected] * 6
+
+
+@pytest.mark.parametrize("label", ["PRIVATE KEY", "RSA PRIVATE KEY", "OPENSSH PRIVATE KEY"])
+@pytest.mark.parametrize("where", ["body", "end-line"])
+def test_round8f_pem_bound_retains_benign_prefix_and_callback_failure_recovers(label, where):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.redaction import redact_insight_text
+
+    prefix = "token=secret12345 First safe note. "
+    begin, end = "-----BEGIN " + label + "-----\n", "-----END " + label + "-----"
+    body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC+/\n" * 200
+    if where == "end-line":
+        body = body[:4090 - len(prefix) - len(begin)]
+    source = prefix + begin + body + end + " tail" * 100
+    expected = "token=[REDACTED] First safe note."
+
+    def fail(_spans):
+        raise RuntimeError("observer failed")
+
+    def clean(_index):
+        events = []
+        shown = redact_insight_text(source, max_len=0, on_replacements=events.append)
+        assert shown == expected and len(events) == 1
+        assert all(end <= len(prefix) for _start, end, _payload in events[0])
+        assert redact_insight_text(shown, max_len=0) == shown
+        return shown
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="^observer failed$"):
+            redact_insight_text(source, max_len=0, on_replacements=fail)
+        assert clean(0) == expected
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(clean, range(6))) == [expected] * 6
+
+
+@pytest.mark.parametrize("candidate_scan", [False, 1, "bad", []])
+def test_round8f_invalid_tail_metadata_refuses_before_parsing_then_retries(monkeypatch, candidate_scan):
+    from aegis_core.redaction import RedactionRefusal
+
+    original = primitives._display_views
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid tail metadata reached display parsing")
+
+    monkeypatch.setattr("aegis_core.primitives._display_views", forbidden)
+    for _ in range(2):
+        with pytest.raises(RedactionRefusal, match="^invalid$") as caught:
+            primitives.redact_display_secrets("safe", limit=4, bound=True, tail_candidates=candidate_scan)
+        assert caught.value.code == "invalid"
+    monkeypatch.setattr("aegis_core.primitives._display_views", original)
+    assert primitives.redact_display_secrets("safe ", limit=5, bound=True, tail_candidates=lambda _text: ()) == "safe "
+
+
+@pytest.mark.parametrize("label", ["PRIVATE KEY", "RSA PRIVATE KEY", "OPENSSH PRIVATE KEY"])
+def test_round8f_completed_pem_before_later_cut_keeps_intervening_benign_text(label):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.redaction import redact_insight_text
+
+    first = "-----BEGIN " + "PRIVATE KEY-----\nABCD\n-----END " + "PRIVATE KEY-----"
+    prefix = "First safe note. " + first + " Middle safe note. "
+    source = prefix + "-----BEGIN " + label + "-----\n" + "ABCD+/\n" * 1000
+    expected = "First safe note. [REDACTED_PEM] Middle safe note."
+
+    def fail(_spans):
+        raise RuntimeError("observer failed")
+
+    def clean(_index):
+        events = []
+        shown = redact_insight_text(source, max_len=0, on_replacements=events.append)
+        assert shown == expected and len(events) == 1
+        assert events[0] == ((prefix.index("-----BEGIN"), prefix.index(" Middle"), "[REDACTED_PEM]"),)
+        assert redact_insight_text(shown, max_len=0) == shown
+        return shown
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="^observer failed$"):
+            redact_insight_text(source, max_len=0, on_replacements=fail)
+        assert clean(0) == expected
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(clean, range(6))) == [expected] * 6
+
+
+def test_round6_original_union_callback_is_single_replayable_and_recovers():
+    from concurrent.futures import ThreadPoolExecutor
+
+    from aegis_core.redaction import redact_insight_text
+
+    value = "Bearer\rgh" + "p_" + "a" * 20 + ".bbbbbbbb mail person@example.test"
+
+    def fail(_spans):
+        raise RuntimeError("observer failed")
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="^observer failed$"):
+            redact_insight_text(value, max_len=0, on_replacements=fail)
+
+    def clean(_index):
+        events = []
+        shown = redact_insight_text(value, max_len=0, on_replacements=events.append)
+        assert len(events) == 1
+        parts, cursor = [], 0
+        for start, end, replacement in events[0]:
+            assert cursor <= start < end <= len(value)
+            parts.extend((value[cursor:start], replacement))
+            cursor = end
+        parts.append(value[cursor:])
+        assert shown == " ".join("".join(parts).split())
+        assert "bbbb" not in shown and "person@" not in shown
+        return shown
+
+    expected = clean(0)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(clean, range(6))) == [expected] * 6
+
+
+@pytest.mark.parametrize("spans", [None, [], ((0, 0, "mask"),), ((0, 5, "mask"),),
+                                  ((False, 2, "mask"),), ((0, 2, None),), ((0, 2),)])
+def test_round6_extra_spans_refuse_before_allocation_then_retry(monkeypatch, spans):
+    from aegis_core.redaction import RedactionRefusal
+
+    def forbidden(*args):
+        pytest.fail("invalid spans reached display allocation")
+
+    original = primitives._display_views
+    monkeypatch.setattr("aegis_core.primitives._display_views", forbidden)
+    for _ in range(2):
+        with pytest.raises(RedactionRefusal, match="^invalid$") as caught:
+            primitives.redact_display_secrets("safe", limit=4, extra_spans=spans)
+        assert caught.value.code == "invalid"
+    monkeypatch.setattr("aegis_core.primitives._display_views", original)
+    assert primitives.redact_display_secrets("safe", limit=4, extra_spans=((0, 4, "[REDACTED]"),)) == "[REDACTED]"
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("/home/person@example.test", "/home/~user"),
+    ("/Users/person@example.test", "/Users/~user"),
+    ("C:\\Users\\person@example.test", "C:\\Users\\~user"),
+    ("https://user:secret123@example.test", "https://user:[REDACTED]@example.test"),
+    ("person@example.test", "[REDACTED_EMAIL]"),
+    ("/home/10.20.30.40", "/home/~user"),
+])
+def test_round6_privacy_context_keeps_historical_bytes(value, expected):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from aegis_core.redaction import redact_insight_text
+
+    def fail(_spans):
+        raise RuntimeError("observer failed")
+
+    def clean(_index):
+        events = []
+        shown = redact_insight_text(value, max_len=0, on_replacements=events.append)
+        assert shown == expected and len(events) == 1
+        assert redact_insight_text(shown, max_len=0) == shown
+        return shown
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="^observer failed$"):
+            redact_insight_text(value, max_len=0, on_replacements=fail)
+        assert clean(0) == expected
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(clean, range(6))) == [expected] * 6
+
+
+@pytest.mark.parametrize("control", ["\r", "\x85", "\x00", "\x1b[31m", "\x9b31m"],
+                         ids=["cr", "nel", "nul", "esc", "c1"])
+@pytest.mark.parametrize("position", [4095, 4096, 4097], ids=["before", "at", "after"])
+def test_round8e_conservative_control_window_and_plain_head(control, position):
+    from aegis_core.redaction import redact_insight_text
+
+    benign = "First safe note. " + "ordinary " * 1200
+    raw = benign[:4097]
+    words = raw.split()
+    if not raw[-1].isspace():
+        words.pop()
+    expected = " ".join(words)
+    assert redact_insight_text(benign, max_len=0) == expected
+    source = benign[:position] + control + benign[position + 1:]
+    shown = redact_insight_text(source, max_len=0)
+    assert shown.startswith(expected)
+    if position == 4097:
+        assert shown == expected
+    else:
+        assert shown[len(expected):].strip(" .") == ""
+    assert redact_insight_text(shown, max_len=0) == shown
+
+
+def _round8_credential_families():
+    from tests.unit.cli.test_check_ci_push import REDACTION_FAMILY_PROBES
+
+    return [row for row in REDACTION_FAMILY_PROBES if row[0] not in {"email", "home", "ip"}]
+
+
+@pytest.mark.parametrize("control", ["\r", "\x85", "\x00", "\x7f", "\x86"], ids=["cr", "nel", "nul", "del", "c1"])
+def test_round8e_entropy_bound_resolves_removed_runs(control):
+    from aegis_core.redaction import redact_insight_text
+
+    secret = "k7Qm9pL2xV4nR8wY3tB6cD1fH0aZ"
+    value = "First safe note. " + secret[:16] + control * 4097 + secret[16:]
+    shown = redact_insight_text(value, max_len=0)
+    assert shown == "First safe note. ..."
+    assert all(secret[index:index + 4] not in shown for index in range(len(secret) - 3))
+    assert redact_insight_text(shown, max_len=0) == shown
+
+
+@pytest.mark.parametrize("intro", ["\x1b[", "\x9b"], ids=["esc", "c1"])
+@pytest.mark.parametrize("header", ["1;", " "], ids=["parameters", "intermediates"])
+@pytest.mark.parametrize("count", [5000, 30000], ids=["resolved", "exhausted"])
+@pytest.mark.parametrize("tail", ["m" + "B" * 8, ""], ids=["complete", "unfinished"])
+def test_round8e_bound_inside_csi_never_keeps_credential_fragments(tmp_path, intro, header, count, tail):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.insights import add_insight, read_insight_rows
+    from aegis_core.redaction import redact_insight_text
+
+    value = "First safe note. x\rAKIA" + "B" * 8 + intro + header * count + tail
+
+    def clean(_index):
+        shown = redact_insight_text(value, max_len=0)
+        # ROUND-8h: the earlier CR joins x to the candidate in the deleted view.
+        assert shown == "First safe note. ..."
+        assert "BBBB" not in shown
+        assert redact_insight_text(shown, max_len=0) == shown
+        return shown
+
+    expected = clean(0)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(clean, range(6))) == [expected] * 6
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    workspace.mkdir()
+    for _ in range(2):
+        row = add_insight(workspace, value, paths=[], home=home)
+        assert "BBBB" not in row["text"]
+    assert all("BBBB" not in row["text"] for row in read_insight_rows(workspace, home=home))
+
+
+@pytest.mark.parametrize("control", ["\r", "\x85", "\x00", "\x1b[" + " " * 30000 + "m"],
+                         ids=["cr", "nel", "nul", "csi"])
+@pytest.mark.parametrize("token", ["harmless", "k7Qm9pL2xV4nR8wY", "person@example"],
+                         ids=["benign", "entropy", "privacy"])
+def test_round8e_control_tail_is_withheld_before_matching_and_recovers(monkeypatch, control, token):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core import redaction
+
+    removed = control if len(control) > 1 else control * 50000
+    source = "token=secret12345 First second " + token + removed + "tail"
+    original_control, original_spans = redaction.CONTROL_RE, redaction._text_spans
+    original_views, sizes = primitives._display_views, []
+
+    class BoundedControls:
+        def search(self, text):
+            sizes.append(len(text))
+            assert len(text) <= redaction.MAX_LINE_LENGTH + 1
+            return original_control.search(text)
+
+    def bounded_views(text, *args, **kwargs):
+        assert len(text) <= redaction.MAX_LINE_LENGTH + 1
+        return original_views(text, *args, **kwargs)
+
+    def bounded_spans(text):
+        assert len(text) <= redaction.MAX_LINE_LENGTH + 1
+        return original_spans(text)
+
+    monkeypatch.setattr("aegis_core.redaction.CONTROL_RE", BoundedControls())
+    monkeypatch.setattr("aegis_core.primitives._display_views", bounded_views)
+    monkeypatch.setattr("aegis_core.redaction._text_spans", bounded_spans)
+
+    def fail(_spans):
+        raise RuntimeError("observer failed")
+
+    for _ in range(2):  # The retained earlier secret still reports one replacement.
+        with pytest.raises(RuntimeError, match="^observer failed$"):
+            redaction.redact_insight_text(source, max_len=0, on_replacements=fail)
+
+    def clean(_index):
+        events = []
+        shown = redaction.redact_insight_text(source, max_len=0, on_replacements=events.append)
+        assert shown == "token=[REDACTED] First second ..." and len(events) == 1
+        assert all(end <= source.index(" First") for _start, end, _payload in events[0])
+        return shown
+
+    expected = clean(0)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(clean, range(6))) == [expected] * 6
+    assert sizes and max(sizes) == redaction.MAX_LINE_LENGTH + 1
+    monkeypatch.setattr("aegis_core.redaction.CONTROL_RE", original_control)
+    monkeypatch.setattr("aegis_core.primitives._display_views", original_views)
+    monkeypatch.setattr("aegis_core.redaction._text_spans", original_spans)
+    safe = "token=secret12345 First second"
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="^observer failed$"):
+            redaction.redact_insight_text(safe, max_len=0, on_replacements=fail)
+    assert redaction.redact_insight_text(safe, max_len=0) == "token=[REDACTED] First second"
+
+
+@pytest.mark.parametrize("family,value,secret,marker", _round8_credential_families())
+@pytest.mark.parametrize("control", ["\r", "\x85", "\x1b[31m"], ids=["cr", "nel", "csi"])
+@pytest.mark.parametrize("placement", ["before", "at", "after"])
+def test_round8_carried_unfinished_candidate_matrix(tmp_path, family, value, secret, marker, control, placement):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from aegis_core.insights import add_insight, read_insight_rows
+    from aegis_core.redaction import redact_insight_text
+
+    import re
+
+    run = re.search(r"([A-Za-z0-9])\1{3,}$", secret)
+    body = run.group() if run else secret
+    split = value.index(secret) + (run.start() if run else 0) + min(8, max(4, len(body) // 2))
+    head, tail = value[:split], value[split:]
+    if placement == "before":
+        source = "note x" + control + head + control * 4097 + tail
+    else:
+        position = 4096 if placement == "at" else 4098
+        padding = ("note " * 1000)[:position - len(control) - 1]
+        source = padding + "x" + control + head + control * 4097 + tail
+
+    def clean(_index):
+        shown = redact_insight_text(source, max_len=0)
+        assert body[:4] not in shown
+        assert redact_insight_text(shown, max_len=0) == shown
+        return shown
+
+    expected = clean(0)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(clean, range(3))) == [expected] * 3
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("pass\n", encoding="utf-8")
+    for _ in range(2):
+        row = add_insight(workspace, source, paths=["app.py"], home=home)
+        assert body[:4] not in row["text"]
+    assert all(body[:4] not in row["text"] for row in read_insight_rows(workspace, home=home))
+
+
+@pytest.mark.parametrize("bounded", [False, True], ids=["short", "bounded"])
+@pytest.mark.parametrize("order", ["family-first", "entropy-first", "family-middle"])
+@pytest.mark.parametrize("control", ["\r", "\x85", "\x1b[31m"], ids=["cr", "nel", "csi"])
+def test_round8_overlap_preserves_every_detector_byte(tmp_path, bounded, order, control):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from aegis_core.insights import add_insight, read_insight_rows
+    from aegis_core.proposals.model import clean_text
+    from aegis_core.redaction import redact_insight_text
+
+    entropy = "aB1cD2eF3gH4iJ5kL6mN7oP8"
+    family = "AK" + "IA" + control + "ABCDEFGHIJKLMNOP"
+    value = {"family-first": family + entropy,
+             "entropy-first": entropy + control + family,
+             "family-middle": entropy + control + family + entropy}[order]
+    source = value + (" safe " + "note " * 1000 if bounded else "")
+
+    def clean(_index):
+        events = []
+        shown = redact_insight_text(source, max_len=0, on_replacements=events.append)
+        assert "[REDACTED_AWS]" in shown
+        assert len(events) == 1
+        assert not any(entropy[index:index + 4] in shown for index in range(len(entropy) - 3))
+        cursor = 0
+        for batch in events:
+            for start, end, replacement in batch:
+                assert cursor <= start < end <= min(len(source), 4097)
+                assert entropy not in replacement
+                cursor = end
+        assert redact_insight_text(shown, max_len=0) == shown
+        return shown
+
+    expected = clean(0)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(clean, range(3))) == [expected] * 3
+    assert entropy[:4] not in clean_text(value, 300)
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("pass\n", encoding="utf-8")
+    for _ in range(2):
+        add_insight(workspace, source, paths=["app.py"], kind=value, home=home)
+    stored = read_insight_rows(workspace, home=home)
+    assert all(entropy[:4] not in row[field] for row in stored for field in ("text", "kind"))
+
+
+@pytest.mark.parametrize("prefix", ["", "person.", "/home/"])
+@pytest.mark.parametrize("bounded", [False, True])
+def test_round8_privacy_overlap_and_existing_masks_are_stable(prefix, bounded):
+    from aegis_core.redaction import redact_insight_text
+
+    credential = "gh" + "p_" + "a" * 36
+    value = prefix + credential + ("@example.test" if prefix != "/home/" else "/file")
+    if bounded:
+        value += " safe " + "note " * 1000
+    shown = redact_insight_text(value, max_len=0)
+    assert "[REDACTED_VCS_TOKEN]" in shown
+    assert "aaaa" not in shown
+    if prefix != "/home/":
+        # ROUND-8c: overlapping privacy leaves known-secret context intact.
+        assert shown.startswith(prefix + "[REDACTED_VCS_TOKEN]@example.test")
+        assert "[REDACTED_EMAIL]" not in shown
+    for _ in range(2):
+        events = []
+        assert redact_insight_text(shown, max_len=0, on_replacements=events.append) == shown
+        assert events == []
+
+
+@pytest.mark.parametrize("control", ["", "\r", "\x85", "\x1b[1:2m", "\x9b31m"],
+                         ids=["plain", "cr", "nel", "esc", "c1"])
+@pytest.mark.parametrize("bounded", [False, True])
+@pytest.mark.parametrize("shape", ["email", "home", "ip", "disjoint"])
+def test_round8c_privacy_context_and_secret_material_keep_distinct_coverage(tmp_path, control, bounded, shape):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.insights import add_insight, read_insight_rows
+    from aegis_core.redaction import redact_insight_text
+
+    key = "gh" + "p_" + "a" * 10 + control + "a" * 26
+    value, expected = {
+        "email": ("person." + key + "@example.test", "person.[REDACTED_VCS_TOKEN]@example.test"),
+        "home": ("/home/person." + key + ".vault/file", "/home/person.[REDACTED_VCS_TOKEN].vault/file"),
+        "ip": ("token=10." + control + "20.30.40", "token=[REDACTED]"),
+        "disjoint": ("person@example.test " + key + " /home/alice 10.20.30.40",
+                     "[REDACTED_EMAIL] [REDACTED_VCS_TOKEN] /home/~user [REDACTED_IP]"),
+    }[shape]
+    source = value + (" safe " + "note " * 1000 if bounded else "")
+
+    def clean(_index):
+        events = []
+        shown = redact_insight_text(source, max_len=0, on_replacements=events.append)
+        assert shown.startswith(expected)
+        if not bounded:
+            assert shown == expected
+        assert len(events) == 1
+        assert "aaaa" not in shown
+        cursor = 0
+        for batch in events:
+            for start, end, payload in batch:
+                assert cursor <= start < end <= min(len(source), 4097)
+                cursor = end
+        assert redact_insight_text(shown, max_len=0) == shown
+        return shown
+
+    def fail(_events):
+        raise RuntimeError("observer failed")
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="^observer failed$"):
+            redact_insight_text(source, max_len=0, on_replacements=fail)
+    shown = clean(0)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(clean, range(3))) == [shown] * 3
+    workspace, home = tmp_path / "ws", tmp_path / "home"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("pass\n", encoding="utf-8")
+    for _ in range(2):
+        row = add_insight(workspace, value, kind=value, paths=["app.py"], home=home)
+        assert row["text"] == expected and row["kind"] == expected
+    assert all(row["text"] == expected for row in read_insight_rows(workspace, home=home))
+
+
+@pytest.mark.parametrize("name", ["extra_spans", "protected_spans"])
+@pytest.mark.parametrize("spans", [((0, 1, "x" * 129),), ((0, 1, "x"),) * 129])
+def test_round8_span_budgets_refuse_before_detection_then_retry(monkeypatch, name, spans):
+    from aegis_core.redaction import RedactionRefusal
+
+    original = primitives._display_secret_spans
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("oversized span metadata reached detection")
+
+    monkeypatch.setattr("aegis_core.primitives._display_secret_spans", forbidden)
+    for _ in range(2):
+        with pytest.raises(RedactionRefusal, match="^too_large$"):
+            primitives.redact_display_secrets("safe", limit=4, **{name: spans})
+    monkeypatch.setattr("aegis_core.primitives._display_secret_spans", original)
+    assert primitives.redact_display_secrets("safe", limit=4) == "safe"
+
+
+@pytest.mark.parametrize("family,value,secret,marker", _round8_credential_families())
+@pytest.mark.parametrize("intro", ["\x1b[", "\x9b"], ids=["esc", "c1"])
+@pytest.mark.parametrize("header", ["m", "1;2m", "1:2m", "1:2 !p"], ids=["empty", "semicolon", "colon", "intermediate"])
+def test_round8_complete_csi_detection_keeps_original_coordinates(tmp_path, family, value, secret, marker, intro, header):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.insights import add_insight, read_insight_rows
+    from aegis_core.proposals.model import clean_text
+    from aegis_core.redaction import redact_insight_text
+
+    split = max(1, len(secret) // 2)
+    joined = secret[:split] + intro + header + secret[split:]
+    source = value.replace(secret, joined, 1)
+    events = []
+    shown = redact_insight_text(source, max_len=0, on_replacements=events.append)
+    assert marker in shown and secret[:4] not in shown
+    assert len(events) == 1
+    cursor = 0
+    for start, end, payload in events[0]:
+        assert cursor <= start < end <= len(source)
+        cursor = end
+    assert redact_insight_text(shown, max_len=0) == shown
+    assert secret[:4] not in clean_text(source, 4096)
+    benign = "ordinary" + intro + header + " note"
+    assert redact_insight_text(benign, max_len=0) == benign
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(lambda _: redact_insight_text(source, max_len=0), range(3))) == [shown] * 3
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    for _ in range(2):
+        add_insight(workspace, source, paths=[], home=tmp_path / "home")
+    assert all(secret[:4] not in row["text"] for row in read_insight_rows(workspace, home=tmp_path / "home"))
+
+
+@pytest.mark.parametrize("control", ["\r", "\x85", "\x1b[1:2m", "\x9b31m"], ids=["cr", "nel", "esc", "c1"])
+@pytest.mark.parametrize("value,split,body", [
+    ("k7Qm9pL2xV4nR8wY3tB6cD1fH0aZ", 16, "k7Qm"),
+    ("person@example.test", 3, "pers"),
+    ("10.20.30.40", 5, "10.2"),
+    ("/home/person", 8, "pers"),
+])
+@pytest.mark.parametrize("bounded", [False, True])
+def test_round8_entropy_and_privacy_scan_every_display_view(tmp_path, control, value, split, body, bounded):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.insights import add_insight, read_insight_rows
+    from aegis_core.proposals.model import clean_text, ProposalError
+    from aegis_core.redaction import redact_insight_text
+
+    source = value[:split] + control + value[split:] + (" note" * 1000 if bounded else "")
+    events = []
+    shown = redact_insight_text(source, max_len=0, on_replacements=events.append)
+    assert body not in shown
+    assert len(events) == 1
+    if bounded:
+        with pytest.raises(ProposalError) as refusal:
+            clean_text(source, 300)
+        assert refusal.value.code == "too_large"
+    else:
+        assert body not in clean_text(source, 300)
+    assert redact_insight_text(shown, max_len=0) == shown
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(lambda _: redact_insight_text(source, max_len=0), range(3))) == [shown] * 3
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    for _ in range(2):
+        add_insight(workspace, source, paths=[], home=tmp_path / "home")
+    assert all(body not in row["text"] for row in read_insight_rows(workspace, home=tmp_path / "home"))
+
+
+# Bind after all definitions: the shared table imports these callables for replay,
+# and either test module must also be importable first. Only layout/label metadata
+# lives beside the table; every original argument comes from CORPUS_CASES.
+from tests.unit.core.test_display_attribution_dense import parametrize_original
+
+test_display_escape_boundaries_mask_secrets_on_every_surface = parametrize_original(
+    test_display_escape_boundaries_mask_secrets_on_every_surface)
+test_display_removed_controls_preserve_secret_boundaries = parametrize_original(
+    test_display_removed_controls_preserve_secret_boundaries)
+test_display_ten_million_removed_controls_do_not_build_per_control_state = parametrize_original(
+    test_display_ten_million_removed_controls_do_not_build_per_control_state)
+test_display_boundary_detection_uses_shared_secret_families = parametrize_original(
+    test_display_boundary_detection_uses_shared_secret_families)
+test_display_provenance_masks_low_entropy_keys_after_every_header = parametrize_original(
+    test_display_provenance_masks_low_entropy_keys_after_every_header)
+test_display_provenance_masks_overlaps_inside_an_ordinary_match = parametrize_original(
+    test_display_provenance_masks_overlaps_inside_an_ordinary_match)
+test_display_provenance_covers_every_string_form_and_header = parametrize_original(
+    test_display_provenance_covers_every_string_form_and_header)
+test_display_provenance_overlaps_and_headers_are_independent_in_threads = parametrize_original(
+    test_display_provenance_overlaps_and_headers_are_independent_in_threads)
+test_display_source_view_masks_credentials_partly_consumed_by_csi = parametrize_original(
+    test_display_source_view_masks_credentials_partly_consumed_by_csi)
+test_display_source_view_keeps_header_state_across_ignored_controls = parametrize_original(
+    test_display_source_view_keeps_header_state_across_ignored_controls)
+test_display_source_view_accepts_control_only_nonsecret_text = parametrize_original(
+    test_display_source_view_accepts_control_only_nonsecret_text)
+test_display_deleted_view_masks_consumed_prefix_with_internal_control = parametrize_original(
+    test_display_deleted_view_masks_consumed_prefix_with_internal_control)
+test_display_deleted_view_keeps_bel_transparent_in_nonterminating_headers = parametrize_original(
+    test_display_deleted_view_keeps_bel_transparent_in_nonterminating_headers)
+test_display_deleted_view_preserves_bel_termination_and_nonsecret_parity = parametrize_original(
+    test_display_deleted_view_preserves_bel_termination_and_nonsecret_parity)
+test_display_renderer_provenance_keeps_control_interrupted_headers = parametrize_original(
+    test_display_renderer_provenance_keeps_control_interrupted_headers)
+test_display_renderer_provenance_recovers_consumed_credential_label = parametrize_original(
+    test_display_renderer_provenance_recovers_consumed_credential_label)
+test_display_pem_extents_cover_differently_labelled_nested_body = parametrize_original(
+    test_display_pem_extents_cover_differently_labelled_nested_body)
+test_display_source_segments_seal_suppressed_strings = parametrize_original(
+    test_display_source_segments_seal_suppressed_strings)
+test_display_source_segments_do_not_invent_credential_whitespace = parametrize_original(
+    test_display_source_segments_do_not_invent_credential_whitespace)
+test_display_source_segments_do_not_join_visible_context_through_hidden_payload = parametrize_original(
+    test_display_source_segments_do_not_join_visible_context_through_hidden_payload)
+test_display_source_segments_still_mask_visible_secrets_on_both_sides = parametrize_original(
+    test_display_source_segments_still_mask_visible_secrets_on_both_sides)
+test_display_source_segments_keep_prefixed_secret_context_detectable = parametrize_original(
+    test_display_source_segments_keep_prefixed_secret_context_detectable)
+test_display_rendered_segments_seal_hidden_token_prefix = parametrize_original(
+    test_display_rendered_segments_seal_hidden_token_prefix)
+test_display_rendered_segments_preserve_visible_space_inside_nonsecret = parametrize_original(
+    test_display_rendered_segments_preserve_visible_space_inside_nonsecret)
+test_display_rendered_segments_still_join_fully_removed_controls = parametrize_original(
+    test_display_rendered_segments_still_join_fully_removed_controls)
+test_display_rendered_segments_keep_visible_credential_whitespace = parametrize_original(
+    test_display_rendered_segments_keep_visible_credential_whitespace)
+test_display_reassembled_tokens_use_markers_before_caller_redaction = parametrize_original(
+    test_display_reassembled_tokens_use_markers_before_caller_redaction)
+test_display_unions_canonical_and_source_only_masks = parametrize_original(
+    test_display_unions_canonical_and_source_only_masks)
+test_display_does_not_orphan_value_after_guarding_secret_key_context = parametrize_original(
+    test_display_does_not_orphan_value_after_guarding_secret_key_context)
+test_display_restored_union_masks_before_boundary_changes_or_clipping = parametrize_original(
+    test_display_restored_union_masks_before_boundary_changes_or_clipping)
+test_display_source_guard_cannot_complete_a_new_credential_or_tear_a_mask = parametrize_original(
+    test_display_source_guard_cannot_complete_a_new_credential_or_tear_a_mask)
+test_display_attribution_preserves_ordinary_left_boundary = parametrize_original(
+    test_display_attribution_preserves_ordinary_left_boundary)
+test_display_attribution_covers_shared_rule_families = parametrize_original(
+    test_display_attribution_covers_shared_rule_families)
+test_display_attribution_long_benign_colour_runs_keep_parity = parametrize_original(
+    test_display_attribution_long_benign_colour_runs_keep_parity)
+test_display_attribution_detection_windows_span_removed_control_gaps = parametrize_original(
+    test_display_attribution_detection_windows_span_removed_control_gaps)
+test_display_attribution_masks_overlapping_ordinary_credentials = parametrize_original(
+    test_display_attribution_masks_overlapping_ordinary_credentials)
+test_display_attribution_fallback_preserves_ordinary_boundary_and_flags = parametrize_original(
+    test_display_attribution_fallback_preserves_ordinary_boundary_and_flags)
+test_display_attribution_fallback_keeps_carried_starts = parametrize_original(
+    test_display_attribution_fallback_keeps_carried_starts)

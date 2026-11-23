@@ -42,6 +42,7 @@ from aegis_core.guidance_projection import (
     estimate_tokens as estimate_tokens,
     field_text, finish_payload, project_detail, project_display_data, project_display_text,
     project_error_name, project_field, project_identifier,
+    projection_refusal, projection_refusal_reason, projection_refusal_repair, rule_error_rows_fit,
 )
 from aegis_core.match import normalize_path, workspace_files
 from aegis_core import gitsafe, match as rule_match, rule_integrity
@@ -50,9 +51,10 @@ from aegis_core.rule_inventory import RuleInventory, RuleInventoryError
 from aegis_core.rules import Rule, RuleCache, RuleSet, workspace_root
 from aegis_core.skills.slots import SlotRegistry
 from aegis_core.scan_simulation import (
-    COLD_LIST_LIMIT as _COLD_LIST_LIMIT, COLD_SAMPLE_LIMIT as _COLD_SAMPLE_LIMIT,
-    ColdRule as _ColdRule, SimulationBudget as _SimulationBudget,
-    SimulationCache as _SimulationCache, SimulationHooks,
+    COLD_LIST_LIMIT as _COLD_LIST_LIMIT,
+    ColdRule as _ColdRule, SIMULATION_FAIL_STATUS as _STATUS_FAIL,
+    SimulationBudget as _SimulationBudget,
+    SimulationHooks,
     simulate_rule_selection as simulate_selection,
 )
 from aegis_core.taxonomy import (
@@ -90,7 +92,6 @@ RULE_CACHE = RuleCache()
 
 NO_CHANGES_TEXT = "No changed files detected. Governance guidance will be provided when files are modified."
 NO_MATCH_TEXT = "No governance rules match your current changes."
-_STATUS_FAIL = "FAIL"
 _COLD_OUTPUT_LIMIT = 1024 * 1024
 _COLD_MATCH_BUDGET = 16384
 
@@ -183,8 +184,11 @@ class _ScanResult(GuidanceResult):
 
 
 def _match(rule: Rule, matched: Tuple[str, ...], fitness: Fitness) -> _Match:
-    exact = (any(rule.applies_to(f, exact=True) for f in matched) if isinstance(rule, _ColdRule)
-             else any(normalize_path(p) == normalize_path(f) for p in rule.target_paths for f in matched))
+    rank_exact = getattr(rule, "rank_exact", None)
+    if rank_exact is None:
+        exact = any(normalize_path(p) == normalize_path(f) for p in rule.target_paths for f in matched)
+    else:
+        exact = rank_exact(matched)
     return _Match(rule, matched, exact, fitness)
 
 
@@ -303,33 +307,24 @@ def _projection_entries(matches: List[_Match], registry: Optional[SlotRegistry])
     """Collect safe locations within the failure envelope's node/character caps."""
     entries, errors = [], []
     code, size = None, 0
-    reasons = {"guidance_projection_invalid_field": "invalid_field", "guidance_projection_limit": "limit"}
     for match in matches:
         try:
             entries.append(_entry(match, registry))
         except GuidanceProjectionError as exc:
             code = code or exc.code
-            if (not isinstance(exc, _RuleProjectionError) or exc.code not in reasons
-                    or exc.field not in {"hypothesis", "prediction", "detail", "matched_files"}
-                    or 9 + 6 * (len(errors) + 1) > 4096):
+            reason = projection_refusal_reason(exc.code, exc.field) if isinstance(exc, _RuleProjectionError) else None
+            if reason is None or not rule_error_rows_fit(len(errors) + 1):
                 return [], _failure(code)
             try:
                 path = project_error_name(exc.path)
             except GuidanceProjectionError:
                 return [], _failure(code)
-            reason = exc.field + ": " + reasons[exc.code]
             size += len(path) + len(reason) + len("patherror")
             if size + len("statusFAILerrorrule_errors") + len(code) > MAX_GUIDANCE_CHARS:
                 return [], _failure(code)
             errors.append({"path": path, "error": reason})
     if code is None:
         return entries, None
-    # The complete schema check is authoritative; its own refusal must never
-    # replace the first selection refusal's documented code.
-    try:
-        checked_result_copy({"status": _STATUS_FAIL, "error": code, "rule_errors": errors}, None)
-    except GuidanceProjectionError:
-        return [], _failure(code)
     return [], _failure(code, errors)
 
 
@@ -422,6 +417,8 @@ def _tokens(value: object) -> int:
 
 
 def _failure(message: str, rule_errors: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
+    if projection_refusal_repair(message) is not None:
+        return projection_refusal(message, rule_errors)
     result: Dict[str, Any] = {"status": _STATUS_FAIL, "error": assembled_text(message)}
     if rule_errors is not None:
         result["rule_errors"] = rule_errors
@@ -454,9 +451,8 @@ def _ignored_warning(ruleset: RuleSet) -> str:
 
 def _broken(ruleset: RuleSet) -> Dict[str, Any]:
     broken = ruleset.errors
-    # The failure envelope has nine fixed JSON nodes and six per error row.
-    # Match checked_result_copy's node cap before allocating those rows.
-    if 9 + 6 * len(broken) > 4096:
+    # Check the shared envelope node cap before allocating error rows.
+    if not rule_error_rows_fit(len(broken)):
         return _failure("guidance_projection_limit")
     errors, size = [], 0
     try:
@@ -510,13 +506,22 @@ def _scan(workspace: Any, changed_files: Optional[List[str]], budget: Optional[i
     except RuleInventoryError as exc:
         return _failure(f"the rules directory cannot be read safely: {project_display_text(str(exc))}")
     except rule_integrity.IntegrityError as exc:
+        # Simulation is the only capture that carries compare_candidates. A typed
+        # custody cap stays a GitError so the shared mapper can name it; every
+        # other caller still receives the reviewed-base failure result.
+        cause = exc.__cause__
+        if (cache is not None and getattr(cache, "compare_candidates", None) is not None
+                and isinstance(cause, gitsafe.GitError) and cause.code == "git_output_limit"):
+            raise cause from None
         reason = project_display_text(str(exc))
         return _failure(f"the reviewed (base) version of the rules cannot be read, so none is served: {reason}")
     ruleset = view.ruleset
     if ruleset.errors:
         return _broken(ruleset)
-    if isinstance(cache, _SimulationCache):
-        cache.compare_candidates(ruleset)
+    if cache is not None:
+        compare_candidates = getattr(cache, "compare_candidates", None)
+        if compare_candidates is not None:
+            compare_candidates(ruleset)
 
     # Workspace-relative, each file once, as every other surface matches them.
     files = workspace_files(workspace_root(workspace), changed_files if changed_files else _git_changed_files(workspace))
@@ -530,7 +535,7 @@ def _scan(workspace: Any, changed_files: Optional[List[str]], budget: Optional[i
 def simulate_rule_selection(workspace: Any, inventory: RuleInventory, ruleset: RuleSet) -> Dict[str, str]:
     """Simulate lint selection with the current scan seams and request-local limits."""
     hooks = SimulationHooks(_scan, _ScanResult, select_guidance, for_rules, _cold_rules,
-                            _COLD_OUTPUT_LIMIT, _COLD_MATCH_BUDGET)
+                            _COLD_OUTPUT_LIMIT, _COLD_MATCH_BUDGET, _STATUS_FAIL)
     return simulate_selection(workspace, inventory, ruleset, hooks)
 
 

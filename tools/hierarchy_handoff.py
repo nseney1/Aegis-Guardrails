@@ -30,8 +30,11 @@ the plan assigns, and refuses the entry when the plan is not that root's own. Th
 successor's session record comes from the add-role that builds its connection and
 profile. Roots without a host plan keep today's unchecked host choice.
 For runs with a governing host plan, the next checkpoint keeps briefs for open
-work, the last touching brief and entries[].briefs, so standing briefs must be listed
-there; without a plan, briefs carry forward unchanged.
+work, the last touching brief and entries[].briefs, so standing briefs must be
+listed there or they silently leave the next checkpoint. When none qualifies,
+the last inherited brief is kept. A standalone draft-handoff preview still lists
+every brief. Under a governing host plan, the preview checkpoint sha differs from
+the bound one when a brief is omitted; without a plan, briefs carry forward unchanged.
 """
 from __future__ import annotations
 

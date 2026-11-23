@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 import time
 
 from hierarchy_mailbox import ACROSS_ROLES, Mailbox, strict_json
@@ -178,12 +179,12 @@ class LoopSubscriptions:
             chunks.append(chunk.encode("ascii"))
         return b"".join(chunks)
 
-    def _notify(self, root, registered):
+    def _notify(self, root, registered, cache):
         # HM brief references must remain outside the mailbox, within its parent.
         # The shared state namespace includes SUB-1's mailbox identity in cursors.
         root = configuration_path(root)
         try:
-            mailbox = Mailbox(root)
+            mailbox = _cached_mailbox(cache, root)
             configuration = self._configuration(mailbox)
         except SubscriptionError:
             raise
@@ -192,7 +193,7 @@ class LoopSubscriptions:
         state = root.parent / "subscriptions"
         try:
             for row in registered:
-                Mailbox(row["mailbox_root"]).outside_mailbox(state, "subscription state directory")
+                _cached_mailbox(cache, row["mailbox_root"]).outside_mailbox(state, "subscription state directory")
         except (ValueError, OSError, UnicodeError):
             raise SubscriptionError("PATH") from None
         if not configuration["subscriptions"]:
@@ -211,7 +212,7 @@ class LoopSubscriptions:
                         raise
                     if target.read_bytes(MAX_CONFIG) != raw:
                         raise SubscriptionError("STATE")
-            return notify(root, state, state / name)
+            return notify(root, state, state / name, mailbox=mailbox)
         except ConfinedFileError as error:
             raise _storage_error(error) from None
 
@@ -226,9 +227,10 @@ class LoopSubscriptions:
         except SubscriptionError as error:
             work.hold("notify", error.code, str(error), "owner")
             initiatives = []
+        cache = {}
         for row in initiatives:
             try:
-                summary = self._notify(row["mailbox_root"], registered)
+                summary = self._notify(row["mailbox_root"], registered, cache)
                 if summary is None:
                     continue
                 for key in totals:
@@ -276,6 +278,39 @@ def path_polling_supported():
     return callable(getattr(os, "stat", None))
 
 
+def read_supported():
+    """Descriptor polling needs open and stat, not the publisher's rename, link, or unlink."""
+    names = {function.__name__ for function in os.supports_dir_fd}
+    return (os.name == "posix" and hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW")
+            and {"open", "stat"} <= names)
+
+
+# Failures Mailbox raises while reading a manifest. Callers map this same
+# exception to their own refusal. The name keeps TypeError off a new except.
+_MAILBOX_BUILD_ERRORS = (ValueError, OSError, UnicodeError, KeyError, TypeError, RecursionError)
+
+
+def _cached_mailbox(cache, root):
+    """Parse each root once per pass, including a failed construction.
+
+    The cached failure is the original exception, so each caller keeps its
+    refusal code. The next pass uses a new cache and retries.
+    """
+    key = str(Path(root))
+    if key in cache:
+        found = cache[key]
+        if isinstance(found, BaseException):
+            raise found
+        return found
+    try:
+        found = Mailbox(root)
+    except _MAILBOX_BUILD_ERRORS as error:
+        cache[key] = error
+        raise
+    cache[key] = found
+    return found
+
+
 def release_nudge(args):
     """Reclaim watcher capacity after a failed launch; never retry that step here."""
     watcher = getattr(args, "nudge_watcher", None)
@@ -295,7 +330,7 @@ class InboxNudge:
     def __init__(self, roots):
         self.descriptors, self.entries = [], []
         self.directories, self.paths = {}, {}
-        self.closed, self.confined = False, supported()
+        self.closed, self.confined = False, read_supported()
         if not path_polling_supported():
             raise NudgeError("UNSUPPORTED")
         self.budget = descriptor_capacity() if self.confined else 0
@@ -394,4 +429,86 @@ def prepare_nudge(args):
     except (ValueError, OSError, UnicodeError, KeyError, TypeError, RecursionError) as error:
         fallback = "UNSUPPORTED" if isinstance(error, SubscriptionError) and error.code == "SUBSCRIPTIONS_UNSUPPORTED" else "IO"
         return None, nudge_refusal(error, fallback)
+
+
+def arm_nudge(args):
+    """Snapshot before a pass and retain the watcher for the wait."""
+    watcher, args.nudge_failure = prepare_nudge(args)
+    args.nudge_watcher = watcher
+    return watcher
+
+
+class SubscriptionStatus:
+    """Status keys appear only when a subscription runner is configured."""
+
+    def __init__(self, runner):
+        self.runner = runner
+
+    def seed(self, base):
+        if self.runner is None:
+            return
+        base.update(subscriptions_sha256=self.runner.sha256, subscription_suppressed=[],
+                    subscription_suppressed_complete=False)
+
+    def heartbeat(self, base, work):
+        if self.runner is None:
+            return
+        base.update(subscription_suppressed=work.subscription_suppressed,
+                    subscription_suppressed_complete=work.subscription_suppressed_complete)
+
+    def finish(self, value, work):
+        if self.runner is None:
+            return
+        value.update(subscriptions_sha256=self.runner.sha256,
+                     subscription_suppressed=work.subscription_suppressed,
+                     subscription_suppressed_complete=work.subscription_suppressed_complete)
+
+
+def subscription_parser_type(argv):
+    """Use the fixed diagnostic parser only when an opt-in flag is already present."""
+    values = sys.argv[1:] if argv is None else argv
+    if any(flag.startswith(value[:len(flag) + 1].partition("=")[0]) or value.startswith(flag + "=")
+           for value in values if value.startswith("--")
+           for flag in ("--subscriptions", "--nudge-seconds")):
+        return SubscriptionParser
+    return argparse.ArgumentParser
+
+
+def add_subscription_arguments(parser, runner):
+    """Install the opt-in flags with their existing help text."""
+    parser.add_argument("--subscriptions", help="Absolute path to subscriptions; frozen until loop restart")
+    runner.add_argument("--nudge-seconds", help="Stat-only inbox polling during waits; minimum 1, default off")
+
+
+def configure_subscriptions(args):
+    """Refuse opted-in configuration before the loop starts. None means continue."""
+    if args.subscriptions is None and getattr(args, "nudge_seconds", None) is None:
+        return None
+    try:
+        configure(args)
+    except SubscriptionError as error:
+        print(json.dumps({"code": error.code, "error": str(error)}, sort_keys=True))
+        return 2
+    return None
+
+
+def steps_with_notify(args, dispatching):
+    """Insert notify ahead of sweep when a subscription runner is configured."""
+    steps = (("router_status", "route", "dispatch", "sweep", "run_open") if dispatching
+             else ("router_status", "route", "sweep", "run_open"))
+    if getattr(args, "subscription_runner", None) is not None:
+        index = steps.index("sweep")
+        steps = (*steps[:index], "notify", *steps[index:])
+    return steps
+
+
+def nudge_exhausted(work, step, error):
+    """Hold a descriptor-exhausted nudge once. Other OS errors stay with the caller."""
+    if getattr(work.args, "nudge_seconds", None) is None or error.errno not in {errno.EMFILE, errno.ENFILE}:
+        return False
+    refusal = release_nudge(work.args)
+    if not any(row["step"] == "nudge" and row["kind"] == refusal.code for row in work.holds):
+        work.hold("nudge", refusal.code, str(refusal), "owner")
+    work.steps.append({"step": step, "state": "hold", "exit": 2})
+    return True
 

@@ -158,17 +158,72 @@ except ImportError:
     pass
 
 
+# GitHub inputs consumed by product code, plus the union of the former per-file
+# scrub lists. Git repository selectors follow `git rev-parse --local-env-vars`;
+# config injection and namespaces also affect the repository selected by Git.
+# setup-python exports LD_LIBRARY_PATH on Linux. Its standard hosted builds
+# link against the toolcache lib directory through rpath, so child interpreters
+# can still start after pytest removes it. Leave other loader keys untouched.
+# Both session-entry isolation and per-test restoration use this one policy.
+_CI_ENVIRONMENT = frozenset((
+    "GITHUB_EVENT_PATH", "GITHUB_EVENT_NAME", "GITHUB_REF", "GITHUB_BASE_REF",
+    "GITHUB_STEP_SUMMARY", "GITHUB_REF_NAME",
+    "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
+    "GH_HOST", "GH_REPO", "GITHUB_SHA", "GITHUB_REF_TYPE", "GITHUB_OUTPUT",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT", "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE", "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX",
+    "GIT_SHALLOW_FILE", "GIT_COMMON_DIR", "GIT_NAMESPACE",
+    "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+    "LD_LIBRARY_PATH",
+))
+
+
+def _ci_environment_name(name):
+    upper = name.upper()
+    return upper in _CI_ENVIRONMENT or upper.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+
+
+def _ci_environment_snapshot():
+    return {name: value for name, value in os.environ.items() if _ci_environment_name(name)}
+
+
+def _remove_ci_environment():
+    removed = _ci_environment_snapshot()
+    for name in removed:
+        os.environ.pop(name)
+    return removed
+
+
+def _restore_ci_environment(previous):
+    _remove_ci_environment()
+    os.environ.update(previous)
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_fixture_setup(fixturedef, request):
+    if fixturedef.argname == "monkeypatch" and fixturedef.scope == "function":
+        previous = _ci_environment_snapshot()
+        # Register before the fixture's yield finalizer: LIFO teardown first
+        # undoes patches, then removes even a direct write that undo resurrects.
+        # Broader-scoped fixture setup has already run and is preserved here.
+        request.addfinalizer(partial(_restore_ci_environment, previous))
+
+
 @pytest.fixture(autouse=True)
 def _no_real_gh(monkeypatch):
     """The trust tier (``aegis doctor``) reads GitHub through the user's own gh. No test reaches
     the network or the developer's gh: without a stand-in the answer is "gh is not installed"
     (tier C). A test of tier detection or ``doctor --github`` installs its own fake runner. The stub
-    has the real runner's signature; the fixture's value is the real runner."""
+    has the real runner's signature; the fixture's value is the real runner.
+    Session entry has already removed launcher inputs. This fixture's function-
+    scoped monkeypatch dependency restores CI inputs after its own undo, keeping
+    values owned by broader-scoped fixtures and removing test-local leaks."""
     from aegis_core import ghcli
 
     real = ghcli.default_gh_runner
     monkeypatch.setattr(ghcli, "default_gh_runner", lambda argv, stdin=None, cwd=None, timeout=None: None)
-    monkeypatch.delenv("GITHUB_EVENT_PATH", raising=False)
     return real
 
 
@@ -282,7 +337,19 @@ def _patch_guard_enabled(config):
     return config._patch_guard_enabled
 
 
+@pytest.hookimpl(tryfirst=True)
 def pytest_configure(config):
+    # Initial conftests are loaded before this hook; test-module collection and
+    # every fixture start afterward. xdist configures each worker independently,
+    # while workers spawned by this controller already inherit its clean state.
+    # A config can dispatch this hook through more than one plugin registration.
+    if getattr(config, "_ci_launcher_environment", None) is None:
+        removed = _remove_ci_environment()
+        config._ci_launcher_environment = removed
+        # Public Config cleanup runs even after collection/configuration errors,
+        # after unconfigure hooks and fixture teardown. Restore exactly the pairs
+        # this config removed, without replacing the rest of the environment.
+        config.add_cleanup(partial(os.environ.update, removed))
     _configure_basetemp(config)
     policy = os.path.join(TESTS_DIR, "contract", "test_monkeypatch_raising.py")
     if (_patch_guard_enabled(config)

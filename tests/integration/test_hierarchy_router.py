@@ -1198,3 +1198,618 @@ sys.exit(code)
     assert all(row['path'] == str(private) and row['kind'] in {'stat', 'lstat'}
                and row['operation'] is not None for row in accesses), seen
     assert len({(row['path'], row['operation']) for row in accesses}) == len(accesses), seen
+
+
+def _router():
+    sys.path.insert(0, str(ROOT / "tools"))
+    import hierarchy_router as router
+    return router
+
+
+SHADOW_REFUSALS = (
+    "mode_read_only", "unknown_mode", "input_limit", "missing_header", "checked_reads",
+    "regular_file", "symlink_entry", "unexpected_entry", "record_limit", "routing_folder",
+    "duplicate_id", "changed_read", "changed_check", "byte_contradiction", "pinned_call",
+    "private_path", "unsupported_anchor", "symlink_path", "captured_policy", "owner_policy", "owner_home", "invalid_home",
+    "invalid_declaration", "configured_home", "private_identity", "identity_unavailable",
+    "absolute_path", "io", "permission", "missing_file", "not_directory", "unicode",
+    "type", "key", "recursion", "memory", "runtime", "unprintable", "base", "system_exit", "keyboard_interrupt", "generator_exit",
+)
+SHADOW_OUTCOMES = ("match", "divergence", *("constructor_" + name for name in SHADOW_REFUSALS),
+                   "messages_raises", "get_raises", "diagnostics_raises", "guard_copy", "guard_enter", "guard_exit")
+
+
+def _shadow_error(router, refusal, root):
+    from hierarchy_mailbox_index import (_ChangedDuringRead, _ChangedCheckObservation,
+                                        _ObservedByteContradiction, _PinnedCallError)
+    messages = {
+        "unknown_mode": "unknown mailbox index mode; valid modes: shadow, indexed",
+        "input_limit": "input exceeds 262144 bytes", "missing_header": "missing header",
+        "checked_reads": "checked mailbox reads unavailable", "regular_file": "input must be a regular file",
+        "symlink_entry": "symlink mailbox entry is not supported", "unexpected_entry": "unexpected mailbox entry",
+        "record_limit": "mailbox exceeds record limit", "routing_folder": "message is in the wrong routing folder",
+        "duplicate_id": "duplicate message_id in history", "owner_home": "cannot determine owner's home folder",
+        "invalid_home": "invalid owner home directory", "invalid_declaration": "invalid host home declaration",
+        "configured_home": "configured host home must be absolute without traversal",
+        "private_identity": "cannot determine private directory identity",
+        "identity_unavailable": "private directory identity unavailable",
+        "absolute_path": "path must be absolute without traversal",
+    }
+    if refusal == "private_path":
+        return router.PrivatePathError(root)
+    if refusal == "unsupported_anchor":
+        return router.PrivatePathError(root, "unsupported Windows path anchor")
+    if refusal == "symlink_path":
+        return router.SymlinkPathError(root)
+    if refusal == "captured_policy":
+        return router.CapturedPolicyError("host-home configuration changed during capture")
+    if refusal == "owner_policy":
+        return router.CapturedPolicyError("owner-home policy changed during capture")
+    if refusal == "unprintable":
+        class Unprintable(Exception):
+            def __str__(self):
+                raise RuntimeError("exception formatting is forbidden")
+        return Unprintable()
+    internal = {"changed_read": _ChangedDuringRead, "changed_check": _ChangedCheckObservation,
+                "byte_contradiction": _ObservedByteContradiction, "pinned_call": _PinnedCallError}
+    if refusal in internal:
+        return internal[refusal](RuntimeError("index-side reconciliation failed"))
+    kinds = {"mode_read_only": AttributeError, "io": OSError, "permission": PermissionError,
+             "missing_file": FileNotFoundError, "not_directory": NotADirectoryError, "unicode": UnicodeError,
+             "type": TypeError, "key": KeyError, "recursion": RecursionError, "memory": MemoryError,
+             "runtime": RuntimeError, "base": BaseException, "system_exit": SystemExit,
+             "keyboard_interrupt": KeyboardInterrupt, "generator_exit": GeneratorExit}
+    return kinds.get(refusal, ValueError)(messages.get(refusal, "secret=shadow-token\n" + "x" * 4096))
+
+
+def _shadow_components(router, outcome, root, events):
+    import copy
+    from contextlib import contextmanager
+
+    class Index:
+        def __init__(self, mailbox, *, mode):
+            events.append("constructor")
+            assert mode == "shadow"
+            if outcome.startswith("constructor_"):
+                raise _shadow_error(router, outcome[len("constructor_"):], root)
+            self.mailbox = mailbox
+            self.mode = mode
+            self.last_reconciliation = None
+            self.content_changed = []
+
+        @property
+        def last_divergence(self):
+            if outcome == "diagnostics_raises":
+                raise RuntimeError("secret=diagnostics-token")
+            return [{"kind": "mailbox_index_divergence"}] if outcome == "divergence" else []
+
+        def messages(self):
+            events.append("messages")
+            if outcome == "messages_raises":
+                raise OSError("secret=messages-token")
+            return {} if outcome == "divergence" else self.mailbox.messages()
+
+        def get(self, message_id):
+            events.append("get")
+            if outcome == "get_raises":
+                raise RuntimeError("secret=get-token")
+            return self.messages().get(message_id)
+
+    def copy_guard(guard):
+        events.append("guard_copy")
+        if outcome == "guard_copy":
+            raise RuntimeError("fixture guard copy failed")
+        snapshot = copy.copy(guard)
+
+        @contextmanager
+        def active():
+            if outcome == "guard_enter":
+                raise RuntimeError("fixture guard entry failed")
+            with snapshot.active():
+                yield
+            if outcome == "guard_exit":
+                raise RuntimeError("fixture guard exit failed")
+
+        return SimpleNamespace(active=active)
+
+    return Index, SimpleNamespace(copy=copy_guard, deepcopy=copy.deepcopy)
+
+
+def test_shadow_reuses_the_pinned_private_identity_snapshot(loop, monkeypatch):
+    from hierarchy_lifecycle import Lifecycle
+    from hierarchy_workspace import Store
+    router = _router()
+    loop.approved(request("snapshot"))
+    private = loop.tmp / "private-home"
+    private.mkdir()
+    calls = []
+    real_os = router.os
+
+    def stated(path, *args, **kwargs):
+        if not isinstance(path, int) and Path(path) == private:
+            calls.append(path)
+        return real_os.stat(path, *args, **kwargs)
+
+    monkeypatch.setattr("hierarchy_router.os", SimpleNamespace(**{**vars(real_os), "stat": stated,
+        "environ": {**os.environ, "CODEX_HOME": str(private)}}))
+    router.status(Lifecycle(loop.ledger.path), Store(loop.workspace.store), 0)
+    assert calls == [private]
+
+
+def test_router_status_to_route_keeps_live_approval(loop, monkeypatch, capsysbinary):
+    from datetime import datetime
+
+    router = _router()
+    value = loop.approved(request("shadow-clock"))
+    loop.ledger.publish(request("unapproved"))
+    at = "2098-12-31T23:59:59Z"
+    late = "2099-01-01T00:00:01Z"
+    observations = []
+
+    def router_time():
+        return late if observations else at
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.fromisoformat(router_time()[:-1] + "+00:00")
+
+    class AdvancingIndex:
+        def __init__(self, mailbox, *, mode):
+            observations.append(True)
+            self.mailbox = mailbox
+            self.last_divergence, self.last_reconciliation, self.content_changed = [], None, []
+
+        def get(self, identifier):
+            return self.mailbox.messages().get(identifier)
+
+    monkeypatch.setattr("hierarchy_router.timestamp", router_time)
+    monkeypatch.setattr("hierarchy_mailbox.timestamp", router_time)
+    monkeypatch.setattr("hierarchy_mailbox.datetime", Clock)
+    monkeypatch.setattr("hierarchy_router.MailboxIndex", AdvancingIndex)
+    args = ["--lifecycle", str(loop.ledger.path), "--store", str(loop.workspace.store)]
+    assert router.main([*args, "status", "--wait", "0"]) == 0
+    status = json.loads(capsysbinary.readouterr().out)
+    rows = {row["request_id"]: row for row in status["requests"]}
+    assert rows[value["id"]]["state"] == "ready"
+
+    assert router.main([*args, "route", "--actor", "router-1", "--evidence-only", "--wait", "0"]) == 0
+    routed = json.loads(capsysbinary.readouterr().out)
+    assert [(row["request_id"], row["delivered"]) for row in routed["routed"]] == [(value["id"], True)], routed
+    rows = {row["request_id"]: row for row in routed["requests"]}
+    assert rows["unapproved"]["state"] == "awaiting_decision"
+    assert observations == []
+
+
+@pytest.mark.parametrize("mutate", [False, True])
+def test_direct_small_change_projection_is_pinned_only(tmp_path, monkeypatch, mutate):
+    _router()
+    from hierarchy_lifecycle import Lifecycle
+    from hierarchy_small_change_dispatch import project
+    from hierarchy_workspace import Store
+    from tests.integration.test_hierarchy_small_change_dispatch import DispatchWorld
+    world = DispatchWorld(tmp_path)
+    attempted = []
+
+    def observe(*args, **kwargs):
+        attempted.append(True)
+        raise AssertionError("small-change projection attempted shadow I/O")
+
+    monkeypatch.setattr("hierarchy_router.MailboxIndex", observe)
+    result = project(Lifecycle(world.ledger.path), Store(world.workspace.store), 0,
+                     world.recipes_path, mutate=mutate)
+    assert result["small_changes"]
+    assert attempted == []
+
+
+def test_router_shadow_refuses_replaced_routing_parent(loop, monkeypatch):
+    from tests.conftest import symlink_or_skip
+    router = _router()
+    import hierarchy_fresh_brief as fresh
+    import hierarchy_mailbox_index as index_module
+    if not router.shadow_descriptor_supported():
+        pytest.skip("shadow reads require directory descriptors")
+    value = loop.approved(request("shadow-parent"))
+    target = raw_request(value)
+    root = loop.mailboxes["engine"]
+    _publish_route(root, value, target, "fixture route conflict")
+    parent, held = root / "engine", root / "held-routing-parent"
+    private = loop.tmp / "private-home"
+    (private / "orchestrator").mkdir(parents=True)
+    replacement = root / "replacement"
+    symlink_or_skip(private, replacement, target_is_directory=True)
+    private_info = private.stat()
+    starts, accesses = [], []
+    original_index = router.MailboxIndex
+
+    def record(path, directory=None):
+        if not starts:
+            return
+        if isinstance(path, int) or directory is not None:
+            info = os.fstat(path if isinstance(path, int) else directory)
+            if (info.st_dev, info.st_ino) == (private_info.st_dev, private_info.st_ino):
+                accesses.append("private descriptor")
+        else:
+            name = Path(path)
+            if parent in name.parents or private in name.parents:
+                accesses.append("unverified descendant pathname")
+
+    def opened(path, flags, *args, dir_fd=None):
+        record(path, dir_fd)
+        return os.open(path, flags, *args, dir_fd=dir_fd)
+
+    def stated(path, *args, dir_fd=None, **kwargs):
+        record(path, dir_fd)
+        return os.stat(path, *args, dir_fd=dir_fd, **kwargs)
+
+    def listed(path):
+        record(path)
+        return os.scandir(path)
+
+    def lstated(path):
+        record(path)
+        return os.lstat(path)
+
+    def replace_parent(mailbox, *, mode):
+        parent.rename(held)
+        replacement.rename(parent)
+        starts.append(True)
+        return original_index(mailbox, mode=mode)
+
+    monkeypatch.setattr("hierarchy_router.os", SimpleNamespace(**{**vars(router.os),
+        "environ": {**os.environ, "CODEX_HOME": str(private)}}))
+    monkeypatch.setattr("hierarchy_fresh_brief.os", SimpleNamespace(**{**vars(fresh.os),
+        "open": opened, "stat": stated, "scandir": listed, "lstat": lstated}))
+    monkeypatch.setattr("hierarchy_mailbox_index.os", SimpleNamespace(**{**vars(index_module.os),
+        "open": opened, "stat": stated, "scandir": listed, "lstat": lstated}))
+    monkeypatch.setattr("hierarchy_router.MailboxIndex", replace_parent)
+    mailbox = fresh._CapturedMailbox(root)
+    identifier = router.route_id(target["sha256"])
+    expected = mailbox.messages()[identifier]
+    reader = router.mailbox_reader(mailbox)
+    try:
+        assert reader.get(identifier) == expected
+        assert starts == [True]
+        assert accesses == []
+        assert reader.last_divergence == [
+            {"kind": "mailbox_index_error", "text": "shadow index read failed"}]
+    finally:
+        if starts:
+            parent.unlink()
+            held.rename(parent)
+
+
+@pytest.mark.parametrize("prior", ["new", "conflict"])
+@pytest.mark.parametrize("outcome", SHADOW_OUTCOMES)
+def test_explicit_shadow_lookup_returns_pinned_outcome(loop, monkeypatch, prior, outcome):
+    import hierarchy_mailbox as hm
+    router = _router()
+    if not router.shadow_descriptor_supported():
+        pytest.skip("shadow diagnostics require directory descriptors")
+    value = loop.approved(request("shadow-matrix"))
+    target = raw_request(value)
+    root = loop.mailboxes["engine"]
+    if prior == "conflict":
+        _publish_route(root, value, target, "conflicting pinned delivery")
+    mailbox = hm.Mailbox(root)
+    identifier = router.route_id(target["sha256"])
+    expected = mailbox.messages().get(identifier)
+    before = loop.ledger.files(), mailbox_snapshot(root)
+    events = []
+    index, guard_copy = _shadow_components(router, outcome, loop.tmp, events)
+    monkeypatch.setattr("hierarchy_router.MailboxIndex", index)
+    monkeypatch.setattr("hierarchy_router.copy", guard_copy)
+    reader = router.mailbox_reader(mailbox)
+    assert reader.get(identifier) == expected
+    assert (loop.ledger.files(), mailbox_snapshot(root)) == before
+    assert bool(reader.last_divergence) == (outcome != "match")
+    if outcome not in {"match", "divergence"}:
+        assert reader.last_divergence == [{"kind": "mailbox_index_error", "text": "shadow index read failed"}]
+    index, guard_copy = _shadow_components(router, "match", loop.tmp, [])
+    monkeypatch.setattr("hierarchy_router.MailboxIndex", index)
+    monkeypatch.setattr("hierarchy_router.copy", guard_copy)
+    assert reader.get(identifier) == expected
+    assert reader.last_divergence == []
+
+
+@pytest.mark.parametrize("api", ["messages", "get"])
+@pytest.mark.parametrize("outcome", SHADOW_OUTCOMES)
+def test_shadow_pinned_failure_precedes_every_index_outcome(loop, monkeypatch, api, outcome):
+    import hierarchy_mailbox as hm
+    router = _router()
+    value = loop.approved(request("shadow-malformed"))
+    target = raw_request(value)
+    root = loop.mailboxes["engine"]
+    _publish_route(root, value, target, "fixture")
+    mailbox = hm.Mailbox(root)
+    identifier = router.route_id(target["sha256"])
+    path = Path(mailbox.messages()[identifier]["path"])
+    path.write_bytes(b"malformed mailbox record")
+    with pytest.raises(ValueError) as expected:
+        mailbox.messages()
+    events = []
+    index, guard_copy = _shadow_components(router, outcome, loop.tmp, events)
+    monkeypatch.setattr("hierarchy_router.MailboxIndex", index)
+    monkeypatch.setattr("hierarchy_router.copy", guard_copy)
+    reader = router.mailbox_reader(mailbox)
+    with pytest.raises(type(expected.value)) as actual:
+        reader.messages() if api == "messages" else reader.get(identifier)
+    assert str(actual.value) == str(expected.value)
+    assert events == []
+
+
+@pytest.mark.parametrize("api", ["messages", "get"])
+def test_shadow_failure_retry_and_pinned_first_order(loop, monkeypatch, api):
+    import hierarchy_mailbox as hm
+    router = _router()
+    if not router.shadow_descriptor_supported():
+        pytest.skip("shadow diagnostics require directory descriptors")
+    original_index, original_copy = router.MailboxIndex, router.copy
+    events = []
+
+    class Authority(hm.Mailbox):
+        def messages(self):
+            events.append("pinned")
+            return hm.Mailbox.messages(self)
+
+    mailbox = Authority(loop.mailboxes["engine"])
+    reader = router.mailbox_reader(mailbox)
+    index, guard_copy = _shadow_components(router, "messages_raises" if api == "messages" else "get_raises", loop.tmp, events)
+    monkeypatch.setattr("hierarchy_router.MailboxIndex", index)
+    monkeypatch.setattr("hierarchy_router.copy", guard_copy)
+    actual = reader.messages() if api == "messages" else reader.get("missing")
+    assert actual == ({} if api == "messages" else None)
+    assert events[0] == "pinned"
+    assert reader.last_divergence
+    monkeypatch.setattr("hierarchy_router.MailboxIndex", original_index)
+    monkeypatch.setattr("hierarchy_router.copy", original_copy)
+    assert (reader.messages() if api == "messages" else reader.get("missing")) == actual
+    assert reader.last_divergence == []
+
+
+def _pinned_delivery(mailbox, team, key, raw):
+    """Classify one pinned messages().get the way prior_delivery does, without the shadow reader."""
+    import hierarchy_mailbox as hm
+    router = _router()
+    prior = hm.Mailbox.messages(mailbox).get(router.route_id(raw["sha256"]))
+    if prior is None:
+        return None
+    expected = router.expected_message(team, key, raw)
+    return "same" if all(prior["message"].get(field) == value for field, value in expected.items()) else "conflict"
+
+
+def _publish_route(root, value, target, body):
+    router = _router()
+    invoke(root, "publish", {
+        "message_id": router.route_id(target["sha256"]), "from": "engine/router", "to": "engine/orchestrator",
+        "host": "host-one", "session": "engine-router", "binding_generation": 1, "type": "info", "body": body})
+
+
+def test_router_shadow_reader_matches_pinned_across_reads(loop):
+    """D-U2: the shadow reader for a mailbox authority returns the pinned lookup."""
+    import hierarchy_mailbox as hm
+    router = _router()
+    if not router.shadow_descriptor_supported():
+        pytest.skip("shadow diagnostics require directory descriptors")
+    value = loop.approved(request("feature-1"))
+    target = raw_request(value)
+    root = loop.mailboxes["engine"]
+    mailbox = hm.Mailbox(root)
+    reader = router.mailbox_reader(mailbox)
+    identifier = router.route_id(target["sha256"])
+    assert reader.mode == "shadow"
+    assert router.mailbox_reader(hm.Mailbox(root)) is not reader
+    assert reader.get(identifier) == mailbox.messages().get(identifier) is None
+    _publish_route(root, value, target, router.route_body(value["id"], target))
+    assert reader.get(identifier) == mailbox.messages()[identifier]
+    assert reader.get(None) is None
+    assert reader.last_divergence == []
+    other = hm.Mailbox(root)
+    path = Path(other.messages()[identifier]["path"])
+    original = path.read_bytes()
+    path.write_bytes(original.replace(router.route_body(value["id"], target).encode("utf-8"), b"different body"))
+    try:
+        assert reader.get(identifier) == other.messages()[identifier]
+        assert reader.content_changed == []
+        other_reader = router.mailbox_reader(other)
+        assert other_reader.get(identifier) == other.messages()[identifier]
+        assert other_reader.last_divergence == []
+    finally:
+        path.write_bytes(original)
+
+
+def test_router_shadow_divergence_returns_pinned_delivery(loop):
+    """A derived index that disagrees still returns the captured pinned record."""
+    import hierarchy_mailbox as hm
+    router = _router()
+    if not router.shadow_descriptor_supported():
+        pytest.skip("shadow diagnostics require directory descriptors")
+    value = loop.approved(request("feature-1"))
+    target = raw_request(value)
+    root = loop.mailboxes["engine"]
+    _publish_route(root, value, target, router.route_body(value["id"], target))
+    identifier = router.route_id(target["sha256"])
+    path = Path(hm.Mailbox(root).messages()[identifier]["path"])
+    original = path.read_bytes()
+    body = router.route_body(value["id"], target).encode("utf-8")
+    assert body in original
+
+    class Interleaved(hm.Mailbox):
+        def messages(self):
+            records = hm.Mailbox.messages(self)
+            if self.after_read is not None:
+                self.after_read()
+            return records
+
+    mailbox = Interleaved(root)
+    mailbox.after_read = None
+    rewrites = []
+
+    def rewrite():
+        rewrites.append(len(rewrites) + 1)
+        path.write_bytes(original.replace(body, ("rewritten body %d" % rewrites[-1]).encode("ascii")))
+
+    rewrite()
+    expected = mailbox.messages()[identifier]
+    reader = router.mailbox_reader(mailbox)
+    mailbox.after_read = rewrite
+    try:
+        assert reader.get(identifier) == expected
+        assert reader.last_divergence
+        assert rewrites == [1, 2]
+        mailbox.after_read = None
+        assert reader.get(identifier) == mailbox.messages()[identifier]
+        assert reader.last_divergence == []
+    finally:
+        path.write_bytes(original)
+
+
+def test_router_shadow_refusal_matches_pinned_and_retries(loop):
+    """A malformed history raises the pinned error; restoring the bytes lets the same reader succeed."""
+    import hierarchy_mailbox as hm
+    router = _router()
+    value = loop.approved(request("feature-1"))
+    target = raw_request(value)
+    root = loop.mailboxes["engine"]
+    _publish_route(root, value, target, router.route_body(value["id"], target))
+    mailbox = hm.Mailbox(root)
+    identifier = router.route_id(target["sha256"])
+    expected = mailbox.messages()[identifier]
+    path = Path(expected["path"])
+    original = path.read_bytes()
+    path.write_bytes(b"malformed mailbox record")
+    try:
+        with pytest.raises(ValueError) as pinned:
+            hm.Mailbox.messages(mailbox)
+        reader = router.mailbox_reader(mailbox)
+        with pytest.raises(type(pinned.value)) as actual:
+            reader.get(identifier)
+        assert str(actual.value) == str(pinned.value)
+        path.write_bytes(original)
+        assert reader.get(identifier) == expected
+    finally:
+        path.write_bytes(original)
+
+
+@pytest.mark.parametrize("index_failure", [False, True])
+def test_router_shadow_reads_serialize_one_authority(loop, monkeypatch, index_failure):
+    """Concurrent lookups on a reader do not overlap its pinned reads."""
+    import hierarchy_mailbox as hm
+    from threading import Event, Thread
+    router = _router()
+    if index_failure:
+        class FailedIndex:
+            def __init__(self, mailbox, *, mode):
+                raise RuntimeError("shadow constructor unavailable")
+        monkeypatch.setattr("hierarchy_router.MailboxIndex", FailedIndex)
+    value = loop.approved(request("feature-1"))
+    target = raw_request(value)
+    root = loop.mailboxes["engine"]
+    entered, release, second_entered = Event(), Event(), Event()
+    calls = []
+
+    class Gated(hm.Mailbox):
+        def messages(self):
+            if not calls:
+                calls.append("first")
+                entered.set()
+                if not release.wait(timeout=5):
+                    raise ValueError("test authority gate timed out")
+            else:
+                second_entered.set()
+            return hm.Mailbox.messages(self)
+
+    mailbox = Gated(root)
+    reader = router.mailbox_reader(mailbox)
+    identifier = router.route_id(target["sha256"])
+    errors = []
+
+    def lookup():
+        try:
+            reader.get(identifier)
+        except Exception as exc:
+            errors.append(exc)
+
+    first, second = Thread(target=lookup), Thread(target=lookup)
+    first.start()
+    try:
+        assert entered.wait(timeout=5), "first pinned read did not start"
+        second.start()
+        assert not second_entered.wait(timeout=0.2), "pinned reads overlapped"
+    finally:
+        release.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+    assert errors == []
+    assert first.is_alive() is False and second.is_alive() is False
+    assert reader.get(identifier) == mailbox.messages().get(identifier) is None
+
+
+def test_row_view_report_and_deliver_match_pinned_mailbox_reads(loop, monkeypatch):
+    from hierarchy_fresh_brief import _CapturedMailbox
+    from hierarchy_lifecycle import Lifecycle
+    from hierarchy_workspace import Store
+    router = _router()
+    value = loop.approved(request("feature-1"))
+    target = raw_request(value)
+    shadow_calls = []
+
+    def observe(mailbox):
+        shadow_calls.append(True)
+        raise AssertionError("authoritative operation requested the shadow facade")
+
+    monkeypatch.setattr("hierarchy_router.mailbox_reader", observe)
+    journal, store = Lifecycle(loop.ledger.path), Store(loop.workspace.store)
+    status = router.status(journal, store, 0)
+    row = {item["request_id"]: item for item in status["requests"]}["feature-1"]
+    pinned = _CapturedMailbox(loop.mailboxes["engine"])
+    assert _pinned_delivery(pinned, "engine", value["id"], target) is None
+    assert row["state"] == "ready"
+    assert router.report(journal, store, 0) == [row]
+    result, failure = router.deliver(journal, store.load(), "router-1", value["id"], 0.2)
+    assert failure is None and result["delivered"] is True
+    fresh = _CapturedMailbox(loop.mailboxes["engine"])
+    assert router.prior_delivery(fresh, "engine", value["id"], target) == "same"
+    pinned_cache = fresh._records
+    assert pinned_cache and router.prior_delivery(fresh, "engine", value["id"], target) == "same"
+    assert fresh._records is pinned_cache
+    assert _pinned_delivery(fresh, "engine", value["id"], target) == "same"
+    assert shadow_calls == []
+
+
+def test_row_view_and_deliver_refusal_retries_after_the_pinned_bytes_return(loop):
+    """Refusal at each history site echoes the pinned error; a restored file is delivered once."""
+    import hierarchy_mailbox as hm
+    from hierarchy_fresh_brief import _CapturedMailbox
+    from hierarchy_lifecycle import Lifecycle
+    from hierarchy_workspace import Store
+    router = _router()
+    value = loop.approved(request("feature-1"))
+    target = raw_request(value)
+    root = loop.mailboxes["engine"]
+    _publish_route(root, value, target, "not this delivery")
+    path = Path(hm.Mailbox(root).messages()[router.route_id(target["sha256"])]["path"])
+    original = path.read_bytes()
+    path.write_bytes(b"malformed mailbox record")
+    journal = loop.ledger.files()
+    try:
+        with pytest.raises(ValueError) as pinned:
+            _CapturedMailbox(root).messages()
+        status = router.status(Lifecycle(loop.ledger.path), Store(loop.workspace.store), 0)
+        row = {item["request_id"]: item for item in status["requests"]}["feature-1"]
+        assert (row["state"], row["reason"]) == ("held", "team_mailbox_unreadable")
+        assert row["detail"] == str(pinned.value)[:1024]
+        delivered, failure = router.deliver(Lifecycle(loop.ledger.path), Store(loop.workspace.store).load(),
+                                            "router-1", value["id"], 0.2)
+        assert delivered is None and failure["reason"] == "delivery_error"
+        assert failure["detail"] == str(pinned.value)[:1024]
+        assert loop.ledger.files() == journal
+    finally:
+        path.write_bytes(original)
+    status = router.status(Lifecycle(loop.ledger.path), Store(loop.workspace.store), 0)
+    row = {item["request_id"]: item for item in status["requests"]}["feature-1"]
+    assert (row["state"], row["reason"]) == ("held", "route_message_conflict")
+    result, failure = router.deliver(Lifecycle(loop.ledger.path), Store(loop.workspace.store).load(),
+                                     "router-1", value["id"], 0.2)
+    assert result is None and failure == {"reason": "route_message_conflict"}
+    assert loop.ledger.files() == journal

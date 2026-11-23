@@ -12,7 +12,6 @@ Renew refuses ``lease_branch_missing`` or ``liveness_unknown``. GC may warn ``ex
 from __future__ import annotations
 
 import argparse
-from contextlib import redirect_stderr, redirect_stdout
 import json
 import sys
 import time
@@ -21,7 +20,9 @@ from typing import Any, Callable, Dict, List, Optional
 
 from aegis_core import primitives
 from aegis_cli import sanitize_display, team_queue as queue_cli
+from aegis_cli import team_isolation as isolation_cli
 from aegis_cli import team_lease_output as lease_output
+from aegis_cli import team_mail as mail_cli, team_board as board_cli
 from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_core import gitsafe, team
 from aegis_core.primitives import utc_stamp
@@ -168,19 +169,6 @@ class ModelHostKinds(argparse.Action):
         setattr(namespace, self.dest, previous + [value])
 
 
-class _SilentModelOutput:
-    """Discard incidental text without retaining or parsing untrusted output."""
-
-    def write(self, text):
-        return len(text)
-
-    def flush(self):
-        pass
-
-    def isatty(self):
-        return False
-
-
 class ModelErrorPolicy:
     """Own the complete raw model invocation and publish one structured result."""
 
@@ -197,13 +185,12 @@ class ModelErrorPolicy:
     def run(self, operation):
         if not self.model_invocation:
             return operation()
-        with redirect_stdout(_SilentModelOutput()), redirect_stderr(_SilentModelOutput()):
-            try:
-                code = operation()
-            except (SystemExit, ModelArgumentError):
-                code = self.output({"error": "invalid_model_arguments"})
-            except (KeyboardInterrupt, Exception):
-                code = self.operation_error()
+        try:
+            code = operation()
+        except (SystemExit, ModelArgumentError):
+            code = self.output({"error": "invalid_model_arguments"})
+        except (KeyboardInterrupt, Exception):
+            code = self.operation_error()
         if self.queue_payload is not None:
             _emit(self.queue_payload)
             return code
@@ -257,10 +244,10 @@ class ModelErrorPolicy:
             if not is_model:
                 return args
             values = {key: getattr(args, key) for key in MODEL_REQUIRED + MODEL_OPTIONAL}
-            if model_argument_refusal(values) is not None:
-                raise ModelArgumentError()
             raw = args.workspace
-            if raw is not None and (len(raw) > MAX_INPUT_BYTES or raw.count("/") + raw.count("\\") > 256):
+            if (model_argument_refusal(values) is not None or
+                    (raw is not None and (len(raw) > MAX_INPUT_BYTES or raw.count("/") + raw.count("\\") > 256))):
+                parser.refuse_scoped_usage()
                 raise ModelArgumentError()
             # main attaches the workspace through the shared upward resolver;
             # model_result then checks that the resolved root is initialized.
@@ -646,8 +633,14 @@ def _refused(args: argparse.Namespace, root: Path, now: int, exc: team.LeaseRefu
 
 def run_team(args: argparse.Namespace) -> int:
     action = getattr(args, "team_action", None)
+    if action == "mail":
+        return mail_cli.run_mail(args)
+    if action == "board":
+        return board_cli.run_board(args)
     if action == "queue":
         return queue_cli.run_queue(args)
+    if action == "isolation":
+        return isolation_cli.run_isolation(args)
     if action == "model":
         values = {key: getattr(args, key) for key in MODEL_REQUIRED + MODEL_OPTIONAL}
         root = args.ws.root if getattr(args, "ws", None) is not None else args.workspace
@@ -702,6 +695,14 @@ def _configure_model_parser(sub, common):
     model.add_argument("--record", action="store_true", help="Atomically select and append under the history lock (60-second timeout); default preview")
 
 
+def _configure_action_parsers(sub, common, parser):
+    _configure_model_parser(sub, common)
+    queue_cli.configure_parser(sub, common, parser)
+    mail_cli.configure_parser(sub, common, parser)
+    board_cli.configure_parser(sub, common, parser)
+    isolation_cli.configure_parser(sub, common, parser)
+
+
 class TeamCommand(AegisCommand):
     """Lane leases: cooperative conflict input for parallel agents."""
 
@@ -716,8 +717,7 @@ class TeamCommand(AegisCommand):
     )
 
     def configure_parser(self, parser: argparse.ArgumentParser) -> None:
-        # Before a team action is recognized, malformed prefixes may target model.
-        # Each recognized non-model child restores its normal error policy.
+        # Malformed team prefixes may target model; non-model children restore ordinary errors.
         parser._model_errors = True
         common = argparse.ArgumentParser(add_help=False)
         common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
@@ -726,8 +726,7 @@ class TeamCommand(AegisCommand):
                             help="Strip ANSI styling and emoji")
         common.add_argument("--workspace", type=str, default=argparse.SUPPRESS, help="Target workspace root")
         sub = parser.add_subparsers(dest="team_action", metavar="ACTION")
-        _configure_model_parser(sub, common)
-        queue_cli.configure_parser(sub, common, parser)
+        _configure_action_parsers(sub, common, parser)
         config = sub.add_parser("config", parents=[common], help="Inspect or initialize a layered team profile")
         config_sub = config.add_subparsers(dest="config_action")
         config_sub.add_parser("show", parents=[common], help="Show every resolved value and its layer")
@@ -817,3 +816,8 @@ class TeamCommand(AegisCommand):
 
     def execute(self, args: argparse.Namespace) -> int:
         return run_team(args)
+
+    def workspace_refusal(self, args, error):
+        if getattr(args, "team_action", None) in ("mail", "board"):
+            return mail_cli.workspace_refusal(args, error)
+        return None

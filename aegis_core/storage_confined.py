@@ -25,7 +25,8 @@ from pathlib import Path
 import stat
 import uuid
 
-__all__ = ("ConfinedFile", "ConfinedFileError", "confined_file", "descriptor_supported")
+__all__ = ("ConfinedFile", "ConfinedFileError", "DirectoryAnchor", "confined_file",
+           "descriptor_supported", "open_directory")
 
 
 _MESSAGES = {
@@ -47,27 +48,69 @@ _MESSAGES = {
 class ConfinedFileError(ValueError):
     """A stable refusal reason and code, without untrusted diagnostic text."""
 
-    def __init__(self, reason):
+    def __init__(self, reason, *, os_errno=None, os_error=None):
         super().__init__(_MESSAGES[reason])
         self.reason = reason
         self.code = "CONFINED_" + reason.upper()
+        self.errno = os_errno
+        self.os_error = os_error
+        self.directory_stage = None
+        self.directory_anchor = None
+
+
+def _descriptor_names():
+    return {function.__name__ for function in os.supports_dir_fd}
+
+
+def _directory_flags_supported():
+    return os.name == "posix" and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")
+
+
+def _walk_supported():
+    """Descriptor-relative open and no-follow stat, with directory flags.
+
+    A read does not require publication primitives. A missing walk primitive
+    refuses before any filesystem operation.
+    """
+    follow = {function.__name__ for function in os.supports_follow_symlinks}
+    return (_directory_flags_supported() and {"open", "stat"} <= _descriptor_names()
+            and "stat" in follow)
 
 
 def descriptor_supported():
-    """Whether all primitives needed by this API are available."""
-    names = {function.__name__ for function in os.supports_dir_fd}
-    return (os.name == "posix" and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")
-            and {"open", "mkdir", "link", "rename", "unlink", "stat"} <= names)
+    """Whether confined publication and parent creation are available."""
+    return (_directory_flags_supported()
+            and {"open", "mkdir", "link", "rename", "unlink", "stat"} <= _descriptor_names())
+
+
+def _require_descriptor_mkdir():
+    """Refuse creation unless mkdir accepts a directory descriptor.
+
+    Reads of existing directories do not call this. The refusal is the same
+    one hosts without descriptor-relative mkdir already returned.
+    """
+    if "mkdir" not in _descriptor_names():
+        raise ConfinedFileError("unsupported") from None
 
 
 @contextmanager
-def _refusals():
+def _refusals(stage=None, *, missing_passthrough=False):
     try:
         yield
+    except ConfinedFileError as error:
+        if error.directory_stage is None:
+            error.directory_stage = stage
+        raise
     except OSError as error:
+        if missing_passthrough and isinstance(error, FileNotFoundError):
+            raise
         reason = {errno.ENOENT: "missing", errno.EEXIST: "exists",
                   errno.ELOOP: "unsafe", errno.ENOTDIR: "unsafe"}.get(error.errno, "io")
-        raise ConfinedFileError(reason) from None
+        if stage is None:
+            raise ConfinedFileError(reason) from None
+        refusal = ConfinedFileError(reason, os_errno=error.errno, os_error=error)
+        refusal.directory_stage = stage
+        raise refusal from None
 
 
 def _flush(fd):
@@ -93,7 +136,7 @@ def _parts(relative_parts):
     return tuple(relative_parts)
 
 
-def _open_parent(root, components, create):
+def _directory_path(root):
     try:
         spelling = str(root) if isinstance(root, Path) else root
         if type(spelling) is not str or not 1 <= len(spelling) <= 32768:
@@ -104,22 +147,216 @@ def _open_parent(root, components, create):
         raise ConfinedFileError("invalid_path") from None
     if not given.is_absolute() or ".." in given.parts or "\x00" in str(given):
         raise ConfinedFileError("invalid_path")
-    fd = os.open(given.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    return given
+
+
+def _close_directories(descriptors, close_fd, stage=None, *, outermost=False):
+    failure = None
+    while descriptors:
+        try:
+            close_fd(descriptors.pop())
+        except OSError as error:
+            if failure is None or outermost:
+                failure = error
+    if failure is not None:
+        with _refusals(stage):
+            raise failure
+
+
+def _directory_fd(name, parent, opener):
+    if opener is None:
+        return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                       dir_fd=parent)
+    return opener(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                  dir_fd=parent)
+
+
+def _walk_directory(given, components=(), create=False, inspect=None, on_missing=None, retain=False,
+                    opener=None, close_fd=None, cleanup_fd=None, cleanup_stage=None):
+    """One root-anchored walk; inspection and missing-directory policy are optional.
+
+    The create branch and a caller's on_missing handler run only when
+    descriptor-relative mkdir is supported. Otherwise this raises
+    ConfinedFileError('unsupported') before either one. Reads of directories
+    that already exist do not require mkdir.
+    """
+    close_fd = os.close if close_fd is None else close_fd
+    cleanup_fd = close_fd if cleanup_fd is None else cleanup_fd
+    descriptors = []
     try:
+        descriptors.append(_directory_fd(given.anchor, None, opener))
+        if inspect is not None:
+            inspect(descriptors[-1], None, None)
         for index, component in enumerate((*given.parts[1:], *components)):
+            parent = descriptors[-1]
             if create and index >= len(given.parts) - 1:
+                _require_descriptor_mkdir()
                 try:
-                    os.mkdir(component, 0o700, dir_fd=fd)
+                    os.mkdir(component, 0o700, dir_fd=parent)
                 except FileExistsError:
                     pass
-                _flush(fd)
-            child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), dir_fd=fd)
-            parent, fd = fd, child
-            os.close(parent)
-        return fd
-    except BaseException:
-        os.close(fd)
-        raise
+                _flush(parent)
+            try:
+                child = _directory_fd(component, parent, opener)
+            except FileNotFoundError:
+                if on_missing is None:
+                    raise
+                _require_descriptor_mkdir()
+                on_missing(parent, component)
+                child = _directory_fd(component, parent, opener)
+            descriptors.append(child)
+            if inspect is not None:
+                inspect(child, parent, component)
+            if not retain:
+                close_fd(descriptors.pop(0))
+        result, descriptors = descriptors, []
+        return result
+    finally:
+        _close_directories(descriptors, cleanup_fd, cleanup_stage, outermost=retain)
+
+
+class DirectoryAnchor:
+    """Owned directory descriptor, identity and root-to-leaf (dev, ino, uid, mode).
+
+    Use as a context manager or call close/detach. With retained ancestors, check()
+    verifies each entry through its held parent; observations grant no authority.
+    """
+
+    def __init__(self, descriptors, names, observations, close_fd, stat_entry, cleanup_fd):
+        self._descriptors = descriptors
+        self._names = names
+        self.observations = tuple(observations)
+        self.identity = self.observations[-1][:2]
+        self.fd = descriptors[-1]
+        self._close_fd = close_fd
+        self._stat_entry = stat_entry
+        self._cleanup_fd = cleanup_fd
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            self.close()
+        except ConfinedFileError as error:
+            # The caller may also receive a staged refusal from its own body.
+            error.directory_anchor = self
+            raise
+
+    def close(self):
+        """Release every owned descriptor, including if an earlier close fails."""
+        self.fd = None
+        # Match nested directory lifetimes: the last (outermost) failure wins.
+        _close_directories(self._descriptors, self._close_fd, "close", outermost=True)
+
+    def detach(self):
+        """Transfer the leaf descriptor to the caller; close any retained parents."""
+        if self.fd is None:
+            raise ConfinedFileError("closed")
+        leaf = self._descriptors.pop()
+        try:
+            self.close()
+        except BaseException:
+            with _refusals("cleanup"):
+                self._cleanup_fd(leaf)
+            raise
+        return leaf
+
+    def check(self):
+        """Refuse renamed ancestors; requires retain_ancestors=True at opening."""
+        if self.fd is None:
+            raise ConfinedFileError("closed")
+        if len(self._descriptors) != len(self.observations):
+            raise ConfinedFileError("invalid_data")
+        with _refusals("check"):
+            for parent, name, expected in zip(self._descriptors, self._names, self.observations[1:]):
+                current = self._stat_entry(name, dir_fd=parent, follow_symlinks=False)
+                if not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != expected[:2]:
+                    raise ConfinedFileError("unsafe")
+
+
+def open_directory(opener, root, *, policy=None, on_missing=None, retain_ancestors=False,
+                   close_fd=None, stat_fd=None, stat_entry=None, cleanup_fd=None):
+    """Walk an absolute root without following any component; no path fallback.
+
+    Refuse before any filesystem operation unless descriptor-relative open and
+    no-follow stat are supported with the directory flags. Publication stays
+    behind descriptor_supported(). A missing directory is created only when
+    descriptor-relative mkdir is supported; otherwise the walk raises
+    ConfinedFileError('unsupported') before the caller's on_missing handler.
+
+    policy(stat_result) validates the leaf before transfer. on_missing(parent_fd,
+    name, observations) may create a missing directory under the held parent;
+    creation policy and durability belong to that caller. Refusals use this
+    module's fixed reasons; exceptions raised by policy callbacks pass through.
+    By default only the leaf stays open. Retain ancestors for check() when needed.
+    opener is the caller's trusted os.open boundary; close_fd, stat_fd and
+    stat_entry default to this module's os.close, os.fstat and os.stat. Passing
+    the caller's boundaries preserves its descriptor ownership instrumentation.
+    cleanup_fd defaults to close_fd; a caller may supply its established
+    failure-cleanup policy to preserve the primary refusal if close also fails.
+    A refusal retains os_error and directory_stage for callers whose established
+    error contract passes particular OS failures through; its own text stays fixed.
+    """
+    with _refusals("prepare"):
+        given = _directory_path(root)
+        if not _walk_supported():
+            raise ConfinedFileError("unsupported")
+    close_fd = os.close if close_fd is None else close_fd
+    cleanup_fd = close_fd if cleanup_fd is None else cleanup_fd
+    stat_fd = os.fstat if stat_fd is None else stat_fd
+    stat_entry = os.stat if stat_entry is None else stat_entry
+    observations = []
+    opening = "open"
+
+    def opened(name, flags, *, dir_fd=None):
+        nonlocal opening
+        try:
+            with _refusals("open_root" if dir_fd is None else opening,
+                           missing_passthrough=dir_fd is not None and opening == "open"):
+                return opener(name, flags, dir_fd=dir_fd)
+        finally:
+            opening = "open"
+
+    def closed(fd):
+        with _refusals("walk_close"):
+            close_fd(fd)
+
+    def inspect(fd, parent, component):
+        with _refusals("stat"):
+            info = stat_fd(fd)
+        observations.append((info.st_dev, info.st_ino, info.st_uid, info.st_mode))
+        if len(observations) == len(given.parts):
+            with _refusals("policy"):
+                if policy is not None:
+                    policy(info)
+            with _refusals("verify"):
+                visible = stat_entry(component if parent is not None else ".",
+                                     dir_fd=parent if parent is not None else fd, follow_symlinks=False)
+                if not stat.S_ISDIR(visible.st_mode) or (visible.st_dev, visible.st_ino) != observations[-1][:2]:
+                    raise ConfinedFileError("unsafe")
+
+    def missing(parent, component):
+        nonlocal opening
+        with _refusals("create"):
+            on_missing(parent, component, tuple(observations))
+        opening = "reopen"
+
+    with _refusals("open"):
+        descriptors = _walk_directory(given, inspect=inspect,
+                                      on_missing=missing if on_missing is not None else None,
+                                      retain=retain_ancestors, opener=opened, close_fd=closed,
+                                      cleanup_fd=cleanup_fd, cleanup_stage="cleanup")
+        try:
+            result = DirectoryAnchor(descriptors, given.parts[1:], observations, close_fd, stat_entry, cleanup_fd)
+            descriptors = []
+            return result
+        finally:
+            _close_directories(descriptors, cleanup_fd, "cleanup", outermost=retain_ancestors)
+
+
+def _open_parent(root, components, create):
+    return _walk_directory(_directory_path(root), components, create)[0]
 
 
 class ConfinedFile:
@@ -134,6 +371,12 @@ class ConfinedFile:
         if self._parent is None:
             raise ConfinedFileError("closed")
 
+    @property
+    def parent_fd(self):
+        """Borrow the held parent descriptor while open; never close it or retain it after exit."""
+        self._check_open()
+        return self._parent
+
     def parent_stat(self):
         """Inspect the held parent for caller-specific ownership/mode policy."""
         self._check_open()
@@ -146,6 +389,10 @@ class ConfinedFile:
             raise ConfinedFileError("unsafe")
         try:
             current = _open_parent(*self._location, False)
+        except ConfinedFileError as error:
+            if error.reason in ("missing", "unsafe"):
+                raise ConfinedFileError("unsafe") from None
+            raise
         except OSError as error:
             if error.errno in (errno.ENOENT, errno.ELOOP, errno.ENOTDIR):
                 raise ConfinedFileError("unsafe") from None
