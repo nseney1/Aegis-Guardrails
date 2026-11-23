@@ -6565,3 +6565,527 @@ def test_recording_failure_after_successful_raw_close_is_reported(monkeypatch):
     assert boundary.live == {} and boundary.calls == [fd]
     assert ledger.rows[0]["state"] == "retired"
     assert ledger.rows[0]["good"] == 1
+
+
+_LOOKUP = codec.Store._lookup.__wrapped__.__code__
+_CANONICAL = codec.canonical.__code__
+_READ_BYTES = codec.Store._read_bytes.__code__
+_PARSE = codec_store.parse.__code__
+_ISOLATE = codec_store._isolate.__code__
+_STORE_READ = codec.Store.read.__code__
+_STORE_VERIFIED = codec.Store.verified.__code__
+_RESOLUTION = "reference not found or ambiguous; use the full id or a longer handle"
+_HANDLE = "handle must be 16-64 lowercase hex"
+
+
+@contextmanager
+def _counting(*codes):
+    """Count Python calls to these code objects without patching a shared module."""
+    seen = {code: [] for code in codes}
+    previous = sys.getprofile()
+
+    def observe(frame, event, _arg):
+        # A generator resume after yield is another call event for the same scope.
+        if (event == "call" and frame.f_code in seen and
+                frame.f_lineno == frame.f_code.co_firstlineno):
+            seen[frame.f_code].append(frame.f_locals.get("reference"))
+
+    sys.setprofile(observe)
+    try:
+        yield seen
+    finally:
+        sys.setprofile(previous)
+
+
+def _other_id(rid):
+    tail = "b" * 48 if rid[16:] != "b" * 48 else "c" * 48
+    return rid[:16] + tail
+
+
+def stored_log(store, *, with_child=False):
+    rows = [{"text": f"row {index}"} for index in range(2048)]
+    value = record("log", {"rows": rows}, body="heading\nlog body")
+    value["spans"] = [[0, 7, "heading"]]
+    if with_child:
+        value["refs"]["child"] = store.write(record(body="referenced body"))
+    return value, store.write(value)
+
+
+@pytest.mark.parametrize("outline", [False, True])
+@pytest.mark.parametrize("kind", ["none", "context", "subclass", "duck"])
+def test_stored_view_refuses_non_store_readers_before_lookup(tmp_path, kind, outline):
+    class DerivedStore(codec.Store):
+        pass
+
+    class DuckReader:
+        def read(self, reference):
+            pytest.fail("called read on a duck-typed reader")
+
+        def verified(self, reference):
+            pytest.fail("called verified on a duck-typed reader")
+
+    with closing(make_store(tmp_path)) as store, closing(DerivedStore(tmp_path)) as derived:
+        rid = store.write(record())
+        readers = {"none": None, "context": codec.ReadContext(store, lambda reference: pytest.fail("authorized")),
+                   "subclass": derived, "duck": DuckReader()}
+        prepared = codec.preflight_read(outline=outline)
+        with _counting(_LOOKUP, _STORE_READ, _STORE_VERIFIED) as calls:
+            assert_error("E_REF", lambda: codec.read_stored_view(readers[kind], rid, prepared))
+        assert not any(calls.values())
+
+
+@pytest.mark.parametrize("shape", ["plain", "container", "dict-subclass", "missing", "extra",
+                                     "store", "non-string", "string-subclass"])
+def test_stored_view_refuses_invalid_option_shape_before_lookup(tmp_path, shape):
+    class OptionDict(dict):
+        pass
+
+    class OptionName(str):
+        pass
+
+    with closing(make_store(tmp_path)) as store:
+        rid = store.write(record())
+        prepared = codec.preflight_read(outline=True)
+        options = prepared.options
+        if shape == "plain":
+            prepared = options
+        elif shape == "container":
+            prepared = prepared._replace(options=list(options.items()))
+        elif shape == "dict-subclass":
+            prepared = prepared._replace(options=OptionDict(options))
+        elif shape == "missing":
+            del options["outline"]
+        elif shape == "extra":
+            options[MARKER] = True
+        elif shape == "store":
+            del options["format"]
+            options["store"] = store
+        else:
+            del options["outline"]
+            key = 1 if shape == "non-string" else OptionName("outline")
+            options[key] = True
+
+        with _counting(_LOOKUP, _STORE_READ, _STORE_VERIFIED) as calls:
+            with pytest.raises(codec.CodecError) as caught:
+                codec.read_stored_view(store, rid, prepared)
+        assert caught.value.detail == "option"
+        assert caught.value.as_dict() == {"error": {"code": "E_SELECTOR", "message": "unknown option"}}
+        assert not any(calls.values())
+
+
+@pytest.mark.parametrize("key,bad,code,message", [
+    ("outline", MARKER, "E_SELECTOR", None),
+    ("selectors", [MARKER + ".["], "E_SELECTOR", None),
+    ("spans", [-1], "E_SPAN", None),
+    ("expand", [MARKER + "/"], "E_REF", None),
+    ("since", MARKER, "E_SELECTOR", None),
+    ("row_limit", 0, "E_LIMIT", None),
+    ("format", MARKER, "E_FORMAT", "invalid format; choose json, md or tsv"),
+    ("max_chars", -1, "E_LIMIT", None),
+], ids=["outline", "selectors", "spans", "expand", "since", "row-limit", "format", "max-chars"])
+def test_stored_view_revalidates_option_values_before_lookup(tmp_path, key, bad, code, message):
+    with closing(make_store(tmp_path)) as store:
+        rid = store.write(record())
+        prepared = codec.preflight_read(outline=True)
+        prepared.options[key] = bad
+        with _counting(_LOOKUP, _STORE_READ, _STORE_VERIFIED) as calls:
+            assert_error(code, lambda: codec.read_stored_view(store, rid, prepared), message)
+        assert not any(calls.values())
+
+
+def test_preflight_outline_only_tolerates_missing_option_and_requires_true():
+    prepared = codec.preflight_read(outline=True)
+    assert prepared.outline_only is True
+    assert prepared._replace(options=[]).outline_only is False
+    del prepared.options["outline"]
+    assert prepared.outline_only is False
+    prepared.options["outline"] = 1
+    assert prepared.outline_only is False
+
+
+@pytest.mark.parametrize("options", [
+    {"outline": True}, {"outline": True, "format": "md"}, {"outline": True, "format": "tsv"},
+    {}, {"selectors": ["body"]}, {"spans": [0], "outline": True},
+    {"since": "0", "row_limit": 1, "outline": True}, {"expand": ["child"], "outline": True},
+], ids=["outline-json", "outline-md", "outline-tsv", "default", "selected", "span", "page", "expand"])
+def test_bound_render_has_no_record_copy(tmp_path, options):
+    with closing(make_store(tmp_path)) as store:
+        value, rid = stored_log(store, with_child="expand" in options)
+        expected = codec.read_view(value, store=store, **options)
+        with _counting(_LOOKUP, _PARSE, _CANONICAL, _ISOLATE) as binding:
+            bound = store.verified(rid[:16])
+        with _counting(_LOOKUP, _PARSE, _CANONICAL, _ISOLATE) as renders:
+            assert codec.read_view(bound, store=store, **options) == expected
+            assert codec.read_view(bound, store=store, **options) == expected
+
+        assert binding[_LOOKUP] == [rid[:16]]
+        assert len(binding[_PARSE]) == len(binding[_CANONICAL]) == 1
+        child = value["refs"].get("child")
+        assert renders[_LOOKUP] == ([child, child] if child else [])
+        assert len(renders[_PARSE]) == (2 if child else 0)
+        pure = set(options) <= {"outline", "format"} and options.get("outline", False)
+        assert len(renders[_CANONICAL]) == (0 if pure else 4 if child else 2)
+        assert (len(binding[_ISOLATE]), len(renders[_ISOLATE])) == (0, 0)
+
+
+def test_bound_value_copies_nested_log_containers(tmp_path):
+    with closing(make_store(tmp_path)) as store:
+        value, rid = stored_log(store)
+        bound = store.verified(rid)
+        with _counting(_ISOLATE) as seen:
+            exposed = bound.value
+        exposed["fields"]["rows"][0]["text"] = MARKER
+        exposed["fields"]["rows"].pop()
+        assert bound.value == value
+        assert len(seen[_ISOLATE]) > len(value["fields"]["rows"])
+
+
+def test_verified_read_binds_id_and_length_in_one_directory_scope(tmp_path):
+    store = make_store(tmp_path)
+    try:
+        value = record(body="bound identity")
+        rid = store.write(value)
+        for reference in (rid, rid[:16]):
+            with _counting(_LOOKUP, _READ_BYTES) as seen:
+                bound = store.verified(reference)
+            assert seen[_LOOKUP] == [reference]
+            assert seen[_READ_BYTES] == [None]
+            assert (bound.rid, bound.length, bound.value) == (rid, len(raw(value)), value)
+            assert type(bound.value) is dict
+            assert store.read(reference) == value
+            assert store.describe(reference) == {
+                "ref": rid[:16], "kind": value["kind"], "chars": bound.length}
+        with _counting(_LOOKUP) as seen:
+            assert store.read(rid) == value
+            assert store.describe(rid[:16])["chars"] == len(raw(value))
+        assert seen[_LOOKUP] == [rid, rid[:16]]
+    finally:
+        store.close()
+
+
+def test_verified_read_refusals_do_not_echo_input_and_leave_bytes(tmp_path):
+    store = make_store(tmp_path)
+    try:
+        value = record(body="stable bytes")
+        rid = store.write(value)
+        path = tmp_path / rid[:2] / (rid + ".json")
+        original = path.read_bytes()
+        for reference in (MARKER, "a" * 15, "A" * 64, "a" * 16 + "\n" + "b" * 16, record(), None):
+            assert_error("E_REF", lambda: store.verified(reference), _HANDLE)
+        assert_error("E_REF", lambda: store.verified("a" * 64), _RESOLUTION)
+        path.write_bytes(b"HOSTILE_MARKER")
+        with _counting(_LOOKUP, _READ_BYTES) as seen:
+            assert_error("E_HASH", lambda: store.verified(rid))
+        assert seen[_LOOKUP] == [rid] and seen[_READ_BYTES] == [None]
+        assert path.read_bytes() == b"HOSTILE_MARKER"
+        assert sorted(item.name for item in path.parent.iterdir()) == [rid + ".json"]
+        path.write_bytes(original)
+        assert store.verified(rid[:16]).value == value
+        padded = b" " + original
+        forged = hashlib.sha256(padded).hexdigest()
+        forged_path = _seed_record_path(tmp_path, forged)
+        forged_path.write_bytes(padded)
+        assert_error("E_FORMAT", lambda: store.verified(forged))
+        assert forged_path.read_bytes() == padded and path.read_bytes() == original
+        store.close()
+        assert_error("E_AUTH", lambda: store.verified(rid))
+    finally:
+        store.close()
+
+
+def test_verified_read_sharded_ambiguity_is_one_scope_and_full_id_still_reads(tmp_path):
+    store = make_store(tmp_path)
+    try:
+        value = record(body="unique full id")
+        rid = store.write(value)
+        sibling = _other_id(rid)
+        sibling_path = _seed_record_path(tmp_path, sibling)
+        sibling_path.write_bytes(b"{}")
+        real = tmp_path / rid[:2] / (rid + ".json")
+        before = real.read_bytes()
+        names = sorted(item.name for item in real.parent.iterdir())
+        with _counting(_LOOKUP, _READ_BYTES) as seen:
+            assert_error("E_REF", lambda: store.verified(rid[:16]), _RESOLUTION)
+        assert seen[_LOOKUP] == [rid[:16]] and seen[_READ_BYTES] == []
+        with _counting(_LOOKUP, _READ_BYTES) as seen:
+            bound = store.verified(rid)
+        assert seen[_LOOKUP] == [rid] and bound.rid == rid and bound.value == value
+        assert_error("E_HASH", lambda: store.verified(sibling))
+        assert real.read_bytes() == before
+        assert sorted(item.name for item in real.parent.iterdir()) == names
+    finally:
+        store.close()
+
+
+def test_verified_read_concurrent_callers_release_the_directory_scope(tmp_path):
+    store = make_store(tmp_path)
+    try:
+        value = record(body="concurrent")
+        rid = store.write(value)
+        errors, barrier = [], threading.Barrier(8)
+
+        def worker(index):
+            try:
+                barrier.wait(5)
+                if index == 0:
+                    store.verified(MARKER)
+                else:
+                    reference = rid[:16] if index % 2 == 0 else rid
+                    bound = store.verified(reference)
+                    assert (bound.rid, bound.length, bound.value) == (rid, len(raw(value)), value)
+            except codec.CodecError as error:
+                if not (index == 0 and error.code == "E_REF" and MARKER not in str(error)):
+                    errors.append(error)
+            except Exception as error:
+                errors.append(error)
+
+        threads = [threading.Thread(target=worker, args=(index,)) for index in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+            assert not thread.is_alive()
+        assert errors == []
+        assert store.verified(rid).value == value
+    finally:
+        store.close()
+
+
+def test_verified_read_constructor_is_not_a_trust_bypass():
+    assert_error("E_AUTH", lambda: codec_store.VerifiedRead(record(), "a" * 64, 1, MARKER))
+
+
+@pytest.mark.parametrize("fmt", ["json", "md", "tsv"])
+def test_pure_stored_outline_reuses_verified_metadata(tmp_path, fmt):
+    store = make_store(tmp_path)
+    try:
+        value = record(body="outline\n" + "x" * 3000)
+        rid = store.write(value)
+        bound = store.verified(rid[:16])
+        with _counting(_CANONICAL) as seen:
+            rendered = codec.read_view(bound, outline=True, format=fmt, store=store)
+        assert seen[_CANONICAL] == []
+        plain = codec.read_view(bound.value, outline=True, format=fmt, store=store)
+        assert rendered == plain
+        if fmt == "json":
+            view = json.loads(rendered)
+            assert view["ref"] == rid[:16] and view["omitted_chars"] == bound.length
+            assert "data" not in view and MARKER not in rendered
+        assert codec.read_view(bound, outline=True, format=fmt, max_chars=len(rendered),
+                               store=store) == rendered
+        assert_error("E_LIMIT", lambda: codec.read_view(
+            bound, outline=True, format=fmt, max_chars=len(rendered) - 1, store=store))
+    finally:
+        store.close()
+
+
+def test_caller_supplied_and_covered_views_still_check_the_value(tmp_path):
+    store = make_store(tmp_path)
+    try:
+        value = record(body="checked")
+        rid = store.write(value)
+        bound = store.verified(rid)
+        copied = dict(bound.value)
+        with _counting(_CANONICAL) as seen:
+            caller = codec.read_view(copied, outline=True, store=store)
+        assert seen[_CANONICAL]
+        assert caller == codec.read_view(bound, outline=True, store=store)
+        with _counting(_CANONICAL) as seen:
+            selected = codec.read_view(bound, outline=True, selectors=["body"], store=store)
+        assert seen[_CANONICAL]
+        assert selected == codec.read_view(value, outline=True, selectors=["body"], store=store)
+        child = store.write(record(body="child"))
+        parent = dict(record(), refs={"child": child})
+        parent_bound = store.verified(store.write(parent))
+        with _counting(_CANONICAL) as seen:
+            expanded = codec.read_view(parent_bound, expand=["child"], store=store)
+        assert seen[_CANONICAL]
+        assert expanded == codec.read_view(parent_bound.value, expand=["child"], store=store)
+        logged = record("log", {"rows": [{"text": "one"}, {"text": "two"}]})
+        logged_bound = store.verified(store.write(logged))
+        with _counting(_CANONICAL) as seen:
+            paged = codec.read_view(logged_bound, since="0", row_limit=1, store=store)
+        assert seen[_CANONICAL]
+        assert paged == codec.read_view(logged_bound.value, since="0", row_limit=1, store=store)
+    finally:
+        store.close()
+
+
+def test_unbound_verified_read_refuses_with_typed_error():
+    forged = codec_store.VerifiedRead.__new__(codec_store.VerifiedRead)
+    assert_error("E_AUTH", lambda: forged.value)
+    assert_error("E_AUTH", lambda: forged.rid)
+    assert_error("E_AUTH", lambda: forged.length)
+    assert_error("E_AUTH", lambda: codec.read_view(forged, outline=True))
+    assert_error("E_AUTH", lambda: setattr(forged, "rid", "\n`" + MARKER))
+    assert_error("E_AUTH", lambda: delattr(forged, "value"))
+
+
+def test_verified_value_is_isolated_and_metadata_is_readonly(tmp_path):
+    store = make_store(tmp_path)
+    try:
+        value = record(body="isolated")
+        rid = store.write(value)
+        bound = store.verified(rid)
+        exposed, other = bound.value, bound.value
+        assert exposed == value and type(exposed) is dict and type(exposed["meta"]) is dict
+        assert exposed is not other and exposed["meta"] is not other["meta"]
+        assert exposed["fields"] is not other["fields"] and exposed["spans"] is not other["spans"]
+        exposed["meta"]["from"] = MARKER
+        assert other["meta"]["from"] == value["meta"]["from"]
+        assert bound.value["meta"]["from"] == value["meta"]["from"]
+        assert bound.value["meta"] is not exposed["meta"]
+        def assign_value():
+            bound.value = MARKER
+
+        def delete_value():
+            del bound.value
+
+        def assign_rid():
+            bound.rid = MARKER
+
+        def delete_rid():
+            del bound.rid
+
+        def assign_length():
+            bound.length = MARKER
+
+        def delete_length():
+            del bound.length
+
+        assert_error("E_AUTH", assign_value)
+        assert_error("E_AUTH", delete_value)
+        assert_error("E_AUTH", assign_rid)
+        assert_error("E_AUTH", delete_rid)
+        assert_error("E_AUTH", assign_length)
+        assert_error("E_AUTH", delete_length)
+        assert_error("E_AUTH", lambda: setattr(bound, "rid", "\n`" + MARKER + "\n" + "a" * 64))
+        assert_error("E_AUTH", lambda: setattr(bound, "length", 1))
+        assert_error("E_AUTH", lambda: getattr(bound, "_verifiedread_snapshot"))
+        assert_error("E_AUTH", lambda: getattr(bound, "_verifiedread_for_render"))
+        assert (bound.rid, bound.length, bound.value) == (rid, len(raw(value)), value)
+    finally:
+        store.close()
+
+
+def test_pure_outline_uses_protected_snapshot_after_mutation_and_retry(tmp_path):
+    store = make_store(tmp_path)
+    try:
+        body = "outline\n" + "y" * 40
+        value = record(body=body)
+        value["spans"] = [[0, 7, "title"]]
+        rid = store.write(value)
+        bound = store.verified(rid[:16])
+        child = store.write(record(body="child-body"))
+        parent = dict(record(body="parent-body"), refs={"child": child})
+        parent_bound = store.verified(store.write(parent))
+        logged = record("log", {"rows": [{"text": "one"}, {"text": "two"}]})
+        logged_bound = store.verified(store.write(logged))
+        originals = {fmt: codec.read_view(bound, outline=True, format=fmt, max_chars=4000, store=store)
+                     for fmt in ("json", "md", "tsv")}
+        for fmt, text in originals.items():
+            assert text == codec.read_view(value, outline=True, format=fmt, max_chars=4000, store=store)
+            assert text == codec.read_view(bound.value, outline=True, format=fmt, max_chars=4000, store=store)
+        selected = codec.read_view(bound, selectors=["body"], store=store)
+        spanned = codec.read_view(bound, spans=[0], store=store)
+        expanded = codec.read_view(parent_bound, expand=["child"], store=store)
+        paged = codec.read_view(logged_bound, since="0", row_limit=1, store=store)
+        bound.value["meta"]["from"] = MARKER
+        bound.value["schema"] = "invalid"
+        bound.value["body"] = "x" * 9000
+        bound.value["kind"] = MARKER
+        del bound.value["meta"]
+        held = bound.value
+        held["body"] = "x" * 9000
+        held["meta"]["from"] = MARKER
+        del held["meta"]
+        held["kind"] = MARKER
+        parent_bound.value["body"] = MARKER
+        logged_bound.value["fields"]["rows"][0]["text"] = MARKER
+        with _counting(_LOOKUP, _CANONICAL) as seen:
+            rendered = {fmt: codec.read_view(bound, outline=True, format=fmt, max_chars=4000, store=store)
+                        for fmt in ("json", "md", "tsv")}
+        assert seen[_LOOKUP] == [] and seen[_CANONICAL] == []
+        assert rendered == originals
+        view = json.loads(rendered["json"])
+        assert view["ref"] == rid[:16] and view["from"] == "writer" and view["kind"] == "text"
+        assert view["omitted_chars"] == bound.length == len(raw(value))
+        assert view["outline"]["body_chars"] == len(body) and "data" not in view
+        assert rendered["md"].splitlines()[0] == rid[:16] + " text untrusted omitted_chars=" + str(bound.length)
+        for fmt, text in rendered.items():
+            assert MARKER not in text
+            assert codec.read_view(bound, outline=True, format=fmt, max_chars=len(text), store=store) == text
+            assert_error("E_LIMIT", lambda fmt=fmt, text=text: codec.read_view(
+                bound, outline=True, format=fmt, max_chars=len(text) - 1, store=store))
+        assert codec.read_view(bound, selectors=["body"], store=store) == selected
+        assert json.loads(selected)["data"]["body"] == body
+        assert codec.read_view(bound, spans=[0], store=store) == spanned
+        assert json.loads(spanned)["data"]["span:0"] == "outline"
+        assert codec.read_view(parent_bound, expand=["child"], store=store) == expanded
+        assert MARKER not in expanded
+        assert codec.read_view(logged_bound, since="0", row_limit=1, store=store) == paged
+        assert MARKER not in paged
+        replaced = copy.deepcopy(value)
+        replaced["body"] = "x" * 9000
+        with _counting(_CANONICAL) as seen:
+            caller = json.loads(codec.read_view(replaced, outline=True, max_chars=20000))
+        assert seen[_CANONICAL]
+        assert caller["outline"]["body_chars"] == 9000
+        assert caller["ref"] == hashlib.sha256(raw(replaced)).hexdigest()[:16]
+        assert caller["omitted_chars"] == len(raw(replaced)) and caller["ref"] != rid[:16]
+        missing = record(body=MARKER)
+        del missing["meta"]
+        assert_error("E_FORMAT", lambda: codec.read_view(missing, outline=True))
+        bad_kind = record(body=MARKER)
+        bad_kind["kind"] = MARKER
+        assert_error("E_FORMAT", lambda: codec.read_view(bad_kind, outline=True))
+        bad_schema = record(body=MARKER)
+        bad_schema["schema"] = "invalid"
+        assert_error("E_FORMAT", lambda: codec.read_view(bad_schema, outline=True))
+        assert codec.read_view(bound, outline=True, format="json", max_chars=4000, store=store) == originals["json"]
+    finally:
+        store.close()
+
+
+def test_verified_outline_concurrent_readers_keep_the_protected_snapshot(tmp_path):
+    store = make_store(tmp_path)
+    try:
+        value = record(body="concurrent-outline")
+        rid = store.write(value)
+        bound = store.verified(rid)
+        expected = {fmt: codec.read_view(bound, outline=True, format=fmt, max_chars=4000)
+                    for fmt in ("json", "md", "tsv")}
+        errors, barrier = [], threading.Barrier(8)
+
+        def worker(index):
+            try:
+                barrier.wait(5)
+                local = bound.value
+                local["body"] = "x" * (100 + index)
+                local["meta"]["from"] = MARKER
+                local["schema"] = "invalid"
+                if index % 2 == 0:
+                    del local["meta"]
+                else:
+                    local["kind"] = MARKER
+                for fmt, text in expected.items():
+                    assert codec.read_view(bound, outline=True, format=fmt, max_chars=4000) == text
+                fresh = bound.value
+                assert fresh == value and fresh is not local and fresh["meta"] is not local.get("meta")
+                assert bound.rid == rid and bound.length == len(raw(value))
+            except Exception as error:
+                errors.append(repr(error))
+
+        threads = [threading.Thread(target=worker, args=(index,)) for index in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+            assert not thread.is_alive()
+        assert errors == []
+        for fmt, text in expected.items():
+            assert codec.read_view(bound, outline=True, format=fmt, max_chars=len(text)) == text
+            assert_error("E_LIMIT", lambda fmt=fmt, text=text: codec.read_view(
+                bound, outline=True, format=fmt, max_chars=len(text) - 1))
+    finally:
+        store.close()

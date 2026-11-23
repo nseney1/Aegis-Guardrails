@@ -8,6 +8,7 @@ since is '<n>:<sha256(canonical rows[:n])>'; '0' starts; row_limit pages first.
 Unsafe/closed/unsupported stores refuse E_AUTH; Windows support is deferred.
 JSON is default; MD fences that JSON; TSV marks data and uses JSON cells.
 JSON short escapes are preserved; outline alone emits only envelope and outline.
+A pure stored outline renders the protected snapshot and reuses its id and length only when coverage is empty.
 """
 from functools import partial
 import hashlib
@@ -21,7 +22,7 @@ from .message_codec_format import (
     INDEX, KEYS, STRING, INTEGER, Budget, require, object_schema, array_schema, KEY_MARKER, CURSOR_PATTERN,
     json_chunks, escape_char, neutral_text, canonical, parse, compose, record_id,
 )
-from .message_codec_store import Store
+from .message_codec_store import Store, VerifiedRead
 
 
 __all__ = ["CodecError", "Store", "canonical", "parse", "compose", "record_id", "read_view",
@@ -314,9 +315,20 @@ def _renderer(limit):
     return _views.Renderer(require, escape_char, neutral_text, limit)
 
 
+_STORED_READ_OPTION_KEYS = frozenset(("selectors", "spans", "expand", "since", "row_limit", "outline",
+                                     "format", "max_chars"))
+
+
 class _ReadOptions(NamedTuple):
     options: dict
     planned: dict
+
+    @property
+    def outline_only(self):
+        opts = self.options
+        return (type(opts) is dict and opts.get("outline") is True
+                and not (opts.get("selectors") or opts.get("spans") or opts.get("expand")
+                         or opts.get("since") is not None or opts.get("row_limit") is not None))
 
 
 def _read_selectors(groups, cli):
@@ -398,15 +410,39 @@ def prepare_read(value, *, selectors=(), spans=(), expand=(), since=None, row_li
     return prepared
 
 
+def read_stored_view(store, reference, prepared):
+    """Revalidate prepared options before reading from an exact Store."""
+    require(type(store) is Store, "E_REF")
+    require(type(prepared) is _ReadOptions, "E_SELECTOR", detail="option")
+    options = prepared.options
+    require(type(options) is dict and len(options) == len(_STORED_READ_OPTION_KEYS), "E_SELECTOR", detail="option")
+    options = options.copy()
+    require(all(type(key) is str for key in options) and options.keys() == _STORED_READ_OPTION_KEYS,
+            "E_SELECTOR", detail="option")
+    prepared = preflight_read(store=store, **options)
+    value = store.verified(reference) if prepared.outline_only else store.read(reference)
+    return read_view(value, store=store, **prepared.options)
+
+
 def read_view(value, *, selectors=(), spans=(), outline=False, since=None, row_limit=None,
               expand=(), store=None, format="json", max_chars=60000, **unknown):
     """Total for data inputs, including unknown options; wrong arity is programmer error."""
-    planned = prepare_read(value, selectors=selectors, spans=spans, expand=expand, since=since, row_limit=row_limit,
-                           outline=outline, format=format, max_chars=max_chars, store=store, **unknown).planned
+    bound = value if type(value) is VerifiedRead else None
+    if bound is not None:
+        # Borrow within the codec. Public attribute access only returns an isolate.
+        value = object.__getattribute__(bound, "_verifiedread_for_render")
+    prepared = prepare_read(value, selectors=selectors, spans=spans, expand=expand, since=since, row_limit=row_limit,
+                            outline=outline, format=format, max_chars=max_chars, store=store, **unknown)
+    planned = prepared.planned
     renderer, budget = _renderer(max_chars), Budget(MAX_WORK_BYTES)
-    size = canonical(value, _size_only=True)
+    outline_only = prepared.outline_only
+    pure = bound is not None and outline_only
+    size = bound.length if pure else canonical(value, _size_only=True)
+    require(type(value) is dict and type(value.get("meta")) is dict and type(value["meta"].get("from")) is str
+            and type(value.get("kind")) is str and value["kind"] in KIND_SCHEMAS
+            and type(value.get("body")) is str and type(value.get("fields")) is dict
+            and type(value.get("spans")) is list and type(value.get("refs")) is dict, "E_FORMAT")
     require(all(index < len(value["spans"]) for index in spans), "E_SPAN")
-    outline_only = outline and not (selectors or spans or since is not None or expand)
     view = {"ref": _views.Text("0" * 16), "kind": value["kind"], "from": value["meta"]["from"],
             "untrusted": True, "omitted_chars": 0}
     if not outline_only:
@@ -469,8 +505,14 @@ def read_view(value, *, selectors=(), spans=(), outline=False, since=None, row_l
         coverage.add(("refs",))
     renderer.json_size(data, MAX_OUTPUT_CHARS if format == "tsv" else max_chars)
     coverage.active = False  # Replay plans without recharging selection analysis.
-    rid, view["omitted_chars"] = coverage.measure(size, chunks)
-    view["ref"] = _views.Text(rid, 0, 16)
+    if pure and not coverage.paths and not coverage.spans:
+        view["ref"] = _views.Text(bound.rid, 0, 16)
+        view["omitted_chars"] = size
+    else:
+        if pure:
+            size = canonical(original, _size_only=True)
+        rid, view["omitted_chars"] = coverage.measure(size, chunks)
+        view["ref"] = _views.Text(rid, 0, 16)
     if not outline_only:
         view["data"] = data
     if cursor is not None:
