@@ -2040,7 +2040,7 @@ def test_insights_isolated_import_bootstrap_does_not_load_conftest(insights_boot
 @pytest.mark.parametrize("marker", [
     "file", "incomplete", "corrupt-index", "dangling", "missing-head", "corrupt-head",
     "gitfile-missing", "gitfile-not-directory", "gitfile-empty", "gitfile-multiline",
-    "gitfile-blank-line", "gitfile-nul", "gitfile-oversized",
+    "gitfile-nul", "gitfile-oversized",
 ])
 def test_insights_census_refuses_an_unreadable_index(tmp_path: Path, marker: str, insights_import_path):
     _git(tmp_path, "init", "-q")
@@ -2066,7 +2066,6 @@ def test_insights_census_refuses_an_unreadable_index(tmp_path: Path, marker: str
         contents = {
             "gitfile-empty": b"gitdir: \n",
             "gitfile-multiline": pointer + b"\njunk\n",
-            "gitfile-blank-line": pointer + b"\n\n",
             "gitfile-nul": pointer + b"\0ignored\n",
         }
         metadata.write_bytes(pointer + b"\n" * GITFILE_MAX_BYTES if marker == "gitfile-oversized"
@@ -2097,8 +2096,10 @@ def test_insights_census_refuses_an_unreadable_index(tmp_path: Path, marker: str
 
 @pytest.mark.parametrize("layout,relative,ending", [
     ("linked", False, "\n"), ("linked", True, "\r\n"),
+    ("linked", True, "\n\n"),
     ("submodule", False, ""), ("submodule", True, "\n"),
-], ids=["linked-absolute-lf", "linked-relative-crlf", "submodule-absolute-eof", "submodule-relative-lf"])
+], ids=["linked-absolute-lf", "linked-relative-crlf", "linked-relative-trailing-lf-run",
+        "submodule-absolute-eof", "submodule-relative-lf"])
 def test_insights_census_accepts_gitfiles(tmp_path: Path, layout: str, relative: bool, ending: str,
                                         insights_import_path):
     origin = _make_repo(tmp_path / "origin")
