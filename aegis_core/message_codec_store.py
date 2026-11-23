@@ -1,4 +1,9 @@
-"""Anchored, content-addressed message storage; every read verifies bytes."""
+"""Anchored, content-addressed message storage; every read verifies bytes.
+
+One directory scope resolves a reference, checks those bytes against the full id,
+and parses canonical form. VerifiedRead keeps that id and length read-only on a
+protected snapshot. Callers receive an isolated dict with no nested alias.
+"""
 from contextlib import contextmanager, ExitStack, suppress
 import errno
 import hashlib
@@ -14,7 +19,88 @@ from .message_codec_format import (CodecError, HANDLE, MAX_BYTES, SHA, Budget,
 from .storage_confined import ConfinedFileError, open_directory
 
 
-__all__ = ["Store", "store_supported"]
+__all__ = ["Store", "VerifiedRead", "store_supported"]
+
+
+# Identity of a store-built read. Not an attribute, so assignment cannot copy it.
+_READ_SEAL = object()
+
+
+def _isolate(value):
+    """Deep copy of JSON containers. Scalars are immutable and are not aliased."""
+    kind = type(value)
+    if kind is dict:
+        return {key: _isolate(item) for key, item in value.items()}
+    if kind is list:
+        return [_isolate(item) for item in value]
+    require(value is None or kind in (str, int, float, bool), "E_FORMAT")
+    return value
+
+
+def _sealed(bound, name):
+    try:
+        seal = object.__getattribute__(bound, "_verifiedread_seal")
+        stored = object.__getattribute__(bound, name)
+    except AttributeError:
+        raise CodecError("E_AUTH") from None
+    require(seal is _READ_SEAL, "E_AUTH")
+    return stored
+
+
+class VerifiedRead:
+    """Read-only id and length for one verified snapshot.
+
+    value is a new isolated dict on every read. The snapshot stays private.
+    """
+
+    __slots__ = ("_verifiedread_seal", "_verifiedread_snapshot", "_verifiedread_rid", "_verifiedread_length")
+
+    def __init__(self, *_args, **_kwargs):
+        raise CodecError("E_AUTH")
+
+    def __getattribute__(self, name):
+        if name in ("value", "rid", "length") or (len(name) >= 4 and name[:2] == name[-2:] == "__"):
+            return object.__getattribute__(self, name)
+        raise CodecError("E_AUTH")
+
+    def __setattr__(self, _name, _value):
+        raise CodecError("E_AUTH")
+
+    def __delattr__(self, _name):
+        raise CodecError("E_AUTH")
+
+    @property
+    def value(self):
+        return _isolate(_sealed(self, "_verifiedread_snapshot"))
+
+    @property
+    def _verifiedread_for_render(self):
+        """The codec borrows the sealed value for the duration of rendering."""
+        return _sealed(self, "_verifiedread_snapshot")
+
+    @property
+    def rid(self):
+        rid = _sealed(self, "_verifiedread_rid")
+        require(type(rid) is str and len(rid) == 64 and SHA.fullmatch(rid) is not None, "E_HASH")
+        return rid
+
+    @property
+    def length(self):
+        length = _sealed(self, "_verifiedread_length")
+        require(type(length) is int and 0 <= length <= MAX_BYTES, "E_LIMIT", detail="record")
+        return length
+
+
+def _bind_read(value, rid, length):
+    """Take ownership of the fresh value returned by the store's parser."""
+    require(type(value) is dict and type(rid) is str and len(rid) == 64 and SHA.fullmatch(rid) is not None, "E_HASH")
+    require(type(length) is int and 0 <= length <= MAX_BYTES, "E_LIMIT", detail="record")
+    bound = VerifiedRead.__new__(VerifiedRead)
+    object.__setattr__(bound, "_verifiedread_seal", _READ_SEAL)
+    object.__setattr__(bound, "_verifiedread_snapshot", value)
+    object.__setattr__(bound, "_verifiedread_rid", rid)
+    object.__setattr__(bound, "_verifiedread_length", length)
+    return bound
 
 
 class _FlatStoreError(CodecError):
@@ -295,21 +381,27 @@ class Store:
         require(len(data) == before.st_size and hashlib.sha256(data).hexdigest() == rid, "E_HASH")
         return data, len(data)
 
-    def _verified(self, reference, budget, describe=False):
+    def _verified(self, reference, budget):
         require(budget is None or type(budget) is Budget, "E_LIMIT")
         with self._lookup(reference) as (rid, shardfd, check):
             data, size = self._reference(check, self._read_bytes, rid, shardfd, budget)
-            value = parse(data)
-            if not describe:
-                return value
-            return {"ref": rid[:16], "kind": value["kind"], "chars": size}
+            return rid, size, parse(data)
 
     def read(self, reference, *, _budget=None):
-        return self._verified(reference, _budget)
+        return self._verified(reference, _budget)[2]
 
     def describe(self, reference, *, _budget=None):
         """Verify actual bytes, canonical encoding and schema on every call."""
-        return self._verified(reference, _budget, describe=True)
+        rid, size, value = self._verified(reference, _budget)
+        return {"ref": rid[:16], "kind": value["kind"], "chars": size}
+
+    def verified(self, reference, *, _budget=None):
+        """Resolve, verify and parse in one directory scope.
+
+        The result binds that read's full id and byte length to the parsed value.
+        """
+        rid, size, value = self._verified(reference, _budget)
+        return _bind_read(value, rid, size)
 
     def begin_publication(self):
         """Track one write attempt while the caller holds its publication lease."""
