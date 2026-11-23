@@ -8,6 +8,7 @@ with one line on stderr naming its replacement.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 from functools import partial
 import os
 import sys
@@ -448,16 +449,13 @@ def _ordinary_bound_root(args: argparse.Namespace):
 
 
 def main(argv: Optional[List[str]] = None, prog: str = PROG) -> int:
-    from aegis_core.pathlookup import ordinary_root
+    from aegis_core.pathlookup_gitcache import bound_ordinary_root
 
     argv = list(sys.argv[1:] if argv is None else argv)
     policy = _invocation_policy(argv)
     # A nested invocation must discover its own binding without the caller's fence.
-    token = ordinary_root.set(None)
-    try:
+    with bound_ordinary_root(None):
         return policy.run(partial(_main, argv, prog, policy))
-    finally:
-        ordinary_root.reset(token)
 
 
 def _main(argv: List[str], prog: str, policy=None) -> int:
@@ -494,55 +492,52 @@ def _main(argv: List[str], prog: str, policy=None) -> int:
         return 0
 
     command = get_default_registry().get(args.command)
-    from aegis_core import pathlookup
     from aegis_core.errors import WorkspaceError
+    from aegis_core.pathlookup_gitcache import bound_ordinary_root
     from aegis_core.workspace.binding import WorkspaceHold
 
-    ordinary_token = None
-    try:
+    with ExitStack() as ordinary_scope:
         try:
-            if args.command != "workspace":
-                _attach_workspace(args)
-        except (WorkspaceError, OSError) as exc:
-            workspace_refusal = getattr(command, "workspace_refusal", None)
-            if workspace_refusal is not None:
-                refusal = workspace_refusal(args, exc)
+            try:
+                if args.command != "workspace":
+                    _attach_workspace(args)
+            except (WorkspaceError, OSError) as exc:
+                workspace_refusal = getattr(command, "workspace_refusal", None)
+                if workspace_refusal is not None:
+                    refusal = workspace_refusal(args, exc)
+                    if refusal is not None:
+                        return refusal
+                refusal = policy.workspace_error(args, exc)
                 if refusal is not None:
                     return refusal
-            refusal = policy.workspace_error(args, exc)
-            if refusal is not None:
-                return refusal
+                if args.command == "scan":
+                    refusal = _DefaultErrorPolicy().workspace_error(args, exc)
+                    if refusal is not None:
+                        return refusal
+                if not isinstance(exc, WorkspaceError):
+                    raise
+                if isinstance(exc, WorkspaceHold):
+                    _print_hold(args, exc)
+                else:
+                    print(f"Error: {exc}", file=sys.stderr)
+                return _WORKSPACE_ERROR_EXIT.get(args.command, 1)
+            bound_root = _ordinary_bound_root(args)
+            if bound_root is not None:
+                ordinary_scope.enter_context(bound_ordinary_root(bound_root))
+            return command.execute(args)
+        except KeyboardInterrupt:
+            return 130
+        except Exception as e:
+            if getattr(policy, "model_invocation", False):
+                return policy.operation_error()
             if args.command == "scan":
-                refusal = _DefaultErrorPolicy().workspace_error(args, exc)
-                if refusal is not None:
-                    return refusal
-            if not isinstance(exc, WorkspaceError):
-                raise
-            if isinstance(exc, WorkspaceHold):
-                _print_hold(args, exc)
-            else:
-                print(f"Error: {exc}", file=sys.stderr)
-            return _WORKSPACE_ERROR_EXIT.get(args.command, 1)
-        bound_root = _ordinary_bound_root(args)
-        if bound_root is not None:
-            ordinary_token = pathlookup.ordinary_root.set(os.path.normcase(os.fspath(bound_root)))
-        return command.execute(args)
-    except KeyboardInterrupt:
-        return 130
-    except Exception as e:
-        if getattr(policy, "model_invocation", False):
-            return policy.operation_error()
-        if args.command == "scan":
-            from aegis_core.guidance_projection import project_diagnostic
+                from aegis_core.guidance_projection import project_diagnostic
 
-            message = project_diagnostic(str(e))
-        else:
-            message = str(e)
-        print(f"Error: {message}", file=sys.stderr)
-        return 1
-    finally:
-        if ordinary_token is not None:
-            pathlookup.ordinary_root.reset(ordinary_token)
+                message = project_diagnostic(str(e))
+            else:
+                message = str(e)
+            print(f"Error: {message}", file=sys.stderr)
+            return 1
 
 
 if __name__ == "__main__":
