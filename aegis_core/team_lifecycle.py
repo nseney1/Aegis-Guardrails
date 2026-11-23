@@ -4,7 +4,7 @@ Native authority is injected; this module never discovers plans or imports tools
 """
 from __future__ import annotations
 from contextlib import contextmanager
-from functools import partial, wraps
+from functools import wraps
 import copy
 import errno
 import hashlib
@@ -13,6 +13,7 @@ import json
 import math
 import os
 from pathlib import Path, PurePath, PurePosixPath
+from types import MappingProxyType
 import uuid
 from aegis_core.primitives import json_preflight
 from aegis_core.team_mailbox_primitives import GIT_ID, SHA256, SLUG, MailboxRefusal, bounded_tree, fields, integer, matching, parse_time, text, render_mailbox_refusal
@@ -54,33 +55,44 @@ def require(condition, message=''):
 _DECORATOR = object()
 
 def boundary(function=_DECORATOR, *, checks=None):
-    """Translate documented failures and apply the entry point's explicit validators."""
-    require(checks is None or (type(checks) is dict and bool(checks)
-                               and all(type(name) is str and callable(check) for name, check in checks.items())))
-    if function is _DECORATOR:
-        require(checks is not None)
-        return partial(boundary, checks=checks)
-    require(callable(function))
+    """Bind explicit validators at registration and translate documented failures."""
+    require(checks is None or type(checks) is dict)
+    bindings = MappingProxyType(checks.copy() if checks is not None else {})
+    require(checks is None or bool(bindings) and
+            all(type(name) is str and callable(check) for name, check in bindings.items()))
 
-    @wraps(function)
-    def call(*args, **kwargs):
+    def call(target, positional_count, names, keywords, required, args, kwargs):
         try:
-            values = _bind_arguments(function, args, kwargs)
-            if checks is not None:
-                for name, value in values.items():
-                    if name in checks:
-                        checks[name](value)
-            return function(*args, **kwargs)
+            require(len(args) <= positional_count and kwargs.keys() <= keywords)
+            values = dict(zip(names, args), **kwargs)
+            require(len(values) == len(args) + len(kwargs) and required <= values.keys())
+            for name in filter(bindings.__contains__, values):
+                bindings[name](values[name])
+            return target(*args, **kwargs)
         except MailboxRefusal as error:
             raise LifecycleRefusal(render_mailbox_refusal(error)["reason"]) from None
         except LifecycleRefusal:
             raise
         except OSError as error:
-            code = {errno.ENOENT: 'missing', errno.EEXIST: 'exists', errno.ELOOP: 'unsafe_path', errno.ENOTDIR: 'unsafe_path'}.get(error.errno, 'io')
-            raise LifecycleRefusal(code) from None
+            refusal = {errno.ENOENT: 'missing', errno.EEXIST: 'exists', errno.ELOOP: 'unsafe_path', errno.ENOTDIR: 'unsafe_path'}.get(error.errno, 'io')
+            raise LifecycleRefusal(refusal) from None
         except (ValueError, KeyError, AttributeError, RecursionError, OverflowError):
             raise LifecycleRefusal() from None
-    return call
+
+    def decorate(target, /):
+        require(inspect.isfunction(target))
+        code = target.__code__
+        names = code.co_varnames[:code.co_argcount + code.co_kwonlyargcount]
+        require(bindings.keys() <= set(names))
+        keywords = frozenset(names[code.co_posonlyargcount:])
+        required = frozenset(names[:code.co_argcount - len(target.__defaults__ or ())]) | (
+            frozenset(names[code.co_argcount:]) - (target.__kwdefaults__ or {}).keys())
+        @wraps(target)
+        def wrapped(*args, **kwargs):
+            return call(target, code.co_argcount, names, keywords, required, args, kwargs)
+        return wrapped
+
+    return decorate if function is _DECORATOR and checks is not None else decorate(function)
 
 _MAP_FIELDS = frozenset({'event', 'custody', 'continuation', 'profile', 'actors', 'current', 'successors', 'requests', 'consumed', 'receipts', 'meters', 'request', 'intent', 'start', 'terminal', 'admission', 'association', 'initial_bootstrap', 'genesis', 'creations', 'small_change', 'registration', 'envelope', 'value', 'cancellation', 'resolution', 'provider_handle'})
 _NULL_MAPS = frozenset({'intent', 'start', 'terminal', 'admission', 'association', 'cancellation', 'resolution', 'provider_handle'})
@@ -124,18 +136,6 @@ def _shape(value):
                 if key == 'active_seconds':
                     require(type(child) in (int, float) and math.isfinite(child))
                 pending.append((child, key))
-
-def _bind_arguments(function, args, kwargs):
-    code = function.__code__
-    names = code.co_varnames[:code.co_argcount + code.co_kwonlyargcount]
-    require(len(args) <= code.co_argcount and kwargs.keys() <= set(names))
-    require(not set(names[:len(args)]) & kwargs.keys())
-    values = dict(zip(names, args))
-    values.update(kwargs)
-    required = names[:code.co_argcount - len(function.__defaults__ or ())]
-    required += tuple(name for name in names[code.co_argcount:] if name not in (function.__kwdefaults__ or {}))
-    require(all(name in values for name in required))
-    return values
 
 def _mapping(value):
     """Validate a bounded lifecycle mapping before copies or nested access."""
