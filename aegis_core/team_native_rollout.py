@@ -378,18 +378,55 @@ def restricted_profile(profile):
     return observed["entries"]
 
 
-@_boundary
-def bounded_write_path(value):
+def _index_write_roots(values):
+    """Validate explicit roots once. Membership uses lexical path equality."""
+    require(all(type(value) is str or isinstance(value, Path) for value in values))
+    rendered = [value if type(value) is str else str(value) for value in values]
+    require(all(len(text) <= MAX_RECORD_BYTES for text in rendered), reason="too_large")
+    indexed = set()
+    for text in rendered:
+        path = Path(text)
+        require(path.is_absolute() and ".." not in path.parts and path.parent != path)
+        indexed.add(path)
+    return indexed
+
+
+def _lexical_write_path(value):
+    """One absolute lexical write, or None when native path rules reject it."""
     require(type(value) is str)
     require(len(value) <= MAX_RECORD_BYTES, reason="too_large")
     path = Path(value)
-    return path.is_absolute() and str(path) == value and ".." not in path.parts and path.parent != path
+    if path.is_absolute() and str(path) == value and ".." not in path.parts and path.parent != path:
+        return path
+    return None
+
+
+def _within_indexed_roots(path, roots):
+    """Walk lexical parents. This never resolves links or touches the filesystem."""
+    current = path
+    while current not in roots:
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
+    return True
+
+
+@_boundary
+def bounded_write_path(value):
+    """True when value is one absolute lexical write path."""
+    return _lexical_write_path(value) is not None
 
 
 @_boundary
 def check_profile(observation, model, effort, cwd, *, write_roots=(), allow_tmpdir=False,
                   allow_special_writes=(), approval_policy="on-request", approvals_reviewer="auto_review"):
-    """Compare requested policy; a matching maintenance profile never qualifies execution."""
+    """Compare requested policy; a matching maintenance profile never qualifies execution.
+
+    Explicit roots are validated once. Each bounded path write is compared by
+    walking its lexical parents. An omitted directory stays an unchecked hold;
+    path writes then ask for an explicit directory or roots.
+    """
     require(type(observation) is dict)
     require(type(allow_special_writes) in (tuple, list, set, frozenset))
     require(len(allow_special_writes) <= 10000, reason="too_large")
@@ -431,11 +468,9 @@ def check_profile(observation, model, effort, cwd, *, write_roots=(), allow_tmpd
         reasons.append("effective restricted permission profile unavailable")
     else:
         require(type(write_roots) in (tuple, list) and len(write_roots) <= 10000)
-        values = write_roots or (cwd,)
-        require(all(type(value) is str or isinstance(value, Path) for value in values))
-        require(all(len(str(value)) <= MAX_RECORD_BYTES for value in values), reason="too_large")
-        roots = [Path(value) for value in values]
-        require(all(value.is_absolute() and ".." not in value.parts and value.parent != value for value in roots))
+        # An omitted directory is not a root. Read-only input keeps the unchecked
+        # hold; recorded path writes ask for an explicit directory or roots.
+        roots = None if not write_roots and cwd is None else _index_write_roots(write_roots or (cwd,))
         for entry in entries:
             if entry["access"] != "write":
                 continue
@@ -443,9 +478,13 @@ def check_profile(observation, model, effort, cwd, *, write_roots=(), allow_tmpd
             if entry["kind"] == "special":
                 if value not in specials:
                     reasons.append("special write access was not requested: " + _shown(value))
-            elif not bounded_write_path(value) or not any(
-                    Path(value) == root or root in Path(value).parents for root in roots):
+                continue
+            path = _lexical_write_path(value)
+            if path is None or (roots is not None and not _within_indexed_roots(path, roots)):
                 reasons.append("write root is outside requested scope: " + _shown(value))
+            elif roots is None:
+                reasons.append("path write comparison requires an explicit directory or roots: "
+                               + _shown(value))
     result = {"state": "PROFILE_HOLD" if reasons else "PROFILE_MATCH", "reasons": reasons, "checks": checks,
               "native_execution_qualified": False, "observation": observation}
     if reasons:

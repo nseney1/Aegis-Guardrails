@@ -58,11 +58,39 @@ class ConfinedFileError(ValueError):
         self.directory_anchor = None
 
 
+def _descriptor_names():
+    return {function.__name__ for function in os.supports_dir_fd}
+
+
+def _directory_flags_supported():
+    return os.name == "posix" and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")
+
+
+def _walk_supported():
+    """Descriptor-relative open and no-follow stat, with directory flags.
+
+    A read does not require publication primitives. A missing walk primitive
+    refuses before any filesystem operation.
+    """
+    follow = {function.__name__ for function in os.supports_follow_symlinks}
+    return (_directory_flags_supported() and {"open", "stat"} <= _descriptor_names()
+            and "stat" in follow)
+
+
 def descriptor_supported():
-    """Whether all primitives needed by this API are available."""
-    names = {function.__name__ for function in os.supports_dir_fd}
-    return (os.name == "posix" and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")
-            and {"open", "mkdir", "link", "rename", "unlink", "stat"} <= names)
+    """Whether confined publication and parent creation are available."""
+    return (_directory_flags_supported()
+            and {"open", "mkdir", "link", "rename", "unlink", "stat"} <= _descriptor_names())
+
+
+def _require_descriptor_mkdir():
+    """Refuse creation unless mkdir accepts a directory descriptor.
+
+    Reads of existing directories do not call this. The refusal is the same
+    one hosts without descriptor-relative mkdir already returned.
+    """
+    if "mkdir" not in _descriptor_names():
+        raise ConfinedFileError("unsupported") from None
 
 
 @contextmanager
@@ -145,7 +173,13 @@ def _directory_fd(name, parent, opener):
 
 def _walk_directory(given, components=(), create=False, inspect=None, on_missing=None, retain=False,
                     opener=None, close_fd=None, cleanup_fd=None, cleanup_stage=None):
-    """One root-anchored walk; inspection and missing-directory policy are optional."""
+    """One root-anchored walk; inspection and missing-directory policy are optional.
+
+    The create branch and a caller's on_missing handler run only when
+    descriptor-relative mkdir is supported. Otherwise this raises
+    ConfinedFileError('unsupported') before either one. Reads of directories
+    that already exist do not require mkdir.
+    """
     close_fd = os.close if close_fd is None else close_fd
     cleanup_fd = close_fd if cleanup_fd is None else cleanup_fd
     descriptors = []
@@ -156,6 +190,7 @@ def _walk_directory(given, components=(), create=False, inspect=None, on_missing
         for index, component in enumerate((*given.parts[1:], *components)):
             parent = descriptors[-1]
             if create and index >= len(given.parts) - 1:
+                _require_descriptor_mkdir()
                 try:
                     os.mkdir(component, 0o700, dir_fd=parent)
                 except FileExistsError:
@@ -166,6 +201,7 @@ def _walk_directory(given, components=(), create=False, inspect=None, on_missing
             except FileNotFoundError:
                 if on_missing is None:
                     raise
+                _require_descriptor_mkdir()
                 on_missing(parent, component)
                 child = _directory_fd(component, parent, opener)
             descriptors.append(child)
@@ -243,6 +279,12 @@ def open_directory(opener, root, *, policy=None, on_missing=None, retain_ancesto
                    close_fd=None, stat_fd=None, stat_entry=None, cleanup_fd=None):
     """Walk an absolute root without following any component; no path fallback.
 
+    Refuse before any filesystem operation unless descriptor-relative open and
+    no-follow stat are supported with the directory flags. Publication stays
+    behind descriptor_supported(). A missing directory is created only when
+    descriptor-relative mkdir is supported; otherwise the walk raises
+    ConfinedFileError('unsupported') before the caller's on_missing handler.
+
     policy(stat_result) validates the leaf before transfer. on_missing(parent_fd,
     name, observations) may create a missing directory under the held parent;
     creation policy and durability belong to that caller. Refusals use this
@@ -258,7 +300,7 @@ def open_directory(opener, root, *, policy=None, on_missing=None, retain_ancesto
     """
     with _refusals("prepare"):
         given = _directory_path(root)
-        if not descriptor_supported():
+        if not _walk_supported():
             raise ConfinedFileError("unsupported")
     close_fd = os.close if close_fd is None else close_fd
     cleanup_fd = close_fd if cleanup_fd is None else cleanup_fd

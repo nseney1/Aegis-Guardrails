@@ -64,16 +64,45 @@ _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _LANE = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}\Z")
 
 
+def _pending_withdrawal(entry):
+    """True only for a fully validated pending record.
+
+    Lane and expected head are exact compare-and-swap tokens. An invalid
+    record contributes no custodian fields and is not echoed.
+    """
+    if type(entry) is not QueueEntry:
+        return False
+    try:
+        validate_entry(entry)
+    except QueueRefused:
+        return False
+    return True
+
+
 class QueueRefused(ValueError):
-    """Fixed input-free diagnostic; no transport or hostile text is echoed."""
+    """Fixed input-free diagnostic; no transport or hostile text is echoed.
+
+    archived_completion also carries the selected pending lane and expected
+    head on next_action. Those tokens stay out of the fixed recovery text.
+    """
 
     # Keep the qualified name used by callers of the original queue module.
     __module__ = "aegis_core.merge_queue"
 
-    def __init__(self, code):
-        super().__init__(REFUSALS[code])
+    def __init__(self, code, withdrawal=None):
+        message = REFUSALS[code]
+        if code == "archived_completion":
+            if not _pending_withdrawal(withdrawal):
+                raise QueueRefused("state_unavailable")
+        elif withdrawal is not None:
+            raise QueueRefused("invalid_request")
+        super().__init__(message)
         self.code = code
-        self.next_action = {"actor": "custodian", "command": REFUSALS[code]}
+        action = {"actor": "custodian", "command": message}
+        if code == "archived_completion":
+            action["lane"] = withdrawal.lane
+            action["expected_head"] = withdrawal.head
+        self.next_action = action
 
 
 def valid_oid(value):
