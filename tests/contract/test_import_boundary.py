@@ -226,6 +226,8 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_qualify": 0,
     "aegis_core.team_queue": 2,
     "aegis_core.team_review_copy": 0,
+    "aegis_core.team_review_files": 0,
+    "aegis_core.team_review_verify": 0,
     "aegis_core.team_roles": 0,
     "aegis_core.team_session_census": 1,
     "aegis_core.team_session_custody": 1,
