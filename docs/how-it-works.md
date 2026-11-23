@@ -465,13 +465,22 @@ Proposal bytes accept sources `insight`, `mine`, `one` and `lint`. Merging propo
 
 ## Git delivery
 
-`aegis_core.team_git` is lane Git plumbing with no subcommand. `snapshot_tree` keeps the real index and returns a tree id. `plan_merge`, `plan_pick` and `plan_revert` return a plan and do not publish. `commit_tested` records a commit in the caller-supplied store. Only `cas_fast_forward` publishes objects and updates a ref. `team_qualify.record_pass` and `team_custody.commit` journal that effect first. `aegis_core.team_gitops` stores the intent and the observed result. It runs neither git nor `gh`. Qualification records use that compare-and-swap and have no CLI, as [architecture](architecture.md#tree-bound-teams-qualification) describes. `Publisher` requires an owner-supplied `gh` adapter and a qualification reader. Its activation is not wired, and nothing turns on a legacy publisher by default.
+The lane Git library keeps worktree snapshots and plans private. A snapshot
+captures the worktree. Merge, pick and revert plans use supplied Git objects, and
+a tested commit uses a supplied tree. Publication updates a ref by
+compare-and-swap. Custody journals the effect before publication, and the merge
+queue checks qualification for the exact landing tree. See
+[tree-bound qualification](architecture.md#tree-bound-teams-qualification).
 
-`aegis_core.merge_queue.MergeQueue` requires qualification for the exact landing tree. `MergeQueue.revalidate` saves its own queue checkpoint, then calls `team_git.cas_fast_forward` to pin the candidate for a separate publisher. It does not write a team_gitops journal. `revalidate` refuses `issued_unresolved` while an issued record or cleanup is set. `check_issued` refuses `issued_unresolved` when that issued checkpoint conflicts or results remain. A refusal's `next_action` names the custodian and a fixed recovery text, and it echoes no transport text. Automatic landing remains separate work.
-
-`snapshot_tree` refuses `unsupported_platform` unless `descriptor_support` is true: `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `stat` and `readlink`. Plans and commits of an already supplied tree do not use that check. The work queue refuses `unsupported_platform` unless `storage.confined_descriptor_supported` is true: `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `mkdir`, `link`, `rename`, `unlink` and `stat`. That function does not use `readlink`. The proposal store refuses `unsupported` on that same function. Both are false when `os.name` is not `posix`, so Windows fails them. Neither function tests for macOS. Qualification writes call `team_qualify.descriptor_supported` and otherwise refuse `unsupported_platform`. That function is true only when `team_git.descriptor_support` is true, `team_gitops.descriptor_supported` is true (`fcntl` is available and `storage.confined_descriptor_supported` is true), and `gitops_fds.descriptor_supported` is true (`sys.platform` is `linux`, `os.name` is `posix`, and `prctl(37)` returns 0).
-
-`MergeQueue.prepare` refuses `unsupported_platform` unless the snapshot and qualification probes pass, including Linux subreaper support. See [Git delivery in the architecture guide](architecture.md#git-delivery).
+Worktree snapshots, supplied-object Git plans and tested commits, the work queue
+and the proposal store are unavailable on Windows. Plans and tested commits skip
+the snapshot check and still require descriptor procfs (`/proc/self/fd`) and
+native Git. Linux subreaper support is required for qualification writes and
+merge-queue admission, candidate preparation, issued checks, landing observation
+and reconciliation. Publisher activation is still unwired, and automatic
+landing remains separate work.
+Processes sharing the trusted owner UID can access owner records despite file
+modes. See [Teams platform capabilities](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/architecture.md#teams-platform-capabilities).
 
 ## Cheat sheet
 
