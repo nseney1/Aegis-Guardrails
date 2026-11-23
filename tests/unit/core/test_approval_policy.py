@@ -3,8 +3,10 @@ import ast
 from concurrent.futures import ThreadPoolExecutor
 import difflib
 import json
+import os
 from pathlib import Path
 import random
+import shutil
 import string
 import sys
 from string import Formatter
@@ -630,6 +632,150 @@ def _add_overlapping_remotes(project):
     project.git("config", "--local", "remote.team/fork.fetch", "+refs/heads/*:refs/remotes/team/fork/*")
 
 
+# One session repository per base policy. The bound is above a three-commit
+# selector project and stops a walk before it reads file bytes.
+_SELECTOR_ENTRY_LIMIT = 4096
+_SELECTOR_POLICIES = (
+    ("legacy", None),
+    ("known-none", {"main": "none", "*": "signature"}),
+    ("known-signature", {"main": "signature", "*": "none"}),
+)
+
+
+def _selector_policy_token(base_policy):
+    for token, policy in _SELECTOR_POLICIES:
+        if policy == base_policy:
+            return token
+    raise AssertionError("selector template has no base policy")
+
+
+def _walk_selector(root, *, read, limit):
+    """List a template without following links. Refuse before reading bytes when over limit."""
+    if root.is_symlink():
+        return True, ()
+    entries = []
+    pending = [root]
+    seen = 0
+    while pending:
+        current = pending.pop()
+        try:
+            children = list(current.iterdir())
+        except OSError:
+            raise AssertionError("selector template cannot be read")
+        seen += len(children)
+        if seen > limit:
+            raise AssertionError("selector template is too large")
+        for path in children:
+            relative = path.relative_to(root).as_posix()
+            if path.is_symlink():
+                if not read:
+                    return True, ()
+                entries.append((relative, "link", str(path.readlink())))
+                continue
+            if path.is_dir():
+                if read:
+                    entries.append((relative, "dir"))
+                pending.append(path)
+                continue
+            if read and path.is_file():
+                entries.append((relative, "file", path.read_bytes()))
+    return False, tuple(sorted(entries))
+
+
+def _selector_state(root):
+    linked, entries = _walk_selector(root, read=True, limit=_SELECTOR_ENTRY_LIMIT)
+    if linked or any(kind == "link" for _relative, kind, *_rest in entries):
+        raise AssertionError("selector template contains a symlink")
+    return entries
+
+
+def _bind_copied_repo(root, home):
+    # Skip Repo.__init__: it runs git init and would replace the copied project.
+    project = hg.Repo.__new__(hg.Repo)
+    project.root = root
+    project.home = home
+    return project
+
+
+def _copy_selector_project(template, directory, *, entry_limit=_SELECTOR_ENTRY_LIMIT):
+    """Copy one session template into directory/project. The template is only read."""
+    destination = directory / "project"
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError("selector copy destination exists")
+    linked, _entries = _walk_selector(template.root, read=False, limit=entry_limit)
+    if linked:
+        raise AssertionError("selector template contains a symlink")
+    shutil.copytree(template.root, destination, symlinks=True)
+    project = _bind_copied_repo(destination, hg.Home(directory / "home"))
+    if (project.head() != template.head
+            or project.git("rev-parse", "refs/heads/main") != template.base
+            or project.git("rev-parse", "refs/tags/ambiguous") != template.older):
+        raise AssertionError("copied selector project does not match its template")
+    return project
+
+
+def _build_selector_template(directory, base_policy):
+    """Build one immutable selector repository under a private home.
+
+    Inherited GIT_CONFIG_GLOBAL is hidden for the build, matching the policy
+    fixture, and restored even when construction fails.
+    """
+    removed = os.environ.pop("GIT_CONFIG_GLOBAL", None)
+    try:
+        home = hg.Home(directory / "home")
+        project = hg.Repo(directory / "project", home)
+        project.write(".aegis/config.json", json.dumps({"approvals": base_policy} if base_policy is not None else {}))
+        project.write("README.md", "tag base\n")
+        older = project.commit("tag base")
+        project.write("README.md", "branch base\n")
+        base = project.commit("branch base")
+        project.git("update-ref", "refs/remotes/origin/main", base)
+        project.git("update-ref", "refs/remotes/upstream/main", base)
+        project.git("update-ref", "refs/remotes/team/fork/main", base)
+        project.git("update-ref", "refs/remotes/team/fork/HEAD", base)
+        project.git("update-ref", "refs/remotes/unknown/main", base)
+        project.git("update-ref", "refs/remotes/origin/release+1", base)
+        project.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+        project.git("symbolic-ref", "refs/heads/alias", "refs/heads/main")
+        project.git("update-ref", "refs/aegis/example", base)
+        project.git("tag", "v1.2", base)
+        project.git("tag", "ambiguous", older)
+        project.git("branch", "ambiguous", base)
+        for remote in ("origin", "upstream"):
+            project.git("remote", "add", remote, "/not-contacted")
+        _add_overlapping_remotes(project)
+        project.branch("work")
+        project.git("branch", "--set-upstream-to=origin/main", "work")
+        project.write(".github/workflows/ci.yml", "name: changed\n")
+        head = project.commit("workflow")
+        (project.root / ".git" / "FETCH_HEAD").write_text(base + "\n", encoding="ascii")
+        project.git("update-ref", "ORIG_HEAD", base)
+        if (project.head() != head or project.git("rev-parse", "refs/heads/main") != base
+                or project.git("rev-parse", "refs/tags/ambiguous") != older):
+            raise AssertionError("selector template head drifted during construction")
+        template = SimpleNamespace(root=project.root, older=older, base=base, head=head)
+        template.baseline = _selector_state(template.root)
+        return template
+    finally:
+        if removed is not None:
+            os.environ["GIT_CONFIG_GLOBAL"] = removed
+
+
+@pytest.fixture(scope="session")
+def _selector_templates(tmp_path_factory):
+    """Three immutable Git projects per worker, one for each base policy."""
+    if not hg.git_ok():
+        pytest.skip("needs git")
+    root = tmp_path_factory.mktemp("approval-selector-templates")
+    templates = {}
+    for token, base_policy in _SELECTOR_POLICIES:
+        templates[token] = _build_selector_template(root / token, base_policy)
+    yield templates
+    for template in templates.values():
+        if _selector_state(template.root) != template.baseline:
+            raise AssertionError("selector template changed after its cases")
+
+
 @pytest.mark.parametrize("base_policy", [None, {"main": "none", "*": "signature"},
                                          {"main": "signature", "*": "none"}],
                          ids=["legacy", "known-none", "known-signature"])
@@ -641,36 +787,13 @@ def _add_overlapping_remotes(project):
     "origin/HEAD-direct", "team/fork/main", "refs/remotes/team/fork/main", "slash-upstream",
     "unknown/main", "refs/heads/HEAD", "refs/remotes/team/fork/HEAD", "refs/remotes/origin/release+1",
 ])
-def test_git_selector_table_agrees_across_public_commands(tmp_path, _policy_environment, monkeypatch, capsys, base_policy, form):
+def test_git_selector_table_agrees_across_public_commands(tmp_path, _policy_environment, monkeypatch, capsys,
+                                                         base_policy, form, _selector_templates):
     if not hg.git_ok():
         pytest.skip("needs git")
-    project = hg.Repo(tmp_path / "project", hg.Home(tmp_path / "home"))
-    project.write(".aegis/config.json", json.dumps({"approvals": base_policy} if base_policy is not None else {}))
-    project.write("README.md", "tag base\n")
-    older = project.commit("tag base")
-    project.write("README.md", "branch base\n")
-    base = project.commit("branch base")
-    project.git("update-ref", "refs/remotes/origin/main", base)
-    project.git("update-ref", "refs/remotes/upstream/main", base)
-    project.git("update-ref", "refs/remotes/team/fork/main", base)
-    project.git("update-ref", "refs/remotes/team/fork/HEAD", base)
-    project.git("update-ref", "refs/remotes/unknown/main", base)
-    project.git("update-ref", "refs/remotes/origin/release+1", base)
-    project.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
-    project.git("symbolic-ref", "refs/heads/alias", "refs/heads/main")
-    project.git("update-ref", "refs/aegis/example", base)
-    project.git("tag", "v1.2", base)
-    project.git("tag", "ambiguous", older)
-    project.git("branch", "ambiguous", base)
-    for remote in ("origin", "upstream"):
-        project.git("remote", "add", remote, "/not-contacted")
-    _add_overlapping_remotes(project)
-    project.branch("work")
-    project.git("branch", "--set-upstream-to=origin/main", "work")
-    project.write(".github/workflows/ci.yml", "name: changed\n")
-    head = project.commit("workflow")
-    (project.root / ".git" / "FETCH_HEAD").write_text(base + "\n", encoding="ascii")
-    project.git("update-ref", "ORIG_HEAD", base)
+    template = _selector_templates[_selector_policy_token(base_policy)]
+    project = _copy_selector_project(template, tmp_path)
+    older, base, head = template.older, template.base, template.head
     selector = form
     if form == "empty":
         selector = ""
@@ -746,6 +869,173 @@ def test_git_selector_table_agrees_across_public_commands(tmp_path, _policy_envi
                 assert "fetch-depth" not in captured.out + captured.err
             assert observed == [(expected_base, expected_target, expected_mode)]
         assert project.head() == head
+
+
+def _restore_git_config_global(previous):
+    if previous is None:
+        os.environ.pop("GIT_CONFIG_GLOBAL", None)
+    else:
+        os.environ["GIT_CONFIG_GLOBAL"] = previous
+
+
+def test_selector_policy_token_refuses_an_unknown_policy_without_echo():
+    value = "not-a-policy"
+    with pytest.raises(AssertionError, match="^selector template has no base policy$") as caught:
+        _selector_policy_token({"main": value})
+    assert value not in str(caught.value)
+
+
+def test_selector_templates_are_one_repository_per_base_policy(tmp_path, _selector_templates):
+    if not hg.git_ok():
+        pytest.skip("needs git")
+    assert tuple(_selector_templates) == tuple(token for token, _policy in _SELECTOR_POLICIES)
+    heads = set()
+    configs = set()
+    for token, template in _selector_templates.items():
+        case = tmp_path / token
+        case.mkdir()
+        project = _copy_selector_project(template, case)
+        assert project.root != template.root
+        assert project.head() == template.head
+        assert _selector_state(project.root) == template.baseline
+        heads.add(template.head)
+        configs.add((project.root / ".aegis" / "config.json").read_bytes())
+    assert len(heads) == len(_SELECTOR_POLICIES)
+    assert len(configs) == len(_SELECTOR_POLICIES)
+
+
+def test_selector_copy_failure_leaves_the_template_and_retry_matches(tmp_path, _selector_templates):
+    if not hg.git_ok():
+        pytest.skip("needs git")
+    template = _selector_templates["known-none"]
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    (blocked / "project").mkdir()
+    with pytest.raises(FileExistsError, match="^selector copy destination exists$"):
+        _copy_selector_project(template, blocked)
+    assert list((blocked / "project").iterdir()) == []
+    assert _selector_state(template.root) == template.baseline
+    retry = tmp_path / "retry"
+    retry.mkdir()
+    project = _copy_selector_project(template, retry)
+    assert project.head() == template.head
+    assert _selector_state(project.root) == template.baseline
+    assert json.loads((project.root / ".aegis" / "config.json").read_text(encoding="utf-8")) == {
+        "approvals": {"main": "none", "*": "signature"}}
+
+
+def test_selector_copy_refuses_a_symlink_destination_before_copy(tmp_path, _selector_templates):
+    from tests.conftest import symlink_or_skip
+    if not hg.git_ok():
+        pytest.skip("needs git")
+    template = _selector_templates["legacy"]
+    case = tmp_path / "case"
+    case.mkdir()
+    real = tmp_path / "real"
+    real.mkdir()
+    symlink_or_skip(real, case / "project", target_is_directory=True)
+    with pytest.raises(FileExistsError, match="^selector copy destination exists$"):
+        _copy_selector_project(template, case)
+    assert list(real.iterdir()) == []
+    assert _selector_state(template.root) == template.baseline
+
+
+def test_selector_copy_refuses_a_symlinked_template_file_before_copy(tmp_path):
+    from tests.conftest import symlink_or_skip
+    source = tmp_path / "template"
+    source.mkdir()
+    (source / "README.md").write_bytes(b"tag base\n")
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"outside\n")
+    symlink_or_skip(outside, source / "link")
+    template = SimpleNamespace(root=source, head="unused", base="unused", older="unused")
+    case = tmp_path / "case"
+    case.mkdir()
+    with pytest.raises(AssertionError, match="^selector template contains a symlink$"):
+        _copy_selector_project(template, case)
+    assert not (case / "project").exists()
+    assert outside.read_bytes() == b"outside\n"
+
+
+def test_selector_copy_refuses_an_oversized_template_before_copy(tmp_path):
+    source = tmp_path / "template"
+    source.mkdir()
+    (source / "one").write_bytes(b"a")
+    (source / "two").write_bytes(b"b")
+    template = SimpleNamespace(root=source, head="unused", base="unused", older="unused")
+    case = tmp_path / "case"
+    case.mkdir()
+    with pytest.raises(AssertionError, match="^selector template is too large$"):
+        _copy_selector_project(template, case, entry_limit=1)
+    assert not (case / "project").exists()
+    assert (source / "one").read_bytes() == b"a"
+    assert _SELECTOR_ENTRY_LIMIT >= 128
+
+
+def test_selector_copies_stay_independent_across_threads(tmp_path, _selector_templates):
+    if not hg.git_ok():
+        pytest.skip("needs git")
+    template = _selector_templates["known-signature"]
+    def one(index):
+        directory = tmp_path / ("copy-" + str(index))
+        directory.mkdir()
+        project = _copy_selector_project(template, directory)
+        project.git("update-ref", "refs/heads/mutated", template.head)
+        return project.git("rev-parse", "refs/heads/mutated")
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        found = list(executor.map(one, range(4)))
+    assert found == [template.head] * 4
+    assert _selector_state(template.root) == template.baseline
+    assert not (template.root / ".git" / "refs" / "heads" / "mutated").exists()
+    for index in range(4):
+        mutated = tmp_path / ("copy-" + str(index)) / "project" / ".git" / "refs" / "heads" / "mutated"
+        assert mutated.read_text(encoding="ascii").strip() == template.head
+
+
+def test_selector_template_build_refuses_a_file_and_retries(tmp_path):
+    if not hg.git_ok():
+        pytest.skip("needs git")
+    previous = os.environ.get("GIT_CONFIG_GLOBAL")
+    marker = tmp_path / "global.gitconfig"
+    marker.write_text("", encoding="utf-8")
+    os.environ["GIT_CONFIG_GLOBAL"] = str(marker)
+    try:
+        blocked = tmp_path / "blocked"
+        blocked.write_bytes(b"x")
+        with pytest.raises((FileExistsError, NotADirectoryError)):
+            _build_selector_template(blocked, None)
+        assert os.environ.get("GIT_CONFIG_GLOBAL") == str(marker)
+        assert blocked.read_bytes() == b"x"
+        template = _build_selector_template(tmp_path / "fresh", None)
+        assert os.environ.get("GIT_CONFIG_GLOBAL") == str(marker)
+        case = tmp_path / "case"
+        case.mkdir()
+        project = _copy_selector_project(template, case)
+        assert project.head() == template.head
+        assert json.loads((project.root / ".aegis" / "config.json").read_text(encoding="utf-8")) == {}
+    finally:
+        _restore_git_config_global(previous)
+
+
+def test_selector_template_ignores_global_git_template_dir(tmp_path):
+    if not hg.git_ok():
+        pytest.skip("needs git")
+    template_dir = tmp_path / "developer-template"
+    (template_dir / "hooks").mkdir(parents=True)
+    (template_dir / "hooks" / "pre-commit").write_text("#!/bin/sh\nexit 86\n", encoding="utf-8")
+    config = tmp_path / "global.gitconfig"
+    config.write_text("[init]\n\ttemplateDir = " + json.dumps(template_dir.as_posix()) + "\n",
+                      encoding="utf-8")
+    previous = os.environ.get("GIT_CONFIG_GLOBAL")
+    os.environ["GIT_CONFIG_GLOBAL"] = str(config)
+    try:
+        built = _build_selector_template(tmp_path / "built", {"main": "signature", "*": "none"})
+        assert not (built.root / ".git" / "hooks" / "pre-commit").exists()
+        assert os.environ.get("GIT_CONFIG_GLOBAL") == str(config)
+        assert json.loads((built.root / ".aegis" / "config.json").read_text(encoding="utf-8")) == {
+            "approvals": {"main": "signature", "*": "none"}}
+    finally:
+        _restore_git_config_global(previous)
 
 
 @pytest.mark.parametrize("has_map", [False, True])

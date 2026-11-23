@@ -38,7 +38,7 @@ _MAX_BYTES = 65536
 _GIT_BYTES = 8192
 _DEADLINE_SECONDS = 10.0
 _OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
-# A .git file or admin gitdir file holds one path and Git's final LF.
+# A .git file, commondir, or admin gitdir file is one path record.
 _LINK_BYTES = 8192
 _UNREPRESENTABLE = "Target diagnostic text is not valid Unicode and is not shown."
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
@@ -387,16 +387,39 @@ def _read_metadata(path: Path) -> Optional[bytes]:
 
 
 def _link_value(raw: Optional[bytes], prefix: bytes = b"") -> Optional[str]:
-    if raw is None or not raw.startswith(prefix) or not raw.endswith(b"\n"):
+    """Decode one gitfile or admin path record, or None when the shared codec refuses it.
+
+    Git strips a trailing CR/LF run and then accepts a remaining CR or LF as
+    part of the name. This decoder strips that same run, then refuses a
+    remaining CR or LF. gitfile framing applies only to the ``gitdir: ``
+    prefix. commondir and the admin gitdir back-pointer are records. The
+    bounded reader stays outside.
+    """
+    if raw is None:
         return None
-    value = raw[len(prefix):-1]
-    if not value or b"\0" in value:
+    from aegis_core.git_path_codec import path_text
+
+    gitfile = prefix == b"gitdir: "
+    if prefix and not gitfile:
         return None
-    return _decode(value)
+    try:
+        text = path_text(raw, gitfile=True) if gitfile else path_text(raw, record=True)
+    except gitsafe.GitError:
+        return None
+    if not isinstance(text, str) or not text:
+        return None
+    # The codec accepted the line. The module seam still refuses an injected
+    # undecodable value of those same bytes.
+    try:
+        encoded = os.fsencode(text)
+    except UnicodeEncodeError:
+        return None
+    decoded = _decode(encoded)
+    return decoded if decoded == text else None
 
 
 def _read_link(path: Path, prefix: bytes = b"") -> Optional[str]:
-    """A bounded no-follow path record; only Git's final LF is removed."""
+    """A bounded no-follow path record, decoded by the shared Git path codec."""
     return _link_value(_read_metadata(path), prefix)
 
 
