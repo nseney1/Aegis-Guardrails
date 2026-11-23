@@ -19,9 +19,9 @@ import uuid
 
 import pytest
 
+from tests.helpers_mailbox_index import make_mailbox, publish
 from tests.integration.test_hierarchy_delivery import HELPER
 from tests.integration.test_hierarchy_mailbox import ROOT, git, invoke
-from tests.integration.test_hierarchy_mailbox_index_reuse import make_mailbox, publish
 from tests.integration.test_hierarchy_provision import INITIATIVE, LANES, Setup, provision
 from tests.conftest import symlink_or_skip
 
