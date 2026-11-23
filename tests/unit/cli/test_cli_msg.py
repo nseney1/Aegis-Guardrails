@@ -17,7 +17,8 @@ from conftest import symlink_or_skip
 
 from aegis_cli.cli import main
 from aegis_core import message_codec as codec
-from tests.unit.core.test_message_codec import make_store
+from tests.unit.core.test_message_codec import (make_store, stored_log, _counting, _CANONICAL, _ISOLATE,
+                                                _LOOKUP, _PARSE, _STORE_READ, _STORE_VERIFIED)
 
 
 GOLDENS = json.loads((Path(__file__).parents[1] / "core" / "message_codec_goldens.json").read_text(encoding="utf-8"))
@@ -1163,3 +1164,135 @@ def test_invalid_read_options_have_identical_frontend_refusals_before_io(
     assert not opened
     if record_state == "no-store":
         assert not directory.parent.exists()
+
+
+def _observe(codes):
+    seen = {code: [] for code in codes}
+    previous = sys.getprofile()
+
+    def observe(frame, event, _arg):
+        # A generator resume after yield is another call event for the same scope.
+        if (event == "call" and frame.f_code in seen and
+                frame.f_lineno == frame.f_code.co_firstlineno):
+            seen[frame.f_code].append(frame.f_locals.get("reference"))
+
+    sys.setprofile(observe)
+    return seen, previous
+
+
+@pytest.mark.parametrize("width", [16, 64])
+def test_verify_one_scope_both_widths(store, workspace, capsys, width):
+    rid = store.write(GOLDENS[0]["record"])
+    lookup, canonical = codec.Store._lookup.__wrapped__.__code__, codec.canonical.__code__
+    seen, previous = _observe((lookup, canonical))
+    try:
+        status = invoke(store, "verify", rid[:width])
+    finally:
+        sys.setprofile(previous)
+    output = capsys.readouterr()
+    assert status == 0 and not output.err
+    assert json.loads(output.out) == {"id": rid, "ref": rid[:16], "verified": True}
+    assert seen[lookup] == [rid[:width]]
+    assert len(seen[canonical]) == 1
+
+
+def test_verify_failure_is_one_scope_and_retries(store, workspace, capsys):
+    value = GOLDENS[0]["record"]
+    rid = store.write(value)
+    path = store.root / rid[:2] / (rid + ".json")
+    original = path.read_bytes()
+    path.write_bytes(b"HOSTILE_MARKER")
+    lookup = codec.Store._lookup.__wrapped__.__code__
+    seen, previous = _observe((lookup,))
+    try:
+        status = invoke(store, "verify", rid)
+    finally:
+        sys.setprofile(previous)
+    assert status == 2
+    assert_error(capsys.readouterr(), "E_HASH")
+    assert seen[lookup] == [rid]
+    assert path.read_bytes() == b"HOSTILE_MARKER"
+    assert list(path.parent.iterdir()) == [path]
+    path.write_bytes(original)
+    assert invoke(store, "verify", rid[:16]) == 0
+    assert json.loads(capsys.readouterr().out) == {"id": rid, "ref": rid[:16], "verified": True}
+    assert invoke(store, "verify", "abcd\n" + "e" * 16) == 2
+    assert_error(capsys.readouterr(), "E_REF", "handle")
+
+
+def test_verify_sharded_ambiguity_preserves_bytes(store, workspace, capsys):
+    rid = store.write(GOLDENS[0]["record"])
+    sibling = rid[:16] + ("b" * 48 if rid[16:] != "b" * 48 else "c" * 48)
+    sibling_path = store.root / sibling[:2] / (sibling + ".json")
+    sibling_path.write_bytes(b"{}")
+    real = store.root / rid[:2] / (rid + ".json")
+    before = real.read_bytes()
+    assert invoke(store, "verify", rid[:16]) == 2
+    assert_error(capsys.readouterr(), "E_REF", "resolution")
+    assert real.read_bytes() == before and sibling_path.read_bytes() == b"{}"
+    assert invoke(store, "verify", rid) == 0
+    assert json.loads(capsys.readouterr().out) == {"id": rid, "ref": rid[:16], "verified": True}
+    assert real.read_bytes() == before and sibling_path.read_bytes() == b"{}"
+
+
+@pytest.mark.parametrize("fmt", ["json", "md", "tsv"])
+def test_stored_outline_encode_count_matches_one_verified_read(store, workspace, capsys, fmt):
+    value = copy.deepcopy(GOLDENS[0]["record"])
+    value["body"] = "outline\n" + "x" * 2000
+    rid = store.write(value)
+    canonical = codec.canonical.__code__
+    seen, previous = _observe((canonical,))
+    try:
+        status = invoke(store, "read", rid[:16], "--outline", "--format", fmt)
+    finally:
+        sys.setprofile(previous)
+    output = capsys.readouterr()
+    assert status == 0 and not output.err
+    assert len(seen[canonical]) == 1
+    assert output.out == codec.read_view(store.read(rid), outline=True, format=fmt, store=store)
+
+
+def test_stored_selection_still_encodes_after_verification(store, workspace, capsys):
+    rid = store.write(GOLDENS[0]["record"])
+    canonical = codec.canonical.__code__
+    seen, previous = _observe((canonical,))
+    try:
+        status = invoke(store, "read", rid, "--fields", "body", "--outline")
+    finally:
+        sys.setprofile(previous)
+    output = capsys.readouterr()
+    assert status == 0 and not output.err
+    assert len(seen[canonical]) == 2
+    assert output.out == codec.read_view(store.read(rid), selectors=["body"], outline=True, store=store)
+
+
+@pytest.mark.parametrize("width", [16, 64])
+@pytest.mark.parametrize("action,flags,options", [
+    ("verify", [], {}),
+    ("read", ["--outline"], {"outline": True}),
+    ("read", [], {}),
+    ("read", ["--outline", "--fields", "body"], {"outline": True, "selectors": ["body"]}),
+    ("read", ["--outline", "--spans", "0"], {"outline": True, "spans": [0]}),
+    ("read", ["--outline", "--since", "0", "--fields", "rows.0"],
+     {"outline": True, "since": "0", "selectors": ["rows.0"]}),
+    ("read", ["--outline", "--expand", "child"], {"outline": True, "expand": ["child"]}),
+], ids=["verify", "outline", "default", "selected", "span", "cursor", "expand"])
+def test_cli_stored_operation_has_no_record_copy(store, workspace, capsys, width, action, flags, options):
+    value, rid = stored_log(store, with_child="expand" in options)
+    with _counting(_LOOKUP, _PARSE, _CANONICAL, _ISOLATE, _STORE_READ, _STORE_VERIFIED) as seen:
+        status = invoke(store, action, rid[:width], *flags)
+
+    output = capsys.readouterr()
+    assert status == 0 and not output.err
+    if action == "verify":
+        assert output.out == json.dumps({"id": rid, "ref": rid[:16], "verified": True}, separators=(",", ":")) + "\n"
+    else:
+        assert output.out == codec.read_view(value, store=store, **options)
+    child = list(value["refs"].values())
+    assert seen[_LOOKUP] == [rid[:width], *child]
+    assert len(seen[_PARSE]) == 1 + len(child)
+    assert len(seen[_ISOLATE]) == 0
+    verified = action == "verify" or options == {"outline": True}
+    assert seen[_STORE_VERIFIED] == ([rid[:width]] if verified else [])
+    assert seen[_STORE_READ] == ([] if verified else [rid[:width], *child])
+    assert len(seen[_CANONICAL]) == (1 if verified else 2 + len(child))
