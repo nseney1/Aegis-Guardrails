@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-from aegis_core import hosts, pathlookup
+from aegis_core import hosts, pathlookup_gitcache
 from aegis_core._version import __version__
 from aegis_core.bootstrap import instructions_text
 from aegis_core.config import env_client, env_manager_registration, env_workspace
@@ -462,9 +462,9 @@ def _initialize_queue(req_id, params):
 
 
 def _arm_ordinary_root(binding):
-    """Install the canonical root after discovery; the caller owns the reset token."""
-    root = os.path.normcase(os.fspath(binding.root)) if binding.bound else None
-    return pathlookup.ordinary_root.set(root)
+    """Context that installs the canonical root after discovery and always resets it."""
+    root = binding.root if binding.bound else None
+    return pathlookup_gitcache.bound_ordinary_root(root)
 
 
 def _queue_claim_call(req_id, params):
@@ -476,31 +476,31 @@ def _queue_claim_call(req_id, params):
         return _json_tool_result(req_id, invalid, True)
     if _queue_error is not None or _queue_grant is None:
         return _json_tool_result(req_id, queue_role.refusal(_queue_error or "role_missing"), True)
-    reset = None
-    try:
-        binding = _bind(params, {})
-        reset = _arm_ordinary_root(binding)
-        if not binding.bound or str(binding.root) != _queue_grant.workspace:
+    with contextlib.ExitStack() as ordinary_scope:
+        try:
+            binding = _bind(params, {})
+            ordinary_scope.enter_context(_arm_ordinary_root(binding))
+            if not binding.bound or str(binding.root) != _queue_grant.workspace:
+                return _json_tool_result(req_id, queue_role.refusal("queue_io_unavailable"), True)
+            result = execute_tool("aegis_team_queue_claim", args, queue_grant=_queue_grant, queue_session=_session_id)
+            return _json_tool_result(req_id, result, bool(result.get("refused")))
+        except Exception:
             return _json_tool_result(req_id, queue_role.refusal("queue_io_unavailable"), True)
-        result = execute_tool("aegis_team_queue_claim", args, queue_grant=_queue_grant, queue_session=_session_id)
-        return _json_tool_result(req_id, result, bool(result.get("refused")))
-    except Exception:
-        return _json_tool_result(req_id, queue_role.refusal("queue_io_unavailable"), True)
-    finally:
-        if reset is not None:
-            pathlookup.ordinary_root.reset(reset)
 
 
 def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    # Discovery, including reentrant calls, always starts without a bound fence.
-    token = pathlookup.ordinary_root.set(None)
-    try:
+    """Dispatch one request and restore the caller's root on exit.
+
+    Discovery starts clear, including during reentrant requests.
+    """
+    ordinary_scope = pathlookup_gitcache.bound_ordinary_root(None)
+    with ordinary_scope:
         return _handle_request(request)
-    finally:
-        pathlookup.ordinary_root.reset(token)
 
 
 def _handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Route a request within the discovery scope opened by handle_request."""
+
     global _session_id, _client_platform, _client_name, _client_version, _roots_capable, _host_roots
 
     if not isinstance(request, dict):
@@ -597,14 +597,14 @@ def _repository_call(req_id, params, name, args):
     # The client never chooses the workspace or the attribution of what it reports.
     args = strip_server_owned(args)
     binding = _bind(params, args)
-    reset = _arm_ordinary_root(binding)
-    try:
+    ordinary_scope = _arm_ordinary_root(binding)
+    with ordinary_scope:
         return _finish_repository_call(req_id, name, args, binding)
-    finally:
-        pathlookup.ordinary_root.reset(reset)
 
 
 def _finish_repository_call(req_id, name, args, binding):
+    """Apply the completed workspace binding and dispatch the repository tool."""
+
     if binding.bound:
         args["workspace"] = _workspace_for(binding)
         args["_binding"] = binding.source
