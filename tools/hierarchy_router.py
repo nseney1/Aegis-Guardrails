@@ -11,14 +11,12 @@ from __future__ import annotations
 
 import argparse
 import copy
-from collections import OrderedDict
 from contextlib import contextmanager
 from functools import wraps
 import os
 import stat
 import sys
 import threading
-from threading import Lock
 from types import SimpleNamespace
 import time
 from pathlib import Path, PurePath, PureWindowsPath
@@ -516,35 +514,25 @@ class _MailboxReader:
     def __init__(self, mailbox):
         self._mailbox = mailbox
         self._reader_lock = threading.RLock()
-        self._index = self._shadow = self._index_lock = None
         self._diagnostics = ([], None, [])
 
     def _observe(self, history, read_index):
         # _read holds _reader_lock throughout this comparison.
         try:
-            if self._index_lock is None:
-                self._index_lock = Lock()
             operation = getattr(self._mailbox, "operation", None)
             guard = operation.path_guard if operation is not None else _operation_guard()
-            with self._index_lock, copy.copy(guard).active():
-                if self._shadow is None:
-                    self._shadow = _shadow_mailbox(self._mailbox)
-                authority = self._shadow
+            with copy.copy(guard).active():
+                authority = _shadow_mailbox(self._mailbox)
                 authority.messages = lambda: dict(history)
                 try:
-                    if self._index is None:
-                        self._index = MailboxIndex(authority, mode="shadow")
-                    index = self._index
+                    index = MailboxIndex(authority, mode="shadow")
                     read_index(index)
                     divergence = index.last_divergence
                     self._diagnostics = copy.deepcopy((divergence, index.last_reconciliation, index.content_changed))
                 finally:
                     del authority.messages
-                if divergence:
-                    self._index = self._shadow = None
         except BaseException:
             self._diagnostics = ([{"kind": "mailbox_index_error", "text": "shadow index read failed"}], None, [])
-            self._index = self._shadow = self._index_lock = None
 
     def _read(self, read_pinned, read_index):
         with self._reader_lock:
@@ -576,23 +564,9 @@ class _MailboxReader:
             return copy.deepcopy(self._diagnostics[2])
 
 
-_MAILBOX_READERS = OrderedDict()
-_MAILBOX_READERS_LOCK = Lock()
-_MAILBOX_READER_CACHE_LIMIT = 16
-
-
 def mailbox_reader(mailbox):
-    """Return the explicit shadow facade for this exact Mailbox authority."""
-    key = (mailbox.root, os.getpid(), id(mailbox))
-    with _MAILBOX_READERS_LOCK:
-        reader = _MAILBOX_READERS.get(key)
-        if reader is None:
-            if len(_MAILBOX_READERS) >= _MAILBOX_READER_CACHE_LIMIT:
-                _MAILBOX_READERS.popitem(last=False)
-            reader = _MailboxReader(mailbox)
-            _MAILBOX_READERS[key] = reader
-        _MAILBOX_READERS.move_to_end(key)
-        return reader
+    """Construct a shadow reader for this mailbox authority."""
+    return _MailboxReader(mailbox)
 
 
 def prior_delivery(mailbox, team, key, raw):
