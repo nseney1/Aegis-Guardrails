@@ -84,7 +84,7 @@ def run_safety_gate(
         cmd = args.get("CommandLine", "")
     if not cmd or not isinstance(cmd, str) or not cmd.strip():
         reason = "Unable to parse command — requesting confirmation"
-        log_gate_event(cmd or "", "BLOCKED", reason, root)
+        log_gate_event(cmd if isinstance(cmd, str) else "", "BLOCKED", reason, root)
         return 0, {
             "decision": "force_ask",
             "reason": f"🛡️ Safety Gate: {reason}",
