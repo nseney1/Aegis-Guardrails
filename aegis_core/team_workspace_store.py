@@ -556,6 +556,8 @@ class WorkspaceStore:
         _record(data)
         bounded_tree(data)
         require(ledger.seq < MAX_RECORDS, reason="too_large")
+        # Publication and the returned event keep this snapshot, not the caller's containers.
+        data = deepcopy(data)
         schema = SUPERSEDE_EVENT_SCHEMA if kind == "request" and "supersedes" in data else EVENT_SCHEMA
         event = {"schema": schema, "seq": ledger.seq + 1, "at": timestamp(), "kind": kind, "data": data}
         event = _events.validate_envelope(

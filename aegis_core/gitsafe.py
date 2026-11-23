@@ -302,12 +302,12 @@ def _layout(cwd: Path | str) -> Optional[Layout]:
             raise
         return None
     # In a bare repository or inside .git, git dies on --show-toplevel after the first three lines.
-    lines = [os.fsdecode(line) for line in res.stdout.split(b"\n")[:-1]]
+    lines = gitsafe_run.path_text(res.stdout).split("\n") if res.stdout else []
     if len(lines) == (4 if res.returncode == 0 else 3):
         # An old git echoes the flag it does not know: read as shallow, the side that caches nothing.
         # git prints C:/x on Windows; normpath gives the separators Path and the callers use.
-        top = lines[3].strip() if len(lines) == 4 else ""
-        return Layout(lines[0].strip(), lines[1].rstrip("\r"), lines[2].strip() != "false", os.path.normpath(top) if top else None)
+        top = lines[3] if len(lines) == 4 else ""
+        return Layout(lines[0], lines[1], lines[2].strip() != "false", os.path.normpath(top) if top else None)
     common = _text(["rev-parse", "--git-common-dir"], cwd) if lines else None
     if common is None:
         return None
@@ -315,7 +315,7 @@ def _layout(cwd: Path | str) -> Optional[Layout]:
     # call, and shallow assumed so that nothing about it is kept beyond the request.
     prefix = _out(["rev-parse", "--show-prefix"], cwd) or b""
     top = _text(["rev-parse", "--show-toplevel"], cwd)
-    return Layout(common, os.fsdecode(prefix.rstrip(b"\r\n")), True, os.path.normpath(top) if top else None)
+    return Layout(common, gitsafe_run.path_text(prefix), True, os.path.normpath(top) if top else None)
 
 
 def layout(cwd: Path | str) -> Optional[Layout]:
@@ -337,7 +337,7 @@ def show_prefix(cwd: Path | str) -> str:
     if res.returncode != 0:
         detail = " ".join(res.stderr.decode("utf-8", "replace").split())[:200]
         raise GitError(f"git rev-parse --show-prefix failed: {detail}")
-    return os.fsdecode(res.stdout.rstrip(b"\r\n"))
+    return gitsafe_run.path_text(res.stdout)
 
 
 def relative_to_prefix(prefix: str, path: str) -> Optional[str]:
