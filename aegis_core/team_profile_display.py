@@ -14,7 +14,6 @@ __all__ = ["NEXT_ACTION_TEMPLATES", "TERMINAL_NAMES", "closed_object", "provenan
 
 TERMINAL_NAMES = ("hold", "skip")
 
-
 NEXT_ACTION_TEMPLATES = {
     "start": ("Start the job on ", "; capacity advice grants no execution authority."),
     "check": ("Run aegis team hosts check ", " ", " --json; use that declared host if admitted."),
@@ -73,7 +72,7 @@ def _display_action_parts(parts, shown, pattern, max_string):
     return sanitize_display("".join(rendered), max_len=512)
 
 
-def render_profile(value: Any, *, identifier_pattern: str, max_string: int, capacity=False) -> Any:
+def render_profile(value: Any, *, identifier_pattern: str, max_string: int, registry_fields, capacity=False) -> Any:
     """Canonicalize/redact/truncate; capacity views opt into typed actions.
 
     The default retains config-only redaction for the read-only MCP tool.
@@ -107,9 +106,15 @@ def render_profile(value: Any, *, identifier_pattern: str, max_string: int, capa
             return "[REDACTED]"
         if type(item) is dict:
             result = {}
+            # Validation records field policies on the same detached rows rendered here.
+            fields = registry_fields.get(id(item))
             action = (_display_action_parts(item["next_action_parts"], shown, identifier_pattern, max_string)
                       if capacity and "next_action" in item and "next_action_parts" in item else None)
             for key, child in item.items():
+                mode = fields.get(key) if fields else None
+                if mode is not None:
+                    result[key] = child if mode == "enum" else shown(child)
+                    continue
                 reference = key in {"runner", "hosts", "host_pref", "applied_to", "applied_paths", "path"}
                 reference = reference or (capacity and key in {"host", "host_kind", "selected_host", "kind", "decision"})
                 reference = reference or (key == "next_action_parts" and action is not None)

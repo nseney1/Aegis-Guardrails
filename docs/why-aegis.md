@@ -156,9 +156,20 @@ Each v4 change came with a prediction that could fail, and a failed one is somet
 
 The sections above are about how v4 got its shape. This branch also contains team coordination. The package version is still 4.5.0 until the release cut.
 
-In the tree now: repository leases and `aegis check --lane`; the team work queue; model selection that refuses a binding that was not admitted; `aegis msg` for the message codec; the product mailbox library; source-checkout hierarchy tools that are not in the wheel; lane Git snapshot, plan and compare-and-swap publish; qualification records with no CLI; a publisher core whose activation is not wired; proposal records that can name source `mine`; and `aegis rule lint`, which reports findings, exits 0 and does not install a rule. [Agent teams](teams.md) is the entry. [How Aegis works](how-it-works.md#proposals-and-rule-lint) and [Architecture](architecture.md#git-delivery) name the libraries.
+In the tree now: repository leases and `aegis check --lane`; the team work queue; model selection that refuses a binding that was not admitted; `aegis msg` for the message codec; the product mailbox library; source-checkout hierarchy tools that are not in the wheel; lane Git snapshot, plan and compare-and-swap publish; qualification records with no CLI; a publisher core whose activation is not wired; proposal records that can name source `mine`; and `aegis rule lint`, which reports findings, exits 0 and does not install a rule. [Agent teams](teams.md) is the entry. [How Aegis works](how-it-works.md#proposals-and-rule-lint) describes proposals and lint.
 
-Not in this tree: copying `tools/hierarchy_templates/` into the wheel, and a separate OS principal. `aegis_core.merge_queue.MergeQueue` is an in-tree library whose landing wiring is separate work. The wheel does include `aegis_core/team_templates/role-registry.json`. `team_git.descriptor_support` is true when `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `stat` and `readlink`. `storage.confined_descriptor_supported` is true when `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `mkdir`, `link`, `rename`, `unlink` and `stat`. That function does not use `readlink`. Both are false when `os.name` is not `posix`, so Windows fails them. Neither function tests for macOS. Qualification writes call `team_qualify.descriptor_supported` and otherwise refuse `unsupported_platform`. That function is true only when `team_git.descriptor_support` is true, `team_gitops.descriptor_supported` is true (`fcntl` is available and `storage.confined_descriptor_supported` is true), and `gitops_fds.descriptor_supported` is true (`sys.platform` is `linux`, `os.name` is `posix`, and `prctl(37)` returns 0). File modes do not isolate another process running as the owner. A local score is still a label, and promoting a rule is still a reviewed change.
+Worktree snapshots, supplied-object Git plans and tested commits, the work queue
+and the proposal store are unavailable on Windows. Plans and tested commits skip
+the snapshot check and still require descriptor procfs (`/proc/self/fd`) and
+native Git. Linux subreaper support is required for qualification writes and
+merge-queue admission, candidate preparation, issued checks, landing observation
+and reconciliation. Automatic landing remains separate work.
+Processes sharing the trusted owner UID can access owner records despite file
+modes. See [Teams platform capabilities](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/architecture.md#teams-platform-capabilities).
+
+The wheel includes `aegis_core/team_templates/role-registry.json`.
+`tools/hierarchy_templates/` stays in the source checkout. A local score is still
+a label, and promoting a rule is still a reviewed change.
 
 ## Appendix A: Trade-offs
 

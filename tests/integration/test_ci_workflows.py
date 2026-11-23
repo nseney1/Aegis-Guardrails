@@ -118,35 +118,29 @@ def test_integration_push_runs_every_develop_job_and_step_condition():
         *_WINDOWS_JOBS,
     }
     matrix = jobs["validate"]["strategy"]["matrix"]
-    validate_legs = [
-        (os_name, version) for os_name in matrix["os"] for version in matrix["python-version"]
-        if {"os": os_name, "python-version": version} not in matrix["exclude"]
-    ]
-    validate_legs += [(leg["os"], leg["python-version"]) for leg in matrix["include"]]
-    assert sorted(validate_legs) == [
-        ("macos-latest", "3.11"), ("macos-latest", "3.9"),
-        ("ubuntu-24.04", "3.9"), ("ubuntu-latest", "3.11"),
-    ]
-    assert jobs["validate"]["runs-on"] == "${{ matrix.os }}"
-    legs = [(name, job["runs-on"], None) for name, job in jobs.items()
+    validate_legs = [(leg["os"], leg["python-version"]) for leg in matrix["leg"]]
+    assert set(validate_legs) == set(_VALIDATE_LEGS)
+    assert jobs["validate"]["runs-on"] == "${{ matrix.leg.os }}"
+    legs = [(name, job["runs-on"], None, None) for name, job in jobs.items()
             if name != "validate" and not name.startswith("test-windows")]
-    legs += [("validate", os_name, version) for os_name, version in validate_legs]
+    legs += [("validate", os_name, version, shard) for os_name, version in validate_legs
+             for shard in matrix["shard"]]
     for name in _WINDOWS_JOBS:
         windows_matrix = jobs[name]["strategy"]["matrix"]
         assert windows_matrix == {"python-version": ["3.9", "3.12"]}, name
         assert jobs[name]["runs-on"] == "windows-latest"
         assert jobs[name]["strategy"]["fail-fast"] is False
-        legs += [(name, "windows-latest", version) for version in windows_matrix["python-version"]]
-    # 8 singleton jobs (four of them test-fast shards) + 4 validate legs
+        legs += [(name, "windows-latest", version, None) for version in windows_matrix["python-version"]]
+    # 8 singleton jobs (four of them test-fast shards) + 6 jobs on each of 4 validate legs
     # + each Windows job's two Python versions.
-    assert len(legs) == 8 + 4 + len(_WINDOWS_JOBS) * 2
+    assert len(legs) == 8 + 6 * 4 + len(_WINDOWS_JOBS) * 2
     runner_os = {"ubuntu-latest": "Linux", "ubuntu-24.04": "Linux",
                  "macos-latest": "macOS", "windows-latest": "Windows"}
-    for name, runner, version in legs:
+    for name, runner, version, shard in legs:
         job = jobs[name]
         contexts = [{"github.event_name": "push", "github.base_ref": "",
                      "github.ref": "refs/heads/" + branch, "github.ref_name": branch,
-                     "runner.os": runner_os[runner]}
+                     "runner.os": runner_os[runner], "matrix.shard": shard}
                     for branch in ("develop", INTEGRATION_BRANCH)]
         eligible = [_condition_allows(job.get("if"), context) for context in contexts]
         assert eligible == [True, True], (name, runner, version)
@@ -161,8 +155,13 @@ def test_integration_push_runs_every_develop_job_and_step_condition():
         skipped = set()
         if name == "aegis-check":
             skipped.add("Fetch wave pull request head as data")
-        if name == "validate" and runner_os[runner] != "Linux":
-            skipped.update(("Install bubblewrap", "Prove bubblewrap runs"))
+        if name == "validate":
+            if runner_os[runner] != "Linux" or shard == "checks":
+                skipped.update(("Install bubblewrap", "Prove bubblewrap runs"))
+            if shard == "checks":
+                skipped.add("Run test suite")
+            else:
+                skipped.update(_VALIDATE_CHECKS)
         assert outcomes[1] == [step.get("name") not in skipped for step in job["steps"]], (name, runner, version)
 
 
@@ -409,7 +408,7 @@ def test_linux_legs_install_bubblewrap_and_prove_it_runs_before_the_suite():
         assert _runs(job)[install].count("-o Acquire::Retries=3") == 2
         probe = _index(job, _bubblewrap_probe())
         if name == "validate":
-            suite = _index(job, "make test")
+            suite = job["steps"].index(_suite_step(job))
         else:
             suite = _index(job, "-m pytest", "$TEST_FAST_PATHS")
         assert install < probe < suite
@@ -418,7 +417,8 @@ def test_linux_legs_install_bubblewrap_and_prove_it_runs_before_the_suite():
         # lifting that, the probe fails and the eight bubblewrap job tests would skip silently.
         assert "kernel.apparmor_restrict_unprivileged_userns=0" in steps[probe]["run"]
         if name == "validate":
-            assert steps[install].get("if") == steps[probe].get("if") == "runner.os == 'Linux'"
+            condition = "runner.os == 'Linux' && matrix.shard != 'checks'"
+            assert steps[install].get("if") == steps[probe].get("if") == condition
         assert not steps[probe].get("continue-on-error") and "|| true" not in steps[probe]["run"]
 
 
@@ -1325,6 +1325,172 @@ def _expected_directory_selectors(workflow):
         "test-windows-integration": _selector_text(fast["test-fast-integration"]),
         "test-windows-contract": _selector_text(fast["test-fast-contract"]),
     }
+
+
+_VALIDATE_LEGS = (
+    ("ubuntu-24.04", "3.9"), ("ubuntu-latest", "3.11"),
+    ("macos-latest", "3.9"), ("macos-latest", "3.11"),
+)
+_VALIDATE_SHARDS = ("unit-core-a", "unit-core-b", "unit-rest", "integration", "contract")
+_VALIDATE_CHECKS = (
+    "Smoke-test installed wheel (source hidden)", "Lint",
+    "Run Layer 1 Deterministic Verification", "Check for hardcoded paths",
+)
+_VALIDATE_MEASUREMENT_PREFIX = "# validate-measurement: "
+_VALIDATE_PYTEST_ARGS = ["-n", "auto", "--durations=25", "--"]
+
+
+def _guard_validate_timeouts(job, workflow_text):
+    cap = job["timeout-minutes"]
+    assert type(cap) is int and 45 <= cap <= 360
+    rows = [line[len(_VALIDATE_MEASUREMENT_PREFIX):] for line in workflow_text.splitlines()
+            if line.startswith(_VALIDATE_MEASUREMENT_PREFIX)]
+    if rows == ["pending"]:
+        assert cap == 360, "keep the maximum cap until every validate job has a hosted measurement"
+        return
+    measured = {}
+    for row in rows:
+        runner, version, shard, evidence = row.split(" ", 3)
+        match = _WINDOWS_MEASURED_VALUE.fullmatch(evidence)
+        key = (runner, version, shard)
+        assert match and key not in measured, row
+        measured[key] = int(match[1])
+    assert set(measured) == {
+        (runner, version, shard) for runner, version in _VALIDATE_LEGS
+        for shard in (*_VALIDATE_SHARDS, "checks")
+    }
+    for key, seconds in measured.items():
+        assert cap >= _minimum_timeout_minutes(seconds), (key, seconds, cap)
+
+
+def test_validate_budget_keeps_all_targets_shards_and_checks_required():
+    jobs = _load("validate.yml")["jobs"]
+    job = jobs["validate"]
+    assert job["strategy"] == {
+        "fail-fast": False,
+        "matrix": {
+            "leg": [{"os": runner, "python-version": version} for runner, version in _VALIDATE_LEGS],
+            "shard": [*_VALIDATE_SHARDS, "checks"],
+        },
+    }
+    assert job["runs-on"] == "${{ matrix.leg.os }}"
+    assert _step_using(job, "actions/setup-python")[0]["with"]["python-version"] == "${{ matrix.leg.python-version }}"
+    assert job["needs"] == ["build-wheel", "dependency-audit"]
+    assert all("validate" in jobs[name]["needs"] for name in ("aegis-check", "verdict"))
+    assert "continue-on-error" not in job
+    conditional = {step["name"]: step["if"] for step in job["steps"] if "if" in step}
+    assert conditional == {
+        **dict.fromkeys(_VALIDATE_CHECKS, "matrix.shard == 'checks'"),
+        "Install bubblewrap": "runner.os == 'Linux' && matrix.shard != 'checks'",
+        "Prove bubblewrap runs": "runner.os == 'Linux' && matrix.shard != 'checks'",
+        "Run test suite": "matrix.shard != 'checks'",
+    }
+    assert all("continue-on-error" not in step for step in job["steps"])
+    suite = _suite_step(job)
+    assert suite["env"]["TEST_VALIDATE_SHARD"] == "${{ matrix.shard }}"
+    assert suite["shell"] == "bash"
+    _guard_validate_timeouts(job, _read("validate.yml"))
+
+
+def test_validate_cap_covers_every_completed_job_including_setup():
+    rows = [f"{_VALIDATE_MEASUREMENT_PREFIX}{runner} {version} {shard} 10800s run 123"
+            for runner, version in _VALIDATE_LEGS for shard in (*_VALIDATE_SHARDS, "checks")]
+    job = {"timeout-minutes": 360}
+    _guard_validate_timeouts(job, "\n".join(rows))
+    with pytest.raises(AssertionError, match="10801"):
+        _guard_validate_timeouts(job, "\n".join(rows).replace("3.9 integration 10800", "3.9 integration 10801"))
+    with pytest.raises(AssertionError):
+        _guard_validate_timeouts(job, "\n".join(rows[:-1]))
+
+
+def _validate_suite_command():
+    step = _suite_step(_load("validate.yml")["jobs"]["validate"])
+    preamble, opening, body = step["run"].partition(" <<'PYTHON'\n")
+    command, closing, end = body.rpartition("\nPYTHON\n")
+    assert opening and closing and not end
+    assert preamble.splitlines() == [
+        "set -euo pipefail",
+        'userbase="${PYTHONUSERBASE:-$(python -c \'import site; print(site.getuserbase())\')}"',
+        'home="$(mktemp -d /tmp/aegis-test-home.XXXXXX)"',
+        "trap 'rm -rf \"$home\"' EXIT",
+        'HOME="$home" USERPROFILE="$home" XDG_CONFIG_HOME="$home/.config" PYTHONUSERBASE="$userbase" python -',
+    ]
+    return step["env"], command
+
+
+def _run_validate_selector(shard, cwd, pytest_argv_probe):
+    variables, command = _validate_suite_command()
+    return subprocess.run(
+        [sys.executable, "-"], input=command, cwd=cwd,
+        env=dict(os.environ, PYTHONPATH=pytest_argv_probe, TEST_VALIDATE_SHARD=shard,
+                 TEST_VALIDATE_UNIT_REST=variables["TEST_VALIDATE_UNIT_REST"]),
+        capture_output=True, text=True, timeout=30,
+    )
+
+
+def test_validate_shards_run_the_whole_suite_exactly_once_with_duration_reporting(pytest_argv_probe):
+    files = _suite_test_files()
+    expected_paths = _expected_directory_selectors(_load("validate.yml"))
+    covered = []
+    for shard in _VALIDATE_SHARDS:
+        proc = _run_validate_selector(shard, REPO_ROOT, pytest_argv_probe)
+        assert proc.returncode == 87, proc.stderr
+        argv = json.loads(proc.stdout)
+        assert argv[:len(_VALIDATE_PYTEST_ARGS)] == _VALIDATE_PYTEST_ARGS
+        selectors = argv[len(_VALIDATE_PYTEST_ARGS):]
+        if shard.startswith("unit-core-"):
+            assert selectors == _core_paths_for_half(files, "le" if shard == "unit-core-a" else "gt")
+        else:
+            assert selectors == expected_paths[f"test-windows-{shard}"].split()
+            assert all(_positive_selector(selector, files) for selector in selectors)
+        assert selectors
+        for selector in selectors:
+            covered.extend(_selected_test_files(selector, files))
+    assert sorted(covered) == files
+
+
+@pytest.mark.parametrize("shard,message", [
+    ("unit-core-a", "Validate shard has no test paths"),
+    ("unit-core-b", "Validate shard has no test paths"),
+    ("unknown", "Invalid validate shard"),
+])
+def test_validate_selector_refuses_empty_core_half_or_unknown_shard(shard, message, tmp_path, pytest_argv_probe):
+    proc = _run_validate_selector(shard, tmp_path, pytest_argv_probe)
+    assert (proc.returncode, proc.stdout, proc.stderr.strip()) == (1, "", message)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="validate suite uses a POSIX temporary HOME")
+def test_validate_suite_keeps_arguments_and_cleans_home_on_failure_and_retry(bash, tmp_path):
+    root = tmp_path / "tests" / "unit" / "core"
+    root.mkdir(parents=True)
+    (root / "test_a spaced.py").touch()
+    (tmp_path / "pytest.py").write_text(
+        "import json, os\n"
+        "def main(args):\n"
+        "    print(json.dumps([args, *(os.environ[key] for key in "
+        "('HOME', 'USERPROFILE', 'XDG_CONFIG_HOME', 'PYTHONUSERBASE'))]))\n"
+        "    return 87\n",
+        encoding="utf-8",
+    )
+    run = _suite_step(_load("validate.yml")["jobs"]["validate"])["run"]
+    # Replay the real mktemp/trap under the fixture-owned directory.
+    run = run.replace(" /tmp/aegis-test-home.XXXXXX", ' "$TEST_TMP/aegis-test-home.XXXXXX"')
+    homes = []
+    for init, preset in (("unset PYTHONUSERBASE\n", None), ("", str(tmp_path / "preset user base"))):
+        proc = _run_windows_suite_script(
+            bash, init + run, tmp_path, TEST_TMP=str(tmp_path), TEST_VALIDATE_SHARD="unit-core-a",
+            PYTHONUSERBASE=preset or "",
+        )
+        assert proc.returncode == 87, proc.stderr
+        args, home, profile, config, userbase = json.loads(proc.stdout)
+        assert args == [*_VALIDATE_PYTEST_ARGS, "tests/unit/core/test_a spaced.py"]
+        assert home == profile and Path(config) == Path(home) / ".config"
+        assert Path(home).parent == tmp_path and not Path(home).exists()
+        assert userbase and userbase != home
+        if preset is not None:
+            assert userbase == preset
+        homes.append(home)
+    assert len(set(homes)) == 2
 
 
 def _guard_windows_language(job):
