@@ -1167,6 +1167,111 @@ def test_output_guards_refuse_without_creating_the_copy(tmp_path):
     assert not (tmp_path / "elsewhere").exists()
 
 
+@pytest.mark.parametrize("name", [" repository", "repository "])
+@pytest.mark.parametrize("location, status, refusal", [
+    ("internal-output", 2, "inside_repository"),
+    ("internal-state", 2, "record_required"),
+    ("sibling-output", 0, None),
+    ("sibling-state", 0, None),
+])
+def test_prepare_uses_the_exact_checkout_top_for_containment(tmp_path, name, location, status, refusal):
+    repo, base, _, candidate, _ = make_repo(tmp_path)
+    checkout = repo.rename(tmp_path / name)
+    source = checkout / "nested"
+    source.mkdir()
+    repo.mkdir()  # A distinct sibling with the whitespace-stripped name.
+    output_root = {"internal-output": checkout, "sibling-output": repo}.get(location, tmp_path)
+    state_root = {"internal-state": checkout, "sibling-state": repo}.get(location, tmp_path)
+    out = output_root / "reviews" / "one"
+    ports = _keywords(real_spawn, state_root)
+
+    actual, result = review_copy.prepare(str(source), base, candidate, str(out), **ports)
+    assert (actual, result.get("code")) == (status, refusal)
+    if status == 0:
+        assert result["out"] == str(out)
+        assert (out / "candidate" / "src" / "app.py").read_bytes() == b"value = 2\n"
+        assert review_copy.remove(str(out), preparation_dir=ports["preparation_dir"])[0] == 0
+    else:
+        assert not out.parent.exists() and not list(Path(ports["preparation_dir"]).iterdir())
+
+
+def test_prepare_refuses_a_sibling_parent_swapped_during_checkout_discovery(tmp_path):
+    repo, base, _, candidate, _ = make_repo(tmp_path)
+    checkout = repo.rename(tmp_path / "repository ")
+    repo.mkdir()
+    moved = tmp_path / "moved-sibling"
+    replacement = tmp_path / "replacement"
+    symlink_or_skip(checkout, replacement)
+    out = repo / "review"
+
+    def spawn(root, args, env, timeout):
+        if "--git-dir" in args:
+            repo.rename(moved)
+            replacement.rename(repo)
+        return real_spawn(root, args, env, timeout)
+
+    ports = _keywords(spawn, tmp_path)
+    status, result = review_copy.prepare(str(checkout), base, candidate, str(out), **ports)
+    assert (status, result.get("code")) == (2, "unsafe_path")
+    assert repo.is_symlink() and not (checkout / out.name).exists() and not list(moved.iterdir())
+    assert not list(Path(ports["preparation_dir"]).iterdir())
+
+    repo.unlink()
+    moved.rename(repo)
+    assert _prepare(checkout, base, candidate, out)[0] == 0
+    assert review_copy.remove(str(out), preparation_dir=ports["preparation_dir"])[0] == 0
+
+
+def test_prepare_refuses_state_inside_the_reported_checkout_top(tmp_path):
+    repo, base, _, candidate, _ = make_repo(tmp_path)
+    checkout = tmp_path / "reported-checkout "
+    checkout.mkdir()
+    (tmp_path / "reported-checkout").mkdir()
+    out = tmp_path / "review"
+
+    def spawn(root, args, env, timeout):
+        # Exercise the check after Git answers, independent of the metadata preflight.
+        if "--show-toplevel" in args:
+            return _Buffer({"stdout": os.fsencode(checkout) + b"\n"})
+        return real_spawn(root, args, env, timeout)
+
+    ports = _keywords(spawn, checkout)
+    status, result = review_copy.prepare(str(repo), base, candidate, str(out), **ports)
+    assert (status, result.get("code")) == (2, "record_required")
+    assert not out.exists() and not list(Path(ports["preparation_dir"]).iterdir())
+
+
+@pytest.mark.parametrize("record, refusal", [
+    (b"/untrusted\0path\n", "unsafe_path"),
+    (b"/untrusted\npath\n", "unsafe_path"),
+    (b"/untrusted/path\n\n", "unsafe_path"),
+    (b"/untrusted/path\r\n", "unsafe_path"),
+    (b"/untrusted/path\xff\n", "encoding"),
+    (b"untrusted/path\n", "unsafe_path"),
+    (b"\n", "unsafe_path"),
+    pytest.param(b"/" + b"x" * review_copy.MAX_PATH_BYTES, "limit_exceeded", id="over-limit"),
+])
+def test_prepare_refuses_malformed_checkout_top_and_can_retry(tmp_path, record, refusal):
+    repo, base, _, candidate, _ = make_repo(tmp_path)
+    out = tmp_path / "new-parent" / "review"
+    child = _Buffer({"stdout": record})
+
+    def spawn(root, args, env, timeout):
+        if "--show-toplevel" in args:
+            return child
+        return real_spawn(root, args, env, timeout)
+
+    ports = _keywords(spawn, tmp_path)
+    status, result = review_copy.prepare(str(repo), base, candidate, str(out), **ports)
+    assert (status, result.get("reason"), result.get("code")) == (2, refusal, refusal)
+    assert "untrusted" not in json.dumps(result)
+    assert child.closed and not out.parent.exists()
+    assert not list(Path(ports["preparation_dir"]).iterdir())
+
+    assert _prepare(repo, base, candidate, out)[0] == 0
+    assert review_copy.remove(str(out), preparation_dir=ports["preparation_dir"])[0] == 0
+
+
 def test_unsafe_tree_path_leaves_nothing(tmp_path):
     repo, base, _base_tree, _candidate, _candidate_tree = make_repo(tmp_path)
     blob = _git(repo, "hash-object", "-w", "--stdin", input_bytes=b"planted\n").decode().strip()

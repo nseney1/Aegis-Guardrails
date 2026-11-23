@@ -15,7 +15,7 @@ import pytest
 
 from aegis_cli import team_isolation as adapter
 from aegis_cli.cli import main
-from aegis_core.team_isolation_refusal import IsolationRefusal
+from aegis_core.team_isolation_refusal import IsolationRefusal, REFUSALS
 from aegis_core.team_isolation_verify import container_name
 from conftest import symlink_or_skip
 
@@ -47,7 +47,11 @@ def test_nested_usage_refuses_without_echoing_input(tmp_path, capsys):
         main(["team", "isolation", "check", "--unknown", "untrusted-argument"])
     captured = capsys.readouterr()
     assert error.value.code == 2
-    assert json.loads(captured.err)["code"] == "invalid_arguments"
+    payload = json.loads(captured.err)
+    assert payload["code"] == "invalid_arguments"
+    assert set(payload) == {"status", "code", "reason", "next_action"}
+    assert payload["reason"] == REFUSALS["invalid_arguments"]
+    assert payload["next_action"] == {"actor": "operator", "command": payload["reason"]}
     assert "untrusted-argument" not in captured.err + captured.out
 
 
@@ -71,8 +75,28 @@ def test_check_refusals_and_retry(store, capsys, content, expected):
     code, result = invoke(store, capsys, "--config", str(config))
     assert code == 1 and result["code"] == expected
     assert "untrusted-" not in json.dumps(result)
+    if expected in ("document_invalid", "document_read", "document_size"):
+        assert result["stage"] == "config"
+        assert set(result) == {"status", "code", "reason", "next_action", "stage"}
+        assert result["reason"] == REFUSALS[expected]
+        assert "\n" not in result["reason"]
+    else:
+        assert "stage" not in result
+        assert set(result) == {"status", "code", "reason", "next_action"}
     config.write_text("{}", encoding="utf-8")
     assert invoke(store, capsys, "--config", str(config))[0] == 0
+
+
+def test_config_stage_text_is_one_line_and_retries(store, capsys):
+    path = store / "team-run.json"
+    path.write_bytes(b'{"')
+    code = main(["--workspace", str(store), "team", "isolation", "check", "--config", str(path), "--plain"])
+    captured = capsys.readouterr()
+    assert code == 1 and captured.out == ""
+    assert captured.err == "document_invalid — " + REFUSALS["document_invalid"] + " (config)\n"
+    assert captured.err.count("\n") == 1
+    path.write_text("{}", encoding="utf-8")
+    assert invoke(store, capsys, "--config", str(path), output="--plain") == (0, "Isolation plan (host)\n")
 
 
 @pytest.mark.parametrize("value", ["{}", "1" * 200], ids=["encoded-object", "digits"])
@@ -190,8 +214,35 @@ def test_cli_verification_uses_only_digest_inspection(mount_inputs, capsys, monk
     assert status == 1 and result["status"] == "mismatch" and result["mismatches"], result
     assert seen == [["docker", "image", "inspect", image]]
 
+    matching = _matching_container_document(store, config, capsys)
+    actual.write_bytes(matching)
+    assert invoke(store, capsys, "--config", str(config), "--inspect", str(actual)) == (
+        0, {"status": "ok", "mismatches": []})
+
+    actual.write_text("{", encoding="utf-8")
+    status, result = invoke(store, capsys, "--config", str(config), "--inspect", str(actual))
+    assert status == 1 and result["code"] == "document_invalid" and result["stage"] == "container-inspection"
+    assert len(seen) == 2 and set(result) == {"status", "code", "reason", "next_action", "stage"}
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("double-encoded inspection reached a container dependency")
+
+    actual.write_text(json.dumps(matching.decode()), encoding="utf-8")
+    monkeypatch.setattr(adapter, "observe", unexpected)
+    monkeypatch.setattr(adapter, "inspect_image", unexpected)
+    assert invoke(store, capsys, "--config", str(config), "--inspect", str(actual)) == (
+        1, {"status": "mismatch", "mismatches": ["inspect"]})
+
+
+def _image_document(image):
+    digest = image.rsplit("@", 1)[1]
+    return json.dumps([{"Id": "sha256:" + "b" * 64, "RepoDigests": [image],
+                        "Digest": digest, "Config": {"Env": []}}]).encode()
+
+
+def _matching_container_document(store, config, capsys):
     status, plan = invoke(store, capsys, "--config", str(config))
-    assert status == 0, plan
+    assert status == 0 and plan["mode"] == "container", plan
     run, argv = plan["run"], plan["create_argv"]
     data = {"Name": "/" + container_name(run), "Image": "sha256:" + "b" * 64,
             "Config": {"Labels": {"aegis.team.run": run}, "User": "%d:%d" % (os.geteuid(), os.getegid()),
@@ -202,22 +253,129 @@ def test_cli_verification_uses_only_digest_inspection(mount_inputs, capsys, monk
                            "PidsLimit": 64, "Tmpfs": {"/tmp": "rw,nosuid,nodev", "/dev/shm": "rw,nosuid,nodev"}},
             "Mounts": [dict(Type="bind", Source=row["source"], Destination=row["destination"], RW=row["rw"])
                        for row in plan["mounts"]]}
-    actual.write_text(json.dumps([data]), encoding="utf-8")
-    assert invoke(store, capsys, "--config", str(config), "--inspect", str(actual)) == (
-        0, {"status": "ok", "mismatches": []})
+    return json.dumps([data]).encode()
 
-    actual.write_text("{", encoding="utf-8")
-    status, result = invoke(store, capsys, "--config", str(config), "--inspect", str(actual))
-    assert status == 1 and result["code"] == "document_invalid" and len(seen) == 2
+
+def _assert_cli_refusal(store, capsys, arguments, code, reason, stage=None):
+    body = {"status": "refused", "code": code, "reason": reason,
+            "next_action": {"actor": "operator", "command": reason}}
+    line = code + " — " + reason
+    if stage is not None:
+        body["stage"] = stage
+        line += " (" + stage + ")"
+    assert invoke(store, capsys, *arguments) == (1, body)
+    assert main(["--workspace", str(store), "team", "isolation", "check", *arguments, "--plain"]) == 1
+    shown = capsys.readouterr()
+    assert (shown.out, shown.err) == ("", line + "\n")
+
+
+def _assert_verified(store, capsys, arguments):
+    assert invoke(store, capsys, *arguments) == (0, {"status": "ok", "mismatches": []})
+    assert invoke(store, capsys, *arguments, output="--plain") == (0, "Isolation verified\n")
+
+
+@pytest.mark.parametrize(("stage", "code"), [
+    ("config", "document_invalid"),
+    ("container-inspection", "document_invalid"),
+    ("image-inspection", "document_invalid"),
+    ("image-inspection", "document_read"),
+], ids=["config", "container", "image", "image-read"])
+def test_each_document_stage_refuses_then_verifies_in_both_modes(mount_inputs, capsys, monkeypatch, stage, code):
+    store = mount_inputs
+    config, image = container_inputs(store)
+    configured = config.read_bytes()
+    matching = _matching_container_document(store, config, capsys)
+    actual = store / "untrusted-inspect.json"
+    actual.write_bytes(matching)
+    arguments = ("--config", str(config), "--inspect", str(actual))
+    snapshot = adapter.observe
+    retry = False
+    calls = []
 
     def unexpected(*args, **kwargs):
-        pytest.fail("double-encoded inspection reached a container dependency")
+        pytest.fail("malformed config or container input reached observation")
 
-    actual.write_text(json.dumps(json.dumps([data])), encoding="utf-8")
-    monkeypatch.setattr(adapter, "observe", unexpected)
-    monkeypatch.setattr(adapter, "inspect_image", unexpected)
-    assert invoke(store, capsys, "--config", str(config), "--inspect", str(actual)) == (
-        1, {"status": "mismatch", "mismatches": ["inspect"]})
+    def inspector(argv, *, workspace):
+        assert retry or stage == "image-inspection"
+        calls.append(argv)
+        if retry:
+            return _image_document(image)
+        if code == "document_read":
+            raise IsolationRefusal(code)
+        return b'{"untrusted-image":'
+
+    if stage == "config":
+        config.write_bytes(b'{"untrusted-config":')
+    elif stage == "container-inspection":
+        actual.write_bytes(b'{"untrusted-inspect":')
+    if stage != "image-inspection":
+        monkeypatch.setattr(adapter, "observe", unexpected)
+    monkeypatch.setattr(adapter, "inspect_image", inspector)
+    before = _open_fds()
+    _assert_cli_refusal(store, capsys, arguments, code, REFUSALS[code], stage)
+    failed_calls = 2 if stage == "image-inspection" else 0
+    assert calls == [["docker", "image", "inspect", image]] * failed_calls
+    assert _open_fds() == before
+    config.write_bytes(configured)
+    actual.write_bytes(matching)
+    monkeypatch.setattr(adapter, "observe", snapshot)
+    retry = True
+    _assert_verified(store, capsys, arguments)
+    assert calls == [["docker", "image", "inspect", image]] * (failed_calls + 2)
+    assert _open_fds() == before
+
+
+def test_launcher_environment_cli_refusal_hides_input_and_retries(mount_inputs, capsys, monkeypatch):
+    store = mount_inputs
+    snapshot = adapter.observe
+    observed = []
+
+    def observe(*args, **kwargs):
+        facts = snapshot(*args, **kwargs)
+        observed.append(facts)
+        return facts
+
+    monkeypatch.setattr(adapter, "observe", observe)
+    config, image = container_inputs(store)
+    actual = store / "inspect.json"
+    actual.write_bytes(_matching_container_document(store, config, capsys))
+    assert len(observed) == 1
+    # Keep mount evidence independent of the engine custody fixture.
+    monkeypatch.setattr(adapter, "observe", lambda *args, **kwargs: observed[0])
+    _qualify_engine_ancestors(store, monkeypatch)
+    _, _, _, executable = _prepare_engine(store, "exit 91")
+    arguments = ("--config", str(config), "--inspect", str(actual))
+    launched = []
+    clean = False
+
+    @contextmanager
+    def popen(argv, **kwargs):
+        assert clean, "invalid environment reached the process boundary"
+        assert argv == [str(executable), "image", "inspect", image]
+        assert kwargs["stderr"] == adapter.subprocess.DEVNULL
+        assert kwargs["env"] == {"PATH": "/usr/bin", "LANG": "C"}
+        launched.append(argv)
+        output, writer = os.pipe()
+        try:
+            try:
+                os.write(writer, _image_document(image))
+            finally:
+                os.close(writer)
+            yield SimpleNamespace(stdout=SimpleNamespace(fileno=lambda: output), wait=lambda **_: 0, poll=lambda: 0)
+        finally:
+            os.close(output)
+
+    _use_popen(monkeypatch, popen)
+    monkeypatch.setattr(adapter, "which", lambda *_args, **_kwargs: str(executable))
+    _use_environ(monkeypatch, environ={
+        "PATH": "/usr/bin", "OPENAI_API_KEY": "synthetic-launcher-value", "BAD": "synthetic\x00untrusted"})
+    before = _open_fds()
+    _assert_cli_refusal(store, capsys, arguments, "image_inspect", "Retry from a clean launcher environment.")
+    assert launched == [] and _open_fds() == before
+    _use_environ(monkeypatch, environ={"PATH": "/usr/bin", "LANG": "C"})
+    clean = True
+    _assert_verified(store, capsys, arguments)
+    assert len(launched) == 2 and _open_fds() == before
 
 
 def test_cli_output_redacts_canonicalized_values_in_all_fields(mount_inputs, capsys):
@@ -256,6 +414,11 @@ def test_observer_refuses_an_incomplete_credential_policy(store):
 
 @pytest.fixture
 def engine_store(store, monkeypatch):
+    _qualify_engine_ancestors(store, monkeypatch)
+    return store
+
+
+def _qualify_engine_ancestors(store, monkeypatch):
     # The sandbox maps ancestors outside the fixture to a different owner and
     # includes shared coordination directories. Only those ancestors are
     # projected as a qualified host chain. Test files and test PATH keep real facts.
@@ -267,7 +430,6 @@ def engine_store(store, monkeypatch):
         return info
 
     monkeypatch.setattr(adapter, "os", SimpleNamespace(**{**vars(os), "fstat": trusted_ancestors}))
-    return store
 
 
 @pytest.mark.parametrize(("script", "code"), [
@@ -298,8 +460,12 @@ def test_image_process_status_and_timeout(engine_store, monkeypatch, script, cod
     if code is None:
         assert adapter.inspect_image(argv, workspace=workspace, search_path=search_path) == b"[]"
     else:
-        with pytest.raises(ValueError, match="^" + code + "$"):
+        with pytest.raises(ValueError, match="^" + code + "$") as caught:
             adapter.inspect_image(argv, workspace=workspace, search_path=search_path)
+        assert caught.value.stage == ("image-inspection" if code == "document_size" else None)
+        if code == "image_inspect":
+            assert caught.value.message == REFUSALS["image_inspect"]
+            assert caught.value.note is None
 
 
 def test_document_open_stays_bound_across_parent_rename(store, capsys, monkeypatch):
@@ -541,12 +707,18 @@ def _assert_reaped(process):
         os.kill(process.pid, 0)
 
 
-def _refusal(caught, code):
+def _refusal(caught, code, message=None):
     assert isinstance(caught.value, IsolationRefusal)
     assert caught.value.code == code
     assert str(caught.value) == code
-    rendered = str(caught.value) + caught.value.message
+    rendered = str(caught.value) + caught.value.message + json.dumps(caught.value.next_action)
     assert "synthetic" not in rendered and "untrusted" not in rendered
+    assert "\n" not in caught.value.message and "\r" not in caught.value.message
+    if message is None:
+        assert caught.value.message == REFUSALS[code]
+    else:
+        assert caught.value.message == message
+    assert caught.value.next_action == {"actor": "operator", "command": caught.value.message}
 
 
 def test_image_launch_uses_registry_filtered_environment(engine_store, monkeypatch):
@@ -662,7 +834,9 @@ def test_image_environment_policy_failure_refuses_before_spawn_and_retries(engin
     before = _open_fds()
     with pytest.raises(ValueError, match="^image_inspect$") as caught:
         adapter.inspect_image(argv, workspace=workspace, search_path=search_path)
-    _refusal(caught, "image_inspect")
+    _refusal(caught, "image_inspect", "Retry from a clean launcher environment.")
+    assert caught.value.stage is None
+    assert REFUSALS["image_inspect"] not in caught.value.message
     assert launched == [] and not marker.exists() and _open_fds() == before
     _use_environ(monkeypatch, environ=_parent_environment())
     executable.write_text("#!/bin/sh\n" + script + "\n", encoding="utf-8")
@@ -696,7 +870,9 @@ def test_non_dict_environment_policy_refuses_before_spawn_and_retries(engine_sto
     before = _open_fds()
     with pytest.raises(ValueError, match="^image_inspect$") as caught:
         adapter.inspect_image(argv, workspace=workspace, search_path=search_path)
-    _refusal(caught, "image_inspect")
+    _refusal(caught, "image_inspect", "Retry from a clean launcher environment.")
+    assert caught.value.stage is None
+    assert "OPENAI_API_KEY" not in caught.value.message
     assert launched == [] and _open_fds() == before
     monkeypatch.setattr(adapter, "team_host_registry", registry)
     assert adapter.inspect_image(argv, workspace=workspace, search_path=search_path) == b"[]"

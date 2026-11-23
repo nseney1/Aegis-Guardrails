@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 from threading import Barrier
@@ -16,6 +17,7 @@ import pytest
 
 from aegis_core import gitsafe, pathlookup, storage_confined, team_git
 from aegis_core import team_jobs_source as source_module
+from aegis_core.pathlookup_gitcache import bound_ordinary_root
 from conftest import symlink_or_skip
 from tests.helpers_team_git import git
 from tools import hierarchy_jobs as legacy
@@ -213,21 +215,20 @@ def test_job_source_keeps_the_injected_program_when_path_changes(source, repo):
     selected = folder / "git"
     selected.write_text(f'#!/bin/sh\nexec {shlex.quote(reads.program)} "$@"\n', encoding="utf-8")
     selected.chmod(0o700)
-    previous = os.environ.get("PATH")
-    root_token = pathlookup.ordinary_root.set(str(repo.path))
-    try:
-        os.environ["PATH"] = str(folder)
-        api = source.JobSource(run=reads.run, object_read_argv=team_git.object_read_argv,
-                               object_read_env=team_git.object_read_env, child_environment=lambda env, _: env,
-                               program=str(selected))
-        os.environ["PATH"] = os.devnull
-        assert api.refuse_paths_outside_commit(repo.path, repo.commit, ["dir/file"]) is None
-    finally:
-        pathlookup.ordinary_root.reset(root_token)
-        if previous is None:
-            os.environ.pop("PATH", None)
-        else:
-            os.environ["PATH"] = previous
+    original_cwd = Path.cwd()
+    previous_root = pathlookup.ordinary_root.get()
+    previous_path = os.environ.get("PATH")
+    with _temporary_environment("PATH"):
+        with bound_ordinary_root(repo.path):
+            os.environ["PATH"] = str(folder)
+            api = source.JobSource(run=reads.run, object_read_argv=team_git.object_read_argv,
+                                   object_read_env=team_git.object_read_env, child_environment=lambda env, _: env,
+                                   program=str(selected))
+            os.environ["PATH"] = os.devnull
+            assert api.refuse_paths_outside_commit(repo.path, repo.commit, ["dir/file"]) is None
+    assert pathlookup.ordinary_root.get() == previous_root
+    assert Path.cwd() == original_cwd
+    assert os.environ.get("PATH") == previous_path
 
 
 @contextmanager
@@ -256,18 +257,22 @@ def test_job_source_requires_an_injected_program_without_executing_path(source, 
     candidate.write_text(f"#!/bin/sh\nprintf invoked > {shlex.quote(str(marker))}\n", encoding="utf-8")
     candidate.chmod(0o700)
     original_cwd = Path.cwd()
-    root_token = pathlookup.ordinary_root.set(str(controller))
+    previous_root = pathlookup.ordinary_root.get()
+    previous_path = os.environ.get("PATH")
     try:
-        with _temporary_environment("PATH"):
-            os.chdir(controller)
-            os.environ["PATH"] = str(folder)
-            with refused(source, "invalid_input"):
-                source.JobSource(run=reads.run, object_read_argv=team_git.object_read_argv,
-                                 object_read_env=team_git.object_read_env, child_environment=lambda env, _: env)
+        with bound_ordinary_root(controller):
+            with _temporary_environment("PATH"):
+                os.chdir(controller)
+                os.environ["PATH"] = str(folder)
+                with refused(source, "invalid_input"):
+                    source.JobSource(run=reads.run, object_read_argv=team_git.object_read_argv,
+                                     object_read_env=team_git.object_read_env, child_environment=lambda env, _: env)
     finally:
-        pathlookup.ordinary_root.reset(root_token)
         os.chdir(original_cwd)
         assert not marker.exists()
+    assert pathlookup.ordinary_root.get() == previous_root
+    assert Path.cwd() == original_cwd
+    assert os.environ.get("PATH") == previous_path
 
 
 def writable_exports(*targets):
@@ -1262,25 +1267,27 @@ def test_export_isolates_all_reader_children(source, repo, service, planned):
     api = source.JobSource(run=reads.run, object_read_argv=team_git.object_read_argv,
                            object_read_env=team_git.object_read_env, child_environment=lambda env, _: env,
                            program=str(observer))
-    saved = {key: os.environ.get(key) for key in ambient}
+    original_cwd = Path.cwd()
+    previous_root = pathlookup.ordinary_root.get()
+    saved = {key: os.environ.get(key) for key in (*ambient, "PATH")}
     target = repo.parent / "output"
-    root_token = pathlookup.ordinary_root.set(str(repo.path))
     try:
-        os.environ.update(ambient)
-        assert api.export_commit(repo.path, repo.commit, repo.tree, target, planned=planned)["entries"] == 2
-        assert (target / "dir" / "file").read_bytes() == b"committed\n"
-        absent = "0" * (len(keys) + 1)
-        assert observations.read_text(encoding="ascii").splitlines() == [
-            "size " + absent, "payload " + absent, "size " + absent, "payload " + absent,
-        ]
+        with _temporary_environment(*saved):
+            with bound_ordinary_root(repo.path):
+                os.environ.update(ambient)
+                assert api.export_commit(repo.path, repo.commit, repo.tree, target, planned=planned)["entries"] == 2
+                assert (target / "dir" / "file").read_bytes() == b"committed\n"
+                absent = "0" * (len(keys) + 1)
+                assert observations.read_text(encoding="ascii").splitlines() == [
+                    "size " + absent, "payload " + absent, "size " + absent, "payload " + absent,
+                ]
     finally:
-        pathlookup.ordinary_root.reset(root_token)
-        for key, value in saved.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
         writable_exports(target)
+    assert pathlookup.ordinary_root.get() == previous_root
+    assert Path.cwd() == original_cwd
+    assert all(os.environ.get(key) == value for key, value in saved.items()), "environment was not restored"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o700
+    assert stat.S_IMODE((target / "dir").stat().st_mode) == 0o700
 
 
 def test_owner_excludes_file_survives_a_caller_config_view(source, repo):

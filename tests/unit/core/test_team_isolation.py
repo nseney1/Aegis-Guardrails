@@ -7,11 +7,14 @@ from pathlib import PurePosixPath
 import posixpath
 import stat
 import sys
+from threading import Barrier
 
 import pytest
 
 from aegis_core import hosts, team_host_registry, team_isolation as core
 from aegis_core import team_isolation_mounts as mounts
+from aegis_core import team_isolation_verify as verifier
+from aegis_core.team_isolation_refusal import plan_response, plan_text
 
 
 HOME = "/owner"
@@ -65,9 +68,18 @@ def direct(value, **options):
     return core.check(value, **_inputs(**options))
 
 
-def refused_as(code):
-    return {"status": "refused", "code": code, "reason": mounts.REFUSALS[code],
+def refused_as(code, stage=None):
+    body = {"status": "refused", "code": code, "reason": mounts.REFUSALS[code],
             "next_action": {"actor": "operator", "command": mounts.REFUSALS[code]}}
+    if stage is not None:
+        body["stage"] = stage
+    return body
+
+
+def _document_stage(code):
+    if code in ("document_invalid", "document_read", "document_size"):
+        return "config"
+    return None
 
 
 def _same_object(value, snapshot):
@@ -153,9 +165,11 @@ def test_host_plan_does_not_observe_or_lookup_owner(value):
         "recipes", "bin", "recipe-fields", "live-limit"])
 def test_plan_refusal_and_retry(value, code):
     refused = check(value)
-    assert refused == {"status": "refused", "code": code, "reason": mounts.REFUSALS[code],
-                       "next_action": {"actor": "operator", "command": mounts.REFUSALS[code]}}
-    assert check(config())["status"] == "ok"
+    assert refused == refused_as(code, _document_stage(code))
+    assert set(refused) == ({"status", "code", "reason", "next_action", "stage"}
+                            if _document_stage(code) else {"status", "code", "reason", "next_action"})
+    retry = check(config())
+    assert retry["status"] == "ok" and "stage" not in retry
 
 
 def test_inferred_prefix_and_concurrent_plans():
@@ -175,21 +189,70 @@ def test_inferred_prefix_and_concurrent_plans():
     assert check(dict(value, python_prefix=PREFIX), observer=absent)["status"] == "ok"
 
 
+def unexpected_observer(*args, **kwargs):
+    pytest.fail("malformed container input reached observation")
+
+
 def test_inspection_refusal_order_and_retry():
+    value, inspected, good_image = _matching_inspections()
     calls = []
-    digest = IMAGE.rsplit("@", 1)[1]
 
     def inspector(argv):
         calls.append(argv)
-        return json.dumps([{"Id": "sha256:" + "b" * 64, "RepoDigests": [IMAGE],
-                            "Digest": digest, "Config": {"Env": []}}]).encode()
+        return good_image
 
-    refused = check(config(), inspect=lambda: b"bad", inspector=inspector)
-    assert refused["code"] == "document_invalid" and not calls
-    result = check(config(), inspect=lambda: b"[{}]", inspector=inspector)
-    assert result["status"] == "mismatch" and result["mismatches"]
-    assert calls == [["podman", "image", "inspect", IMAGE]]
-    assert check(config(), inspect=lambda: b"[{}]", inspector=lambda _: b"{}")["code"] == "image_inspect"
+    refused = check(value, inspect=lambda: b"bad", inspector=inspector, observer=unexpected_observer)
+    assert refused == refused_as("document_invalid", "container-inspection") and not calls
+    assert check(value, inspect=lambda: inspected, inspector=inspector) == {"status": "ok", "mismatches": []}
+    assert calls == [["docker", "image", "inspect", IMAGE]]
+    assert check(value, inspect=lambda: inspected, inspector=lambda _: b"{}") == refused_as("image_inspect")
+    assert check(value, inspect=lambda: inspected, inspector=lambda _: b"{") == (
+        refused_as("document_invalid", "image-inspection"))
+    assert check(value, inspect=lambda: inspected, inspector=inspector) == {"status": "ok", "mismatches": []}
+
+
+@pytest.mark.parametrize("stage", ["container-inspection", "image-inspection"])
+def test_typed_reader_refusal_has_its_document_stage_and_retries(stage):
+    value, inspected, good_image = _matching_inspections()
+
+    class ReaderRefusal(mounts.IsolationRefusal):
+        pass
+
+    def unreadable(*args):
+        error = ReaderRefusal("document_read")
+        error.message = "untrusted\nreader message"
+        raise error
+
+    if stage == "container-inspection":
+        refused = check(value, inspect=unreadable, inspector=unexpected_observer, observer=unexpected_observer)
+    else:
+        refused = check(value, inspect=lambda: inspected, inspector=unreadable)
+    assert refused == refused_as("document_read", stage)
+    assert check(value, inspect=lambda: inspected, inspector=lambda _: good_image) == (
+        {"status": "ok", "mismatches": []})
+
+
+def test_document_stages_stay_isolated_across_concurrent_checks():
+    value, inspected, good_image = _matching_inspections()
+
+    def project(index):
+        kind = index % 3
+        if kind == 0:
+            body = check(b"{")
+        elif kind == 1:
+            body = check(value, inspect=lambda: b"{", observer=unexpected_observer,
+                         inspector=unexpected_observer)
+        else:
+            body = check(value, inspect=lambda: inspected, inspector=lambda _argv: [{"extra": 1 << 128}])
+        retry = check(value, inspect=lambda: inspected, inspector=lambda _argv: good_image)
+        return body, retry
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        found = list(pool.map(project, range(9)))
+    success = {"status": "ok", "mismatches": []}
+    assert found[0::3] == [(refused_as("document_invalid", "config"), success)] * 3
+    assert found[1::3] == [(refused_as("document_invalid", "container-inspection"), success)] * 3
+    assert found[2::3] == [(refused_as("document_size", "image-inspection"), success)] * 3
 
 
 @pytest.mark.parametrize("rw", [False, True])
@@ -273,13 +336,13 @@ def test_ignored_alias_failures_keep_the_caller_and_then_retry():
     )
     for value, code in cases:
         snapshot = dict(value) if type(value) is dict else list(value) if type(value) is list else value
-        assert direct(value) == refused_as(code)
-        assert check(value) == refused_as(code)
+        assert direct(value) == refused_as(code, _document_stage(code))
+        assert check(value) == refused_as(code, _document_stage(code))
         rendered = json.dumps(direct(value))
         assert "marker" not in rendered and "m" * 40 not in rendered and "y" * 40 not in rendered
         _same_object(value, snapshot)
     odd = {1: "marker"}
-    assert direct(odd) == refused_as("document_invalid")
+    assert direct(odd) == refused_as("document_invalid", "config")
     _same_object(odd, {1: "marker"})
     assert "marker" not in json.dumps(direct(odd))
     assert direct({"codex_home": "m" * 16384}) == HOST
@@ -311,17 +374,15 @@ def test_core_run_does_not_decode_strings(value):
 
     refused = core.check(value, observer=unexpected, owner_homes=unexpected, owner_identity=unexpected,
                          cpu_count=unexpected, host_table=unexpected, platform="linux", source="/source")
-    assert refused["status"] == "refused" and refused["code"] == "document_invalid"
+    assert refused == refused_as("document_invalid", "config")
 
 
-def test_core_rejects_double_encoded_matching_inspection():
-    from aegis_core.team_isolation_verify import container_name
-
+def _matching_inspections():
     value = config()
     value["isolation"] = dict(ISOLATION, engine="docker", allow_unqualified=True)
     plan = check(value)
     argv = plan["create_argv"]
-    inspected = {"Name": "/" + container_name(RUN), "Image": "sha256:" + "b" * 64,
+    inspected = {"Name": "/" + verifier.container_name(RUN), "Image": "sha256:" + "b" * 64,
                  "Config": {"Labels": {"aegis.team.run": RUN}, "User": "0:0",
                             "Env": [argv[i + 1] for i, item in enumerate(argv) if item == "--env"]},
                  "HostConfig": {"ReadonlyRootfs": True, "Privileged": False, "CapAdd": [], "Devices": [],
@@ -332,16 +393,194 @@ def test_core_rejects_double_encoded_matching_inspection():
                  "Mounts": [dict(Type="bind", Source=row["source"], Destination=row["destination"], RW=row["rw"])
                             for row in plan["mounts"]]}
 
-    def inspector(argv):
-        return [{"Id": "sha256:" + "b" * 64, "RepoDigests": [IMAGE], "Config": {"Env": []}}]
+    image = [{"Id": "sha256:" + "b" * 64, "RepoDigests": [IMAGE], "Config": {"Env": []}}]
+    return value, json.dumps([inspected]), image
+
+
+def _verification_context():
+    return dict(host_table=TABLE, home=HOME, observed=observe((RUN, PROJECT, SOURCE, PREFIX), (HOME,)),
+                owner_uid=0, owner_homes=_inputs()["owner_homes"]())
+
+
+@pytest.mark.parametrize(("cpus", "code", "reason"), [
+    (1 << 128, "document_size", "Reduce the isolation input to its documented size limits."),
+    ("\ud800untrusted-cpu", "document_invalid", "Supply a valid bounded JSON document."),
+], ids=["size", "invalid"])
+def test_expected_plan_stages_config_document_refusal_then_verifies(cpus, code, reason):
+    value, container, image = _matching_inspections()
+    rows = check(value)["mounts"]
+    context = _verification_context()
+
+    def expected(isolation):
+        return verifier.expected_plan(isolation, run=RUN, mounts=rows, image_inspect=image,
+                                      uid=0, gid=0, cpu_count=4, platform="linux", **context)
+
+    isolation = dict(value["isolation"], cpus=cpus)
+    with pytest.raises(mounts.IsolationRefusal, match="^" + code + "$") as caught:
+        expected(isolation)
+    error = caught.value
+    assert error.stage == "config"
+    assert error.exit_code == 1
+    body = plan_response(error)
+    assert body == {"status": "refused", "code": code, "reason": reason, "stage": "config",
+                    "next_action": {"actor": "operator", "command": reason}}
+    assert plan_text(body) == code + " — " + reason + " (config)"
+
+    isolation["cpus"] = value["isolation"]["cpus"]
+    assert verifier.verify(container, expected(isolation), **context) == []
+
+
+@pytest.mark.parametrize("entry", ["decoded", "text", "bytes", "argv"])
+@pytest.mark.parametrize(("cpus", "code", "stage"), [
+    (1 << 128, "document_size", "config"),
+    ("\ud800untrusted-cpu", "document_invalid", "config"),
+    (5, "isolation_cpus", None),
+], ids=["size", "invalid", "semantic"])
+def test_config_readers_and_argv_distinguish_document_and_field_errors(entry, cpus, code, stage):
+    isolation = dict(ISOLATION, cpus=cpus)
+    limits = dict(cpu_count=4, platform="linux")
+    with pytest.raises(mounts.IsolationRefusal, match="^" + code + "$") as caught:
+        if entry == "decoded":
+            mounts.read_isolation(isolation, **limits)
+        elif entry == "argv":
+            core.create_argv(isolation, run=RUN, mounts=check(config())["mounts"], uid=0, gid=0,
+                             **_verification_context(), **limits)
+        else:
+            text = json.dumps(isolation)
+            mounts.load_isolation(text.encode() if entry == "bytes" else text, **limits)
+    assert caught.value.stage == stage
+    assert plan_response(caught.value) == refused_as(code, stage)
+
+
+def test_isolation_readers_keep_their_input_domains():
+    limits = dict(cpu_count=4, platform="linux")
+    text = json.dumps(ISOLATION)
+    for reader, raw, code, stage in (
+        (mounts.read_isolation, text, "isolation_object", None),
+        (mounts.read_isolation, text.encode(), "document_invalid", "config"),
+        (mounts.load_isolation, ISOLATION, "document_invalid", "config"),
+        (mounts.load_isolation, b'{"untrusted":', "document_invalid", "config"),
+        (mounts.load_isolation, json.dumps(text), "isolation_object", None),
+    ):
+        with pytest.raises(mounts.IsolationRefusal, match="^" + code + "$") as caught:
+            reader(raw, **limits)
+        assert plan_response(caught.value) == refused_as(code, stage)
+
+
+@pytest.mark.parametrize("entry", ["decoded", "text", "bytes"])
+def test_isolation_readers_bound_each_config_document_once(entry, monkeypatch):
+    decodes, bounds = [], []
+    strict_loads, bounded_value = mounts.strict_loads, mounts.bounded_value
+
+    def decode(text):
+        decodes.append(text)
+        return strict_loads(text)
+
+    def bound(value):
+        bounds.append(value)
+        bounded_value(value)
+
+    monkeypatch.setattr(mounts, "strict_loads", decode)
+    monkeypatch.setattr(mounts, "bounded_value", bound)
+    text = json.dumps(ISOLATION)
+    limits = dict(cpu_count=4, platform="linux")
+    if entry == "decoded":
+        result = mounts.read_isolation(ISOLATION, **limits)
+        assert decodes == []
+    else:
+        result = mounts.load_isolation(text.encode() if entry == "bytes" else text, **limits)
+        assert decodes == [text]
+    assert bounds == [ISOLATION]
+    assert result == dict(ISOLATION, allow_unqualified=False)
+
+
+def test_config_and_inspection_refusal_stages_are_call_local():
+    value, container, image = _matching_inspections()
+    rows = check(value)["mounts"]
+    context = _verification_context()
+    large = 1 << 128
+
+    def expected(isolation, evidence):
+        return verifier.expected_plan(isolation, run=RUN, mounts=rows, image_inspect=evidence,
+                                      uid=0, gid=0, cpu_count=4, platform="linux", **context)
+
+    isolation = value["isolation"]
+    record = expected(isolation, image)
+    cases = (
+        (lambda: expected(dict(isolation, cpus=large), image), "config"),
+        (lambda: expected(isolation, [{"extra": large}]), "image-inspection"),
+        (lambda: verifier.verify([{"extra": large}], record, **context), "container-inspection"),
+        (lambda: verifier.verify(container, dict(record, extra=large), **context), None),
+        (lambda: verifier.verify(container, record, **dict(context, observed={"extra": large})), None),
+        (lambda: mounts.load_document(json.dumps({"extra": large})), None),
+    )
+    start = Barrier(len(cases), timeout=10)
+
+    def project(case):
+        operation, stage = case
+        start.wait()
+        with pytest.raises(mounts.IsolationRefusal, match="^document_size$") as caught:
+            operation()
+        assert caught.value.stage == stage
+        assert plan_response(caught.value) == refused_as("document_size", stage)
+
+    with ThreadPoolExecutor(max_workers=len(cases)) as pool:
+        list(pool.map(project, cases))
+    assert verifier.verify(container, record, **context) == []
+
+
+def test_core_rejects_double_encoded_matching_inspection():
+    value, raw, image = _matching_inspections()
 
     def unexpected(*args, **kwargs):
         pytest.fail("twice-encoded matching data reached container dependencies")
 
-    raw = json.dumps([inspected])
-    assert check(value, inspect=lambda: raw, inspector=inspector) == {"status": "ok", "mismatches": []}
+    assert check(value, inspect=lambda: raw, inspector=lambda _: image) == {"status": "ok", "mismatches": []}
     assert check(value, inspect=lambda: json.dumps(raw), inspector=unexpected, observer=unexpected) == (
         {"status": "mismatch", "mismatches": ["inspect"]})
+
+
+@pytest.mark.parametrize("encode", [lambda value: value, json.dumps, lambda value: json.dumps(value).encode()],
+                         ids=["decoded", "text", "bytes"])
+def test_verifier_stages_input_limits_and_bounds_each_inspection_once(encode, monkeypatch):
+    value, container, image = _matching_inspections()
+    container = json.loads(container)
+    rows = check(value)["mounts"]
+    context = _verification_context()
+    invalid = [{"extra": 1 << 128}]
+
+    def expected(evidence):
+        return verifier.expected_plan(value["isolation"], run=RUN, mounts=rows, image_inspect=evidence,
+                                      uid=0, gid=0, cpu_count=4, platform="linux", **context)
+
+    def verify(evidence, record):
+        return verifier.verify(evidence, record, **context)
+
+    with pytest.raises(mounts.IsolationRefusal, match="^document_size$") as error:
+        expected(encode(invalid))
+    assert error.value.stage == "image-inspection"
+    record = expected(encode(image))
+    with pytest.raises(mounts.IsolationRefusal, match="^document_size$") as error:
+        verify(encode(invalid), record)
+    assert error.value.stage == "container-inspection"
+    with pytest.raises(mounts.IsolationRefusal, match="^document_size$") as error:
+        verify(encode(container), dict(record, extra=1 << 128))
+    assert error.value.stage is None
+
+    bounds = []
+    bounded_value = mounts.bounded_value
+
+    def track(candidate):
+        bounds.append(candidate)
+        bounded_value(candidate)
+
+    monkeypatch.setattr(mounts, "bounded_value", track)
+    monkeypatch.setattr(verifier, "bounded_value", track)
+    assert expected(encode(image)) == record
+    assert bounds.count(image) == 1
+    bounds.clear()
+    assert verify(encode(container), record) == []
+    assert bounds.count(container) == 1
 
 
 # Credential roots that remain covered after a host row leaves the catalogue.
