@@ -1,8 +1,8 @@
 """Public host-authority checks and parity against the frozen adapter."""
 import copy
+import json
 import os
 import pickle
-import socket
 import stat
 import threading
 import time
@@ -529,34 +529,102 @@ def test_socket_inspection_checks_kind_without_opening_a_connection(protected):
     assert not boundary.read_sizes
 
 
-def test_control_wire_uses_one_borrowed_socket_and_owner_revokes(runtime):
-    if not authority.descriptor_supported():
-        pytest.skip("Linux protected descriptor and ACL checks required")
-    runtime.io_gate = threading.RLock()
-    runtime.fenced = False
-    owned, peer = socket.socketpair()
+def _unexpected_control_resource(*_args, **_kwargs):
+    pytest.fail("ControlIO admission touched an owner resource")
 
-    def close():
-        with runtime.io_gate:
-            runtime.fenced = True
-            owned.close()
 
-    with owned, peer:
-        runtime.control_socket = owned
-        runtime.close = close
-        wire = authority.ControlIO(runtime)
-        deadline = time.monotonic() + 3
-        peer.settimeout(3)
-        wire.write({"operation": "describe"}, deadline)
-        with peer.makefile("rb") as stream:
-            assert stream.readline() == b'{"operation":"describe"}\n'
-        frames = b'{"id":1}\n{"id":2}\n'
-        assert os.write(peer.fileno(), frames) == len(frames)
-        assert wire.read(deadline) == {"id": 1}
-        wire.close()
-        assert owned.fileno() == -1
-        with refusal("HOST_PROTOCOL_ERROR", "invalid host protocol frame"):
-            wire.read(deadline)
+class ControlBinding:
+    __slots__ = ("foreign", "_fenced", "checks", "__weakref__")
+
+    def __init__(self, *, foreign=False, fenced=False):
+        self.foreign = foreign
+        self._fenced = fenced
+        self.checks = []
+
+    def require_owner_process(self):
+        self.checks.append("process")
+        if self.foreign:
+            raise HostAuthorityError("STALE_INVOCATION",
+                                     "runtime binding belongs to another host process")
+
+    @property
+    def fenced(self):
+        self.checks.append("fenced")
+        return self._fenced
+
+    @property
+    def io_gate(self):
+        pytest.fail("ControlIO admission accessed the owner gate")
+
+    @property
+    def control_socket(self):
+        pytest.fail("ControlIO admission accessed the owner socket")
+
+    def close(self):
+        pytest.fail("ControlIO admission closed the owner")
+
+
+@pytest.fixture
+def control_registry(monkeypatch):
+    registry = keys.NativeIdentities()
+    registry.bind_type("binding", ControlBinding)
+    unexpected = _unexpected_control_resource
+    monkeypatch.setattr(authority, "native_identities", registry)
+    monkeypatch.setattr(authority, "descriptor_supported", lambda: True)
+    monkeypatch.setattr(authority, "os", SimpleNamespace(
+        set_blocking=unexpected, read=unexpected, write=unexpected, close=unexpected))
+    monkeypatch.setattr(authority, "threading", SimpleNamespace(
+        Thread=unexpected, Lock=unexpected, Event=unexpected))
+    monkeypatch.setattr(authority, "weakref", SimpleNamespace(
+        WeakValueDictionary=unexpected, finalize=unexpected))
+    return registry
+
+
+def test_control_constructor_checks_platform_before_identity(control_registry, monkeypatch):
+    monkeypatch.setattr(authority, "descriptor_supported", lambda: False)
+    with refusal("UNSUPPORTED_HOST", "protected control requires Linux"):
+        authority.ControlIO(object())
+
+
+def test_control_constructor_checks_exact_binding_identity_before_process(control_registry):
+    class ForeignBinding(ControlBinding):
+        pass
+
+    owner = ForeignBinding(foreign=True, fenced=True)
+    with refusal("ROLE_OPERATION_FORBIDDEN", "control requires an owned binding"):
+        authority.ControlIO(owner)
+    assert owner.checks == []
+
+
+def test_control_constructor_checks_owner_process_before_staleness(control_registry):
+    owner = ControlBinding(foreign=True, fenced=True)
+    with refusal("STALE_INVOCATION", "runtime binding belongs to another host process"):
+        authority.ControlIO(owner)
+    assert owner.checks == ["process"]
+
+
+def test_control_constructor_checks_staleness_before_deployment(control_registry):
+    owner = ControlBinding(fenced=True)
+    with refusal("STALE_INVOCATION", "runtime binding is closed"):
+        authority.ControlIO(owner)
+    assert owner.checks == ["process", "fenced"]
+    assert owner._fenced is True
+
+
+@pytest.mark.parametrize("registered", [False, True])
+def test_control_constructor_repeatedly_refuses_without_owner_side_effects(control_registry, registered):
+    first, fresh = ControlBinding(), ControlBinding()
+    for owner in (first, fresh):
+        if registered:
+            control_registry.register_binding(keys.LIVE_KEY, owner)
+        initial_checks = ["process"] if registered else []
+        for _ in range(2):
+            with refusal("UNPROTECTED_DEPLOYMENT", "unprotected host deployment") as error:
+                authority.ControlIO(owner)
+            assert error.value.__cause__ is None
+            assert owner.foreign is False and owner._fenced is False
+            assert control_registry.owns_binding(owner) is registered
+        assert owner.checks == initial_checks + ["process", "fenced"] * 2
 
 
 def test_missing_and_invalid_paths_refuse_without_diagnostics(protected):
@@ -578,6 +646,8 @@ def test_unsupported_host_refuses_before_any_filesystem_work(monkeypatch):
         authority.protected_path("/unread", {0}, -1)
     with refusal("UNSUPPORTED_HOST", "protected control requires Linux"):
         authority.process_identity(1)
+    with refusal("UNSUPPORTED_HOST", "protected control requires Linux"):
+        authority.ControlIO(object())
 
 
 def test_process_identity_matches_legacy_on_linux():

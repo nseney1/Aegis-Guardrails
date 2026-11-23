@@ -5,14 +5,16 @@ hits are revalidated outside the store lock; each call captures its bound root.
 """
 from __future__ import annotations
 
-from contextvars import ContextVar
+import os
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Optional
 
 from aegis_core.primitives import sanitize_display
 from aegis_core.redaction import redact_insight_text
 
-__all__ = ["GitCache", "ordinary_root"]
+__all__ = ["GitCache", "bound_ordinary_root", "ordinary_root"]
 
 
 class _RootCache:
@@ -135,8 +137,37 @@ class _FenceCacheStore(dict):
         return self
 
 
-# Only invocation adapters set this, using a canonical root from completed binding.
-ordinary_root = ContextVar("aegis_gitsafe_ordinary_root", default=None)
+_ordinary_root = ContextVar("aegis_gitsafe_ordinary_root", default=None)
+
+
+class _OrdinaryRootView:
+    """Read the current context's root through the public exports."""
+
+    __slots__ = ()
+
+    @property
+    def name(self) -> str:
+        return _ordinary_root.name
+
+    def get(self, *args):
+        return _ordinary_root.get(*args)
+
+
+ordinary_root = _OrdinaryRootView()
+
+
+@contextmanager
+def bound_ordinary_root(root):
+    """Yield the normalized root and restore the previous binding on exit.
+
+    ``None`` clears the binding for the duration of the context.
+    """
+    normalized = None if root is None else os.path.normcase(os.fspath(root))
+    token = _ordinary_root.set(normalized)
+    try:
+        yield normalized
+    finally:
+        _ordinary_root.reset(token)
 
 
 class GitCache(_FenceCacheStore):
