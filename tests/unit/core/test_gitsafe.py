@@ -2218,6 +2218,177 @@ def test_a_snapshot_rerun_of_a_leading_dash_revision_fails_without_reaching_git(
 
 # ── one request's repository facts: memo and layout (R-structure-4) ─────────
 
+def test_layout_empty_output_keeps_one_query_per_scope_and_retries_across_threads(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, local
+    observed = local()
+    gate = Barrier(2, timeout=10)
+    def answer(args, cwd, **kwargs):
+        observed.calls.append(tuple(args))
+        stdout = b".git\n\nfalse\n" + os.fsencode(cwd) + b"\n" if observed.available else b""
+        return subprocess.CompletedProcess(args, 0 if observed.available else 128, stdout, b"")
+    monkeypatch.setattr(gitsafe, "run", answer)
+    def verify(index):
+        root = tmp_path / ("worker-" + str(index))
+        observed.calls, observed.available = [], False
+        gate.wait()
+        with gitsafe.memo():
+            for _ in range(2):
+                assert gitsafe.layout(root) is None
+        assert len(observed.calls) == 1
+        observed.available = True
+        with gitsafe.memo():
+            for _ in range(2):
+                assert gitsafe.layout(root) == gitsafe.Layout(".git", "", False, os.path.normpath(root))
+        assert len(observed.calls) == 2
+        return True
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(verify, range(2), timeout=15)) == [True, True]
+
+
+@pytest.mark.parametrize("suffix", [" ", "\t", "\r", "\n"])
+def test_git_path_transport_removes_only_one_final_lf(tmp_path, monkeypatch, suffix):
+    path = " leading" + suffix
+    def answer(args, cwd, **kwargs):
+        return subprocess.CompletedProcess(args, 0, os.fsencode(path) + b"\n", b"")
+    monkeypatch.setattr(gitsafe, "run", answer)
+    for _ in range(2):
+        if os.name != "nt":  # Windows rejects/normalizes these filesystem names.
+            assert str(gitsafe.git_path(tmp_path, "hooks")) == str(tmp_path / path)
+        assert gitsafe.show_prefix(tmp_path) == path
+
+
+def test_git_path_decoder_bounds_before_decoding_and_refuses_nul():
+    for raw, code, message in (
+        (b"\xff" * 65537, "git_path_limit", "Git path output exceeds its byte limit."),
+        (b"private\0path\n", "git_path_invalid", "Git path framing is invalid."),
+        (b"gitdir:missing-space\n", "git_path_invalid", "Git path framing is invalid."),
+    ):
+        with pytest.raises(gitsafe.GitError) as caught:
+            gitsafe_run.path_text(raw, gitfile=raw.startswith(b"gitdir:"))
+        assert (caught.value.code, str(caught.value)) == (code, message)
+    assert gitsafe_run.path_text(b"gitdir:  leading \n", gitfile=True) == " leading "
+    assert gitsafe_run.path_text(b"\n") == ""
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("bad", [b"secret-\xff", b"two\nlines", b"two\n"])
+def test_lane_discovery_paths_refuse_and_retry(tmp_path, monkeypatch, bad):
+    outputs = iter((bad,))
+    def capture(argv, **kwargs):
+        raw = next(outputs, os.fsencode(str(tmp_path / " repository ")))
+        return subprocess.CompletedProcess(argv, 0, raw + b"\n", b"")
+    monkeypatch.setattr(gitsafe_run, "capture", capture)
+    monkeypatch.setattr(gitsafe, "custody_program", lambda *a, **kw: "/trusted/git")
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.lane_runner(tmp_path, tmp_path / "scratch", environ={})
+    assert caught.value.code == ("git_path_encoding" if b"\xff" in bad else "invalid_repository")
+    lane = gitsafe.lane_runner(tmp_path, tmp_path / "scratch", environ={})
+    assert lane.cwd == tmp_path
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows normalizes trailing whitespace in paths")
+def test_git_path_whitespace_roundtrips_across_worktrees_and_threads(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    main = _repo(tmp_path / " main ")
+    (main / "tracked").write_text("data\n")
+    _commit(main)
+    admin = tmp_path / " admin "
+    _git(main, "rev-parse", "--git-dir")
+    _git(main, "init", "--separate-git-dir", str(admin))
+    linked = tmp_path / " linked "
+    _git(main, "worktree", "add", "-q", "--detach", str(linked))
+    def observe(root):
+        for _ in range(2):
+            with gitsafe.memo():
+                assert gitsafe.toplevel(root) == root
+                assert gitsafe.common_dir(root) == admin
+                assert gitsafe.git_path(root, "hooks") == admin / "hooks"
+        return True
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert all(pool.map(observe, (main, linked)))
+
+
+@pytest.mark.parametrize("query", ["layout", "fallback", "prefix", "hooks"])
+def test_undecodable_git_paths_refuse_and_retry(tmp_path, monkeypatch, query):
+    bad = True
+    def answer(args, cwd, **kwargs):
+        path = b"secret-\xff" if bad else b" leading "
+        if len(args) == 5:
+            out = path + b"\n\nfalse\n/top\n"
+            if query == "fallback":
+                out += b"extra\n"
+        else:
+            out = path + b"\n"
+        return subprocess.CompletedProcess(args, 0, out, b"")
+    monkeypatch.setattr(gitsafe, "run", answer)
+    invoke = {"layout": gitsafe.layout, "fallback": gitsafe.layout,
+              "prefix": gitsafe.show_prefix,
+              "hooks": lambda root: gitsafe.git_path(root, "hooks")}[query]
+    with pytest.raises(gitsafe.GitError) as caught:
+        invoke(tmp_path)
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_encoding", "Git path is not decodable.")
+    bad = False
+    assert invoke(tmp_path) is not None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows normalizes trailing whitespace in paths")
+@pytest.mark.parametrize("bad", [False, True])
+def test_hook_gitfile_and_commondir_preserve_whitespace_or_refuse(tmp_path, bad):
+    from aegis_core.workspace import hooks
+    root = tmp_path / "root"
+    root.mkdir()
+    admin = root / " admin "
+    admin.mkdir()
+    common = admin / " common "
+    common.mkdir()
+    (root / ".git").write_bytes(b"gitdir:  admin \n")
+    (admin / "commondir").write_bytes(b" common \n" if not bad else b"secret-\xff\n")
+    if bad:
+        with pytest.raises(gitsafe.GitError) as caught:
+            hooks._find_git_dirs(root)
+        assert caught.value.code == "git_path_encoding"
+        (admin / "commondir").write_bytes(b" common \n")
+    for _ in range(2):
+        assert hooks._find_git_dirs(root) == (admin, common)
+
+
+@pytest.mark.parametrize("bad_file", ["gitfile", "commondir"])
+def test_hook_path_decoding_refuses_invalid_bytes_and_recovers(tmp_path, bad_file):
+    from concurrent.futures import ThreadPoolExecutor
+    from aegis_core.workspace import hooks
+    root = tmp_path / "root"
+    admin = root / "admin"
+    common = admin / "common"
+    common.mkdir(parents=True)
+    gitfile = root / ".git"
+    commondir = admin / "commondir"
+    gitfile.write_bytes(b"gitdir: admin\n")
+    commondir.write_bytes(b"common\n")
+    broken, repaired = ((gitfile, b"gitdir: admin\n") if bad_file == "gitfile"
+                        else (commondir, b"common\n"))
+    broken.write_bytes(b"gitdir: secret-\xff\n" if bad_file == "gitfile" else b"secret-\xff\n")
+    def refused(_):
+        with pytest.raises(gitsafe.GitError) as caught:
+            hooks._find_git_dirs(root)
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_encoding", "Git path is not decodable.")
+        return True
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(refused, range(2), timeout=10)) == [True, True]
+        broken.write_bytes(repaired)
+        assert list(pool.map(hooks._find_git_dirs, [root, root], timeout=10)) == [
+            (admin, common), (admin, common)]
+
+
+@pytest.mark.parametrize("content", [b"not a gitfile\n", b""])
+def test_hook_non_gitfile_retains_discovery_fallthrough(tmp_path, content):
+    from aegis_core.workspace import hooks
+    (tmp_path / ".git").write_bytes(content)
+    assert hooks._find_git_dirs(tmp_path) == (None, None)
+
+
 def test_a_memo_scope_asks_git_once_for_the_top_level_and_the_common_dir(repo: Path, git_calls):
     (repo / "sub").mkdir()
     git_calls.clear()
@@ -5682,6 +5853,94 @@ def test_effect_root_open_failure_is_typed_and_closes_descriptors(repo, tmp_path
         assert "untrusted-root-input" not in str(caught.value) and caught.value.next_action
         assert set(os.listdir("/proc/self/fd")) == before
         os.fstat(effect_lock)
+
+
+def _effect_record_layout(repo, record, sibling):
+    _git(repo, "config", "aegis.recordPathProbe", "owner")
+    admin = repo / (" admin " if record == "gitdir" else "admin")
+    _git(repo, "init", "-q", "--separate-git-dir", str(admin))
+    if record == "gitdir":
+        common, path, good = admin, repo / ".git", b"gitdir:  admin \n"
+        neighbor = repo / "admin"
+    else:
+        common = admin / " common "
+        common.mkdir()
+        for name in ("objects", "refs", "config"):
+            (admin / name).rename(common / name)
+        path, good = admin / "commondir", b" common \n"
+        neighbor = admin / "common"
+    path.write_bytes(good)
+    if sibling:
+        _git(repo, "init", "-q", "--bare", str(neighbor))
+        _git(neighbor, "config", "aegis.recordPathProbe", "sibling")
+    assert _git(repo, "config", "--get", "aegis.recordPathProbe") == "owner\n"
+    return admin, common, path, good
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("record", ["gitdir", "commondir"])
+@pytest.mark.parametrize("sibling", [False, True])
+def test_effect_record_paths_preserve_whitespace_and_never_bind_sibling(repo, effect_lock, record, sibling):
+    from concurrent.futures import ThreadPoolExecutor
+    admin, common, _, _ = _effect_record_layout(repo, record, sibling)
+    def observe(_):
+        env = gitops_fds.effect_environment({}, repo, error=gitsafe.GitError,
+            worktree_root=repo, transport=gitsafe_run.transport_services())
+        assert env.repository["dirs"] == (str(admin), str(common))
+        assert env["GIT_DIR"] == str(admin)
+        return True
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(observe, range(2), timeout=10)) == [True, True]
+    for _ in range(2):
+        result = gitsafe.run(["rev-parse", "--git-common-dir"], repo,
+            effect_fds=(effect_lock,), worktree_root=repo)
+        assert result.returncode == 0 and result.stdout == os.fsencode(common) + b"\n"
+        os.fstat(effect_lock)
+        assert not os.get_inheritable(effect_lock)
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("record", ["gitdir", "commondir"])
+def test_effect_record_crlf_paths_match_git(repo, effect_lock, record):
+    admin, common, path, good = _effect_record_layout(repo, record, True)
+    path.write_bytes(good[:-1] + b"\r\n")
+    git_admin = (repo / _git(repo, "rev-parse", "--git-dir").removesuffix("\n")).resolve()
+    git_common = (repo / _git(repo, "rev-parse", "--git-common-dir").removesuffix("\n")).resolve()
+    assert (git_admin, git_common) == (admin.resolve(), common.resolve())
+    env = gitops_fds.effect_environment({}, repo, error=gitsafe.GitError,
+        worktree_root=repo, transport=gitsafe_run.transport_services())
+    assert env.repository["dirs"] == (str(git_admin), str(git_common))
+    result = gitsafe.run(["rev-parse", "--git-common-dir"], repo,
+        effect_fds=(effect_lock,), worktree_root=repo)
+    assert result.returncode == 0 and result.stdout == os.fsencode(git_common) + b"\n"
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("record", ["gitdir", "commondir"])
+@pytest.mark.parametrize("bad", ["undecodable", "nul", "multiline", "embedded-cr", "oversize", "empty"])
+def test_effect_record_refusals_are_fixed_close_fds_and_recover(repo, effect_lock, record, bad):
+    admin, common, path, good = _effect_record_layout(repo, record, True)
+    prefix = b"gitdir: " if record == "gitdir" else b""
+    damaged = {"undecodable": prefix + b"private-\xff\n", "nul": prefix + b"private\0record\n",
+               "multiline": good + b"extra\n", "embedded-cr": prefix + b"private\rrecord\n",
+               "oversize": prefix + b"x" * 16385, "empty": prefix + b"\n"}[bad]
+    path.write_bytes(damaged)
+    before = set(os.listdir("/proc/self/fd"))
+    for _ in range(2):
+        with pytest.raises(gitsafe.GitError) as caught:
+            gitsafe.run(["rev-parse", "--git-common-dir"], repo,
+                effect_fds=(effect_lock,), worktree_root=repo)
+        assert (caught.value.code, str(caught.value), caught.value.process_started) == (
+            "effect_environment_unavailable", "Git operation effect roots unavailable.", False)
+        assert caught.value.next_action
+        assert set(os.listdir("/proc/self/fd")) == before
+        os.fstat(effect_lock)
+    path.write_bytes(good)
+    env = gitops_fds.effect_environment({}, repo, error=gitsafe.GitError,
+        worktree_root=repo, transport=gitsafe_run.transport_services())
+    assert env.repository["dirs"] == (str(admin), str(common))
+    assert set(os.listdir("/proc/self/fd")) == before
+    assert not os.get_inheritable(effect_lock)
 
 
 @pytest.mark.usefixtures("strict_program")
