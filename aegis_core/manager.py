@@ -6,12 +6,11 @@ delegation authority, native identity or verified completion.
 from __future__ import annotations
 
 import copy
-import os
 import re
 import uuid
 from pathlib import Path
 
-from aegis_core import gitsafe
+from aegis_core import gitsafe, gitsafe_run
 from aegis_core.manager_config import initialize, load_config, verify_owner
 from aegis_core.manager_policy import (
     ACTIONS, CONTEXT_LIMITS, DECISION_REF_LENGTH, EVIDENCE_LIMITS, MAX_EVIDENCE, MAX_IDEMPOTENCY_KEY_LENGTH,
@@ -77,7 +76,10 @@ def _runtime_paths(member, worktree):
     result = gitsafe.run(["rev-parse", "--absolute-git-dir"], path, timeout=5)
     if result.returncode or common is None:
         raise ManagerError("membership_unavailable")
-    gitdir = Path(os.fsdecode(result.stdout).strip())
+    try:
+        gitdir = Path(gitsafe_run.path_text(result.stdout))
+    except gitsafe.GitError:
+        raise ManagerError("membership_unavailable") from None
     if gitsafe.toplevel(path) != path or common != Path(member["common_dir"]):
         raise ManagerError("membership_unavailable")
     return {"root": path, "common_dir": common, "git_dir": gitdir}
