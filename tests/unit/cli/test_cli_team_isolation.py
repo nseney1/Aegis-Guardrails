@@ -1,15 +1,21 @@
 """Exercise the registered CLI and descriptor boundary."""
 from contextlib import contextmanager
+import errno
 import json
 import os
 from pathlib import Path
+import shlex
+import shutil
 import stat
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
 
 from aegis_cli import team_isolation as adapter
 from aegis_cli.cli import main
+from aegis_core.team_isolation_refusal import IsolationRefusal
 from aegis_core.team_isolation_verify import container_name
 from conftest import symlink_or_skip
 
@@ -274,6 +280,13 @@ def test_image_process_status_and_timeout(engine_store, monkeypatch, script, cod
     bindir.mkdir()
     workspace.mkdir()
     executable = bindir / "podman"
+    if script == "exec sleep 60":
+        script = "exec " + shlex.quote(_absolute_sleep()) + " 60"
+    elif script.startswith("exec head "):
+        head = shutil.which("head")
+        if head is None:
+            pytest.skip("head executable required")
+        script = "exec " + shlex.quote(os.path.abspath(head)) + script[len("exec head"):]
     executable.write_text("#!/bin/sh\n" + script + "\n", encoding="utf-8")
     executable.chmod(0o700)
     search_path = str(bindir)
@@ -455,3 +468,492 @@ def test_engine_launch_uses_the_qualified_inode_after_rename(engine_store, monke
     argv = ["podman", "image", "inspect", "localhost/aegis-test@sha256:" + "a" * 64]
     assert adapter.inspect_image(argv, workspace=workspace, search_path=search_path) == b"[1]"
     assert adapter.inspect_image(argv, workspace=workspace, search_path=search_path) == b"[2]"
+
+
+_IMAGE = "localhost/aegis-test@sha256:" + "a" * 64
+_REPORT = """
+printf 'keep=%s\\n' "$AEGIS_INSPECT_KEEP"
+printf 'near=%s\\n' "$CLAUDE_CODEX_KEEP"
+if [ -n "${CODEX_THREAD_ID+x}" ]; then printf 'session=present\\n'; else printf 'session=absent\\n'; fi
+if [ -n "${CLAUDE_CODE_SESSION_ID+x}" ]; then printf 'claude-session=present\\n'; else printf 'claude-session=absent\\n'; fi
+if [ -n "${OPENAI_API_KEY+x}" ]; then printf 'billing=present\\n'; else printf 'billing=absent\\n'; fi
+if [ -n "${ANTHROPIC_API_KEY+x}" ]; then printf 'anthropic=present\\n'; else printf 'anthropic=absent\\n'; fi
+if [ -n "${CLAUDE_CODE_EXTRA+x}" ]; then printf 'prefix=present\\n'; else printf 'prefix=absent\\n'; fi
+if [ -n "${CODEX_CI+x}" ]; then printf 'marker=present\\n'; else printf 'marker=absent\\n'; fi
+if [ -n "${PATH+x}" ]; then printf 'path=present\\n'; else printf 'path=absent\\n'; fi
+if [ -n "${LANG+x}" ]; then printf 'lang=present\\n'; else printf 'lang=absent\\n'; fi
+""".strip()
+_FILTERED_REPORT = (
+    "keep=before value\nnear=ordinary\nsession=absent\nclaude-session=absent\n"
+    "billing=absent\nanthropic=absent\nprefix=absent\nmarker=absent\npath=present\nlang=present\n")
+
+
+def _open_fds():
+    return set(os.listdir("/proc/self/fd"))
+
+
+def _absolute_sleep(search_path=None):
+    found = shutil.which("sleep", path=search_path)
+    if found is None:
+        pytest.skip("sleep executable required")
+    # The fake engine runs with cwd="/", so a relative PATH hit must be made absolute here.
+    return os.path.abspath(found)
+
+
+def _prepare_engine(store, script):
+    bindir, workspace = store / "bin", store / "workspace"
+    bindir.mkdir()
+    workspace.mkdir()
+    executable = bindir / "podman"
+    executable.write_text("#!/bin/sh\n" + script + "\n", encoding="utf-8")
+    executable.chmod(0o700)
+    return workspace, str(bindir), ["podman", "image", "inspect", _IMAGE], executable
+
+
+def _parent_environment():
+    return {
+        "PATH": "/usr/bin:/bin", "LANG": "C", "AEGIS_INSPECT_KEEP": "before value",
+        "CLAUDE_CODEX_KEEP": "ordinary", "CODEX_THREAD_ID": "synthetic-session",
+        "CLAUDE_CODE_SESSION_ID": "synthetic-claude-session", "OPENAI_API_KEY": "synthetic-billing",
+        "ANTHROPIC_API_KEY": "synthetic-anthropic", "CLAUDE_CODE_EXTRA": "synthetic-prefix",
+        "CODEX_CI": "synthetic-marker",
+    }
+
+
+def _use_environ(monkeypatch, environ):
+    monkeypatch.setattr(adapter, "os", SimpleNamespace(**{**vars(adapter.os), "environ": environ}))
+
+
+def _use_read(monkeypatch, read):
+    monkeypatch.setattr(adapter, "os", SimpleNamespace(**{**vars(adapter.os), "read": read}))
+
+
+def _use_popen(monkeypatch, popen):
+    module = adapter.subprocess
+    monkeypatch.setattr(adapter, "subprocess", SimpleNamespace(
+        Popen=popen, DEVNULL=module.DEVNULL, PIPE=module.PIPE, TimeoutExpired=module.TimeoutExpired))
+
+
+def _assert_reaped(process):
+    assert process.stdout.closed
+    assert process.returncode is not None and process.returncode < 0
+    with pytest.raises(ProcessLookupError):
+        os.kill(process.pid, 0)
+
+
+def _refusal(caught, code):
+    assert isinstance(caught.value, IsolationRefusal)
+    assert caught.value.code == code
+    assert str(caught.value) == code
+    rendered = str(caught.value) + caught.value.message
+    assert "synthetic" not in rendered and "untrusted" not in rendered
+
+
+def test_image_launch_uses_registry_filtered_environment(engine_store, monkeypatch):
+    """Invariant: the qualified inode starts with a no-host copy, not the live parent map."""
+    workspace, search_path, argv, _executable = _prepare_engine(engine_store, _REPORT)
+    source = _parent_environment()
+    _use_environ(monkeypatch, environ=source)
+    module = adapter.subprocess
+    launched = []
+
+    def popen(*args, **kwargs):
+        assert kwargs["cwd"] == "/" and kwargs.get("shell") in (None, False)
+        assert kwargs["stdin"] is module.DEVNULL and kwargs["stdout"] is module.PIPE
+        assert kwargs["stderr"] is module.DEVNULL
+        assert kwargs["executable"].startswith("/proc/self/fd/") and len(kwargs["pass_fds"]) == 1
+        environment = kwargs["env"]
+        assert environment["AEGIS_INSPECT_KEEP"] == "before value"
+        assert environment["CLAUDE_CODEX_KEEP"] == "ordinary" and environment["PATH"] == source["PATH"]
+        assert environment["LANG"] == "C"
+        for name in ("CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+                     "CLAUDE_CODE_EXTRA", "CODEX_CI"):
+            assert name not in environment
+        source["AEGIS_INSPECT_KEEP"] = "after"
+        source["OPENAI_API_KEY"] = "synthetic-billing-changed"
+        launched.append(environment)
+        return module.Popen(*args, **kwargs)
+
+    _use_popen(monkeypatch, popen)
+    before = _open_fds()
+    assert adapter.inspect_image(argv, workspace=workspace, search_path=search_path) == _FILTERED_REPORT.encode()
+    assert _open_fds() == before and len(launched) == 1
+    source["AEGIS_INSPECT_KEEP"] = "before value"
+    del source["OPENAI_API_KEY"]
+    source["OPENAI_API_KEY"] = "synthetic-billing"
+    assert adapter.inspect_image(argv, workspace=workspace, search_path=search_path) == _FILTERED_REPORT.encode()
+    assert len(launched) == 2 and launched[0] is not launched[1]
+
+
+class _ThreadEnvironment:
+    def __init__(self):
+        self.local = threading.local()
+
+    def items(self):
+        payload = self.local.payload
+        if payload is None:
+            raise ValueError("synthetic-untrusted")
+        return payload.items()
+
+
+def test_image_environment_is_isolated_across_concurrent_launches(engine_store, monkeypatch):
+    """Concurrent launches snapshot their own no-host maps. A policy failure does not stop the others."""
+    workspace, search_path, argv, _executable = _prepare_engine(engine_store, _REPORT)
+    environ = _ThreadEnvironment()
+    _use_environ(monkeypatch, environ=environ)
+    barrier = threading.Barrier(3)
+    outcome = {}
+
+    def worker(name):
+        if name == "bad":
+            environ.local.payload = None
+        else:
+            payload = _parent_environment()
+            payload["AEGIS_INSPECT_KEEP"] = name
+            environ.local.payload = payload
+        try:
+            barrier.wait(timeout=10)
+            outcome[name] = adapter.inspect_image(argv, workspace=workspace, search_path=search_path)
+        except BaseException as exc:
+            outcome[name] = exc
+
+    before = _open_fds()
+    threads = [threading.Thread(target=worker, args=(name,), name=name) for name in ("alpha", "beta", "bad")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert [thread.is_alive() for thread in threads] == [False, False, False]
+    assert _open_fds() == before
+    for name in ("alpha", "beta"):
+        assert outcome[name] == _FILTERED_REPORT.replace("before value", name).encode(), outcome[name]
+    assert isinstance(outcome["bad"], IsolationRefusal) and outcome["bad"].code == "image_inspect"
+    assert "synthetic-untrusted" not in str(outcome["bad"]) + outcome["bad"].message
+
+
+class _BadItems:
+    def items(self):
+        raise ValueError("synthetic-untrusted")
+
+
+@pytest.mark.parametrize(("label", "environ"), [
+    ("missing", None),
+    ("bad-items", _BadItems()),
+    ("nul", {"PATH": "/usr/bin", "AEGIS_INSPECT_KEEP": "synthetic\x00untrusted"}),
+    ("non-string", {"PATH": "/usr/bin", "AEGIS_INSPECT_KEEP": 7}),
+    ("equals", {"PATH": "/usr/bin", "AEGIS=INSPECT": "synthetic-untrusted"}),
+    ("surrogate-value", {"PATH": "/usr/bin", "AEGIS_INSPECT_KEEP": "synthetic\ud800untrusted"}),
+    ("surrogate-key", {"PATH": "/usr/bin", "AEGIS\ud800KEEP": "synthetic-untrusted"}),
+], ids=["missing", "bad-items", "nul", "non-string", "equals", "surrogate-value", "surrogate-key"])
+def test_image_environment_policy_failure_refuses_before_spawn_and_retries(engine_store, monkeypatch, label, environ):
+    """Policy failure is image_inspect before spawn. A later valid environment still launches."""
+    marker = engine_store / ("spawned-" + label)
+    script = ": > %s\nprintf '[]'\n" % shlex.quote(str(marker))
+    workspace, search_path, argv, executable = _prepare_engine(engine_store, script)
+    _use_environ(monkeypatch, environ=environ)
+    module = adapter.subprocess
+    launched = []
+
+    def popen(*args, **kwargs):
+        launched.append(kwargs.get("env"))
+        return module.Popen(*args, **kwargs)
+
+    _use_popen(monkeypatch, popen)
+    before = _open_fds()
+    with pytest.raises(ValueError, match="^image_inspect$") as caught:
+        adapter.inspect_image(argv, workspace=workspace, search_path=search_path)
+    _refusal(caught, "image_inspect")
+    assert launched == [] and not marker.exists() and _open_fds() == before
+    _use_environ(monkeypatch, environ=_parent_environment())
+    executable.write_text("#!/bin/sh\n" + script + "\n", encoding="utf-8")
+    executable.chmod(0o700)
+    assert adapter.inspect_image(argv, workspace=workspace, search_path=search_path) == b"[]"
+    assert marker.is_file() and len(launched) == 1
+    assert "OPENAI_API_KEY" not in launched[0] and launched[0]["AEGIS_INSPECT_KEEP"] == "before value"
+    assert _open_fds() == before
+
+
+def test_non_dict_environment_policy_refuses_before_spawn_and_retries(engine_store, monkeypatch):
+    workspace, search_path, argv, _executable = _prepare_engine(engine_store, "printf '[]'\n")
+    registry = adapter.team_host_registry
+    module = adapter.subprocess
+    launched = []
+
+    def policy(environ, purpose):
+        assert purpose == "no-host" and environ == source
+        return [("OPENAI_API_KEY", "synthetic-billing")]
+
+    source = _parent_environment()
+    _use_environ(monkeypatch, environ=source)
+
+    def popen(*args, **kwargs):
+        launched.append(kwargs.get("env"))
+        return module.Popen(*args, **kwargs)
+
+    _use_popen(monkeypatch, popen)
+    monkeypatch.setattr(adapter, "team_host_registry", SimpleNamespace(
+        child_environment=policy, HostRefusal=registry.HostRefusal))
+    before = _open_fds()
+    with pytest.raises(ValueError, match="^image_inspect$") as caught:
+        adapter.inspect_image(argv, workspace=workspace, search_path=search_path)
+    _refusal(caught, "image_inspect")
+    assert launched == [] and _open_fds() == before
+    monkeypatch.setattr(adapter, "team_host_registry", registry)
+    assert adapter.inspect_image(argv, workspace=workspace, search_path=search_path) == b"[]"
+    assert len(launched) == 1 and "OPENAI_API_KEY" not in launched[0]
+    assert _open_fds() == before
+
+
+def _bind_selector(monkeypatch, select):
+    class _Selector:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def register(self, stream, event):
+            return None
+
+        def select(self, timeout=None):
+            return select(timeout)
+
+    monkeypatch.setattr(adapter, "selectors", SimpleNamespace(
+        DefaultSelector=_Selector, EVENT_READ=adapter.selectors.EVENT_READ))
+
+
+def _two_tick_clock(monkeypatch, first, later):
+    ticks = {"count": 0}
+
+    def monotonic():
+        ticks["count"] += 1
+        return first if ticks["count"] == 1 else later
+
+    monkeypatch.setattr(adapter, "time", SimpleNamespace(monotonic=monotonic))
+    return ticks
+
+
+def _install_clock(monkeypatch, now):
+    monkeypatch.setattr(adapter, "time", SimpleNamespace(monotonic=lambda: now[0]))
+
+
+def _expired_clock(monkeypatch):
+    ticks = {"count": 0}
+
+    def monotonic():
+        ticks["count"] += 1
+        return 0 if ticks["count"] == 1 else 31
+
+    monkeypatch.setattr(adapter, "time", SimpleNamespace(monotonic=monotonic))
+    return ticks
+
+
+@pytest.mark.parametrize("mode", ["before-read", "empty-selector", "wait-timeout", "selector-error"])
+def test_image_timeout_seams_refuse_close_and_reap_then_retry(engine_store, monkeypatch, mode):
+    """Deadline, empty select, wait timeout and select failure close the pipe and reap the child."""
+    sleep = shlex.quote(_absolute_sleep())
+    sleeping = mode != "wait-timeout"
+    script = "exec " + sleep + " 60" if sleeping else "printf '[]'\nexec 1>&-\nexec " + sleep + " 60"
+    workspace, search_path, argv, executable = _prepare_engine(engine_store, script)
+    module = adapter.subprocess
+    seen = []
+    waits = []
+    reads = []
+    now = [0.0]
+    real_read = os.read
+
+    def read(fd, size):
+        chunk = real_read(fd, size)
+        reads.append(chunk)
+        if chunk == b"":
+            now[0] = 29.5
+        return chunk
+
+    def popen(*args, **kwargs):
+        process = module.Popen(*args, **kwargs)
+        real_wait = process.wait
+
+        def wait(timeout=None):
+            waits.append(timeout)
+            return real_wait(timeout)
+
+        process.wait = wait
+        seen.append(process)
+        return process
+
+    def counting_read(fd, size):
+        reads.append(b"called")
+        return real_read(fd, size)
+
+    controlled = _parent_environment()
+    controlled["PATH"] = search_path
+    _use_environ(monkeypatch, environ=controlled)
+    timeouts = []
+    origin, later = 10.0, 10.5
+    budget = origin + adapter._INSPECT_SECONDS - later
+
+    def record_select(timeout=None):
+        timeouts.append(timeout)
+        if mode == "selector-error":
+            raise OSError(errno.EBADF, "synthetic-untrusted")
+        return []
+
+    _use_popen(monkeypatch, popen)
+    if mode == "before-read":
+        _expired_clock(monkeypatch)
+        _use_read(monkeypatch, read=counting_read)
+        _bind_selector(monkeypatch, record_select)
+    elif mode == "wait-timeout":
+        _use_read(monkeypatch, read=read)
+        _install_clock(monkeypatch, now)
+    elif mode == "empty-selector":
+        _two_tick_clock(monkeypatch, origin, later)
+        _use_read(monkeypatch, read=counting_read)
+        _bind_selector(monkeypatch, record_select)
+    else:
+        _two_tick_clock(monkeypatch, origin, later)
+        _use_read(monkeypatch, read=counting_read)
+        _bind_selector(monkeypatch, record_select)
+    before = _open_fds()
+    expected = "image_inspect" if mode == "selector-error" else "image_inspect_timeout"
+    with pytest.raises(ValueError, match="^" + expected + "$") as caught:
+        adapter.inspect_image(argv, workspace=workspace, search_path=search_path)
+    _refusal(caught, expected)
+    assert len(seen) == 1 and _open_fds() == before
+    _assert_reaped(seen[0])
+    # Popen's context exit also waits, with no timeout. Only the product wait is timed.
+    timed = [item for item in waits if item is not None]
+    if mode == "wait-timeout":
+        assert b"" in reads and len(timed) == 1 and 0 < timed[0] < 1
+    else:
+        assert reads == [] and timed == []
+    if mode == "before-read":
+        assert timeouts == []
+    elif mode in ("empty-selector", "selector-error"):
+        assert timeouts == [budget]
+    monkeypatch.setattr(adapter, "time", time)
+    monkeypatch.setattr(adapter, "selectors", __import__("selectors"))
+    _use_read(monkeypatch, read=real_read)
+    executable.write_text("#!/bin/sh\nprintf '[]'\n", encoding="utf-8")
+    executable.chmod(0o700)
+    assert adapter.inspect_image(argv, workspace=workspace, search_path=search_path) == b"[]"
+    assert _open_fds() == before
+
+
+@pytest.mark.parametrize("mode", ["before-read", "wait-timeout"])
+def test_image_timeout_kill_race_preserves_refusal_and_reaps(engine_store, monkeypatch, mode):
+    """A kill that loses the pid must not replace the timeout refusal or leak the pipe."""
+    sleep = shlex.quote(_absolute_sleep())
+    script = "exec " + sleep + " 60" if mode == "before-read" else "printf '[]'\nexec 1>&-\nexec " + sleep + " 60"
+    workspace, search_path, argv, _executable = _prepare_engine(engine_store, script)
+    module = adapter.subprocess
+    seen = []
+    now = [0.0]
+
+    def read(fd, size):
+        chunk = os.read(fd, size)
+        if chunk == b"":
+            now[0] = 29.5
+        return chunk
+
+    def popen(*args, **kwargs):
+        process = module.Popen(*args, **kwargs)
+        real_kill = process.kill
+
+        def kill():
+            real_kill()
+            raise ProcessLookupError(errno.ESRCH, "synthetic-untrusted")
+
+        process.kill = kill
+        process.poll = lambda: None
+        seen.append(process)
+        return process
+
+    controlled = _parent_environment()
+    controlled["PATH"] = search_path
+    _use_environ(monkeypatch, environ=controlled)
+    timeouts = []
+
+    def record_select(timeout=None):
+        timeouts.append(timeout)
+        return []
+
+    _use_popen(monkeypatch, popen)
+    if mode == "before-read":
+        _expired_clock(monkeypatch)
+        _bind_selector(monkeypatch, record_select)
+    else:
+        _use_read(monkeypatch, read=read)
+        _install_clock(monkeypatch, now)
+    before = _open_fds()
+    with pytest.raises(ValueError, match="^image_inspect_timeout$") as caught:
+        adapter.inspect_image(argv, workspace=workspace, search_path=search_path)
+    _refusal(caught, "image_inspect_timeout")
+    assert len(seen) == 1 and seen[0].stdout.closed and seen[0].returncode is not None
+    with pytest.raises(ProcessLookupError):
+        os.kill(seen[0].pid, 0)
+    assert _open_fds() == before
+    if mode == "before-read":
+        assert timeouts == []
+
+
+def test_image_chunk_cannot_refresh_the_read_budget(engine_store, monkeypatch):
+    """One delivered chunk still expires at the original deadline. The next select is not a fresh window."""
+    sleep = shlex.quote(_absolute_sleep())
+    workspace, search_path, argv, executable = _prepare_engine(engine_store, "exec " + sleep + " 60")
+    module = adapter.subprocess
+    seen = []
+    timeouts = []
+    reads = []
+    origin, later, expired = 5.0, 5.25, 35.0
+    samples = [origin, later]
+
+    def monotonic():
+        return samples.pop(0) if samples else expired
+
+    def read(fd, size):
+        reads.append(size)
+        return b"x" if len(reads) == 1 else b""
+
+    def select(timeout=None):
+        timeouts.append(timeout)
+        return [object()]
+
+    def popen(*args, **kwargs):
+        process = module.Popen(*args, **kwargs)
+        seen.append(process)
+        return process
+
+    controlled = _parent_environment()
+    controlled["PATH"] = search_path
+    _use_environ(monkeypatch, environ=controlled)
+    _use_read(monkeypatch, read=read)
+    monkeypatch.setattr(adapter, "time", SimpleNamespace(monotonic=monotonic))
+    _bind_selector(monkeypatch, select)
+    _use_popen(monkeypatch, popen)
+    before = _open_fds()
+    with pytest.raises(ValueError, match="^image_inspect_timeout$") as caught:
+        adapter.inspect_image(argv, workspace=workspace, search_path=search_path)
+    _refusal(caught, "image_inspect_timeout")
+    assert timeouts == [origin + adapter._INSPECT_SECONDS - later]
+    assert reads == [8192]
+    assert len(seen) == 1 and _open_fds() == before
+    _assert_reaped(seen[0])
+    monkeypatch.setattr(adapter, "time", time)
+    monkeypatch.setattr(adapter, "selectors", __import__("selectors"))
+    _use_read(monkeypatch, read=os.read)
+    executable.write_text("#!/bin/sh\nprintf '[]'\n", encoding="utf-8")
+    executable.chmod(0o700)
+    assert adapter.inspect_image(argv, workspace=workspace, search_path=search_path) == b"[]"
+    assert _open_fds() == before
+
+
+def test_fixture_tools_are_absolute_under_a_relative_path(tmp_path):
+    """A relative caller PATH entry still yields an absolute fake-engine tool (cwd is '/')."""
+    tools = tmp_path / "toolchain" / "bin"
+    tools.mkdir(parents=True)
+    fake = tools / "sleep"
+    fake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake.chmod(0o700)
+    found = _absolute_sleep(os.path.relpath(tools))
+    assert os.path.isabs(found) and os.path.samefile(found, fake)

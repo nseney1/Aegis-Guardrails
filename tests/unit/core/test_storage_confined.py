@@ -2,6 +2,7 @@
 import errno
 import os
 from pathlib import Path
+import stat
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,56 @@ def make_store(root):
     if not storage.confined_descriptor_supported():
         pytest.skip("requires descriptor-relative nofollow operations")
     return root.resolve()
+
+
+class _CapabilityName:
+    def __init__(self, name):
+        self.__name__ = name
+
+
+def install_confined_os(monkeypatch, *, present, follow=True, name="posix",
+                        nofollow=True, directory=True, open_impl=None,
+                        close_impl=None, mkdir_impl=None):
+    """Replace this module's os seam. Process-wide os stays untouched.
+
+    Requested directory flags are always present on the seam: the host constant
+    when it exists, otherwise a distinct non-zero sentinel. Real opens on a
+    POSIX host therefore keep the host flag bits.
+    """
+    values = {
+        "name": name,
+        "supports_dir_fd": tuple(_CapabilityName(item) for item in present),
+        "supports_follow_symlinks": tuple(_CapabilityName(item) for item in (("stat",) if follow else ())),
+        "fsencode": os.fsencode,
+        "open": os.open if open_impl is None else open_impl,
+        "close": os.close if close_impl is None else close_impl,
+        "fstat": os.fstat,
+        "stat": os.stat,
+        "mkdir": os.mkdir if mkdir_impl is None else mkdir_impl,
+        "fsync": os.fsync,
+    }
+    if nofollow:
+        values["O_NOFOLLOW"] = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 1
+    if directory:
+        values["O_DIRECTORY"] = os.O_DIRECTORY if hasattr(os, "O_DIRECTORY") else 2
+    if hasattr(os, "O_RDONLY"):
+        values["O_RDONLY"] = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        values["O_CLOEXEC"] = os.O_CLOEXEC
+    monkeypatch.setattr("aegis_core.storage_confined.os", SimpleNamespace(**values))
+
+
+def _tracked_directory_io(live):
+    def opened(path, flags, *args, **kwargs):
+        fd = os.open(path, flags, *args, **kwargs)
+        live.add(fd)
+        return fd
+
+    def closed(fd):
+        live.discard(fd)
+        os.close(fd)
+
+    return opened, closed
 
 
 class ModuleOS(SimpleNamespace):
@@ -684,11 +735,436 @@ def test_directory_walk_refusals_and_retry(tmp_path, monkeypatch, case):
 
 def test_directory_walk_unsupported_refuses_before_open(tmp_path, monkeypatch):
     from aegis_core import storage_confined
-    monkeypatch.setattr("aegis_core.storage_confined.descriptor_supported", lambda: False)
-    monkeypatch.setattr("aegis_core.storage_confined.os", ModuleOS(open=lambda *a, **k: pytest.fail("opened")))
+
+    def opened(*args, **kwargs):
+        pytest.fail("opened")
+
+    install_confined_os(monkeypatch, present=("mkdir", "link", "rename", "unlink", "stat"),
+                        open_impl=opened)
     with pytest.raises(storage_confined.ConfinedFileError) as refused:
-        storage_confined.open_directory(storage_confined.os.open, tmp_path)
+        storage_confined.open_directory(opened, tmp_path)
     assert refused.value.reason == "unsupported"
+
+
+_WALK_PRESENT = ("open", "mkdir", "link", "rename", "unlink", "stat")
+_PUBLICATION_ONLY = ("mkdir", "link", "rename", "unlink")
+
+
+@pytest.mark.parametrize("case", ["open", "stat", "nofollow_stat", "O_NOFOLLOW", "O_DIRECTORY", "posix"])
+def test_walk_refuses_each_missing_primitive_before_io(tmp_path, monkeypatch, case):
+    """Invariant: a walk refuses before I/O when its own primitive is absent."""
+    from aegis_core import storage_confined
+
+    def opened(*args, **kwargs):
+        pytest.fail("opened")
+
+    present = [item for item in _WALK_PRESENT if item != case]
+    install_confined_os(
+        monkeypatch, present=tuple(present), follow=case != "nofollow_stat",
+        name="nt" if case == "posix" else "posix", nofollow=case != "O_NOFOLLOW",
+        directory=case != "O_DIRECTORY", open_impl=opened)
+    spelling = str(tmp_path)
+    for _ in range(2):
+        with pytest.raises(storage_confined.ConfinedFileError) as refused:
+            storage_confined.open_directory(opened, tmp_path)
+        assert refused.value.reason == "unsupported"
+        assert refused.value.code == "CONFINED_UNSUPPORTED"
+        assert str(refused.value) == "unsupported platform: confined file operations unavailable"
+        assert refused.value.directory_stage == "prepare"
+        assert spelling not in str(refused.value)
+        assert refused.value.__cause__ is None
+
+
+def test_walk_refuses_absent_nofollow_stat_while_publication_stays_available(tmp_path, monkeypatch):
+    """No-follow stat is the walk's own requirement, even when publication is available."""
+    from aegis_core import storage_confined
+
+    def opened(*args, **kwargs):
+        pytest.fail("opened")
+
+    install_confined_os(monkeypatch, present=_WALK_PRESENT, follow=False, open_impl=opened)
+    assert storage_confined.descriptor_supported() is True
+    for _ in range(2):
+        with pytest.raises(storage_confined.ConfinedFileError) as refused:
+            storage_confined.open_directory(opened, tmp_path)
+        assert refused.value.reason == "unsupported"
+        assert refused.value.code == "CONFINED_UNSUPPORTED"
+
+
+def test_invalid_root_still_precedes_a_missing_walk_primitive(monkeypatch):
+    from aegis_core import storage_confined
+
+    def opened(*args, **kwargs):
+        pytest.fail("opened")
+
+    install_confined_os(monkeypatch, present=(), open_impl=opened)
+    with pytest.raises(storage_confined.ConfinedFileError) as refused:
+        storage_confined.open_directory(opened, "relative")
+    assert refused.value.reason == "invalid_path"
+    assert str(refused.value) == "invalid confined file path"
+
+
+@pytest.mark.parametrize("case", [
+    "mkdir", "link", "rename", "unlink", "open", "stat", "posix", "O_NOFOLLOW", "O_DIRECTORY", "complete",
+])
+def test_publication_gate_keeps_its_full_predicate(monkeypatch, case):
+    """Publication still requires mkdir, link, rename, unlink, open and stat."""
+    from aegis_core import storage_confined
+    present = [item for item in _WALK_PRESENT if item != case]
+    install_confined_os(
+        monkeypatch, present=tuple(present), name="nt" if case == "posix" else "posix",
+        nofollow=case != "O_NOFOLLOW", directory=case != "O_DIRECTORY")
+    assert storage_confined.descriptor_supported() is (case == "complete")
+
+
+def test_walk_reads_when_publication_primitives_are_absent(tmp_path, monkeypatch):
+    """Permit a read when open and no-follow stat exist. Keep publication closed."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from aegis_core import storage_confined
+    root = make_store(tmp_path)
+    nested = root / "parent" / "leaf"
+    nested.mkdir(parents=True)
+    live = set()
+    opened, closed = _tracked_directory_io(live)
+
+    def module_open(*args, **kwargs):
+        pytest.fail("opened")
+
+    install_confined_os(monkeypatch, present=("open", "stat"), open_impl=module_open)
+    assert storage_confined.descriptor_supported() is False
+    expected = (nested.stat().st_dev, nested.stat().st_ino)
+    for _ in range(2):
+        with storage_confined.open_directory(
+                opened, nested, close_fd=closed, stat_fd=os.fstat, stat_entry=os.stat) as held:
+            assert held.identity == expected
+            assert held.fd in live
+        assert not live
+    barrier = Barrier(2, timeout=5)
+
+    def once():
+        barrier.wait()
+        with storage_confined.open_directory(
+                os.open, nested, close_fd=os.close, stat_fd=os.fstat, stat_entry=os.stat) as held:
+            return held.identity
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(once) for _ in range(2)]
+        assert [future.result(timeout=10) for future in futures] == [expected, expected]
+    missing = root / "missing"
+    for _ in range(2):
+        with pytest.raises(storage_confined.ConfinedFileError) as refused:
+            storage_confined.open_directory(
+                opened, missing, close_fd=closed, stat_fd=os.fstat, stat_entry=os.stat)
+        assert refused.value.reason == "missing"
+        assert refused.value.code == "CONFINED_MISSING"
+        assert not live and not missing.exists()
+    for _ in range(2):
+        with pytest.raises(storage_confined.ConfinedFileError) as refused:
+            with storage_confined.confined_file(root, ("state", "file"), create_parents=True):
+                pytest.fail("publication admitted")
+        assert refused.value.reason == "unsupported"
+        assert refused.value.code == "CONFINED_UNSUPPORTED"
+        assert not (root / "state").exists()
+
+
+def test_walk_without_publication_still_refuses_a_swapped_ancestor(tmp_path, monkeypatch):
+    from conftest import symlink_or_skip
+    from aegis_core import storage_confined
+    root = make_store(tmp_path)
+    parent, outside = root / "parent", root / "outside"
+    parent.mkdir()
+    (parent / "leaf").mkdir()
+    outside.mkdir()
+    (outside / "leaf").mkdir()
+    live = set()
+    opened, closed = _tracked_directory_io(live)
+
+    def module_open(*args, **kwargs):
+        pytest.fail("opened")
+
+    install_confined_os(monkeypatch, present=("open", "stat"), open_impl=module_open)
+    parent.rename(root / "original")
+    symlink_or_skip(root / "original", parent, target_is_directory=True)
+    for _ in range(2):
+        with pytest.raises(storage_confined.ConfinedFileError) as refused:
+            storage_confined.open_directory(
+                opened, parent / "leaf", close_fd=closed, stat_fd=os.fstat, stat_entry=os.stat)
+        assert refused.value.reason == "unsafe"
+        assert refused.value.code == "CONFINED_UNSAFE"
+        assert not live
+    with storage_confined.open_directory(
+            opened, root, close_fd=closed, stat_fd=os.fstat, stat_entry=os.stat) as held:
+        assert held.identity == (root.stat().st_dev, root.stat().st_ino)
+    assert not live
+
+
+def test_caller_creation_does_not_require_publication_primitives(tmp_path, monkeypatch):
+    """A caller handler still creates when descriptor-relative mkdir exists.
+
+    Link, rename and unlink stay unnecessary. A failed attempt closes
+    descriptors and can retry.
+    """
+    from aegis_core import storage_confined
+    root = make_store(tmp_path)
+    target = root / "created"
+    live = set()
+    opened, closed = _tracked_directory_io(live)
+
+    def module_open(*args, **kwargs):
+        pytest.fail("opened")
+
+    install_confined_os(monkeypatch, present=("open", "stat", "mkdir"), open_impl=module_open)
+
+    def failed(parent, name, observations):
+        raise OSError(errno.EIO, "token=secret\nprivate path")
+
+    for _ in range(2):
+        with pytest.raises(storage_confined.ConfinedFileError) as refused:
+            storage_confined.open_directory(
+                opened, target, on_missing=failed, close_fd=closed,
+                stat_fd=os.fstat, stat_entry=os.stat)
+        assert refused.value.reason == "io"
+        assert refused.value.code == "CONFINED_IO"
+        assert str(refused.value) == "confined file I/O failed"
+        assert not live and not target.exists()
+
+    def create(parent, name, observations):
+        os.mkdir(name, 0o700, dir_fd=parent)
+        os.fsync(parent)
+
+    with storage_confined.open_directory(
+            opened, target, on_missing=create, close_fd=closed,
+            stat_fd=os.fstat, stat_entry=os.stat) as held:
+        assert held.fd in live
+        assert stat.S_ISDIR(os.fstat(held.fd).st_mode)
+    assert not live
+    assert (target.stat().st_mode & 0o777) == 0o700
+
+
+def _read_seam(monkeypatch, live, mkdir_calls):
+    def opened(path, flags, *args, **kwargs):
+        fd = os.open(path, flags, *args, **kwargs)
+        live.add(fd)
+        return fd
+
+    def closed(fd):
+        live.discard(fd)
+        os.close(fd)
+
+    def trapped_mkdir(*args, **kwargs):
+        mkdir_calls.append(args)
+        raise NotImplementedError("dir_fd mkdir")
+
+    install_confined_os(
+        monkeypatch, present=("open", "stat"), open_impl=opened, close_impl=closed,
+        mkdir_impl=trapped_mkdir)
+    return opened, closed
+
+
+def test_creation_without_dir_fd_mkdir_refuses_before_handler(tmp_path, monkeypatch):
+    """Reads stay open. Creation refuses before the handler or the walk mkdir."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from aegis_core import storage_confined
+    root = make_store(tmp_path)
+    existing = root / "existing"
+    existing.mkdir(mode=0o700)
+    missing = root / "missing"
+    present = root / "present"
+    present.mkdir(mode=0o700)
+    live = set()
+    mkdir_calls = []
+    handler_calls = []
+    opened, closed = _read_seam(monkeypatch, live, mkdir_calls)
+    expected = (existing.stat().st_dev, existing.stat().st_ino)
+
+    for _ in range(2):
+        with storage_confined.open_directory(
+                opened, existing, close_fd=closed, stat_fd=os.fstat, stat_entry=os.stat) as held:
+            assert held.identity == expected
+        assert not live
+
+    def handler(parent, name, observations):
+        handler_calls.append(name)
+        raise AssertionError("handler")
+
+    spelling = str(missing)
+    for _ in range(2):
+        with pytest.raises(storage_confined.ConfinedFileError) as refused:
+            storage_confined.open_directory(
+                opened, missing, on_missing=handler, close_fd=closed,
+                stat_fd=os.fstat, stat_entry=os.stat)
+        assert refused.value.reason == "unsupported"
+        assert refused.value.code == "CONFINED_UNSUPPORTED"
+        assert str(refused.value) == "unsupported platform: confined file operations unavailable"
+        assert spelling not in str(refused.value)
+        assert refused.value.__cause__ is None
+        assert handler_calls == []
+        assert mkdir_calls == []
+        assert not live and not missing.exists()
+    barrier = Barrier(2, timeout=5)
+
+    def once():
+        barrier.wait()
+        with pytest.raises(storage_confined.ConfinedFileError) as refused:
+            storage_confined.open_directory(
+                os.open, missing, on_missing=handler, close_fd=os.close,
+                stat_fd=os.fstat, stat_entry=os.stat)
+        return refused.value.reason
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(once) for _ in range(2)]
+        assert [future.result(timeout=10) for future in futures] == ["unsupported", "unsupported"]
+    assert handler_calls == [] and not missing.exists()
+    for parts in (("missing-parent",), ("present",)):
+        for _ in range(2):
+            with pytest.raises(storage_confined.ConfinedFileError) as refused:
+                storage_confined._open_parent(root, parts, True)
+            assert refused.value.reason == "unsupported"
+            assert refused.value.code == "CONFINED_UNSUPPORTED"
+            assert refused.value.__cause__ is None
+            assert mkdir_calls == []
+            assert not live
+    assert not (root / "missing-parent").exists() and present.is_dir()
+
+
+def test_manager_creation_without_dir_fd_mkdir_is_a_stable_refusal(tmp_path, monkeypatch):
+    """Manager append and transaction refuse before creating a missing store."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from aegis_core import storage_confined
+    from aegis_core.manager_policy import ManagerError
+    from aegis_core.manager_store import ManagerStore
+    root = make_store(tmp_path)
+    store_dir = root / "audit"
+    live = set()
+    mkdir_calls = []
+    _read_seam(monkeypatch, live, mkdir_calls)
+    store = ManagerStore(store_dir)
+    calls = []
+
+    def callback(rows):
+        calls.append(rows)
+        return {"kind": "scan"}, "done"
+
+    for _ in range(2):
+        with pytest.raises(ManagerError, match="^unsafe_store$") as refused:
+            store.append({"kind": "scan"})
+        assert type(refused.value.__cause__) is storage_confined.ConfinedFileError
+        assert refused.value.__cause__.reason == "unsupported"
+        assert not store_dir.exists() and mkdir_calls == [] and not live
+        with pytest.raises(ManagerError, match="^unsafe_store$") as refused:
+            store.transaction(callback)
+        assert calls == []
+        assert type(refused.value.__cause__) is storage_confined.ConfinedFileError
+        assert refused.value.__cause__.reason == "unsupported"
+        assert not store_dir.exists()
+    barrier = Barrier(2, timeout=5)
+
+    def once():
+        barrier.wait()
+        with pytest.raises(ManagerError, match="^unsafe_store$") as refused:
+            ManagerStore(store_dir).append({"kind": "scan"})
+        return refused.value.__cause__.reason
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(once) for _ in range(2)]
+        assert [future.result(timeout=10) for future in futures] == ["unsupported", "unsupported"]
+    assert not store_dir.exists() and mkdir_calls == []
+
+
+def test_manager_read_of_missing_store_without_dir_fd_mkdir_stays_empty(tmp_path, monkeypatch):
+    """A read registers no creating handler, so a missing store stays absent.
+
+    Append and transaction still refuse before any mkdir. A store that already
+    exists still reads. Retry and concurrent reads create nothing.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from aegis_core import storage_confined
+    from aegis_core.manager_policy import ManagerError
+    from aegis_core.manager_store import ManagerStore
+    root = make_store(tmp_path)
+    missing = root / "missing-audit"
+    existing = root / "existing-audit"
+    row = ManagerStore(existing).append({"kind": "scan"})
+    live = set()
+    mkdir_calls = []
+    _read_seam(monkeypatch, live, mkdir_calls)
+    store = ManagerStore(missing)
+    for _ in range(2):
+        assert store.read() == []
+        assert not missing.exists() and mkdir_calls == [] and not live
+    assert ManagerStore(existing).read() == [row]
+    assert existing.is_dir() and (existing / "audit.jsonl").is_file()
+    with pytest.raises(ManagerError, match="^unsafe_store$") as refused:
+        store.append({"kind": "scan"})
+    assert type(refused.value.__cause__) is storage_confined.ConfinedFileError
+    assert refused.value.__cause__.reason == "unsupported"
+    assert not missing.exists() and mkdir_calls == [] and not live
+    calls = []
+
+    def callback(rows):
+        calls.append(rows)
+        return {"kind": "scan"}, "done"
+
+    with pytest.raises(ManagerError, match="^unsafe_store$") as refused:
+        store.transaction(callback)
+    assert calls == []
+    assert type(refused.value.__cause__) is storage_confined.ConfinedFileError
+    assert refused.value.__cause__.reason == "unsupported"
+    assert not missing.exists() and mkdir_calls == []
+    barrier = Barrier(2, timeout=5)
+
+    def once():
+        barrier.wait()
+        return ManagerStore(missing).read()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(once) for _ in range(2)]
+        assert [future.result(timeout=10) for future in futures] == [[], []]
+    assert not missing.exists() and mkdir_calls == [] and not live
+
+
+def test_manager_missing_read_stays_empty_and_append_creates_with_dir_fd_mkdir(tmp_path):
+    """With descriptor-relative mkdir, a missing read stays empty and append creates."""
+    from aegis_core.manager_store import ManagerStore
+    root = make_store(tmp_path)
+    store_dir = root / "audit"
+    store = ManagerStore(store_dir)
+    for _ in range(2):
+        assert store.read() == []
+        assert not store_dir.exists()
+    row = store.append({"kind": "scan"})
+    assert store_dir.is_dir()
+    assert (store_dir.stat().st_mode & 0o777) == 0o700
+    assert store.read() == [row]
+
+
+def test_unsupported_walk_refusal_is_stable_across_threads(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from aegis_core import storage_confined
+    calls = []
+
+    def opened(*args, **kwargs):
+        calls.append(args)
+        pytest.fail("opened")
+
+    install_confined_os(monkeypatch, present=_PUBLICATION_ONLY, open_impl=opened)
+    barrier = Barrier(2, timeout=5)
+
+    def once():
+        barrier.wait()
+        with pytest.raises(storage_confined.ConfinedFileError) as refused:
+            storage_confined.open_directory(opened, tmp_path)
+        return refused.value.code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(once) for _ in range(2)]
+        assert [future.result(timeout=10) for future in futures] == ["CONFINED_UNSUPPORTED"] * 2
+    assert calls == []
 
 
 @pytest.mark.parametrize("after_open", [False, True])

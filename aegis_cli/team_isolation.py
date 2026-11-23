@@ -259,6 +259,33 @@ def _pin_engine(executable, stack):
         raise IsolationRefusal("engine_custody") from None
 
 
+def _inspection_environment(environ):
+    """Registry no-host environment. A policy or encoding failure refuses before any engine is spawned."""
+    try:
+        environment = team_host_registry.child_environment(environ, "no-host")
+    except team_host_registry.HostRefusal:
+        raise IsolationRefusal("image_inspect") from None
+    mounts.require(type(environment) is dict, "image_inspect")
+    for key, value in environment.items():
+        mounts.require(type(key) is str and type(value) is str and key != "" and "=" not in key
+                       and "\x00" not in key and "\x00" not in value, "image_inspect")
+        try:
+            os.fsencode(key)
+            os.fsencode(value)
+        except UnicodeError:
+            raise IsolationRefusal("image_inspect") from None
+    return environment
+
+
+def _release_child(process):
+    """Stop a live child. An already-reaped pid must not replace the in-flight refusal."""
+    if process.poll() is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+
+
 def inspect_image(argv, *, workspace, search_path=None):
     mounts.require(type(argv) is list and len(argv) == 4 and argv[1:3] == ["image", "inspect"],
                    "image_inspect")
@@ -267,18 +294,19 @@ def inspect_image(argv, *, workspace, search_path=None):
     try:
         executable = which(argv[0], path=search_path, outside=workspace, fence_program=True)
         mounts.require(executable is not None, "image_inspect")
+        environment = _inspection_environment(os.environ)
         with ExitStack() as stack:
             fd = _pin_engine(executable, stack)
             process = stack.enter_context(subprocess.Popen(
                 [executable, *argv[1:]], executable="/proc/self/fd/" + str(fd), pass_fds=(fd,), cwd="/",
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL))
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                env=environment))
             try:
                 raw = _read_image_output(process.stdout, deadline)
                 mounts.require(process.wait(timeout=_time_left(deadline)) == 0, "image_inspect")
                 return raw
             finally:
-                if process.poll() is None:
-                    process.kill()
+                _release_child(process)
     except subprocess.TimeoutExpired:
         raise IsolationRefusal("image_inspect_timeout") from None
     except OSError:

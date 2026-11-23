@@ -103,7 +103,7 @@ def request_environment(source=None, *, profile="ordinary", scope=None, override
         ambient=source is None or type(source) is _ENVIRON_TYPE, environ_type=_ENVIRON_TYPE)
 __all__ = ["BASE_ENV", "DEFAULT_HARDENING", "HARDENING_KEEP_HOOKS_PATH", "LOCAL_ENV",
            "capture", "checked", "completed", "custody", "custody_active",
-           "execute", "memo_context", "output", "query_result", "validate_review_preparation",
+           "execute", "memo_context", "output", "path_text", "query_result", "validate_review_preparation",
            "private_headers", "private_object", "private_objects", "scrubbed", "text", "update_once",
            "strict_active", "lane_update_ref", "validate_update_input", "find_executable", "git_path",
            "LaneRunner", "hashed_blob", "check_ref_name", "CustodyRefusal", "request_environment", "Environment", "outside_roots", "AMBIENT_ENV", "custody_inputs", "merge_inputs", "transport_services", "REPLACEMENT_UNSET"]
@@ -204,7 +204,7 @@ def _git_marker_entry(parent, name):
     except FileNotFoundError:
         return None
 
-def _git_marker_line(parent, name, read_open, stack, checks):
+def _git_marker_line(parent, name, read_open, stack, checks, *, gitfile=False):
     fd = read_open(name, parent)
     stack.callback(os.close, fd)
     seen = os.fstat(fd)
@@ -214,13 +214,10 @@ def _git_marker_line(parent, name, read_open, stack, checks):
     if len(raw) != seen.st_size:
         raise ValueError("changed Git metadata")
     checks.append((parent, name, seen))
-    end = len(raw)
-    while end and raw[end - 1] in b"\r\n":
-        end -= 1
-    body = raw[:end]
-    if not body or b"\0" in body:
-        raise ValueError("invalid Git metadata")
-    return os.fsdecode(body)
+    try:
+        return path_text(raw, gitfile=gitfile, record=True)
+    except GitError:
+        raise ValueError("invalid Git metadata") from None
 
 def _git_marker_directory(parent, name, stack, checks):
     from aegis_core.pathlookup_fence import open_directory
@@ -261,10 +258,8 @@ def _review_git_directory(root, marker, read_open, stack, checks):
             raise ValueError("missing Git metadata target")
         checks.append((parent, name, info))
     if stat.S_ISREG(info.st_mode):
-        pointer = _git_marker_line(parent, name, read_open, stack, checks)
-        if not pointer.startswith("gitdir: "):
-            raise ValueError("invalid Git metadata record")
-        parent, name = _git_marker_location(root, pointer[8:], stack, checks)
+        pointer = _git_marker_line(parent, name, read_open, stack, checks, gitfile=True)
+        parent, name = _git_marker_location(root, pointer, stack, checks)
     return _git_marker_directory(parent, name, stack, checks)
 
 def _check_preparation_overlap(fd, protected):
@@ -524,9 +519,9 @@ def issue_runner(cwd, scratch, services, effect_fds=None, *, environ=None, write
         for args in (("--absolute-git-dir",), ("--git-common-dir",), ("--show-toplevel",), ("--git-path", "index")):
             result = capture((program, *DEFAULT_HARDENING, *_LANE_OPTIONS, "rev-parse", *args), cwd=cwd,
                 env=base, stdin=None, timeout=60, error=services.error, _policy=policy, effect_fds=effect_fds, worktree_root=base.root if effect_fds is not None else None)
-            raw = result.stdout.rstrip(b"\r\n")
-            if result.returncode or not raw or b"\0" in raw or b"\n" in raw or b"\r" in raw: raise services.error("Lane repository discovery refused.", code="invalid_repository")
-            values.append(Path(cwd, os.fsdecode(raw)).resolve())
+            raw = path_text(result.stdout)
+            if result.returncode or not raw or "\n" in raw or "\r" in raw: raise services.error("Lane repository discovery refused.", code="invalid_repository")
+            values.append(Path(cwd, raw).resolve())
         git_dir, common, top, index = values
         resolved = scratch.resolve()
         if resolved.is_relative_to(common) or resolved.is_relative_to(top): raise services.error("Lane scratch refused.", code="unsafe_scratch")
@@ -904,9 +899,18 @@ def output(args, cwd, *, completed, **kwargs):
     result = completed(args, cwd, **kwargs)
     return result.stdout if result is not None and result.returncode == 0 else None
 
+def path_text(out, *, gitfile=False, record=False):
+    """Decode on first use without adding the codec to ordinary hook imports."""
+    from aegis_core.git_path_codec import path_text as decode_path
+
+    return decode_path(out, gitfile=gitfile, record=record)
+
 def text(args, cwd, *, output, **kwargs):
     out = output(args, cwd, **kwargs)
     if out is None: return None
+    if len(args) > 1 and args[0] == "rev-parse" and args[1] in (
+            "--git-path", "--git-dir", "--absolute-git-dir", "--git-common-dir", "--show-prefix", "--show-toplevel"):
+        return path_text(out)
     value = os.fsdecode(out.strip())
     return value or None
 
