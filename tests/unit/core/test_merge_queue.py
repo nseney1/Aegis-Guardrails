@@ -1,20 +1,27 @@
 """Serial queue contracts using test-owned history and real qualification records."""
-import ast
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, replace
-from inspect import getsource
 from itertools import permutations, product
 import json
+import os
+from pathlib import Path
 import pickle
 import shutil
-from threading import Barrier
+import subprocess
+from threading import Barrier, Event
 from types import SimpleNamespace
 
 import pytest
 
 from aegis_core import gitsafe_run, merge_queue as mq, merge_queue_types, team_gitops, team_qualify as qual
-from tests.helpers_team_git import IDENTITY, commit, git, make_store, shared_bytes
+from tests import helpers_team_git
+from tests.helpers_team_git import (
+    IDENTITY, commit, copied_rig, copy_immutable_repo, git, make_store,
+    queue_seed_env, rig_template, shared_bytes, state,
+)
+from tests.unit.core.test_team_custody import rig as custody_rig
+from tests.unit.core.test_team_custody_checks import rig as custody_checks_rig
 
 
 class StateBackend:
@@ -130,25 +137,692 @@ def issue(q, rig, candidate):
                         read_mode=lambda *args: "none", identity=IDENTITY, now=100)
 
 
-@pytest.fixture
-def rig(tmp_path):
+def build_merge_queue_graph(repo, env=None, *, run_git=git):
+    """Main at ``other``, lane/a at ``head``, both children of ``base``."""
+    pinned = queue_seed_env(repo, env)
+    run_git(repo, "init", "-q", "--object-format=sha1", "--template=", "-b", "main", env=pinned)
+    # The seed template is empty, so init does not create info/. The merge-driver
+    # test writes .git/info/attributes and needs that directory.
+    (Path(repo) / ".git" / "info").mkdir(exist_ok=True)
+    base = commit(repo, "base", b"base\n", env=pinned, run_git=run_git)
+    run_git(repo, "checkout", "-qb", "lane/a", env=pinned)
+    head = commit(repo, "a", b"a\n", env=pinned, run_git=run_git)
+    tree = run_git(repo, "rev-parse", "HEAD^{tree}", env=pinned).decode().strip()
+    run_git(repo, "checkout", "-q", "main", env=pinned)
+    other = commit(repo, "b", b"b\n", env=pinned, run_git=run_git)
+    return SimpleNamespace(repo=repo, base=base, head=head, tree=tree, other=other)
+
+
+@pytest.fixture(scope="module")
+def merge_queue_template(tmp_path_factory):
+    """One immutable graph per worker. Each test mutates only its own copy."""
     if shutil.which("git") is None:
         pytest.skip("needs git")
+    repo = tmp_path_factory.mktemp("merge-queue-template") / "repo"
+    repo.mkdir()
+    template = build_merge_queue_graph(repo)
+    template.baseline = state(template)
+    yield template
+    assert state(template) == template.baseline
+
+
+def _queue_store(repo):
+    context = make_store(repo)
+    if not qual.descriptor_supported():
+        pytest.skip("qualification requires descriptor-relative custody")
+    return context
+
+
+@contextmanager
+def _queue_rig(template, directory, context, *, copy_file=None):
+    repo = copy_immutable_repo(template, directory, copy_file=copy_file)
+    with context as store:
+        yield SimpleNamespace(repo=repo, store=store, base=template.base,
+                              head=template.head, tree=template.tree,
+                              other=template.other,
+                              journal=team_gitops.GitOpsJournal(repo / ".git"), count=0,
+                              backends={})
+
+
+@pytest.fixture
+def rig(tmp_path, request):
+    context = _queue_store(tmp_path / "repo")
+    template = request.getfixturevalue("merge_queue_template")
+    with _queue_rig(template, tmp_path, context) as candidate:
+        yield candidate
+
+
+@contextmanager
+def sequence_stores():
+    """Close every store opened for one sequence before the caller continues."""
+    opened = []
+    with ExitStack() as stack:
+        def open_store(repo):
+            store = stack.enter_context(make_store(repo))
+            opened.append(store.scratch)
+            return store
+        yield open_store
+    for scratch in opened:
+        assert not scratch.exists()
+
+
+def _commit_identity(repo, oid, env):
+    """Author and committer lines from the raw commit object. One line each."""
+    raw = git(repo, "cat-file", "commit", oid, env=env)
+    authors = [line for line in raw.split(b"\n") if line.startswith(b"author ")]
+    committers = [line for line in raw.split(b"\n") if line.startswith(b"committer ")]
+    assert len(authors) == 1 and len(committers) == 1
+    return authors[0], committers[0]
+
+
+def test_fresh_graph_matches_the_immutable_template(tmp_path, merge_queue_template):
     repo = tmp_path / "repo"
     repo.mkdir()
-    git(repo, "init", "-q", "-b", "main")
-    base = commit(repo, "base", b"base\n")
-    git(repo, "checkout", "-qb", "lane/a")
-    head = commit(repo, "a", b"a\n")
-    tree = git(repo, "rev-parse", "HEAD^{tree}").decode().strip()
-    git(repo, "checkout", "-q", "main")
-    other = commit(repo, "b", b"b\n")
-    with make_store(repo) as store:
-        if not qual.descriptor_supported():
-            pytest.skip("qualification requires descriptor-relative custody")
-        yield SimpleNamespace(repo=repo, store=store, base=base, head=head, tree=tree,
-                              other=other, journal=team_gitops.GitOpsJournal(repo / ".git"), count=0,
-                              backends={})
+    built = build_merge_queue_graph(repo)
+    assert (built.base, built.head, built.tree, built.other) == (
+        merge_queue_template.base, merge_queue_template.head,
+        merge_queue_template.tree, merge_queue_template.other)
+    assert (repo / "base").read_bytes() == (merge_queue_template.repo / "base").read_bytes() == b"base\n"
+    assert (repo / "b").read_bytes() == b"b\n"
+    assert not (repo / "a").exists()
+    assert not (merge_queue_template.repo / "a").exists()
+
+
+def test_queue_seed_pins_identity_against_the_launcher_environment(tmp_path, merge_queue_template):
+    """Invariant: author, committer, and both dates are the pin, never the launcher.
+
+    A multi-line launcher value is replaced whole. Two hostile sources and a
+    concurrent rebuild share one graph id with the worker template.
+    """
+    pinned_author = b"author Test <test@example.com> 1700000000 +0000"
+    pinned_committer = b"committer Test <test@example.com> 1700000000 +0000"
+    hostile = dict(os.environ)
+    hostile.update({
+        "GIT_AUTHOR_NAME": "Launcher\nJoined",
+        "git_author_name": "lower\nname",
+        "GIT_AUTHOR_EMAIL": "launcher@example.com",
+        "GIT_AUTHOR_DATE": "1800000000 +0000",
+        "GIT_COMMITTER_NAME": "Other Person",
+        "GIT_COMMITTER_EMAIL": "other@example.com",
+        "GIT_COMMITTER_DATE": "1900000000 +0000",
+        "EMAIL": "ambient@example.com",
+    })
+    again = dict(hostile)
+    again["GIT_AUTHOR_NAME"] = "Second\rLauncher"
+    again["GIT_COMMITTER_NAME"] = "Third"
+    again["GIT_COMMITTER_DATE"] = "2000000000 +0000"
+
+    def build(name, source):
+        directory = tmp_path / name
+        directory.mkdir()
+        repo = directory / "repo"
+        repo.mkdir()
+        return build_merge_queue_graph(repo, source)
+
+    built = build("fresh", hostile)
+    retried = build("retry", again)
+    assert (built.base, built.head, built.tree, built.other) == (
+        retried.base, retried.head, retried.tree, retried.other) == (
+        merge_queue_template.base, merge_queue_template.head,
+        merge_queue_template.tree, merge_queue_template.other)
+    env = queue_seed_env(built.repo, hostile)
+    assert env["GIT_AUTHOR_NAME"] == env["GIT_COMMITTER_NAME"] == "Test"
+    assert env["GIT_AUTHOR_EMAIL"] == env["GIT_COMMITTER_EMAIL"] == "test@example.com"
+    assert env["GIT_AUTHOR_DATE"] == env["GIT_COMMITTER_DATE"] == "1700000000 +0000"
+    assert "\n" not in env["GIT_AUTHOR_NAME"] and "\r" not in env["GIT_COMMITTER_NAME"]
+    folded = [key for key in env if key.casefold() == "git_author_name"]
+    assert folded == ["GIT_AUTHOR_NAME"]
+    for oid in (built.base, built.head, built.other):
+        assert _commit_identity(built.repo, oid, env) == (pinned_author, pinned_committer)
+    for oid in (merge_queue_template.base, merge_queue_template.head, merge_queue_template.other):
+        assert _commit_identity(merge_queue_template.repo, oid,
+                                queue_seed_env(merge_queue_template.repo)) == (pinned_author, pinned_committer)
+
+    def concurrent(name):
+        return build(name, hostile if name == "left" else again)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        left, right = tuple(pool.map(concurrent, ("left", "right")))
+    assert (left.base, left.head, left.tree, left.other) == (right.base, right.head, right.tree, right.other) == (
+        built.base, built.head, built.tree, built.other)
+    assert state(merge_queue_template) == merge_queue_template.baseline
+
+
+def _hostile_launcher_source(root, object_format):
+    """Launcher home, global encoding, hash, and template. The seed must ignore them."""
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    home = root / "home"
+    home.mkdir()
+    config = home / ".gitconfig"
+    config.write_text("[i18n]\n\tcommitEncoding = ISO-8859-1\n", encoding="ascii")
+    xdg = home / ".config" / "git"
+    xdg.mkdir(parents=True)
+    (xdg / "config").write_text("[i18n]\n\tcommitEncoding = ISO-8859-1\n", encoding="ascii")
+    template = root / "hostile-template"
+    template.mkdir()
+    (template / "config").write_text("[i18n]\n\tcommitEncoding = ISO-8859-1\n", encoding="ascii")
+    (template / "description").write_text("hostile\n", encoding="ascii")
+    source = dict(os.environ)
+    source.update({
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(home / ".config"),
+        "GIT_CONFIG_GLOBAL": str(config),
+        "GIT_CONFIG_SYSTEM": str(config),
+        "GIT_CONFIG_NOSYSTEM": "0",
+        "GIT_DEFAULT_HASH": object_format,
+        "git_default_hash": "sha256",
+        "GIT_TEMPLATE_DIR": str(template),
+        "GIT_CONFIG": str(config),
+        "GIT_CONFIG_PARAMETERS": "'i18n.commitEncoding=ISO-8859-1'",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "i18n.commitEncoding",
+        "GIT_CONFIG_VALUE_0": "ISO-8859-1",
+    })
+    return source, template
+
+
+def _sha256_supported(directory, source=None, *, run_git=git):
+    """Probe an explicit object format with the same isolation as the queue seed."""
+    probe = directory / "sha256-probe"
+    probe.mkdir()
+    env = queue_seed_env(probe, source)
+    try:
+        run_git(probe, "init", "-q", "--object-format=sha256", "--template=", env=env)
+    except subprocess.CalledProcessError as error:
+        lines = error.stderr.splitlines() if error.stderr else []
+        if lines and (error.returncode, lines[0]) in {
+            (128, b"fatal: unknown hash algorithm 'sha256'"),
+            (129, b"error: unknown option `object-format=sha256'"),
+        }:
+            return False
+        raise
+    assert run_git(probe, "rev-parse", "--show-object-format", env=env).strip() == b"sha256"
+    return True
+
+
+@pytest.mark.parametrize("launcher_setting", ["attributes", "old-config", "redirect"])
+def test_queue_seed_ignores_launcher_settings_on_direct_build(
+        tmp_path, merge_queue_template, launcher_setting):
+    source, hostile_template = _hostile_launcher_source(tmp_path / "launcher", "sha1")
+    run_git = git
+    if launcher_setting == "attributes":
+        attributes = Path(source["XDG_CONFIG_HOME"]) / "git" / "attributes"
+        attributes.write_text("a working-tree-encoding=UTF-16LE\n", encoding="ascii")
+    elif launcher_setting == "old-config":
+        def git_without_config_overrides(repo, *args, data=None, env=None):
+            legacy = {key: value for key, value in env.items()
+                      if key not in {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"}}
+            return git(repo, *args, data=data, env=legacy)
+
+        # Both direct commands and the shared commit helper cross this boundary.
+        run_git = git_without_config_overrides
+    else:
+        source.update({
+            "GIT_DIR": str(tmp_path / "redirected-git"),
+            "GIT_WORK_TREE": str(hostile_template),
+            "GIT_INDEX_FILE": str(tmp_path / "redirected-index"),
+            "GIT_OBJECT_DIRECTORY": str(tmp_path / "redirected-objects"),
+            "gIt_AlTeRnAtE_oBjEcT_dIrEcToRiEs": str(tmp_path / "alternate-objects"),
+        })
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    built = build_merge_queue_graph(repo, source, run_git=run_git)
+    assert (built.base, built.head, built.tree, built.other) == (
+        merge_queue_template.base, merge_queue_template.head,
+        merge_queue_template.tree, merge_queue_template.other)
+    assert not list(tmp_path.glob("redirected-*"))
+
+
+def test_queue_seed_passes_its_environment_to_every_graph_command(tmp_path):
+    if shutil.which("git") is None:
+        pytest.skip("needs git")
+    source, _ = _hostile_launcher_source(tmp_path / "launcher", "sha256")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    expected = queue_seed_env(repo, source)
+    calls = []
+
+    def audit_git(cwd, *args, data=None, env=None):
+        assert cwd == repo and env == expected
+        calls.append(args)
+        return git(cwd, *args, data=data, env=env)
+
+    build_merge_queue_graph(repo, source, run_git=audit_git)
+    assert calls[0] == ("init", "-q", "--object-format=sha1", "--template=", "-b", "main")
+    assert [args[0] for args in calls] == [
+        "init", "add", "commit", "rev-parse", "checkout", "add", "commit", "rev-parse",
+        "rev-parse", "checkout", "add", "commit", "rev-parse",
+    ]
+
+
+def test_sha256_probe_propagates_unrelated_git_failure(tmp_path):
+    failure = subprocess.CalledProcessError(128, ["git"], stderr=b"fatal: cannot read config\n")
+
+    def failing_git(*args, **kwargs):
+        raise failure
+
+    with pytest.raises(subprocess.CalledProcessError) as caught:
+        _sha256_supported(tmp_path, run_git=failing_git)
+    assert caught.value is failure
+
+
+@pytest.mark.parametrize("returncode, stderr", [
+    (128, b"fatal: unknown hash algorithm 'sha256'\n"),
+    (129, b"error: unknown option `object-format=sha256'\nusage: git init\n"),
+], ids=["unknown-hash", "unknown-option"])
+def test_sha256_probe_reports_recognized_unsupported_git(tmp_path, returncode, stderr):
+    def unsupported_git(repo, *args, env):
+        assert args == ("init", "-q", "--object-format=sha256", "--template=")
+        assert env == queue_seed_env(repo)
+        raise subprocess.CalledProcessError(returncode, ["git"], stderr=stderr)
+
+    assert not _sha256_supported(tmp_path, run_git=unsupported_git)
+
+
+@pytest.mark.parametrize("shown", [b"sha256\n", b"sha1\n"], ids=["sha256", "wrong-format"])
+def test_sha256_probe_checks_the_created_object_format(tmp_path, shown):
+    calls = []
+
+    def probe_git(repo, *args, env):
+        calls.append(args)
+        assert env == queue_seed_env(repo)
+        return shown if args[0] == "rev-parse" else b""
+
+    if shown == b"sha256\n":
+        assert _sha256_supported(tmp_path, run_git=probe_git)
+    else:
+        with pytest.raises(AssertionError):
+            _sha256_supported(tmp_path, run_git=probe_git)
+    assert calls == [("init", "-q", "--object-format=sha256", "--template="),
+                     ("rev-parse", "--show-object-format")]
+
+
+def test_queue_seed_env_drops_launcher_hash_encoding_and_template(tmp_path):
+    """Invariant: the seed env has no launcher config, no template, and sha1."""
+    source, hostile_template = _hostile_launcher_source(tmp_path, "sha256")
+    source.update(GiT_TrAcE=str(tmp_path / "trace"), GiT_DiR=str(hostile_template),
+                  home=source["HOME"], xdg_config_home=source["XDG_CONFIG_HOME"],
+                  PATH="launcher-path", SystemRoot="launcher-system-root")
+    repo = tmp_path / "repo"
+    env = queue_seed_env(repo, source)
+    assert env["PATH"] == source["PATH"] and env["SystemRoot"] == source["SystemRoot"]
+    assert env["GIT_DEFAULT_HASH"] == "sha1"
+    assert [key for key in env if key.casefold() == "git_default_hash"] == ["GIT_DEFAULT_HASH"]
+    assert env["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert env["GIT_CONFIG_SYSTEM"] == os.devnull
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert env["GIT_ATTR_NOSYSTEM"] == "1"
+    assert Path(env["HOME"]) == tmp_path / "repo-seed-home"
+    assert Path(env["XDG_CONFIG_HOME"]) == Path(env["HOME"]) / ".config"
+    assert list(Path(env["HOME"]).iterdir()) == [Path(env["XDG_CONFIG_HOME"])]
+    assert not any(Path(env["XDG_CONFIG_HOME"]).iterdir())
+    folded = {key.casefold() for key in env}
+    assert {key for key in folded if key.startswith("git_")} == {
+        "git_author_name", "git_author_email", "git_author_date", "git_committer_name",
+        "git_committer_email", "git_committer_date", "git_config_global", "git_config_system",
+        "git_config_nosystem", "git_attr_nosystem", "git_default_hash",
+    }
+    assert "home" not in env and "xdg_config_home" not in env
+    assert env["GIT_AUTHOR_NAME"] == env["GIT_COMMITTER_NAME"] == "Test"
+    assert env["GIT_AUTHOR_DATE"] == env["GIT_COMMITTER_DATE"] == "1700000000 +0000"
+
+
+@pytest.mark.parametrize("object_format", ["sha1", "sha256"])
+def test_queue_graph_ids_ignore_launcher_hash_and_global_encoding(
+        tmp_path, merge_queue_template, object_format):
+    """Invariant: varying GIT_DEFAULT_HASH and a global i18n.commitEncoding keeps four ids.
+
+    The sha256 variant is skipped, with a stated reason, when this git cannot
+    create a sha256 repository. The commit object stays a sha1 id with no
+    encoding header.
+    """
+    source, _hostile = _hostile_launcher_source(tmp_path / "launcher", object_format)
+    attributes = Path(source["XDG_CONFIG_HOME"]) / "git" / "attributes"
+    attributes.write_text("a working-tree-encoding=UTF-16LE\n", encoding="ascii")
+    source.update(GIT_DIR=str(tmp_path / "redirected-git"),
+                  GIT_INDEX_FILE=str(tmp_path / "redirected-index"),
+                  GIT_OBJECT_DIRECTORY=str(tmp_path / "redirected-objects"))
+    if object_format == "sha256" and not _sha256_supported(tmp_path, source):
+        pytest.skip("installed git has no sha256 support")
+
+    def build(name, env):
+        repo = tmp_path / name
+        repo.mkdir()
+        return build_merge_queue_graph(repo, env)
+
+    clean = build("reference", None)
+    built = build("fresh", source)
+    retry = build("retry", source)
+    start = Barrier(2)
+
+    def concurrent(name):
+        start.wait(timeout=30)
+        return build(name, source)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        left, right = tuple(pool.map(concurrent, ("left", "right")))
+    expected = (clean.base, clean.head, clean.tree, clean.other)
+    for graph in (merge_queue_template, built, retry, left, right):
+        assert (graph.base, graph.head, graph.tree, graph.other) == expected
+    assert not list(tmp_path.glob("redirected-*"))
+    repo = built.repo
+    assert len(built.base) == 40 and len(built.tree) == 40
+    assert (repo / ".git" / "info").is_dir()
+    assert not (repo / ".git" / "description").exists()
+    env = queue_seed_env(repo, source)
+    shown = git(repo, "rev-parse", "--show-object-format", env=env).decode().strip()
+    assert shown == "sha1"
+    raw = git(repo, "cat-file", "commit", built.base, env=env)
+    assert b"\nencoding " not in raw
+    pinned_author = b"author Test <test@example.com> 1700000000 +0000"
+    pinned_committer = b"committer Test <test@example.com> 1700000000 +0000"
+    for oid in (built.base, built.head, built.other):
+        assert _commit_identity(repo, oid, env) == (pinned_author, pinned_committer)
+    assert state(merge_queue_template) == merge_queue_template.baseline
+
+
+def test_rig_capability_checks_run_before_copy_or_queue_template(tmp_path, request, monkeypatch):
+    monkeypatch.setattr(helpers_team_git, "team_git", SimpleNamespace(descriptor_support=lambda: False))
+    reason = "snapshot requires descriptor-relative no-follow opens and bound executables"
+    with pytest.raises(pytest.skip.Exception, match=reason):
+        request.getfixturevalue("rig")
+    # A source object without a repo would fail if the copy ran before the guard.
+    with pytest.raises(pytest.skip.Exception, match=reason):
+        with copied_rig(object(), tmp_path):
+            pytest.fail("unsupported platform yielded a custody rig")
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(("fixture_name", "template_name"), [
+    pytest.param("rig", "merge_queue_template", id="queue"),
+    pytest.param("custody_rig", "rig_template", id="custody"),
+    pytest.param("custody_checks_rig", "rig_template", id="custody-checks"),
+])
+def test_fixture_yields_template_bytes(request, fixture_name, template_name):
+    candidate = request.getfixturevalue(fixture_name)
+    template = request.getfixturevalue(template_name)
+    assert state(candidate) == template.baseline
+
+
+def test_failed_copy_leaves_the_template_unchanged_and_retry_matches(tmp_path, merge_queue_template):
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    (blocked / "repo").mkdir()
+    with pytest.raises(FileExistsError):
+        copy_immutable_repo(merge_queue_template, blocked)
+    assert state(merge_queue_template) == merge_queue_template.baseline
+    assert list((blocked / "repo").iterdir()) == []
+    repo = copy_immutable_repo(merge_queue_template, tmp_path)
+    again = tmp_path / "retry"
+    again.mkdir()
+    retried = copy_immutable_repo(merge_queue_template, again)
+    assert state(SimpleNamespace(repo=repo)) == merge_queue_template.baseline
+    assert state(SimpleNamespace(repo=retried)) == merge_queue_template.baseline
+    assert repo != retried
+
+
+def test_partial_copy_keeps_source_and_sibling_bytes_and_retry_matches(tmp_path, merge_queue_template):
+    """Invariant: a checked copy can fail partway without changing source bytes or another copy."""
+    sibling = copy_immutable_repo(merge_queue_template, tmp_path)
+    sibling_before = state(SimpleNamespace(repo=sibling))
+    source_base = (merge_queue_template.repo / "base").read_bytes()
+    copied = []
+
+    def copy_file(source, destination, *, follow_symlinks=True):
+        if copied:
+            raise OSError("injected partial copy failure")
+        shutil.copy2(source, destination, follow_symlinks=follow_symlinks)
+        copied.append(Path(destination))
+
+    def corrupt_base(source, destination, *, follow_symlinks=True):
+        shutil.copy2(source, destination, follow_symlinks=follow_symlinks)
+        if Path(source).name == "base":
+            Path(destination).write_bytes(b"not-the-template\n")
+
+    partial = tmp_path / "partial"
+    partial.mkdir()
+    with pytest.raises(shutil.Error):
+        copy_immutable_repo(merge_queue_template, partial, copy_file=copy_file)
+    assert copied and copied[0].is_file()
+    assert state(SimpleNamespace(repo=partial / "repo")) != merge_queue_template.baseline
+    assert (merge_queue_template.repo / "base").read_bytes() == source_base
+    assert state(merge_queue_template) == merge_queue_template.baseline
+    assert state(SimpleNamespace(repo=sibling)) == sibling_before
+    mismatched = tmp_path / "mismatched"
+    mismatched.mkdir()
+    with pytest.raises(AssertionError):
+        copy_immutable_repo(merge_queue_template, mismatched, copy_file=corrupt_base)
+    assert (mismatched / "repo" / "base").read_bytes() == b"not-the-template\n"
+    assert (merge_queue_template.repo / "base").read_bytes() == source_base
+    assert state(SimpleNamespace(repo=sibling)) == sibling_before
+    retry_dir = tmp_path / "after-failure"
+    retry_dir.mkdir()
+    retried = copy_immutable_repo(merge_queue_template, retry_dir)
+    assert state(SimpleNamespace(repo=retried)) == merge_queue_template.baseline
+    assert (retried / "base").read_bytes() == source_base
+
+
+class _FalseyCopy:
+    """A callable whose bool is false. The helper must still invoke it."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def __bool__(self):
+        return False
+
+    def __call__(self, source, destination, *, follow_symlinks=True):
+        self.calls += 1
+        return shutil.copy2(source, destination, follow_symlinks=follow_symlinks)
+
+
+def test_falsey_copy_file_is_used(tmp_path, merge_queue_template):
+    """Invariant: shutil.copy2 is selected only when copy_file is None."""
+    copier = _FalseyCopy()
+    destination = tmp_path / "falsey"
+    destination.mkdir()
+    repo = copy_immutable_repo(merge_queue_template, destination, copy_file=copier)
+    assert copier.calls > 0
+    assert state(SimpleNamespace(repo=repo)) == merge_queue_template.baseline
+    assert state(merge_queue_template) == merge_queue_template.baseline
+
+
+_INJECTED_COPY_ERROR = "injected partial copy failure"
+
+
+def _copy_that_pauses_after_first_file(release):
+    """Copy one file and wait for the sibling before injecting the copy error."""
+    entered = Event()
+    copied = {}
+
+    def copy_file(source, destination, *, follow_symlinks=True):
+        if "path" not in copied:
+            shutil.copy2(source, destination, follow_symlinks=follow_symlinks)
+            copied.update(path=Path(destination), source=Path(source))
+            entered.set()
+            assert release.wait(timeout=30), "sibling did not finish while the partial copy was pending"
+        raise OSError(_INJECTED_COPY_ERROR)
+
+    return copy_file, entered, copied
+
+
+def test_partial_copy_pause_timeout_is_not_an_injected_copy_error(tmp_path):
+    source = tmp_path / "source"
+    source.write_bytes(b"one file\n")
+    destination = tmp_path / "destination"
+    copy_file, entered, _ = _copy_that_pauses_after_first_file(
+        SimpleNamespace(wait=lambda *, timeout: False))
+    with pytest.raises(AssertionError, match="sibling did not finish"):
+        copy_file(source, destination)
+    assert entered.is_set() and destination.read_bytes() == source.read_bytes()
+
+
+@contextmanager
+def _paused_copy_failure(open_failed_rig, failed_dir, template):
+    release = Event()
+    copy_file, entered, copied = _copy_that_pauses_after_first_file(release)
+
+    def fail():
+        with open_failed_rig(copy_file) as candidate:
+            pytest.fail("partial copy yielded a rig")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(fail)
+        try:
+            assert entered.wait(timeout=30), "failing copy did not pause after its first file"
+            assert copied["path"].read_bytes() == copied["source"].read_bytes()
+            yield
+            assert not future.done(), "failing copy finished before the sibling"
+        finally:
+            release.set()
+        with pytest.raises(shutil.Error) as caught:
+            future.result(timeout=30)
+        errors, = caught.value.args
+        assert {message for _, _, message in errors} == {_INJECTED_COPY_ERROR}
+    assert copied["path"].read_bytes() == copied["source"].read_bytes()
+    assert state(SimpleNamespace(repo=failed_dir / "repo")) != template.baseline
+    assert list(failed_dir.iterdir()) == [failed_dir / "repo"]
+
+
+def test_concurrent_partial_copy_isolates_the_sibling(tmp_path, request):
+    failed_dir = tmp_path / "fail"
+    context = _queue_store(failed_dir / "repo")
+    template = request.getfixturevalue("merge_queue_template")
+    failed_dir.mkdir()
+    source_base = (template.repo / "base").read_bytes()
+    early_dir = tmp_path / "early"
+    early_dir.mkdir()
+    early = SimpleNamespace(repo=copy_immutable_repo(template, early_dir))
+    early_before = state(early)
+
+    def failing_rig(copy_file):
+        return _queue_rig(template, failed_dir, context, copy_file=copy_file)
+
+    with _paused_copy_failure(failing_rig, failed_dir, template):
+        sibling = request.getfixturevalue("rig")
+        sibling_state = state(sibling)
+        assert sibling_state == template.baseline
+        assert (template.repo / "base").read_bytes() == source_base
+    assert state(sibling) == sibling_state
+    assert state(early) == early_before
+    assert (template.repo / "base").read_bytes() == source_base
+    assert state(template) == template.baseline
+    retry_dir = tmp_path / "retry"
+    retry_dir.mkdir()
+    with _queue_rig(template, retry_dir, _queue_store(retry_dir / "repo")) as retried:
+        assert state(retried) == template.baseline
+        assert (retried.repo / "base").read_bytes() == source_base
+        scratch = retried.store.scratch
+    assert not scratch.exists()
+
+
+def test_copied_rig_partial_failure_does_not_yield_and_retry_is_isolated(tmp_path, rig_template):
+    source_base = (rig_template.repo / "src" / "a.py").read_bytes()
+    failed = tmp_path / "failed"
+    failed.mkdir()
+    sibling_dir = tmp_path / "sibling"
+    sibling_dir.mkdir()
+
+    def failing_rig(copy_file):
+        return copied_rig(rig_template, failed, copy_file=copy_file)
+
+    with ExitStack() as rigs:
+        with _paused_copy_failure(failing_rig, failed, rig_template):
+            sibling = rigs.enter_context(copied_rig(rig_template, sibling_dir))
+            sibling_bytes = (sibling.repo / "src" / "a.py").read_bytes()
+            sibling_state = state(sibling)
+            sibling_scratch = sibling.store.scratch
+            assert sibling_bytes == source_base
+            assert sibling_state == rig_template.baseline
+            assert sibling_scratch.exists()
+            assert (rig_template.repo / "src" / "a.py").read_bytes() == source_base
+
+        assert state(sibling) == sibling_state
+        assert (sibling.repo / "src" / "a.py").read_bytes() == sibling_bytes
+        assert state(rig_template) == rig_template.baseline
+        assert (rig_template.repo / "src" / "a.py").read_bytes() == source_base
+        retry_dir = tmp_path / "retry"
+        retry_dir.mkdir()
+        with copied_rig(rig_template, retry_dir) as retried:
+            assert (retried.repo / "src" / "a.py").read_bytes() == source_base
+            assert state(retried) == rig_template.baseline
+            retry_scratch = retried.store.scratch
+            assert retry_scratch != sibling_scratch
+            assert retry_scratch.exists() and sibling_scratch.exists()
+        assert not retry_scratch.exists() and sibling_scratch.exists()
+    assert not sibling_scratch.exists()
+
+
+def test_concurrent_copies_mutate_only_their_own_bytes(tmp_path, merge_queue_template):
+    barrier = Barrier(2)
+
+    def mutate(name):
+        directory = tmp_path / name
+        directory.mkdir()
+        repo = copy_immutable_repo(merge_queue_template, directory)
+        barrier.wait(timeout=30)
+        commit(repo, name + ".txt", name.encode() + b"\n")
+        return repo
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        left, right = tuple(pool.map(mutate, ("left", "right")))
+    assert (left / "left.txt").read_bytes() == b"left\n"
+    assert not (left / "right.txt").exists()
+    assert (right / "right.txt").read_bytes() == b"right\n"
+    assert not (right / "left.txt").exists()
+    assert (left / "base").read_bytes() == (right / "base").read_bytes() == b"base\n"
+    assert state(merge_queue_template) == merge_queue_template.baseline
+
+
+def test_rig_mutation_does_not_change_the_template_or_a_sibling_copy(rig, tmp_path, request):
+    # rig already passed the capability guards; do not resolve the template first.
+    merge_queue_template = request.getfixturevalue("merge_queue_template")
+    sibling_dir = tmp_path / "sibling"
+    sibling_dir.mkdir()
+    sibling = copy_immutable_repo(merge_queue_template, sibling_dir)
+    (rig.repo / "base").write_bytes(b"mutated-by-this-test\n")
+    assert (sibling / "base").read_bytes() == b"base\n"
+    assert (merge_queue_template.repo / "base").read_bytes() == b"base\n"
+    assert state(merge_queue_template) == merge_queue_template.baseline
+
+
+def test_sequence_store_closes_on_failure_and_retry_opens_another(rig):
+    failed = None
+    with pytest.raises(RuntimeError, match="injected sequence failure"):
+        with sequence_stores() as open_store:
+            store = open_store(rig.repo)
+            failed = store.scratch
+            assert failed.exists() and failed != rig.store.scratch
+            raise RuntimeError("injected sequence failure")
+    assert failed is not None and not failed.exists()
+    with sequence_stores() as open_store:
+        store = open_store(rig.repo)
+        retried = store.scratch
+        assert retried.exists() and retried != failed
+    assert not retried.exists()
+
+
+def test_concurrent_sequence_stores_release_independent_scratches(tmp_path, request):
+    # Main-thread capability skip. Workers must not be the first make_store probe.
+    make_store(tmp_path)
+    merge_queue_template = request.getfixturevalue("merge_queue_template")
+
+    def once(name):
+        directory = tmp_path / name
+        directory.mkdir()
+        repo = copy_immutable_repo(merge_queue_template, directory)
+        with sequence_stores() as open_store:
+            store = open_store(repo)
+            scratch = store.scratch
+            assert scratch.exists()
+        assert not scratch.exists()
+        return str(scratch)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        scratches = tuple(pool.map(once, ("one", "two")))
+    assert scratches[0] != scratches[1]
+    assert state(merge_queue_template) == merge_queue_template.baseline
 
 
 def passing(rig, tree=None, head=None, legs=mq.REQUIRED_LEGS):
@@ -215,6 +889,26 @@ def refused(code, action):
     assert caught.value.code == code
     assert str(caught.value) == mq.REFUSALS[code]
     assert caught.value.next_action
+
+
+def refusal_of(code, action):
+    """Same fixed-text checks as refused, returning the custodian refusal."""
+    with pytest.raises(mq.QueueRefused) as caught:
+        action()
+    assert caught.value.code == code
+    assert str(caught.value) == mq.REFUSALS[code]
+    assert caught.value.args == (mq.REFUSALS[code],)
+    assert caught.value.next_action["actor"] == "custodian"
+    assert caught.value.next_action["command"] == mq.REFUSALS[code]
+    return caught.value
+
+
+def _withdrawal_entry(lane, head, **changes):
+    reviews = changes.pop("reviews", None)
+    if reviews is None:
+        reviews = tuple(mq.Review(session, "c" * 40, "b" * 40, "ACCEPT", True)
+                        for session in ("reviewer-1", "reviewer-2"))
+    return replace(mq.QueueEntry(lane, "writer", head, reviews), **changes)
 
 
 @pytest.mark.parametrize("name", merge_queue_types.__all__)
@@ -379,22 +1073,114 @@ def test_model_json_checkpoint_reopens_receipts_and_archive(rig, phase, has_resu
     assert restarted.hosted_result(receipt.commit, passed=True, attempt=4) == "stale"
 
 
-def model_cleanup_resolutions():
+# Test-owned durable strings and outcomes. Coverage is compared with the model's
+# named declaration; these literals are not read from the validator source.
+DURABLE_CLEANUP_OUTCOMES = {
+    "issuing": "not_applied",
+    "aborted": "not_applied",
+    "done": "already",
+    "not_applied": "not_applied",
+    "released": "released",
+}
+UNKNOWN_CLEANUP_RESOLUTIONS = ("unknown", "done\n", "not_applied\r", "issuing aborted", "ISSUING", "")
+
+
+def _synthetic_entry(lane, parents=()):
+    commit, tree = "a" * 40, "b" * 40
+    reviews = tuple(mq.Review(session, commit, tree, "ACCEPT", True)
+                    for session in ("reviewer-1", "reviewer-2"))
+    return mq.QueueEntry(lane, "writer", commit, reviews, parents=tuple(parents))
+
+
+def _validated_state(entries, cleanup=None, serial=0):
     from aegis_core import merge_queue_model as model
 
-    # The accepted values are inline in the model validator. Require the source
-    # predicate so a change to its shape cannot silently empty the test matrix.
-    predicate, = (
-        node for node in ast.walk(ast.parse(getsource(model.validate_state)))
-        if isinstance(node, ast.Compare) and len(node.ops) == 1
-        and isinstance(node.ops[0], ast.NotIn) and ast.unparse(node.left) == "record.resolution"
-    )
-    values = ast.literal_eval(predicate.comparators[0])
-    assert values
-    return values
+    state = model.QueueState("integration", model.REQUIRED_LEGS, ("linux-3.12",),
+                             entries=tuple(entries), cleanup=cleanup, serial=serial)
+    return model.validate_state(state, "integration", model.REQUIRED_LEGS, ("linux-3.12",),
+                                model.MAX_ENTRIES)
 
 
-@pytest.mark.parametrize("resolution", model_cleanup_resolutions())
+def _cleanup_state(resolution, result=None):
+    from aegis_core import merge_queue_model as model
+
+    entry = _synthetic_entry("a")
+    landing = model.Landing("ready", "a", "c" * 40, entry.head, "b" * 40, issuance=1)
+    record = model.IssuedRecord(entry, landing, result=result, resolution=resolution,
+                                ref=model.pin_ref("integration", landing), expected=entry.head)
+    return _validated_state((entry,), record, serial=1)
+
+
+def test_cleanup_resolution_declaration_matches_independent_recovery_table():
+    """Invariant: the durable resolution declaration and the test-owned table agree."""
+    from aegis_core import merge_queue_model as model
+
+    declared = getattr(model, "CLEANUP_RESOLUTIONS", None)
+    assert type(declared) is tuple and declared
+    assert len(set(declared)) == len(declared)
+    assert set(declared) == set(DURABLE_CLEANUP_OUTCOMES)
+    for value in declared:
+        assert type(value) is str and value == value.strip() and "\n" not in value and "\r" not in value
+        assert " " not in value
+
+
+def test_validate_state_pins_declared_cleanup_resolutions_and_refuses_unknown():
+    """Unknown and multi-line resolutions are refused whole; a declared value retries."""
+    from aegis_core import merge_queue_model as model
+
+    for resolution in DURABLE_CLEANUP_OUTCOMES:
+        for result in (None, model.HostedResult("a" * 40, True, 3)):
+            state = _cleanup_state(resolution, result)
+            assert state.cleanup.resolution == resolution
+            assert state.cleanup.result == result
+    for resolution in UNKNOWN_CLEANUP_RESOLUTIONS:
+        for result in (None, model.HostedResult("a" * 40, True, 3)):
+            refused("state_unavailable", lambda resolution=resolution, result=result:
+                    _cleanup_state(resolution, result))
+            repaired = _cleanup_state("issuing", result)
+            assert repaired.cleanup.resolution == "issuing"
+            assert repaired.cleanup.result == result
+
+
+def test_validate_state_rejects_pending_cycles_and_keeps_external_parents():
+    """One cycle check: enqueue root is parent_cycle; full restore is state_unavailable."""
+    from aegis_core import merge_queue_model as model
+
+    solo = _synthetic_entry("solo", ("outside",))
+    left = _synthetic_entry("left", ("right",))
+    right = _synthetic_entry("right", ("left",))
+    diamond_d = _synthetic_entry("d")
+    diamond_b = _synthetic_entry("b", ("d",))
+    diamond_c = _synthetic_entry("c", ("d", "outside"))
+    diamond_a = _synthetic_entry("a", ("b", "c"))
+    acyclic = {"solo": solo, "d": diamond_d, "b": diamond_b, "c": diamond_c, "a": diamond_a}
+    snapshot = dict(acyclic)
+
+    model.check_acyclic(_synthetic_entry("fresh", ("outside",)), acyclic)
+    refused("parent_cycle", lambda: model.check_acyclic(_synthetic_entry("right", ("left",)),
+                                                        {"left": left}))
+    hidden = {"loop-a": _synthetic_entry("loop-a", ("loop-b",)),
+              "loop-b": _synthetic_entry("loop-b", ("loop-a",))}
+    refused("parent_cycle", lambda: model.check_acyclic(_synthetic_entry("child", ("loop-a",)), hidden))
+    model.check_acyclic(_synthetic_entry("child", ("outside",)), dict(hidden))
+    assert acyclic == snapshot
+
+    _validated_state((solo, diamond_d, diamond_b, diamond_c, diamond_a))
+    _validated_state(())
+    refused("state_unavailable", lambda: _validated_state((solo, left, right)))
+    refused("state_unavailable", lambda: _validated_state((
+        _synthetic_entry("a", ("b",)), _synthetic_entry("b", ("c",)), _synthetic_entry("c", ("a",)))))
+    refused("state_unavailable", lambda: _validated_state((_synthetic_entry("a", ("a",)),)))
+    chain = tuple(_synthetic_entry("n%d" % index, (("n%d" % (index + 1),) if index < 4 else ("n0",)))
+                  for index in range(5))
+    refused("state_unavailable", lambda: _validated_state((solo,) + chain))
+    repaired = _validated_state((solo, left, replace(right, parents=("outside",))))
+    assert {item.lane for item in repaired.entries} == {"solo", "left", "right"}
+    refused("state_unavailable", lambda: model.check_acyclic(None, {"left": left, "right": right}))
+    model.check_acyclic(None, {item.lane: item for item in repaired.entries})
+
+
+@pytest.mark.parametrize("resolution", list(DURABLE_CLEANUP_OUTCOMES))
 @pytest.mark.parametrize("has_result", [False, True], ids=["without-result", "with-result"])
 def test_model_json_checkpoint_recovers_every_cleanup_resolution(rig, resolution, has_result):
     original = queue(rig)
@@ -426,13 +1212,8 @@ def test_model_json_checkpoint_recovers_every_cleanup_resolution(rig, resolution
     def acknowledge(active):
         return active.observe_landed(rig.store, receipt, read_target=lambda _: receipt.commit)
 
-    recover, expected = {
-        "issuing": (reconcile, "not_applied"),
-        "aborted": (reconcile, "not_applied"),
-        "done": (acknowledge, "already"),
-        "not_applied": (reconcile, "not_applied"),
-        "released": (withdraw, "released"),
-    }[resolution]
+    expected = DURABLE_CLEANUP_OUTCOMES[resolution]
+    recover = {"not_applied": reconcile, "already": acknowledge, "released": withdraw}[expected]
     if resolution != "issuing":
         backend.fail = "cleanup-before"
         refused("state_unavailable", lambda: recover(original))
@@ -462,6 +1243,272 @@ def test_model_json_checkpoint_recovers_every_cleanup_resolution(rig, resolution
     else:
         assert recover(restarted) == "already"
     assert git(rig.repo, "for-each-ref", "--format=%(objectname)", "refs/aegis/merge-queue/") == b""
+
+
+@pytest.mark.parametrize("has_result", [False, True], ids=["without-result", "with-result"])
+def test_unknown_cleanup_resolution_reopen_refuses_and_declared_retry_recovers(rig, has_result):
+    """Reopen refuses unknown input whole; a declared resolution retries the saved result."""
+    original = queue(rig)
+    backend = rig.backends[original]
+    passing(rig)
+    candidate = prepare(original, rig)
+    backend.fail = "issue-before"
+    refused("state_unavailable", lambda: issue(original, rig, candidate))
+    backend.fail = None
+    original = fresh_queue(rig, backend=backend, initialize=False)
+    receipt = original.issued
+    if has_result:
+        assert original.hosted_result(receipt.commit, passed=True, attempt=3) == "pending"
+    saved_result = mq.HostedResult(receipt.commit, True, 3) if has_result else None
+    assert backend.state.cleanup.resolution == "issuing"
+    assert backend.state.cleanup.result == saved_result
+
+    def reopen(active_backend):
+        fresh_queue(rig, backend=active_backend, initialize=False)
+
+    for unknown in UNKNOWN_CLEANUP_RESOLUTIONS:
+        backend.state = replace(backend.state, cleanup=replace(backend.state.cleanup, resolution=unknown))
+        recovered = json_round_trip_backend(backend)
+        assert recovered.state.cleanup.resolution == unknown
+        assert recovered.state.cleanup.result == saved_result
+        refused("state_unavailable", lambda recovered=recovered: reopen(recovered))
+        assert recovered.state.cleanup.resolution == unknown
+
+    backend.state = replace(backend.state, cleanup=replace(backend.state.cleanup, resolution="done\n"))
+    recovered = json_round_trip_backend(backend)
+    barrier = Barrier(2)
+
+    def concurrent(_):
+        barrier.wait(timeout=10)
+        try:
+            reopen(recovered)
+            return "opened"
+        except mq.QueueRefused as exc:
+            return exc.code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sorted(pool.map(concurrent, (0, 1))) == ["state_unavailable", "state_unavailable"]
+    assert recovered.state.cleanup.resolution == "done\n"
+    assert recovered.state.cleanup.result == saved_result
+
+    recovered.state = replace(recovered.state, cleanup=replace(recovered.state.cleanup, resolution="issuing"))
+    restarted = fresh_queue(rig, backend=recovered, initialize=False)
+    assert restarted.issued == receipt
+    refused("landing_unconfirmed", lambda: restarted.reconcile_not_landed(
+        rig.store, receipt, read_target=lambda _: receipt.tip, read_outcome=lambda _: "pending"))
+    assert restarted.issued == receipt
+    assert restarted.reconcile_not_landed(
+        rig.store, receipt, read_target=lambda _: receipt.tip,
+        read_outcome=lambda _: "not_applied") == "not_applied"
+    assert restarted.issued is None
+    refused("stale_candidate", lambda: restarted.reconcile_not_landed(
+        rig.store, receipt, read_target=lambda _: receipt.tip, read_outcome=lambda _: "not_applied"))
+
+
+# Resolutions that are not in the durable declaration. Built directly so recovery
+# is tested without validate_state rewriting or refusing them first.
+UNDECLARED_CLEANUP_RESOLUTIONS = ("retry", "forced")
+
+
+def _issuing_checkpoint(rig):
+    """Settled issuing cleanup from a lost issuance reply. The caller plants resolutions."""
+    original = queue(rig)
+    backend = rig.backends[original]
+    passing(rig)
+    candidate = prepare(original, rig)
+    backend.fail = "issue-before"
+    refused("state_unavailable", lambda: issue(original, rig, candidate))
+    backend.fail = None
+    receipt = original.issued
+    baseline = backend.state
+    assert baseline.cleanup.resolution == "issuing"
+    assert receipt == baseline.cleanup.landing
+    # The lost reply left the test journal dirty. The planted record is the settled checkpoint.
+    backend.dirty = False
+    backend.pending.clear()
+    return backend, baseline, receipt
+
+
+def _bind_direct_cleanup(rig, backend, baseline, resolution, result=None):
+    """Install cleanup.resolution on a live queue without calling validate_state."""
+    planted = replace(baseline, reconciliation_required=baseline.reconciliation_required or backend.dirty,
+                      cleanup=replace(baseline.cleanup, resolution=resolution, result=result))
+    backend.state = planted
+    opened = mq.MergeQueue("integration")
+    opened._storage = backend.port()
+    opened._state = planted
+    opened._repo = rig.store.repo
+    rig.backends[opened] = backend
+    return opened
+
+
+def _recovery_snapshot(rig, active, backend):
+    cleanup = active._state.cleanup
+    return (cleanup.resolution, cleanup.result, tuple(item.lane for item in active._state.entries),
+            dict(backend.lanes), dict(backend.commits), active._target_checked, active._faulted,
+            git(rig.repo, "rev-parse", cleanup.ref).decode().strip())
+
+
+def test_direct_undeclared_cleanup_resolution_refuses_without_reopen(rig, monkeypatch):
+    """An undeclared resolution built past validate_state refuses at recovery and does not reopen."""
+    from aegis_core import merge_queue_model as model
+
+    backend, baseline, receipt = _issuing_checkpoint(rig)
+    real_validate = model.validate_state
+    validations = []
+
+    def reject_validation(*args, **kwargs):
+        validations.append(args)
+        raise mq.QueueRefused("state_unavailable")
+
+    monkeypatch.setattr(mq.model, "validate_state", reject_validation)
+
+    def recover_all(active):
+        refused("state_unavailable", lambda: active.withdraw(
+            receipt.lane, expected_head=rig.head, store=rig.store,
+            read_target=lambda _: receipt.tip, read_outcome=lambda _: "not_applied"))
+        refused("state_unavailable", lambda: active.observe_landed(
+            rig.store, receipt, read_target=lambda _: receipt.commit))
+        refused("state_unavailable", lambda: active.reconcile_not_landed(
+            rig.store, receipt, read_target=lambda _: receipt.tip, read_outcome=lambda _: "not_applied"))
+
+    for resolution in UNDECLARED_CLEANUP_RESOLUTIONS:
+        for result in (None, mq.HostedResult(receipt.commit, True, 3)):
+            planted = replace(baseline, cleanup=replace(baseline.cleanup, resolution=resolution, result=result))
+            refused("state_unavailable", lambda planted=planted: real_validate(
+                planted, "integration", model.REQUIRED_LEGS, ("linux-3.12",), model.MAX_ENTRIES))
+            opened = _bind_direct_cleanup(rig, backend, baseline, resolution, result)
+            before = _recovery_snapshot(rig, opened, backend)
+            recover_all(opened)
+            assert validations == []
+            assert _recovery_snapshot(rig, opened, backend) == before
+            assert opened.issued == receipt
+            assert opened.prepare(rig.store, read_target=lambda _: rig.base,
+                                  read_mode=lambda *args: "none", identity=IDENTITY,
+                                  now=100).status == "reconciliation-required"
+            assert opened._state.cleanup.resolution == resolution
+            assert opened._state.cleanup.result == result
+
+    concurrent = _bind_direct_cleanup(rig, backend, baseline, "retry", mq.HostedResult(receipt.commit, True, 3))
+    before = _recovery_snapshot(rig, concurrent, backend)
+    barrier = Barrier(3)
+
+    def attack(kind):
+        barrier.wait(timeout=10)
+        try:
+            if kind == "withdraw":
+                concurrent.withdraw(receipt.lane, expected_head=rig.head, store=rig.store,
+                                    read_target=lambda _: receipt.tip, read_outcome=lambda _: "not_applied")
+            elif kind == "acknowledge":
+                concurrent.observe_landed(rig.store, receipt, read_target=lambda _: receipt.commit)
+            else:
+                concurrent.reconcile_not_landed(rig.store, receipt, read_target=lambda _: receipt.tip,
+                                                read_outcome=lambda _: "not_applied")
+            return "opened"
+        except mq.QueueRefused as exc:
+            return exc.code
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert sorted(pool.map(attack, ("withdraw", "acknowledge", "reconcile"))) == ["state_unavailable"] * 3
+    assert validations == []
+    assert _recovery_snapshot(rig, concurrent, backend) == before
+    assert concurrent.issued == receipt
+
+    restart = _bind_direct_cleanup(rig, backend, baseline, "retry")
+    before = _recovery_snapshot(rig, restart, backend)
+    refused("state_unavailable", lambda: restart.restore_target(
+        rig.store, mq.HostedResult(rig.base, True), read_target=lambda _: rig.base))
+    assert _recovery_snapshot(rig, restart, backend) == before
+    assert restart.issued == receipt
+    assert restart.prepare(rig.store, read_target=lambda _: rig.base,
+                           read_mode=lambda *args: "none", identity=IDENTITY,
+                           now=100).status == "reconciliation-required"
+    refused("state_unavailable", lambda: restart.withdraw(
+        receipt.lane, expected_head=rig.head, store=rig.store,
+        read_target=lambda _: receipt.tip, read_outcome=lambda _: "not_applied"))
+    assert validations == []
+
+    repaired = _bind_direct_cleanup(rig, backend, baseline, "issuing")
+    refused("landing_unconfirmed", lambda: repaired.reconcile_not_landed(
+        rig.store, receipt, read_target=lambda _: receipt.tip, read_outcome=lambda _: "pending"))
+    assert repaired.issued == receipt
+    assert repaired.reconcile_not_landed(
+        rig.store, receipt, read_target=lambda _: receipt.tip,
+        read_outcome=lambda _: "not_applied") == "not_applied"
+    assert repaired.issued is None
+    assert validations == []
+
+
+def test_recovery_dispatch_keys_match_declaration_and_reach_each_handler(rig, monkeypatch):
+    """Every declared resolution reaches the one dispatch handler for the independent outcome."""
+    from aegis_core import merge_queue_model as model
+
+    declared = model.CLEANUP_RESOLUTIONS
+    assert tuple(mq._CLEANUP_RECOVERY) == declared
+    assert set(mq._CLEANUP_RECOVERY) == set(DURABLE_CLEANUP_OUTCOMES)
+    assert len(mq._CLEANUP_RECOVERY) == len(declared)
+    backend, baseline, receipt = _issuing_checkpoint(rig)
+    validations = []
+
+    def reject_validation(*args, **kwargs):
+        validations.append(args)
+        raise mq.QueueRefused("state_unavailable")
+
+    monkeypatch.setattr(mq.model, "validate_state", reject_validation)
+    git(rig.repo, "update-ref", baseline.cleanup.ref, baseline.cleanup.expected)
+
+    def reconcile(active, outcome="not_applied"):
+        return active.reconcile_not_landed(rig.store, receipt, read_target=lambda _: receipt.tip,
+                                           read_outcome=lambda _: outcome)
+
+    def acknowledge(active):
+        return active.observe_landed(rig.store, receipt, read_target=lambda _: receipt.commit)
+
+    def release(active):
+        return active.withdraw(receipt.lane, expected_head=rig.head, store=rig.store,
+                              read_target=lambda _: receipt.tip, read_outcome=lambda _: "not_applied")
+
+    wrong = _bind_direct_cleanup(rig, backend, baseline, "done")
+    refused("stale_candidate", lambda: reconcile(wrong))
+    refused("request_conflict", lambda: release(wrong))
+    assert wrong._state.cleanup.resolution == "done"
+    held = _bind_direct_cleanup(rig, backend, baseline, "not_applied")
+    refused("stale_candidate", lambda: acknowledge(held))
+    refused("request_conflict", lambda: release(held))
+    assert held._state.cleanup.resolution == "not_applied"
+
+    failed = _bind_direct_cleanup(rig, backend, baseline, "done")
+    backend.fail = "cleanup-before"
+    refused("state_unavailable", lambda: acknowledge(failed))
+    backend.fail = None
+    assert failed._state.cleanup.resolution == "done"
+    assert failed._faulted is True
+    retried = _bind_direct_cleanup(rig, backend, baseline, "done")
+    assert acknowledge(retried) == "already"
+    assert retried.issued is None
+
+    runners = {"abort": reconcile, "acknowledge": acknowledge, "settle": reconcile, "release": release}
+    for resolution in declared:
+        git(rig.repo, "update-ref", baseline.cleanup.ref, baseline.cleanup.expected)
+        opened = _bind_direct_cleanup(rig, backend, baseline, resolution)
+        handler = mq._CLEANUP_RECOVERY[resolution]
+        if resolution in ("issuing", "aborted"):
+            assert handler == mq._CLEANUP_RECOVERY["issuing"] == mq._CLEANUP_RECOVERY["aborted"]
+            refused("landing_unconfirmed", lambda opened=opened: reconcile(opened, "pending"))
+            assert opened.issued == receipt
+            assert opened._state.cleanup.resolution == resolution
+        else:
+            # A finish-only handler must not rewrite the resolution before the failing save.
+            backend.fail = "cleanup-before"
+            refused("state_unavailable", lambda opened=opened, handler=handler: runners[handler](opened))
+            backend.fail = None
+            assert opened._state.cleanup.resolution == resolution
+            assert opened._faulted is True
+            git(rig.repo, "update-ref", baseline.cleanup.ref, baseline.cleanup.expected)
+            opened = _bind_direct_cleanup(rig, backend, baseline, resolution)
+        assert runners[handler](opened) == DURABLE_CLEANUP_OUTCOMES[resolution]
+        assert opened.issued is None
+    assert validations == []
 
 
 @pytest.mark.parametrize("phase", ["empty", "queued", "issued", "cleanup", "completed"])
@@ -779,6 +1826,218 @@ def test_archived_completion_refusal_is_distinct_from_ancestry(rig, shape):
     refused("archived_completion", lambda: direct_prepare(q, rig, tip))
     assert backend.commits[receipt.commit].landing == receipt
     assert tuple(backend.lanes) == ("a",)
+
+
+_WITHDRAWAL_HEAD = "a" * 40
+_SPLIT_HEAD = ("a" * 40) + "\n" + ("b" * 40)
+_SECRET_LANE = "ghp_" + ("a" * 20)
+
+
+@pytest.mark.parametrize("withdrawal", [
+    None,
+    "second",
+    {"lane": "second", "expected_head": _WITHDRAWAL_HEAD},
+    _withdrawal_entry("ab\ncd", _WITHDRAWAL_HEAD),
+    _withdrawal_entry("Second", _WITHDRAWAL_HEAD),
+    _withdrawal_entry("second", _SPLIT_HEAD),
+    _withdrawal_entry("second", "A" * 40),
+    _withdrawal_entry("second", _WITHDRAWAL_HEAD, reviews=()),
+    _withdrawal_entry("a" * 64, _WITHDRAWAL_HEAD),
+    _withdrawal_entry(_SECRET_LANE, _WITHDRAWAL_HEAD),
+    _withdrawal_entry("second", _WITHDRAWAL_HEAD, author="writer\ninjected"),
+    _withdrawal_entry("second", _WITHDRAWAL_HEAD, reviews=(
+        mq.Review("reviewer-1", _WITHDRAWAL_HEAD, "b" * 40, "ACCEPT", True),)),
+], ids=["missing", "text", "dict", "multiline-lane", "uppercase-lane", "multiline-head",
+        "uppercase-head", "no-reviews", "long-lane", "secret-lane", "multiline-author",
+        "one-review"])
+def test_archived_completion_rejects_unvalidated_withdrawal_operands(withdrawal):
+    """A refusal without a validated pending entry stays fixed and input-free.
+
+    Multi-line lane or head text is refused. It is not joined, redacted into
+    the message, or attached for withdrawal. A later valid record still works.
+    """
+    refused("state_unavailable", lambda: mq.QueueRefused("archived_completion", withdrawal))
+    caught = None
+    with pytest.raises(mq.QueueRefused) as recorded:
+        raise mq.QueueRefused("archived_completion", withdrawal)
+    caught = recorded.value
+    assert caught.code == "state_unavailable"
+    assert caught.args == (mq.REFUSALS["state_unavailable"],)
+    assert set(caught.next_action) == {"actor", "command"}
+    rendered = str(caught) + "\n" + caught.next_action["command"]
+    assert "\n" not in str(caught) and "\n" not in caught.next_action["command"]
+    assert _SPLIT_HEAD not in rendered
+    assert ("a" * 40) + ("b" * 40) not in rendered
+    assert "ab cd" not in rendered and "abcd" not in rendered
+    assert _SECRET_LANE not in rendered and "ghp_REDACTED" not in rendered
+    assert "writer\ninjected" not in rendered and "injected" not in rendered
+    if type(withdrawal) is mq.QueueEntry and type(withdrawal.lane) is str:
+        assert withdrawal.lane not in rendered
+    good = _withdrawal_entry("second", _WITHDRAWAL_HEAD)
+    restored = mq.QueueRefused("archived_completion", good)
+    assert restored.code == "archived_completion"
+    assert restored.args == (mq.REFUSALS["archived_completion"],)
+    assert restored.next_action == {
+        "actor": "custodian",
+        "command": mq.REFUSALS["archived_completion"],
+        "lane": "second",
+        "expected_head": _WITHDRAWAL_HEAD,
+    }
+    restored.next_action["lane"] = "mutated"
+    restored.next_action["command"] = "mutated"
+    again = mq.QueueRefused("archived_completion", good)
+    assert again.next_action["lane"] == "second"
+    assert again.next_action["command"] == mq.REFUSALS["archived_completion"]
+    assert again.next_action is not restored.next_action
+
+
+def test_other_refusals_reject_withdrawal_operands():
+    """Only archived completion carries withdrawal operands; fixed text stays put."""
+    good = _withdrawal_entry("second", _WITHDRAWAL_HEAD)
+    plain = mq.QueueRefused("already_integrated")
+    assert plain.next_action == {
+        "actor": "custodian",
+        "command": mq.REFUSALS["already_integrated"],
+    }
+    assert set(plain.next_action) == {"actor", "command"}
+    refused("invalid_request", lambda: mq.QueueRefused("already_integrated", good))
+    caught = refusal_of("invalid_request", lambda: mq.QueueRefused("git_failed", good))
+    assert good.lane not in str(caught) and good.head not in str(caught)
+    assert set(caught.next_action) == {"actor", "command"}
+    assert mq.QueueRefused("archived_completion", good).code == "archived_completion"
+
+
+def _archived_pair(rig, shape):
+    """Land one completion, rewind, and enqueue the selected lane plus a later one."""
+    passing(rig)
+    backend = CountingIndexBackend()
+    q = fresh_queue(rig, backend=backend)
+    assert q.enqueue(rig.store, entry(rig)) == "queued"
+    tip = rig.base if shape == "fast-forward" else rig.other
+    if shape == "merge":
+        assert q.restore_target(rig.store, mq.HostedResult(tip, True),
+                                read_target=lambda _: tip) == "green"
+    candidate = direct_prepare(q, rig, tip)
+    passing(rig, candidate.tree, candidate.commit)
+    candidate = direct_prepare(q, rig, tip)
+    assert candidate.status == "ready"
+    receipt = issue(q, rig, candidate)
+    assert q.observe_landed(rig.store, receipt, read_target=lambda _: receipt.commit) == "done"
+    assert q.restore_target(rig.store, mq.HostedResult(tip, True),
+                            read_target=lambda _: tip) == "green"
+    selected = entry(rig, lane="second")
+    later = entry(rig, lane="third")
+    assert q.enqueue(rig.store, selected) == "queued"
+    assert q.enqueue(rig.store, later) == "queued"
+    return q, backend, tip, receipt, selected, later
+
+
+def _archived_operands(q, rig, tip, receipt, backend):
+    start = len(backend.reads)
+    caught = refusal_of("archived_completion", lambda: direct_prepare(q, rig, tip))
+    assert [kind for kind, oid in backend.reads[start:]] == ["commit"]
+    assert backend.reads[-1][1] == receipt.commit
+    assert q.issued is None
+    return caught
+
+
+@pytest.mark.parametrize("shape", ["fast-forward", "merge"])
+def test_archived_completion_returns_selected_pending_operands(rig, shape):
+    """Withdrawal uses only the selected pending lane and expected head.
+
+    Fast-forward and merge both keep the fixed refusal text. A stale head
+    does not withdraw. Each refusal reads the commit index once and does not
+    issue. The later pending lane stays queued until it is selected.
+    """
+    q, backend, tip, receipt, selected, later = _archived_pair(rig, shape)
+    before = backend.state
+    archives = dict(backend.commits)
+    backend.reads.clear()
+    first = _archived_operands(q, rig, tip, receipt, backend)
+    second = _archived_operands(q, rig, tip, receipt, backend)
+    assert first.next_action == second.next_action
+    ops = first.next_action
+    assert list(ops) == ["actor", "command", "lane", "expected_head"]
+    assert ops["lane"] == selected.lane and ops["expected_head"] == selected.head
+    assert ops["lane"] != later.lane
+    assert ops["lane"] not in str(first) and ops["expected_head"] not in str(first)
+    if shape == "merge":
+        assert ops["expected_head"] != receipt.commit
+    else:
+        assert ops["expected_head"] == receipt.commit
+    assert "ancestor" not in ops["command"]
+    assert q.issued is None and backend.state == before and not backend.dirty
+    assert backend.commits == archives
+    assert [kind for kind, _ in backend.reads] == ["commit", "commit"]
+    stale = "0" * len(ops["expected_head"])
+    refused("request_conflict", lambda: q.withdraw(ops["lane"], expected_head=stale))
+    assert backend.state == before and backend.commits == archives and q.issued is None
+    assert q.withdraw(ops["lane"], expected_head=ops["expected_head"]) == "released"
+    assert tuple(item.lane for item in backend.state.entries) == (later.lane,)
+    assert q.issued is None and set(backend.commits) == set(archives)
+    backend.reads.clear()
+    follow = _archived_operands(q, rig, tip, receipt, backend)
+    assert follow.next_action["lane"] == later.lane
+    assert follow.next_action["expected_head"] == later.head
+    assert q.withdraw(follow.next_action["lane"],
+                      expected_head=follow.next_action["expected_head"]) == "released"
+    assert direct_prepare(q, rig, tip).status == "empty"
+    assert q.issued is None and set(backend.commits) == set(archives)
+
+
+@pytest.mark.parametrize("shape", ["fast-forward", "merge"])
+def test_concurrent_archived_completion_uses_returned_operands_once(rig, shape):
+    """Concurrent refusals share one pending operand pair and withdraw once.
+
+    A stale sibling racing the same lane conflicts and leaves the entry. The
+    commit index is read once per preparation. Nothing is issued.
+    """
+    q, backend, tip, receipt, selected, later = _archived_pair(rig, shape)
+    before = backend.state
+    archives = dict(backend.commits)
+    backend.reads.clear()
+    barrier = Barrier(2)
+
+    def plan(_):
+        barrier.wait(timeout=10)
+        return refusal_of("archived_completion", lambda: direct_prepare(q, rig, tip))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        errors = list(pool.map(plan, range(2), timeout=30))
+    assert errors[0].next_action == errors[1].next_action
+    ops = errors[0].next_action
+    assert ops["lane"] == selected.lane and ops["expected_head"] == selected.head
+    assert [kind for kind, oid in backend.reads] == ["commit", "commit"]
+    assert all(oid == receipt.commit for _, oid in backend.reads)
+    assert q.issued is None and backend.state == before and backend.commits == archives
+    stale_barrier = Barrier(2)
+    stale_head = "0" * len(ops["expected_head"])
+
+    def stale(_):
+        stale_barrier.wait(timeout=10)
+        refused("request_conflict", lambda: q.withdraw(ops["lane"], expected_head=stale_head))
+        return "refused"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(stale, range(2), timeout=30)) == ["refused", "refused"]
+    assert backend.state == before and q.issued is None and backend.commits == archives
+    release_barrier = Barrier(2)
+
+    def release(_):
+        release_barrier.wait(timeout=10)
+        return q.withdraw(ops["lane"], expected_head=ops["expected_head"])
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sorted(pool.map(release, range(2), timeout=30)) == ["already", "released"]
+    assert tuple(item.lane for item in backend.state.entries) == (later.lane,)
+    assert q.issued is None and set(backend.commits) == set(archives)
+    backend.reads.clear()
+    follow = _archived_operands(q, rig, tip, receipt, backend)
+    assert follow.next_action["lane"] == later.lane
+    assert q.withdraw(follow.next_action["lane"],
+                      expected_head=follow.next_action["expected_head"]) == "released"
+    assert direct_prepare(q, rig, tip).status == "empty"
+    assert q.issued is None
 
 
 @pytest.mark.parametrize("failure", ["commit-exception", "commit-invalid", "health", "health-invalid"])
@@ -1200,6 +2459,102 @@ def test_parent_cycles_are_rejected_and_retry_keeps_existing_order(rig):
     assert prepare(q, rig).status == "blocked-by-parent"
     q.enqueue(rig.store, entry(rig, lane="b"))
     assert prepare(q, rig).lane == "b"
+
+
+def test_enqueue_cycle_refuses_and_open_prefix_restores(rig):
+    """Admission refuses parent_cycle; an open external prefix reopens and then retries."""
+    passing(rig, legs=("linux-3.12",))
+    q = fresh_queue(rig)
+    first = entry(rig, lane="a", parents=("c",))
+    second = entry(rig, lane="b", parents=("a",))
+    closing = entry(rig, lane="c", parents=("b",))
+    assert q.enqueue(rig.store, first) == "queued"
+    assert q.enqueue(rig.store, second) == "queued"
+    refused("parent_cycle", lambda: q.enqueue(rig.store, closing))
+    refused("parent_cycle", lambda: q.enqueue(rig.store, closing))
+    assert {item.lane for item in rig.backends[q].state.entries} == {"a", "b"}
+
+    restarted = fresh_queue(rig, backend=rig.backends[q], initialize=False)
+    assert prepare(restarted, rig).status == "blocked-by-parent"
+    before = rig.backends[restarted].state
+    barrier = Barrier(2)
+
+    def close(_):
+        barrier.wait(timeout=10)
+        try:
+            return restarted.enqueue(rig.store, closing)
+        except mq.QueueRefused as exc:
+            return exc.code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sorted(pool.map(close, (0, 1))) == ["parent_cycle", "parent_cycle"]
+    assert rig.backends[restarted].state == before
+    opened = replace(closing, parents=())
+    assert restarted.enqueue(rig.store, opened) == "queued"
+    assert restarted.enqueue(rig.store, opened) == "already"
+    assert prepare(restarted, rig).lane == "c"
+    assert {item.lane for item in rig.backends[restarted].state.entries} == {"a", "b", "c"}
+
+
+def test_restart_refuses_cyclic_checkpoint_and_retries_acyclic_graph(rig):
+    """A durable cycle is state_unavailable; repairing it reopens the external parents."""
+    passing(rig, legs=("linux-3.12",))
+    q = fresh_queue(rig)
+    keep = entry(rig, lane="keep", parents=("outside",))
+    assert q.enqueue(rig.store, keep) == "queued"
+    restarted = fresh_queue(rig, backend=rig.backends[q], initialize=False)
+    assert restarted.enqueue(rig.store, keep) == "already"
+    assert prepare(restarted, rig).status == "blocked-by-parent"
+
+    backend = rig.backends[q]
+    left = entry(rig, lane="left", parents=("right",))
+    right = entry(rig, lane="right", parents=("left",))
+    backend.state = replace(backend.state, entries=(keep, left, right))
+    recovered = json_round_trip_backend(backend)
+    before = recovered.state
+    barrier = Barrier(2)
+
+    def reopen(_):
+        barrier.wait(timeout=10)
+        try:
+            fresh_queue(rig, backend=recovered, initialize=False)
+            return "opened"
+        except mq.QueueRefused as exc:
+            return exc.code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sorted(pool.map(reopen, (0, 1))) == ["state_unavailable", "state_unavailable"]
+    refused("state_unavailable", lambda: fresh_queue(rig, backend=recovered, initialize=False))
+    assert recovered.state == before
+
+    recovered.state = replace(recovered.state, entries=(keep, left, replace(right, parents=("new",))))
+    repaired = fresh_queue(rig, backend=recovered, initialize=False)
+    assert {item.lane for item in rig.backends[repaired].state.entries} == {"keep", "left", "right"}
+    joining = entry(rig, lane="new", parents=("left",))
+    refused("parent_cycle", lambda: repaired.enqueue(rig.store, joining))
+    assert repaired.enqueue(rig.store, replace(joining, parents=())) == "queued"
+    assert prepare(repaired, rig).lane == "new"
+
+
+def test_reloaded_cycle_refuses_issued_check_until_repaired_restart(rig):
+    """check_issued reloads through the same restore validation as restart."""
+    q = queue(rig)
+    passing(rig)
+    receipt = issue(q, rig, prepare(q, rig))
+    backend = rig.backends[q]
+    record = backend.state.issued
+    left = entry(rig, lane="left", parents=("right",))
+    right = entry(rig, lane="right", parents=("left",))
+    backend.state = replace(backend.state, entries=(record.entry, left, right))
+    refused("state_unavailable", lambda: q.check_issued(
+        rig.store, receipt, read_target=lambda _: rig.base, read_mode=lambda *args: "none", now=100))
+    refused("state_unavailable", lambda: q.check_issued(
+        rig.store, receipt, read_target=lambda _: rig.base, read_mode=lambda *args: "none", now=100))
+    backend.state = replace(backend.state, entries=(record.entry, left, replace(right, parents=("outside",))))
+    restarted = fresh_queue(rig, backend=backend, initialize=False)
+    restarted.restore_target(rig.store, mq.HostedResult(rig.base, True), read_target=lambda _: rig.base)
+    assert restarted.check_issued(rig.store, receipt, read_target=lambda _: rig.base,
+                                  read_mode=lambda *args: "none", now=100) is True
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -2217,7 +3572,7 @@ def test_unissued_intent_result_survives_abort_with_empty_scratch(rig, monkeypat
 
 @pytest.mark.parametrize("prefix", ["initial", "issued", "landed", "descendant-red",
     "duplicate-red", "withdrawn-red", "cached-merge"])
-def test_bounded_exhaustive_state_sequences_preserve_i1_i2_i3(rig, monkeypatch, request, prefix):
+def test_bounded_exhaustive_state_sequences_preserve_i1_i2_i3(rig, monkeypatch, prefix):
     """Every two-event suffix from seven prefixes; I1-I4 checked after each event.
 
     The independent oracle tracks per-revision attempts, actual target ancestry
@@ -2226,8 +3581,6 @@ def test_bounded_exhaustive_state_sequences_preserve_i1_i2_i3(rig, monkeypatch, 
     their first real read. No repository history or new dependency is needed.
     """
     passing(rig)
-    stores = ExitStack()
-    request.addfinalizer(stores.close)
     subjects = result_subjects(rig)
     base_tree = git(rig.repo, "rev-parse", rig.base + "^{tree}").decode().strip()
     cached_tip = git(rig.repo, "commit-tree", base_tree, "-p", rig.base,
@@ -2340,109 +3693,110 @@ def test_bounded_exhaustive_state_sequences_preserve_i1_i2_i3(rig, monkeypatch, 
     resolved_states = set()
     for seed, initial_target in seeds:
         for sequence in product(events, repeat=2):
-            backend, target = clone(seed), initial_target
-            store = rig.store
-            q = fresh_queue(rig, backend=backend, initialize=False)
-            oracle = {oid: (row.attempt, row.passed) for oid, row in backend.healths.items()}
-            observe(oracle, target, True, 0)
-            q.restore_target(store, mq.HostedResult(target, True), read_target=lambda _: target)
-            fault = False
-            for event in sequence:
-                receipt = q.issued
-                if event == "issue":
-                    candidate = call(lambda: q.prepare(store, read_target=lambda _: target,
-                        read_mode=lambda *args: "none", identity=IDENTITY, now=100))
-                    if isinstance(candidate, mq.Landing) and candidate.status == "ready":
-                        assert not fault and oracle.get(target, (0, True))[1], sequence
-                        assert oracle.get(candidate.commit, (0, True))[1], sequence
-                        issued = call(lambda: q.revalidate(store, candidate, read_target=lambda _: target,
+            with sequence_stores() as open_store:
+                backend, target = clone(seed), initial_target
+                store = rig.store
+                q = fresh_queue(rig, backend=backend, initialize=False)
+                oracle = {oid: (row.attempt, row.passed) for oid, row in backend.healths.items()}
+                observe(oracle, target, True, 0)
+                q.restore_target(store, mq.HostedResult(target, True), read_target=lambda _: target)
+                fault = False
+                for event in sequence:
+                    receipt = q.issued
+                    if event == "issue":
+                        candidate = call(lambda: q.prepare(store, read_target=lambda _: target,
                             read_mode=lambda *args: "none", identity=IDENTITY, now=100))
-                        if isinstance(issued, mq.Landing):
-                            parents.setdefault(issued.commit, (issued.tip, rig.head))
-                elif event == "land":
-                    if receipt is not None:
-                        target = receipt.commit
-                elif event.startswith("advance-"):
-                    target = descendant if event == "advance-descendant" else rig.other
-                elif event in ("red0", "green0", "red1", "green1", "receipt-red0", "receipt-green1"):
-                    subject = receipt.commit if event.startswith("receipt-") and receipt else target
-                    passed, attempt = "green" in event, int(event[-1])
-                    outcome = call(lambda: q.hosted_result(subject, passed=passed, attempt=attempt))
-                    if outcome not in ("state_unavailable", "state_capacity"):
-                        observe(oracle, subject, passed, attempt)
-                elif event == "acknowledge" and receipt is not None:
-                    call(lambda: q.observe_landed(store, receipt, read_target=lambda _: target))
-                elif event == "restore":
-                    outcome = call(lambda: q.restore_target(store, mq.HostedResult(target, True),
-                                                            read_target=lambda _: target))
-                    if outcome in ("green", "target-red"):
-                        observe(oracle, target, True, 0)
-                        fault = False
-                elif event == "reconcile" and receipt is not None:
-                    call(lambda: q.reconcile_not_landed(store, receipt,
-                        read_target=lambda _: target, read_outcome=lambda row: "not_applied"))
-                elif event == "withdraw" and receipt is not None:
-                    record = backend.state.issued or backend.state.cleanup
-                    call(lambda: q.withdraw(receipt.lane, expected_head=record.entry.head, store=store,
-                        read_target=lambda _: target, read_outcome=lambda row: "not_applied"))
-                elif event == "reenqueue":
-                    call(lambda: q.enqueue(store, entry(rig)))
-                elif event == "at-capacity":
-                    for subject in subjects[:-1]:
-                        outcome = call(lambda: q.hosted_result(subject, passed=False))
-                        if outcome not in ("state_unavailable", "state_capacity"):
-                            observe(oracle, subject, False, 0)
-                elif event == "over-capacity":
-                    for subject in subjects:
-                        observe(oracle, subject, False, 0)
-                        backend.healths[subject] = mq.HostedResult(subject, oracle[subject][1], oracle[subject][0])
-                        backend.pending[subject] = backend.healths[subject]
-                    backend.dirty = True
-                    q = fresh_queue(rig, backend=backend, initialize=False)
-                elif event == "restart-fresh-store":
-                    if prefix == "cached-merge":
-                        store = stores.enter_context(make_store(rig.repo))
-                        assert store.scratch != rig.store.scratch
-                        assert not tuple((store.scratch / "objects").iterdir())
+                        if isinstance(candidate, mq.Landing) and candidate.status == "ready":
+                            assert not fault and oracle.get(target, (0, True))[1], sequence
+                            assert oracle.get(candidate.commit, (0, True))[1], sequence
+                            issued = call(lambda: q.revalidate(store, candidate, read_target=lambda _: target,
+                                read_mode=lambda *args: "none", identity=IDENTITY, now=100))
+                            if isinstance(issued, mq.Landing):
+                                parents.setdefault(issued.commit, (issued.tip, rig.head))
+                    elif event == "land":
                         if receipt is not None:
-                            assert store.object(receipt.commit, "commit")
-                    q = fresh_queue(rig, backend=backend, initialize=False)
-                elif event == "restart":
-                    q = fresh_queue(rig, backend=backend, initialize=False)
-                elif event == "storage-fault":
-                    backend.fail = "before"
-                    assert call(lambda: q.hosted_result(target, passed=False, attempt=1)) == "state_unavailable"
-                    observe(oracle, target, False, 1)
-                    backend.fail, fault = None, True
-                red = oracle.get(target, (0, True))[1] is False
-                if red or fault:  # I1 / I3: no ordinary publication after RED / uncertainty.
-                    observation = call(lambda: q.prepare(store, read_target=lambda _: target,
-                        read_mode=lambda *args: "none", identity=IDENTITY, now=100))
-                    assert not isinstance(observation, mq.Landing) or observation.status != "ready", sequence
-                    if q.issued is not None:
-                        assert call(lambda: q.check_issued(store, q.issued,
-                            read_target=lambda _: target, read_mode=lambda *args: "none", now=100)) is not True
-                # I2: even with a fault/restart/contradictory hosted result, every
-                # durable receipt has a public authenticated resolution path.
-                fingerprint = (backend.state, target, backend.dirty, tuple(backend.healths.items()),
-                               tuple(backend.lanes.items()), tuple(backend.commits.items()),
-                               tuple(backend.pending.items()))
-                if fingerprint in resolved_states:
-                    continue
-                resolved_states.add(fingerprint)
-                probe = fresh_queue(rig, backend=clone(backend), initialize=False)
-                if probe.issued is not None:
-                    pending = probe.issued
-                    if landed(pending.commit, target):
-                        assert probe.observe_landed(store, pending,
-                            read_target=lambda _: target) == "done", sequence
-                    else:
-                        outcome = call(lambda: probe.reconcile_not_landed(store, pending,
+                            target = receipt.commit
+                    elif event.startswith("advance-"):
+                        target = descendant if event == "advance-descendant" else rig.other
+                    elif event in ("red0", "green0", "red1", "green1", "receipt-red0", "receipt-green1"):
+                        subject = receipt.commit if event.startswith("receipt-") and receipt else target
+                        passed, attempt = "green" in event, int(event[-1])
+                        outcome = call(lambda: q.hosted_result(subject, passed=passed, attempt=attempt))
+                        if outcome not in ("state_unavailable", "state_capacity"):
+                            observe(oracle, subject, passed, attempt)
+                    elif event == "acknowledge" and receipt is not None:
+                        call(lambda: q.observe_landed(store, receipt, read_target=lambda _: target))
+                    elif event == "restore":
+                        outcome = call(lambda: q.restore_target(store, mq.HostedResult(target, True),
+                                                                read_target=lambda _: target))
+                        if outcome in ("green", "target-red"):
+                            observe(oracle, target, True, 0)
+                            fault = False
+                    elif event == "reconcile" and receipt is not None:
+                        call(lambda: q.reconcile_not_landed(store, receipt,
                             read_target=lambda _: target, read_outcome=lambda row: "not_applied"))
-                        if outcome == "state_conflict":
-                            record = backend.state.issued or backend.state.cleanup
-                            assert probe.withdraw(pending.lane, expected_head=record.entry.head, store=store,
-                                read_target=lambda _: target, read_outcome=lambda row: "not_applied") == "released"
+                    elif event == "withdraw" and receipt is not None:
+                        record = backend.state.issued or backend.state.cleanup
+                        call(lambda: q.withdraw(receipt.lane, expected_head=record.entry.head, store=store,
+                            read_target=lambda _: target, read_outcome=lambda row: "not_applied"))
+                    elif event == "reenqueue":
+                        call(lambda: q.enqueue(store, entry(rig)))
+                    elif event == "at-capacity":
+                        for subject in subjects[:-1]:
+                            outcome = call(lambda: q.hosted_result(subject, passed=False))
+                            if outcome not in ("state_unavailable", "state_capacity"):
+                                observe(oracle, subject, False, 0)
+                    elif event == "over-capacity":
+                        for subject in subjects:
+                            observe(oracle, subject, False, 0)
+                            backend.healths[subject] = mq.HostedResult(subject, oracle[subject][1], oracle[subject][0])
+                            backend.pending[subject] = backend.healths[subject]
+                        backend.dirty = True
+                        q = fresh_queue(rig, backend=backend, initialize=False)
+                    elif event == "restart-fresh-store":
+                        if prefix == "cached-merge":
+                            store = open_store(rig.repo)
+                            assert store.scratch != rig.store.scratch
+                            assert not tuple((store.scratch / "objects").iterdir())
+                            if receipt is not None:
+                                assert store.object(receipt.commit, "commit")
+                        q = fresh_queue(rig, backend=backend, initialize=False)
+                    elif event == "restart":
+                        q = fresh_queue(rig, backend=backend, initialize=False)
+                    elif event == "storage-fault":
+                        backend.fail = "before"
+                        assert call(lambda: q.hosted_result(target, passed=False, attempt=1)) == "state_unavailable"
+                        observe(oracle, target, False, 1)
+                        backend.fail, fault = None, True
+                    red = oracle.get(target, (0, True))[1] is False
+                    if red or fault:  # I1 / I3: no ordinary publication after RED / uncertainty.
+                        observation = call(lambda: q.prepare(store, read_target=lambda _: target,
+                            read_mode=lambda *args: "none", identity=IDENTITY, now=100))
+                        assert not isinstance(observation, mq.Landing) or observation.status != "ready", sequence
+                        if q.issued is not None:
+                            assert call(lambda: q.check_issued(store, q.issued,
+                                read_target=lambda _: target, read_mode=lambda *args: "none", now=100)) is not True
+                    # I2: even with a fault/restart/contradictory hosted result, every
+                    # durable receipt has a public authenticated resolution path.
+                    fingerprint = (backend.state, target, backend.dirty, tuple(backend.healths.items()),
+                                   tuple(backend.lanes.items()), tuple(backend.commits.items()),
+                                   tuple(backend.pending.items()))
+                    if fingerprint in resolved_states:
+                        continue
+                    resolved_states.add(fingerprint)
+                    probe = fresh_queue(rig, backend=clone(backend), initialize=False)
+                    if probe.issued is not None:
+                        pending = probe.issued
+                        if landed(pending.commit, target):
+                            assert probe.observe_landed(store, pending,
+                                read_target=lambda _: target) == "done", sequence
                         else:
-                            assert outcome == "not_applied", sequence
-                    assert probe.issued is None, sequence
+                            outcome = call(lambda: probe.reconcile_not_landed(store, pending,
+                                read_target=lambda _: target, read_outcome=lambda row: "not_applied"))
+                            if outcome == "state_conflict":
+                                record = backend.state.issued or backend.state.cleanup
+                                assert probe.withdraw(pending.lane, expected_head=record.entry.head, store=store,
+                                    read_target=lambda _: target, read_outcome=lambda row: "not_applied") == "released"
+                            else:
+                                assert outcome == "not_applied", sequence
+                        assert probe.issued is None, sequence

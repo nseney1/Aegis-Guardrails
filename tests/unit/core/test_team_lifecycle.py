@@ -162,6 +162,142 @@ def test_boundary_checks_call_shape_without_inference_from_parameter_names(core)
         assert caught.value.as_dict() == core.LifecycleRefusal().as_dict()
 
 
+@pytest.mark.parametrize("use_factory", [False, True], ids=["direct", "factory"])
+def test_boundary_refuses_unknown_checker_at_registration_and_allows_retry(core, use_factory):
+    def accept(value):
+        local = value
+        return local
+
+    checked = []
+    checks = {"value": checked.append, "local": checked.append}
+    if use_factory:
+        decorate = core.boundary(checks=checks)
+    with pytest.raises(core.LifecycleRefusal) as caught:
+        if use_factory:
+            decorate(accept)
+        else:
+            core.boundary(accept, checks=checks)
+    assert caught.value.as_dict() == core.LifecycleRefusal().as_dict()
+    assert checked == []
+
+    del checks["local"]
+    assert core.boundary(accept, checks=checks)(42) == 42
+    assert checked == [42]
+
+
+@pytest.mark.parametrize("mutation", ["add", "remove"])
+def test_boundary_factory_freezes_checks_before_decoration(core, mutation):
+    def integer(value):
+        if type(value) is not int:
+            raise core.LifecycleRefusal()
+
+    def accept(first, second):
+        return first, second
+
+    checks = {"first": integer, "second": integer}
+    decorate = core.boundary(checks=checks)
+
+    def mutate():
+        if mutation == "add":
+            checks["unknown"] = integer
+        else:
+            del checks["second"]
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(mutate).result(timeout=10)
+
+    wrapped = decorate(accept)
+    with pytest.raises(core.LifecycleRefusal) as caught:
+        wrapped(1, "invalid")
+    assert caught.value.as_dict() == core.LifecycleRefusal().as_dict()
+    assert wrapped(1, 2) == (1, 2)
+
+
+def test_boundary_factory_refuses_keyword_override_and_allows_retry(core):
+    checked = []
+
+    def accept(value):
+        return value
+
+    decorate = core.boundary(checks={"value": checked.append})
+    with pytest.raises(TypeError, match="unexpected keyword argument 'checks'"):
+        decorate(accept, checks=None)
+    assert checked == []
+    assert decorate(accept)(42) == 42
+    assert checked == [42]
+
+
+def test_boundary_preserves_signature_defaults_supplied_order_and_refusals(core):
+    checked = []
+
+    def accept(first, second=2, *, third, fourth=4):
+        return first, second, third, fourth
+
+    checks = {name: checked.append for name in ("first", "second", "third", "fourth")}
+    wrapped = core.boundary(checks=checks)(accept)
+    assert inspect.signature(wrapped) == inspect.signature(accept)
+    assert wrapped("first", fourth="fourth", third="third", second="second") == (
+        "first", "second", "third", "fourth")
+    assert checked == ["first", "fourth", "third", "second"]
+
+    checked.clear()
+    for args, kwargs in [((1, 2, 3), {}), ((1,), {}), ((1,), {"third": 3, "extra": 5}),
+                         ((1,), {"first": 5, "third": 3}), ((), {"third": 3})]:
+        with pytest.raises(core.LifecycleRefusal) as caught:
+            wrapped(*args, **kwargs)
+        assert caught.value.as_dict() == core.LifecycleRefusal().as_dict()
+    assert checked == []
+
+    assert wrapped(1, third=3) == (1, 2, 3, 4)
+    assert checked == [1, 3]
+
+
+def test_boundary_keeps_registered_checks_during_mutation_and_retry(core):
+    entered, release = Event(), Event()
+
+    def pause(value):
+        if value == "pause":
+            entered.set()
+            assert release.wait(timeout=10)
+
+    def integer(value):
+        if type(value) is not int:
+            raise core.LifecycleRefusal()
+
+    def accept(first, second):
+        return first, second
+
+    checks = {"first": pause, "second": integer}
+    wrapped = core.boundary(accept, checks=checks)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        in_flight = pool.submit(wrapped, "pause", "invalid")
+        try:
+            assert entered.wait(timeout=10)
+            checks.clear()
+            checks["first"] = integer
+            concurrent = pool.submit(wrapped, "concurrent", 2)
+            assert concurrent.result(timeout=10) == ("concurrent", 2)
+        finally:
+            release.set()
+        with pytest.raises(core.LifecycleRefusal) as caught:
+            in_flight.result(timeout=10)
+        assert caught.value.as_dict() == core.LifecycleRefusal().as_dict()
+
+    assert wrapped("retry", 2) == ("retry", 2)
+
+
+def test_boundary_refuses_keyword_for_positional_only_parameter(core):
+    @core.boundary
+    def accept(value, /):
+        return value
+
+    with pytest.raises(core.LifecycleRefusal) as caught:
+        accept(value=7)
+    assert caught.value.as_dict() == core.LifecycleRefusal().as_dict()
+    assert accept(7) == 7
+
+
 def test_public_reduction_shapes_each_input_once_on_publish_and_retry(core):
     p = policy()
     state = core.initial_state(p)
@@ -497,9 +633,17 @@ def bootstrap(journal, core):
                 "profile_sha256": core.digest(actor["profile"]), "channel_instance_sha256": core.digest(channel),
                 "approved_plan_sha256": runtime.approved_plan_ref["sha256"], "reservation_sequence": sequence,
                 "expires_monotonic_ns": 1000000000}
-    class Guard:
+    class GenesisGuard:
+        def __init__(self, reservations):
+            self.rows = [copy.deepcopy(reservation.witness) for reservation in reservations]
+
         def require_reserved_genesis_current(self):
             pass
+
+        def reserved_genesis_rows(self):
+            return copy.deepcopy(self.rows)
+
+    class Guard:
         def require_initial_identity_current(self, *args):
             pass
         def require_initial_creation_current(self, *args):
@@ -509,8 +653,8 @@ def bootstrap(journal, core):
     class Authority:
         owned_runtime = runtime
         @contextmanager
-        def bootstrap_fence(self, *args):
-            yield Guard()
+        def bootstrap_fence(self, owned_runtime, approved_plan_ref, reservations):
+            yield GenesisGuard(reservations)
     port = SimpleNamespace(HostAuthority=Authority, ReservedEnrollment=Reservation,
                            InitialCreationGuard=Guard, HostAuthorityError=HostError)
     reservations = tuple(Reservation(cid, i) for i, cid in enumerate(sorted(p["actors"]), 1))

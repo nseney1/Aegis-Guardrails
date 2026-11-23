@@ -1,7 +1,9 @@
 """Shared kernel facts: bounded parsing, confinement and stable failures."""
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import errno
 import os
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +16,27 @@ from aegis_mcp import queue_role
 
 
 BOOT = "12345678-1234-1234-1234-123456789abc"
+
+
+class _BorrowedParent:
+    """Public parent_fd only. A closed borrow raises the storage refusal."""
+
+    def __init__(self, read, fd):
+        self._read = read
+        self._fd = fd
+        self._open = True
+
+    @property
+    def parent_fd(self):
+        if not self._open:
+            raise storage_confined.ConfinedFileError("closed")
+        return self._fd
+
+    def read_bytes(self, maximum):
+        return self._read(maximum)
+
+    def close(self):
+        self._open = False
 
 
 def proc_stat(pid=123, state=b"S", ticks=b"77", comm=b"name ) with ( spaces\n"):
@@ -36,9 +59,11 @@ def source(monkeypatch, data):
                 raise storage_confined.ConfinedFileError("too_large")
             return item
 
+        handle = _BorrowedParent(read, 42)
         try:
-            yield SimpleNamespace(read_bytes=read, _parent=42)
+            yield handle
         finally:
+            handle.close()
             closed.append(parts)
 
     return confined, calls, closed
@@ -181,6 +206,136 @@ def test_callers_keep_their_refusal_codes(monkeypatch, reason, code):
         assert refused.value.code == ("unsupported_platform" if reason == "unsupported" else "identity_unavailable")
     with pytest.raises(queue_role.RoleRefusal, match="^" + code + "$"):
         queue_role.process_identity()
+
+
+def test_slice_callers_borrow_the_public_parent_descriptor():
+    """Admitted callers reach the held parent only through parent_fd."""
+    import ast
+    from aegis_core import (
+        team_gitops, team_profile, team_session_wake, team_supervisor, team_supervisor_observe,
+    )
+    modules = (
+        kernel, team_gitops, team_profile, team_supervisor, team_supervisor_observe, team_session_wake,
+    )
+    private, public = [], set()
+    for item in modules:
+        tree = ast.parse(open(item.__file__, encoding="utf-8").read(), filename=item.__file__)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr == "_parent":
+                private.append(item.__name__ + ":" + str(node.lineno))
+            elif isinstance(node, ast.Attribute) and node.attr == "parent_fd":
+                public.add(item.__name__)
+            elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                  and node.func.id == "getattr" and len(node.args) >= 2
+                  and isinstance(node.args[1], ast.Constant) and node.args[1].value == "_parent"):
+                private.append(item.__name__ + ":" + str(node.lineno))
+    assert private == []
+    assert public == {item.__name__ for item in modules}
+
+
+def test_closed_borrow_refuses_then_retry_reads_an_open_parent(monkeypatch):
+    """A closed parent_fd is the fixed identity refusal; a later open borrow succeeds."""
+    monkeypatch.setattr(kernel, "descriptor_supported", lambda: True)
+    state = {"open": False}
+    entered = []
+
+    class Handle:
+        @property
+        def parent_fd(self):
+            if not state["open"]:
+                raise storage_confined.ConfinedFileError("closed")
+            return 42
+
+    @contextmanager
+    def confined(root, parts):
+        entered.append(parts)
+        yield Handle()
+
+    def readlink(name, *, dir_fd):
+        assert dir_fd == 42
+        return str(os.getpid()) if name == "self" else "pid:[12345]"
+
+    with pytest.raises(kernel.IdentityError) as refused:
+        kernel.pid_namespace(confined_file=confined, readlink=readlink)
+    assert refused.value.reason == "closed"
+    assert str(refused.value) == "kernel identity unavailable"
+    state["open"] = True
+    assert kernel.pid_namespace(confined_file=confined, readlink=readlink) == "pid:[12345]"
+    assert entered == [("self",), ("self",), (str(os.getpid()), "ns", "pid")]
+
+
+def test_detached_borrow_survives_link_failure_and_retry(tmp_path, monkeypatch):
+    """The caller owns the directory descriptor. Link failure must not close it."""
+    if not kernel.descriptor_supported():
+        pytest.skip("requires a Linux directory descriptor")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(tmp_path, flags)
+    try:
+        attempts = {"n": 0}
+
+        class Handle:
+            @property
+            def parent_fd(self):
+                return fd
+
+        @contextmanager
+        def confined(root, parts):
+            yield Handle()
+
+        def readlink(name, *, dir_fd):
+            os.fstat(dir_fd)
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise OSError(errno.EIO, "TOKEN=secret")
+            return str(os.getpid()) if name == "self" else "pid:[8]"
+
+        with pytest.raises(kernel.IdentityError) as refused:
+            kernel.pid_namespace(confined_file=confined, readlink=readlink)
+        assert refused.value.reason == "unavailable"
+        assert str(refused.value) == "kernel identity unavailable"
+        assert "secret" not in str(refused.value)
+        os.fstat(fd)
+        assert kernel.pid_namespace(confined_file=confined, readlink=readlink) == "pid:[8]"
+        os.fstat(fd)
+    finally:
+        os.close(fd)
+
+
+def test_concurrent_namespace_borrows_stay_distinct(monkeypatch):
+    """Each open borrow is closed-checked on its own handle and is not shared."""
+    monkeypatch.setattr(kernel, "descriptor_supported", lambda: True)
+    local = threading.local()
+
+    class Handle:
+        @property
+        def parent_fd(self):
+            if not local.open:
+                raise storage_confined.ConfinedFileError("closed")
+            return local.fd
+
+    @contextmanager
+    def confined(root, parts):
+        yield Handle()
+
+    def readlink(name, *, dir_fd):
+        if dir_fd != local.fd:
+            raise OSError("crossed borrow")
+        return str(os.getpid()) if name == "self" else "pid:[4]"
+
+    def one(fd):
+        local.fd = fd
+        local.open = False
+        with pytest.raises(kernel.IdentityError) as refused:
+            kernel.pid_namespace(confined_file=confined, readlink=readlink)
+        assert refused.value.reason == "closed"
+        assert str(refused.value) == "kernel identity unavailable"
+        local.open = True
+        assert kernel.pid_namespace(confined_file=confined, readlink=readlink) == "pid:[4]"
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(one, fd) for fd in (11, 12, 13)]
+        for future in futures:
+            future.result(timeout=5)
 
 
 def test_queue_identity_retains_session_filename_and_keys(monkeypatch):

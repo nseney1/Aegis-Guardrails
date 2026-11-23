@@ -19,6 +19,7 @@ from aegis_core.insights.keys import (
     _user_layout,
     insights_path,
 )
+from aegis_core.insights.records import DECISIONS, INSIGHT_FIELD_POLICIES, MAX_INSIGHT_ITEMS
 from aegis_core.primitives import parse_utc, utc_stamp
 from aegis_core.redaction import RedactionRefusal, redact_insight_text
 from aegis_core.storage import read_jsonl
@@ -57,22 +58,11 @@ JOIN_WINDOW_S = 1800
 MAX_CAPTURES_PER_SESSION = 50
 MAX_CAPTURE_PATHS = 20
 MAX_CAPTURE_PATH_CHARS = 512
-MAX_INSIGHT_ITEMS = 4096
-
-# Every persisted field has one policy. Unknown fields refuse before append.
-INSIGHT_FIELD_POLICIES = {
-    "v": "identity", "ts": "identity", "event": "identity", "id": "identity",
-    "level": "identity", "text": "text", "paths": "path", "psrc": "identity",
-    "host": "text", "hs": "identity", "source": "identity", "kind": "text",
-    "approval_code": "identity", "revs": "identity", "corroborated_by": "identity",
-    "paths_dropped": "identity", "cue": "identity", "inv": "identity",
-    "decision": "identity", "insight_ids": "identity", "reason": "text", "rule_id": "identity",
-}
 _IDENTITY_ENUMS = {
     "event": ("insight", "heartbeat", "inventory", "decision"),
     "level": ("H", "cli", "W2", "suggestion"), "psrc": ("explicit", "dirty"),
     "source": ("cli", "mcp", "hook"),
-    "decision": ("propose", "reject", "snooze", "merge-into-rule", "noise", "confirm"),
+    "decision": DECISIONS,
 }
 _IDENTITY_PATTERNS = {
     "id": r"ins-[0-9a-f]{12}", "corroborated_by": r"ins-[0-9a-f]{12}",

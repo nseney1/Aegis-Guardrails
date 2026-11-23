@@ -221,7 +221,7 @@ Lease lane paths for parallel agents (claim, renew, transfer, release, gc, list,
 
 Leases under refs/aegis/lanes/<lane> declare which paths a lane works on. A lease is cooperative conflict input, not a lock, not an identity and not proof that an agent is alive: claims of different lanes can race, and owner and role are display labels. The backstops are the post-lane gate (aegis check --lane) and aegis team metrics.
 
-Category: Daily Workflow & Verification. Subcommands: `board`, `claim`, `config`, `doctor`, `gc`, `hosts`, `list`, `mail`, `metrics`, `model`, `queue`, `release`, `renew`, `status`, `transfer`.
+Category: Daily Workflow & Verification. Subcommands: `board`, `claim`, `config`, `doctor`, `gc`, `hosts`, `isolation`, `list`, `mail`, `metrics`, `model`, `qualify`, `queue`, `release`, `renew`, `status`, `transfer`.
 
 ### `aegis team board`
 
@@ -375,6 +375,21 @@ Read capacity advice: status \| usage \| check HOST KIND. KIND: writer, review, 
 | `host` | `[HOST]` |  | Declared host alias (see status --json) |
 | `kind` | `[KIND]` |  | Job kind or declared role/lens |
 
+### `aegis team isolation`
+
+Plan or verify team container isolation
+
+Subcommands: `check`.
+
+### `aegis team isolation check`
+
+Read an isolation plan or check engine inspection data
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--config` | `CONFIG` |  | Absolute path to a bounded team-run.json |
+| `--inspect` | `INSPECT` |  | Absolute path to bounded container inspection JSON |
+
 ### `aegis team list`
 
 Show leases (conflict input, not liveness proof)
@@ -456,6 +471,24 @@ Preview model selection as JSON; --record atomically selects and appends. Errors
 | `--lane-family` | `LANE_FAMILY` |  | Lane family required for T3; writer lanes must match team_family |
 | `--review-stage` | `REVIEW_STAGE` | `"primary"` | Review stage: primary, correctness, security, whole or second as allowed by the task |
 | `--record` |  |  | Atomically select and append under the history lock (60-second timeout); default preview |
+
+### `aegis team qualify`
+
+Inspect host report receipt status
+
+Subcommands: `host`.
+
+### `aegis team qualify host`
+
+Inspect receipt status or validate a submitted report
+
+Live version reading is deferred. Receipt operations requiring it return version_unavailable.
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `kind` | `[KIND]` |  | Host id or surface alias |
+| `--report` | `REPORT` |  | Absolute path of the probe report to submit |
+| `--record` |  |  | Request recording of a passing report once a live version reader is available |
 
 ### `aegis team queue`
 

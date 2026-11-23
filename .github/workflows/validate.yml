@@ -20,10 +20,47 @@ permissions:
 # (2026-10-20/21: validate 146 min on macOS 3.9, of which check --ci was about 120; aegis-check
 # 27; test-windows 16; the rest under 1), never below 45 for validate and test-windows, at most
 # GitHub's 360. Lower them only from new measurements: a limit must not turn a slow green run red.
-# test-windows: 90, three times the ~29 min green dispatch runs of 2026-11-04 (41768431362).
-# Dispatch run 41796679010 (2026-11-04) was cancelled at the old 45 with the suite still running;
-# its log has expired, so a hang there is not ruled out. test-fast: 45, against 17.6 min for the
-# ubuntu-latest 3.11 leg (41768431362), the slowest of its last 5 green runs.
+# The old unsharded Windows jobs reached the 90-minute cap in runs 44710278932
+# and 45089040698. In run 45089040698, 3.9 was cancelled after 5414s and 3.12
+# after 5416s. The new jobs have separate ids so both required checks see each
+# result. Five jobs partition the pytest suite; the language job runs wheel
+# smoke, Layer 1, and language acceptance once per Python version.
+# The 300-minute pytest caps and 45-minute language cap are provisional. Record
+# each completed job/version's elapsed seconds including setup and its run ID.
+# Keep each cap at least twice its slowest measured duration, rounded up to
+# whole minutes, with a 45-minute floor. Repartition if the result exceeds 360.
+# test-windows-measurement: test-windows-unit-core-a 3.9 Windows job wall clocks pending (run 45089040698 interim).
+# test-windows-measurement: test-windows-unit-core-a 3.12 Windows job wall clocks pending (run 45089040698 interim).
+# test-windows-measurement: test-windows-unit-core-b 3.9 Windows job wall clocks pending (run 45089040698 interim).
+# test-windows-measurement: test-windows-unit-core-b 3.12 Windows job wall clocks pending (run 45089040698 interim).
+# test-windows-measurement: test-windows-unit-rest 3.9 Windows job wall clocks pending (run 45089040698 interim).
+# test-windows-measurement: test-windows-unit-rest 3.12 Windows job wall clocks pending (run 45089040698 interim).
+# test-windows-measurement: test-windows-integration 3.9 Windows job wall clocks pending (run 45089040698 interim).
+# test-windows-measurement: test-windows-integration 3.12 Windows job wall clocks pending (run 45089040698 interim).
+# test-windows-measurement: test-windows-contract 3.9 Windows job wall clocks pending (run 45089040698 interim).
+# test-windows-measurement: test-windows-contract 3.12 Windows job wall clocks pending (run 45089040698 interim).
+# test-windows-measurement: test-windows-language 3.9 Windows job wall clocks pending (run 45089040698 interim).
+# test-windows-measurement: test-windows-language 3.12 Windows job wall clocks pending (run 45089040698 interim).
+# test-fast shards: run 44219204536 measured the whole suite at 6516.67s (108.6 min) on
+# validate ubuntu-latest 3.11. The old single test-fast job ran that same work and the 45 min
+# cap cancelled it (run 44562897709, still at 23% after 43 min). No per-shard green run exists
+# yet, so each shard records that full-suite duration as its ceiling and uses timeout-minutes
+# 218 (at least twice 108.6 min, at most 360). Lower a shard only after a measurement of that
+# shard. The four jobs are separate ids so ALWAYS_SUCCESS names every shard: a strategy.matrix
+# collapses every leg to one needs key, and a dropped leg would not be "missing" there.
+# test-fast-measurement: test-fast-unit-core 6516.67s run 44219204536
+# test-fast-measurement: test-fast-unit-rest 6516.67s run 44219204536
+# test-fast-measurement: test-fast-integration 6516.67s run 44219204536
+# test-fast-measurement: test-fast-contract 6516.67s run 44219204536
+# validate: after HOSTED-CI-LD-ENV, run 45123562730 completed the four unsharded jobs
+# in 11112s (Ubuntu 24.04/3.9), 11402s (Ubuntu latest/3.11), 12226s (macOS/3.9), and
+# 10077s (macOS/3.11). Even the shortest exceeds half the old 300-minute cap.
+# Reuse the Windows five-way pytest partition on each OS/Python pair. Keep the 360-minute
+# provisional cap until the sharded jobs have completed. Replace the pending marker with one
+# row per OS/Python/shard (including checks): <os> <version> <shard> <seconds>s run <id>.
+# Use whole job wall clocks including setup. Keep the cap at least twice the longest recorded
+# duration rounded up to minutes, with a 45-minute floor. Repartition if it would exceed 360.
+# validate-measurement: pending
 jobs:
   # Audits the resolved runtime dependencies declared in pyproject.toml.
   # pip-audit is a CI-only tool; it is not a project dependency.
@@ -98,13 +135,15 @@ jobs:
           name: aegis-wheel
           path: dist/
 
-  # The per-PR leg (CI plan, owner-approved 2026-11-05): the whole suite on Linux 3.11 with xdist.
-  # It runs on every event, wave PRs into develop included. It executes the pull request's own
-  # code, so it gets the read-only token only, no secrets, and a checkout that keeps no
-  # credentials. Wave PRs build no wheel, so it installs the checkout into its own venv.
-  test-fast:
+  # Per-PR suite, sharded by test directory (HOSTED-CI-TEST-FAST-BUDGET). The four jobs
+  # together select every test file under tests/ once. Each runs on every event, wave
+  # PRs into develop included. It executes the pull request's own code, so it gets the
+  # read-only token only, no secrets, and a checkout that keeps no credentials. Wave PRs
+  # build no wheel, so each shard installs the checkout into its own venv. The shards do
+  # not need each other: they run concurrently, and aegis-check requires every one.
+  test-fast-unit-core:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 218
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -146,7 +185,23 @@ jobs:
         run: make lint PYTHON="$VENV/bin/python"
 
       - name: Run test suite
-        run: make test PYTHON="$VENV/bin/python"
+        env:
+          TEST_FAST_PATHS: tests/unit/core
+        run: |
+          set -euo pipefail
+          set -f
+          python_bin="$VENV/bin/python"
+          userbase="${PYTHONUSERBASE:-$("$python_bin" -c 'import site; print(site.getuserbase())')}"
+          home="$(mktemp -d /tmp/aegis-test-home.XXXXXX)"
+          trap 'rm -rf "$home"' EXIT
+          xdist=""
+          if "$python_bin" -c "import xdist" >/dev/null 2>&1; then
+            xdist="-n auto"
+          fi
+          # Isolated HOME, the same contract as the developer test target. $xdist is -n auto when
+          # pytest-xdist imports. Selectors are the positive paths in TEST_FAST_PATHS.
+          HOME="$home" USERPROFILE="$home" XDG_CONFIG_HOME="$home/.config" PYTHONUSERBASE="$userbase" \
+            "$python_bin" -m pytest -q $xdist $TEST_FAST_PATHS
 
       - name: Check for hardcoded paths
         run: |
@@ -157,8 +212,218 @@ jobs:
           fi
           echo "No hardcoded paths found"
 
+  test-fast-unit-rest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 218
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Install bubblewrap
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends bubblewrap
+
+      # Same probe and reason as the validate job's step of the same name.
+      - name: Prove bubblewrap runs
+        run: |
+          set -euo pipefail
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --unshare-net --unshare-pid --ro-bind / / --dev /dev --proc /proc true
+
+      # The venv sits outside the checkout and outside /tmp, which the job runner's sandbox
+      # replaces, so sandboxed recipes see the same pytest as the suite.
+      - name: Choose the CI venv path
+        run: echo "VENV=$RUNNER_TEMP/ci-venv" >> "$GITHUB_ENV"
+
+      - name: Create the CI venv
+        run: python -m venv "$VENV"
+
+      - name: Install test dependencies into the CI venv
+        run: '"$VENV/bin/pip" install pytest==8.3.4 pytest-xdist==3.6.1 ruff==0.9.10 hypothesis==6.126.0 coverage==7.6.12 pyyaml==6.0.2 anyio==4.12.1'
+
+      - name: Install the checkout into the CI venv
+        run: '"$VENV/bin/pip" install .'
+
+      - name: Lint
+        run: make lint PYTHON="$VENV/bin/python"
+
+      - name: Run test suite
+        env:
+          TEST_FAST_PATHS: tests/unit/cli tests/unit/mcp tests/unit/sdk tests/unit/verification tests/unit/test_ac24_acceptance_audit.py tests/unit/test_ac24_acquire.py tests/unit/test_changelog.py tests/unit/test_docs_claims.py tests/unit/test_docs_links.py tests/unit/test_no_real_gh.py tests/unit/test_p6_noadmin.py tests/unit/test_pypi_state.py tests/unit/test_readme.py tests/unit/test_release_guard.py
+        run: |
+          set -euo pipefail
+          set -f
+          python_bin="$VENV/bin/python"
+          userbase="${PYTHONUSERBASE:-$("$python_bin" -c 'import site; print(site.getuserbase())')}"
+          home="$(mktemp -d /tmp/aegis-test-home.XXXXXX)"
+          trap 'rm -rf "$home"' EXIT
+          xdist=""
+          if "$python_bin" -c "import xdist" >/dev/null 2>&1; then
+            xdist="-n auto"
+          fi
+          # Isolated HOME, the same contract as the developer test target. $xdist is -n auto when
+          # pytest-xdist imports. Selectors are the positive paths in TEST_FAST_PATHS.
+          HOME="$home" USERPROFILE="$home" XDG_CONFIG_HOME="$home/.config" PYTHONUSERBASE="$userbase" \
+            "$python_bin" -m pytest -q $xdist $TEST_FAST_PATHS
+
+      - name: Check for hardcoded paths
+        run: |
+          # Exclude template examples like /home/<user>/ which are privacy instructions
+          if grep -rnI '/home/' rules/ skills/ docs/ README.md 2>/dev/null | grep -v '<user>' | grep -v '<username>'; then
+            echo "ERROR: Hardcoded paths found"
+            exit 1
+          fi
+          echo "No hardcoded paths found"
+  test-fast-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 218
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Install bubblewrap
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends bubblewrap
+
+      # Same probe and reason as the validate job's step of the same name.
+      - name: Prove bubblewrap runs
+        run: |
+          set -euo pipefail
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --unshare-net --unshare-pid --ro-bind / / --dev /dev --proc /proc true
+
+      # The venv sits outside the checkout and outside /tmp, which the job runner's sandbox
+      # replaces, so sandboxed recipes see the same pytest as the suite.
+      - name: Choose the CI venv path
+        run: echo "VENV=$RUNNER_TEMP/ci-venv" >> "$GITHUB_ENV"
+
+      - name: Create the CI venv
+        run: python -m venv "$VENV"
+
+      - name: Install test dependencies into the CI venv
+        run: '"$VENV/bin/pip" install pytest==8.3.4 pytest-xdist==3.6.1 ruff==0.9.10 hypothesis==6.126.0 coverage==7.6.12 pyyaml==6.0.2 anyio==4.12.1'
+
+      - name: Install the checkout into the CI venv
+        run: '"$VENV/bin/pip" install .'
+
+      - name: Lint
+        run: make lint PYTHON="$VENV/bin/python"
+
+      - name: Run test suite
+        env:
+          TEST_FAST_PATHS: tests/integration
+        run: |
+          set -euo pipefail
+          set -f
+          python_bin="$VENV/bin/python"
+          userbase="${PYTHONUSERBASE:-$("$python_bin" -c 'import site; print(site.getuserbase())')}"
+          home="$(mktemp -d /tmp/aegis-test-home.XXXXXX)"
+          trap 'rm -rf "$home"' EXIT
+          xdist=""
+          if "$python_bin" -c "import xdist" >/dev/null 2>&1; then
+            xdist="-n auto"
+          fi
+          # Isolated HOME, the same contract as the developer test target. $xdist is -n auto when
+          # pytest-xdist imports. Selectors are the positive paths in TEST_FAST_PATHS.
+          HOME="$home" USERPROFILE="$home" XDG_CONFIG_HOME="$home/.config" PYTHONUSERBASE="$userbase" \
+            "$python_bin" -m pytest -q $xdist $TEST_FAST_PATHS
+
+      - name: Check for hardcoded paths
+        run: |
+          # Exclude template examples like /home/<user>/ which are privacy instructions
+          if grep -rnI '/home/' rules/ skills/ docs/ README.md 2>/dev/null | grep -v '<user>' | grep -v '<username>'; then
+            echo "ERROR: Hardcoded paths found"
+            exit 1
+          fi
+          echo "No hardcoded paths found"
+  test-fast-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 218
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Install bubblewrap
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends bubblewrap
+
+      # Same probe and reason as the validate job's step of the same name.
+      - name: Prove bubblewrap runs
+        run: |
+          set -euo pipefail
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --unshare-net --unshare-pid --ro-bind / / --dev /dev --proc /proc true
+
+      # The venv sits outside the checkout and outside /tmp, which the job runner's sandbox
+      # replaces, so sandboxed recipes see the same pytest as the suite.
+      - name: Choose the CI venv path
+        run: echo "VENV=$RUNNER_TEMP/ci-venv" >> "$GITHUB_ENV"
+
+      - name: Create the CI venv
+        run: python -m venv "$VENV"
+
+      - name: Install test dependencies into the CI venv
+        run: '"$VENV/bin/pip" install pytest==8.3.4 pytest-xdist==3.6.1 ruff==0.9.10 hypothesis==6.126.0 coverage==7.6.12 pyyaml==6.0.2 anyio==4.12.1'
+
+      - name: Install the checkout into the CI venv
+        run: '"$VENV/bin/pip" install .'
+
+      - name: Lint
+        run: make lint PYTHON="$VENV/bin/python"
+
+      - name: Run test suite
+        env:
+          TEST_FAST_PATHS: tests/contract
+        run: |
+          set -euo pipefail
+          set -f
+          python_bin="$VENV/bin/python"
+          userbase="${PYTHONUSERBASE:-$("$python_bin" -c 'import site; print(site.getuserbase())')}"
+          home="$(mktemp -d /tmp/aegis-test-home.XXXXXX)"
+          trap 'rm -rf "$home"' EXIT
+          xdist=""
+          if "$python_bin" -c "import xdist" >/dev/null 2>&1; then
+            xdist="-n auto"
+          fi
+          # Isolated HOME, the same contract as the developer test target. $xdist is -n auto when
+          # pytest-xdist imports. Selectors are the positive paths in TEST_FAST_PATHS.
+          HOME="$home" USERPROFILE="$home" XDG_CONFIG_HOME="$home/.config" PYTHONUSERBASE="$userbase" \
+            "$python_bin" -m pytest -q $xdist $TEST_FAST_PATHS
+
+      - name: Check for hardcoded paths
+        run: |
+          # Exclude template examples like /home/<user>/ which are privacy instructions
+          if grep -rnI '/home/' rules/ skills/ docs/ README.md 2>/dev/null | grep -v '<user>' | grep -v '<username>'; then
+            echo "ERROR: Hardcoded paths found"
+            exit 1
+          fi
+          echo "No hardcoded paths found"
   aegis-check:
-    needs: [dependency-audit, build-wheel, validate, test-windows, test-fast]
+    needs: [dependency-audit, build-wheel, validate, test-windows-unit-core-a, test-windows-unit-core-b, test-windows-unit-rest, test-windows-integration, test-windows-contract, test-windows-language, test-fast-unit-core, test-fast-unit-rest, test-fast-integration, test-fast-contract]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -172,9 +437,10 @@ jobs:
           NEEDS_JSON: ${{ toJSON(needs) }}
           EXPECTED_RESULT: ${{ github.event_name == 'pull_request' && github.base_ref == 'develop' && 'skipped' || 'success' }}
           # Jobs that run on every event, wave PRs included, so they must always succeed.
-          ALWAYS_SUCCESS: test-fast
+          ALWAYS_SUCCESS: test-fast-unit-core test-fast-unit-rest test-fast-integration test-fast-contract
+          REQUIRED_WINDOWS: test-windows-unit-core-a test-windows-unit-core-b test-windows-unit-rest test-windows-integration test-windows-contract test-windows-language
         run: |
-          python3 -c 'import json, os, sys; needs = json.loads(os.environ["NEEDS_JSON"]); expected = os.environ["EXPECTED_RESULT"]; always = os.environ["ALWAYS_SUCCESS"].split(); bad = {k: v.get("result") for k, v in needs.items() if v.get("result") != ("success" if k in always else expected)}; bad.update({k: "missing" for k in always if k not in needs}); sys.exit(f"Unexpected upstream job results (expected {expected}, and success for {always}): {bad}" if bad else 0)'
+          python3 -c 'import json, os, sys; needs = json.loads(os.environ["NEEDS_JSON"]); expected = os.environ["EXPECTED_RESULT"]; always = os.environ["ALWAYS_SUCCESS"].split(); bad = {k: v.get("result") for k, v in needs.items() if v.get("result") != ("success" if k in always else expected)}; bad.update({k: "missing" for k in always + os.environ["REQUIRED_WINDOWS"].split() if k not in needs}); sys.exit(f"Unexpected upstream job results (expected {expected}, and success for {always}): {bad}" if bad else 0)'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event_name == 'pull_request' && github.base_ref == 'develop' && github.event.pull_request.base.sha || github.sha }}
@@ -185,7 +451,7 @@ jobs:
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/head"
-      # On a wave PR the tests run in test-fast (gated by the first step). This unconditional,
+      # On a wave PR the tests run in the test-fast shards (gated by the first step). This unconditional,
       # base-sourced comparison keeps the governance verdict free of the wave's own code.
       - name: Run CI governance without execution
         env:
@@ -223,25 +489,26 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+  # Aegis-check and verdict depend on the entire matrix. A failed shard fails
+  # validate; fail-fast is off so the other shards can report their results.
   validate:
+    name: validate (${{ matrix.leg.os }}, ${{ matrix.leg.python-version }}, ${{ matrix.shard }})
     if: github.event_name != 'pull_request' || github.base_ref != 'develop'
     needs: [build-wheel, dependency-audit]
-    timeout-minutes: 300
+    timeout-minutes: 360
     strategy:
       # One red leg must not cancel the others and hide the per-OS results.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        python-version: ['3.9', '3.11']
         # ubuntu-latest is Ubuntu 26.04, for which actions/setup-python has no 3.9 build; the oldest
         # supported Python keeps a Linux leg on the previous LTS image.
-        exclude:
-          - os: ubuntu-latest
-            python-version: '3.9'
-        include:
-          - os: ubuntu-24.04
-            python-version: '3.9'
-    runs-on: ${{ matrix.os }}
+        leg:
+          - {os: ubuntu-24.04, python-version: '3.9'}
+          - {os: ubuntu-latest, python-version: '3.11'}
+          - {os: macos-latest, python-version: '3.9'}
+          - {os: macos-latest, python-version: '3.11'}
+        shard: [unit-core-a, unit-core-b, unit-rest, integration, contract, checks]
+    runs-on: ${{ matrix.leg.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -251,7 +518,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: ${{ matrix.leg.python-version }}
           
       - name: Download wheel artifact
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -272,26 +539,29 @@ jobs:
       # wheel from outside the repo, in isolated mode, and asserts every Aegis
       # module resolves from site-packages.
       - name: Smoke-test installed wheel (source hidden)
+        if: matrix.shard == 'checks'
         shell: bash
         run: |
           SMOKE="$PWD/.github/scripts/wheel_smoke.py"
           cd "$RUNNER_TEMP" && env -u PYTHONPATH python -I "$SMOKE"
 
       - name: Lint
+        if: matrix.shard == 'checks'
         run: make lint
 
       - name: Run Layer 1 Deterministic Verification
+        if: matrix.shard == 'checks'
         run: python3 -m aegis_cli.cli check
 
       - name: Install bubblewrap
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.shard != 'checks'
         run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends bubblewrap
 
       # Same probe as tests/integration/test_hierarchy_jobs.py. The job tests skip when it fails,
       # so it runs here as a hard step. Ubuntu 23.10 and later block unprivileged user namespaces
       # through AppArmor; the sysctl lifts that for this throwaway runner.
       - name: Prove bubblewrap runs
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.shard != 'checks'
         run: |
           set -euo pipefail
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
@@ -300,10 +570,54 @@ jobs:
           bwrap --unshare-net --unshare-pid --ro-bind / / --dev /dev --proc /proc true
 
       - name: Run test suite
+        if: matrix.shard != 'checks'
         id: test
-        run: make test
+        shell: bash
+        env:
+          TEST_VALIDATE_SHARD: ${{ matrix.shard }}
+          TEST_VALIDATE_UNIT_REST: tests/unit/cli tests/unit/mcp tests/unit/sdk tests/unit/verification tests/unit/test_ac24_acceptance_audit.py tests/unit/test_ac24_acquire.py tests/unit/test_changelog.py tests/unit/test_docs_claims.py tests/unit/test_docs_links.py tests/unit/test_no_real_gh.py tests/unit/test_p6_noadmin.py tests/unit/test_pypi_state.py tests/unit/test_readme.py tests/unit/test_release_guard.py
+        run: |
+          set -euo pipefail
+          userbase="${PYTHONUSERBASE:-$(python -c 'import site; print(site.getuserbase())')}"
+          home="$(mktemp -d /tmp/aegis-test-home.XXXXXX)"
+          trap 'rm -rf "$home"' EXIT
+          HOME="$home" USERPROFILE="$home" XDG_CONFIG_HOME="$home/.config" PYTHONUSERBASE="$userbase" python - <<'PYTHON'
+          import os
+
+          def walk_failed(_error):
+              raise SystemExit("Could not enumerate validate core tests")
+
+          shard = os.environ.get("TEST_VALIDATE_SHARD")
+          if shard in ("unit-core-a", "unit-core-b"):
+              # Same basename split and pytest file patterns as the Windows core shards.
+              root = "tests/unit/core"
+              paths = []
+              if os.path.isdir(root):
+                  for directory, children, files in os.walk(root, onerror=walk_failed):
+                      children[:] = [name for name in children if name not in ("__pycache__", ".pytest_cache")]
+                      for name in files:
+                          if not (name.endswith(".py") and (name.startswith("test_") or name.endswith("_test.py"))):
+                              continue
+                          if (name <= "test_redaction.py") == (shard == "unit-core-a"):
+                              paths.append(os.path.join(directory, name).replace(os.sep, "/"))
+              paths.sort()
+          elif shard == "unit-rest":
+              paths = os.environ.get("TEST_VALIDATE_UNIT_REST", "").split()
+          elif shard in ("integration", "contract"):
+              paths = ["tests/" + shard]
+          else:
+              raise SystemExit("Invalid validate shard")
+          if not paths:
+              raise SystemExit("Validate shard has no test paths")
+
+          # Keep the normal header for the interpreter and actual xdist worker count.
+          import pytest
+
+          raise SystemExit(pytest.main(["-n", "auto", "--durations=25", "--", *paths]))
+          PYTHON
 
       - name: Check for hardcoded paths
+        if: matrix.shard == 'checks'
         run: |
           # Exclude template examples like /home/<user>/ which are privacy instructions
           if grep -rnI '/home/' rules/ skills/ docs/ README.md 2>/dev/null | grep -v '<user>' | grep -v '<username>'; then
@@ -312,14 +626,363 @@ jobs:
           fi
           echo "No hardcoded paths found"
 
-  # B3: the full pytest suite on Windows. Failures fail the job; there is no
-  # continue-on-error. Steps run under Git Bash (as on a contributor's machine);
-  # tests that drive PowerShell spawn it themselves.
-  test-windows:
+  # HOSTED-CI-WINDOWS-BUDGET pytest shard. tests/unit/core half: basename <= test_redaction.py.
+  # Resolved from the checkout at job start. An empty result fails.
+  test-windows-unit-core-a:
     if: github.event_name != 'pull_request' || github.base_ref != 'develop'
     needs: build-wheel
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest supported and a current release; mirrors the Linux matrix policy.
+        python-version: ['3.9', '3.12']
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Download wheel artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: aegis-wheel
+          path: dist/
+
+      - name: Verify artifact digests
+        run: python .github/scripts/verify_dist.py verify dist
+
+      - name: Install test dependencies
+        run: |
+          pip install pytest==8.3.4 pytest-xdist==3.6.1 ruff==0.9.10 hypothesis==6.126.0 coverage==7.6.12 pyyaml==6.0.2 anyio==4.12.1
+          pip install dist/*.whl
+
+      # HOME and USERPROFILE point at a throwaway directory so no test can write
+      # to the runner's real profile (BUG-010). PYTHONUTF8=0 pins the Windows
+      # legacy encodings (cp1252 locale and piped stdio), the ones contributors
+      # hit (BUG-012, BUG-038), even if a future Python defaults to UTF-8 mode.
+      - name: Run test suite
+        env:
+          HOME: ${{ runner.temp }}\aegis-home
+          USERPROFILE: ${{ runner.temp }}\aegis-home
+          PYTHONUTF8: '0'
+          TEST_WINDOWS_CORE_DIR: tests/unit/core
+          TEST_WINDOWS_CORE_PIVOT: test_redaction.py
+          TEST_WINDOWS_CORE_HALF: le
+        run: |
+          set -euo pipefail
+          # Pass each resolved file as one argument, including names with spaces.
+          python - <<'PYTHON'
+          import os
+
+          root = os.environ["TEST_WINDOWS_CORE_DIR"]
+          pivot = os.environ["TEST_WINDOWS_CORE_PIVOT"]
+          half = os.environ["TEST_WINDOWS_CORE_HALF"]
+          if half not in ("le", "gt"):
+              raise SystemExit("Invalid Windows core half")
+
+          def walk_failed(_error):
+              raise SystemExit("Could not enumerate Windows core tests")
+
+          paths = []
+          if os.path.isdir(root):
+              for directory, children, files in os.walk(root, onerror=walk_failed):
+                  children[:] = [name for name in children if name not in ("__pycache__", ".pytest_cache")]
+                  for name in files:
+                      if not (name.endswith(".py") and (name.startswith("test_") or name.endswith("_test.py"))):
+                          continue
+                      if (name <= pivot) == (half == "le"):
+                          paths.append(os.path.join(directory, name).replace(os.sep, "/"))
+          if not paths:
+              raise SystemExit("TEST_WINDOWS_PATHS is empty")
+
+          os.makedirs(os.environ["USERPROFILE"], exist_ok=True)
+          import pytest
+
+          raise SystemExit(pytest.main(["-q", "-n", "auto", "--", *sorted(paths)]))
+          PYTHON
+
+  # HOSTED-CI-WINDOWS-BUDGET pytest shard. tests/unit/core complement: basename > test_redaction.py.
+  # Resolved from the checkout at job start. An empty result fails.
+  test-windows-unit-core-b:
+    if: github.event_name != 'pull_request' || github.base_ref != 'develop'
+    needs: build-wheel
+    runs-on: windows-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest supported and a current release; mirrors the Linux matrix policy.
+        python-version: ['3.9', '3.12']
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Download wheel artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: aegis-wheel
+          path: dist/
+
+      - name: Verify artifact digests
+        run: python .github/scripts/verify_dist.py verify dist
+
+      - name: Install test dependencies
+        run: |
+          pip install pytest==8.3.4 pytest-xdist==3.6.1 ruff==0.9.10 hypothesis==6.126.0 coverage==7.6.12 pyyaml==6.0.2 anyio==4.12.1
+          pip install dist/*.whl
+
+      # HOME and USERPROFILE point at a throwaway directory so no test can write
+      # to the runner's real profile (BUG-010). PYTHONUTF8=0 pins the Windows
+      # legacy encodings (cp1252 locale and piped stdio), the ones contributors
+      # hit (BUG-012, BUG-038), even if a future Python defaults to UTF-8 mode.
+      - name: Run test suite
+        env:
+          HOME: ${{ runner.temp }}\aegis-home
+          USERPROFILE: ${{ runner.temp }}\aegis-home
+          PYTHONUTF8: '0'
+          TEST_WINDOWS_CORE_DIR: tests/unit/core
+          TEST_WINDOWS_CORE_PIVOT: test_redaction.py
+          TEST_WINDOWS_CORE_HALF: gt
+        run: |
+          set -euo pipefail
+          # Pass each resolved file as one argument, including names with spaces.
+          python - <<'PYTHON'
+          import os
+
+          root = os.environ["TEST_WINDOWS_CORE_DIR"]
+          pivot = os.environ["TEST_WINDOWS_CORE_PIVOT"]
+          half = os.environ["TEST_WINDOWS_CORE_HALF"]
+          if half not in ("le", "gt"):
+              raise SystemExit("Invalid Windows core half")
+
+          def walk_failed(_error):
+              raise SystemExit("Could not enumerate Windows core tests")
+
+          paths = []
+          if os.path.isdir(root):
+              for directory, children, files in os.walk(root, onerror=walk_failed):
+                  children[:] = [name for name in children if name not in ("__pycache__", ".pytest_cache")]
+                  for name in files:
+                      if not (name.endswith(".py") and (name.startswith("test_") or name.endswith("_test.py"))):
+                          continue
+                      if (name <= pivot) == (half == "le"):
+                          paths.append(os.path.join(directory, name).replace(os.sep, "/"))
+          if not paths:
+              raise SystemExit("TEST_WINDOWS_PATHS is empty")
+
+          os.makedirs(os.environ["USERPROFILE"], exist_ok=True)
+          import pytest
+
+          raise SystemExit(pytest.main(["-q", "-n", "auto", "--", *sorted(paths)]))
+          PYTHON
+
+  # HOSTED-CI-WINDOWS-BUDGET pytest shard. Selectors are the positive paths in
+  # TEST_WINDOWS_PATHS.
+  test-windows-unit-rest:
+    if: github.event_name != 'pull_request' || github.base_ref != 'develop'
+    needs: build-wheel
+    runs-on: windows-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest supported and a current release; mirrors the Linux matrix policy.
+        python-version: ['3.9', '3.12']
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Download wheel artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: aegis-wheel
+          path: dist/
+
+      - name: Verify artifact digests
+        run: python .github/scripts/verify_dist.py verify dist
+
+      - name: Install test dependencies
+        run: |
+          pip install pytest==8.3.4 pytest-xdist==3.6.1 ruff==0.9.10 hypothesis==6.126.0 coverage==7.6.12 pyyaml==6.0.2 anyio==4.12.1
+          pip install dist/*.whl
+
+      # HOME and USERPROFILE point at a throwaway directory so no test can write
+      # to the runner's real profile (BUG-010). PYTHONUTF8=0 pins the Windows
+      # legacy encodings (cp1252 locale and piped stdio), the ones contributors
+      # hit (BUG-012, BUG-038), even if a future Python defaults to UTF-8 mode.
+      - name: Run test suite
+        env:
+          HOME: ${{ runner.temp }}\aegis-home
+          USERPROFILE: ${{ runner.temp }}\aegis-home
+          PYTHONUTF8: '0'
+          TEST_WINDOWS_PATHS: tests/unit/cli tests/unit/mcp tests/unit/sdk tests/unit/verification tests/unit/test_ac24_acceptance_audit.py tests/unit/test_ac24_acquire.py tests/unit/test_changelog.py tests/unit/test_docs_claims.py tests/unit/test_docs_links.py tests/unit/test_no_real_gh.py tests/unit/test_p6_noadmin.py tests/unit/test_pypi_state.py tests/unit/test_readme.py tests/unit/test_release_guard.py
+        run: |
+          set -euo pipefail
+          set -f
+          if [ -z "${TEST_WINDOWS_PATHS}" ]; then
+            echo "TEST_WINDOWS_PATHS is empty" >&2
+            exit 1
+          fi
+          python -c "import os; os.makedirs(os.environ['USERPROFILE'], exist_ok=True)"
+          # Positive paths only. Selectors are the words in TEST_WINDOWS_PATHS.
+          python -m pytest -q -n auto $TEST_WINDOWS_PATHS
+
+  # HOSTED-CI-WINDOWS-BUDGET pytest shard. Selectors are the positive paths in
+  # TEST_WINDOWS_PATHS.
+  test-windows-integration:
+    if: github.event_name != 'pull_request' || github.base_ref != 'develop'
+    needs: build-wheel
+    runs-on: windows-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest supported and a current release; mirrors the Linux matrix policy.
+        python-version: ['3.9', '3.12']
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Download wheel artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: aegis-wheel
+          path: dist/
+
+      - name: Verify artifact digests
+        run: python .github/scripts/verify_dist.py verify dist
+
+      - name: Install test dependencies
+        run: |
+          pip install pytest==8.3.4 pytest-xdist==3.6.1 ruff==0.9.10 hypothesis==6.126.0 coverage==7.6.12 pyyaml==6.0.2 anyio==4.12.1
+          pip install dist/*.whl
+
+      # HOME and USERPROFILE point at a throwaway directory so no test can write
+      # to the runner's real profile (BUG-010). PYTHONUTF8=0 pins the Windows
+      # legacy encodings (cp1252 locale and piped stdio), the ones contributors
+      # hit (BUG-012, BUG-038), even if a future Python defaults to UTF-8 mode.
+      - name: Run test suite
+        env:
+          HOME: ${{ runner.temp }}\aegis-home
+          USERPROFILE: ${{ runner.temp }}\aegis-home
+          PYTHONUTF8: '0'
+          TEST_WINDOWS_PATHS: tests/integration
+        run: |
+          set -euo pipefail
+          set -f
+          if [ -z "${TEST_WINDOWS_PATHS}" ]; then
+            echo "TEST_WINDOWS_PATHS is empty" >&2
+            exit 1
+          fi
+          python -c "import os; os.makedirs(os.environ['USERPROFILE'], exist_ok=True)"
+          # Positive paths only. Selectors are the words in TEST_WINDOWS_PATHS.
+          python -m pytest -q -n auto $TEST_WINDOWS_PATHS
+
+  # HOSTED-CI-WINDOWS-BUDGET pytest shard. Selectors are the positive paths in
+  # TEST_WINDOWS_PATHS.
+  test-windows-contract:
+    if: github.event_name != 'pull_request' || github.base_ref != 'develop'
+    needs: build-wheel
+    runs-on: windows-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest supported and a current release; mirrors the Linux matrix policy.
+        python-version: ['3.9', '3.12']
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Download wheel artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: aegis-wheel
+          path: dist/
+
+      - name: Verify artifact digests
+        run: python .github/scripts/verify_dist.py verify dist
+
+      - name: Install test dependencies
+        run: |
+          pip install pytest==8.3.4 pytest-xdist==3.6.1 ruff==0.9.10 hypothesis==6.126.0 coverage==7.6.12 pyyaml==6.0.2 anyio==4.12.1
+          pip install dist/*.whl
+
+      # HOME and USERPROFILE point at a throwaway directory so no test can write
+      # to the runner's real profile (BUG-010). PYTHONUTF8=0 pins the Windows
+      # legacy encodings (cp1252 locale and piped stdio), the ones contributors
+      # hit (BUG-012, BUG-038), even if a future Python defaults to UTF-8 mode.
+      - name: Run test suite
+        env:
+          HOME: ${{ runner.temp }}\aegis-home
+          USERPROFILE: ${{ runner.temp }}\aegis-home
+          PYTHONUTF8: '0'
+          TEST_WINDOWS_PATHS: tests/contract
+        run: |
+          set -euo pipefail
+          set -f
+          if [ -z "${TEST_WINDOWS_PATHS}" ]; then
+            echo "TEST_WINDOWS_PATHS is empty" >&2
+            exit 1
+          fi
+          python -c "import os; os.makedirs(os.environ['USERPROFILE'], exist_ok=True)"
+          # Positive paths only. Selectors are the words in TEST_WINDOWS_PATHS.
+          python -m pytest -q -n auto $TEST_WINDOWS_PATHS
+
+  # B3: Windows language acceptance (Go, P6 and AC24), once per Python version.
+  # The pytest shards above select the suite. This job does not collect tests.
+  # Failures fail the job; there is no continue-on-error. Steps run under Git Bash
+  # (as on a contributor's machine); tests that drive PowerShell spawn it themselves.
+  test-windows-language:
+    if: github.event_name != 'pull_request' || github.base_ref != 'develop'
+    needs: build-wheel
+    runs-on: windows-latest
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -359,19 +1022,6 @@ jobs:
 
       - name: Run Layer 1 Deterministic Verification
         run: python -m aegis_cli.cli check
-
-      # HOME and USERPROFILE point at a throwaway directory so no test can write
-      # to the runner's real profile (BUG-010). PYTHONUTF8=0 pins the Windows
-      # legacy encodings (cp1252 locale and piped stdio), the ones contributors
-      # hit (BUG-012, BUG-038), even if a future Python defaults to UTF-8 mode.
-      - name: Run test suite
-        env:
-          HOME: ${{ runner.temp }}\aegis-home
-          USERPROFILE: ${{ runner.temp }}\aegis-home
-          PYTHONUTF8: '0'
-        run: |
-          python -c "import os; os.makedirs(os.environ['USERPROFILE'], exist_ok=True)"
-          python -m pytest tests/ -q -n auto
 
       # Shared clean source for Go, P6 and AC24; the pinned AC24 helper is their common
       # ownership payload. The AC24 acquisition below is owner-approved (decision A).
@@ -565,7 +1215,7 @@ jobs:
   # The CI verdict (v4.3 T2): attests sha256 of "aegis-ci-verdict/v1\ncommit <sha>\ntree <tree>\n"
   # once every job passed, only on the events doctor --release consumes (not release, not PRs).
   verdict:
-    needs: [dependency-audit, build-wheel, aegis-check, validate, test-windows, test-fast]
+    needs: [dependency-audit, build-wheel, aegis-check, validate, test-windows-unit-core-a, test-windows-unit-core-b, test-windows-unit-rest, test-windows-integration, test-windows-contract, test-windows-language, test-fast-unit-core, test-fast-unit-rest, test-fast-integration, test-fast-contract]
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 10

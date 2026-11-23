@@ -68,7 +68,7 @@ Never call `eval` or `exec` on data. Parse it with `json.loads` or `ast.literal_
 - **Matching across languages:** module separators `/` and `::` and the Node `node:` prefix normalize for matching. A leading-dot call pattern matches receiver spellings. Unresolved imports produce advisory UNKNOWN findings for applicable import restrictions. Parser-supplied allow comments are retained as overrides.
 - **Creating rules**: `aegis rule create --type trap --name ID --hypothesis "..." --target-paths 'src/**/*.py' --body-file rule.md` writes the frontmatter for you (`--hypothesis` is required). The `aegis_create_rule` MCP tool turns a concern into a drafting prompt for the agent and writes nothing. `forbid_ast` is added by hand.
 - **Starter rules**: `aegis init --rules minimal|standard|full` seeds 2, 5 or all 12 of the shipped [rules](../rules/) as `persona` rules with `target_paths: []`. They apply to no file until you name the files each one governs; `aegis status` and `aegis sync` list them until you do. `aegis init` also seeds one active invariant (`.aegis/rules/invariants/no-eval.md`) from day one unless you pass `--rules none-active`.
-- **A file that cannot be loaded stops everything**: the scan fails and names it, and `aegis check` blocks, so a partial rule set is never presented as the whole one.
+- **A file that cannot be loaded stops everything**: the scan fails and names it, and `aegis check` blocks, so a partial rule set is never presented as the whole one. `aegis scan` and `aegis check` (`load_rules`) parse a bounded frontmatter prefix of a rule file over 131072 bytes and report the file unserved as `{size} bytes exceeds the 131072 byte limit (too_large)`. `read_rule_file` and `parse_rule_file` refuse before any YAML parse with `Rule file exceeds the 131072-byte size limit`.
 
 ### A rule for your own code
 
@@ -301,7 +301,7 @@ An advisory model review does not replace independent human review. `aegis check
 
 ### Adopt checks in an existing repository
 
-`aegis check --card` reports languages, active drivers, rule counts and findings. `aegis check --write-baseline` records current eligible findings in `.aegis/baseline.json`; later checks fail on new ones, and `--prune-baseline` drops entries that no longer match. A baseline never grandfathers built-in security or secret findings. With `--base`, the baseline comes from that base, not the change being reviewed. Changes to it require approval when the base has a signing key; otherwise it is self-attested.
+`aegis check --card` reports languages, active drivers, rule counts and findings. On the text card, a file's size advisory is listed under coverage and omitted from checks that could not run, and the card adds one recovery line: use target_paths to exclude generated bundles (`aegis doctor`). `aegis check --write-baseline` records current eligible findings in `.aegis/baseline.json`; later checks fail on new ones, and `--prune-baseline` drops entries that no longer match. A baseline never grandfathers built-in security or secret findings. With `--base`, the baseline comes from that base, not the change being reviewed. Changes to it require approval when the base has a signing key; otherwise it is self-attested.
 
 `aegis rule export` and `aegis rule import` move rules in digest-checked bundles; packs are not signed. `aegis benchmark` measures scan, hook and check performance, not whether rules improve development outcomes. Experimental host registration and packaging are covered in [hosts and hooks](hosts-and-hooks.md).
 
@@ -457,7 +457,7 @@ Command event writes are best effort: a recording error becomes a warning and do
 
 ## Proposals and rule lint
 
-`aegis rule lint` reports findings for rule files and does not change them. It exits 0 when a finding is an error and when the workspace is unavailable. `aegis rule lint --json` sets `report_only` to true.
+`aegis rule lint` reports findings for rule files and does not change them. It exits 0 when a finding is an error and when the workspace is unavailable. `aegis rule lint --json` sets `report_only` to true. A cold scan-simulation finding with no sample says `scan simulation: no sample for hypothetical cold start`. Installed and cold findings share one verdict builder.
 
 Loader findings give fixed repair hints for clearing `expired_at`, removing legacy keys or matching the rule ID and type to its destination when lint can identify the cause. A `paper_gate` finding gives a fixed repair for a missing, empty or invalid `forbid_ast` specification. `aegis_sdk.parse_rule_file` keeps the `RuleParseError` type and `Error parsing rule` prefix for parse failures, with a bounded, redacted path and a fixed diagnostic.
 
@@ -465,13 +465,22 @@ Proposal bytes accept sources `insight`, `mine`, `one` and `lint`. Merging propo
 
 ## Git delivery
 
-`aegis_core.team_git` is lane Git plumbing with no subcommand. `snapshot_tree` keeps the real index and returns a tree id. `plan_merge`, `plan_pick` and `plan_revert` return a plan and do not publish. `commit_tested` records a commit in the caller-supplied store. Only `cas_fast_forward` publishes objects and updates a ref. `team_qualify.record_pass` and `team_custody.commit` journal that effect first. `aegis_core.team_gitops` stores the intent and the observed result. It runs neither git nor `gh`. Qualification records use that compare-and-swap and have no CLI, as [architecture](architecture.md#tree-bound-teams-qualification) describes. `Publisher` requires an owner-supplied `gh` adapter and a qualification reader. Its activation is not wired, and nothing turns on a legacy publisher by default.
+The lane Git library keeps worktree snapshots and plans private. A snapshot
+captures the worktree. Merge, pick and revert plans use supplied Git objects, and
+a tested commit uses a supplied tree. Publication updates a ref by
+compare-and-swap. Custody journals the effect before publication, and the merge
+queue checks qualification for the exact landing tree. See
+[tree-bound qualification](architecture.md#tree-bound-teams-qualification).
 
-`aegis_core.merge_queue.MergeQueue` requires qualification for the exact landing tree. `MergeQueue.revalidate` saves its own queue checkpoint, then calls `team_git.cas_fast_forward` to pin the candidate for a separate publisher. It does not write a team_gitops journal. `revalidate` refuses `issued_unresolved` while an issued record or cleanup is set. `check_issued` refuses `issued_unresolved` when that issued checkpoint conflicts or results remain. Automatic landing remains separate work.
-
-`snapshot_tree` refuses `unsupported_platform` unless `descriptor_support` is true: `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `stat` and `readlink`. Plans and commits of an already supplied tree do not use that check. The work queue refuses `unsupported_platform` unless `storage.confined_descriptor_supported` is true: `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `mkdir`, `link`, `rename`, `unlink` and `stat`. That function does not use `readlink`. The proposal store refuses `unsupported` on that same function. Both are false when `os.name` is not `posix`, so Windows fails them. Neither function tests for macOS. Qualification writes call `team_qualify.descriptor_supported` and otherwise refuse `unsupported_platform`. That function is true only when `team_git.descriptor_support` is true, `team_gitops.descriptor_supported` is true (`fcntl` is available and `storage.confined_descriptor_supported` is true), and `gitops_fds.descriptor_supported` is true (`sys.platform` is `linux`, `os.name` is `posix`, and `prctl(37)` returns 0).
-
-`MergeQueue.prepare` refuses `unsupported_platform` unless the snapshot and qualification probes pass, including Linux subreaper support. See [Git delivery in the architecture guide](architecture.md#git-delivery).
+Worktree snapshots, supplied-object Git plans and tested commits, the work queue
+and the proposal store are unavailable on Windows. Plans and tested commits skip
+the snapshot check and still require descriptor procfs (`/proc/self/fd`) and
+native Git. Linux subreaper support is required for qualification writes and
+merge-queue admission, candidate preparation, issued checks, landing observation
+and reconciliation. Publisher activation is still unwired, and automatic
+landing remains separate work.
+Processes sharing the trusted owner UID can access owner records despite file
+modes. See [Teams platform capabilities](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/architecture.md#teams-platform-capabilities).
 
 ## Cheat sheet
 
@@ -498,6 +507,7 @@ Flags and defaults for every command are in the [reference](reference.md); this 
 | declare a lane's paths | `aegis team claim LANE --paths 'docs/**'` (`aegis team list` to see leases) |
 | list the team work queue | `aegis team queue list --json` |
 | report rule lint findings | `aegis rule lint` (`aegis rule lint --json` for the report-only payload) |
+| plan or compare container isolation | `aegis team isolation check` |
 | check what a lane changed | `aegis check --lane LANE` (`--base-policy` for the witnessed form) |
 | copy the skills into the repo | `aegis skills sync` (`--dry-run` first) |
 | upgrade a v3 workspace | `aegis migrate`, then `aegis migrate --apply`, `aegis init --host ...` and `aegis doctor --fix` |

@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from aegis_core import manager as manager_module
 from aegis_core.manager import ManagerService
 from aegis_core.manager_policy import ManagerError
 from tests.helpers_manager import active, approve, git, manager_root, prepare
@@ -12,6 +13,44 @@ from tests.helpers_manager import active, approve, git, manager_root, prepare
 @pytest.fixture
 def env(manager_root):
     return prepare(manager_root)
+
+
+@pytest.mark.parametrize("bad", [False, True])
+def test_manager_gitdir_preserves_whitespace_or_refuses(tmp_path, monkeypatch, bad):
+    import os
+    import subprocess
+    from types import SimpleNamespace
+    root = tmp_path / "root"
+    root.mkdir()
+    common = root / "common"
+    common.mkdir()
+    gitdir = root / (" leading" if os.name == "nt" else " leading ")
+    gitdir.mkdir()
+    member = {"id": "aegis", "common_dir": str(common),
+              "worktrees": [{"id": "main", "path": str(root)}]}
+    candidate = {"workspace_id": "test", "control_commit": "a" * 40,
+                 "policy_digest": "b" * 64, "membership_digest": "c" * 64,
+                 "membership": {"repositories": [member]}}
+    config = {"workspace_id": "test", "store_root": tmp_path / "audit", "control_root": root}
+    row = {"kind": "init", "config_digest": "config", "workspace_id": "test",
+           "seq": 0, "prev": "0" * 64, "hash": "1" * 64}
+    monkeypatch.setattr(manager_module, "load_config", lambda *a: (config, "config"))
+    monkeypatch.setattr(manager_module, "ManagerStore", lambda *a, **kw: SimpleNamespace(read=lambda: [row]))
+    monkeypatch.setattr(manager_module, "read_candidate", lambda *a: dict(candidate))
+    def answer(args, cwd, **kwargs):
+        assert args == ["rev-parse", "--absolute-git-dir"]
+        path = b"secret-\xff" if bad else os.fsencode(str(gitdir))
+        return subprocess.CompletedProcess(args, 0, path + b"\n", b"")
+    monkeypatch.setattr(manager_module, "gitsafe", SimpleNamespace(**{**vars(manager_module.gitsafe),
+        "run": answer, "common_dir": lambda *a: common, "toplevel": lambda *a: root}))
+    service = manager_module.ManagerService(tmp_path / "config")
+    if bad:
+        with pytest.raises(ManagerError, match="^membership_unavailable$"):
+            service.candidate("a" * 40)
+        bad = False
+    for _ in range(2):
+        result = service.candidate("a" * 40)
+        assert result["bindings"]["aegis/main"]["git_dir"]["path"] == str(gitdir)
 
 
 @pytest.mark.parametrize("operation", ["report", "status"])

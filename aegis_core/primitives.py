@@ -590,17 +590,10 @@ def _display_secret_masks(canonical, deleted, separator_segments, deleted_segmen
 
 
 def redact_display_secrets(text, *, limit, on_replacements=None, bound=False, extra_spans=(), protected_spans=(), scan_text=None,
-                           tail_candidates=None):
-    """Bound before parsing; union original-coordinate spans before one replacement.
-
-    ``bound`` means the caller supplied an input head, not a complete field.
-    The word, unfinished-family and PEM guards all constrain the same source cut.
-    The trusted ``tail_candidates`` callback selects a deleted-view token, then
-    parser maps carry its first character back to the bounded original source.
-    Initial withholding is separate from replacement events. The observer sees
-    only changed spans that survive the cut, once, before any replacement.
-    """
-    if type(bound) is not bool or type(text) is not str or type(limit) is not int or limit < 0 or len(text) > limit:
+                           tail_candidates=None, secret_tail=False):
+    """Bound before parsing, then replace source spans and notify the observer once."""
+    if (type(bound) is not bool or type(secret_tail) is not bool or (bound and secret_tail)
+            or type(text) is not str or type(limit) is not int or limit < 0 or len(text) > limit):
         raise RedactionRefusal('too_large' if type(text) is str and type(limit) is int
                                and limit >= 0 and len(text) > limit else 'invalid')
     if tail_candidates is not None and (not bound or not callable(tail_candidates)):
@@ -615,7 +608,7 @@ def redact_display_secrets(text, *, limit, on_replacements=None, bound=False, ex
             raise RedactionRefusal('invalid')
     raw_spans = (*_display_secret_spans(text, ()), *protected_spans)
     control = _DISPLAY_CONTROLS.search(text)
-    if control is None and not bound and not raw_spans and not extra_spans:
+    if control is None and not bound and not secret_tail and not raw_spans and not extra_spans:
         return text
     index = control.start() if control is not None else len(text)
     views = _display_views(text, index)
@@ -627,10 +620,11 @@ def redact_display_secrets(text, *, limit, on_replacements=None, bound=False, ex
     spans = _display_secret_masks(*views, source=(text, index), source_spans=True,
                                   raw_spans=raw_spans, extra_spans=extra_spans, scan_text=scan_text)
     stop, marker = len(text), ''
-    if bound:
+    if bound or secret_tail:
         stop, marker = bound_redaction_spans(text, spans,
             (*detection_views[:2], views[0], views[1], (text, (), [(0, 0, len(text))])), _display_matches,
-            _display_render_spans(text, index, detection=True), tail_candidates)
+            _display_render_spans(text, index, detection=True), tail_candidates,
+            secret_tail=secret_tail)
         spans = tuple(span for span in spans if span[1] <= stop)
     spans = tuple(span for span in spans if text[span[0]:span[1]] != span[2])
     if on_replacements is not None and spans:

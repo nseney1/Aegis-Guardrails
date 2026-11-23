@@ -20,6 +20,7 @@ __all__ = [
     "Completion", "HostedResult", "IssuedRecord", "Landing", "QueueEntry", "QueueState",
     "QueueStorage", "Review", "QueueRefused", "REFUSALS", "REQUIRED_LEGS", "MAX_ENTRIES",
     "MAX_RESULTS", "MAX_STATE_BYTES", "MAX_REPLAY_RESULTS", "MAX_REVIEWS", "MAX_PARENTS",
+    "CLEANUP_RESOLUTIONS",
     "valid_oid", "valid_lane", "ready_landing", "validate_configuration", "validate_entry",
     "check_acyclic", "valid_result", "merge_result", "retained_result", "check_result_capacity",
     "validate_completion", "pin_ref", "validate_state", "apply_result", "apply_observed_health",
@@ -32,6 +33,8 @@ MAX_STATE_BYTES = 32 * 1024 * 1024
 MAX_REPLAY_RESULTS = MAX_STATE_BYTES // 64
 MAX_REVIEWS = 32
 MAX_PARENTS = 32
+# Durable cleanup resolutions accepted on restart. Recovery tests own a separate table.
+CLEANUP_RESOLUTIONS = ("issuing", "aborted", "done", "not_applied", "released")
 REFUSALS = {
     "state_unavailable": "durable queue state is unavailable; reload before any effect",
     "state_capacity": "bounded queue state capacity reached; reconcile retained observations",
@@ -61,16 +64,45 @@ _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _LANE = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}\Z")
 
 
+def _pending_withdrawal(entry):
+    """True only for a fully validated pending record.
+
+    Lane and expected head are exact compare-and-swap tokens. An invalid
+    record contributes no custodian fields and is not echoed.
+    """
+    if type(entry) is not QueueEntry:
+        return False
+    try:
+        validate_entry(entry)
+    except QueueRefused:
+        return False
+    return True
+
+
 class QueueRefused(ValueError):
-    """Fixed input-free diagnostic; no transport or hostile text is echoed."""
+    """Fixed input-free diagnostic; no transport or hostile text is echoed.
+
+    archived_completion also carries the selected pending lane and expected
+    head on next_action. Those tokens stay out of the fixed recovery text.
+    """
 
     # Keep the qualified name used by callers of the original queue module.
     __module__ = "aegis_core.merge_queue"
 
-    def __init__(self, code):
-        super().__init__(REFUSALS[code])
+    def __init__(self, code, withdrawal=None):
+        message = REFUSALS[code]
+        if code == "archived_completion":
+            if not _pending_withdrawal(withdrawal):
+                raise QueueRefused("state_unavailable")
+        elif withdrawal is not None:
+            raise QueueRefused("invalid_request")
+        super().__init__(message)
         self.code = code
-        self.next_action = {"actor": "custodian", "command": REFUSALS[code]}
+        action = {"actor": "custodian", "command": message}
+        if code == "archived_completion":
+            action["lane"] = withdrawal.lane
+            action["expected_head"] = withdrawal.head
+        self.next_action = action
 
 
 def valid_oid(value):
@@ -149,15 +181,47 @@ def validate_entry(item):
 
 
 def check_acyclic(item, entries):
-    pending, visited = list(item.parents), set()
-    while pending:
-        lane = pending.pop()
-        if lane == item.lane:
-            raise QueueRefused("parent_cycle")
-        if lane not in visited:
-            visited.add(lane)
-            if lane in entries:
-                pending.extend(entries[lane].parents)
+    """One iterative cycle check from an enqueue root, or across every pending lane.
+
+    ``item is None`` walks every component and refuses state_unavailable. An
+    enqueue root refuses parent_cycle. A parent lane absent from the pending
+    map is external and stays valid.
+    """
+    if type(entries) is not dict or len(entries) > MAX_ENTRIES:
+        raise QueueRefused("state_unavailable" if item is None else "invalid_request")
+    if item is not None and (type(item) is not QueueEntry or len(item.parents) > MAX_PARENTS):
+        raise QueueRefused("invalid_request")
+    pending = dict(entries)
+    code = "state_unavailable" if item is None else "parent_cycle"
+    if item is None:
+        starts = tuple(pending)
+    else:
+        pending[item.lane] = item
+        starts = (item.lane,)
+    # 0 unseen, 1 on the stack, 2 finished. A gray parent is a cycle.
+    color = {}
+    for start in starts:
+        if color.get(start) == 2:
+            continue
+        color[start] = 1
+        frame = [(start, 0)]
+        while frame:
+            lane, index = frame[-1]
+            parents = pending[lane].parents
+            if index >= len(parents):
+                color[lane] = 2
+                frame.pop()
+                continue
+            frame[-1] = (lane, index + 1)
+            parent = parents[index]
+            if parent not in pending:
+                continue
+            seen = color.get(parent, 0)
+            if seen == 1:
+                raise QueueRefused(code)
+            if seen == 0:
+                color[parent] = 1
+                frame.append((parent, 0))
 
 
 def valid_result(value):
@@ -255,6 +319,7 @@ def validate_state(state, target, required, entry_legs, capacity):
         raise QueueRefused("state_unavailable") from None
     if len({item.lane for item in state.entries}) != len(state.entries):
         raise QueueRefused("state_unavailable")
+    check_acyclic(None, {item.lane: item for item in state.entries})
     if (any(not valid_result(item) for item in state.results)
             or len({item.commit for item in state.results}) != len(state.results)):
         raise QueueRefused("state_unavailable")
@@ -276,7 +341,7 @@ def validate_state(state, target, required, entry_legs, capacity):
         if not cleanup and (record.resolution is not None or row.entry not in state.entries):
             raise QueueRefused("state_unavailable")
         if cleanup and (state.issued is not None or type(record.resolution) is not str
-                or record.resolution not in ("issuing", "aborted", "done", "not_applied", "released")):
+                or record.resolution not in CLEANUP_RESOLUTIONS):
             raise QueueRefused("state_unavailable")
     return replace(state, reconciliation_required=True) if len(state.results) > MAX_RESULTS else state
 

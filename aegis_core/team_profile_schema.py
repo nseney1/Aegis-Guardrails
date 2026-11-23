@@ -25,6 +25,57 @@ class SupervisorError(ValueError):
         self.path = path
 
 
+def _landing_line(value):
+    return type(value) is str and bool(value) and not any(char in value for char in "\n\r\x00")
+
+
+def _marker_component(part):
+    return (0 < len(part) <= 255 and part != "." and 0 < len(part.encode("utf-8")) <= 255
+            and 0 < len(os.fsencode(part)) <= 255)
+
+
+def _landing_path(value, kind):
+    """Check a schema-bounded string against its consuming path grammar."""
+    if not _landing_line(value) or ".." in value or value[0] in "/\\":
+        return False
+    if len(value) > 1 and value[1] == ":" and value[0].isalpha():
+        return False
+    try:
+        if kind == "marker":
+            # Confined storage allows 128 components including the attempt filename.
+            return "\\" not in value and value.count("/") < 127 and all(
+                _marker_component(part) for part in value.split("/"))
+        # Match the exact tree-path grammar used by GitStore.read_blob.
+        if len(value.encode("utf-8")) > 4096:
+            return False
+        raw = os.fsencode(value)
+        return (len(raw) <= 4096 and not {b"", b".", b".git"}.intersection(raw.split(b"/"))
+                and (os.name != "nt" or (b"\\" not in raw and b":" not in raw)))
+    except UnicodeError:
+        return False
+
+
+def _check_landing_field(value, spec, path, layer):
+    if ("landing_path" in spec and not _landing_path(value, spec["landing_path"])
+            or spec.get("landing_line") and not _landing_line(value)):
+        raise SupervisorError("invalid value: " + path, layer=layer, path=path)
+
+
+def _finish_landing(value, spec, path, layer, records, registry_fields):
+    # A copied value can start at a field of a landing record.
+    _check_landing_field(value, spec, path, layer)
+    # Stable order puts registry rows first and retains array and sorted map order.
+    for record, record_spec, at in sorted(records, key=lambda entry: entry[1]["landing_order"]):
+        # Landing records declare required fields in semantic refusal order.
+        for name, field in record_spec["properties"].items():
+            field_at = at + "." + name
+            if name not in record:
+                raise SupervisorError("invalid value: " + field_at, layer=layer, path=field_at)
+            _check_landing_field(record[name], field, field_at, layer)
+            if registry_fields is not None and "registry_display" in field:
+                registry_fields.setdefault(id(record), {})[name] = field["registry_display"]
+
+
 _META_PATH = {"type": "array", "items": {"type": "string", "maxLength": 64}, "maxItems": 17}
 _META_TEXT = {"type": "string", "maxLength": 4096}
 _PROVENANCE_META = {"type": "object", "additionalProperties": False, "required_first": True, "properties": {
@@ -47,7 +98,7 @@ def _field_schema(schema, path):
     return schema
 
 
-def _provenance_input(records, schema, layer):
+def _provenance_input(records, schema, layer, registry_fields):
     """Check bounded metadata and each copied value under its actual field schema."""
     def invalid():
         raise SupervisorError("invalid value: profile provenance", layer=layer, path="values")
@@ -76,9 +127,10 @@ def _provenance_input(records, schema, layer):
         field = _field_schema(schema["user_schema"] if user else schema["schema"], source_path)
         if field is None:
             invalid()
-        # A copied leaf belongs to one bounded input document. Its metadata and
+        # A copied value belongs to one bounded input document. Its metadata and
         # other copies do not consume that document's validation budget.
-        validate_input(record["value"], field, ".".join(source_path), layer, resolved=True)
+        validate_input(record["value"], field, ".".join(source_path), layer, resolved=True,
+                       landing=True, registry_fields=registry_fields)
 
 
 def _root_input(value, schema, path, layer):
@@ -140,7 +192,26 @@ def _display_input(value, profile_keys):
     return shown, snapshot
 
 
-def validate_input(value, schema, path="", layer="repo", *, required=None, resolved=False):
+def _after_input(item, spec, path, landing_records):
+    if "after" in spec:
+        spec["after"](item)
+    if landing_records is not None and "landing_order" in spec:
+        landing_records.append((item, spec, path))
+
+
+def _object_keys(item, spec, at, expected, refuse):
+    if len(item) > spec.get("maxProperties", 64):
+        refuse("profile object size limit exceeded", at)
+    if any(type(key) is not str for key in item):
+        refuse("profile keys must be strings", at)
+    if any(len(key) > 4096 for key in item):
+        refuse("profile string size limit exceeded", at)
+    priority = {key: index for index, key in enumerate(spec.get("validation_order", ()))}
+    return sorted(item.keys() | expected.keys(), key=lambda key: (priority.get(key, len(priority)), key))
+
+
+def validate_input(value, schema, path="", layer="repo", *, required=None, resolved=False,
+                   landing=False, registry_fields=None):
     """The shared closed-schema gate for profile fragments, resolved values and roots.
 
     Required leaves use a trusted template; partial inputs omit it. Limits precede walks and allocation.
@@ -149,6 +220,7 @@ def validate_input(value, schema, path="", layer="repo", *, required=None, resol
     """
     from aegis_core.team_profile_display import reject_terminal_hosts
     budget = [4096]
+    landing_records = [] if landing else None
 
     def refuse(reason, at):
         raise SupervisorError(reason, layer=layer, path=at)
@@ -163,7 +235,7 @@ def validate_input(value, schema, path="", layer="repo", *, required=None, resol
         if spec["type"] == "root":
             return _root_input(item, spec, at, layer)
         if spec["type"] == "provenance":
-            return _provenance_input(item, spec, layer)
+            return _provenance_input(item, spec, layer, registry_fields)
         if spec["type"] == "display":
             return _display_input(item, spec["profile_keys"])
         if at == "supervisor" and layer == "flags":
@@ -189,15 +261,8 @@ def validate_input(value, schema, path="", layer="repo", *, required=None, resol
             if not spec.get("minimum", 0) <= item <= spec.get("maximum", 1000000):
                 refuse("value out of range: " + at, at)
         if actual == "object":
-            if len(item) > spec.get("maxProperties", 64):
-                refuse("profile object size limit exceeded", at)
-            if any(type(key) is not str for key in item):
-                refuse("profile keys must be strings", at)
-            if any(len(key) > 4096 for key in item):
-                refuse("profile string size limit exceeded", at)
-            priority = {key: index for index, key in enumerate(spec.get("validation_order", ()))}
             expected = template if type(template) is dict else {}
-            keys = sorted(item.keys() | expected.keys(), key=lambda key: (priority.get(key, len(priority)), key))
+            keys = _object_keys(item, spec, at, expected, refuse)
             reject_terminal_hosts(keys, SupervisorError, at)
             if spec.get("required_first") and expected.keys() - item.keys():
                 refuse("invalid value: " + (at or "profile"), at)
@@ -220,7 +285,7 @@ def validate_input(value, schema, path="", layer="repo", *, required=None, resol
                     # Only identifier-shaped unknown keys can extend a refusal path.
                     safe = _IDENT.fullmatch(key) is not None
                     child_at = (at + "." + key if at else key) if safe else (at or "profile")
-                    refuse("unknown key: " + child_at, child_at)
+                    refuse(spec.get("unknown_key_refusal", "unknown key: " + child_at), child_at)
                 child_at = at + "." + key if at else key
                 child_template = template.get(key) if type(template) is dict else None
                 check(child, child_spec, child_at, child_template, depth + 1, remaining)
@@ -231,11 +296,13 @@ def validate_input(value, schema, path="", layer="repo", *, required=None, resol
                 check(child, spec["items"], at + "." + str(index), None, depth + 1, remaining)
             if at == "supervisor.pauses" and len(set(item)) != len(item):
                 refuse("invalid value: supervisor.pauses", at)
-        if "after" in spec:
-            spec["after"](item)
+        _after_input(item, spec, at, landing_records)
 
     try:
-        return check(value, schema, path, required, 0, budget)
+        result = check(value, schema, path, required, 0, budget)
+        if landing_records is not None:
+            _finish_landing(value, schema, path, layer, landing_records, registry_fields)
+        return result
     except SupervisorError as error:
         if error.layer is None:
             error.layer = layer

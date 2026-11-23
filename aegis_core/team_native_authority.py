@@ -26,7 +26,7 @@ from aegis_core.team_native_keys import (
     BOUND_INITIAL_KEY, GUARD_KEY, NATIVE_IDENTITIES as native_identities, RESERVATION_KEY,
 )
 from aegis_core.team_native_wire import (
-    HostAuthorityError, MAX_DEPTH, MAX_FRAME_BYTES, MAX_WAIT_SECONDS, ProtocolClient,
+    HostAuthorityError, MAX_DEPTH, MAX_FRAME_BYTES, MAX_WAIT_SECONDS,
 )
 
 __all__ = [
@@ -364,48 +364,16 @@ def process_identity(pid):
         raise HostAuthorityError("UNPROTECTED_DEPLOYMENT", _UNPROTECTED) from None
 
 
-class ControlIO(ProtocolClient):
-    """Bounded private control frames using the binding's shared I/O gate."""
+class ControlIO:
+    """Check package control admission before refusing the borrow."""
 
     def __init__(self, owner):
         _require_descriptors()
         require(native_identities.is_instance("binding", owner),
                 "ROLE_OPERATION_FORBIDDEN", "control requires an owned binding")
         owner.require_owner_process()
-        self._owner = owner
-        self._gate = owner.io_gate
-        self._maximum, self._buffer = MAX_FRAME_BYTES, b""
-        self._closed = False
-        try:
-            with self._gate:
-                require(not owner.fenced, "STALE_INVOCATION", "runtime binding is closed")
-                self._read_fd = self._write_fd = owner.control_socket.fileno()
-                os.set_blocking(self._read_fd, False)
-        except HostAuthorityError:
-            raise
-        except (OSError, ValueError):
-            raise HostAuthorityError("UNPROTECTED_DEPLOYMENT", _UNPROTECTED) from None
-
-    def _revoked(self):
-        return self._closed or self._owner.fenced
-
-    def read(self, deadline):
-        self._owner.require_owner_process()
-        if self._revoked():
-            self._fail()
-        frame = self._read(deadline)
-        if self._revoked():
-            self._fail()
-        return frame
-
-    def write(self, value, deadline):
-        self._owner.require_owner_process()
-        if self._revoked():
-            self._fail()
-        self._write(value, deadline)
-
-    def close(self):
-        self._owner.close()
+        require(not owner.fenced, "STALE_INVOCATION", "runtime binding is closed")
+        raise HostAuthorityError("UNPROTECTED_DEPLOYMENT", _UNPROTECTED)
 
 
 def _mapping(record, name):
@@ -596,8 +564,6 @@ class _OwnedGuard:
         self._plan = copy.deepcopy(owner.plan_data)
         self._policy = copy.deepcopy(owner.policy_data)
         self._channel = copy.deepcopy(owner.channel_data)
-        self._members = tuple(owner.reservations)
-        self._witnesses = tuple(row.witness for row in self._members)
         self._epoch, self._nonce = owner.epoch, owner.nonce
         self._entry_lock = threading.Lock()
         self._used, self._active = False, False
@@ -661,16 +627,6 @@ class _OwnedGuard:
                  and same_data(owner.channel_data, self._channel),
                  "CANONICAL_CORRELATION_MISMATCH", "owned host inputs changed")
 
-    def _member(self, reservation):
-        require(type(reservation) is ReservedEnrollment
-                 and reservation.belongs_to(self._owner)
-                 and any(reservation is row for row in self._members),
-                 "ROLE_OPERATION_FORBIDDEN", "foreign owned reservation")
-        index = next(i for i, row in enumerate(self._members) if row is reservation)
-        require(same_data(reservation.witness, self._witnesses[index]),
-                 "CANONICAL_CORRELATION_MISMATCH", "owned reservation changed")
-        return self._witnesses[index]
-
     def __exit__(self, exc_type, exc_value, traceback):
         self._owner.require_owner_process()
         require(self._active and self._thread == threading.get_ident(),
@@ -696,25 +652,65 @@ class _OwnedGuard:
         raise TypeError("host guards cannot be serialized")
 
 
-class ReservedGenesisGuard(_OwnedGuard):
+class _EnrollmentGuard(_OwnedGuard):
+    def __init__(self, key, owner, plan_ref, *, deadline_ns=None, genesis=False, supplied=None):
+        super().__init__(key, owner, plan_ref, deadline_ns=deadline_ns)
+        timeout = MAX_WAIT_SECONDS
+        if deadline_ns is not None:
+            timeout = min(timeout, max(0, (deadline_ns - time.monotonic_ns()) / 1000000000))
+        lock = owner.lock
+        require(lock.acquire(timeout=timeout), "HOST_PROTOCOL_TIMEOUT", "host fence deadline expired")
+        try:
+            members = self._live_members()
+            for member in members:
+                self._require_owned_member(member)
+            if genesis:
+                require(type(supplied) is tuple and len(supplied) == len(members)
+                        and all(row is member for row, member in zip(supplied, members)),
+                        "ROLE_OPERATION_FORBIDDEN", "genesis requires the complete owned set")
+            self._reservations = tuple((member, member.witness) for member in members)
+        finally:
+            lock.release()
+
+    def _live_members(self):
+        members = self._owner.reservations
+        require(type(members) is tuple, "ROLE_OPERATION_FORBIDDEN", "invalid owned reservation set")
+        return members
+
+    def _require_owned_member(self, member):
+        require(type(member) is ReservedEnrollment and member.belongs_to(self._owner),
+                 "ROLE_OPERATION_FORBIDDEN", "foreign owned reservation")
+
+    def _require_reservations_current(self, *, fresh_genesis=False):
+        members = self._live_members()
+        require(len(members) == len(self._reservations), _CORRELATION, "owned reservation set changed")
+        for member, (original, witness) in zip(members, self._reservations):
+            self._require_owned_member(member)
+            require(member is original, _CORRELATION, "owned reservation set changed")
+            require(same_data(member.witness, witness), _CORRELATION, "owned reservation changed")
+            if fresh_genesis:
+                require(witness["expires_monotonic_ns"] > time.monotonic_ns()
+                         and member.stage == "reserved", "STALE_INVOCATION",
+                         "genesis reservation is expired or already issued")
+
+
+class ReservedGenesisGuard(_EnrollmentGuard):
     """Fresh full-set genesis authority, never a receipt-recovery fence."""
 
     def __init__(self, key, owner, plan_ref, reservations):
-        super().__init__(key, owner, plan_ref)
-        require(type(reservations) is tuple and len(reservations) == len(self._members)
-                 and all(a is b for a, b in zip(reservations, self._members)),
-                 "ROLE_OPERATION_FORBIDDEN", "genesis requires the complete owned set")
+        super().__init__(key, owner, plan_ref, genesis=True, supplied=reservations)
 
     def _entry_current(self):
         self.require_reserved_genesis_current()
 
     def require_reserved_genesis_current(self):
         self._local_current()
-        for reservation in self._members:
-            witness = self._member(reservation)
-            require(witness["expires_monotonic_ns"] > time.monotonic_ns()
-                     and reservation.stage == "reserved", "STALE_INVOCATION",
-                     "genesis reservation is expired or already issued")
+        self._require_reservations_current(fresh_genesis=True)
+
+    def reserved_genesis_rows(self):
+        """Return detached witness rows in the order validated by this guard."""
+        self.require_reserved_genesis_current()
+        return [copy.deepcopy(witness) for _, witness in self._reservations]
 
     def __exit__(self, exc_type, exc_value, traceback):
         try:
@@ -727,13 +723,15 @@ class ReservedGenesisGuard(_OwnedGuard):
         return False
 
 
-class InitialCreationGuard(_OwnedGuard):
+class InitialCreationGuard(_EnrollmentGuard):
     """Current owner identity, original receipt recovery, then NEW-only checks."""
 
     def __init__(self, key, owner, plan_ref, reservation, *, deadline_ns=None):
         super().__init__(key, owner, plan_ref, deadline_ns=deadline_ns)
         self._target = reservation
-        self._member(reservation)
+        self._target_witness = next((witness for member, witness in self._reservations
+                                     if member is reservation), None)
+        require(self._target_witness is not None, "ROLE_OPERATION_FORBIDDEN", "foreign owned reservation")
 
     def _entry_current(self):
         self.require_initial_identity_current(self._target)
@@ -742,7 +740,7 @@ class InitialCreationGuard(_OwnedGuard):
         self._local_current()
         require(reserved_enrollment is self._target, "ROLE_OPERATION_FORBIDDEN",
                  "guard target does not match owned reservation")
-        self._member(reserved_enrollment)
+        self._require_reservations_current()
 
     def _canonical_current(self, reservation, policy, state):
         self.require_initial_identity_current(reservation)
@@ -753,14 +751,15 @@ class InitialCreationGuard(_OwnedGuard):
                 "CANONICAL_CORRELATION_MISMATCH")
         fields(bootstrap["genesis"], {"envelope", "receipt"},
                 "CANONICAL_CORRELATION_MISMATCH")
+        witnesses = [witness for _, witness in self._reservations]
         envelope = {"schema": "aegis.initial-bootstrap-envelope/v1", "id": "initial-genesis",
                     "event": {"type": "initial_reservations", "approved_plan": self._plan,
                               "channel_witness": self._channel,
-                              "reservations": list(self._witnesses)}}
+                              "reservations": witnesses}}
         receipt = {"event_id": "initial-genesis", "sequence": 1,
                    "event_sha256": digest(envelope), "execution_enabled": False}
         require(same_data(bootstrap["genesis"], {"envelope": envelope, "receipt": receipt})
-                 and same_data(bootstrap["reservations"], list(self._witnesses))
+                 and same_data(bootstrap["reservations"], witnesses)
                  and type(bootstrap["creations"]) is dict,
                  "CANONICAL_CORRELATION_MISMATCH", "original genesis correlation changed")
         return bootstrap
@@ -772,7 +771,8 @@ class InitialCreationGuard(_OwnedGuard):
         bootstrap = self._canonical_current(reserved_enrollment, policy, state)
         if row_or_None is None:
             return  # Identity/correlation only; never NEW append permission.
-        witness = self._member(reserved_enrollment)
+        self._require_reservations_current()
+        witness = self._target_witness
         original = bootstrap["creations"].get(reserved_enrollment.actor_cid)
         expected = original if original is not None else witness
         require(same_data(row_or_None, expected), "CANONICAL_CORRELATION_MISMATCH",
@@ -808,7 +808,8 @@ class InitialCreationGuard(_OwnedGuard):
 
     def require_initial_creation_new(self, reserved_enrollment, policy, state, actual_genesis_row):
         bootstrap = self._canonical_current(reserved_enrollment, policy, state)
-        witness = self._member(reserved_enrollment)
+        self._require_reservations_current()
+        witness = self._target_witness
         require(same_data(actual_genesis_row, witness)
                  and reserved_enrollment.actor_cid not in bootstrap["creations"],
                  "CANONICAL_CORRELATION_MISMATCH", "INITIAL intent already has an original row")
@@ -818,6 +819,7 @@ class InitialCreationGuard(_OwnedGuard):
         require(witness["expires_monotonic_ns"] > time.monotonic_ns()
                  and reserved_enrollment.stage == "reserved", "STALE_INVOCATION",
                  "NEW INITIAL reservation is expired or already issued")
+
 
 class DecisionGuard(_OwnedGuard):
     """Local identity and original-target checks under H then canonical exclusion."""
@@ -860,14 +862,15 @@ class DecisionGuard(_OwnedGuard):
         require(same_data(policy, self._policy) and type(state) is dict,
                  "CANONICAL_CORRELATION_MISMATCH", "canonical policy differs from owned plan")
         actor = _mapping(policy, "actors").get(cid)
-        require(type(actor) is dict and actor.get("role") == "root"
-                and session.actor_data["role"] == "root",
-                 "ROLE_OPERATION_FORBIDDEN", "decision requires current ROOT")
+        role_reason = "decision requires current ROOT"
+        require(type(actor) is dict and actor.get("role") == "root", "ROLE_OPERATION_FORBIDDEN", role_reason)
+        live_actor = session.actor_data
+        require(live_actor["role"] == "root", "ROLE_OPERATION_FORBIDDEN", role_reason)
         require(_mapping(state, "current").get("root") == cid
-                 and actor.get("generation") == session.actor_data["generation"]
+                 and actor.get("generation") == live_actor["generation"]
                  and digest(actor.get("profile"), code="STALE_INVOCATION",
                             reason="canonical generation or custody changed")
-                 == session.actor_data["profile_sha256"],
+                 == live_actor["profile_sha256"],
                  "STALE_INVOCATION", "canonical generation or custody changed")
         initial = session.initial_data
         receipt = {"event_id": initial["initial_event_id"], "sequence": initial["initial_sequence"],

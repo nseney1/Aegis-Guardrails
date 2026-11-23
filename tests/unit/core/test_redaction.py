@@ -33,6 +33,7 @@ from tests.helpers_reviewed_sources import (
 )
 
 from aegis_cli.hooks.redaction import redact_secrets
+from aegis_core.redaction import redact_command_secrets
 from aegis_core import insights as insight_module
 from aegis_core.gitsafe_policy import LOCAL_ENV
 from aegis_core.insights import redact_insight_text
@@ -75,6 +76,7 @@ REVIEWED_REDACTION_IMPORTERS = frozenset({
     "aegis_core/team_profile_display.py",
     "aegis_core/team_qualify.py",
     "aegis_core/team_queue.py",
+    "aegis_core/team_review_copy.py",
     "aegis_core/team_session_wake.py",
     "aegis_core/team_supervisor.py",
     "aegis_core/team_supervisor_observe.py",
@@ -1398,6 +1400,42 @@ def test_a_line_with_two_secrets_loses_both():
     assert redact_secrets(line) == "deploy --a ghp_REDACTED --b AKIA_REDACTED --next"
     assert redact_insight_text(line) == "deploy --a [REDACTED_VCS_TOKEN] --b [REDACTED_AWS] --next"
     assert _scan(line) == [("aws-access-key-id", "gate", snippet), ("github-pat", "gate", snippet)]
+
+
+def test_hook_redaction_withholds_a_candidate_at_an_incomplete_control_boundary():
+    from aegis_core.redaction import MAX_LINE_LENGTH
+
+    key = _samples()["aws-access-key-id"]
+    command = f"echo {key[:8]}\x1b[" + "7" * (MAX_LINE_LENGTH + 1) + f"m{key[8:]} --after"
+
+    assert redact_secrets(command) == "echo ..."
+
+
+@pytest.mark.parametrize("suffix", ["", "\x1b[0m"], ids=["plain-suffix", "control-suffix"])
+def test_hook_redaction_keeps_its_assignment_mask_when_repeated(suffix: str):
+    key = _samples()["aws-access-key-id"]
+    command = f"echo token={key[:4]}\r{key[4:]} --after{suffix}"
+
+    masked = redact_secrets(command)
+
+    assert redact_secrets(masked) == masked
+    # ROUND-1g ruling: stored text ends at the first ESC, and "after" at that cut is withheld by the existing marker.
+    if suffix:
+        assert masked == "echo token=REDACTED --..."
+        assert "\x1b" not in masked
+    else:
+        assert masked == "echo token=REDACTED --after"
+
+
+def test_core_and_gate_sinks_differ_on_the_same_c1_command():
+    """ROUND-1h: whole-field replacement keeps the field; the gate cuts at the first C1."""
+    prefix = "AK" + "IA"
+    token = _samples()["github-pat"]
+    command = f"echo {prefix}\x80{token} --after"
+
+    assert redact_command_secrets(command) == f"echo {prefix}\x80ghp_REDACTED --after"
+    assert redact_secrets(command) == "echo ..."
+    assert token not in redact_secrets(command)
 
 
 # ── One definition, at L0 ─────────────────────────────────────────────────────

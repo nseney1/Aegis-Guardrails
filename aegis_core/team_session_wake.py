@@ -205,7 +205,7 @@ def transcript_mark(profile, *, find_transcript=None):
                 return None
             path = safe_path(path)
             with _file(path) as handle:
-                info = os.stat(path.name, dir_fd=handle._parent, follow_symlinks=False)
+                info = os.stat(path.name, dir_fd=handle.parent_fd, follow_symlinks=False)
                 require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, reason="unsafe_path")
                 return str(path), info.st_size, info.st_mtime_ns
         except OSError:
@@ -220,7 +220,7 @@ def save_terminal_output(profile, entry, log):
             rendered = _shown(shown.stdout)
             with _file(log["stdout"]) as handle:
                 fd = os.open(Path(log["stdout"]).name, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK,
-                             dir_fd=handle._parent)
+                             dir_fd=handle.parent_fd)
                 try:
                     info = os.fstat(fd)
                     require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, reason="unsafe_path")
@@ -266,14 +266,14 @@ def claude_table_lists_session(session, *, home=None, host_entry=None):
             with _file(folder / ".wake-census") as handle:
                 opened = True
                 names = []
-                with os.scandir(handle._parent) as entries:
+                with os.scandir(handle.parent_fd) as entries:
                     for entry in entries:
                         require(len(names) < MAX_RECORDS, reason="too_large")
                         names.append(entry.name)
                 for name in names:
                     if not name.endswith(".json"):
                         continue
-                    record = strict_json(ConfinedFile(handle._parent, name).read_bytes(MAX_BYTES))
+                    record = strict_json(ConfinedFile(handle.parent_fd, name).read_bytes(MAX_BYTES))
                     require(type(record) is dict)
                     text(record.get("sessionId"), "session record id", 256)
                     if record["sessionId"] != session:
@@ -345,15 +345,15 @@ def _launch_files(profile, log_directory, wake_id):
             for path in paths.values():
                 handle = stack.enter_context(_file(path, create=True))
                 fd = os.open(Path(path).name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                             0o600, dir_fd=handle._parent)
+                             0o600, dir_fd=handle.parent_fd)
                 stack.callback(os.close, fd)
                 outputs.append(fd)
                 created.append((handle, Path(path).name))
-            # The inherited directory is the cwd authority even if any ancestor is renamed.
-            yield cwd._parent, outputs, paths
+            # The child inherits this borrowed parent. Do not close it.
+            yield cwd.parent_fd, outputs, paths
         except BaseException:
             for handle, name in reversed(created):
-                os.unlink(name, dir_fd=handle._parent)
+                os.unlink(name, dir_fd=handle.parent_fd)
             raise
 
 

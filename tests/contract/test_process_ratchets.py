@@ -25,6 +25,7 @@ POPEN_POSITIONAL_APIS = {"subprocess." + name for name in ("Popen", "run", "call
 # Coordinator ruling 2026-11-15T04:52:12Z: this reviewed source inventory is
 # the completeness gate. Resolver precision does not grant admission to a site.
 SELECTOR_SITE_TABLE = (
+    ('aegis_core/team_native_codemode.py', '_typed_text', 'lexer-or-message', 'Recognize recorded shell selectors for evidence correlation only.'),
     ("aegis_core/ast/runner.py", "_run_driver", "reviewed-dynamic",
      "Review AST driver argv from the validated driver plan; no shell, no stdin, bounded timeout."),
     ("aegis_cli/doctor.py", "_run_host_cli", "reviewed-dynamic",
@@ -225,6 +226,8 @@ SELECTOR_SITE_TABLE = (
      "Add the fixed owner-selected repository and read-only grep settings to the object-only recipe; _read_command validates every executed command before public gitsafe."),
     ("aegis_core/team_native_bridge.py", "ProcessBridge._run", "reviewed-dynamic",
      "TA-3h: review bounded owner-supplied evidence-only argv; absolute executable, no shell, bounded JSON stdin/output, held cwd descriptor, deadline and WNOWAIT process-group cleanup; no native qualification."),
+    ("aegis_cli/team_isolation.py", "inspect_image", "reviewed-dynamic",
+     "TA-6c: one owner-PATH engine resolved outside the workspace; validated digest-only image inspect, cwd=/, no shell, DEVNULL stdin and stderr, bounded stdout and 30-second deadline."),
     ("aegis_core/testexec.py", "kill_group", "reviewed-dynamic",
      "Run Windows taskkill directly; positional process-group termination shares the scope."),
     ("aegis_core/verification/test_runner.py", "discover_test_evidence", "reviewed-dynamic",

@@ -19,7 +19,7 @@ import stat
 from typing import Any
 
 from aegis_core import hosts as host_registry, pathlookup, storage, team_profile_schema, team_supervisor
-from aegis_core.primitives import json_preflight, sanitize_display as sanitize_display
+from aegis_core.primitives import json_preflight
 from aegis_core.team_profile_display import (
     NEXT_ACTION_TEMPLATES, TERMINAL_NAMES as _TERMINALS,
     closed_object as _object, reject_terminal_hosts as _reject_terminal_hosts,
@@ -81,7 +81,9 @@ PRESET_DATA = {
             "gates": [{"name": "full", "runner": "local", "selector": "whole", "must_pass": True,
                        "reuse_identical_tree": True}],
             "landing": {"target_branch": "main", "strategy": "combined-full", "batch_max": 1,
-                        "signature_required_for": ["main"], "publish": {"remote": "origin", "app": ""}},
+                        "signature_required_for": ["main"], "publish": {"remote": "origin", "app": ""},
+                        "registries": [], "jobs": {}, "flake_rerun_count": 0, "requalify_repeats": 1,
+                        "speculative_wait_s": 0, "speculative_enabled": False},
         },
         "model_settings": {
             "hosts": {}, "roles": {}, "capacity": {},
@@ -140,6 +142,10 @@ def _array(items, limit=MAX_ITEMS):
     return {"type": "array", "items": items, "maxItems": limit}
 
 
+def _landing_object(properties):
+    return {**_object(properties), "unknown_key_refusal": "profile_unavailable"}
+
+
 _TEXT = {"type": "string", "maxLength": MAX_STRING}
 _IDENTIFIER = {"type": "string", "maxLength": 64, "pattern": _IDENTIFIER_PATTERN}
 _BOOL = {"type": "boolean"}
@@ -173,10 +179,28 @@ JSON_SCHEMA = {
                                      "selector": {"type": "string", "enum": ["impacted", "whole", "list"]},
                                      "tests": _array(_TEXT), "python": _TEXT, "must_pass": _BOOL,
                                      "reuse_identical_tree": _BOOL})),
-            "landing": _object({"target_branch": _TEXT,
-                                "strategy": {"type": "string", "enum": ["combined-full", "batch", "direct"]},
-                                "batch_max": _INT, "signature_required_for": _array(_TEXT),
-                                "publish": _object({"remote": _TEXT, "app": _TEXT})}),
+            "landing": _landing_object({
+                "target_branch": _TEXT,
+                "strategy": {"type": "string", "enum": ["combined-full", "batch", "direct"]},
+                "batch_max": _INT, "signature_required_for": _array(_TEXT),
+                "publish": _landing_object({"remote": _TEXT, "app": _TEXT}),
+                "registries": _array({**_landing_object({
+                    "path": {**_TEXT, "landing_path": "registry", "registry_display": "text"},
+                    "encoding": {"type": "string", "enum": ["line_table", "whole_file"]},
+                    "key": {**_TEXT, "landing_line": True, "registry_display": "text"},
+                    "separator": {"type": "string", "enum": ["\t", "|"], "registry_display": "enum"}}),
+                    "landing_order": 0}, 32),
+                "jobs": {**_map({**_landing_object({
+                    "marker_dir": {**_TEXT, "landing_path": "marker"},
+                    "slot": _IDENTIFIER, "encoding": {"type": "string", "enum": ["json_line"]}}),
+                    "landing_order": 1}),
+                    "unknown_key_refusal": "profile_unavailable"},
+                "flake_rerun_count": {"type": "integer", "minimum": 0, "maximum": 1},
+                "requalify_repeats": {"type": "integer", "minimum": 1, "maximum": 8},
+                "speculative_wait_s": {"type": "integer", "minimum": 0, "maximum": 3600},
+                "speculative_enabled": _BOOL, "reliable_slot": _IDENTIFIER,
+                "required_legs": _array({"type": "string", "maxLength": 128,
+                                         "pattern": r"[^\x00\r\n\v\f\x1c-\x1e\x85\u2028\u2029]+"})}),
         }),
         "model_settings": {"validation_order": ("hosts", "roles", "capacity"), **_object({
             "hosts": _map(_HOST, MAX_HOSTS, reserved=_TERMINALS), "roles": _object({
@@ -211,9 +235,10 @@ def _context(error, layer, file=None):
     return error
 
 
-def _validate(value, schema, path, layer, *, required=None, resolved=False):
+def _validate(value, schema, path, layer, *, required=None, resolved=False, registry_fields=None):
     try:
-        return team_profile_schema.validate_input(value, schema, path, layer, required=required, resolved=resolved)
+        return team_profile_schema.validate_input(value, schema, path, layer, required=required,
+                                                  resolved=resolved, registry_fields=registry_fields)
     except team_supervisor.SupervisorError as error:
         raise _context(ProfileError(str(error), path=error.path, layer=error.layer), layer) from None
 
@@ -431,15 +456,17 @@ def _review_routes(profile, families):
                 refuse(rule, route, entry, allowed, cross)
 
 
-def _complete(profile):
+def _complete(profile, *, registry_fields=None):
     settings = profile["model_settings"]
     hosts, roles = settings["hosts"], settings["roles"]
     if len(hosts) > MAX_HOSTS:
         raise ProfileError("profile host limit exceeded", path="model_settings.hosts")
     try:
-        team_profile_schema.validate_input(profile, {**JSON_SCHEMA, "error_path": "", "node_budget": 4 * MAX_NODES}, resolved=True)
+        team_profile_schema.validate_input(
+            profile, {**JSON_SCHEMA, "error_path": "", "node_budget": 4 * MAX_NODES},
+            "", "repo", resolved=True, landing=True, registry_fields=registry_fields)
     except team_supervisor.SupervisorError as error:
-        raise ProfileError(str(error), path=error.path) from None
+        raise ProfileError(str(error), path=error.path) from None  # resolve() attributes the layer
     _reject_terminal_hosts(hosts, ProfileError, "model_settings.hosts")
     for name in sorted(hosts):
         host = hosts[name]
@@ -750,7 +777,7 @@ def _read(root, parts, layer):
                 if info.st_uid != os.getuid() or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
                     raise ProfileError("user profile directory must be owned by the current user and not group/other-writable")
                 data = team_supervisor.read_owned_leaf(
-                    handle._parent, parts[-1], MAX_BYTES,
+                    handle.parent_fd, parts[-1], MAX_BYTES,
                     "user profile file must be owned by the current user and not group/other-writable")
                 return {} if data is None else _parse(data)
             return _parse(handle.read_bytes(MAX_BYTES))
@@ -886,9 +913,13 @@ def initialize(root, preset, *, host=None, force=False):
 
 def validate_resolved(resolved, root=None):
     """Recheck route policy and supervisor bounds before consuming a resolved profile."""
+    _validate_resolved(resolved, root)
+
+
+def _validate_resolved(resolved, root=None, *, registry_fields=None):
     file = str(_repository_root(root).joinpath(*REPO_PATH)) if root is not None else None
     def complete(body):
-        _complete(body)
+        _complete(body, registry_fields=registry_fields)
         team_supervisor.require_resolved(body["supervisor"])
 
     try:
@@ -899,7 +930,7 @@ def validate_resolved(resolved, root=None):
         })}
         _validate(resolved, envelope, "", "repo",
                   required={"profile": {**PRESET_DATA["defaults"], "supervisor": team_supervisor.assemble({}, {})[0]},
-                            "values": {}, "write_scope": []}, resolved=True)
+                            "values": {}, "write_scope": []}, resolved=True, registry_fields=registry_fields)
     except ProfileError as error:
         raise _context(error, "repo", file)
     except team_supervisor.SupervisorError as error:
@@ -934,7 +965,8 @@ def doctor(resolved, root=None):
 def display_profile(value: Any, *, capacity=False) -> Any:
     """Render through the shared policy; capacity views opt into typed actions."""
     value, snapshot = _validate(value, {"type": "display", "profile_keys": tuple(JSON_SCHEMA["properties"])}, "", "repo")
+    registry_fields = {}
     if snapshot is not None:
-        validate_resolved(snapshot)
-    return _render_profile(value, capacity=capacity,
+        _validate_resolved(snapshot, registry_fields=registry_fields)
+    return _render_profile(value, capacity=capacity, registry_fields=registry_fields,
                            identifier_pattern=_IDENTIFIER_PATTERN, max_string=MAX_STRING)

@@ -118,10 +118,9 @@ def _locate(root: Path) -> Tuple[Path, Path, Path]:
     if dotgit.is_dir():
         gitdir = dotgit
     elif dotgit.is_file():
-        first = dotgit.read_text(encoding="utf-8", errors="replace").splitlines()[:1]
-        if not first or not first[0].startswith("gitdir:"):
-            raise TreeError(f"{dotgit} is not a gitdir file")
-        gitdir = Path(first[0][len("gitdir:"):].strip())
+        from aegis_core.git_path_codec import path_text
+
+        gitdir = Path(path_text(dotgit.read_bytes(), gitfile=True))
         if not gitdir.is_absolute():
             gitdir = top / gitdir
     else:
@@ -130,7 +129,9 @@ def _locate(root: Path) -> Tuple[Path, Path, Path]:
     common = gitdir
     pointer = gitdir / "commondir"
     if pointer.is_file():
-        text = pointer.read_text(encoding="utf-8", errors="replace").strip()
+        from aegis_core.git_path_codec import path_text
+
+        text = path_text(pointer.read_bytes(), record=True)
         common = Path(os.path.realpath(gitdir / text if not os.path.isabs(text) else text))
     return top, gitdir, common / "objects"
 
@@ -420,7 +421,10 @@ def bind(root: object) -> Iterator[BoundTree]:
     Raises TreeError when git or the work tree cannot be used at all; every ordinary reason for
     having no tree (a hidden change, an empty read) is a ``TreeBinding`` with status ``unbindable``.
     """
-    top, gitdir, objects = _locate(Path(os.fspath(root)).resolve())
+    try:
+        top, gitdir, objects = _locate(Path(os.fspath(root)).resolve())
+    except gitsafe.GitError as exc:
+        raise TreeError(str(exc), code=exc.code) from None
     temp = Path(tempfile.mkdtemp(prefix="aegis-tree-"))
     try:
         os.chmod(temp, 0o700)

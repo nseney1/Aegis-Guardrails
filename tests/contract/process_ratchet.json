@@ -31,6 +31,10 @@
     "count": 1,
     "reason": "Host installation command boundary."
   },
+  "process:aegis_cli/team_isolation.py:inspect_image:subprocess.Popen": {
+    "count": 1,
+    "reason": "TA-6c bounded digest-qualified engine image inspection with DEVNULL stdin and stderr"
+  },
   "process:aegis_core/ast/batch.py:BatchDriver.__init__:subprocess.Popen": {
     "count": 1,
     "reason": "Deferred Popen type annotation for the bounded protocol-v2 lifecycle; no process starts here."

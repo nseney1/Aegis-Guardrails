@@ -1267,10 +1267,13 @@ def test_clean_host_os_works_without_descriptor_support(tmp_path, monkeypatch):
 def test_git_cache_policy_and_bound_root_have_one_exported_home():
     from aegis_core import pathlookup_gitcache
 
-    assert pathlookup_gitcache.__all__ == ["GitCache", "ordinary_root"]
+    assert pathlookup_gitcache.__all__ == ["GitCache", "bound_ordinary_root", "ordinary_root"]
     assert issubclass(pathlookup.GitCache, pathlookup_gitcache.GitCache)
     assert pathlookup.ordinary_root is pathlookup_gitcache.ordinary_root
-    assert "ordinary_root" in pathlookup.__all__
+    assert pathlookup.__all__ == [
+        "Hit", "INSIDE_FENCE", "RELATIVE_ENTRY", "descriptor_fence_supported", "GitCache",
+        "fenced_program", "git_fence", "is_bare", "only_skipped", "ordinary_root", "which",
+    ]
     assert type(pathlookup.GitCache().for_cwd()).__module__ == pathlookup_gitcache.__name__
 
 
@@ -1407,6 +1410,32 @@ class TestWindowsLookup:
         shim.chmod(0o755)
         assert which("codex", str(shim.parent)) == str(shim)
 
+    def test_explicit_pathext_selects_candidates_and_keeps_the_fence(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+
+        exe, shim = tmp_path / "Git.Exe", tmp_path / "git.cmd"
+        for program in (exe, shim):
+            program.touch()
+            if os.name == "posix":
+                program.chmod(0o755)
+        monkeypatch.setattr("aegis_core.pathlookup.os", SimpleNamespace(
+            **{**vars(os), "pathsep": ";", "environ": {"PATHEXT": ".CMD;.EXE"}}))
+        monkeypatch.setattr("aegis_core.pathlookup.sys", SimpleNamespace(**{**vars(sys), "platform": "win32"}))
+
+        assert which("git", str(tmp_path)) == str(shim)
+        assert which("git", str(tmp_path), pathext=".EXE") == str(exe)
+        assert which("git", str(tmp_path), pathext="") == str(exe)
+        assert which("git", str(tmp_path), outside=tmp_path, pathext=".EXE") is None
+        assert which("git", str(tmp_path), pathext=".BAT") is None
+        assert only_skipped("git", str(tmp_path), outside=tmp_path) == [
+            Hit(str(program), str(tmp_path), pathlookup.INSIDE_FENCE) for program in (shim, exe)
+        ]
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            selected = workers.submit(which, "git", str(tmp_path), pathext=".EXE")
+            ambient = workers.submit(which, "git", str(tmp_path))
+            assert selected.result(timeout=5) == str(exe)
+            assert ambient.result(timeout=5) == str(shim)
+
     def test_a_name_that_carries_an_extension_is_looked_up_as_given(self, tmp_path, windows):
         exe = tmp_path / "bin" / "python3.exe"
         exe.parent.mkdir()
@@ -1451,6 +1480,12 @@ class TestWindowsLookup:
         exe.chmod(0o755)
         assert only_skipped("codex", "bin", outside=ws, base=ws) == [
             Hit(path=os.path.normpath(str(exe)), entry="bin", reason="relative_entry")]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="uses a POSIX executable")
+def test_explicit_pathext_does_not_change_posix_lookup(tmp_path):
+    program = _program(tmp_path, "git")
+    assert which("git", str(tmp_path), pathext=".CMD") == str(program)
 
 
 # ── only_skipped ─────────────────────────────────────────────────────────────
@@ -2251,6 +2286,12 @@ def test_a_windows_rooted_path_uses_the_current_drive(monkeypatch):
         assert skipped and skipped[0].reason == pathlookup.INSIDE_FENCE
         modeled.getcwd = lambda: r"D:\host"
         assert pathlookup._provenance_inside(r"\ws\bin", fence, descriptors=False) is False
+        # Python 3.9–3.12 report a drive-less rooted path as absolute.
+        paths.isabs = lambda path: rooted_isabs(path) or str(path).startswith("\\")
+        paths.abspath = lambda path: "D:" + path if path.startswith("\\") else path
+        assert pathlookup._provenance_inside(r"\bin\git.exe", r"C:\bin", descriptors=False) is False
+        assert pathlookup.fenced_program(r"\bin\git.exe", r"C:\bin", descriptors=False) is None
+        assert pathlookup.fenced_program(r"D:\bin\git.exe", r"C:\bin", descriptors=False) == r"D:\bin\git.exe"
     finally:
         monkeypatch.setattr("aegis_core.pathlookup.os", original)
         monkeypatch.setattr("aegis_core.primitives.os", primitive_os)
@@ -3083,6 +3124,177 @@ def ordinary_home(tmp_path):
         os.environ.update(previous_env)
 
 
+def test_bound_ordinary_root_normalizes_clears_and_resets_on_failure_and_retry(tmp_path):
+    """The public helper is the only arming spelling: normcase(fspath), or clear, then reset."""
+    from aegis_core import pathlookup
+    from aegis_core.pathlookup_gitcache import bound_ordinary_root
+
+    root = tmp_path / "Outer"
+    root.mkdir()
+    expected = os.path.normcase(os.fspath(root))
+    child = root / "missing-child"
+    child_key = os.path.normcase(os.fspath(child))
+    assert pathlookup.ordinary_root.get() is None
+    with bound_ordinary_root(root) as installed:
+        assert installed == expected
+        assert pathlookup.ordinary_root.get() == expected
+        with pytest.raises(RuntimeError, match="^fixture failure$"):
+            with bound_ordinary_root(None):
+                assert pathlookup.ordinary_root.get() is None
+                raise RuntimeError("fixture failure")
+        assert pathlookup.ordinary_root.get() == expected
+        with bound_ordinary_root(child):
+            assert pathlookup.ordinary_root.get() == child_key
+        assert pathlookup.ordinary_root.get() == expected
+    assert pathlookup.ordinary_root.get() is None
+    with bound_ordinary_root(os.fspath(root)):
+        assert pathlookup.ordinary_root.get() == expected
+    assert pathlookup.ordinary_root.get() is None
+
+
+def test_bound_ordinary_root_leaves_the_outer_root_when_normalization_fails(tmp_path):
+    from aegis_core.pathlookup_gitcache import bound_ordinary_root
+
+    with bound_ordinary_root(tmp_path) as outer:
+        class InvalidPath:
+            def __fspath__(self):
+                assert pathlookup.ordinary_root.get() == outer
+                assert pathlookup_gitcache.ordinary_root.get() == outer
+                raise TypeError("fixture path conversion failed")
+
+        with pytest.raises(TypeError, match="^fixture path conversion failed$"):
+            with bound_ordinary_root(InvalidPath()):
+                raise AssertionError("a non-path must fail before the body runs")
+        assert pathlookup.ordinary_root.get() == outer
+        assert pathlookup_gitcache.ordinary_root.get() == outer
+    assert pathlookup.ordinary_root.get() is None
+    assert pathlookup_gitcache.ordinary_root.get() is None
+
+
+def _assert_read_only_root(carrier, expected):
+    assert carrier.get() == expected
+    with pytest.raises(AttributeError, match=r"\bset\b"):
+        _ = carrier.set
+    assert carrier.get() == expected
+    with pytest.raises(AttributeError, match=r"\breset\b"):
+        _ = carrier.reset
+    assert carrier.get() == expected
+
+
+@pytest.mark.parametrize("export_name", ["pathlookup", "pathlookup_gitcache"])
+def test_public_ordinary_root_refuses_mutation_lookup(export_name, tmp_path):
+    export = pathlookup if export_name == "pathlookup" else pathlookup_gitcache
+    with pathlookup_gitcache.bound_ordinary_root(tmp_path) as installed:
+        _assert_read_only_root(export.ordinary_root, installed)
+        assert pathlookup.ordinary_root.get() == installed
+        assert pathlookup_gitcache.ordinary_root.get() == installed
+    assert export.ordinary_root.get() is None
+
+
+def test_ordinary_root_aliases_are_read_only_after_import(tmp_path):
+    from contextvars import ContextVar
+
+    import aegis_core.pathlookup as lookup
+    import aegis_core.pathlookup_gitcache as cache
+    from aegis_core.pathlookup_gitcache import ordinary_root as reassigned
+
+    with cache.bound_ordinary_root(tmp_path) as installed:
+        class Aliases:
+            from aegis_core.pathlookup import ordinary_root as direct
+
+        # Run the conditional class body during the test, outside the collection grammar.
+        namespace = {"installed": installed, "check": _assert_read_only_root}
+        exec(
+            "class ConditionalAliases:\n"
+            "    if installed is not None:\n"
+            "        from aegis_core.pathlookup import ordinary_root as facade\n"
+            "        from aegis_core.pathlookup_gitcache import ordinary_root as cache\n"
+            "        check(facade, installed)\n"
+            "        check(cache, installed)\n",
+            namespace,
+        )
+        conditional = namespace["ConditionalAliases"]
+        for alias in (lookup.ordinary_root, Aliases.direct, conditional.facade, conditional.cache, reassigned):
+            assert alias is cache.ordinary_root
+            _assert_read_only_root(alias, installed)
+
+        reassigned = ContextVar("independent_fixture", default=None)
+        token = reassigned.set("independent")
+        try:
+            assert reassigned.get() == "independent"
+            assert lookup.ordinary_root.get() == installed
+            assert cache.ordinary_root.get() == installed
+        finally:
+            reassigned.reset(token)
+        assert reassigned.get() is None
+    assert lookup.ordinary_root.get() is None
+    assert cache.ordinary_root.get() is None
+
+
+def test_ordinary_root_reads_defaults_and_copied_contexts_through_both_exports(tmp_path):
+    from contextvars import Context, copy_context
+
+    carriers = (pathlookup.ordinary_root, pathlookup_gitcache.ordinary_root)
+    fallback = object()
+
+    def assert_reads(expected, with_default):
+        for carrier in carriers:
+            assert carrier.name == "aegis_gitsafe_ordinary_root"
+            assert carrier.get() == expected
+            assert carrier.get(fallback) == with_default
+
+    assert_reads(None, fallback)
+
+    def clear_copied_root():
+        assert_reads(installed, installed)
+        with pathlookup_gitcache.bound_ordinary_root(None):
+            assert_reads(None, None)
+        assert_reads(installed, installed)
+
+    with pathlookup_gitcache.bound_ordinary_root(tmp_path / "Outer") as installed:
+        assert_reads(installed, installed)
+        copied = copy_context()
+        Context().run(assert_reads, None, fallback)
+        assert_reads(installed, installed)
+    assert_reads(None, fallback)
+    with pathlookup_gitcache.bound_ordinary_root(tmp_path / "Retry") as retry:
+        copied.run(clear_copied_root)
+        assert_reads(retry, retry)
+    assert_reads(None, fallback)
+    copied.run(assert_reads, installed, installed)
+
+
+def test_bound_ordinary_root_threads_keep_separate_roots(tmp_path):
+    from threading import Barrier
+
+    from aegis_core.pathlookup_gitcache import bound_ordinary_root
+
+    left, right = tmp_path / "left", tmp_path / "right"
+    left.mkdir()
+    right.mkdir()
+    barrier = Barrier(2)
+    carriers = (pathlookup.ordinary_root, pathlookup_gitcache.ordinary_root)
+
+    def worker(root):
+        previous = pathlookup.ordinary_root.get()
+        with bound_ordinary_root(root):
+            barrier.wait(5)
+            expected = os.path.normcase(os.fspath(root))
+            for carrier in carriers:
+                _assert_read_only_root(carrier, expected)
+        assert all(carrier.get() == previous for carrier in carriers)
+        return previous
+
+    with bound_ordinary_root(tmp_path) as inherited:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(worker, root) for root in (left, right)]
+            before_left, before_right = [future.result(timeout=10) for future in futures]
+        assert all(carrier.get() == inherited for carrier in carriers)
+    assert all(carrier.get() is None for carrier in carriers)
+    assert before_left == before_right
+    assert before_left in (None, inherited)
+
+
 def _carrier_fence(path):
     from aegis_core import pathlookup
     return pathlookup.real_key(os.fspath(path))
@@ -3090,12 +3302,9 @@ def _carrier_fence(path):
 
 @contextlib.contextmanager
 def _ordinary_root(path):
-    from aegis_core import pathlookup
-    token = pathlookup.ordinary_root.set(_carrier_fence(path))
-    try:
+    from aegis_core.pathlookup_gitcache import bound_ordinary_root
+    with bound_ordinary_root(_carrier_fence(path)):
         yield
-    finally:
-        pathlookup.ordinary_root.reset(token)
 
 
 def test_ordinary_root_fences_the_exact_directory_and_resets(tmp_path, monkeypatch):
@@ -3212,10 +3421,10 @@ def test_ordinary_roots_stay_inside_their_threads(tmp_path):
             found.append(pathlookup.GitCache().for_cwd(root).fence)
         found.append(("after", pathlookup.ordinary_root.get()))
 
-    parent = pathlookup.ordinary_root.set(_carrier_fence(tmp_path))
-    assert parent is not None
+    from aegis_core.pathlookup_gitcache import bound_ordinary_root
     inherited = _carrier_fence(tmp_path)
-    try:
+    with bound_ordinary_root(inherited) as parent:
+        assert parent is not None
         threads = [Thread(target=worker, args=(root,)) for root in (left, right)]
         for thread in threads:
             thread.start()
@@ -3223,8 +3432,6 @@ def test_ordinary_roots_stay_inside_their_threads(tmp_path):
             thread.join(10)
             assert not thread.is_alive()
         assert pathlookup.GitCache().for_cwd(tmp_path).fence == inherited
-    finally:
-        pathlookup.ordinary_root.reset(parent)
     assert sorted(item for item in found if not isinstance(item, tuple)) == sorted(
         [_carrier_fence(left), _carrier_fence(right)])
     # Reset drops that thread's fence. Context-copying threads restore the inherited
@@ -3625,10 +3832,11 @@ def test_unresolved_mcp_requests_keep_outermost_git_fence(ordinary_unbound_repo,
     original = server._arm_ordinary_root
     selected = []
 
+    @contextlib.contextmanager
     def arm(binding):
-        token = original(binding)
-        selected.append((binding.status, pathlookup.ordinary_root.get()))
-        return token
+        with original(binding):
+            selected.append((binding.status, pathlookup.ordinary_root.get()))
+            yield
 
     monkeypatch.setattr(server, "_arm_ordinary_root", arm)
     try:

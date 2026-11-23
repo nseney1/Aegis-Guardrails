@@ -162,10 +162,10 @@ def _reset_for_tests() -> None:
 
 def git_executable(*, environ=None, cwd=None) -> str:
     """Resolve Git centrally; ordinary reads fence the bound root, else the outermost checkout."""
-    return gitsafe_run.find_executable((cache := _GIT_FOUND.for_cwd(cwd)) if environ is None else {}, environ,
-        lambda effective: pathlookup.which("git",
-            **({"path": effective.get("PATH", os.defpath), "outside": getattr(effective, "root", cwd)} if environ is not None else {"outside": cache.fence, "fence_program": True, "descriptors": False})),
-        error=GitError if environ is not None else cache.error(GitError), cwd=cwd)
+    return gitsafe_run.find_executable(_GIT_FOUND, environ,
+        lambda options: pathlookup.which("git",
+            **options),
+        error=GitError, cwd=cwd, ordinary_git=True)
 
 
 def custody_program(cwd, *, environ=None) -> Optional[str]:
@@ -180,11 +180,11 @@ def lane_runner(cwd, scratch, *, effect_fds=None, environ=None, write_roots=(), 
 
 
 @contextmanager
-def custody(*, scratch: Path, env: Optional[Mapping[str, str]] = None,
+def custody(*, scratch: Path, env: Optional[Mapping[str, str]] = None, replace_env=gitsafe_run.REPLACEMENT_UNSET, program: Optional[str] = None,
             stdout_limit: int = 16 * 1024 * 1024, stderr_limit: int = 65536, strict_lane: bool = False, worktree_root=None):
-    """Bounded custody; strict scopes receive only the packaged facade services."""
+    """Bounded custody. Replacement mode accepts an owner-selected absolute Git program."""
     with gitsafe_run.custody(scratch=scratch, env=env, stdout_limit=stdout_limit,
-            stderr_limit=stderr_limit, strict_lane=strict_lane,
+            stderr_limit=stderr_limit, strict_lane=strict_lane, replace_env=replace_env, program=program,
             _services=gitsafe_run._LaneServices(custody_program, GitError, RefConflict, git_executable), worktree_root=worktree_root):
         yield
 
@@ -302,12 +302,12 @@ def _layout(cwd: Path | str) -> Optional[Layout]:
             raise
         return None
     # In a bare repository or inside .git, git dies on --show-toplevel after the first three lines.
-    lines = [os.fsdecode(line) for line in res.stdout.split(b"\n")[:-1]]
+    lines = gitsafe_run.path_text(res.stdout).split("\n") if res.stdout else []
     if len(lines) == (4 if res.returncode == 0 else 3):
         # An old git echoes the flag it does not know: read as shallow, the side that caches nothing.
         # git prints C:/x on Windows; normpath gives the separators Path and the callers use.
-        top = lines[3].strip() if len(lines) == 4 else ""
-        return Layout(lines[0].strip(), lines[1].rstrip("\r"), lines[2].strip() != "false", os.path.normpath(top) if top else None)
+        top = lines[3] if len(lines) == 4 else ""
+        return Layout(lines[0], lines[1], lines[2].strip() != "false", os.path.normpath(top) if top else None)
     common = _text(["rev-parse", "--git-common-dir"], cwd) if lines else None
     if common is None:
         return None
@@ -315,7 +315,7 @@ def _layout(cwd: Path | str) -> Optional[Layout]:
     # call, and shallow assumed so that nothing about it is kept beyond the request.
     prefix = _out(["rev-parse", "--show-prefix"], cwd) or b""
     top = _text(["rev-parse", "--show-toplevel"], cwd)
-    return Layout(common, os.fsdecode(prefix.rstrip(b"\r\n")), True, os.path.normpath(top) if top else None)
+    return Layout(common, gitsafe_run.path_text(prefix), True, os.path.normpath(top) if top else None)
 
 
 def layout(cwd: Path | str) -> Optional[Layout]:
@@ -337,7 +337,7 @@ def show_prefix(cwd: Path | str) -> str:
     if res.returncode != 0:
         detail = " ".join(res.stderr.decode("utf-8", "replace").split())[:200]
         raise GitError(f"git rev-parse --show-prefix failed: {detail}")
-    return os.fsdecode(res.stdout.rstrip(b"\r\n"))
+    return gitsafe_run.path_text(res.stdout)
 
 
 def relative_to_prefix(prefix: str, path: str) -> Optional[str]:

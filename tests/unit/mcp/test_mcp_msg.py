@@ -14,7 +14,8 @@ from aegis_core import message_codec as codec
 from aegis_core.workspace.base import Workspace
 from aegis_mcp import server
 from aegis_mcp.tools import execute_tool
-from tests.unit.core.test_message_codec import make_store
+from tests.unit.core.test_message_codec import (make_store, stored_log, _counting, _CANONICAL, _ISOLATE,
+                                                _LOOKUP, _PARSE, _STORE_READ, _STORE_VERIFIED)
 
 
 GOLDENS = json.loads((Path(__file__).parents[1] / "core" / "message_codec_goldens.json").read_text(encoding="utf-8"))
@@ -283,7 +284,7 @@ def test_projection_cursor_and_expansion_parity(store, capsys):
                                        ("missing", "E_REF"), ("budget", "E_LIMIT")])
 def test_read_integrity_and_budget_refusals(case, code, store):
     rid = store.write(GOLDENS[0]["record"])
-    filename = store.root / (rid + ".json")
+    filename = store.root / rid[:2] / (rid + ".json")
     if case == "hash":
         filename.write_bytes(filename.read_bytes().replace(b"writer", b"reader"))
     elif case == "oversize":
@@ -630,7 +631,8 @@ def test_ambiguous_host_roots_dispatch_gives_launch_pin_guidance(action, tmp_pat
     text, failed = call("write", kind="text", content=CONTENT)
     assert not failed, text
     record = json.loads(text)
-    assert (roots[0] / ".aegis" / "state" / "messages" / (record["id"] + ".json")).is_file()
+    rid = record["id"]
+    assert (roots[0] / ".aegis" / "state" / "messages" / rid[:2] / (rid + ".json")).is_file()
     assert not (roots[1] / ".aegis" / "state").exists()
 
 
@@ -655,6 +657,72 @@ def test_real_unbound_host_roots_dispatch_gives_init_guidance(action, tmp_path, 
     assert refuse(action, "E_AUTH", **options) == {
         "error": {"code": "E_AUTH", "message": "workspace is not initialized; run aegis init"}}
     assert not (root / ".aegis").exists()
+
+
+def _canonical_calls():
+    import sys
+    seen = []
+    code = codec.canonical.__code__
+    previous = sys.getprofile()
+
+    def observe(frame, event, _arg):
+        if event == "call" and frame.f_code is code:
+            seen.append(1)
+
+    sys.setprofile(observe)
+    return seen, previous
+
+
+@pytest.mark.parametrize("fmt", ["json", "md", "tsv"])
+def test_mcp_pure_outline_encodes_once_and_matches_core(fmt, store, capsys):
+    import sys
+    value = dict(GOLDENS[0]["record"], body="mcp outline " + "y" * 1500)
+    rid = store.write(value)
+    seen, previous = _canonical_calls()
+    try:
+        text, failed = call("read", ref=rid[:16], outline=True, format=fmt)
+    finally:
+        sys.setprofile(previous)
+    assert not failed and len(seen) == 1
+    assert text == codec.read_view(store.read(rid), outline=True, format=fmt, store=store)
+    assert main(["msg", "read", rid[:16], "--outline", "--format", fmt]) == 0
+    assert capsys.readouterr().out == text
+
+
+def test_mcp_covered_outline_still_checks_the_value(store):
+    import sys
+    rid = store.write(GOLDENS[0]["record"])
+    seen, previous = _canonical_calls()
+    try:
+        text, failed = call("read", ref=rid, fields=["body"], outline=True)
+    finally:
+        sys.setprofile(previous)
+    assert not failed and len(seen) == 2
+    assert text == codec.read_view(store.read(rid), selectors=["body"], outline=True, store=store)
+
+
+@pytest.mark.parametrize("width", [16, 64])
+@pytest.mark.parametrize("options", [
+    {"outline": True}, {}, {"outline": True, "fields": ["body"]},
+    {"outline": True, "spans": [0]}, {"outline": True, "since": "0", "fields": ["rows.0"]},
+    {"outline": True, "expand": ["child"]},
+], ids=["outline", "default", "selected", "span", "cursor", "expand"])
+def test_mcp_stored_read_has_no_record_copy(store, width, options):
+    value, rid = stored_log(store, with_child="expand" in options)
+    with _counting(_LOOKUP, _PARSE, _CANONICAL, _ISOLATE, _STORE_READ, _STORE_VERIFIED) as seen:
+        text, failed = call("read", ref=rid[:width], **options)
+
+    core_options = dict(options)
+    core_options["selectors"] = core_options.pop("fields", ())
+    assert not failed and text == codec.read_view(value, store=store, **core_options)
+    child = list(value["refs"].values())
+    assert seen[_LOOKUP] == [rid[:width], *child]
+    assert len(seen[_PARSE]) == 1 + len(child)
+    assert len(seen[_ISOLATE]) == 0
+    verified = options == {"outline": True}
+    assert seen[_STORE_VERIFIED] == ([rid[:width]] if verified else [])
+    assert seen[_STORE_READ] == ([] if verified else [rid[:width], *child])
+    assert len(seen[_CANONICAL]) == (1 if verified else 2 + len(child))
 
 
 @pytest.mark.parametrize("existing_ignore", [False, True])

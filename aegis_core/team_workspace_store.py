@@ -18,7 +18,7 @@ import re
 import time
 
 from aegis_core.team_mailbox_primitives import ( MAX_BYTES, MAX_RECORDS, MailboxRefusal,
-    bounded_tree, encoded, integer, matching, parse_time, strict_json, strings, )
+    bounded_tree, encoded, integer, matching, strict_json, strings, )
 from aegis_core.team_mailbox_store import descriptor_supported
 from aegis_core import kernel_identity as _kernel
 from aegis_core import team_workspace_events as _events
@@ -138,15 +138,15 @@ class Ledger:
 
     @refusals
     def apply(self, event):
-        bounded_tree(event)
-        fields(event, {"schema", "seq", "at", "kind", "data"})
-        snapshot = deepcopy(self.__dict__)
-        try:
-            self._apply(event)
-        except BaseException:
-            self.__dict__.clear()
-            self.__dict__.update(snapshot)
-            raise
+        # Validate the receiver before arithmetic. A refusal must not copy retained rows.
+        _ledger(self)
+        require(self.seq < MAX_RECORDS, reason="too_large")
+        expected = self.seq + 1
+        event = _events.validate_envelope(
+            event, expected, recover_queue_time=False, max_records=MAX_RECORDS)
+        preview = deepcopy(self)
+        preview._apply(event)
+        self._apply(event)
 
     def _apply(self, event):
         _events.apply_event(self, event, APPLY)
@@ -504,14 +504,8 @@ class WorkspaceStore:
             if count <= ledger.seq:
                 continue
             event = strict_json(self.storage.read(path, parent=directory, key=keys[count - 1][1]))
-            fields(event, {"schema", "seq", "at", "kind", "data"})
-            require(_key(event["schema"]) in REPLAY_SCHEMAS and event["seq"] == count)
-            try:
-                parse_time(event["at"])
-            except ValueError:
-                if not (for_report and event["kind"] in ("request", "grant", "release", "withdraw")):
-                    raise
-                event = {**event, "at": None}
+            event = _events.validate_envelope(
+                event, count, recover_queue_time=for_report, max_records=MAX_RECORDS)
             ledger._apply(event)
         require(ledger.limits is not None)
 
@@ -562,8 +556,12 @@ class WorkspaceStore:
         _record(data)
         bounded_tree(data)
         require(ledger.seq < MAX_RECORDS, reason="too_large")
+        # Publication and the returned event keep this snapshot, not the caller's containers.
+        data = deepcopy(data)
         schema = SUPERSEDE_EVENT_SCHEMA if kind == "request" and "supersedes" in data else EVENT_SCHEMA
         event = {"schema": schema, "seq": ledger.seq + 1, "at": timestamp(), "kind": kind, "data": data}
+        event = _events.validate_envelope(
+            event, ledger.seq + 1, recover_queue_time=False, max_records=MAX_RECORDS)
         candidate = deepcopy(ledger)
         candidate._apply(event)
         self.publish("%08d.json" % event["seq"], encoded(event) + b"\n")

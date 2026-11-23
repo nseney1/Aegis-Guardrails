@@ -31,13 +31,12 @@ def _content_bytes(content):
 
 def handle_msg_read(args):
     try:
-        options = codec.preflight_read(selectors=args.get("fields", ()), spans=args.get("spans", ()),
-                                       outline=args.get("outline", False), since=args.get("since"),
-                                       expand=args.get("expand", ()), format=args.get("format", "json"),
-                                       max_chars=args.get("max_chars", 60000)).options
+        prepared = codec.preflight_read(selectors=args.get("fields", ()), spans=args.get("spans", ()),
+                                        outline=args.get("outline", False), since=args.get("since"),
+                                        expand=args.get("expand", ()), format=args.get("format", "json"),
+                                        max_chars=args.get("max_chars", 60000))
         with _store(args.get("workspace"), write=False) as store:
-            value = store.read(args.get("ref"))
-            return MessageText(codec.read_view(value, store=store, **options))
+            return MessageText(codec.read_stored_view(store, args.get("ref"), prepared))
     except codec.CodecError as error:
         return frontend_error(error, detail=error.detail)
     except WorkspaceError:

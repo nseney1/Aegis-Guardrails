@@ -10,6 +10,7 @@ import os
 import ast
 import binascii
 import contextlib
+from functools import partial
 import hashlib
 import importlib.util
 import io
@@ -2096,6 +2097,298 @@ def _plant_dist_decoy(dist, kind):
         raise AssertionError(kind)
 
 
+@pytest.mark.parametrize("state,detail", [
+    ("missing", "distribution directory is missing"),
+    ("not-directory", "distribution directory is unreadable"),
+    ("empty", "expected exactly one wheel and one sdist, found wheels=0, sdists=0, "
+              "irregular=0, sample=[], omitted=0"),
+], ids=["missing", "not-directory", "empty"])
+def test_dist_inventory_distinguishes_missing_unreadable_and_empty(tmp_path, state, detail):
+    dist = tmp_path / "dist"
+    if state == "not-directory":
+        dist.write_bytes(b"not a directory")
+    elif state == "empty":
+        dist.mkdir()
+        (dist / "unrelated.txt").write_bytes(b"ignored")
+    for command in ("record", "verify"):
+        refused = _verify(command, str(dist))
+        assert (refused.returncode, refused.stdout, refused.stderr) == (
+            1, "", "verify_dist: " + detail + "\n")
+
+
+def test_dist_inventory_caps_sample_and_preserves_release_stdout(tmp_path):
+    dist = _dist(tmp_path)
+    recorded = _verify("record", str(dist))
+    assert recorded.returncode == 0 and recorded.stderr == ""
+    sums = dist / "SHA256SUMS"
+    original = sums.read_bytes()
+    assert recorded.stdout.encode("utf-8") == original
+    paths = sorted(str(path) for path in dist.iterdir() if path != sums)
+
+    secret = "supersecretvalue12345678"
+    decoys = [dist / ("00-cafe\u0301-token=" + secret + ".WHL"), dist / "01-decoy.tar.gz"]
+    decoys.extend(dist / ("02-%02d.WHL" % index) for index in range(10))
+    for path in reversed(decoys):
+        if path == decoys[1]:
+            path.mkdir()
+        else:
+            path.touch()
+    expected = (
+        "verify_dist: expected exactly one wheel and one sdist, found wheels=12, sdists=1, "
+        'irregular=1, sample=[wheel file "00-caf\u00e9-[REDACTED]", sdist directory "01-decoy.tar.gz", '
+        'wheel file "02-00.WHL", wheel file "02-01.WHL", wheel file "02-02.WHL"], omitted=9\n'
+    )
+    for command in ("record", "verify"):
+        refused = _verify(command, str(dist))
+        assert (refused.returncode, refused.stdout, refused.stderr) == (1, "", expected)
+        assert sums.read_bytes() == original
+
+    for path in decoys:
+        if path == decoys[1]:
+            path.rmdir()
+        else:
+            path.unlink()
+    verified = _verify("verify", str(dist))
+    assert verified.returncode == 0 and verified.stderr == ""
+    assert verified.stdout.splitlines() == paths
+
+
+def test_dist_inventory_quotes_a_delimiter_bearing_filename(tmp_path):
+    dist = _dist(tmp_path)
+    assert _verify("record", str(dist)).returncode == 0
+    sums = dist / "SHA256SUMS"
+    original = sums.read_bytes()
+    name = "00-one.whl, sdist symlink two].tar.gz.whl"
+    (dist / name).touch()
+    for command in ("record", "verify"):
+        refused = _verify(command, str(dist))
+        assert refused.returncode == 1 and refused.stdout == ""
+        assert 'sample=[wheel file "' + name + '", ' in refused.stderr
+        assert refused.stderr.endswith("omitted=0\n")
+        assert sums.read_bytes() == original
+
+
+@pytest.mark.parametrize("command", ["record", "verify"])
+@pytest.mark.parametrize("winerror,entry_type,detail", [
+    (2, "directory", "expected exactly one wheel and one sdist, found wheels=0, sdists=0, "
+                     "irregular=0, sample=[], omitted=0"),
+    (2, "file", "distribution directory is unreadable"),
+    (2, "absent", "distribution directory is missing"),
+    (2, "denied", "distribution directory is unreadable"),
+    (2, "network-probe", "distribution directory is unreadable"),
+    (3, "directory", "distribution directory is unreadable"),
+    (3, "file", "distribution directory is unreadable"),
+    (3, "absent", "distribution directory is missing"),
+    (3, "denied", "distribution directory is unreadable"),
+    (3, "network-probe", "distribution directory is unreadable"),
+    (53, "absent", "distribution directory is unreadable"),
+], ids=["no-match-directory", "no-match-file", "no-match-absent", "no-match-denied", "no-match-network",
+        "path-error-directory", "path-error-file", "path-error-absent", "path-error-denied", "path-error-network",
+        "bad-network-path"])
+def test_dist_inventory_classifies_windows_scan_open_errors(
+        distribution_verifier, tmp_path, capsys, command, winerror, entry_type, detail):
+    dist = tmp_path / "dist"
+    if entry_type == "directory":
+        dist.mkdir()
+    elif entry_type == "file":
+        dist.touch()
+
+    def scan_directory(directory):
+        error = FileNotFoundError("private native scan detail")
+        error.winerror = winerror
+        raise error
+
+    probed = []
+
+    def stat_directory(directory):
+        probed.append(directory)
+        if entry_type == "denied":
+            raise PermissionError("private type probe detail")
+        if entry_type == "network-probe":
+            error = FileNotFoundError("private network type probe detail")
+            error.winerror = 53
+            raise error
+        return os.stat(directory)
+
+    invoke = distribution_verifier.record if command == "record" else distribution_verifier.verify
+    discover = partial(distribution_verifier.dists, scan_directory=scan_directory, stat_directory=stat_directory)
+    with pytest.raises(SystemExit) as error:
+        invoke(str(dist), discover=discover)
+    assert error.value.code == 1
+    assert capsys.readouterr() == ("", "verify_dist: " + detail + "\n")
+    assert probed == ([str(dist)] if winerror in (2, 3) else [])
+
+
+@pytest.mark.parametrize("failed_probe", ["is_symlink", "is_file", "is_dir"])
+def test_dist_inventory_refuses_entry_metadata_errors(distribution_verifier, tmp_path, capsys, failed_probe):
+    dist = _dist(tmp_path)
+    probes = []
+    closed = []
+
+    def inspect(probe):
+        probes.append(probe)
+        if probe == failed_probe:
+            raise PermissionError("private metadata detail")
+        return False
+
+    entry = SimpleNamespace(name="metadata.whl", is_symlink=lambda: inspect("is_symlink"),
+                            is_file=lambda *, follow_symlinks: inspect("is_file"),
+                            is_dir=lambda *, follow_symlinks: inspect("is_dir"))
+
+    @contextlib.contextmanager
+    def scan_directory(directory):
+        with os.scandir(directory) as scan:
+            wheel = next(item for item in scan if item.name.endswith(".whl"))
+            try:
+                yield iter((wheel, entry))
+            finally:
+                closed.append(True)
+
+    with pytest.raises(SystemExit) as error:
+        distribution_verifier.dists(str(dist), scan_directory=scan_directory)
+    assert error.value.code == 1
+    assert capsys.readouterr() == ("", "verify_dist: distribution directory is unreadable\n")
+    assert closed == [True] and probes[-1] == failed_probe
+    assert len(distribution_verifier.dists(str(dist))) == 2
+
+
+@pytest.mark.parametrize("command", ["record", "verify"])
+@pytest.mark.parametrize("suffix,kind", [(".whl", "wheel"), (".tar.gz", "sdist")], ids=["wheel", "sdist"])
+@pytest.mark.parametrize("mode,shape", [
+    (None, None), (stat.S_IFIFO, "other"), (stat.S_IFREG, "file"),
+    (stat.S_IFDIR, "directory"), (stat.S_IFLNK, "symlink"),
+], ids=["vanished", "special", "regular", "directory", "symlink"])
+def test_dist_inventory_confirms_all_negative_entry_types(
+        distribution_verifier, tmp_path, capsys, command, suffix, kind, mode, shape):
+    dist = _dist(tmp_path)
+    _write_sums(dist)
+    sums = dist / "SHA256SUMS"
+    original = sums.read_bytes()
+    regular_names = sorted(path.name for path in dist.iterdir() if path != sums)
+    name = "00-inspected" + suffix
+    events = []
+
+    def negative_type(*, follow_symlinks):
+        assert follow_symlinks is False
+        return False
+
+    def stat_entry(*, follow_symlinks):
+        assert follow_symlinks is False
+        events.append("stat")
+        if mode is None:
+            raise FileNotFoundError("private detail for a vanished entry")
+        return SimpleNamespace(st_mode=mode | 0o644)
+
+    entry = SimpleNamespace(name=name, is_symlink=lambda: False, is_file=negative_type,
+                            is_dir=negative_type, stat=stat_entry)
+
+    def entries(scan):
+        yield from scan
+        yield entry
+
+    @contextlib.contextmanager
+    def scan_directory(directory):
+        try:
+            with os.scandir(directory) as scan:
+                yield entries(scan)
+        finally:
+            events.append("closed")
+
+    invoke = distribution_verifier.record if command == "record" else distribution_verifier.verify
+    discover = partial(distribution_verifier.dists, scan_directory=scan_directory)
+    with pytest.raises(SystemExit) as error:
+        invoke(str(dist), discover=discover)
+    assert error.value.code == 1
+    if mode is None:
+        detail = "distribution directory is unreadable"
+    else:
+        wheels = 2 if kind == "wheel" and shape == "file" else 1
+        sdists = 2 if kind == "sdist" and shape == "file" else 1
+        irregular = 0 if shape == "file" else 1
+        wheel, sdist = regular_names
+        detail = (f"expected exactly one wheel and one sdist, found wheels={wheels}, sdists={sdists}, "
+                  f'irregular={irregular}, sample=[{kind} {shape} "{name}", wheel file "{wheel}", '
+                  f'sdist file "{sdist}"], omitted=0')
+    assert capsys.readouterr() == ("", "verify_dist: " + detail + "\n")
+    assert events == ["stat", "closed"]
+    assert sums.read_bytes() == original
+
+    invoke(str(dist))
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    if command == "record":
+        assert captured.out.encode("utf-8") == sums.read_bytes()
+    else:
+        assert captured.out.splitlines() == [str(dist / name) for name in regular_names]
+
+
+def test_dist_inventory_escapes_quotes_and_backslashes(distribution_verifier, tmp_path, capsys):
+    name = 'item"\\, sdist symlink other.tar.gz.whl'
+    entry = SimpleNamespace(name=name, is_symlink=lambda: True)
+
+    def scan_directory(directory):
+        return contextlib.nullcontext(iter([entry]))
+
+    with pytest.raises(SystemExit) as error:
+        distribution_verifier.dists(str(tmp_path), scan_directory=scan_directory)
+    assert error.value.code == 1
+    assert capsys.readouterr() == (
+        "", "verify_dist: expected exactly one wheel and one sdist, found wheels=0, sdists=0, "
+        'irregular=1, sample=[wheel symlink "item\\\"\\\\, sdist symlink other.tar.gz.whl"], omitted=0\n')
+
+
+def test_dist_inventory_screens_control_characters(distribution_verifier, tmp_path, capsys):
+    name = "control\x1b[2J.whl"
+    entry = SimpleNamespace(name=name, is_symlink=lambda: True)
+
+    def scan_directory(directory):
+        return contextlib.nullcontext(iter([entry]))
+
+    with pytest.raises(SystemExit) as error:
+        distribution_verifier.dists(str(tmp_path), scan_directory=scan_directory)
+    assert error.value.code == 1
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:16]
+    captured = capsys.readouterr()
+    assert (captured.out, captured.err) == (
+        "", "verify_dist: expected exactly one wheel and one sdist, found wheels=0, sdists=0, "
+        'irregular=1, sample=[wheel symlink "member-sha256=' + digest + '"], omitted=0\n')
+
+
+@pytest.mark.parametrize("stage", ["open", "iterate"])
+def test_dist_inventory_refuses_scan_errors_and_retries(distribution_verifier, tmp_path, capsys, stage):
+    dist = _dist(tmp_path)
+    events = []
+
+    def entries(scan):
+        for entry in scan:
+            if entry.name.endswith(".whl"):
+                yield entry
+                break
+        raise FileNotFoundError("private diagnostic from an interrupted scan")
+
+    @contextlib.contextmanager
+    def interrupted_scan(directory):
+        with os.scandir(directory) as scan:
+            try:
+                yield entries(scan)
+            finally:
+                events.append("closed")
+
+    def denied_scan(directory):
+        raise PermissionError("private diagnostic from a denied scan")
+
+    scan_directory = denied_scan if stage == "open" else interrupted_scan
+    with pytest.raises(SystemExit) as error:
+        distribution_verifier.dists(str(dist), scan_directory=scan_directory)
+    assert error.value.code == 1
+    assert events == (["closed"] if stage == "iterate" else [])
+    captured = capsys.readouterr()
+    assert (captured.out, captured.err) == ("", "verify_dist: distribution directory is unreadable\n")
+    assert distribution_verifier.dists(str(dist)) == [str(next(dist.glob(pattern)))
+                                                    for pattern in ("*.whl", "*.tar.gz")]
+    assert capsys.readouterr() == ("", "")
+
+
 @pytest.mark.parametrize("kind", ["wheel-dir", "sdist-dir", "wheel-dot", "sdist-dot"])
 def test_dist_discovery_refuses_extra_archive_entries(tmp_path, kind):
     from concurrent.futures import ThreadPoolExecutor
@@ -2162,10 +2455,19 @@ def test_archive_entry_probe_counts_a_symlink_without_following(distribution_ver
 
     class _Other:
         def is_symlink(self):
-            raise OSError("unsupported")
+            return False
 
         def is_file(self, follow_symlinks=True):
-            raise OSError("unsupported")
+            assert not follow_symlinks
+            return False
+
+        def is_dir(self, follow_symlinks=True):
+            assert not follow_symlinks
+            return False
+
+        def stat(self, *, follow_symlinks):
+            assert follow_symlinks is False
+            return SimpleNamespace(st_mode=stat.S_IFIFO)
 
     assert distribution_verifier._entry_kind(_Symlink()) == "symlink"
     assert distribution_verifier._entry_kind(_Other()) == "other"
@@ -2259,3 +2561,381 @@ def test_wheel_smoke_refuses_when_source_can_shadow_site_packages():
     proc = subprocess.run([sys.executable, SMOKE], capture_output=True,
                           text=True, timeout=60, env=env, cwd=REPO_ROOT)
     assert proc.returncode == 1 and "-I" in proc.stderr
+
+
+def _namespace_entries(kind, rows):
+    """Archive members for one per-parent namespace case. No host symlinks."""
+    prefix = "release/" if kind == "sdist" else ""
+    file_mode = stat.S_IFREG if kind == "wheel" else tarfile.REGTYPE
+    dir_mode = stat.S_IFDIR if kind == "wheel" else tarfile.DIRTYPE
+    entries = []
+    for path, shape in rows:
+        directory = shape == "directory"
+        name = prefix + path
+        if directory and not name.endswith("/"):
+            name += "/"
+        payload = b"" if directory else b"payload"
+        entries.append((name, dir_mode if directory else file_mode, payload))
+    return entries
+
+
+def _namespace_shown(kind, path, shape):
+    """The name verify_dist echoes. Zip keeps one directory slash; tar does not."""
+    name = ("release/" if kind == "sdist" else "") + path
+    if shape == "directory" and kind == "wheel" and not name.endswith("/"):
+        name += "/"
+    return name
+
+
+def _assert_namespace_message(dist, message):
+    """Both release commands refuse with one canonical line and do not write sums."""
+    recorded = _verify("record", str(dist))
+    assert not (dist / "SHA256SUMS").exists(), recorded.stderr
+    _write_sums(dist)
+    verified = _verify("verify", str(dist))
+    expected = "verify_dist: " + message + "\n"
+    assert recorded.returncode == 1 and recorded.stderr == expected, recorded.stderr
+    assert verified.returncode == 1 and verified.stderr == expected, verified.stderr
+    assert "Traceback" not in recorded.stderr
+
+
+def _namespace_conflict_message(kind, member, incoming, existing):
+    prefix, shape = incoming
+    previous, previous_shape = existing
+    reason = "spelling conflict" if shape == previous_shape else "file/directory conflict"
+    part, previous_part = prefix.rsplit("/", 1)[-1], previous.rsplit("/", 1)[-1]
+    return (f"duplicate {kind} member: {member[:_MEMBER_TEXT_LIMIT]} ({reason}: "
+            f"component {part[:_MEMBER_TEXT_LIMIT]} [{shape}], "
+            f"existing component {previous_part[:_MEMBER_TEXT_LIMIT]} [{previous_shape}], "
+            f"conflicting prefix: {prefix[:_MEMBER_TEXT_LIMIT]}, "
+            f"existing prefix: {previous[:_MEMBER_TEXT_LIMIT]})")
+
+
+def _component_file_conflict_cases():
+    """Pairs whose full folded paths differ. The collision is one component."""
+    rows = (
+        ("spelling", "aegis_core/Foo", "/a.py", "aegis_core/foo", "/b.py", ("wheel", "sdist")),
+        ("kind", "aegis_core/foo.py", "", "aegis_core/foo.py", "/bar.py", ("wheel", "sdist")),
+        ("kind-case", "aegis_core/Foo.py", "", "aegis_core/foo.py", "/bar.py", ("wheel", "sdist")),
+        ("deep", "aegis_core/foo/Bar", "/a.py", "aegis_core/foo/bar", "/b.py", ("wheel", "sdist")),
+        ("template", "aegis_core/team_templates/Roles", "/a.json",
+         "aegis_core/team_templates/roles", "/b.json", ("wheel", "sdist")),
+        ("sdist-tree", "guide/Foo", "/a.txt", "guide/foo", "/b.txt", ("sdist",)),
+    )
+    cases = []
+    ids = []
+    for label, left, left_suffix, right, right_suffix, kinds in rows:
+        for kind in kinds:
+            cases.append((kind, (left, left_suffix), (right, right_suffix)))
+            ids.append(kind + "-" + label)
+    return tuple(cases), tuple(ids)
+
+
+_COMPONENT_FILE_CONFLICTS, _COMPONENT_FILE_CONFLICT_IDS = _component_file_conflict_cases()
+
+
+@pytest.mark.parametrize("kind,left,right", _COMPONENT_FILE_CONFLICTS, ids=_COMPONENT_FILE_CONFLICT_IDS)
+def test_per_parent_namespace_refuses_conflicting_files(tmp_path, kind, left, right):
+    """Each parent has one spelling and one kind, in either member order."""
+    for index, (first, second) in enumerate(((left, right), (right, left))):
+        root = tmp_path / str(index)
+        root.mkdir()
+        rows = ((first[0] + first[1], "file"), (second[0] + second[1], "file"))
+        shown = _namespace_shown(kind, rows[1][0], "file")
+        incoming = (_namespace_shown(kind, second[0], "file"), "directory" if second[1] else "file")
+        existing = (_namespace_shown(kind, first[0], "file"), "directory" if first[1] else "file")
+        dist = _admission_dist(root, kind, _namespace_entries(kind, rows))
+        _assert_namespace_message(dist, _namespace_conflict_message(kind, shown, incoming, existing))
+
+
+@pytest.mark.parametrize("kind", ["wheel", "sdist"])
+@pytest.mark.parametrize("order", ["file-first", "directory-first"])
+def test_per_parent_namespace_refuses_explicit_directory_spelling(tmp_path, kind, order):
+    file_row = ("aegis_core/team_templates/roles/probe.json", "file")
+    dir_row = ("aegis_core/team_templates/Roles", "directory")
+    rows = (file_row, dir_row) if order == "file-first" else (dir_row, file_row)
+    shown = _namespace_shown(kind, dir_row[0], "directory")
+    incoming = (_namespace_shown(kind, dir_row[0], "file"), "directory")
+    existing = (_namespace_shown(kind, "aegis_core/team_templates/roles", "file"), "directory")
+    dist = _admission_dist(tmp_path, kind, _namespace_entries(kind, rows))
+    _assert_namespace_message(dist, _namespace_conflict_message(kind, shown, incoming, existing))
+
+
+@pytest.mark.parametrize("kind", ["wheel", "sdist"])
+@pytest.mark.parametrize("order", ["parent-first", "child-first"])
+def test_per_parent_namespace_requires_directory_descendant(tmp_path, kind, order):
+    parent = ("aegis_core/team_templates/roles", "directory")
+    child = ("aegis_core/team_templates/roles/sub", "directory")
+    rows = (parent, child) if order == "parent-first" else (child, parent)
+    shown = _namespace_shown(kind, rows[0][0], "directory")
+    dist = _admission_dist(tmp_path, kind, _namespace_entries(kind, rows))
+    _assert_namespace_message(dist, "unexpected " + kind + " member: " + shown)
+
+
+def _component_accept_cases():
+    rows = (
+        ("siblings", (
+            ("aegis_core/foo/a.py", "file"),
+            ("aegis_core/foo/b.py", "file"),
+        ), ("wheel", "sdist")),
+        ("explicit-dir", (
+            ("aegis_core/foo/a.py", "file"),
+            ("aegis_core/foo", "directory"),
+        ), ("wheel", "sdist")),
+        ("template-dir", (
+            ("aegis_core/team_templates/roles/probe.json", "file"),
+            ("aegis_core/team_templates/roles", "directory"),
+        ), ("wheel", "sdist")),
+        ("nested", (
+            ("aegis_core/team_templates/roles/sub/probe.json", "file"),
+            ("aegis_core/team_templates/roles", "directory"),
+            ("aegis_core/team_templates/roles/sub", "directory"),
+        ), ("wheel", "sdist")),
+        ("sdist-siblings", (
+            ("guide/foo/a.txt", "file"),
+            ("guide/foo/b.txt", "file"),
+        ), ("sdist",)),
+    )
+    cases = []
+    ids = []
+    for label, tree, kinds in rows:
+        for kind in kinds:
+            cases.append((kind, tree))
+            ids.append(kind + "-" + label)
+    return tuple(cases), tuple(ids)
+
+
+_COMPONENT_ACCEPT_CASES, _COMPONENT_ACCEPT_IDS = _component_accept_cases()
+
+
+@pytest.mark.parametrize("kind,tree", _COMPONENT_ACCEPT_CASES, ids=_COMPONENT_ACCEPT_IDS)
+def test_per_parent_namespace_accepts_consistent_members(tmp_path, kind, tree):
+    """Implicit parents, explicit directories and every member order both install."""
+    import itertools
+
+    for index, ordered in enumerate(itertools.permutations(tree)):
+        root = tmp_path / str(index)
+        root.mkdir()
+        dist = _admission_dist(root, kind, _namespace_entries(kind, ordered))
+        _assert_both_admission_commands(dist, True)
+
+
+@pytest.mark.parametrize("kind", ["wheel", "sdist"])
+def test_per_parent_namespace_retries_and_stays_isolated(tmp_path, kind):
+    from concurrent.futures import ThreadPoolExecutor
+
+    good_root, bad_root = tmp_path / "good", tmp_path / "bad"
+    good_root.mkdir()
+    bad_root.mkdir()
+    good = _admission_dist(good_root, kind, _namespace_entries(kind, (
+        ("aegis_core/foo/a.py", "file"),)))
+    bad = _admission_dist(bad_root, kind, _namespace_entries(kind, (
+        ("aegis_core/foo/a.py", "file"),
+        ("aegis_core/Foo/b.py", "file"),
+    )))
+    shown = _namespace_shown(kind, "aegis_core/Foo/b.py", "file")
+    incoming = (_namespace_shown(kind, "aegis_core/Foo", "file"), "directory")
+    existing = (_namespace_shown(kind, "aegis_core/foo", "file"), "directory")
+    expected = "verify_dist: " + _namespace_conflict_message(kind, shown, incoming, existing) + "\n"
+    assert _verify("record", str(good)).returncode == 0
+    assert _verify("record", str(good)).returncode == 0
+    _write_sums(bad)
+    preserved = (bad / "SHA256SUMS").read_bytes()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for command in ("record", "verify"):
+            accepted, refused = pool.map(
+                lambda dist, command=command: _verify(command, str(dist)), (good, bad))
+            assert accepted.returncode == 0, accepted.stderr
+            assert refused.returncode == 1 and refused.stderr == expected, refused.stderr
+            assert "Traceback" not in refused.stderr
+            assert (bad / "SHA256SUMS").read_bytes() == preserved
+    pattern = "*.whl" if kind == "wheel" else "*.tar.gz"
+    next(bad.glob(pattern)).write_bytes(next(good.glob(pattern)).read_bytes())
+    for command in ("record", "verify"):
+        retried = _verify(command, str(bad))
+        assert retried.returncode == 0, retried.stderr
+
+
+@pytest.mark.parametrize("kind", ["wheel", "sdist"])
+def test_component_index_records_spelling_kind_and_explicit_state(distribution_verifier, kind):
+    prefix = "release/" if kind == "sdist" else ""
+    file_type = stat.S_IFREG if kind == "wheel" else tarfile.REGTYPE
+    dir_type = stat.S_IFDIR if kind == "wheel" else tarfile.DIRTYPE
+    file_name = prefix + "aegis_core/team_templates/roles/probe.json"
+    other_name = prefix + "aegis_core/team_templates/roles/other.json"
+    dir_name = prefix + "aegis_core/team_templates/roles" + ("/" if kind == "wheel" else "")
+    state = distribution_verifier._admission_state()
+    assert distribution_verifier.admit_member(
+        kind, file_name, file_name, file_type, 2, state, mode=0o644) == "admitted"
+    parent = distribution_verifier._fold_key(prefix + "aegis_core/team_templates")
+    assert state["components"][parent]["roles"] == ("roles", "directory", False)
+    assert distribution_verifier.admit_member(
+        kind, other_name, other_name, file_type, 2, state, mode=0o644) == "admitted"
+    assert state["components"][parent]["roles"] == ("roles", "directory", False)
+    assert distribution_verifier.admit_member(
+        kind, dir_name, dir_name, dir_type, 0, state, mode=0) == "admitted"
+    assert state["components"][parent]["roles"] == ("roles", "directory", True)
+    leaf_parent = distribution_verifier._fold_key(prefix + "aegis_core/team_templates/roles")
+    assert state["components"][leaf_parent]["probe.json"] == ("probe.json", "file", False)
+    root_part = "release" if kind == "sdist" else "aegis_core"
+    assert state["components"][""][distribution_verifier._fold_part(root_part)] == (
+        root_part, "directory", False)
+
+
+@pytest.mark.parametrize("first,second,incoming,existing", [
+    ("aegis_core/foo.py", "aegis_core/foo.py/bar.py",
+     ("aegis_core/foo.py", "directory"), ("aegis_core/foo.py", "file")),
+    ("aegis_core/Foo/a.py", "aegis_core/foo/b.py",
+     ("aegis_core/foo", "directory"), ("aegis_core/Foo", "directory")),
+], ids=["kind-conflict", "spelling-conflict"])
+def test_component_conflict_does_not_mutate_admission_state(
+        distribution_verifier, capsys, first, second, incoming, existing):
+    import copy
+
+    state = distribution_verifier._admission_state()
+    assert distribution_verifier.admit_member(
+        "wheel", first, first, stat.S_IFREG, 1, state, mode=0o644) == "admitted"
+    snapshot = copy.deepcopy(state)
+    with pytest.raises(SystemExit) as error:
+        distribution_verifier.admit_member(
+            "wheel", second, second, stat.S_IFREG, 1, state, mode=0o644)
+    assert error.value.code == 1
+    assert state == snapshot
+    expected = _namespace_conflict_message("wheel", second, incoming, existing)
+    assert capsys.readouterr().err == "verify_dist: " + expected + "\n"
+
+
+def test_component_index_threads_do_not_share_state(distribution_verifier):
+    from concurrent.futures import ThreadPoolExecutor
+
+    def walk(pair):
+        first, second = pair
+        state = distribution_verifier._admission_state()
+        admitted = distribution_verifier.admit_member(
+            "wheel", first, first, stat.S_IFREG, 1, state, mode=0o644)
+        try:
+            distribution_verifier.admit_member(
+                "wheel", second, second, stat.S_IFREG, 1, state, mode=0o644)
+        except SystemExit as error:
+            return admitted, error.code, set(state["names"])
+        return admitted, 0, set(state["names"])
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        good, bad = pool.map(walk, (
+            ("aegis_core/foo/a.py", "aegis_core/foo/b.py"),
+            ("aegis_core/Foo/a.py", "aegis_core/foo/b.py"),
+        ))
+    assert good == ("admitted", 0, {"aegis_core/foo/a.py", "aegis_core/foo/b.py"})
+    assert bad[0] == "admitted" and bad[1] == 1
+    assert bad[2] == {"aegis_core/Foo/a.py"}
+
+
+def test_explicit_directory_missing_descendant_is_refused(distribution_verifier, capsys):
+    state = {"components": {"": {"roles": ("roles", "directory", True)}}}
+    with pytest.raises(SystemExit) as error:
+        distribution_verifier._refuse_orphan_directories("wheel", state)
+    assert error.value.code == 1
+    assert capsys.readouterr().err == "verify_dist: unexpected wheel member: directory\n"
+    state["components"]["roles"] = {"probe.json": ("probe.json", "file", False)}
+    distribution_verifier._refuse_orphan_directories("sdist", state)
+    assert capsys.readouterr().err == ""
+    distribution_verifier._refuse_orphan_directories("wheel", {"components": {}})
+
+
+@pytest.mark.parametrize("kind", ["wheel", "sdist"])
+@pytest.mark.parametrize("reverse", [False, True], ids=["forward", "reverse"])
+@pytest.mark.parametrize("same_leaf", [False, True], ids=["component", "folded-alias"])
+def test_namespace_conflict_screens_each_prefix(tmp_path, kind, reverse, same_leaf):
+    base = "aegis_core/" + "a" * 130 + "/" + "b" * 130 + "/"
+    assert len(base) > _MEMBER_TEXT_LIMIT
+    early = (base + "Upper", "first.py")
+    late = (base + "upper", "first.py" if same_leaf else "second.py")
+    first, second = (late, early) if reverse else (early, late)
+    rows = [(prefix + "/" + leaf, "file") for prefix, leaf in (first, second)]
+    dist = _admission_dist(tmp_path, kind, _namespace_entries(kind, rows))
+    shown = _namespace_shown(kind, rows[1][0], "file")
+    incoming = _namespace_shown(kind, second[0], "file")
+    previous = _namespace_shown(kind, first[0], "file")
+    _assert_namespace_message(
+        dist, _namespace_conflict_message(kind, shown, (incoming, "directory"), (previous, "directory")))
+
+
+@pytest.mark.parametrize("kind", ["wheel", "sdist"])
+@pytest.mark.parametrize("reverse", [False, True], ids=["forward", "reverse"])
+@pytest.mark.parametrize("left_leaf,right_leaf,left_shape,right_shape,reason", [
+    ("/First.py", "/second.py", "directory", "directory", "spelling conflict"),
+    ("/First.py", "/first.py", "directory", "directory", "spelling conflict"),
+    ("", "/first.py", "file", "directory", "file/directory conflict"),
+], ids=["component", "folded-alias", "mixed-kind"])
+def test_namespace_conflict_excerpts_include_the_first_spelling_difference(
+        tmp_path, kind, reverse, left_leaf, right_leaf, left_shape, right_shape, reason):
+    before, after = "x" * _MEMBER_TEXT_LIMIT, "y" * _MEMBER_TEXT_LIMIT
+    left = (before + "A" + after + ".py", left_leaf, left_shape, "A")
+    right = (before + "a" + after + ".py", right_leaf, right_shape, "a")
+    existing, incoming = (right, left) if reverse else (left, right)
+    rows = [("aegis_core/" + part + leaf, "file") for part, leaf, _, _ in (existing, incoming)]
+    dist = _admission_dist(tmp_path, kind, _namespace_entries(kind, rows))
+    _write_sums(dist)
+    sums = dist / "SHA256SUMS"
+    original = sums.read_bytes()
+
+    for command in ("record", "verify"):
+        result = _verify(command, str(dist))
+        # Verify emits each checked path before validating the next archive.
+        stdout = str(next(dist.glob("*.whl"))) + "\n" if command == "verify" and kind == "sdist" else ""
+        assert (result.returncode, result.stdout) == (1, stdout)
+        match = re.fullmatch(
+            rf"verify_dist: duplicate {kind} member: (.+) \({re.escape(reason)}: "
+            r"component (.+) \[(file|directory)\], existing component (.+) \[(file|directory)\], "
+            r"conflicting prefix: (.+), existing prefix: (.+)\)\n", result.stderr)
+        assert match, result.stderr
+        member, part, shape, old_part, old_shape, prefix, old_prefix = match.groups()
+        for excerpt, actual_kind, relative, expected in (
+                (part, shape, prefix, incoming), (old_part, old_shape, old_prefix, existing)):
+            component, _, expected_kind, letter = expected
+            assert actual_kind == expected_kind
+            assert len(excerpt) <= _MEMBER_TEXT_LIMIT
+            assert re.fullmatch(r"\.{3}x+" + letter + r"y+\.{3}", excerpt), excerpt
+            shown = _namespace_shown(kind, "aegis_core/" + component, "file")
+            assert relative == shown[:_MEMBER_TEXT_LIMIT]
+        assert member == _namespace_shown(kind, rows[1][0], "file")[:_MEMBER_TEXT_LIMIT]
+        assert sums.read_bytes() == original
+
+
+@pytest.mark.parametrize("kind", ["wheel", "sdist"])
+@pytest.mark.parametrize("first,second", [
+    ("file", "file"), ("file", "directory"), ("directory", "file"), ("directory", "directory"),
+], ids=["file-duplicate", "file-first", "directory-first", "directory-duplicate"])
+def test_namespace_exact_name_refusal_consults_only_leaf(distribution_verifier, capsys, kind, first, second):
+    lookups = []
+
+    class CountedIndex(dict):
+        def get(self, key, default=None):
+            lookups.append(key)
+            return super().get(key, default)
+
+    state = distribution_verifier._admission_state()
+    path = "aegis_core/" + "parent/" * 64 + "probe.py"
+    file_type = stat.S_IFREG if kind == "wheel" else tarfile.REGTYPE
+    dir_type = stat.S_IFDIR if kind == "wheel" else tarfile.DIRTYPE
+
+    def admit(path, shape):
+        name = _namespace_shown(kind, path, shape)
+        mode = file_type if shape == "file" else dir_type
+        return distribution_verifier.admit_member(kind, name, name, mode, 0, state)
+
+    if first == "directory":
+        assert admit(path + "/child.py", "file") == "admitted"
+    assert admit(path, first) == "admitted"
+    state["components"] = CountedIndex(state["components"])
+    with pytest.raises(SystemExit) as error:
+        admit(path, second)
+    assert error.value.code == 1
+    assert lookups == [_namespace_shown(kind, path, "file").rsplit("/", 1)[0]]
+    name = _namespace_shown(kind, path, second)
+    prefix = _namespace_shown(kind, path, "file")
+    if first == second:
+        message = "duplicate " + kind + " member: " + name[:_MEMBER_TEXT_LIMIT]
+    else:
+        message = _namespace_conflict_message(kind, name, (prefix, second), (prefix, first))
+    assert capsys.readouterr() == ("", "verify_dist: " + message + "\n")

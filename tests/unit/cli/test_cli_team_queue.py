@@ -106,11 +106,11 @@ CLI_BYTE_GOLDENS = {'team model/text/help': '532200670f8b5b09d6cb0987738defddab0
  'team queue compact/json/malformed': 'ba8f7e0d3282be2939562f05a367cd1be9b9fa507d02c11e6b5d507055e4e85f',
  'team queue compact/json/oversized': 'ba8f7e0d3282be2939562f05a367cd1be9b9fa507d02c11e6b5d507055e4e85f',
  'team config show/text/help': '99b4216fef9182f001615d635b089d074c3a8f9ac963883d47aa56d96f770e3c',
- 'team config show/text/missing': 'd6ec215e55a753f856208e60a301db1acaf9bf8929606cedd0c7531f411de13a',
+ 'team config show/text/missing': 'c2093ef430433606f8499845ed404a4368c8c6dc11a89968074b3a6833980f79',
  'team config show/text/malformed': 'ab3ce0306fdf22b1defb7ef22f3b6102177138d008ea9ec1499a4058db91d65a',
  'team config show/text/oversized': '8902de7d0dc899f5f8fe1ba099b3ad8bd16e42105c8533e9af2650dc9ad37e3d',
  'team config show/json/help': '99b4216fef9182f001615d635b089d074c3a8f9ac963883d47aa56d96f770e3c',
- 'team config show/json/missing': 'd6ec215e55a753f856208e60a301db1acaf9bf8929606cedd0c7531f411de13a',
+ 'team config show/json/missing': 'c2093ef430433606f8499845ed404a4368c8c6dc11a89968074b3a6833980f79',
  'team config show/json/malformed': 'ab3ce0306fdf22b1defb7ef22f3b6102177138d008ea9ec1499a4058db91d65a',
  'team config show/json/oversized': '8902de7d0dc899f5f8fe1ba099b3ad8bd16e42105c8533e9af2650dc9ad37e3d',
  'team config presets/text/help': 'e8eb19bd881f1b7fee1552302b2a33a62ca483ffd410f5851845145d9670caf3',
@@ -1777,8 +1777,8 @@ OPERATION_GOLDENS = {'cli-queue/unclaim/writer_live/text': '34e3221632188bc94d25
  'msg/verify/unsafe_store/json': 'd83be425b161695af6698fc77a3924fd6c40ea51aeb361041b637f032b834177',
  'msg/verify/unsupported/json': '976ce16c911133889767fae77ab8fed7565f5c43cb42b8b4a27ef412dca38968',
  'msg/verify/io/json': '5d29360e7557f29ade7744a785e9ab1d0ba66d50118fdd08bba4588370f7a60c',
- 'profile/config show/valid/text': 'dd71353ac81aaaeeed0493687f1cc39507a60d45560aa8fa5236129f6da83a2c',
- 'profile/config show/valid/json': 'dd71353ac81aaaeeed0493687f1cc39507a60d45560aa8fa5236129f6da83a2c',
+ 'profile/config show/valid/text': 'bb7abd39a7839d62a7b5af2c597c4e512747e8d48a8706d48c9a395c6e7b9de9',
+ 'profile/config show/valid/json': 'bb7abd39a7839d62a7b5af2c597c4e512747e8d48a8706d48c9a395c6e7b9de9',
  'profile/config show/oversized/text': '8902de7d0dc899f5f8fe1ba099b3ad8bd16e42105c8533e9af2650dc9ad37e3d',
  'profile/config show/oversized/json': '8902de7d0dc899f5f8fe1ba099b3ad8bd16e42105c8533e9af2650dc9ad37e3d',
  'profile/config show/invalid_profile/text': 'e9d9d54c2c7b942a6a90de408b3c2159deca4b0d410e8ec91ded122d2dfd4032',
@@ -1787,8 +1787,8 @@ OPERATION_GOLDENS = {'cli-queue/unclaim/writer_live/text': '34e3221632188bc94d25
  'profile/config presets/valid/json': '95009f06d74e498b53fc3b35039f5b9b0c527465edac9260a2a9f8dc75a1ffdc',
  'profile/config presets/oversized/text': '8902de7d0dc899f5f8fe1ba099b3ad8bd16e42105c8533e9af2650dc9ad37e3d',
  'profile/config presets/oversized/json': '8902de7d0dc899f5f8fe1ba099b3ad8bd16e42105c8533e9af2650dc9ad37e3d',
- 'profile/config init/valid/text': '46dfe9feb53833a169955ee7555970103898632ec84c37937367faa2e376bf0a',
- 'profile/config init/valid/json': '46dfe9feb53833a169955ee7555970103898632ec84c37937367faa2e376bf0a',
+ 'profile/config init/valid/text': '8bb41f0d2c830642d86e7504731898ff941441cb524617dfdcf2bbd1eb2e87f4',
+ 'profile/config init/valid/json': '8bb41f0d2c830642d86e7504731898ff941441cb524617dfdcf2bbd1eb2e87f4',
  'profile/config init/oversized/text': '8902de7d0dc899f5f8fe1ba099b3ad8bd16e42105c8533e9af2650dc9ad37e3d',
  'profile/config init/oversized/json': '8902de7d0dc899f5f8fe1ba099b3ad8bd16e42105c8533e9af2650dc9ad37e3d',
  'profile/config init/invalid_profile/text': 'e9d9d54c2c7b942a6a90de408b3c2159deca4b0d410e8ec91ded122d2dfd4032',
@@ -2236,7 +2236,7 @@ def _compat_message_setup(root, verb, case):
     elif case == "unsafe_store":
         directory.chmod(0o777)
     elif case == "hash":
-        (directory / (rid + ".json")).write_bytes(b"{}")
+        (directory / rid[:2] / (rid + ".json")).write_bytes(b"{}")
     if verb == "write":
         argv = ["msg", "--store", str(directory), "write", "--kind", "text", "--in", str(source)]
     else:

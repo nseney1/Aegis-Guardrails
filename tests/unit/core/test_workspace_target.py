@@ -173,6 +173,14 @@ def test_relative_git_paths_use_the_binding_not_process_cwd(target_repo, target_
     assert tree(target_repo.root) == before
 
 
+# A CR or LF that remains after the trailing framing run. Space and TAB stay data.
+_EMBEDDED_RECORD_BREAKS = (
+    ("line\nbreak", "admin\ninside"),
+    ("worktree\r", "admin"),
+    ("worktree\n", "admin"),
+)
+
+
 @pytest.mark.parametrize("root_name,admin_name", [
     pytest.param(" worktree ", " admin ", marks=pytest.mark.skipif(
         os.name == "nt", reason="Ordinary Windows filesystem calls normalize trailing spaces in path components")),
@@ -201,10 +209,19 @@ def test_git_path_whitespace_is_data(target_home, tmp_path, root_name, admin_nam
             assert result.returncode == 0 and result.stdout == os.fsencode(expected) + b"\n"
     before = tree(tmp_path)
     doc = observe_target(WorkspaceBinding("bound", repo.root, "cli_workspace", "operator"))
-    assert doc["status"] == "observed"
-    assert doc["repository"] == {"status": "observed", "reason": None,
-        "common_dir": str(admin.resolve(strict=True)), "worktree_root": str(repo.root.resolve(strict=True))}
-    assert doc["head"]["oid"] == expected_head
+    if (root_name, admin_name) in _EMBEDDED_RECORD_BREAKS:
+        # Git still reports the path. The selecting record fails closed, so the
+        # diagnostic identity stays the existing unknown document.
+        assert doc["status"] == "unknown" and doc["reason"] == "unverified_git_link"
+        assert doc["binding"]["root"] == str(repo.root)
+        assert doc["repository"] == {"status": "unknown", "reason": "unverified_git_link",
+                                     "common_dir": None, "worktree_root": None}
+        assert doc["head"] == {"status": "unknown", "reason": "unverified_git_link", "oid": None}
+    else:
+        assert doc["status"] == "observed"
+        assert doc["repository"] == {"status": "observed", "reason": None,
+            "common_dir": str(admin.resolve(strict=True)), "worktree_root": str(repo.root.resolve(strict=True))}
+        assert doc["head"]["oid"] == expected_head
     # Negative control: the separate-git-dir checkout itself has no back-link.
     control = observe_target(WorkspaceBinding("bound", main.root.resolve(), "cli_workspace", "operator"))
     assert control["status"] == "unknown" and control["reason"] == "unverified_git_link"
@@ -472,8 +489,11 @@ def _git_link_case(case, tmp_path, target_home):
                 "backlink_two_newlines": b"\n\n", "backlink_missing": None}[case]
         if tail is None:
             (admin / "gitdir").unlink()
-        else:
-            (admin / "gitdir").write_bytes(back + tail)
+            return wt, "unverified_git_link", None
+        (admin / "gitdir").write_bytes(back + tail)
+        # A trailing CR/LF run is Git's framing. A trailing space is part of the name.
+        if case in ("backlink_crlf", "backlink_two_newlines"):
+            return wt, None, main.root / ".git"
         return wt, "unverified_git_link", None
     if case == "commondir_elsewhere":
         wt = linked(main, tmp_path / "wt").root
@@ -494,6 +514,55 @@ def _git_link_case(case, tmp_path, target_home):
         (root / ".git").write_bytes(b"not a gitdir pointer\n")
         return root, "not_a_repository", None
     raise AssertionError(case)
+
+
+def _cr_sibling(path: Path) -> Path:
+    """The directory or file whose name is ``path`` plus a trailing CR."""
+    return Path(os.fsdecode(os.fsencode(path) + b"\r"))
+
+
+def _absolute_git_path(root: Path, flag: str) -> Path:
+    reported = Path(hg.git(root, "rev-parse", flag))
+    return reported.resolve() if reported.is_absolute() else (root / reported).resolve()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a CR in a directory name is not a Windows path")
+@pytest.mark.parametrize("record", ["gitfile", "commondir", "gitdir"])
+def test_crlf_git_records_resolve_the_directory_git_uses(target_home, tmp_path, record):
+    """A trailing CRLF record names the plain path, with the CR-suffixed sibling present."""
+    from aegis_core.workspace.target import observe_target
+
+    main = hg.Repo(tmp_path / "main", hg.Home(target_home))
+    main.write("app.py", "x = 1\n")
+    main.commit()
+    wt = linked(main, tmp_path / "wt").root
+    admin = _absolute_git_path(wt, "--absolute-git-dir")
+    if record == "gitfile":
+        record_path = wt / ".git"
+        decoy = _cr_sibling(admin)
+        decoy.mkdir()
+        (decoy / "HEAD").write_bytes(b"ref: refs/heads/decoy\n")
+    elif record == "commondir":
+        record_path = admin / "commondir"
+        decoy = _cr_sibling(main.root / ".git")
+        decoy.mkdir()
+        (decoy / "HEAD").write_bytes(b"ref: refs/heads/decoy\n")
+    else:
+        record_path = admin / "gitdir"
+        decoy = _cr_sibling(wt / ".git")
+        decoy.write_bytes(b"gitdir: decoy\n")
+    raw = record_path.read_bytes()
+    assert raw.endswith(b"\n") and not raw.endswith(b"\r\n")
+    record_path.write_bytes(raw[:-1] + b"\r\n")
+    git_dir = _absolute_git_path(wt, "--absolute-git-dir")
+    git_common = _absolute_git_path(wt, "--git-common-dir")
+    assert git_dir == admin
+    doc = observe_target(WorkspaceBinding("bound", wt, "cli_workspace", "operator"))
+    assert doc["status"] == "observed" and doc["reason"] is None
+    assert doc["repository"]["common_dir"] == str(git_common)
+    assert doc["repository"]["worktree_root"] == str(wt)
+    assert doc["head"]["oid"] == literal_head(wt)
+    assert os.fsdecode(b"\r") not in doc["repository"]["common_dir"]
 
 
 @pytest.mark.parametrize("case", [
@@ -990,19 +1059,20 @@ def test_all_git_calls_have_bounded_capture_and_a_shared_budget(target_repo, mon
 
     real_run, budgets = gitsafe.run, []
 
+    from aegis_core.pathlookup_gitcache import bound_ordinary_root
+
+    armed = os.path.normcase(os.fspath(target_repo.root))
+
     def run(args, root, **kwargs):
         assert gitsafe.custody_active()
-        assert pathlookup.ordinary_root.get() == str(target_repo.root)
+        assert pathlookup.ordinary_root.get() == armed
         budgets.append(kwargs["timeout"])
         return real_run(args, root, **kwargs)
 
     monkeypatch.setattr(gitsafe, "run", run)
-    token = pathlookup.ordinary_root.set(str(target_repo.root))
-    try:
+    with bound_ordinary_root(target_repo.root):
         doc = observe_target(WorkspaceBinding("bound", target_repo.root, "cli_workspace", "operator"))
-        assert pathlookup.ordinary_root.get() == str(target_repo.root)
-    finally:
-        pathlookup.ordinary_root.reset(token)
+        assert pathlookup.ordinary_root.get() == armed
     assert doc["status"] == "observed"
     assert len(budgets) == 5 and all(0 < later < earlier for earlier, later in zip(budgets, budgets[1:]))
 

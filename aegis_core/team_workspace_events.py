@@ -6,7 +6,7 @@ import re
 
 from aegis_core.team_mailbox_primitives import (
     GIT_ID, MAX_RECORDS, MAX_WRITERS, SHA256, SLUG,
-    bounded_tree, integer, matching, strings, text,
+    bounded_tree, integer, matching, parse_time, strings, text,
 )
 from aegis_core.team_workspace_display import require, refusals
 
@@ -15,7 +15,7 @@ __all__ = [
     "DEFAULT_HEAVY_TESTS", "MAX_PRIORITY", "KINDS", "INITIATIVE_STATES", "LIMIT_FIELDS",
     "record", "key", "rows", "require_ledger", "path", "fields", "absolute",
     "evidence_reference", "validate_initiative", "validate_lists", "require_unclaimed_lanes",
-    "apply_event", "apply_init", "apply_set_limits", "apply_register", "apply_update",
+    "validate_envelope", "apply_event", "apply_init", "apply_set_limits", "apply_register", "apply_update",
     "apply_request", "apply_withdraw", "apply_grant", "apply_release", "apply_merge", "apply_clear",
 ]
 
@@ -29,6 +29,8 @@ MAX_PRIORITY = 1000
 KINDS = ("writer", "heavy", "heavy-tests")
 INITIATIVE_STATES = {"active", "paused", "done"}
 _FIELD_LIMIT = MAX_RECORDS
+# Report-only recovery is limited to queue events. Other kinds refuse a damaged time.
+_QUEUE_TIME_KINDS = frozenset(("request", "grant", "release", "withdraw"))
 
 
 def record(value):
@@ -54,7 +56,7 @@ def require_ledger(value):
     """Check the state and methods used by workspace transitions and views."""
     for name in ("initiatives", "requests", "granted_counts"):
         record(getattr(value, name, None))
-    require(isinstance(getattr(value, "seq", None), int))
+    require(type(getattr(value, "seq", None)) is int and 0 <= value.seq)
     require(type(getattr(value, "open_holders", None)) is set)
     require(all(callable(getattr(value, name, None)) for name in ("initiative", "request", "held", "unresolved")))
     limits = getattr(value, "limits", None)
@@ -131,6 +133,7 @@ def validate_lists(data):
 @refusals
 def apply_init(ledger, data, _event):
     require_ledger(ledger)
+    require(ledger.seq == 0)
     fields(data, {"writer_limit", "heavy_limit"}, {"heavy_tests_limit"})
     integer(data["writer_limit"], "writer_limit", maximum=MAX_WRITERS)
     integer(data["heavy_limit"], "heavy_limit", maximum=MAX_HEAVY)
@@ -157,6 +160,17 @@ def apply_set_limits(ledger, data, _event):
     for name in changes:
         ledger.limits[LIMIT_FIELDS[name][0]] = data[name]
 
+def _owned(value):
+    """Copy nested containers so a retained row does not alias its caller."""
+    kind = type(value)
+    if kind is dict:
+        return {key: _owned(item) for key, item in value.items()}
+    if kind is list:
+        return [_owned(item) for item in value]
+    if kind is tuple:
+        return tuple(_owned(item) for item in value)
+    return value
+
 @refusals
 def require_unclaimed_lanes(ledger, repository, lanes, identifier):
     require_ledger(ledger)
@@ -171,6 +185,8 @@ def require_unclaimed_lanes(ledger, repository, lanes, identifier):
 def apply_register(ledger, data, event):
     require_ledger(ledger)
     record(event)
+    bounded_tree(data)
+    data = _owned(data)
     validate_initiative(data)
     require(data["id"] not in ledger.initiatives)
     require_unclaimed_lanes(ledger, data["repository"], data.get("lanes", []), data["id"])
@@ -181,6 +197,8 @@ def apply_register(ledger, data, event):
 @refusals
 def apply_update(ledger, data, _event):
     require_ledger(ledger)
+    bounded_tree(data)
+    data = _owned(data)
     fields(data, {"initiative", "source"}, {"priority", "state", "blocked_by", "touched_paths", "checkouts", "lanes"})
     initiative = ledger.initiative(data["initiative"])
     text(data["source"], "source")
@@ -199,6 +217,8 @@ def apply_update(ledger, data, _event):
 def apply_request(ledger, data, event):
     require_ledger(ledger)
     record(event)
+    bounded_tree(data)
+    data = _owned(data)
     fields(data, {"request_id", "initiative", "kind", "holder"}, {"reference", "supersedes"})
     initiative = ledger.initiative(data["initiative"])
     require(initiative["state"] == "active")
@@ -221,7 +241,7 @@ def apply_request(ledger, data, event):
     require(previous is not None or holder not in ledger.open_holders)
     replacement = {**data, "state": "queued", "seq": previous["seq"] if previous is not None else event["seq"],
                    "requested_at": event["at"], "reserved_repository": initiative["repository"],
-                   "reserved_paths": list(initiative["touched_paths"])}
+                   "reserved_paths": _owned(initiative["touched_paths"])}
     if previous is not None:
         previous.update(state="withdrawn", closed_at=event["at"], superseded_by=data["request_id"])
     ledger.requests[data["request_id"]] = replacement
@@ -253,6 +273,8 @@ def apply_grant(ledger, data, event):
 def apply_release(ledger, data, event):
     require_ledger(ledger)
     record(event)
+    bounded_tree(data)
+    data = _owned(data)
     fields(data, {"request_id", "evidence"})
     evidence_reference(data["evidence"])
     request = ledger.request(data["request_id"])
@@ -289,6 +311,32 @@ def apply_clear(ledger, data, _event):
     initiative["base_moved"] = None
 
 @refusals
+def validate_envelope(event, expected_seq, *, recover_queue_time, max_records=MAX_RECORDS):
+    """Check schema, expected sequence and time before any transition.
+
+    recover_queue_time is the report-reader policy: a damaged time on a queue
+    event becomes None and the original mapping is left unchanged. Every other
+    damaged time is a refusal. Callers pass the only sequence this event may carry
+    and the record ceiling that sequence has to fit.
+    """
+    event = record(event)
+    fields(event, {"schema", "seq", "at", "kind", "data"})
+    require(key(event["schema"]) in REPLAY_SCHEMAS)
+    require(type(expected_seq) is int and expected_seq >= 1)
+    require(type(max_records) is int and max_records >= 1)
+    require(expected_seq <= max_records, reason="too_large")
+    require(type(event["seq"]) is int and event["seq"] == expected_seq)
+    require(type(recover_queue_time) is bool)
+    try:
+        parse_time(event["at"])
+    except ValueError:
+        kind = event["kind"]
+        if not (recover_queue_time and type(kind) is str and kind in _QUEUE_TIME_KINDS):
+            raise
+        event = {**event, "at": None}
+    return event
+
+@refusals
 def apply_event(ledger, event, transitions):
     """Apply one event using the store's public transition dispatch table."""
     event = record(event)
@@ -296,6 +344,8 @@ def apply_event(ledger, event, transitions):
     transition = record(transitions).get(kind)
     require(callable(transition))
     require(kind == "init" or ledger.limits is not None)
+    require(type(getattr(ledger, "seq", None)) is int)
+    require(ledger.seq == 0 if kind == "init" else ledger.seq >= 1)
     data, seq = event["data"], event["seq"]
     transition(ledger, data, event)
     ledger.seq = seq

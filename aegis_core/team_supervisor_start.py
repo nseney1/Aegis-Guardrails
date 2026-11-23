@@ -81,7 +81,7 @@ def _state_directory(home):
         info = handle.parent_stat()
         if info.st_uid != os.getuid() or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
             raise _Refusal("state_unavailable")
-        yield handle._parent
+        yield handle.parent_fd
 
 
 @contextmanager

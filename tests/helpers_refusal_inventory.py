@@ -26,6 +26,9 @@ EXACT is issued only by the closed PROVEN_PATTERNS allowlist in resolve().
 All other identities, layouts and states are UNKNOWN; joins retain every
 candidate. Unenumerable code/detail values use the reserved ANY whole-field
 sentinel. Closed escape-form guards still refuse unsupported constructs.
+The record-tool contract requires an exact CLOSED_REFUSAL_TABLE row for each
+concrete triple in the bounded inventory and for each explicit pin. Symbolic
+rows retain contributor evidence. The table loader rejects wildcard rows.
 Unknown values never acquire a convenient primitive default. The closed
 MODELLED_WRAPPERS and MODELLED_STORES tables prove the effects they support;
 other consumers get unknown_environment() and other binding effects widen to
@@ -55,6 +58,8 @@ import re
 from types import SimpleNamespace
 from time import monotonic
 
+from aegis_core.insights import redact_insight_text
+
 
 # Bounds apply to the abstract value graph, independently of Python's stack.
 INVENTORY_CANDIDATE_BOUND = 64
@@ -62,6 +67,8 @@ INVENTORY_DEPTH_BOUND = 64
 INVENTORY_WORK_BUDGET = 100000
 
 _REPO = Path(__file__).resolve().parents[1]
+# Captured before a test can point _REPO at a synthetic tree.
+_PRODUCTION_REPO = _REPO
 
 # Reserved whole-field sentinel in inventory results, never a substring glob.
 # (code, ANY) includes every detail for that code; (ANY, ANY) includes every
@@ -4072,15 +4079,275 @@ def _widened_refusal_inventory(model, callback_trace, analysis_stats):
     return tools, {name: HistoryRows(history) for name in tools}
 
 
-def reachable_refusal_pairs(*, sources=None, codec_sources=None, codec_trace=None, callback_trace=None, analysis_stats=None):
-    """Every (code, detail) from the adapter and guidance module's error sites.
+# Closed (tool, code, detail) contract. Kinds are accepted-action or
+# pinned-no-action. The ANY sentinel is not a row. Limits are applied before
+# a row is stored or matched. PINNED_EXPLICIT_REFUSALS are emissions the
+# symbolic inventory only represented with a wildcard; they stay explicit.
+_RECORD_TOOLS = frozenset(("mailbox_publish_record", "mailbox_read_record", "mailbox_digest"))
+_ROW_KINDS = frozenset(("accepted-action", "pinned-no-action"))
+_CODE_LIMIT = 32
+_DETAIL_LIMIT = 64
+_TABLE_LIMIT = 256
+_EMISSION_LIMIT = 1024
+_DISPLAY_LIMIT = 8
+_CODE_TOKEN = re.compile(r"E_[A-Z0-9_]+")
+_DETAIL_TOKEN = re.compile(r"[A-Za-z0-9_]*")
 
-    The call graph is the source. A hand list of tools cannot drop a pair that a
-    tool function reaches. Mailbox history is included where a reachable function
-    calls messages(). Binding history is included where call() checks the binding
-    through _checked before that tool. A handler that replaces an empty E_LIMIT
-    keeps the replacement detail only.
+
+PINNED_EXPLICIT_REFUSALS = frozenset((
+    ("mailbox_digest", "E_AUTH", "operation"),
+    ("mailbox_digest", "E_FORMAT", ""),
+    ("mailbox_digest", "E_HASH", ""),
+    ("mailbox_digest", "E_LIMIT", "digest_view_minimum"),
+    ("mailbox_digest", "E_SELECTOR", ""),
+    ("mailbox_publish_record", "E_AUTH", "operation"),
+    ("mailbox_publish_record", "E_FORMAT", ""),
+    ("mailbox_publish_record", "E_HASH", ""),
+    ("mailbox_publish_record", "E_SELECTOR", ""),
+    ("mailbox_read_record", "E_AUTH", "operation"),
+    ("mailbox_read_record", "E_FORMAT", ""),
+    ("mailbox_read_record", "E_HASH", ""),
+    ("mailbox_read_record", "E_SELECTOR", ""),
+))
+
+
+CLOSED_REFUSAL_TABLE = (
+    ("mailbox_digest", "E_AUTH", "", "pinned-no-action"),
+    ("mailbox_digest", "E_AUTH", "attribution", "accepted-action"),
+    ("mailbox_digest", "E_AUTH", "binding", "accepted-action"),
+    ("mailbox_digest", "E_AUTH", "cited_reference", "accepted-action"),
+    ("mailbox_digest", "E_AUTH", "identity", "accepted-action"),
+    ("mailbox_digest", "E_AUTH", "lock", "accepted-action"),
+    ("mailbox_digest", "E_AUTH", "mailbox_lock", "accepted-action"),
+    ("mailbox_digest", "E_AUTH", "message_id", "accepted-action"),
+    ("mailbox_digest", "E_AUTH", "operation", "pinned-no-action"),
+    ("mailbox_digest", "E_AUTH", "path", "pinned-no-action"),
+    ("mailbox_digest", "E_AUTH", "private", "pinned-no-action"),
+    ("mailbox_digest", "E_AUTH", "reference", "accepted-action"),
+    ("mailbox_digest", "E_AUTH", "scope", "accepted-action"),
+    ("mailbox_digest", "E_FORMAT", "", "pinned-no-action"),
+    ("mailbox_digest", "E_FORMAT", "format", "pinned-no-action"),
+    ("mailbox_digest", "E_FORMAT", "number", "pinned-no-action"),
+    ("mailbox_digest", "E_HASH", "", "pinned-no-action"),
+    ("mailbox_digest", "E_LIMIT", "", "pinned-no-action"),
+    ("mailbox_digest", "E_LIMIT", "digest_floor", "accepted-action"),
+    ("mailbox_digest", "E_LIMIT", "digest_inbox", "accepted-action"),
+    ("mailbox_digest", "E_LIMIT", "digest_limit", "accepted-action"),
+    ("mailbox_digest", "E_LIMIT", "digest_max_chars", "accepted-action"),
+    ("mailbox_digest", "E_LIMIT", "digest_page", "accepted-action"),
+    ("mailbox_digest", "E_LIMIT", "digest_view", "accepted-action"),
+    ("mailbox_digest", "E_LIMIT", "digest_view_minimum", "accepted-action"),
+    ("mailbox_digest", "E_LIMIT", "grants", "accepted-action"),
+    ("mailbox_digest", "E_LIMIT", "history", "accepted-action"),
+    ("mailbox_digest", "E_LIMIT", "record", "pinned-no-action"),
+    ("mailbox_digest", "E_REF", "", "pinned-no-action"),
+    ("mailbox_digest", "E_REF", "handle", "pinned-no-action"),
+    ("mailbox_digest", "E_REF", "resolution", "pinned-no-action"),
+    ("mailbox_digest", "E_SELECTOR", "", "pinned-no-action"),
+    ("mailbox_digest", "E_SELECTOR", "option", "pinned-no-action"),
+    ("mailbox_publish_record", "E_AUTH", "", "pinned-no-action"),
+    ("mailbox_publish_record", "E_AUTH", "attribution", "accepted-action"),
+    ("mailbox_publish_record", "E_AUTH", "binding", "accepted-action"),
+    ("mailbox_publish_record", "E_AUTH", "cited_reference", "accepted-action"),
+    ("mailbox_publish_record", "E_AUTH", "identity", "accepted-action"),
+    ("mailbox_publish_record", "E_AUTH", "lock", "accepted-action"),
+    ("mailbox_publish_record", "E_AUTH", "mailbox_lock", "accepted-action"),
+    ("mailbox_publish_record", "E_AUTH", "message_id", "accepted-action"),
+    ("mailbox_publish_record", "E_AUTH", "operation", "pinned-no-action"),
+    ("mailbox_publish_record", "E_AUTH", "path", "pinned-no-action"),
+    ("mailbox_publish_record", "E_AUTH", "private", "pinned-no-action"),
+    ("mailbox_publish_record", "E_AUTH", "reference", "accepted-action"),
+    ("mailbox_publish_record", "E_AUTH", "scope", "accepted-action"),
+    ("mailbox_publish_record", "E_FORMAT", "", "pinned-no-action"),
+    ("mailbox_publish_record", "E_FORMAT", "format", "pinned-no-action"),
+    ("mailbox_publish_record", "E_FORMAT", "number", "pinned-no-action"),
+    ("mailbox_publish_record", "E_HASH", "", "pinned-no-action"),
+    ("mailbox_publish_record", "E_LIMIT", "", "accepted-action"),
+    ("mailbox_publish_record", "E_LIMIT", "digest_floor", "accepted-action"),
+    ("mailbox_publish_record", "E_LIMIT", "digest_inbox", "accepted-action"),
+    ("mailbox_publish_record", "E_LIMIT", "digest_limit", "accepted-action"),
+    ("mailbox_publish_record", "E_LIMIT", "digest_max_chars", "accepted-action"),
+    ("mailbox_publish_record", "E_LIMIT", "digest_page", "accepted-action"),
+    ("mailbox_publish_record", "E_LIMIT", "digest_view", "accepted-action"),
+    ("mailbox_publish_record", "E_LIMIT", "grants", "accepted-action"),
+    ("mailbox_publish_record", "E_LIMIT", "history", "accepted-action"),
+    ("mailbox_publish_record", "E_LIMIT", "record", "pinned-no-action"),
+    ("mailbox_publish_record", "E_REF", "", "pinned-no-action"),
+    ("mailbox_publish_record", "E_REF", "handle", "pinned-no-action"),
+    ("mailbox_publish_record", "E_REF", "resolution", "pinned-no-action"),
+    ("mailbox_publish_record", "E_SELECTOR", "", "pinned-no-action"),
+    ("mailbox_publish_record", "E_SELECTOR", "option", "pinned-no-action"),
+    ("mailbox_read_record", "E_AUTH", "", "pinned-no-action"),
+    ("mailbox_read_record", "E_AUTH", "attribution", "accepted-action"),
+    ("mailbox_read_record", "E_AUTH", "binding", "accepted-action"),
+    ("mailbox_read_record", "E_AUTH", "cited_reference", "accepted-action"),
+    ("mailbox_read_record", "E_AUTH", "identity", "accepted-action"),
+    ("mailbox_read_record", "E_AUTH", "lock", "accepted-action"),
+    ("mailbox_read_record", "E_AUTH", "mailbox_lock", "accepted-action"),
+    ("mailbox_read_record", "E_AUTH", "message_id", "accepted-action"),
+    ("mailbox_read_record", "E_AUTH", "operation", "pinned-no-action"),
+    ("mailbox_read_record", "E_AUTH", "path", "pinned-no-action"),
+    ("mailbox_read_record", "E_AUTH", "private", "pinned-no-action"),
+    ("mailbox_read_record", "E_AUTH", "reference", "accepted-action"),
+    ("mailbox_read_record", "E_AUTH", "scope", "accepted-action"),
+    ("mailbox_read_record", "E_FORMAT", "", "pinned-no-action"),
+    ("mailbox_read_record", "E_FORMAT", "format", "pinned-no-action"),
+    ("mailbox_read_record", "E_FORMAT", "number", "pinned-no-action"),
+    ("mailbox_read_record", "E_HASH", "", "pinned-no-action"),
+    ("mailbox_read_record", "E_LIMIT", "", "pinned-no-action"),
+    ("mailbox_read_record", "E_LIMIT", "digest_floor", "pinned-no-action"),
+    ("mailbox_read_record", "E_LIMIT", "digest_inbox", "pinned-no-action"),
+    ("mailbox_read_record", "E_LIMIT", "digest_limit", "pinned-no-action"),
+    ("mailbox_read_record", "E_LIMIT", "digest_max_chars", "pinned-no-action"),
+    ("mailbox_read_record", "E_LIMIT", "digest_page", "pinned-no-action"),
+    ("mailbox_read_record", "E_LIMIT", "digest_view", "pinned-no-action"),
+    ("mailbox_read_record", "E_LIMIT", "grants", "accepted-action"),
+    ("mailbox_read_record", "E_LIMIT", "history", "accepted-action"),
+    ("mailbox_read_record", "E_LIMIT", "record", "pinned-no-action"),
+    ("mailbox_read_record", "E_REF", "", "pinned-no-action"),
+    ("mailbox_read_record", "E_REF", "handle", "pinned-no-action"),
+    ("mailbox_read_record", "E_REF", "resolution", "pinned-no-action"),
+    ("mailbox_read_record", "E_SELECTOR", "", "pinned-no-action"),
+    ("mailbox_read_record", "E_SELECTOR", "option", "pinned-no-action"),
+)
+
+
+class ClosedRefusalError(AssertionError):
+    """Fixed refusal code. Unsafe field text is omitted, then the safe list is truncated."""
+
+    def __init__(self, code, triples=()):
+        self.code = code
+        safe = []
+        for triple in triples:
+            shown = _display_triple(triple)
+            if shown is not None:
+                safe.append(shown)
+            if len(safe) == _DISPLAY_LIMIT:
+                break
+        self.triples = tuple(safe)
+        message = code
+        if safe:
+            message = code + " " + ",".join(tool + ":" + code_field + ":" + detail for tool, code_field, detail in safe)
+        super().__init__(message)
+
+
+def _multiline(value):
+    return "\n" in value or "\r" in value
+
+
+def _wildcard_field(value):
+    return value == ANY or ANY in value or "*" in value
+
+
+def _display_triple(triple):
+    if type(triple) is not tuple or len(triple) != 3:
+        return None
+    tool, code, detail = triple
+    if type(tool) is not str or type(code) is not str or type(detail) is not str:
+        return None
+    if tool not in _RECORD_TOOLS or len(code) > _CODE_LIMIT or len(detail) > _DETAIL_LIMIT:
+        return None
+    if _multiline(tool) or _multiline(code) or _multiline(detail):
+        return None
+    if _wildcard_field(tool) or _wildcard_field(code) or _wildcard_field(detail):
+        return None
+    if _CODE_TOKEN.fullmatch(code) is None or _DETAIL_TOKEN.fullmatch(detail) is None:
+        return None
+    visible = tuple(redact_insight_text(field, max_len=_DETAIL_LIMIT) for field in triple)
+    return visible if visible == triple else None
+
+
+def load_closed_refusal_table(rows):
+    """Reject wildcard and malformed rows before any row can satisfy a check."""
+    if type(rows) is not tuple:
+        raise ClosedRefusalError("malformed_table")
+    if len(rows) > _TABLE_LIMIT:
+        raise ClosedRefusalError("table_limit")
+    loaded = {}
+    for row in rows:
+        if type(row) is not tuple or len(row) != 4:
+            raise ClosedRefusalError("malformed_row")
+        tool, code, detail, kind = row
+        if type(tool) is not str or type(code) is not str or type(detail) is not str or type(kind) is not str:
+            raise ClosedRefusalError("malformed_row")
+        if len(tool) > 64 or len(code) > _CODE_LIMIT or len(detail) > _DETAIL_LIMIT or len(kind) > 32:
+            raise ClosedRefusalError("field_limit")
+        if _multiline(tool) or _multiline(code) or _multiline(detail) or _multiline(kind):
+            raise ClosedRefusalError("multiline_field")
+        if _wildcard_field(tool) or _wildcard_field(code) or _wildcard_field(detail) or _wildcard_field(kind):
+            raise ClosedRefusalError("wildcard_row")
+        if tool not in _RECORD_TOOLS:
+            raise ClosedRefusalError("unknown_tool")
+        if _CODE_TOKEN.fullmatch(code) is None or _DETAIL_TOKEN.fullmatch(detail) is None:
+            raise ClosedRefusalError("untokenized_field")
+        if kind not in _ROW_KINDS:
+            raise ClosedRefusalError("unknown_kind")
+        key = (tool, code, detail)
+        if key in loaded:
+            raise ClosedRefusalError("duplicate_row")
+        loaded[key] = kind
+    return loaded
+
+
+def closed_refusal_gaps(triples, table):
+    """Exact rows only. A wildcard triple is a gap and never matches another row."""
+    if type(triples) not in (list, tuple):
+        raise ClosedRefusalError("malformed_triple")
+    if len(triples) > _EMISSION_LIMIT:
+        raise ClosedRefusalError("emission_limit")
+    if type(table) is not dict:
+        raise ClosedRefusalError("malformed_table")
+    gaps = []
+    for triple in triples:
+        if type(triple) is not tuple or len(triple) != 3:
+            raise ClosedRefusalError("malformed_triple")
+        tool, code, detail = triple
+        if type(tool) is not str or type(code) is not str or type(detail) is not str:
+            raise ClosedRefusalError("malformed_triple")
+        if len(tool) > 64 or len(code) > _CODE_LIMIT or len(detail) > _DETAIL_LIMIT:
+            raise ClosedRefusalError("field_limit")
+        if _multiline(tool) or _multiline(code) or _multiline(detail):
+            raise ClosedRefusalError("multiline_field")
+        wildcard = _wildcard_field(tool) or _wildcard_field(code) or _wildcard_field(detail)
+        if not wildcard:
+            if tool not in _RECORD_TOOLS:
+                raise ClosedRefusalError("unknown_tool")
+            if _CODE_TOKEN.fullmatch(code) is None or _DETAIL_TOKEN.fullmatch(detail) is None:
+                raise ClosedRefusalError("untokenized_field")
+        if wildcard or (tool, code, detail) not in table:
+            gaps.append((tool, code, detail))
+    return tuple(gaps)
+
+
+def _finish_inventory(result, real_tree):
+    if real_tree:
+        table = load_closed_refusal_table(CLOSED_REFUSAL_TABLE)
+        obligations = set(PINNED_EXPLICIT_REFUSALS)
+        for tool, rows in result[0].items():
+            for code, detail in rows:
+                if ANY in (code, detail):
+                    continue
+                triple = (tool, code, detail)
+                if len(obligations) >= _EMISSION_LIMIT and triple not in obligations:
+                    raise ClosedRefusalError("emission_limit")
+                obligations.add(triple)
+        gaps = closed_refusal_gaps(sorted(obligations), table)
+        if gaps:
+            raise ClosedRefusalError("untabled_refusal", gaps)
+    return result
+
+
+def reachable_refusal_pairs(*, sources=None, codec_sources=None, codec_trace=None, callback_trace=None, analysis_stats=None):
+    """Bounded source inventory of refusal pairs and history messages by tool.
+
+    The call graph supplies concrete and symbolic rows. History includes
+    messages() calls and the binding check through _checked. A handler that
+    replaces an empty E_LIMIT keeps the replacement detail only. On the real
+    tree each concrete row and explicit pin requires an exact table entry.
     """
+    # Enforce only the production tree. Codec probes and a _REPO stand-in still
+    # read adapter text, and their planted details are not production emissions.
+    real_tree = sources is None and codec_sources is None and _REPO == _PRODUCTION_REPO
     started = monotonic()
     if sources is None:
         sources = [(_REPO / "tools" / (name + ".py")).read_text(encoding="utf-8")
@@ -4090,14 +4357,14 @@ def reachable_refusal_pairs(*, sources=None, codec_sources=None, codec_trace=Non
         result = _widened_refusal_inventory(model, callback_trace, analysis_stats)
         if analysis_stats is not None:
             analysis_stats["runtime_seconds"] = monotonic() - started
-        return result
+        return _finish_inventory(result, real_tree)
     callbacks = set().union(*(site["invocations"] for site in model.callback_sites.values()))
     model.callback_summaries = codec_refusal_pairs({}, {}, {}, sources=model.sources, model=model, callback_roots=callbacks)
     if model.widened:
         result = _widened_refusal_inventory(model, callback_trace, analysis_stats)
         if analysis_stats is not None:
             analysis_stats["runtime_seconds"] = monotonic() - started
-        return result
+        return _finish_inventory(result, real_tree)
     names = ("hierarchy_mailbox_records", "hierarchy_mailbox_records_guidance")
     named_sources = (sources.items() if isinstance(sources, dict) else
                      ((names[index] if index < len(names) else "source_" + str(index), source)
@@ -4336,7 +4603,7 @@ def reachable_refusal_pairs(*, sources=None, codec_sources=None, codec_trace=Non
         result = _widened_refusal_inventory(model, callback_trace, analysis_stats)
         if analysis_stats is not None:
             analysis_stats["runtime_seconds"] = monotonic() - started
-        return result
+        return _finish_inventory(result, real_tree)
     for tool, roots in direct_names.items():
         for record, emitted in call_summaries.items():
             tools[tool].update(emitted)
@@ -4374,7 +4641,7 @@ def reachable_refusal_pairs(*, sources=None, codec_sources=None, codec_trace=Non
             rows.update(known_rows)
         if analysis_stats is not None:
             analysis_stats["runtime_seconds"] = monotonic() - started
-        return result
+        return _finish_inventory(result, real_tree)
     wildcards = sum(ANY in row for rows in tools.values() for row in rows)
     for tool, rows in tools.items():
         if any(ANY in row and covers_refusal([row], ("E_LIMIT", "history")) for row in rows):
@@ -4390,4 +4657,7 @@ def reachable_refusal_pairs(*, sources=None, codec_sources=None, codec_trace=Non
                               wildcard_rows=wildcards, pool_complete=True, work_used=model.work_used,
                               history_wildcards=sum(ANY in rows for rows in history_messages.values()),
                               budget_exhausted=False, runtime_seconds=monotonic() - started)
-    return {tool: RefusalRows(rows) for tool, rows in tools.items()}, {tool: HistoryRows(rows) for tool, rows in history_messages.items()}
+    return _finish_inventory(
+        ({tool: RefusalRows(rows) for tool, rows in tools.items()},
+         {tool: HistoryRows(rows) for tool, rows in history_messages.items()}),
+        real_tree)
