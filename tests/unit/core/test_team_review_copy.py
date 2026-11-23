@@ -4,12 +4,15 @@ from __future__ import annotations
 import errno
 from collections import Counter
 import hashlib
+import importlib
 import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -1672,3 +1675,246 @@ def test_verify_bounds_total_side_files_across_directories(monkeypatch, tmp_path
     assert (code, result["code"]) == (2, "limit_exceeded")
     monkeypatch.setattr(review_copy, "MAX_ENTRIES", original)
     assert review_copy.verify(str(out))[0] == 3
+
+
+def _snapshot(root):
+    rows = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        for name in dirnames + filenames:
+            path = Path(dirpath) / name
+            info = path.lstat()
+            payload = None
+            if stat.S_ISREG(info.st_mode):
+                payload = path.read_bytes()
+            elif stat.S_ISLNK(info.st_mode):
+                payload = os.readlink(path)
+            rows.append((str(path.relative_to(root)), info.st_mode, payload))
+    return tuple(sorted(rows))
+
+
+def _chmod_tree(root, directory_mode, file_mode):
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        os.chmod(dirpath, directory_mode)
+        for name in filenames:
+            path = Path(dirpath) / name
+            if not path.is_symlink():
+                os.chmod(path, file_mode)
+
+
+def test_review_verification_is_a_public_facade_over_bounded_retention():
+    files = importlib.import_module("aegis_core.team_review_files")
+    verifier = importlib.import_module("aegis_core.team_review_verify")
+    assert list(files.__all__) == ["ProblemPrefix", "strict_json"]
+    assert list(verifier.__all__) == ["verify_copy"]
+    assert callable(files.strict_json) and callable(verifier.verify_copy)
+    assert review_copy.verify.__module__ == "aegis_core.team_review_copy"
+    rendered = []
+
+    def render(text):
+        rendered.append(text)
+        if "\n" in text:
+            raise review_copy.ReviewRefusal("multiline_field")
+        return "shown:" + text
+
+    prefix = files.ProblemPrefix(1, render, lambda text: text == "fixed")
+    prefix.add("fixed", proved=True)
+    prefix.add("fixed", proved=True)
+    prefix.add("candidate/late is writable")
+    prefix.observe_past_cap("candidate/extra is writable")
+    assert prefix.kept == ["shown:fixed"]
+    assert prefix.count == 4
+    assert rendered == ["fixed", "candidate/late is writable", "candidate/extra is writable"]
+    with pytest.raises(ValueError):
+        files.ProblemPrefix(-1, render, lambda text: False)
+    refused = files.ProblemPrefix(0, render, lambda text: False)
+    with pytest.raises(review_copy.ReviewRefusal):
+        refused.add("has\nnewline")
+    assert refused.kept == [] and refused.count == 1
+
+
+def test_problem_cap_keeps_order_total_and_the_entry_limit(monkeypatch, tmp_path):
+    _require_descriptors()
+    repo, base, _base_tree, candidate, _candidate_tree = make_repo(tmp_path)
+    out = tmp_path / "review"
+    assert _prepare(repo, base, candidate, out)[0] == 0
+    before = _snapshot(out)
+    fds = _fds() if Path("/proc/self/fd").exists() else None
+    problems_limit = review_copy.MAX_PROBLEMS
+    entries_limit = review_copy.MAX_ENTRIES
+    monkeypatch.setattr(review_copy, "MAX_PROBLEMS", -1)
+    code, body = review_copy.verify(str(out))
+    assert (code, body["code"]) == (2, "invalid_input")
+    assert str(out) not in json.dumps(body) and "\n" not in json.dumps(body)
+    assert _snapshot(out) == before
+    if fds is not None:
+        assert _fds() == fds
+    monkeypatch.setattr(review_copy, "MAX_PROBLEMS", problems_limit)
+    assert review_copy.verify(str(out))[0] == 0
+    side = out / "candidate"
+    os.chmod(side, 0o755)
+    os.chmod(side / "src", 0o755)
+    for index in range(4):
+        (side / "src" / ("added-%s" % index)).write_bytes(b"extra")
+    monkeypatch.setattr(review_copy, "MAX_PROBLEMS", 1000)
+    status, full = review_copy.verify(str(out))
+    assert status == 3 and full["ok"] is False and full["code"] == "copy_differs"
+    assert full["problem_count"] == len(full["problems"]) > 3
+    order = list(full["problems"])
+    for cap in (0, 1, 2, len(order) - 1, len(order)):
+        monkeypatch.setattr(review_copy, "MAX_PROBLEMS", cap)
+        checked, limited = review_copy.verify(str(out))
+        assert checked == 3 and limited["ok"] is False
+        assert limited["problem_count"] == full["problem_count"]
+        assert limited["problems"] == order[:cap]
+        assert limited["base"] == full["base"] and limited["candidate"] == full["candidate"]
+    monkeypatch.setattr(review_copy, "MAX_PROBLEMS", 1)
+    monkeypatch.setattr(review_copy, "MAX_ENTRIES", 1)
+    refused, limited = review_copy.verify(str(out))
+    assert (refused, limited["code"]) == (2, "limit_exceeded")
+    assert "added-0" not in json.dumps(limited)
+    monkeypatch.setattr(review_copy, "MAX_ENTRIES", entries_limit)
+    checked, again = review_copy.verify(str(out))
+    assert checked == 3 and again["problems"] == order[:1]
+    assert again["problem_count"] == full["problem_count"]
+    if fds is not None:
+        assert _fds() == fds
+
+
+def test_scaffold_summary_precedes_modes_and_proved_lines_skip_render(monkeypatch, tmp_path):
+    _require_descriptors()
+    calls = []
+
+    def sanitize(text, max_len=80):
+        calls.append(text)
+        return text
+
+    monkeypatch.setattr(review_copy, "sanitize_display", sanitize)
+    repo, base, _base_tree, candidate, _candidate_tree = make_repo(tmp_path)
+    out = tmp_path / "review"
+    assert _prepare(repo, base, candidate, out)[0] == 0
+    _chmod_tree(out, 0o755, 0o644)
+    git_file = next(path for path in (out / ".git").rglob("*") if path.is_file() and not path.is_symlink())
+    git_file.write_bytes(git_file.read_bytes() + b"\n")
+    (out / ".git").chmod(0o755)
+    monkeypatch.setattr(review_copy, "MAX_PROBLEMS", 1000)
+    status, full = review_copy.verify(str(out))
+    assert status == 3
+    texts = full["problems"]
+    changed = texts.index(".git changed")
+    writable = texts.index(".git is writable")
+    details = [index for index, row in enumerate(texts) if row.startswith(".git/")]
+    assert details and changed < writable < details[0]
+    calls.clear()
+    monkeypatch.setattr(review_copy, "MAX_PROBLEMS", 1)
+    checked, body = review_copy.verify(str(out))
+    assert checked == 3 and body["problems"] == [".git changed"]
+    assert body["problem_count"] == full["problem_count"] > 2
+    assert ".git is writable" not in calls
+    assert any(text.startswith(".git/") and text.endswith(" is writable") for text in calls)
+    calls.clear()
+    shutil.rmtree(out / ".git")
+    monkeypatch.setattr(review_copy, "MAX_PROBLEMS", 0)
+    checked, hidden = review_copy.verify(str(out))
+    assert checked == 3 and hidden["problems"] == [] and hidden["ok"] is False
+    assert hidden["problem_count"] >= 2
+    assert ".git is missing" not in calls
+    assert "candidate is writable" not in calls
+    assert any(text.startswith("candidate/") and text.endswith(" is writable") for text in calls)
+
+
+def test_late_multiline_refusal_survives_the_cap_and_retries_clean(monkeypatch, tmp_path):
+    _require_descriptors()
+    repo, base, _base_tree, candidate, _candidate_tree = make_repo(tmp_path)
+    out = tmp_path / "review"
+    assert _prepare(repo, base, candidate, out)[0] == 0
+    _chmod_tree(out, 0o755, 0o644)
+    side = out / "candidate"
+    for index in range(5):
+        (side / ("a-filler-%s" % index)).write_bytes(b"x")
+    late = side / "z-late"
+    late.mkdir()
+    symlink_or_skip("target", late / "has\nnewline")
+    monkeypatch.setattr(review_copy, "MAX_PROBLEMS", 1)
+    fds = _fds() if Path("/proc/self/fd").exists() else None
+    code, result = review_copy.verify(str(out))
+    assert (code, result["code"]) == (2, "multiline_field")
+    rendered = json.dumps(result)
+    assert "\n" not in rendered and "has newline" not in rendered and "has\\nnewline" not in rendered
+    if fds is not None:
+        assert _fds() == fds
+    again, repeated = review_copy.verify(str(out))
+    assert (again, repeated["code"]) == (2, "multiline_field")
+    (late / "has\nnewline").unlink()
+    _chmod_tree(out, 0o555, 0o444)
+    for index in range(5):
+        os.chmod(side, 0o755)
+        (side / ("a-filler-%s" % index)).unlink()
+    os.chmod(late, 0o755)
+    os.chmod(side, 0o755)
+    late.rmdir()
+    _chmod_tree(out, 0o555, 0o444)
+    checked, body = review_copy.verify(str(out))
+    assert checked == 0 and body["ok"] is True and body["problems"] == []
+    if fds is not None:
+        assert _fds() == fds
+
+
+def test_concurrent_verify_stays_read_only_and_a_stat_swap_stays_typed(monkeypatch, tmp_path):
+    _require_descriptors()
+    repo, base, _base_tree, candidate, _candidate_tree = make_repo(tmp_path)
+    out = tmp_path / "review"
+    assert _prepare(repo, base, candidate, out)[0] == 0
+    before = _snapshot(out)
+    fds = _fds() if Path("/proc/self/fd").exists() else None
+    barrier = threading.Barrier(2)
+    results = []
+    errors = []
+
+    def run():
+        try:
+            barrier.wait(timeout=30)
+            results.append(review_copy.verify(str(out)))
+        except Exception as exc:
+            errors.append(type(exc).__name__)
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+    assert errors == [] and sorted(thread.is_alive() for thread in threads) == [False, False]
+    assert [item[0] for item in results] == [0, 0]
+    assert _snapshot(out) == before
+    if fds is not None:
+        assert _fds() == fds
+    _chmod_tree(out, 0o755, 0o644)
+    armed = {"go": True}
+
+    def swap_stat(path, *args, **kwargs):
+        info = os.stat(path, *args, **kwargs)
+        dir_fd = kwargs.get("dir_fd")
+        if armed["go"] and dir_fd is not None and stat.S_ISREG(info.st_mode):
+            armed["go"] = False
+            os.unlink(path, dir_fd=dir_fd)
+            os.symlink("replaced-leaf", path, dir_fd=dir_fd)
+        return info
+
+    support = review_copy.descriptor_support
+    monkeypatch.setattr(review_copy, "os", SimpleNamespace(**{**vars(os), "stat": swap_stat}))
+    monkeypatch.setattr(review_copy, "descriptor_support", lambda: True)
+    outcome = review_copy.verify(str(out))
+    assert isinstance(outcome, tuple) and len(outcome) == 2
+    code, body = outcome
+    assert armed["go"] is False
+    assert code == 2 and isinstance(body, dict) and isinstance(body.get("code"), str)
+    rendered = json.dumps(body)
+    assert "replaced-leaf" not in rendered and "\n" not in rendered
+    if fds is not None:
+        assert _fds() == fds
+    monkeypatch.setattr(review_copy, "os", os)
+    monkeypatch.setattr(review_copy, "descriptor_support", support)
+    fresh = tmp_path / "fresh"
+    assert _prepare(repo, base, candidate, fresh)[0] == 0
+    assert review_copy.verify(str(fresh))[0] == 0
+    if fds is not None:
+        assert _fds() == fds
