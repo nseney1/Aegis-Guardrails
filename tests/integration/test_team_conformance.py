@@ -23,7 +23,7 @@ import tempfile
 import pytest
 
 from aegis_cli.cli import main
-from aegis_core import pathlookup, team_host_registry, team_hosts, team_profile, team_queue
+from aegis_core import team_host_registry, team_hosts, team_profile, team_queue
 from aegis_core.hosts import all_hosts
 from aegis_mcp import schemas
 from aegis_mcp.tools import execute_tool
@@ -68,12 +68,11 @@ def refusal(result, code, schema, reason, next_action):
 
 
 def same_snapshot(cli_payload, tool, arguments):
+    from aegis_core.pathlookup_gitcache import bound_ordinary_root
+
     # The server binds ordinary Git lookup before dispatch to this adapter.
-    token = pathlookup.ordinary_root.set(os.path.normcase(os.fspath(arguments["workspace"])))
-    try:
+    with bound_ordinary_root(arguments["workspace"]):
         mcp_payload = execute_tool(tool, arguments)
-    finally:
-        pathlookup.ordinary_root.reset(token)
     # Each frontend captures its own observation time.
     assert cli_payload["checked_at"] and mcp_payload["checked_at"]
     assert {k: v for k, v in cli_payload.items() if k != "checked_at"} == {

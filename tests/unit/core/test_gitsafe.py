@@ -6962,7 +6962,7 @@ _STRICT_CENSUS_SOURCES = {
 }
 
 _STRICT_SITE_PROOFS = {
-    ('test_gitsafe', 'test_bound_root_does_not_change_supplied_or_unsupported_strict_lookup'): ('489c9f1bb9b60e968c51f0bd9a741dadf130f2404e7f4fe9643fc01923e15cfb', 'The program probe is forced false; custody_program must refuse unsupported_effect_platform before spawn on every platform.'),
+    ('test_gitsafe', 'test_bound_root_does_not_change_supplied_or_unsupported_strict_lookup'): ('141afd0b0e5474a14e57b2f2c6a00a7a3f5381ef876c15f86b69b871c2f863bd', 'The program probe is forced false; custody_program must refuse unsupported_effect_platform before spawn on every platform.'),
     ('test_gitsafe', 'test_effect_descriptor_refused_before_any_spawn'): ('f440d542ccf05a986720fb51cdadb1b5a38a54c0c776d783a4c8c4f2fa72e07b', 'Invalid receipt descriptors refuse in pass_through before executable lookup.'),
     ('test_gitsafe', 'test_effect_unsupported_platform_is_a_pre_spawn_refusal'): ('4480e3b2ef2f7c06b1c60a74288dd00df9da0584dae64c5a8a765ec7437174ba', 'The effect-platform probe is forced false; pass_through refuses before lookup.'),
     ('test_gitsafe', 'test_effect_write_roots_refuse_before_expansion'): ('f8042b05a19e1caa57c0370d7e57ff2c964a11d522499873180c6f8ad4bada44', 'Invalid or oversized root containers refuse before executable lookup.'),
@@ -7387,12 +7387,10 @@ def _bound_fence(path):
 
 @contextlib.contextmanager
 def _bound_ordinary_root(path):
-    from aegis_core import pathlookup
-    token = pathlookup.ordinary_root.set(_bound_fence(path))
-    try:
+    from aegis_core.pathlookup_gitcache import bound_ordinary_root
+
+    with bound_ordinary_root(_bound_fence(path)):
         yield
-    finally:
-        pathlookup.ordinary_root.reset(token)
 
 
 def test_bound_root_runs_enclosing_git_skips_workspace_git_and_retries(tmp_path, fresh_git_lookup):
