@@ -22,8 +22,18 @@ permissions:
 # GitHub's 360. Lower them only from new measurements: a limit must not turn a slow green run red.
 # test-windows: 90, three times the ~29 min green dispatch runs of 2026-11-04 (41768431362).
 # Dispatch run 41796679010 (2026-11-04) was cancelled at the old 45 with the suite still running;
-# its log has expired, so a hang there is not ruled out. test-fast: 45, against 17.6 min for the
-# ubuntu-latest 3.11 leg (41768431362), the slowest of its last 5 green runs.
+# its log has expired, so a hang there is not ruled out.
+# test-fast shards: run 44219204536 measured the whole suite at 6516.67s (108.6 min) on
+# validate ubuntu-latest 3.11. The old single test-fast job ran that same work and the 45 min
+# cap cancelled it (run 44562897709, still at 23% after 43 min). No per-shard green run exists
+# yet, so each shard records that full-suite duration as its ceiling and uses timeout-minutes
+# 218 (at least twice 108.6 min, at most 360). Lower a shard only after a measurement of that
+# shard. The four jobs are separate ids so ALWAYS_SUCCESS names every shard: a strategy.matrix
+# collapses every leg to one needs key, and a dropped leg would not be "missing" there.
+# test-fast-measurement: test-fast-unit-core 6516.67s run 44219204536
+# test-fast-measurement: test-fast-unit-rest 6516.67s run 44219204536
+# test-fast-measurement: test-fast-integration 6516.67s run 44219204536
+# test-fast-measurement: test-fast-contract 6516.67s run 44219204536
 jobs:
   # Audits the resolved runtime dependencies declared in pyproject.toml.
   # pip-audit is a CI-only tool; it is not a project dependency.
@@ -98,13 +108,15 @@ jobs:
           name: aegis-wheel
           path: dist/
 
-  # The per-PR leg (CI plan, owner-approved 2026-11-05): the whole suite on Linux 3.11 with xdist.
-  # It runs on every event, wave PRs into develop included. It executes the pull request's own
-  # code, so it gets the read-only token only, no secrets, and a checkout that keeps no
-  # credentials. Wave PRs build no wheel, so it installs the checkout into its own venv.
-  test-fast:
+  # Per-PR suite, sharded by test directory (HOSTED-CI-TEST-FAST-BUDGET). The four jobs
+  # together select every test file under tests/ once. Each runs on every event, wave
+  # PRs into develop included. It executes the pull request's own code, so it gets the
+  # read-only token only, no secrets, and a checkout that keeps no credentials. Wave PRs
+  # build no wheel, so each shard installs the checkout into its own venv. The shards do
+  # not need each other: they run concurrently, and aegis-check requires every one.
+  test-fast-unit-core:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 218
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -146,7 +158,23 @@ jobs:
         run: make lint PYTHON="$VENV/bin/python"
 
       - name: Run test suite
-        run: make test PYTHON="$VENV/bin/python"
+        env:
+          TEST_FAST_PATHS: tests/unit/core
+        run: |
+          set -euo pipefail
+          set -f
+          python_bin="$VENV/bin/python"
+          userbase="${PYTHONUSERBASE:-$("$python_bin" -m site --user-base)}"
+          home="$(mktemp -d /tmp/aegis-test-home.XXXXXX)"
+          trap 'rm -rf "$home"' EXIT
+          xdist=""
+          if "$python_bin" -c "import xdist" >/dev/null 2>&1; then
+            xdist="-n auto"
+          fi
+          # Isolated HOME, the same contract as the developer test target. $xdist is -n auto when
+          # pytest-xdist imports. Selectors are the positive paths in TEST_FAST_PATHS.
+          HOME="$home" USERPROFILE="$home" XDG_CONFIG_HOME="$home/.config" PYTHONUSERBASE="$userbase" \
+            "$python_bin" -m pytest -q $xdist $TEST_FAST_PATHS
 
       - name: Check for hardcoded paths
         run: |
@@ -157,8 +185,218 @@ jobs:
           fi
           echo "No hardcoded paths found"
 
+  test-fast-unit-rest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 218
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Install bubblewrap
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends bubblewrap
+
+      # Same probe and reason as the validate job's step of the same name.
+      - name: Prove bubblewrap runs
+        run: |
+          set -euo pipefail
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --unshare-net --unshare-pid --ro-bind / / --dev /dev --proc /proc true
+
+      # The venv sits outside the checkout and outside /tmp, which the job runner's sandbox
+      # replaces, so sandboxed recipes see the same pytest as the suite.
+      - name: Choose the CI venv path
+        run: echo "VENV=$RUNNER_TEMP/ci-venv" >> "$GITHUB_ENV"
+
+      - name: Create the CI venv
+        run: python -m venv "$VENV"
+
+      - name: Install test dependencies into the CI venv
+        run: '"$VENV/bin/pip" install pytest==8.3.4 pytest-xdist==3.6.1 ruff==0.9.10 hypothesis==6.126.0 coverage==7.6.12 pyyaml==6.0.2 anyio==4.12.1'
+
+      - name: Install the checkout into the CI venv
+        run: '"$VENV/bin/pip" install .'
+
+      - name: Lint
+        run: make lint PYTHON="$VENV/bin/python"
+
+      - name: Run test suite
+        env:
+          TEST_FAST_PATHS: tests/unit/cli tests/unit/mcp tests/unit/sdk tests/unit/verification tests/unit/test_ac24_acceptance_audit.py tests/unit/test_ac24_acquire.py tests/unit/test_changelog.py tests/unit/test_docs_claims.py tests/unit/test_docs_links.py tests/unit/test_no_real_gh.py tests/unit/test_p6_noadmin.py tests/unit/test_pypi_state.py tests/unit/test_readme.py tests/unit/test_release_guard.py
+        run: |
+          set -euo pipefail
+          set -f
+          python_bin="$VENV/bin/python"
+          userbase="${PYTHONUSERBASE:-$("$python_bin" -m site --user-base)}"
+          home="$(mktemp -d /tmp/aegis-test-home.XXXXXX)"
+          trap 'rm -rf "$home"' EXIT
+          xdist=""
+          if "$python_bin" -c "import xdist" >/dev/null 2>&1; then
+            xdist="-n auto"
+          fi
+          # Isolated HOME, the same contract as the developer test target. $xdist is -n auto when
+          # pytest-xdist imports. Selectors are the positive paths in TEST_FAST_PATHS.
+          HOME="$home" USERPROFILE="$home" XDG_CONFIG_HOME="$home/.config" PYTHONUSERBASE="$userbase" \
+            "$python_bin" -m pytest -q $xdist $TEST_FAST_PATHS
+
+      - name: Check for hardcoded paths
+        run: |
+          # Exclude template examples like /home/<user>/ which are privacy instructions
+          if grep -rnI '/home/' rules/ skills/ docs/ README.md 2>/dev/null | grep -v '<user>' | grep -v '<username>'; then
+            echo "ERROR: Hardcoded paths found"
+            exit 1
+          fi
+          echo "No hardcoded paths found"
+  test-fast-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 218
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Install bubblewrap
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends bubblewrap
+
+      # Same probe and reason as the validate job's step of the same name.
+      - name: Prove bubblewrap runs
+        run: |
+          set -euo pipefail
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --unshare-net --unshare-pid --ro-bind / / --dev /dev --proc /proc true
+
+      # The venv sits outside the checkout and outside /tmp, which the job runner's sandbox
+      # replaces, so sandboxed recipes see the same pytest as the suite.
+      - name: Choose the CI venv path
+        run: echo "VENV=$RUNNER_TEMP/ci-venv" >> "$GITHUB_ENV"
+
+      - name: Create the CI venv
+        run: python -m venv "$VENV"
+
+      - name: Install test dependencies into the CI venv
+        run: '"$VENV/bin/pip" install pytest==8.3.4 pytest-xdist==3.6.1 ruff==0.9.10 hypothesis==6.126.0 coverage==7.6.12 pyyaml==6.0.2 anyio==4.12.1'
+
+      - name: Install the checkout into the CI venv
+        run: '"$VENV/bin/pip" install .'
+
+      - name: Lint
+        run: make lint PYTHON="$VENV/bin/python"
+
+      - name: Run test suite
+        env:
+          TEST_FAST_PATHS: tests/integration
+        run: |
+          set -euo pipefail
+          set -f
+          python_bin="$VENV/bin/python"
+          userbase="${PYTHONUSERBASE:-$("$python_bin" -m site --user-base)}"
+          home="$(mktemp -d /tmp/aegis-test-home.XXXXXX)"
+          trap 'rm -rf "$home"' EXIT
+          xdist=""
+          if "$python_bin" -c "import xdist" >/dev/null 2>&1; then
+            xdist="-n auto"
+          fi
+          # Isolated HOME, the same contract as the developer test target. $xdist is -n auto when
+          # pytest-xdist imports. Selectors are the positive paths in TEST_FAST_PATHS.
+          HOME="$home" USERPROFILE="$home" XDG_CONFIG_HOME="$home/.config" PYTHONUSERBASE="$userbase" \
+            "$python_bin" -m pytest -q $xdist $TEST_FAST_PATHS
+
+      - name: Check for hardcoded paths
+        run: |
+          # Exclude template examples like /home/<user>/ which are privacy instructions
+          if grep -rnI '/home/' rules/ skills/ docs/ README.md 2>/dev/null | grep -v '<user>' | grep -v '<username>'; then
+            echo "ERROR: Hardcoded paths found"
+            exit 1
+          fi
+          echo "No hardcoded paths found"
+  test-fast-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 218
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Install bubblewrap
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends bubblewrap
+
+      # Same probe and reason as the validate job's step of the same name.
+      - name: Prove bubblewrap runs
+        run: |
+          set -euo pipefail
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --unshare-net --unshare-pid --ro-bind / / --dev /dev --proc /proc true
+
+      # The venv sits outside the checkout and outside /tmp, which the job runner's sandbox
+      # replaces, so sandboxed recipes see the same pytest as the suite.
+      - name: Choose the CI venv path
+        run: echo "VENV=$RUNNER_TEMP/ci-venv" >> "$GITHUB_ENV"
+
+      - name: Create the CI venv
+        run: python -m venv "$VENV"
+
+      - name: Install test dependencies into the CI venv
+        run: '"$VENV/bin/pip" install pytest==8.3.4 pytest-xdist==3.6.1 ruff==0.9.10 hypothesis==6.126.0 coverage==7.6.12 pyyaml==6.0.2 anyio==4.12.1'
+
+      - name: Install the checkout into the CI venv
+        run: '"$VENV/bin/pip" install .'
+
+      - name: Lint
+        run: make lint PYTHON="$VENV/bin/python"
+
+      - name: Run test suite
+        env:
+          TEST_FAST_PATHS: tests/contract
+        run: |
+          set -euo pipefail
+          set -f
+          python_bin="$VENV/bin/python"
+          userbase="${PYTHONUSERBASE:-$("$python_bin" -m site --user-base)}"
+          home="$(mktemp -d /tmp/aegis-test-home.XXXXXX)"
+          trap 'rm -rf "$home"' EXIT
+          xdist=""
+          if "$python_bin" -c "import xdist" >/dev/null 2>&1; then
+            xdist="-n auto"
+          fi
+          # Isolated HOME, the same contract as the developer test target. $xdist is -n auto when
+          # pytest-xdist imports. Selectors are the positive paths in TEST_FAST_PATHS.
+          HOME="$home" USERPROFILE="$home" XDG_CONFIG_HOME="$home/.config" PYTHONUSERBASE="$userbase" \
+            "$python_bin" -m pytest -q $xdist $TEST_FAST_PATHS
+
+      - name: Check for hardcoded paths
+        run: |
+          # Exclude template examples like /home/<user>/ which are privacy instructions
+          if grep -rnI '/home/' rules/ skills/ docs/ README.md 2>/dev/null | grep -v '<user>' | grep -v '<username>'; then
+            echo "ERROR: Hardcoded paths found"
+            exit 1
+          fi
+          echo "No hardcoded paths found"
   aegis-check:
-    needs: [dependency-audit, build-wheel, validate, test-windows, test-fast]
+    needs: [dependency-audit, build-wheel, validate, test-windows, test-fast-unit-core, test-fast-unit-rest, test-fast-integration, test-fast-contract]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -172,7 +410,7 @@ jobs:
           NEEDS_JSON: ${{ toJSON(needs) }}
           EXPECTED_RESULT: ${{ github.event_name == 'pull_request' && github.base_ref == 'develop' && 'skipped' || 'success' }}
           # Jobs that run on every event, wave PRs included, so they must always succeed.
-          ALWAYS_SUCCESS: test-fast
+          ALWAYS_SUCCESS: test-fast-unit-core test-fast-unit-rest test-fast-integration test-fast-contract
         run: |
           python3 -c 'import json, os, sys; needs = json.loads(os.environ["NEEDS_JSON"]); expected = os.environ["EXPECTED_RESULT"]; always = os.environ["ALWAYS_SUCCESS"].split(); bad = {k: v.get("result") for k, v in needs.items() if v.get("result") != ("success" if k in always else expected)}; bad.update({k: "missing" for k in always if k not in needs}); sys.exit(f"Unexpected upstream job results (expected {expected}, and success for {always}): {bad}" if bad else 0)'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -185,7 +423,7 @@ jobs:
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/head"
-      # On a wave PR the tests run in test-fast (gated by the first step). This unconditional,
+      # On a wave PR the tests run in the test-fast shards (gated by the first step). This unconditional,
       # base-sourced comparison keeps the governance verdict free of the wave's own code.
       - name: Run CI governance without execution
         env:
@@ -565,7 +803,7 @@ jobs:
   # The CI verdict (v4.3 T2): attests sha256 of "aegis-ci-verdict/v1\ncommit <sha>\ntree <tree>\n"
   # once every job passed, only on the events doctor --release consumes (not release, not PRs).
   verdict:
-    needs: [dependency-audit, build-wheel, aegis-check, validate, test-windows, test-fast]
+    needs: [dependency-audit, build-wheel, aegis-check, validate, test-windows, test-fast-unit-core, test-fast-unit-rest, test-fast-integration, test-fast-contract]
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 10

@@ -74,6 +74,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_custody_checks": 1,
     "aegis_core.team_git": 0,
     "aegis_core.atomicio": 0,
+    "aegis_core.git_path_codec": 0,
     # Read-only repository facts keyed by full object ids; imports gitsafe and errors only.
     "aegis_core.gitevidence": 0,
     # The one PATH lookup of a program Aegis runs or registers (stdlib only).
@@ -125,6 +126,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_isolation_refusal": 0,
     "aegis_core.team_isolation_verify": 0,
     "aegis_core.team_jobs_recipes": 0,
+    "aegis_core.team_jobs_source": 0,
     "aegis_core.team_lease_custody": 0,
     "aegis_core.team_lifecycle": 1,
     "aegis_core.team_lifecycle_writers": 1,
@@ -226,6 +228,8 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_qualify": 0,
     "aegis_core.team_queue": 2,
     "aegis_core.team_review_copy": 0,
+    "aegis_core.team_review_files": 0,
+    "aegis_core.team_review_verify": 0,
     "aegis_core.team_roles": 0,
     "aegis_core.team_session_census": 1,
     "aegis_core.team_session_custody": 1,
