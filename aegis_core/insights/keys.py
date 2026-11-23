@@ -167,20 +167,23 @@ def _fast_git_common_and_top(root: Path) -> Optional[Tuple[Path, Path]]:
             return dot_git, cand
         if stat.S_ISREG(st.st_mode):
             try:
-                raw = dot_git.read_text(encoding="utf-8", errors="replace").strip()
+                raw = dot_git.read_bytes()
             except OSError:
                 break
-            if raw.startswith("gitdir:"):
-                g_raw = raw[7:].strip()
-                gitdir = (cand / g_raw).resolve() if not os.path.isabs(g_raw) else Path(g_raw).resolve()
-                cfile = gitdir / "commondir"
-                if cfile.is_file():
-                    try:
-                        common_rel = cfile.read_text(encoding="utf-8", errors="replace").strip()
-                        return (gitdir / common_rel).resolve(), cand
-                    except OSError:
-                        pass
-                return gitdir, cand
+            if not raw.startswith(b"gitdir: "):
+                break  # Let Git's discovery decide whether this marker bounds identity.
+            from aegis_core.git_path_codec import path_text
+
+            g_raw = path_text(raw, gitfile=True)
+            gitdir = (cand / g_raw).resolve() if not os.path.isabs(g_raw) else Path(g_raw).resolve()
+            cfile = gitdir / "commondir"
+            if cfile.is_file():
+                try:
+                    common_rel = path_text(cfile.read_bytes(), record=True)
+                    return (gitdir / common_rel).resolve(), cand
+                except OSError:
+                    pass
+            return gitdir, cand
     return None
 
 
