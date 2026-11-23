@@ -3,7 +3,7 @@ from pathlib import PurePosixPath
 import stat
 
 from aegis_core import team_isolation_mounts as mount_policy
-from aegis_core.team_isolation_refusal import IsolationRefusal
+from aegis_core.team_isolation_refusal import IsolationRefusal, plan_response, with_document_stage
 from aegis_core.team_isolation_verify import container_name, container_user, expected_plan, load_inspection, verify
 
 __all__ = ["build_image_argv", "check", "create_argv", "exec_argv", "image_inspect_argv",
@@ -100,18 +100,34 @@ def build_image_argv(engine, *, context, containerfile, tag):
             "--tag", _operand(tag, "image_tag"), str(mount_policy.absolute_path(context))]
 
 
+def _decode_config(config):
+    """Decode one config document. Field policy runs only after this returns."""
+    try:
+        if type(config) is bytes:
+            config = mount_policy.load_document(config)
+            mount_policy.require(type(config) is dict, "document_invalid")
+        else:
+            mount_policy.require(type(config) is dict, "document_invalid")
+            mount_policy.bounded_value(config)
+    except IsolationRefusal as error:
+        raise with_document_stage(error, "config") from None
+    return config
+
+
+def _read_supplied(reader, stage, *args):
+    try:
+        return reader(*args)
+    except IsolationRefusal as error:
+        raise with_document_stage(error, stage) from None
+
+
 def _read_run(config):
     """Bound the whole document, then ignore inert home aliases, before the closed schema.
 
     Bytes use the preflight ingress. Direct dicts use the same field policy and
     their own budget walk. Neither form mutates the caller's object.
     """
-    if type(config) is bytes:
-        config = mount_policy.load_document(config)
-        mount_policy.require(type(config) is dict, "document_invalid")
-    else:
-        mount_policy.require(type(config) is dict, "document_invalid")
-        mount_policy.bounded_value(config)
+    config = _decode_config(config)
     mount_policy.require(config.keys() <= _RUN_FIELDS, "team_run_fields")
     if not _IGNORED_RUN_FIELDS.isdisjoint(config):
         config = {key: value for key, value in config.items() if key not in _IGNORED_RUN_FIELDS}
@@ -178,7 +194,7 @@ def check(config, *, observer, owner_homes, cpu_count, platform, host_table, sou
             return dict(status="ok", mode="host", isolation=None, mounts=[], create_argv=None)
         inspected = None
         if inspect is not None:
-            inspected = load_inspection(inspect())
+            inspected = load_inspection(_read_supplied(inspect, "container-inspection"))
             if inspected is None:
                 return dict(status="mismatch", mismatches=["inspect"])
             mount_policy.require(inspector is not None, "image_inspect")
@@ -191,10 +207,10 @@ def check(config, *, observer, owner_homes, cpu_count, platform, host_table, sou
         if inspect is None:
             argv = _create_argv(isolation, run, rows, policy, owner_uid, owner_gid)
             return dict(status="ok", mode="container", run=run, isolation=isolation, mounts=rows, create_argv=argv)
-        image = inspector(image_inspect_argv(isolation["engine"], isolation["image"]))
+        image = _read_supplied(inspector, "image-inspection", image_inspect_argv(isolation["engine"], isolation["image"]))
         expected = expected_plan(isolation, run=run, mounts=rows, image_inspect=image, host_table=policy,
                                  cpu_count=cpu_count, platform=platform, uid=owner_uid, gid=owner_gid, **context)
         mismatches = verify(inspected, expected, host_table=policy, **context)
         return dict(status="mismatch" if mismatches else "ok", mismatches=mismatches)
     except IsolationRefusal as error:
-        return dict(status=error.status, code=error.code, reason=error.message, next_action=error.next_action)
+        return plan_response(error)

@@ -18,7 +18,7 @@ from aegis_core.team_isolation_mounts import (
     home_folders, host_policy, image, load_document, memory_bytes, mount_rows, pids_limit,
     assess_expected_mounts, read_isolation, require as require_refusal, validate_mounts,
 )
-from aegis_core.team_isolation_refusal import IsolationRefusal
+from aegis_core.team_isolation_refusal import IsolationRefusal, with_document_stage
 
 __all__ = ["container_name", "container_user", "expected_plan", "load_inspection", "verify"]
 
@@ -71,7 +71,22 @@ def _inspection(value):
 
 def load_inspection(raw):
     """Decode one transport and admit exactly one inspection object."""
-    return _inspection(load_document(raw))
+    try:
+        decoded = load_document(raw)
+    except IsolationRefusal as error:
+        raise with_document_stage(error, "container-inspection") from None
+    return _inspection(decoded)
+
+
+def _bounded_inspection(value, stage):
+    """Decode a transport or bound an already decoded inspection."""
+    try:
+        if type(value) in (str, bytes):
+            return load_document(value)
+        bounded_value(value)
+    except IsolationRefusal as error:
+        raise with_document_stage(error, stage) from None
+    return value
 
 
 def _repo_digests(value):
@@ -664,9 +679,7 @@ def expected_plan(isolation, *, run, mounts, image_inspect, host_table, home, ob
     """Build a comparison record from validated config and trusted observations."""
     isolation = read_isolation(isolation, cpu_count=cpu_count, platform=platform)
     require_refusal(isolation is not None, "container_required")
-    if type(image_inspect) in (str, bytes):
-        image_inspect = load_document(image_inspect)
-    bounded_value(image_inspect)
+    image_inspect = _bounded_inspection(image_inspect, "image-inspection")
     try:
         info = _image_record(image_inspect, isolation["image"])
     except (ValueError, KeyError, RecursionError):
@@ -690,9 +703,7 @@ def verify(inspect_json, expected, *, host_table, home, observed, owner_uid, pri
     Expected mount rows are untrusted too. Revalidate them against the same
     fresh injected path facts before comparing any engine observations.
     """
-    if type(inspect_json) in (str, bytes):
-        inspect_json = load_document(inspect_json)
-    bounded_value(inspect_json)
+    inspect_json = _bounded_inspection(inspect_json, "container-inspection")
     bounded_value(expected)
     host_table = host_policy(host_table)
     # Qualify even if expected has no mount field. Structural row errors are
