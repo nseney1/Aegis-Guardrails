@@ -1,8 +1,8 @@
 """The shared secret-redaction entry points (L0).
 
 The table lives in redaction_patterns and is re-exported here. Text Aegis persists
-or echoes goes through it: the hook command log
-(``redact_command_secrets``, through aegis_cli.hooks.redaction), stored insight text
+or echoes goes through it: the hook command log applies this whole-field replacement
+after its gate adapter selects a command head (aegis_cli.hooks.redaction), stored insight text
 (``redact_insight_text``) and the snippet of a secret finding (aegis_core.verification.scanners
 masks with ``TOKEN_REDACTIONS`` and ``is_high_entropy_secret``). URL credential removal
 (``remove_url_credentials``) and atomic clipping (``clip_atomic_text``) live here as well.
@@ -104,7 +104,11 @@ def is_high_entropy_secret(tok: str, threshold: float = 3.8) -> bool:
 
 
 def redact_command_secrets(cmd: str) -> str:
-    """Mask known secret patterns in command strings before logging."""
+    """Replace known secrets across the whole command field.
+
+    ESC/C1 head selection and a bounded secret tail belong to the gate adapter.
+    This replacement does not cut the field.
+    """
     for pattern, replacement in SECRET_REPLACEMENTS:
         cmd = pattern.sub(replacement, cmd)
     return cmd
