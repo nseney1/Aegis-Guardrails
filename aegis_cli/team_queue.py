@@ -48,6 +48,7 @@ class QueueErrorPolicy:
         self.active = active
         self.output = output
         self.parser_error = parser_error
+        self.qualify_parsing = None
 
     def __call__(self):
         self.fallback()
@@ -74,11 +75,15 @@ class QueueErrorPolicy:
         diagnostic = None
         try:
             args = parser.parse_args(argv)
+            if self.qualify_parsing is not None and self.qualify_parsing.entered:
+                return args
             raw = args.workspace
             if raw is not None and not team_queue.valid_workspace_spelling(raw):
                 raise QueueArgumentError()
             return args
         except SystemExit as error:
+            if self.qualify_parsing is not None and self.qualify_parsing.entered:
+                raise
             if error.code == 0:
                 return EXIT_OK
         except QueueArgumentError as error:
