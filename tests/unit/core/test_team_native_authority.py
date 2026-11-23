@@ -14,8 +14,12 @@ import pytest
 
 from conftest import symlink_or_skip
 from aegis_core import team_native_authority as authority
+from aegis_core import team_lifecycle as lifecycle
+from aegis_core import team_lifecycle_writers as writers
 from aegis_core import team_native_keys as keys
 from aegis_core.team_native_wire import HostAuthorityError, MAX_DEPTH, MAX_FRAME_BYTES
+from tests.unit.core import test_team_lifecycle as journal_cases
+from tests.unit.core.test_team_mailbox import make_store, mailbox, owner_plane
 from tools import hierarchy_host_authority as legacy
 
 
@@ -169,6 +173,65 @@ def test_genesis_rejects_nested_and_incomplete_guards(runtime):
     assert runtime.active_guard is None
 
 
+def test_genesis_rechecks_pairs_in_order_and_releases_after_refusal(runtime, monkeypatch):
+    first, = runtime.reservations
+    second = authority.ReservedEnrollment(keys.RESERVATION_KEY, runtime, dict(
+        first.witness, actor_cid="router-1", role="router", reservation_sequence=2))
+    runtime.reservations = (first, second)
+    host = runtime.authority
+    with refusal("ROLE_OPERATION_FORBIDDEN", "genesis requires the complete owned set"):
+        host.bootstrap_fence(runtime, runtime.plan_data, (second, first))
+
+    read_witness = authority.ReservedEnrollment.witness.fget
+    owns = authority.ReservedEnrollment.belongs_to
+    changed, foreign = set(), set()
+
+    def witness(reservation):
+        row = read_witness(reservation)
+        if reservation in changed:
+            row["generation"] += 1
+        return row
+
+    def belongs_to(reservation, owner):
+        return reservation not in foreign and owns(reservation, owner)
+
+    monkeypatch.setattr(authority.ReservedEnrollment, "witness", property(witness))
+    monkeypatch.setattr(authority.ReservedEnrollment, "belongs_to", belongs_to)
+    now = time.monotonic_ns()
+    clock = SimpleNamespace(now=now, monotonic_ns=lambda: clock.now)
+    monkeypatch.setattr(authority, "time", clock)
+
+    guard = host.bootstrap_fence(runtime, runtime.plan_data, runtime.reservations)
+    with refusal("CANONICAL_CORRELATION_MISMATCH", "owned reservation changed"):
+        with guard:
+            with ThreadPoolExecutor(max_workers=1) as worker:
+                worker.submit(changed.add, first).result(timeout=3)
+                worker.submit(foreign.add, second).result(timeout=3)
+            # First witness drift wins over the second member's lost ownership.
+            with refusal("CANONICAL_CORRELATION_MISMATCH", "owned reservation changed"):
+                guard.require_reserved_genesis_current()
+            changed.clear()
+            with refusal("ROLE_OPERATION_FORBIDDEN", "foreign owned reservation"):
+                guard.require_reserved_genesis_current()
+            foreign.clear()
+            second.stage = "issued"
+            with refusal("STALE_INVOCATION", "genesis reservation is expired or already issued"):
+                guard.require_reserved_genesis_current()
+            second.stage = "reserved"
+            changed.add(first)  # Exit still has to recheck the first member.
+
+    changed.clear()
+    assert runtime.active_guard is None
+    clock.now = first.witness["expires_monotonic_ns"]
+    fresh = host.bootstrap_fence(runtime, runtime.plan_data, runtime.reservations)
+    with refusal("STALE_INVOCATION", "genesis reservation is expired or already issued"):
+        with fresh:
+            pytest.fail("expired reservation admitted")
+    clock.now = now
+    with host.bootstrap_fence(runtime, runtime.plan_data, runtime.reservations):
+        pass
+
+
 def test_one_guard_entry_during_concurrent_preflight(runtime):
     started, finish = threading.Event(), threading.Event()
 
@@ -211,6 +274,163 @@ def test_failed_preflight_consumes_guard_without_blocking_fresh_guard(runtime):
             pytest.fail("failed guard reused")
     runtime.prove = lambda: None
     with runtime.authority.bootstrap_fence(runtime, runtime.plan_data, runtime.reservations):
+        pass
+
+
+@pytest.fixture
+def two_reservations(runtime):
+    first, = runtime.reservations
+    second = authority.ReservedEnrollment(keys.RESERVATION_KEY, runtime, dict(
+        first.witness, actor_cid="router-1", role="router", reservation_sequence=2))
+    runtime.reservations = (first, second)
+    return runtime.reservations
+
+
+def enrollment_fence(runtime, purpose, members):
+    if purpose == "genesis":
+        return runtime.authority.bootstrap_fence(runtime, runtime.plan_data, members)
+    return runtime.authority.initial_creation_fence(runtime, runtime.plan_data, members[0])
+
+
+def changed_members(runtime, members, change):
+    if change == "remove":
+        return members[:-1]
+    if change == "empty":
+        return ()
+    if change == "add":
+        added = authority.ReservedEnrollment(keys.RESERVATION_KEY, runtime, dict(
+            members[0].witness, actor_cid="reviewer-1", role="reviewer", reservation_sequence=len(members) + 1))
+        return (*members, added)
+    if change == "reorder":
+        return members[::-1]
+    if change == "replace":
+        replacement = authority.ReservedEnrollment(keys.RESERVATION_KEY, runtime, members[-1].witness)
+        assert replacement.witness == members[-1].witness
+        return (*members[:-1], replacement)
+    if change == "malformed-container":
+        return list(members)
+    assert change == "malformed-member"
+    return (*members[:-1], object())
+
+
+@pytest.mark.parametrize("purpose", ["genesis", "initial"])
+def test_enrollment_captures_witnesses_with_owner_lock(runtime, two_reservations, purpose, monkeypatch):
+    read_witness = authority.ReservedEnrollment.witness.fget
+    observations = []
+
+    def can_acquire():
+        if not runtime.lock.acquire(blocking=False):
+            return False
+        runtime.lock.release()
+        return True
+
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        def witness(member):
+            observations.append(worker.submit(can_acquire).result(timeout=3))
+            return read_witness(member)
+
+        monkeypatch.setattr(authority.ReservedEnrollment, "witness", property(witness))
+        enrollment_fence(runtime, purpose, two_reservations)
+        assert observations and not any(observations)
+        assert worker.submit(can_acquire).result(timeout=3)
+
+
+@pytest.mark.parametrize("purpose", ["genesis", "initial"])
+@pytest.mark.parametrize("change,reason", [
+    ("malformed-container", "invalid owned reservation set"),
+    ("malformed-member", "foreign owned reservation"),
+], ids=["malformed-container", "malformed-member"])
+def test_enrollment_refuses_malformed_baseline_before_reading_witnesses(
+        runtime, two_reservations, purpose, change, reason, monkeypatch):
+    runtime.reservations = changed_members(runtime, two_reservations, change)
+    read_witness = authority.ReservedEnrollment.witness.fget
+
+    def witness(member):
+        assert runtime.reservations is two_reservations, "malformed membership reached witness reads"
+        return read_witness(member)
+
+    monkeypatch.setattr(authority.ReservedEnrollment, "witness", property(witness))
+    with refusal("ROLE_OPERATION_FORBIDDEN", reason):
+        enrollment_fence(runtime, purpose, two_reservations)
+    assert runtime.active_guard is None
+    runtime.reservations = two_reservations
+    with enrollment_fence(runtime, purpose, two_reservations):
+        pass
+
+
+@pytest.mark.parametrize("purpose", ["genesis", "initial"])
+@pytest.mark.parametrize("change,code,reason", [
+    ("remove", "CANONICAL_CORRELATION_MISMATCH", "owned reservation set changed"),
+    ("empty", "CANONICAL_CORRELATION_MISMATCH", "owned reservation set changed"),
+    ("add", "CANONICAL_CORRELATION_MISMATCH", "owned reservation set changed"),
+    ("reorder", "CANONICAL_CORRELATION_MISMATCH", "owned reservation set changed"),
+    ("replace", "CANONICAL_CORRELATION_MISMATCH", "owned reservation set changed"),
+    ("malformed-container", "ROLE_OPERATION_FORBIDDEN", "invalid owned reservation set"),
+    ("malformed-member", "ROLE_OPERATION_FORBIDDEN", "foreign owned reservation"),
+], ids=["remove", "empty", "add", "reorder", "replace", "malformed-container", "malformed-member"])
+def test_enrollment_refuses_concurrent_preflight_membership_drift(
+        runtime, two_reservations, purpose, change, code, reason):
+    shifted = changed_members(runtime, two_reservations, change)
+    guard = enrollment_fence(runtime, purpose, two_reservations)
+
+    def set_members(members):
+        assert runtime.lock.acquire(timeout=2), "owner lock held across preflight or refusal"
+        try:
+            runtime.reservations = members
+        finally:
+            runtime.lock.release()
+
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        runtime.prove = lambda: worker.submit(set_members, shifted).result(timeout=3)
+        with refusal(code, reason):
+            with guard:
+                pytest.fail("preflight membership drift admitted")
+        assert runtime.active_guard is None
+        worker.submit(set_members, two_reservations).result(timeout=3)
+
+    runtime.prove = lambda: None
+    with refusal("ROLE_OPERATION_FORBIDDEN", "guard cannot be reentered"):
+        with guard:
+            pytest.fail("failed guard reused")
+    with enrollment_fence(runtime, purpose, two_reservations):
+        pass
+
+
+def test_initial_constructor_refuses_foreign_sibling(runtime, two_reservations, monkeypatch):
+    target, sibling = two_reservations
+    belongs_to = authority.ReservedEnrollment.belongs_to
+    foreign = True
+
+    monkeypatch.setattr(authority.ReservedEnrollment, "belongs_to",
+                        lambda member, owner: (member is not sibling or not foreign) and belongs_to(member, owner))
+    with refusal("ROLE_OPERATION_FORBIDDEN", "foreign owned reservation"):
+        runtime.authority.initial_creation_fence(runtime, runtime.plan_data, target)
+    assert runtime.active_guard is None
+    foreign = False
+    with runtime.authority.initial_creation_fence(runtime, runtime.plan_data, target):
+        pass
+
+
+def test_initial_constructor_respects_original_deadline_under_lock_contention(runtime):
+    target, = runtime.reservations
+    acquired, release = threading.Event(), threading.Event()
+
+    def hold_owner_lock():
+        with runtime.lock:
+            acquired.set()
+            assert release.wait(3)
+
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        owner = worker.submit(hold_owner_lock)
+        try:
+            assert acquired.wait(3)
+            with refusal("HOST_PROTOCOL_TIMEOUT", "host fence deadline expired"):
+                authority.InitialCreationGuard(keys.GUARD_KEY, runtime, runtime.plan_data, target,
+                                               deadline_ns=time.monotonic_ns())
+        finally:
+            release.set()
+        owner.result(timeout=3)
+    with runtime.authority.initial_creation_fence(runtime, runtime.plan_data, target):
         pass
 
 
@@ -278,6 +498,560 @@ def test_decision_requires_actual_canonical_row(runtime):
             host.require_current(invocation, runtime.policy_data, state, copy.deepcopy(row))
         with refusal("CANONICAL_CORRELATION_MISMATCH", "canonical target row is invalid"):
             host.require_current(invocation, runtime.policy_data, state, row)
+
+
+class PublicationBoundary:
+    """Inject drift around the real writer's storage operations."""
+
+    def __init__(self, *args, drift, site, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.drift, self.site = drift, site
+
+    @contextmanager
+    def transaction(self):
+        with super().transaction() as reader:
+            if self.site == "transaction-entry":
+                self.drift()
+            yield reader
+        if self.site == "after-unlock":
+            self.drift()
+
+    def publish_record(self, record):
+        super().publish_record(record)
+        if self.site == "after-publish":
+            self.drift()
+
+
+@pytest.fixture
+def canonical_runtime(tmp_path, runtime, owner_plane):
+    mailbox_root = make_store(tmp_path)
+    policy = journal_cases.policy()
+    process = {"boot_id": "00000000-0000-0000-0000-000000000001", "pid_namespace": 1,
+               "pid": 2, "start_ticks": 3}
+    channel = {"schema": "aegis.host-channel-witness/v1", "runtime_instance": process,
+               "appserver_instance": process, "control_peer_instance": process, "read_pipe_inode": 1,
+               "write_pipe_inode": 2, "epoch": 1, "deployment_sha256": "a" * 64,
+               "runtime_executable_sha256": "b" * 64, "host_source_closure_sha256": "c" * 64,
+               "role_ceiling_sha256": "d" * 64}
+    runtime.canonical_root = tmp_path / "canonical"
+    runtime.plan_data = runtime.approved_plan_ref = policy["authority"][0]
+    runtime.channel_data = runtime.channel_witness = channel
+    runtime.policy_data = policy
+    runtime.accepted_plan = {key: policy[key] for key in ("source", "actors", "current", "successors")}
+    template = runtime.reservations[0].witness
+    runtime.reservations = tuple(authority.ReservedEnrollment(keys.RESERVATION_KEY, runtime, dict(
+        template, actor_cid=cid, role=actor["role"], generation=actor["generation"],
+        cap_seconds=actor["cap_seconds"], profile_sha256=authority.digest(actor["profile"]),
+        channel_instance_sha256=authority.digest(channel), approved_plan_sha256=runtime.plan_data["sha256"],
+        reservation_sequence=sequence,
+    )) for sequence, (cid, actor) in enumerate(sorted(policy["actors"].items()), 1))
+    with mailbox(mailbox_root) as box:
+        yield runtime, {"mailbox": box, "clock": lambda: journal_cases.NOW, "host_authority": authority}
+
+
+@pytest.mark.parametrize("change", [
+    "malformed-container", "tuple-subclass", "malformed-member", "remove", "reorder", "replace",
+    "none", "shared-list", "live-malformed-member", "foreign-owner",
+])
+def test_genesis_writer_refuses_membership_before_reading_rows(canonical_runtime, monkeypatch, change):
+    class TupleSubclass(tuple):
+        pass
+
+    runtime, options = canonical_runtime
+    members = runtime.reservations
+    if change == "tuple-subclass":
+        supplied = TupleSubclass(members)
+    elif change == "none":
+        supplied = None
+    elif change == "shared-list":
+        runtime.reservations = supplied = list(members)
+    elif change == "live-malformed-member":
+        runtime.reservations = changed_members(runtime, members, "malformed-member")
+        supplied = members
+    elif change == "foreign-owner":
+        owns = authority.ReservedEnrollment.belongs_to
+        monkeypatch.setattr(authority.ReservedEnrollment, "belongs_to",
+                            lambda row, owner: row is not members[-1] and owns(row, owner))
+        supplied = members
+    else:
+        supplied = changed_members(runtime, members, change)
+
+    read_witness = authority.ReservedEnrollment.witness.fget
+    reads = []
+
+    def witness(member):
+        reads.append(member)
+        return read_witness(member)
+
+    monkeypatch.setattr(authority.ReservedEnrollment, "witness", property(witness))
+    writer = writers.ProtectedCanonicalEnrollmentWriter(runtime.canonical_root, runtime.authority, **options)
+    with pytest.raises(writers.CanonicalGenesisError) as caught:
+        writer.initialize_reserved_genesis(runtime, supplied, runtime.plan_data)
+    result = caught.value.as_dict()
+    assert (result["state"], result["effect"], result["code"]) == ("refused", "none", "HOST_AUTHORITY_REFUSED")
+    assert reads == []
+    assert not runtime.canonical_root.exists()
+    assert runtime.active_guard is None
+
+
+def test_genesis_writer_persists_guarded_rows_and_allows_initial(canonical_runtime, monkeypatch):
+    runtime, options = canonical_runtime
+    target = next(member for member in runtime.reservations if member.actor_cid == "root-1")
+    original = target.witness
+    capture = authority.HostAuthority.bootstrap_fence
+    read_witness = authority.ReservedEnrollment.witness.fget
+    updated = dict(original, expires_monotonic_ns=original["expires_monotonic_ns"] + 1)
+    witness_updates = {}
+
+    def witness(member):
+        return witness_updates.get(member, read_witness(member)).copy()
+
+    def fence(host, owned_runtime, plan, members):
+        witness_updates[target] = updated
+        return capture(host, owned_runtime, plan, members)
+
+    monkeypatch.setattr(authority.ReservedEnrollment, "witness", property(witness))
+    monkeypatch.setattr(authority.HostAuthority, "bootstrap_fence", fence)
+    writer = writers.ProtectedCanonicalEnrollmentWriter(runtime.canonical_root, runtime.authority, **options)
+    receipt = writer.initialize_reserved_genesis(runtime, runtime.reservations, runtime.plan_data)
+    reader = writers.Lifecycle(runtime.canonical_root, mailbox=options["mailbox"])
+    snapshot = reader.initial_bootstrap()
+    expected = [member.witness for member in runtime.reservations]
+    assert snapshot["reservations"] == expected
+    _, state = reader.load()
+    genesis = state["initial_bootstrap"]["genesis"]
+    assert genesis["envelope"]["event"]["reservations"] == expected
+    assert snapshot["genesis_receipt"] == state["receipts"]["initial-genesis"] == genesis["receipt"]
+    assert genesis["receipt"]["event_sha256"] == authority.digest(genesis["envelope"])
+    assert receipt["policy_sha256"] == snapshot["policy_sha256"]
+    assert receipt["checkpoint_sha256"] == snapshot["genesis_checkpoint"]["sha256"]
+    assert [row["reservation_witness_sha256"] for row in receipt["enrollments"]] == [
+        authority.digest(row) for row in expected]
+    with runtime.authority.bootstrap_fence(runtime, runtime.plan_data, runtime.reservations) as guard:
+        detached = guard.reserved_genesis_rows()
+        assert detached == expected
+        detached[0]["expires_monotonic_ns"] = 0
+        detached.reverse()
+        assert guard.reserved_genesis_rows() == expected
+    initial = writers.ProtectedCanonicalBootstrapWriter(reader.root, **options)
+    with runtime.authority.initial_creation_fence(runtime, runtime.plan_data, target) as guard:
+        result = initial.commit_initial_creation(guard, target)
+    assert (result["state"], result["receipt"]["sequence"]) == ("recorded", 2)
+    assert runtime.active_guard is None
+
+
+@pytest.mark.parametrize("site,sequence", [
+    ("preflight", None), ("transaction-entry", 0), ("after-publish", 1), ("after-unlock", 1),
+])
+def test_genesis_writer_preserves_publication_uncertainty(canonical_runtime, site, sequence):
+    class EnrollmentWriter(PublicationBoundary, writers.ProtectedCanonicalEnrollmentWriter):
+        pass
+
+    runtime, options = canonical_runtime
+    member = runtime.reservations[-1]
+    reader = writers.Lifecycle(runtime.canonical_root, mailbox=options["mailbox"])
+
+    def drift():
+        member.stage = "issued"
+
+    if site == "preflight":
+        runtime.prove = drift
+    writer = EnrollmentWriter(reader.root, runtime.authority, drift=drift, site=site, **options)
+    with pytest.raises(writers.CanonicalGenesisError) as caught:
+        writer.initialize_reserved_genesis(runtime, runtime.reservations, runtime.plan_data)
+    outcome = caught.value
+    if sequence is None:
+        assert (outcome.state, outcome.effect, outcome.code) == ("refused", "none", "HOST_AUTHORITY_REFUSED")
+        assert not reader.root.exists()
+    else:
+        assert (outcome.state, outcome.effect, outcome.code) == ("unknown", "possible", "GENESIS_PUBLICATION_UNKNOWN")
+        assert reader.load()[1]["sequence"] == sequence
+    assert (outcome.__cause__.code, outcome.__cause__.reason) == (
+        "STALE_INVOCATION", "genesis reservation is expired or already issued")
+    assert runtime.active_guard is None
+
+    runtime.prove = lambda: None
+    member.stage = "reserved"
+    retry = writers.ProtectedCanonicalEnrollmentWriter(reader.root, runtime.authority, **options)
+    if sequence is None:
+        result = retry.initialize_reserved_genesis(runtime, runtime.reservations, runtime.plan_data)
+        assert [row["actor_cid"] for row in result["enrollments"]] == [row.actor_cid for row in runtime.reservations]
+    else:
+        with pytest.raises(writers.CanonicalGenesisError) as existing:
+            retry.initialize_reserved_genesis(runtime, runtime.reservations, runtime.plan_data)
+        assert existing.value.code == "ROOT_ALREADY_EXISTS"
+        assert reader.load()[1]["sequence"] == sequence
+
+
+@pytest.mark.parametrize("site,change,sequence", [
+    ("preflight", "empty", None), ("after-prepare", "replace", None),
+    ("claim", "remove", 0), ("transaction-entry", "remove", 0),
+    ("after-publish", "replace", 1), ("after-unlock", "reorder", 1), ("guard-exit", "replace", 1),
+], ids=["preflight", "after-prepare", "claim", "transaction-entry", "after-publish", "after-unlock", "guard-exit"])
+def test_genesis_writer_maps_live_membership_drift(canonical_runtime, site, change, sequence, monkeypatch):
+    class EnrollmentWriter(PublicationBoundary, writers.ProtectedCanonicalEnrollmentWriter):
+        pass
+
+    runtime, options = canonical_runtime
+    members = runtime.reservations
+    shifted = changed_members(runtime, members, change)
+
+    def drift():
+        runtime.reservations = shifted
+
+    prepare = writers.prepare_initial
+    initialize = writers.initialize
+    guard_exit = authority.ReservedGenesisGuard.__exit__
+    read_bootstrap = writers.Lifecycle.initial_bootstrap
+    faults = {site}
+
+    def prepare_and_drift(*args):
+        candidate = prepare(*args)
+        if "after-prepare" in faults:
+            drift()
+        return candidate
+
+    def initialize_and_drift(*args, **kwargs):
+        result = initialize(*args, **kwargs)
+        if "claim" in faults:
+            drift()
+        return result
+
+    def exit_guard(guard, exc_type, exc_value, traceback):
+        if "guard-exit" in faults and exc_type is None:
+            drift()
+        if "after-unlock" in faults:
+            runtime.reservations = members
+        return guard_exit(guard, exc_type, exc_value, traceback)
+
+    def read_before_drift(reader):
+        assert "after-publish" not in faults or runtime.reservations is members
+        return read_bootstrap(reader)
+
+    monkeypatch.setattr(writers, "prepare_initial", prepare_and_drift)
+    monkeypatch.setattr(writers, "initialize", initialize_and_drift)
+    monkeypatch.setattr(authority.ReservedGenesisGuard, "__exit__", exit_guard)
+    monkeypatch.setattr(writers.Lifecycle, "initial_bootstrap", read_before_drift)
+    if site == "preflight":
+        runtime.prove = drift
+    writer = EnrollmentWriter(runtime.canonical_root, runtime.authority, drift=drift, site=site, **options)
+    with pytest.raises(writers.CanonicalGenesisError) as caught:
+        writer.initialize_reserved_genesis(runtime, members, runtime.plan_data)
+    outcome = caught.value
+    assert (outcome.__cause__.code, outcome.__cause__.reason) == (
+        "CANONICAL_CORRELATION_MISMATCH", "owned reservation set changed")
+    assert runtime.active_guard is None
+    reader = writers.Lifecycle(runtime.canonical_root, mailbox=options["mailbox"])
+    retry = writers.ProtectedCanonicalEnrollmentWriter(reader.root, runtime.authority, **options)
+    faults.clear()
+    runtime.prove = lambda: None
+    runtime.reservations = members
+    if sequence is None:
+        assert (outcome.state, outcome.effect, outcome.code) == ("refused", "none", "HOST_AUTHORITY_REFUSED")
+        assert not reader.root.exists()
+        receipt = retry.initialize_reserved_genesis(runtime, members, runtime.plan_data)
+        assert receipt["checkpoint_sha256"] == reader.initial_bootstrap()["genesis_checkpoint"]["sha256"]
+        assert reader.load()[1]["sequence"] == 1
+    else:
+        assert (outcome.state, outcome.effect, outcome.code) == ("unknown", "possible", "GENESIS_PUBLICATION_UNKNOWN")
+        _, before = reader.load()
+        assert before["sequence"] == sequence
+        assert ("initial-genesis" in before["receipts"]) == (sequence == 1)
+        with pytest.raises(writers.CanonicalGenesisError) as existing:
+            retry.initialize_reserved_genesis(runtime, members, runtime.plan_data)
+        assert existing.value.code == "ROOT_ALREADY_EXISTS"
+        assert reader.load()[1] == before
+
+
+class LiveActor:
+    def __init__(self, actor, receipt):
+        self.actor = actor
+        self.initial_data = {"initial_event_id": receipt["event_id"], "initial_sequence": receipt["sequence"],
+                             "initial_event_sha256": receipt["event_sha256"]}
+        self.reads = 0
+
+    @property
+    def actor_data(self):
+        self.reads += 1
+        return self.actor.copy()
+
+
+@pytest.fixture
+def genesis_journal(canonical_runtime):
+    runtime, options = canonical_runtime
+    reader = writers.Lifecycle(runtime.canonical_root, mailbox=options["mailbox"], clock=options["clock"])
+    enrollment = writers.ProtectedCanonicalEnrollmentWriter(reader.root, runtime.authority, **options)
+    enrollment.initialize_reserved_genesis(runtime, runtime.reservations, runtime.plan_data)
+    root = next(member for member in runtime.reservations if member.actor_cid == "root-1")
+    return runtime, root, reader, options
+
+
+@pytest.mark.parametrize("site", ["transaction-entry", "after-publish", "after-unlock"])
+def test_initial_writer_rechecks_identity_and_preserves_original_receipt(genesis_journal, site):
+    class InitialWriter(PublicationBoundary, writers.ProtectedCanonicalBootstrapWriter):
+        pass
+
+    runtime, root, reader, options = genesis_journal
+
+    def drift():
+        runtime.nonce = "rotated"
+
+    writer = InitialWriter(reader.root, drift=drift, site=site, **options)
+    with runtime.authority.initial_creation_fence(runtime, runtime.plan_data, root) as guard:
+        outcome = writer.commit_initial_creation(guard, root)
+    assert outcome["receipt"] is None and runtime.active_guard is None
+    published = site != "transaction-entry"
+    _, state = reader.load()
+    if published:
+        assert (outcome["state"], outcome["effect"], outcome["code"]) == (
+            "unknown", "possible", "INITIAL_CREATION_PUBLICATION_UNKNOWN")
+        original = state["initial_bootstrap"]["creations"][root.actor_cid]["receipt"]
+        root.stage = "issued"
+    else:
+        assert (outcome["state"], outcome["effect"], outcome["code"]) == (
+            "refused", "none", "HOST_AUTHORITY_REFUSED")
+        assert state["initial_bootstrap"]["creations"] == {}
+    retry = writers.ProtectedCanonicalBootstrapWriter(reader.root, **options)
+    with runtime.authority.initial_creation_fence(runtime, runtime.plan_data, root) as guard:
+        result = retry.commit_initial_creation(guard, root)
+    if published:
+        assert (result["state"], result["receipt"]) == ("recovered", original)
+        assert reader.load()[1] == state
+    else:
+        assert result["state"] == "recorded"
+        assert reader.load()[1]["sequence"] == state["sequence"] + 1
+
+
+@pytest.mark.parametrize("site", ["transaction-entry", "before-publish", "after-publish", "after-unlock"])
+@pytest.mark.parametrize("change", ["witness", "ownership", "replace"])
+def test_initial_writer_maps_live_sibling_drift(genesis_journal, site, change, monkeypatch):
+    class InitialWriter(PublicationBoundary, writers.ProtectedCanonicalBootstrapWriter):
+        pass
+
+    runtime, root, reader, options = genesis_journal
+    members = runtime.reservations
+    sibling = members[-1]
+    assert sibling is not root
+    sibling.stage = "issued"
+    shifted = changed_members(runtime, members, "replace")
+    read_witness = authority.ReservedEnrollment.witness.fget
+    belongs_to = authority.ReservedEnrollment.belongs_to
+    active_changes = set()
+
+    def witness(member):
+        row = read_witness(member)
+        if "witness" in active_changes and member is sibling:
+            row["generation"] += 1
+        return row
+
+    def owns(member, owner):
+        return not ("ownership" in active_changes and member is sibling) and belongs_to(member, owner)
+
+    monkeypatch.setattr(authority.ReservedEnrollment, "witness", property(witness))
+    monkeypatch.setattr(authority.ReservedEnrollment, "belongs_to", owns)
+
+    def drift():
+        active_changes.add(change)
+        if change == "replace":
+            runtime.reservations = shifted
+
+    writer_options = options
+    if site == "before-publish":
+        def clock():
+            drift()
+            return journal_cases.NOW
+
+        writer_options = {**options, "clock": clock}
+    writer = InitialWriter(reader.root, drift=drift, site=site, **writer_options)
+    with runtime.authority.initial_creation_fence(runtime, runtime.plan_data, root) as guard:
+        outcome = writer.commit_initial_creation(guard, root)
+    assert runtime.active_guard is None
+    active_changes.clear()
+    runtime.reservations = members
+    assert outcome["receipt"] is None
+    _, state = reader.load()
+    unpublished = site in ("transaction-entry", "before-publish")
+    if unpublished:
+        assert (outcome["state"], outcome["effect"], outcome["code"]) == (
+            "refused", "none", "HOST_AUTHORITY_REFUSED")
+        assert state["sequence"] == 1
+        assert state["initial_bootstrap"]["creations"] == {}
+    else:
+        assert (outcome["state"], outcome["effect"], outcome["code"]) == (
+            "unknown", "possible", "INITIAL_CREATION_PUBLICATION_UNKNOWN")
+        assert state["sequence"] == 2
+    retry = writers.ProtectedCanonicalBootstrapWriter(reader.root, **options)
+    with runtime.authority.initial_creation_fence(runtime, runtime.plan_data, root) as guard:
+        result = retry.commit_initial_creation(guard, root)
+    if unpublished:
+        assert (result["state"], result["receipt"]["sequence"]) == ("recorded", 2)
+    else:
+        original = state["initial_bootstrap"]["creations"][root.actor_cid]["receipt"]
+        assert (result["state"], result["receipt"]) == ("recovered", original)
+        assert reader.load()[1] == state
+    assert reader.load()[1]["sequence"] == 2
+    assert runtime.active_guard is None
+
+
+@pytest.mark.parametrize("change", ["expires-at-equality", "issued"])
+def test_new_initial_writer_rechecks_target_after_prepare(genesis_journal, monkeypatch, change):
+    runtime, root, reader, options = genesis_journal
+    expires = root.witness["expires_monotonic_ns"]
+    clock = SimpleNamespace(now=expires - 1, monotonic_ns=lambda: clock.now)
+    monkeypatch.setattr(authority, "time", clock)
+    prepare = writers.prepare_initial
+
+    def prepare_and_drift(*args):
+        candidate = prepare(*args)
+        if change == "expires-at-equality":
+            clock.now = expires
+        else:
+            root.stage = "issued"
+        return candidate
+
+    monkeypatch.setattr(writers, "prepare_initial", prepare_and_drift)
+    before = reader.load()[1]
+    writer = writers.ProtectedCanonicalBootstrapWriter(reader.root, **options)
+    with runtime.authority.initial_creation_fence(runtime, runtime.plan_data, root) as guard:
+        result = writer.commit_initial_creation(guard, root)
+        guard.require_initial_identity_current(root)
+    assert (result["state"], result["effect"], result["code"], result["receipt"]) == (
+        "refused", "none", "HOST_AUTHORITY_REFUSED", None)
+    assert reader.load()[1] == before
+    assert runtime.active_guard is None
+
+    clock.now = expires - 1
+    root.stage = "reserved"
+    monkeypatch.setattr(writers, "prepare_initial", prepare)
+    with runtime.authority.initial_creation_fence(runtime, runtime.plan_data, root) as guard:
+        retry = writer.commit_initial_creation(guard, root)
+    assert (retry["state"], retry["receipt"]["sequence"]) == ("recorded", before["sequence"] + 1)
+
+
+def test_initial_writer_is_uncertain_from_publication_attempt(genesis_journal):
+    class FailingWriter(writers.ProtectedCanonicalBootstrapWriter):
+        def publish_record(self, record):
+            raise OSError("publication interrupted")
+
+    runtime, root, reader, options = genesis_journal
+    before = reader.load()[1]
+    writer = FailingWriter(reader.root, **options)
+    with runtime.authority.initial_creation_fence(runtime, runtime.plan_data, root) as guard:
+        result = writer.commit_initial_creation(guard, root)
+    assert (result["state"], result["effect"], result["code"], result["receipt"]) == (
+        "unknown", "possible", "INITIAL_CREATION_PUBLICATION_UNKNOWN", None)
+    assert reader.load()[1] == before
+    assert runtime.active_guard is None
+    retry = writers.ProtectedCanonicalBootstrapWriter(reader.root, **options)
+    with runtime.authority.initial_creation_fence(runtime, runtime.plan_data, root) as guard:
+        created = retry.commit_initial_creation(guard, root)
+    assert (created["state"], created["receipt"]["sequence"]) == ("recorded", before["sequence"] + 1)
+
+
+@pytest.mark.parametrize("target_status", ["issued", "expired"])
+def test_initial_writer_allows_issued_sibling_and_recovers_original(genesis_journal, target_status, monkeypatch):
+    runtime, root, reader, options = genesis_journal
+    sibling = runtime.reservations[-1]
+    assert sibling is not root
+    sibling.stage = "issued"
+    writer = writers.ProtectedCanonicalBootstrapWriter(reader.root, **options)
+    with runtime.authority.initial_creation_fence(runtime, runtime.plan_data, root) as guard:
+        created = writer.commit_initial_creation(guard, root)
+    assert (created["state"], created["receipt"]["sequence"]) == ("recorded", 2)
+    before = reader.load()[1]
+    if target_status == "issued":
+        root.stage = "issued"
+    else:
+        expired_at = root.witness["expires_monotonic_ns"]
+        monkeypatch.setattr(authority, "time", SimpleNamespace(monotonic_ns=lambda: expired_at))
+    with runtime.authority.initial_creation_fence(runtime, runtime.plan_data, root) as guard:
+        retry = writer.commit_initial_creation(guard, root)
+    assert (retry["state"], retry["receipt"]) == ("recovered", created["receipt"])
+    assert reader.load()[1] == before
+    assert runtime.active_guard is None
+
+
+@pytest.fixture
+def decision_journal(genesis_journal):
+    runtime, root, reader, options = genesis_journal
+    initial = writers.ProtectedCanonicalBootstrapWriter(reader.root, **options)
+    with runtime.authority.initial_creation_fence(runtime, runtime.plan_data, root) as guard:
+        receipt = initial.commit_initial_creation(guard, root)["receipt"]
+    reader.record(journal_cases.event("publish", request=journal_cases.raw(journal_cases.request())))
+    invocation = Invocation(runtime)
+    invocation.event_id, invocation.decision_recovery_event_id = "approval", None
+    invocation.arguments = {"event_id": invocation.event_id, **journal_cases.target(),
+                            "decision": "approve", "reason": "reviewed"}
+    invocation.session = LiveActor(root.witness, receipt)
+    runtime.canonical_api = lifecycle
+    options = {**options, "host_authority": SimpleNamespace(
+        HostAuthority=authority.HostAuthority, HostInvocation=Invocation, HostAuthorityError=HostAuthorityError)}
+    return runtime, invocation, reader, options
+
+
+@pytest.mark.parametrize("site,changed,reads", [
+    ("none", {}, 5), ("before-publish", {"generation": 2}, 3),
+    ("after-publish", {"profile_sha256": "e" * 64}, 4), ("after-unlock", {"role": "router"}, 5),
+], ids=["unchanged", "before-publish", "after-publish", "after-unlock"])
+def test_decision_writer_reads_one_live_actor_per_checkpoint(decision_journal, site, changed, reads):
+    class DecisionWriter(PublicationBoundary, writers.ProtectedCanonicalDecisionWriter):
+        pass
+
+    runtime, invocation, reader, options = decision_journal
+    before = reader.load()[1]["sequence"]
+    command = invocation.arguments
+
+    def drift():
+        invocation.session.actor.update(changed)
+
+    if site == "before-publish":
+        def validate(raw):
+            request = lifecycle.validate_request(raw)
+            drift()  # After validating the old target and before checking the candidate.
+            return request
+
+        runtime.canonical_api = SimpleNamespace(validate_request=validate)
+
+    writer = DecisionWriter(reader.root, runtime.authority, drift=drift, site=site, **options)
+    result = writer.commit_decision(invocation, command)
+    expected = {
+        "none": ("recorded", "canonical_decision", None),
+        "before-publish": ("refused", "none", "STALE_INVOCATION"),
+        "after-publish": ("unknown", "possible", "PUBLICATION_UNKNOWN"),
+        "after-unlock": ("unknown", "possible", "PUBLICATION_UNKNOWN"),
+    }
+    assert (result["state"], result["effect"], result["code"]) == expected[site]
+    assert invocation.session.reads == reads
+    sequence = before + (site != "before-publish")
+    assert reader.load()[1]["sequence"] == sequence
+    retry = writer.commit_decision(invocation, command)
+    assert (retry["state"], retry["code"], retry["receipt"]) == ("unknown", "PUBLICATION_UNKNOWN", None)
+    assert reader.load()[1]["sequence"] == sequence
+    assert invocation.session.reads == reads
+    assert runtime.active_guard is None and invocation.scope_depth == 0
+
+
+def test_decision_skips_enrollment_snapshots_and_preserves_role_refusal_order(runtime):
+    class ObservedReservations(tuple):
+        def __iter__(self):
+            reads.append("reservations")
+            return super().__iter__()
+
+    reads = []
+    runtime.reservations = ObservedReservations(runtime.reservations)
+    invocation = Invocation(runtime)
+    actor = {"role": "router", "generation": 1, "profile": {}}
+    runtime.policy_data["actors"][invocation.actor_cid] = actor
+    session = invocation.session = LiveActor({"role": "root"}, {
+        "event_id": "initial", "sequence": 2, "event_sha256": "a" * 64})
+    host = runtime.authority
+    with host.effect_fence(invocation, "decision"):
+        with refusal("CANONICAL_CORRELATION_MISMATCH", "canonical policy differs from owned plan"):
+            host.require_current(invocation, {}, {}, None)
+        with refusal("ROLE_OPERATION_FORBIDDEN", "decision requires current ROOT"):
+            host.require_current(invocation, runtime.policy_data, {}, None)
+    assert session.reads == 0
+    assert reads == []
 
 
 @pytest.mark.parametrize("raw,code,reason", [
