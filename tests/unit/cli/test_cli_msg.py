@@ -1,4 +1,5 @@
 """Public message CLI contracts; codec output is passed through verbatim."""
+from concurrent.futures import ThreadPoolExecutor
 import copy
 from datetime import datetime, timezone
 import hashlib
@@ -10,6 +11,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+from threading import Barrier
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +19,7 @@ from conftest import symlink_or_skip
 
 from aegis_cli.cli import main
 from aegis_core import message_codec as codec
+from aegis_core import message_codec_store
 from tests.unit.core.test_message_codec import (make_store, stored_log, _counting, _CANONICAL, _ISOLATE,
                                                 _LOOKUP, _PARSE, _STORE_READ, _STORE_VERIFIED)
 
@@ -345,6 +348,132 @@ def test_round6_missing_anchored_capabilities_refuse_fixed_json(
         separators=(",", ":")) + "\n"
     assert list(directory.iterdir()) == []
     assert not (workspace / ".aegis" / "state").exists()
+
+
+@pytest.fixture
+def without_descriptor_scandir(tmp_path, monkeypatch):
+    make_store(tmp_path).close()
+    unsupported_os = SimpleNamespace(
+        supports_dir_fd=os.supports_dir_fd,
+        supports_follow_symlinks=os.supports_follow_symlinks,
+        supports_fd=os.supports_fd - {os.scandir},
+        O_DIRECTORY=os.O_DIRECTORY,
+        O_NOFOLLOW=os.O_NOFOLLOW,
+        geteuid=os.geteuid,
+    )
+    monkeypatch.setattr(message_codec_store, "os", unsupported_os)
+
+
+@pytest.mark.parametrize("entry", ["cli", "storage"])
+@pytest.mark.parametrize("existing_state", [False, True])
+@pytest.mark.usefixtures("without_descriptor_scandir")
+def test_default_write_preflights_descriptor_scandir(
+        entry, existing_state, workspace, tmp_path, monkeypatch, capsys):
+    from aegis_core import storage
+    from aegis_core.workspace.base import Workspace
+
+    state = workspace / ".aegis" / "state"
+    if existing_state:
+        state.mkdir()
+        (state / "sentinel").write_bytes(b"unchanged")
+    source = tmp_path / "content.json"
+    source.write_text(json.dumps(content(GOLDENS[0]["record"])), encoding="utf-8")
+    argv = ["msg", "write", "--kind", "text", "--in", str(source)]
+    bound = Workspace(workspace)
+    ready = Barrier(2, timeout=5)
+
+    def refuse_storage_write():
+        ready.wait()
+        with pytest.raises(codec.CodecError) as caught:
+            with storage.message_store(bound, write=True):
+                pytest.fail("unsupported store admitted a writer")
+        assert caught.value.as_dict() == codec.CodecError("E_AUTH").as_dict()
+
+    if entry == "cli":
+        assert main(argv) == 2
+        refusal = capsys.readouterr()
+    else:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            writers = [pool.submit(refuse_storage_write) for _ in range(2)]
+            for writer in writers:
+                writer.result(timeout=5)
+    if existing_state:
+        assert sorted(path.name for path in state.iterdir()) == ["sentinel"]
+        assert (state / "sentinel").read_bytes() == b"unchanged"
+    else:
+        assert not state.exists()
+    if entry == "cli":
+        assert refusal.err == ""
+        assert json.loads(refusal.out) == {"error": {"code": "E_AUTH", "message":
+            "platform unsupported; message stores require anchored file operations"}}
+
+    monkeypatch.setattr(message_codec_store, "os", os)
+    if entry == "cli":
+        assert main(argv) == 0
+        rid = json.loads(capsys.readouterr().out)["id"]
+    else:
+        with storage.message_store(bound, write=True) as default_store:
+            rid = default_store.write(GOLDENS[0]["record"])
+    assert (state / "messages" / rid[:2] / (rid + ".json")).is_file()
+
+
+@pytest.mark.usefixtures("without_descriptor_scandir")
+@pytest.mark.parametrize("action", ["read", "verify"])
+@pytest.mark.parametrize("present", [False, True])
+def test_default_cli_reads_preserve_refusals_without_descriptor_scandir(action, present, workspace, capsys):
+    directory = workspace / ".aegis" / "state" / "messages"
+    if present:
+        directory.mkdir(parents=True, mode=0o700)
+    assert main(["msg", action, "a" * 64]) == 2
+    assert_error(capsys.readouterr(), "E_AUTH" if present else "E_REF", None if present else "resolution")
+    assert directory.exists() == present
+    assert not (directory.parent / ".gitignore").exists()
+
+
+@pytest.mark.usefixtures("without_descriptor_scandir")
+@pytest.mark.parametrize("action, payload, code", [
+    ("read", None, "E_AUTH"),
+    ("verify", None, "E_AUTH"),
+    ("write", '{"fields":{},"body":"","refs":{}}', "E_AUTH"),
+    ("write", '{"body":', "E_FORMAT"),
+], ids=["read", "verify", "valid-write", "malformed-write"])
+def test_explicit_store_preserves_refusals_without_descriptor_scandir(action, payload, code, workspace, tmp_path, capsys):
+    directory = tmp_path / "explicit"
+    directory.mkdir(mode=0o700)
+    if payload is None:
+        args = ["a" * 64]
+    else:
+        source = tmp_path / "content.json"
+        source.write_text(payload, encoding="utf-8")
+        args = ["--kind", "text", "--in", str(source)]
+    assert main(["msg", "--store", str(directory), action, *args]) == 2
+    assert_error(capsys.readouterr(), code)
+    assert list(directory.iterdir()) == []
+    assert not (workspace / ".aegis" / "state").exists()
+
+
+@pytest.mark.usefixtures("without_descriptor_scandir")
+@pytest.mark.parametrize("entry", ["storage", "mcp"])
+@pytest.mark.parametrize("present", [False, True])
+def test_default_core_reads_preserve_refusals_without_descriptor_scandir(entry, present, workspace):
+    from aegis_core import storage
+    from aegis_core.workspace.base import Workspace
+    from aegis_mcp.handlers.msg import handle_msg_read
+
+    directory = workspace / ".aegis" / "state" / "messages"
+    if present:
+        directory.mkdir(parents=True, mode=0o700)
+    bound = Workspace(workspace)
+    expected = (codec.CodecError("E_AUTH") if present else codec.CodecError("E_REF", detail="resolution")).as_dict()
+    if entry == "storage":
+        with pytest.raises(codec.CodecError) as caught:
+            with storage.message_store(bound):
+                pytest.fail("unavailable store admitted a reader")
+        assert caught.value.as_dict() == expected
+    else:
+        assert handle_msg_read({"workspace": bound, "ref": "a" * 64}) == expected
+    assert directory.exists() == present
+    assert not (directory.parent / ".gitignore").exists()
 
 
 @pytest.mark.parametrize("token", [
