@@ -4,6 +4,8 @@ Covers least-privilege tokens, SHA-pinned actions, Dependabot, dependency
 auditing, build provenance attestations and PyPI Trusted Publishing (OIDC).
 PyYAML parses the workflow key ``on`` as boolean ``True``; ``_triggers`` reads either spelling.
 """
+import copy
+import math
 import os
 import re
 import json
@@ -93,7 +95,9 @@ def test_integration_push_runs_every_develop_job_and_step_condition():
     assert INTEGRATION_BRANCH in _triggers(workflow)["push"]["branches"]
     jobs = workflow["jobs"]
     assert set(jobs) == {
-        "dependency-audit", "build-wheel", "test-fast", "aegis-check", "validate", "test-windows", "verdict",
+        "dependency-audit", "build-wheel",
+        "test-fast-unit-core", "test-fast-unit-rest", "test-fast-integration", "test-fast-contract",
+        "aegis-check", "validate", "test-windows", "verdict",
     }
     matrix = jobs["validate"]["strategy"]["matrix"]
     validate_legs = [
@@ -113,7 +117,8 @@ def test_integration_push_runs_every_develop_job_and_step_condition():
             if name not in ("validate", "test-windows")]
     legs += [("validate", os_name, version) for os_name, version in validate_legs]
     legs += [("test-windows", "windows-latest", version) for version in windows_matrix["python-version"]]
-    assert len(legs) == 11
+    # 8 singleton jobs (four of them test-fast shards) + 4 validate legs + 2 Windows legs.
+    assert len(legs) == 14
     runner_os = {"ubuntu-latest": "Linux", "ubuntu-24.04": "Linux",
                  "macos-latest": "macOS", "windows-latest": "Windows"}
     for name, runner, version in legs:
@@ -199,13 +204,65 @@ def test_wave_tests_run_pull_requests_into_develop_without_secrets():
     ("success", "failure", False), ("skipped", "cancelled", False),
 ])
 def test_required_check_rejects_unexpected_upstream_results(expected, actual, passed):
-    proc = _run_upstream_gate(expected, {"build-wheel": {"result": actual}, FAST_JOB: {"result": "success"}})
+    needs = {"build-wheel": {"result": actual}}
+    needs.update({name: {"result": "success"} for name, _job in _fast_jobs()})
+    proc = _run_upstream_gate(expected, needs)
     assert (proc.returncode == 0) is passed, proc.stderr
     if not passed:
         assert "build-wheel" in proc.stderr and "Unexpected upstream job results" in proc.stderr
+# Run 44219204536, validate ubuntu-latest 3.11: the suite finished in 6516.67s.
+# A test-fast timeout below twice that cancels a green run (the 45 min cap did).
+SUITE_GREEN_SECONDS = 6516.67
+SUITE_GREEN_RUN = "44219204536"
+_MEASUREMENT_LINE = re.compile(
+    r"^# test-fast-measurement: ([A-Za-z0-9_-]+) ([0-9]+(?:\.[0-9]+)?)s run ([0-9]+)\s*$",
+    re.M,
+)
 
 
-FAST_JOB = "test-fast"
+def _minimum_timeout_minutes(seconds):
+    """Smallest integer minute cap that is at least twice ``seconds``."""
+    minutes = (seconds * 2) / 60.0
+    whole = int(minutes)
+    if minutes - whole > 1e-9:
+        return whole + 1
+    return whole
+
+
+def _fast_jobs(workflow=None):
+    """The per-PR suite job, or each of its directory shards. One unsharded job is not enough."""
+    jobs = (workflow or _load("validate.yml"))["jobs"]
+    return [(name, job) for name, job in jobs.items()
+            if name == "test-fast" or name.startswith("test-fast-")]
+
+
+def _recorded_fast_measurements(text):
+    found = {}
+    for job, seconds, run in _MEASUREMENT_LINE.findall(text):
+        assert job not in found, job
+        found[job] = (float(seconds), run)
+    return found
+
+
+def _suite_test_files():
+    """Pytest's default file names under ``tests/``, as repo-relative forward-slash paths."""
+    root = os.path.join(REPO_ROOT, "tests")
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(name for name in dirnames if name not in ("__pycache__", ".pytest_cache"))
+        for name in filenames:
+            if name.endswith(".py") and (name.startswith("test_") or name.endswith("_test.py")):
+                full = os.path.join(dirpath, name)
+                found.append(os.path.relpath(full, REPO_ROOT).replace(os.sep, "/"))
+    return sorted(found)
+
+
+def _selected_test_files(selector, files):
+    """Test files a positive directory or file selector collects. No glob and no parent escape."""
+    if selector.endswith(".py"):
+        return [path for path in files if path == selector]
+    prefix = selector.rstrip("/") + "/"
+    return [path for path in files if path.startswith(prefix)]
 
 
 def _run_upstream_gate(expected, needs):
@@ -223,17 +280,20 @@ def _run_upstream_gate(expected, needs):
     ("success", "failure", False), ("skipped", None, False),
 ])
 def test_required_check_needs_the_fast_leg_to_succeed_on_every_run(expected, fast, passed):
-    needs = {"build-wheel": {"result": expected}}
-    if fast is not None:
-        needs[FAST_JOB] = {"result": fast}
-    proc = _run_upstream_gate(expected, needs)
-    assert (proc.returncode == 0) is passed, proc.stderr
-    if not passed:
-        assert FAST_JOB in proc.stderr and "Unexpected upstream job results" in proc.stderr
-
-
-def _fast_job():
-    return _load("validate.yml")["jobs"][FAST_JOB]
+    """Every shard is in ALWAYS_SUCCESS, so each one must succeed on a wave PR and on a full run."""
+    names = [name for name, _job in _fast_jobs()]
+    assert names
+    for target in names:
+        needs = {"build-wheel": {"result": expected}}
+        for name in names:
+            if name != target:
+                needs[name] = {"result": "success"}
+            elif fast is not None:
+                needs[name] = {"result": fast}
+        proc = _run_upstream_gate(expected, needs)
+        assert (proc.returncode == 0) is passed, (target, proc.stderr)
+        if not passed:
+            assert target in proc.stderr and "Unexpected upstream job results" in proc.stderr
 
 
 def _runs(job):
@@ -253,46 +313,59 @@ def _packages(run):
 def test_wave_prs_run_the_fast_linux_leg_with_a_read_only_token_and_no_secrets():
     workflow = _load("validate.yml")
     assert "pull_request_target" not in _triggers(workflow)
-    job = workflow["jobs"][FAST_JOB]
-    # No `if` and no `needs`: build-wheel and dependency-audit skip on wave PRs, and the verdict
-    # needs this job to succeed on push and dispatch too.
-    assert "if" not in job and "needs" not in job
-    assert job["runs-on"] == "ubuntu-latest"
-    assert job.get("permissions", {"contents": "read"}) == {"contents": "read"}
-    assert isinstance(job.get("timeout-minutes"), int) and job["timeout-minutes"] <= 60
-    text = yaml.safe_dump(job)
-    # Any spelling of a secret or the workflow token: secrets.X, secrets['X'], toJSON(secrets),
-    # github.token, github['token'].
-    assert not re.search(r"\bsecrets\b|github\s*(\.|\[)\s*'?token|GH_TOKEN", text), text
-    assert not {"environment", "container", "services"} & set(job)
-    assert [s["with"]["python-version"] for s in _step_using(job, "actions/setup-python")] == ["3.11"]
-    checkout = _step_using(job, "actions/checkout")
-    assert len(checkout) == 1 and checkout[0]["with"] == {"fetch-depth": 0, "persist-credentials": False}
-    for step in job["steps"]:
-        assert not step.get("continue-on-error") and "if" not in step, step
-        assert "|| true" not in step.get("run", ""), step
-    assert FAST_JOB in workflow["jobs"]["aegis-check"]["needs"]
+    needs = workflow["jobs"]["aegis-check"]["needs"]
+    if isinstance(needs, str):
+        needs = [needs]
+    for name, job in _fast_jobs(workflow):
+        # No `if` and no `needs`: build-wheel and dependency-audit skip on wave PRs, and the verdict
+        # needs this job to succeed on push and dispatch too.
+        assert "if" not in job and "needs" not in job, name
+        assert job["runs-on"] == "ubuntu-latest"
+        assert job.get("permissions", {"contents": "read"}) == {"contents": "read"}
+        # Twice the 6516.67s suite measurement is 218 minutes, above the old 60 cap.
+        # GitHub's own ceiling is 360; the twice-measured floor is a separate test.
+        assert type(job.get("timeout-minutes")) is int and job["timeout-minutes"] <= 360
+        text = yaml.safe_dump(job)
+        # Any spelling of a secret or the workflow token: secrets.X, secrets['X'], toJSON(secrets),
+        # github.token, github['token'].
+        assert not re.search(r"\bsecrets\b|github\s*(\.|\[)\s*'?token|GH_TOKEN", text), text
+        assert not {"environment", "container", "services"} & set(job)
+        assert [s["with"]["python-version"] for s in _step_using(job, "actions/setup-python")] == ["3.11"]
+        checkout = _step_using(job, "actions/checkout")
+        assert len(checkout) == 1 and checkout[0]["with"] == {"fetch-depth": 0, "persist-credentials": False}
+        for step in job["steps"]:
+            assert not step.get("continue-on-error") and "if" not in step, step
+            assert "|| true" not in step.get("run", ""), step
+        assert name in needs
 
 
 def test_the_fast_leg_runs_the_whole_suite_with_xdist_from_its_own_venv():
-    job = _fast_job()
-    # The runner context is not available to job-level env, so a step exports the venv path.
-    export = _index(job, 'echo "VENV=$RUNNER_TEMP/ci-venv" >> "$GITHUB_ENV"')
-    venv = _index(job, 'python -m venv "$VENV"')
-    assert export < venv
-    install = _index(job, '"$VENV/bin/pip" install pytest==')
-    package = _index(job, '"$VENV/bin/pip" install .')
-    lint = _index(job, 'make lint PYTHON="$VENV/bin/python"')
-    suite = _index(job, 'make test PYTHON="$VENV/bin/python"')
-    assert venv < install < package < lint < suite
+    """Each shard installs the same venv as validate and runs the canonical suite step.
+
+    The selectors together are the whole suite (see the exact-coverage test). The whole
+    job equals one template, so a narrowed command or an earlier step is a different job.
+    """
+    jobs = _fast_jobs()
     validate_install = next(s["run"] for s in _load("validate.yml")["jobs"]["validate"]["steps"]
                             if s.get("name") == INSTALL_STEP)
-    packages = _packages(_runs(job)[install])
-    assert packages == _packages(validate_install.splitlines()[0]) and "pytest-xdist==3.6.1" in packages
-    assert _runs(job)[suite].strip() == 'make test PYTHON="$VENV/bin/python"'
-    for flag in ("--deselect", " -k ", " -m ", "--ignore"):
-        assert flag not in _runs(job)[suite]
-    assert _index(job, "grep -rnI '/home/'") > package
+    for _name, job in jobs:
+        # The runner context is not available to job-level env, so a step exports the venv path.
+        export = _index(job, 'echo "VENV=$RUNNER_TEMP/ci-venv" >> "$GITHUB_ENV"')
+        venv = _index(job, 'python -m venv "$VENV"')
+        assert export < venv
+        install = _index(job, '"$VENV/bin/pip" install pytest==')
+        package = _index(job, '"$VENV/bin/pip" install .')
+        lint = _index(job, 'make lint PYTHON="$VENV/bin/python"')
+        suite = _index(job, "-m pytest", "$TEST_FAST_PATHS")
+        assert venv < install < package < lint < suite
+        packages = _packages(_runs(job)[install])
+        assert packages == _packages(validate_install.splitlines()[0]) and "pytest-xdist==3.6.1" in packages
+        run = _runs(job)[suite]
+        assert 'xdist="-n auto"' in run
+        assert 'mktemp -d /tmp/aegis-test-home.' in run
+        assert 'HOME="$home"' in run and 'USERPROFILE="$home"' in run
+        _shard_paths(job)
+        assert _index(job, "grep -rnI '/home/'") > package
 
 
 def _bubblewrap_probe():
@@ -300,22 +373,585 @@ def _bubblewrap_probe():
     return shlex.join(BUBBLEWRAP_PROBE)
 
 
-@pytest.mark.parametrize("name", [FAST_JOB, "validate"])
-def test_linux_legs_install_bubblewrap_and_prove_it_runs_before_the_suite(name):
-    job = _load("validate.yml")["jobs"][name]
-    install = _index(job, "apt-get", "install -y --no-install-recommends bubblewrap")
-    # A transient mirror error must not fail a wave PR's required check.
-    assert _runs(job)[install].count("-o Acquire::Retries=3") == 2
-    probe = _index(job, _bubblewrap_probe())
-    suite = _index(job, "make test")
-    assert install < probe < suite
-    steps = job["steps"]
-    # Ubuntu 23.10 and later block unprivileged user namespaces through AppArmor; without
-    # lifting that, the probe fails and the eight bubblewrap job tests would skip silently.
-    assert "kernel.apparmor_restrict_unprivileged_userns=0" in steps[probe]["run"]
-    if name == "validate":
-        assert steps[install].get("if") == steps[probe].get("if") == "runner.os == 'Linux'"
-    assert not steps[probe].get("continue-on-error") and "|| true" not in steps[probe]["run"]
+def test_linux_legs_install_bubblewrap_and_prove_it_runs_before_the_suite():
+    names = [name for name, _job in _fast_jobs()] + ["validate"]
+    for name in names:
+        job = _load("validate.yml")["jobs"][name]
+        install = _index(job, "apt-get", "install -y --no-install-recommends bubblewrap")
+        # A transient mirror error must not fail a wave PR's required check.
+        assert _runs(job)[install].count("-o Acquire::Retries=3") == 2
+        probe = _index(job, _bubblewrap_probe())
+        if name == "validate":
+            suite = _index(job, "make test")
+        else:
+            suite = _index(job, "-m pytest", "$TEST_FAST_PATHS")
+        assert install < probe < suite
+        steps = job["steps"]
+        # Ubuntu 23.10 and later block unprivileged user namespaces through AppArmor; without
+        # lifting that, the probe fails and the eight bubblewrap job tests would skip silently.
+        assert "kernel.apparmor_restrict_unprivileged_userns=0" in steps[probe]["run"]
+        if name == "validate":
+            assert steps[install].get("if") == steps[probe].get("if") == "runner.os == 'Linux'"
+        assert not steps[probe].get("continue-on-error") and "|| true" not in steps[probe]["run"]
+
+
+def test_each_test_fast_timeout_is_at_least_twice_its_recorded_measurement():
+    """A cap below twice the measured green duration cancels a slow green run.
+
+    The unsharded job's 45 min cap is not twice the 6516.67s suite measurement.
+    Each shard records that duration until a green run of the shard itself exists.
+    """
+    text = _read("validate.yml")
+    recorded = _recorded_fast_measurements(text)
+    floor = _minimum_timeout_minutes(SUITE_GREEN_SECONDS)
+    problems = []
+    for name, job in _fast_jobs():
+        timeout = job.get("timeout-minutes")
+        seconds, run = recorded.get(name, (None, None))
+        if (type(timeout) is not int or timeout < floor or timeout > 360
+                or seconds is None or seconds + 1e-9 < SUITE_GREEN_SECONDS or run != SUITE_GREEN_RUN
+                or timeout < _minimum_timeout_minutes(seconds)):
+            problems.append((name, timeout, seconds, run, floor, SUITE_GREEN_SECONDS))
+    assert problems == []
+
+
+# One template for every shard. The run text is byte-identical; only TEST_FAST_PATHS changes.
+# A backslash before the newline is part of the shell continuation, not a Python line join.
+_CANONICAL_SUITE_RUN = "\n".join([
+    "set -euo pipefail",
+    # Pathname expansion is off, so a selector cannot glob into another directory.
+    "set -f",
+    'python_bin="$VENV/bin/python"',
+    'userbase="${PYTHONUSERBASE:-$("$python_bin" -m site --user-base)}"',
+    'home="$(mktemp -d /tmp/aegis-test-home.XXXXXX)"',
+    """trap 'rm -rf "$home"' EXIT""",
+    'xdist=""',
+    'if "$python_bin" -c "import xdist" >/dev/null 2>&1; then',
+    '  xdist="-n auto"',
+    "fi",
+    "# Isolated HOME, the same contract as the developer test target. $xdist is -n auto when",
+    "# pytest-xdist imports. Selectors are the positive paths in TEST_FAST_PATHS.",
+    'HOME="$home" USERPROFILE="$home" XDG_CONFIG_HOME="$home/.config" PYTHONUSERBASE="$userbase" \\',
+    '  "$python_bin" -m pytest -q $xdist $TEST_FAST_PATHS',
+]) + "\n"
+_PYTEST_LINE = '  "$python_bin" -m pytest -q $xdist $TEST_FAST_PATHS\n'
+# Steps owned by this test. A shard equals the job built from these lists plus the suite step.
+_CANONICAL_STEPS_BEFORE = [
+    {"uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "with": {"fetch-depth": 0, "persist-credentials": False}},
+    {"name": "Set up Python",
+     "uses": "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
+     "with": {"python-version": "3.11"}},
+    {"name": "Install bubblewrap",
+     "run": "sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install "
+            "-y --no-install-recommends bubblewrap"},
+    {"name": "Prove bubblewrap runs",
+     "run": "set -euo pipefail\n"
+            "if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then\n"
+            "  sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0\n"
+            "fi\n"
+            "bwrap --unshare-net --unshare-pid --ro-bind / / --dev /dev --proc /proc true\n"},
+    {"name": "Choose the CI venv path", "run": 'echo "VENV=$RUNNER_TEMP/ci-venv" >> "$GITHUB_ENV"'},
+    {"name": "Create the CI venv", "run": 'python -m venv "$VENV"'},
+    {"name": "Install test dependencies into the CI venv",
+     "run": '"$VENV/bin/pip" install pytest==8.3.4 pytest-xdist==3.6.1 ruff==0.9.10 '
+            "hypothesis==6.126.0 coverage==7.6.12 pyyaml==6.0.2 anyio==4.12.1"},
+    {"name": "Install the checkout into the CI venv", "run": '"$VENV/bin/pip" install .'},
+    {"name": "Lint", "run": 'make lint PYTHON="$VENV/bin/python"'},
+]
+_CANONICAL_STEPS_AFTER = [
+    {"name": "Check for hardcoded paths",
+     "run": "# Exclude template examples like /home/<user>/ which are privacy instructions\n"
+            "if grep -rnI '/home/' rules/ skills/ docs/ README.md 2>/dev/null | grep -v '<user>' | "
+            "grep -v '<username>'; then\n"
+            '  echo "ERROR: Hardcoded paths found"\n'
+            "  exit 1\n"
+            "fi\n"
+            'echo "No hardcoded paths found"\n'},
+]
+_CANONICAL_UPSTREAM_STEP = {
+    "name": "Verify upstream jobs succeeded",
+    "env": {
+        "NEEDS_JSON": "${{ toJSON(needs) }}",
+        "EXPECTED_RESULT": "${{ github.event_name == 'pull_request' && github.base_ref == "
+                           "'develop' && 'skipped' || 'success' }}",
+        "ALWAYS_SUCCESS": "test-fast-unit-core test-fast-unit-rest test-fast-integration "
+                          "test-fast-contract",
+    },
+    "run": "python3 -c 'import json, os, sys; needs = json.loads(os.environ[\"NEEDS_JSON\"]); expected "
+           "= os.environ[\"EXPECTED_RESULT\"]; always = os.environ[\"ALWAYS_SUCCESS\"].split(); bad = {k: "
+           "v.get(\"result\") for k, v in needs.items() if v.get(\"result\") != (\"success\" if k in always "
+           "else expected)}; bad.update({k: \"missing\" for k in always if k not in needs}); "
+           "sys.exit(f\"Unexpected upstream job results (expected {expected}, and success for "
+           "{always}): {bad}\" if bad else 0)'\n",
+}
+
+
+def _canonical_suite_step(selectors):
+    return {
+        "name": "Run test suite",
+        "env": {"TEST_FAST_PATHS": selectors},
+        "run": _CANONICAL_SUITE_RUN,
+    }
+
+
+def _canonical_fast_job(selectors):
+    """One test-fast job. The only value that changes per shard is TEST_FAST_PATHS."""
+    return {
+        "runs-on": "ubuntu-latest",
+        "timeout-minutes": 218,
+        "steps": [
+            *copy.deepcopy(_CANONICAL_STEPS_BEFORE),
+            _canonical_suite_step(selectors),
+            *copy.deepcopy(_CANONICAL_STEPS_AFTER),
+        ],
+    }
+
+
+# Steps of aegis-check after the upstream verification. The job has no env and no defaults.
+_CANONICAL_AEGIS_STEPS_AFTER = [
+    {"uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+     "with": {"ref": "${{ github.event_name == 'pull_request' && github.base_ref == "
+                     "'develop' && github.event.pull_request.base.sha || github.sha }}",
+              "fetch-depth": 0,
+              "persist-credentials": False}},
+    {"name": "Fetch wave pull request head as data",
+     "if": "github.event_name == 'pull_request' && github.base_ref == 'develop'",
+     "env": {"PR_NUMBER": "${{ github.event.pull_request.number }}"},
+     "run": "git fetch --no-tags origin "
+            '"+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/head"'},
+    {"name": "Run CI governance without execution",
+     "env": {"GH_TOKEN": "${{ github.token }}"},
+     "run": "python3 -m aegis_cli.cli check --ci --no-exec"},
+    {"name": "Set up Python",
+     "if": "github.event_name != 'pull_request' || github.base_ref != 'develop'",
+     "uses": "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
+     "with": {"python-version": "3.11"}},
+    {"name": "Download wheel artifact",
+     "if": "github.event_name != 'pull_request' || github.base_ref != 'develop'",
+     "uses": "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333",
+     "with": {"name": "aegis-wheel", "path": "dist/"}},
+    {"name": "Verify artifact digests",
+     "if": "github.event_name != 'pull_request' || github.base_ref != 'develop'",
+     "run": "python .github/scripts/verify_dist.py verify dist"},
+    {"name": "Install test dependencies",
+     "if": "github.event_name != 'pull_request' || github.base_ref != 'develop'",
+     "run": "pip install pytest==8.3.4 pytest-xdist==3.6.1 ruff==0.9.10 hypothesis==6.126.0 "
+            "coverage==7.6.12 pyyaml==6.0.2 anyio==4.12.1\n"
+            "pip install dist/*.whl\n"},
+    {"name": "Run Layer 1 Deterministic Verification",
+     "if": "github.event_name != 'pull_request' || github.base_ref != 'develop'",
+     "run": "python3 -I -m aegis_cli.cli check"},
+    {"name": "Run CI Governance & Regression Check",
+     "if": "github.event_name != 'pull_request' || github.base_ref != 'develop'",
+     "run": "python3 -I -m aegis_cli.cli check --ci",
+     "env": {"GH_TOKEN": "${{ github.token }}"}},
+]
+
+
+def _canonical_aegis_job():
+    """aegis-check as one object. Env and defaults stay absent."""
+    return {
+        "needs": [
+            "dependency-audit",
+            "build-wheel",
+            "validate",
+            "test-windows",
+            "test-fast-unit-core",
+            "test-fast-unit-rest",
+            "test-fast-integration",
+            "test-fast-contract",
+        ],
+        "if": "always()",
+        "runs-on": "ubuntu-latest",
+        "timeout-minutes": 60,
+        "permissions": {"contents": "read", "pull-requests": "read"},
+        "steps": [
+            copy.deepcopy(_CANONICAL_UPSTREAM_STEP),
+            *copy.deepcopy(_CANONICAL_AEGIS_STEPS_AFTER),
+        ],
+    }
+
+
+def _suite_step(job):
+    found = [step for step in job.get("steps") or []
+             if isinstance(step, dict) and step.get("name") == "Run test suite"]
+    assert len(found) == 1, "a test-fast shard must run the suite once"
+    return found[0]
+
+
+# Letters, digits, underscore, dot, slash, and hyphen. Glob and shell metacharacters are out.
+_SELECTOR_CLASS = re.compile(r"^tests(?:/[A-Za-z0-9_.-]+)+$")
+
+
+def _positive_selector(selector, files):
+    """A selector is a tests/ path in the fixed class, and it hits the suite partition."""
+    parts = selector.split("/")
+    if (_SELECTOR_CLASS.fullmatch(selector) is None or ".." in parts
+            or any(part in ("", ".") for part in parts)):
+        return False
+    return bool(_selected_test_files(selector, files))
+
+
+def _selector_text(job):
+    step = _suite_step(job)
+    raw = (step.get("env") or {}).get("TEST_FAST_PATHS")
+    assert isinstance(raw, str) and raw.split(), raw
+    return raw
+
+
+def _guard_test_fast_allowlist(workflow):
+    """Whole-job equality for every shard and for aegis-check.
+
+    The only value that may differ across shards is TEST_FAST_PATHS. Selectors match
+    one fixed character class and are the positive paths of the suite partition.
+    The workflow has no env mapping. aegis-check equals one job, so an inherited
+    SHELLOPTS, BASHOPTS, or BASH_ENV cannot be added on either object.
+    """
+    assert "env" not in workflow
+    assert "defaults" not in workflow
+    jobs = _fast_jobs(workflow)
+    assert 3 <= len(jobs) <= 4, [name for name, _job in jobs]
+    files = _suite_test_files()
+    owned = {}
+    for name, job in jobs:
+        raw = _selector_text(job)
+        assert job == _canonical_fast_job(raw), name
+        for selector in raw.split():
+            assert _positive_selector(selector, files), (name, selector)
+            for path in _selected_test_files(selector, files):
+                owned.setdefault(path, []).append((name, selector))
+    gap = [path for path in files if path not in owned]
+    overlap = [path for path, who in owned.items() if len(who) > 1]
+    assert gap == [] and overlap == [], (gap[:20], overlap[:20])
+    assert workflow.get("jobs", {}).get("aegis-check") == _canonical_aegis_job()
+    return [(name, _selector_text(job).split()) for name, job in jobs]
+
+
+def _shard_paths(job):
+    """Selectors for one shard whose whole job equals the canonical template."""
+    raw = _selector_text(job)
+    files = _suite_test_files()
+    assert job == _canonical_fast_job(raw)
+    selectors = raw.split()
+    assert all(_positive_selector(selector, files) for selector in selectors), selectors
+    return selectors
+
+
+def _rewrite_suite_run(workflow, old, new):
+    _name, job = _fast_jobs(workflow)[0]
+    step = _suite_step(job)
+    assert old in step["run"], old
+    step["run"] = step["run"].replace(old, new, 1)
+
+
+def _mutate_ignore_glob_equals(workflow):
+    _rewrite_suite_run(
+        workflow, _PYTEST_LINE,
+        "  \"$python_bin\" -m pytest -q $xdist --ignore-glob='*test_team.py' $TEST_FAST_PATHS\n")
+
+
+def _mutate_ignore_glob_space(workflow):
+    _rewrite_suite_run(
+        workflow, _PYTEST_LINE,
+        "  \"$python_bin\" -m pytest -q $xdist --ignore-glob '*test_team.py' $TEST_FAST_PATHS\n")
+
+
+def _mutate_k_space(workflow):
+    _rewrite_suite_run(
+        workflow, _PYTEST_LINE,
+        '  "$python_bin" -m pytest -q $xdist -k smoke $TEST_FAST_PATHS\n')
+
+
+def _mutate_k_equals(workflow):
+    _rewrite_suite_run(
+        workflow, _PYTEST_LINE,
+        '  "$python_bin" -m pytest -q $xdist -k=smoke $TEST_FAST_PATHS\n')
+
+
+def _mutate_deselect_space(workflow):
+    _rewrite_suite_run(
+        workflow, _PYTEST_LINE,
+        '  "$python_bin" -m pytest -q $xdist --deselect tests/unit/core/test_team.py $TEST_FAST_PATHS\n')
+
+
+def _mutate_deselect_equals(workflow):
+    _rewrite_suite_run(
+        workflow, _PYTEST_LINE,
+        '  "$python_bin" -m pytest -q $xdist --deselect=tests/unit/core/test_team.py $TEST_FAST_PATHS\n')
+
+
+def _mutate_collect_only(workflow):
+    _rewrite_suite_run(
+        workflow, _PYTEST_LINE,
+        '  "$python_bin" -m pytest -q $xdist --collect-only $TEST_FAST_PATHS\n')
+
+
+def _mutate_continuation_k(workflow):
+    _rewrite_suite_run(
+        workflow, _PYTEST_LINE,
+        '  "$python_bin" -m pytest -q $xdist $TEST_FAST_PATHS \\\n  -k smoke\n')
+
+
+def _mutate_comment_hides_command(workflow):
+    _rewrite_suite_run(
+        workflow, _PYTEST_LINE,
+        '  # "$python_bin" -m pytest -q $xdist $TEST_FAST_PATHS\n'
+        '  "$python_bin" -m pytest -q $xdist -k smoke $TEST_FAST_PATHS\n')
+
+
+def _mutate_pytest_addopts_workflow(workflow):
+    workflow["env"] = {"PYTEST_ADDOPTS": "-k smoke"}
+
+
+def _mutate_pytest_addopts_job(workflow):
+    _name, job = _fast_jobs(workflow)[0]
+    job["env"] = {"PYTEST_ADDOPTS": "--collect-only"}
+
+
+def _mutate_pytest_addopts_step(workflow):
+    _name, job = _fast_jobs(workflow)[0]
+    _suite_step(job)["env"]["PYTEST_ADDOPTS"] = "--collect-only"
+
+
+def _mutate_reassign_xdist(workflow):
+    _rewrite_suite_run(workflow, 'xdist="-n auto"', 'xdist="-n auto"\n  xdist="$xdist -k smoke"')
+
+
+def _mutate_reassign_paths(workflow):
+    _rewrite_suite_run(workflow, _PYTEST_LINE, 'TEST_FAST_PATHS=""\n' + _PYTEST_LINE)
+
+
+def _mutate_job_continue_on_error(workflow):
+    _name, job = _fast_jobs(workflow)[0]
+    job["continue-on-error"] = True
+
+
+def _mutate_upstream_if(workflow):
+    workflow["jobs"]["aegis-check"]["steps"][0]["if"] = (
+        "github.event_name != 'pull_request' || github.base_ref != 'develop'")
+
+
+def _mutate_upstream_continue_on_error(workflow):
+    workflow["jobs"]["aegis-check"]["steps"][0]["continue-on-error"] = True
+
+
+_GITHUB_ENV_COLLECT = "echo 'PYTEST_ADDOPTS=--collect-only' >> \"$GITHUB_ENV\""
+_GITHUB_ENV_IGNORE = "echo 'PYTEST_ADDOPTS=--ignore-glob=*test_team.py' >> \"$GITHUB_ENV\""
+_FAST_SHARDS = (
+    "test-fast-unit-core",
+    "test-fast-unit-rest",
+    "test-fast-integration",
+    "test-fast-contract",
+)
+
+
+def _mutate_github_env(shard, line):
+    def mutate(workflow):
+        job = dict(_fast_jobs(workflow))[shard]
+        found = [step for step in job["steps"] if step.get("name") == "Choose the CI venv path"]
+        assert len(found) == 1, shard
+        found[0]["run"] = found[0]["run"] + "\n" + line
+    return mutate
+
+
+def _mutate_added_step_before_suite(workflow):
+    _name, job = _fast_jobs(workflow)[0]
+    index = next(i for i, step in enumerate(job["steps"]) if step.get("name") == "Run test suite")
+    job["steps"].insert(index, {
+        "name": "Export pytest options",
+        "run": _GITHUB_ENV_COLLECT,
+    })
+
+
+def _mutate_upstream_shell_true(workflow):
+    workflow["jobs"]["aegis-check"]["steps"][0]["shell"] = "true {0}"
+
+
+def _mutate_upstream_shell_bash(workflow):
+    workflow["jobs"]["aegis-check"]["steps"][0]["shell"] = 'bash -c "exit 0" {0}'
+
+
+def _mutate_needs_json(workflow):
+    workflow["jobs"]["aegis-check"]["steps"][0]["env"]["NEEDS_JSON"] = "${{ toJSON(github.event) }}"
+
+
+def _mutate_upstream_moved(workflow):
+    steps = workflow["jobs"]["aegis-check"]["steps"]
+    verify = steps.pop(0)
+    steps.insert(1, verify)
+
+
+def _mutate_defaults_workflow(workflow):
+    workflow["defaults"] = {"run": {"shell": "true {0}"}}
+
+
+def _mutate_defaults_job(workflow):
+    _fast_jobs(workflow)[0][1]["defaults"] = {"run": {"shell": 'bash -c "exit 0" {0}'}}
+
+
+def _mutate_defaults_aegis(workflow):
+    workflow["jobs"]["aegis-check"]["defaults"] = {"run": {"shell": "true {0}"}}
+
+
+def _mutate_workflow_shellopts(workflow):
+    workflow["env"] = {"SHELLOPTS": "noexec"}
+
+
+def _mutate_aegis_shellopts(workflow):
+    workflow["jobs"]["aegis-check"]["env"] = {"SHELLOPTS": "noexec"}
+
+
+def _mutate_workflow_bashopts(workflow):
+    workflow["env"] = {"BASHOPTS": "noglob"}
+
+
+def _mutate_aegis_bashopts(workflow):
+    workflow["jobs"]["aegis-check"]["env"] = {"BASHOPTS": "noglob"}
+
+
+def _mutate_workflow_bash_env(workflow):
+    workflow["env"] = {"BASH_ENV": "/tmp/evil.sh"}
+
+
+def _mutate_aegis_bash_env(workflow):
+    workflow["jobs"]["aegis-check"]["env"] = {"BASH_ENV": "/tmp/evil.sh"}
+
+
+def _mutate_bracket_selector(workflow):
+    for name, job in _fast_jobs(workflow):
+        if name == "test-fast-unit-rest":
+            step = _suite_step(job)
+            step["env"]["TEST_FAST_PATHS"] = step["env"]["TEST_FAST_PATHS"] + " tests/unit/c[o]re"
+            return
+    raise AssertionError("unit-rest shard missing")
+
+
+def test_bracket_selector_is_refused_even_when_its_literal_test_file_exists():
+    """The fixed character class, not an empty selection, refuses a glob-shaped selector.
+
+    With a literal tests/unit/c[o]re/ test file present, the selector selects it, so a
+    selection-only predicate would count it as covered while bash expands it to tests/unit/core.
+    """
+    literal = "tests/unit/c[o]re/test_example.py"
+    files = list(_suite_test_files()) + [literal]
+    assert _selected_test_files("tests/unit/c[o]re", files) == [literal]
+    assert not _positive_selector("tests/unit/c[o]re", files)
+
+
+def test_test_fast_allowlist_holds():
+    """The shipped shards and aegis-check equal their templates, and the workflow has no env."""
+    _guard_test_fast_allowlist(_load("validate.yml"))
+
+
+@pytest.mark.parametrize("mutate", [
+    pytest.param(_mutate_ignore_glob_equals, id="ignore-glob-equals"),
+    pytest.param(_mutate_ignore_glob_space, id="ignore-glob-space"),
+    pytest.param(_mutate_k_space, id="k-space"),
+    pytest.param(_mutate_k_equals, id="k-equals"),
+    pytest.param(_mutate_deselect_space, id="deselect-space"),
+    pytest.param(_mutate_deselect_equals, id="deselect-equals"),
+    pytest.param(_mutate_collect_only, id="collect-only"),
+    pytest.param(_mutate_continuation_k, id="continuation-k"),
+    pytest.param(_mutate_comment_hides_command, id="comment-hides-command"),
+    pytest.param(_mutate_pytest_addopts_workflow, id="pytest-addopts-workflow"),
+    pytest.param(_mutate_pytest_addopts_job, id="pytest-addopts-job"),
+    pytest.param(_mutate_pytest_addopts_step, id="pytest-addopts-step"),
+    pytest.param(_mutate_reassign_xdist, id="reassign-xdist"),
+    pytest.param(_mutate_reassign_paths, id="reassign-paths"),
+    pytest.param(_mutate_job_continue_on_error, id="job-continue-on-error"),
+    pytest.param(_mutate_upstream_if, id="upstream-if"),
+    pytest.param(_mutate_upstream_continue_on_error, id="upstream-continue-on-error"),
+    *[pytest.param(_mutate_github_env(shard, _GITHUB_ENV_COLLECT),
+                   id="github-env-collect-" + shard) for shard in _FAST_SHARDS],
+    *[pytest.param(_mutate_github_env(shard, _GITHUB_ENV_IGNORE),
+                   id="github-env-ignore-glob-" + shard) for shard in _FAST_SHARDS],
+    pytest.param(_mutate_added_step_before_suite, id="added-step-before-suite"),
+    pytest.param(_mutate_upstream_shell_true, id="upstream-shell-true"),
+    pytest.param(_mutate_upstream_shell_bash, id="upstream-shell-bash"),
+    pytest.param(_mutate_needs_json, id="needs-json-changed"),
+    pytest.param(_mutate_upstream_moved, id="upstream-moved-off-zero"),
+    pytest.param(_mutate_defaults_workflow, id="defaults-workflow-shell"),
+    pytest.param(_mutate_defaults_job, id="defaults-job-shell"),
+    pytest.param(_mutate_defaults_aegis, id="defaults-aegis-shell"),
+    pytest.param(_mutate_workflow_shellopts, id="shellopts-workflow"),
+    pytest.param(_mutate_aegis_shellopts, id="shellopts-aegis"),
+    pytest.param(_mutate_workflow_bashopts, id="bashopts-workflow"),
+    pytest.param(_mutate_aegis_bashopts, id="bashopts-aegis"),
+    pytest.param(_mutate_workflow_bash_env, id="bash-env-workflow"),
+    pytest.param(_mutate_aegis_bash_env, id="bash-env-aegis"),
+    pytest.param(_mutate_bracket_selector, id="bracket-selector"),
+])
+def test_test_fast_allowlist_rejects_a_narrowed_gate(mutate):
+    """Each narrowed copy of validate.yml fails the guard. The shipped file is left untouched."""
+    workflow = copy.deepcopy(_load("validate.yml"))
+    mutate(workflow)
+    with pytest.raises(AssertionError):
+        _guard_test_fast_allowlist(workflow)
+
+
+def test_test_fast_shards_select_every_test_file_exactly_once():
+    """Directory selectors cover tests/ once: a gap or an overlap would hide a failure or run it twice."""
+    jobs = _fast_jobs()
+    assert 3 <= len(jobs) <= 4, [name for name, _job in jobs]
+    files = _suite_test_files()
+    assert files, "the suite has test files"
+    owned = {}
+    for name, job in jobs:
+        selectors = _shard_paths(job)
+        assert selectors, name
+        for selector in selectors:
+            assert selector.startswith("tests/") and ".." not in selector.split("/"), selector
+            hit = _selected_test_files(selector, files)
+            assert hit, (name, selector)
+            for path in hit:
+                owned.setdefault(path, []).append((name, selector))
+    gap = [path for path in files if path not in owned]
+    overlap = [(path, who) for path, who in owned.items() if len(who) > 1]
+    assert gap == [] and overlap == [], (gap[:20], overlap[:20])
+
+
+def test_every_test_fast_shard_is_required_and_a_bad_shard_is_refused():
+    """A shard missing from ALWAYS_SUCCESS, or cancelled, must fail the required check.
+
+    Shards do not need each other, so they run concurrently. aegis-check still runs when one
+    fails (``if: always()``) and refuses that result. All shards succeeding is the retry path.
+    """
+    workflow = _load("validate.yml")
+    names = [name for name, _job in _fast_jobs(workflow)]
+    assert 3 <= len(names) <= 4, names
+    check = workflow["jobs"]["aegis-check"]
+    assert check.get("if") == "always()"
+    needs = check["needs"]
+    if isinstance(needs, str):
+        needs = [needs]
+    always = check["steps"][0]["env"]["ALWAYS_SUCCESS"].split()
+    assert sorted(always) == sorted(names) and len(always) == len(set(always))
+    assert set(names) <= set(needs)
+    verdict_needs = workflow["jobs"]["verdict"]["needs"]
+    if isinstance(verdict_needs, str):
+        verdict_needs = [verdict_needs]
+    assert set(names) <= set(verdict_needs)
+    for name, job in _fast_jobs(workflow):
+        assert "needs" not in job and "if" not in job, name
+        text = "\n".join(step.get("run", "") for step in job.get("steps", []))
+        assert "make test" not in text, name
+        assert "$TEST_FAST_PATHS" in text, name
+    for name, job in workflow["jobs"].items():
+        blob = "\n".join(step.get("run", "") for step in job.get("steps", []))
+        runs_suite = "make test" in blob or "-m pytest" in blob
+        if runs_suite and job.get("if") != FULL_VALIDATION:
+            assert name in names, name
+    success = {name: {"result": "success"} for name in names}
+    proc = _run_upstream_gate("skipped", success)
+    assert proc.returncode == 0, proc.stderr
+    for target in names:
+        others = {name: {"result": "success"} for name in names if name != target}
+        for result in ("failure", "cancelled", "skipped"):
+            proc = _run_upstream_gate("success", dict(others, **{target: {"result": result}}))
+            assert proc.returncode != 0 and target in proc.stderr, (target, result, proc.stderr)
+        proc = _run_upstream_gate("success", others)
+        assert proc.returncode != 0 and target in proc.stderr, (target, proc.stderr)
 
 
 def test_the_full_matrix_also_runs_nightly_and_on_dispatch():

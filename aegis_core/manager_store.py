@@ -193,8 +193,12 @@ class ManagerStore:
 
         held = None
         try:
+            # A missing-directory handler is registered only when this call will
+            # create. A read maps the walk's missing result to an empty anchor
+            # and does not require descriptor-relative mkdir.
             with open_directory(os.open, self.root, policy=lambda info: _private(info, directory=True),
-                                on_missing=missing, close_fd=os.close, stat_fd=os.fstat, stat_entry=os.stat) as held:
+                                on_missing=missing if create else None,
+                                close_fd=os.close, stat_fd=os.fstat, stat_entry=os.stat) as held:
                 directory, chain = held.fd, chain_for(held.observations)
                 self._anchor_check(chain)
                 self._entries(directory)
@@ -202,7 +206,7 @@ class ManagerStore:
         except ConfinedFileError as exc:
             if exc.directory_anchor is not held:
                 raise
-            if exc.reason == "missing" and exc.directory_stage == "create" and not create:
+            if exc.reason == "missing" and not create and exc.directory_stage in ("open", "create"):
                 yield None
                 return
             if exc.os_error is not None and exc.directory_stage not in ("open", "verify"):

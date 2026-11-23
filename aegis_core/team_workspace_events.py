@@ -160,6 +160,17 @@ def apply_set_limits(ledger, data, _event):
     for name in changes:
         ledger.limits[LIMIT_FIELDS[name][0]] = data[name]
 
+def _owned(value):
+    """Copy nested containers so a retained row does not alias its caller."""
+    kind = type(value)
+    if kind is dict:
+        return {key: _owned(item) for key, item in value.items()}
+    if kind is list:
+        return [_owned(item) for item in value]
+    if kind is tuple:
+        return tuple(_owned(item) for item in value)
+    return value
+
 @refusals
 def require_unclaimed_lanes(ledger, repository, lanes, identifier):
     require_ledger(ledger)
@@ -174,6 +185,8 @@ def require_unclaimed_lanes(ledger, repository, lanes, identifier):
 def apply_register(ledger, data, event):
     require_ledger(ledger)
     record(event)
+    bounded_tree(data)
+    data = _owned(data)
     validate_initiative(data)
     require(data["id"] not in ledger.initiatives)
     require_unclaimed_lanes(ledger, data["repository"], data.get("lanes", []), data["id"])
@@ -184,6 +197,8 @@ def apply_register(ledger, data, event):
 @refusals
 def apply_update(ledger, data, _event):
     require_ledger(ledger)
+    bounded_tree(data)
+    data = _owned(data)
     fields(data, {"initiative", "source"}, {"priority", "state", "blocked_by", "touched_paths", "checkouts", "lanes"})
     initiative = ledger.initiative(data["initiative"])
     text(data["source"], "source")
@@ -202,6 +217,8 @@ def apply_update(ledger, data, _event):
 def apply_request(ledger, data, event):
     require_ledger(ledger)
     record(event)
+    bounded_tree(data)
+    data = _owned(data)
     fields(data, {"request_id", "initiative", "kind", "holder"}, {"reference", "supersedes"})
     initiative = ledger.initiative(data["initiative"])
     require(initiative["state"] == "active")
@@ -224,7 +241,7 @@ def apply_request(ledger, data, event):
     require(previous is not None or holder not in ledger.open_holders)
     replacement = {**data, "state": "queued", "seq": previous["seq"] if previous is not None else event["seq"],
                    "requested_at": event["at"], "reserved_repository": initiative["repository"],
-                   "reserved_paths": list(initiative["touched_paths"])}
+                   "reserved_paths": _owned(initiative["touched_paths"])}
     if previous is not None:
         previous.update(state="withdrawn", closed_at=event["at"], superseded_by=data["request_id"])
     ledger.requests[data["request_id"]] = replacement
@@ -256,6 +273,8 @@ def apply_grant(ledger, data, event):
 def apply_release(ledger, data, event):
     require_ledger(ledger)
     record(event)
+    bounded_tree(data)
+    data = _owned(data)
     fields(data, {"request_id", "evidence"})
     evidence_reference(data["evidence"])
     request = ledger.request(data["request_id"])

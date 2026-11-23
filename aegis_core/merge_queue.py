@@ -427,7 +427,8 @@ class MergeQueue:
         # issuance read the index again; this miss is only for the health check.
         done = self._commit_done(candidate.commit)
         if done is not None:
-            raise QueueRefused("archived_completion")
+            # Withdraw this pending entry. The archived row is not the operand.
+            raise QueueRefused("archived_completion", item)
         result = self._retained(candidate.commit, done=done)
         if result is not None and not result.passed:
             return replace(candidate, status="target-red")
