@@ -15,15 +15,17 @@ import re
 import shutil
 import subprocess
 import time
+from types import SimpleNamespace
 from typing import List, Optional
 
 import pytest
 
 from aegis_cli.cli import main
 from aegis_cli import team_lease_output
-from aegis_core import events, team, team_queue, team_lease_custody
+from aegis_core import events, primitives, team, team_queue, team_lease_custody
 from aegis_core import gitsafe as rendering_git
 from aegis_core._version import __version__
+from aegis_core.errors import WorkspaceError
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
 
@@ -525,11 +527,89 @@ def test_no_action_prints_usage_and_exits_2(ws: Path, capsys):
                    "aegis team --help describes each action.\n")
 
 
+@pytest.mark.parametrize("argv", [
+    ["team", "--workspace", "mail", "PRIVATE_SENTINEL"],
+    ["team", "--", "board", "PRIVATE_SENTINEL"],
+    ["team", "model", "--subject", "mail", "--host-kind", "x" * 129],
+    ["--workspace=../PRIVATE_SENTINEL", "team", "queue", "list", "--capability", "board"],
+])
+def test_sibling_policy_bytes_survive_qualify_registration(capsys, argv):
+    with pytest.raises(SystemExit) as caught:
+        main(argv)
+    captured = capsys.readouterr()
+    assert caught.value.code == 2
+    assert (captured.out, captured.err) == (
+        '{"exit_code": 2, "next_action": "Use aegis team mail or board --help and supply the required options.", '
+        '"reason": "invalid_arguments", "status": "refused"}\n',
+        "",
+    )
+
+
+def test_qualify_as_workspace_value_keeps_raw_model_refusal(capsys):
+    assert main(["team", "--workspace", "qualify", "--workspace", "model"]) == 2
+    assert capsys.readouterr() == ('{\n  "error": "invalid_model_arguments"\n}\n', "")
+
+
+def test_qualify_registration_keeps_read_only_sibling_dispatch(tmp_path, capsys):
+    root = tmp_path / "project"
+    (root / ".aegis" / "rules").mkdir(parents=True)
+    argv = ["team", "--workspace", "qualify", "config", "presets", "--workspace", str(root), "--json"]
+    assert main(argv) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out)["schema"] == "aegis.team.config.presets/v1"
+
+
+def test_team_prefix_workspace_denial_keeps_base_result(capsys, monkeypatch):
+    def deny(_args):
+        raise WorkspaceError("workspace denied")
+
+    monkeypatch.setattr("aegis_cli.cli._attach_workspace", deny)
+    assert main(["team", "--workspace", "qualify"]) == 1
+    assert capsys.readouterr() == ("", "Error: workspace denied\n")
+
+
+@pytest.mark.parametrize("denied", [False, True], ids=["listed", "workspace-denied"])
+def test_composed_queue_delivers_one_result(ws, capsys, monkeypatch, denied):
+    if not denied and not team_queue.descriptor_supported():
+        pytest.skip("queue reads require POSIX descriptor support")
+    (ws / ".aegis" / "rules").mkdir()
+    stamp = primitives.utc_stamp(NOW)
+    monkeypatch.setattr(primitives, "utc_stamp", lambda _now=None: stamp)
+    monkeypatch.setattr(team_queue, "time", SimpleNamespace(time=lambda: NOW))
+    if denied:
+        def deny(_args):
+            raise WorkspaceError("workspace denied")
+
+        monkeypatch.setattr("aegis_cli.cli._attach_workspace", deny)
+        expected = team_queue.refusal("queue_io_unavailable", verb="list")
+    else:
+        expected = team_queue.list(ws, capabilities=["model"], now=NOW)
+
+    assert expected["exit_code"] == int(denied)
+    assert main(["team", "queue", "list", "--capability", "model", "--workspace", str(ws)]) == int(denied)
+    assert capsys.readouterr() == (json.dumps(expected, indent=2) + "\n", "")
+
+
+def test_composed_queue_interrupted_after_parse_keeps_base_result(ws, capsys, monkeypatch):
+    def interrupt(args):
+        assert (args.command, args.team_action, args.queue_action) == ("team", "queue", "list")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("aegis_cli.cli._attach_workspace", interrupt)
+    assert main(["team", "queue", "list", "--capability", "model", "--workspace", str(ws)]) == 2
+    assert capsys.readouterr() == ('{\n  "error": "invalid_model_arguments"\n}\n', "")
+
+
 def test_help_says_a_lease_is_not_a_lock(ws: Path, capsys):
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as caught:
         main(["team", "--help"])
-    out = " ".join(capsys.readouterr().out.split())
+    captured = capsys.readouterr()
+    assert caught.value.code == 0
+    assert captured.err == ""
+    out = " ".join(captured.out.split())
     assert "not a lock" in out
+    assert "qualify" not in out
     for action in ("claim", "renew", "transfer", "release", "gc", "list", "metrics"):
         assert action in out
 

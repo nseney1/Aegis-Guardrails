@@ -31,15 +31,20 @@ These surfaces are in the tree. This page is the entry; the linked pages are the
 | Served identity | `aegis_core.model_served.observe_served` records host, model, level, family and a fallback reason; it adds no command | [Model selection](model-selection.md) |
 | Job recipes and packets | `aegis_core.team_jobs_recipes`; validation includes typed `unknown_recipe` and `invalid_packet` refusals and grants no execution authority | [Architecture](architecture.md#where-to-read-next) |
 | Hierarchy runs | `tools/hierarchy_team.py`, outside the installed wheel | [Runtime guide](agent-hierarchies.md) and [prerequisites](hierarchy-team.md#prerequisites) |
-| Git delivery | snapshot, plans, compare-and-swap publish, qualification and the publisher, as libraries | [Architecture](architecture.md#git-delivery) |
+| Git delivery | snapshots, plans, compare-and-swap publishing and qualification as libraries. Publisher activation is still unwired. | [Teams platform capabilities](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/architecture.md#teams-platform-capabilities) |
 | Proposals and lint | proposal records, including source `mine`; `aegis rule lint` reports and exits 0 | [Proposals and rule lint](how-it-works.md#proposals-and-rule-lint) |
 | Supervisor | profile-driven pauses and backoff | [Supervisor profile](teams-supervisor.md) |
 
-`aegis_core.merge_queue.MergeQueue` checks qualification for the exact landing tree. Automatic landing remains separate work. `revalidate` refuses `issued_unresolved` while an issued record or cleanup is set. `check_issued` refuses `issued_unresolved` when that issued checkpoint conflicts or results remain. A refusal's `next_action` names the custodian and a fixed recovery text, and it echoes no transport text. `tools/hierarchy_templates/` is outside the wheel. The wheel includes `job-recipes.json` and `role-registry.json` under `aegis_core/team_templates/`. `team_roles.registry` reads the role registry. An `invalid_registry` refusal keeps that reason; a missing field, a field type or routes puts the matching repair in `next_action`. [Absorption](teams-absorption.md) describes the package boundary for templates that are not moved yet.
+Worktree snapshots, supplied-object Git plans and tested commits, the work queue
+and the proposal store are unavailable on Windows. Plans and tested commits skip
+the snapshot check and still require descriptor procfs (`/proc/self/fd`) and
+native Git. Linux subreaper support is required for qualification writes and
+merge-queue admission, candidate preparation, issued checks, landing observation
+and reconciliation. Automatic landing remains separate work.
+Processes sharing the trusted owner UID can access owner records despite file
+modes. A separate OS principal is tracked in `OS-PRINCIPAL-1`.
 
-Snapshots refuse `unsupported_platform` unless `descriptor_support` is true: `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `stat` and `readlink`. The work queue refuses `unsupported_platform`, and the proposal store refuses `unsupported`, unless `storage.confined_descriptor_supported` is true: `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `mkdir`, `link`, `rename`, `unlink` and `stat`. That function does not use `readlink`. Both probes are false when `os.name` is not `posix`, so Windows fails them. Neither function tests for macOS.
-
-Qualification writes call `team_qualify.descriptor_supported` and otherwise refuse `unsupported_platform`. That function is true only when `team_git.descriptor_support` is true, `team_gitops.descriptor_supported` is true (`fcntl` is available and `storage.confined_descriptor_supported` is true), and `gitops_fds.descriptor_supported` confirms Linux subreaper support (`sys.platform` is `linux`, `os.name` is `posix`, and `prctl(37)` returns 0). The merge queue checks the snapshot and qualification probes before preparing a candidate and refuses `unsupported_platform` if either fails. Publisher activation is not wired. A separate OS principal is not in this branch (`OS-PRINCIPAL-1`). File modes do not isolate another process running as the owner.
+`tools/hierarchy_templates/` is outside the wheel. The wheel includes `job-recipes.json` and `role-registry.json` under `aegis_core/team_templates/`. `team_roles.registry` reads the role registry. An `invalid_registry` refusal keeps that reason; a missing field, a field type or routes puts the matching repair in `next_action`. [Absorption](teams-absorption.md) describes the package boundary for templates that are not moved yet.
 
 ## Setup and limits of each surface
 
@@ -162,9 +167,16 @@ aegis team queue compact --json
 ```
 
 To return unfinished work instead of completing it, use `aegis team queue release
-DOCS-1 --lane docs --expect CLAIM_REVISION --json`. To return its intersecting lane
-leases too, use `aegis team queue unclaim DOCS-1 --lane docs --expect CLAIM_REVISION
---writer-stopped --reason 'Waiting for review' --json` after stopping the writer.
+DOCS-1 --lane docs --expect CLAIM_REVISION --json`. Use `unclaim` to also return
+the lane's repository lease when its paths intersect the item's write set.
+Stop the lane's writer and queued jobs and verify their liveness in the host layer
+before acknowledging with `aegis team queue unclaim DOCS-1 --lane docs --expect
+CLAIM_REVISION --writer-stopped --reason 'Waiting for review' --json`. The binding
+check supplements that verification by refusing a verified live writer even when
+you pass `--writer-stopped`.
+[`test_unclaim_releases_intersecting_lease_and_records_once`](../tests/unit/core/test_team_claims.py#L617),
+[`test_operator_must_acknowledge_stopped_writer`](../tests/unit/core/test_team_claims.py#L854),
+[`test_cli_unclaim_live_binding_defeats_stop_acknowledgement`](../tests/unit/cli/test_cli_team_queue.py#L648).
 
 `list --capability` names capabilities available to the team: list items whose
 requirements are all satisfied. Repeat it to supply multiple capabilities.
@@ -179,47 +191,31 @@ but cannot complete work. Stale revisions always refuse, including concurrent
 claims of the same item. List displays claimed lanes as `lane [ITEM: title]`.
 Each lane may hold one live queue claim; another claim refuses with `lane_busy`.
 Release and done accept `--lane`; live claims require their matching lane
-(`lane_required` or `lane_mismatch` otherwise). Lane labels are cooperative caller
+(`lane_required` when the lane is omitted, and the claim's own lane when another
+lane is supplied). Lane labels are cooperative caller
 assertions, not authenticated identities or OS permissions.
-Use `unclaim` to return a claim together with that lane's repository lease when
-its paths intersect the item's write set. It requires the matching lane even
-after expiry and refuses completed work or a stale revision. The lease's owner
-label must match the caller (the CLI uses `team.default_owner()`); a live foreign
-covering lease or any unreadable lease refuses before changes. Unrelated leases
-remain in place. `unclaim_lease_refused` includes the lease OID and a release
-command for inspection and reconciliation. The optional reason follows the
-queue's single-line, 4,096-character and credential-text validation.
-Unclaim also requires `--writer-stopped`: the operator must explicitly acknowledge
-that the lane's writer and queued jobs are stopped. Omitting it refuses with
-`writer_not_stopped` (exit 1), without changes. The receipt records this
-acknowledgement with the caller label. The host layer must check process and job
-liveness before calling unclaim; core cannot inspect host processes. Verifiable
-runtime evidence is tracked separately by **BL-16f-LIVE**. Unclaim is an owner-UID
-administrative transition; sandboxed children cannot invoke it against owner records.
-An unreadable, torn or oversized receipt log refuses before release with
-`unclaim_event_unavailable` (exit 1). Receipt reads use descriptor confinement,
-a 16 MiB admission reader and the queue's bounded JSON-row parser. Admission
-reserves 1 MiB for the release event and receipt; recovery accepts bounded slack
-up to 17 MiB so those events cannot exhaust its reader. The coordinator must
-reconcile retained event evidence before retrying an unavailable log.
 
-Queue transitions are serialized by the workspace writer lock. Unclaim records
-a durable intent before releasing the intersecting lease using its current OID
-as the CAS expectation. A crash or uncertain I/O result returns
-`unclaim_recovery_required` (exit 1); all other queue operations then refuse,
-including expiry-based claims. Retry the original unclaim with the same item,
-revision, lane and caller to finish it. The original reason remains attached.
-The refusal's `blockers` carry the pending item, lane, revision, caller and a
-concrete retry command with `--writer-stopped`; omitting `--reason` on retry keeps
-the original reason. A replacement reason is refused. Until a release may have
-landed, a definite refusal restores the exact original queue bytes. Recovery
-retains its pending intent and never rolls the item back to an unreserved claim.
-The queue becomes available only after the release and one correlated `unclaim`
-event containing the lane, reason and `released_lease_ids` have completed.
-Released IDs attest only successful release calls acknowledged by this operation.
-An externally vanished lease or a lost release acknowledgement is never attested;
-recovery can finish with an empty released-ID list while preserving existing events.
-These leases remain cooperative scheduling records; unclaim does not stop agents.
+**Recovering an unclaim**
+
+If an unclaim cannot complete, read the top-level `reason` and `next_action`
+in the JSON response. In the tested retries with a saved intent and a lease or
+receipt blocker, the response also shows the cause and its `next_action` in
+`blockers`. Follow the applicable `next_action`. In the tested case of a live
+foreign covering lease, the cause's action contains the `aegis team release`
+command after the `Inspect the covering lease before retrying` prefix.
+[`test_crash_recovery_blocks_other_transitions_and_records_once`](../tests/unit/core/test_team_claims.py#L710),
+[`test_recovery_cause_names_the_blocker_and_retries`](../tests/unit/core/test_team_claims.py#L1643).
+
+Retry the same unclaim for the recorded item, lane and revision as the recorded
+caller. In those recovery cases, a later run that finds the saved intent
+completes it once the blocker is resolved or reports the pending cause while it
+persists.
+[`test_cli_recovery_from_another_cwd_names_and_reaches_its_workspace`](../tests/unit/cli/test_cli_team_queue.py#L2448),
+[`test_recovery_cause_names_the_blocker_and_retries`](../tests/unit/core/test_team_claims.py#L1643).
+
+In the concurrent-unclaim regression, one caller wins and one `unclaim` event
+is recorded.
+[`test_concurrent_unclaims_have_one_recorded_winner`](../tests/unit/core/test_team_claims.py#L745).
 
 Successful `queue list --json` responses include `claimable_fingerprint`, a
 SHA-256 digest of scheduling state: claimable item IDs and revisions, item and
@@ -229,8 +225,9 @@ validity/capacity. The claimable set uses the same eligibility checks as claim.
 Git errors and timeouts refuse observation; they never mean an empty lease set.
 In a non-Git workspace, `lease_free` holds stay unmet because lease evidence is
 unavailable. The digest is independent of display filters and observation
-timestamps. Unchanged scheduling state yields the same digest; unclaim, lease
-release or expiry, completion and clearing a hold change it. A changed digest
+timestamps. Unchanged scheduling state yields the same digest. The digest changes
+after unclaim in [`test_unclaim_releases_intersecting_lease_and_records_once`](../tests/unit/core/test_team_claims.py#L617).
+Lease release or expiry, completion and clearing a hold change it. A changed digest
 signals callers to inspect the queue again; it grants no claim authority and
 does not replace the revision check. Automatic supervisor retries are separate.
 

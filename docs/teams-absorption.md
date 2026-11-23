@@ -123,6 +123,41 @@ Native commands remain explicitly `unqualified` until TA-3's owner-run real-host
 qualification record passes. TA-0 registers no new CLI or MCP surface, so these
 are acceptance requirements for the family ports rather than new runtime claims.
 
+TA-7b stores a version 2 report receipt under the user Aegis state root from
+`UserLayout.aegis_dir`, at `host-qualification/<resolved-host-id>.json`, mode
+0600 and owner UID only. Recording and reading refuse when the record path lies
+inside the workspace or the workspace lies inside the record directory. The
+adapter accepts the producer's report without a top-level host and requires
+any explicit host to match the requested kind. A report must be bounded,
+completed, producer-reported passing and non-fake. ROOT settings and permission
+entries are producer data within the bounded JSON and ROOT observation
+envelopes. Reports with roles require login data. A ROOT-only report requires
+a complete ROOT observation and null login.
+
+The receipt carries the report digest, all reported role rows, owner
+timestamp, host version and version source. ROOT-only v2 receipts carry
+`root_only: true` and `roles: {}`. Role-bearing receipts retain their existing
+fields and format. The receipt's `enforcement_claim` is `report-only`, and
+`require_qualified` always raises `HostUnqualified`. Version 1 receipts are
+refused and their bytes are left in place. The record byte budget
+`MAX_RECORD_BYTES = 6 * MAX_REPORT_BYTES + 768` applies to encoding, reads,
+validation and replacement.
+
+An injected core version reader binds writes and matching reads to one live
+version. Those operations return unqualified `receipt_recorded` and
+`receipt_current`. A different version produces `version_changed`, and a
+recording request with a matching new version can atomically replace the
+prior v2 receipt. The shipping `aegis team qualify host` always supplies an
+unavailable reader. Operations requiring a live version return unqualified
+`version_unavailable` and exit 1 without publication or renewal. Native
+version transport and positive host qualification are deferred to
+TA-7B-RUNTIME-QUALIFICATION with TA-7c and TA-3.
+
+Team prefixes before child selection follow the integration-base parser and
+its composed policies for usage, help and workspace errors. The fixed qualify
+refusal applies once argparse enters the qualify child. A dedicated team
+prefix refusal is deferred to TA-7B-TEAM-PREFIX-REFUSAL.
+
 ## Install and upgrade switch contract
 
 The round-3 coordinator ruling assigns COORD-LIVE-PREFLIGHT implementation and

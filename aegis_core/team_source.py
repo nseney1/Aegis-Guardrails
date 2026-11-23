@@ -6,6 +6,8 @@ over 4194304 bytes instead of returning a legacy partial prefix. Blobs are bound
 at 16777216 bytes before payload capture; metadata and stderr at 65536 bytes.
 Only the latest decoded file may be cached, under a retained-size ceiling.
 The repository is an owner-selected absolute root, never a tool argument.
+Structured grep builds one immutable commit-pinned request with a literal pattern record.
+The raw entry points validate immutable snapshots of allowed non-grep reads.
 """
 from __future__ import annotations
 
@@ -17,6 +19,7 @@ import re
 import sys
 import tempfile
 from threading import RLock
+from typing import NamedTuple, Optional
 
 from aegis_core import gitsafe, team_git, team_host_registry
 from aegis_core.team_host_plan import absolute_path
@@ -52,7 +55,10 @@ _NEXT = {
     "source_repository": "Choose an available local Git repository at an absolute path.",
     "source_partial_clone": "Supply a repository with every required object already local.",
     "source_blob_limit": "Choose a file no larger than the source blob byte limit.",
-    "source_grep_output_limit": "Narrow the pattern or the path, then retry.",
+    "source_grep_output_limit": (
+        "Narrow paths and the fixed string, then retry. Output over the capture cap refuses the whole "
+        "result before the post-capture returned-match limit; a capture that fits can still truncate at "
+        "that limit. For a known eligible blob, use paged source_show."),
     "source_git_output_limit": "Reduce the source query to its documented output limits.",
     "source_timeout": "Restore local repository responsiveness, then retry the read.",
     "source_git_failed": "Restore the local source objects, then retry the read.",
@@ -122,14 +128,38 @@ def _rendered_size(value):
     return len(json.dumps(json.dumps(value)))
 
 
-def _read_command(arguments):
-    """Closed plumbing grammar, validated before argv construction or capture."""
-    _require(type(arguments) in (tuple, list) and len(arguments) <= MAX_GREP_PATHS + 14)
-    _require(all(type(arg) is str and len(arg) <= MAX_PATH_CHARS + 41 and "\0" not in arg for arg in arguments))
-    args = tuple(arguments)
+_GREP_PREFIX = (
+    "grep", "-z", "-n", "-I", "-F", "--no-color", "--no-column", "--no-textconv",
+    "--no-recurse-submodules", "--full-name", "-f", "-",
+)
+
+
+class _ReadRequest(NamedTuple):
+    arguments: tuple[str, ...]
+    data: Optional[bytes]
+
+
+def _argument_snapshot(arguments, maximum):
+    _require(type(arguments) in (tuple, list))
+    count = len(arguments)
+    _require(count <= maximum)
+    if type(arguments) is tuple:
+        return arguments
+    try:
+        # A concurrent append cannot extend the copy. A shrink during the copy refuses.
+        return tuple(arguments[index] for index in range(count))
+    except IndexError:
+        raise SourceRefusal("invalid_arguments") from None
+
+
+def _read_command(arguments, data):
+    """Validate the public non-grep grammar on a bounded operand snapshot."""
+    _require(data is None or type(data) is bytes and len(data) <= MAX_PATTERN_CHARS * 4 + 1)
+    args = _argument_snapshot(arguments, 3)
+    _require(all(type(arg) is str and len(arg) <= MAX_PATH_CHARS + 41 and "\0" not in arg for arg in args))
     if args in (("rev-parse", "--show-toplevel"),
                 ("config", "--get-regexp", r"^(extensions\.partialclone|remote\..*\.promisor)$")):
-        return
+        return _ReadRequest(args, data)
     if (len(args) == 3 and (args[:2] in (("cat-file", "-t"), ("cat-file", "-s"), ("cat-file", "blob"),
                                         ("rev-parse", "--verify")))):
         oid, separator, path = args[2].partition(":")
@@ -137,13 +167,15 @@ def _read_command(arguments):
         if separator:
             _require(args[:2] in (("cat-file", "-t"), ("rev-parse", "--verify")))
             relative_path(path)
-        return
-    prefix = ("grep", "-z", "-n", "-I", "-F", "--no-color", "--no-column", "--no-textconv",
-              "--no-recurse-submodules", "--full-name", "-f", "-")
-    _require(len(args) >= 14 and args[:12] == prefix and args[13] == "--")
-    _require(len(args[12]) == 40 and _OID.fullmatch(args[12]) is not None)
-    for path in args[14:]:
-        relative_path(path)
+        return _ReadRequest(args, data)
+    raise SourceRefusal("invalid_arguments")
+
+
+def _committed_search(commit: str, paths: tuple[str, ...], pattern: str) -> _ReadRequest:
+    """Build a grep request from validated structured arguments."""
+    # Git strips one CR before the record's LF. Supply that CR separately from the literal.
+    ending = b"\r\n" if pattern.endswith("\r") else b"\n"
+    return _ReadRequest((*_GREP_PREFIX, commit, "--", *paths), pattern.encode("utf-8") + ending)
 
 
 class SourceViews:
@@ -182,29 +214,31 @@ class SourceViews:
         except team_git.GitRefusal:
             raise SourceRefusal("invalid_environment") from None
 
-    def _run(self, arguments, *, data=None, limit=65536, overflow="source_git_output_limit"):
-        _read_command(arguments)
+    def _run(self, request, *, limit, overflow="source_git_output_limit"):
         _require(type(limit) is int and 0 <= limit <= max(65536, MAX_BLOB_BYTES, MAX_GREP_OUTPUT_BYTES))
-        _require(data is None or type(data) is bytes and len(data) <= MAX_PATTERN_CHARS * 4 + 1)
         try:
             with gitsafe.custody(scratch=Path(tempfile.gettempdir()), stdout_limit=limit, stderr_limit=65536):
                 # Build the child environment from the sanitized mapping alone.
-                return gitsafe.run(self.argv(*arguments), self.repository, timeout=GIT_TIMEOUT_SECONDS,
-                                   stdin=data, _env=self.read_environment(), _environ={})
+                return gitsafe.run(self.argv(*request.arguments), self.repository, timeout=GIT_TIMEOUT_SECONDS,
+                                   stdin=request.data, _env=self.read_environment(), _environ={})
         except gitsafe.GitError as error:
             reason = {"git_timeout": "source_timeout", "git_output_limit": overflow,
                       "invalid_environment": "invalid_environment"}.get(error.code, "source_git_failed")
             raise SourceRefusal(reason) from None
 
     @_guarded
-    def git(self, *arguments, check=True, output_limit=65536):
-        result = self._run(arguments, limit=output_limit)
+    def git(self, *arguments, check=True, output_limit=65536, data=None):
+        """Run an allowed non-grep read."""
+        result = self._run(_read_command(arguments, data), limit=output_limit)
         _require(not check or result.returncode == 0, "source_git_failed")
         return result
 
     @_guarded
     def bounded(self, arguments, data, limit):
-        result = self._run(arguments, data=data, limit=limit, overflow="source_grep_output_limit")
+        return self._bounded(_read_command(arguments, data), limit)
+
+    def _bounded(self, request, limit):
+        result = self._run(request, limit=limit, overflow="source_grep_output_limit")
         _require(not any(line.startswith((b"error:", b"fatal:")) for line in result.stderr.splitlines()),
                  "source_git_failed")
         return result.stdout, len(result.stdout) == limit, result.returncode
@@ -275,18 +309,18 @@ class SourceViews:
     @_guarded
     def grep(self, arguments):
         _fields(arguments, {"commit", "pattern"}, {"paths", "limit"})
-        pattern = arguments["pattern"]
+        pattern = arguments.get("pattern")
         _require(type(pattern) is str and 0 < len(pattern) <= MAX_PATTERN_CHARS and "\n" not in pattern
                  and "\0" not in pattern and not any(0xD800 <= ord(char) <= 0xDFFF for char in pattern))
         paths = arguments.get("paths", [])
-        _require(type(paths) is list and len(paths) <= MAX_GREP_PATHS)
-        paths = [relative_path(path) for path in paths]
+        _require(type(paths) is list)
+        paths = _argument_snapshot(paths, MAX_GREP_PATHS)
+        for path in paths:
+            relative_path(path)
         limit = arguments.get("limit", DEFAULT_GREP_MATCHES)
         _require(type(limit) is int and 1 <= limit <= MAX_GREP_MATCHES)
-        commit = self.commit(arguments["commit"])
-        output, truncated, code = self.bounded(
-            ["grep", "-z", "-n", "-I", "-F", "--no-color", "--no-column", "--no-textconv", "--no-recurse-submodules",
-             "--full-name", "-f", "-", commit, "--", *paths], pattern.encode("utf-8") + b"\n", MAX_GREP_OUTPUT_BYTES)
+        commit = self.commit(arguments.get("commit"))
+        output, truncated, code = self._bounded(_committed_search(commit, paths, pattern), MAX_GREP_OUTPUT_BYTES)
         _require(code in (0, 1), "source_git_failed")
         prefix = (commit + ":").encode("ascii")
         matches, used = [], _rendered_size({"commit": commit, "pattern": pattern, "paths": paths})
@@ -307,7 +341,7 @@ class SourceViews:
                 truncated = True
                 break
             matches.append(match)
-        return {"commit": commit, "pattern": pattern, "paths": paths, "matches": matches, "truncated": truncated}
+        return {"commit": commit, "pattern": pattern, "paths": list(paths), "matches": matches, "truncated": truncated}
 
     def call(self, name, arguments):
         _require(type(name) is str and name in ("source_show", "source_grep"))

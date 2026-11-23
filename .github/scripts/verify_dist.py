@@ -8,7 +8,9 @@
 are tested are byte-for-byte the files that are published. It prints the
 verified file paths, one per line, for the caller to use.
 """
+from bisect import insort
 import hashlib
+import json
 import os
 from email.parser import BytesParser
 from pathlib import PurePosixPath
@@ -52,6 +54,9 @@ NAME_LIMIT = 4096
 ZIP_EXTRA_LIMIT = 65535
 METADATA_LIMIT = 1 << 20
 TEXT_LIMIT = 240
+DIST_SAMPLE_LIMIT = 5
+_WIN_FILE_NOT_FOUND = 2
+_WIN_PATH_NOT_FOUND = 3
 LINE_BREAKS = "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029\x00"
 _SECRET_RE = re.compile(
     "(?i)(?<![A-Za-z0-9])"
@@ -151,7 +156,7 @@ def _component_parent(parts, index):
     return _fold_key("/".join(parts[:index]))
 
 
-def _component_claim(parts, directory, state):
+def _component_claim(parts, directory, state, *, leaf_only=False):
     """Compare one member with the per-parent index. Do not mutate state.
 
     Each destination component has one spelling and one kind. An explicit
@@ -159,7 +164,9 @@ def _component_claim(parts, directory, state):
     """
     index = state.get("components") or {}
     absent = False
-    for offset, part in enumerate(parts):
+    start = len(parts) - 1 if leaf_only else 0
+    for offset in range(start, len(parts)):
+        part = parts[offset]
         parent = _component_parent(parts, offset)
         folded = _fold_part(part)
         leaf = offset == len(parts) - 1
@@ -172,12 +179,12 @@ def _component_claim(parts, directory, state):
             continue
         spelling, previous_kind, previous_explicit = slot
         if spelling != part or previous_kind != kind:
-            return "duplicate"
+            return "duplicate", (offset, spelling, kind, previous_kind)
         if kind == "file" or (explicit and previous_explicit):
-            return "duplicate"
+            return "duplicate", None
     if absent:
-        return "absent"
-    return "ok"
+        return "absent", None
+    return "ok", None
 
 
 def _record_components(parts, directory, state):
@@ -230,8 +237,8 @@ def _bounded_digest(value):
     return "member-sha256=" + hashlib.sha256(raw).hexdigest()[:16]
 
 
-def public_text(value):
-    """Canonicalize, redact, then truncate. Multi-line text is not joined."""
+def _screen_text(value):
+    """Canonicalize and redact the entire bounded value before display."""
     if not isinstance(value, str):
         return "member-sha256=unavailable"
     # Length and line breaks before encode or normalize. A break is refused, not folded.
@@ -241,10 +248,46 @@ def public_text(value):
         canonical = unicodedata.normalize("NFC", value)
     except (ValueError, UnicodeError):
         return _bounded_digest(value)
-    redacted = _SECRET_RE.sub("[REDACTED]", canonical)
-    if len(redacted) > TEXT_LIMIT:
-        return redacted[:TEXT_LIMIT]
-    return redacted
+    return _SECRET_RE.sub("[REDACTED]", canonical)
+
+
+def public_text(value):
+    return _screen_text(value)[:TEXT_LIMIT]
+
+
+def _component_excerpt(text, difference):
+    if len(text) <= TEXT_LIMIT:
+        return text
+    start = max(0, difference - TEXT_LIMIT // 2)
+    leading = "..." if start else ""
+    end = start + TEXT_LIMIT - len(leading)
+    if end < len(text):
+        return leading + text[start:end - 3] + "..."
+    return leading + text[start:end]
+
+
+def _component_excerpts(part, previous):
+    part, previous = _screen_text(part), _screen_text(previous)
+    if part == previous:
+        return part[:TEXT_LIMIT], previous[:TEXT_LIMIT]
+    difference = next((index for index, (left, right) in enumerate(zip(part, previous)) if left != right),
+                      min(len(part), len(previous)))
+    return _component_excerpt(part, difference), _component_excerpt(previous, difference)
+
+
+def _refuse_duplicate(archive_kind, name, parts, conflict):
+    message = "duplicate " + archive_kind + " member: " + public_text(name)
+    if conflict is not None:
+        offset, spelling, kind, previous_kind = conflict
+        part, existing = _component_excerpts(parts[offset], spelling)
+        prefix = "/".join(parts[:offset + 1])
+        previous = "/".join(parts[:offset] + [spelling])
+        reason = "spelling conflict" if kind == previous_kind else "file/directory conflict"
+        message += (f" ({reason}: component {part} [{kind}], "
+                    f"existing component {existing} [{previous_kind}], "
+                    f"conflicting prefix: {public_text(prefix)}, "
+                    f"existing prefix: {public_text(previous)})")
+    fail(message)
 
 
 def _admission_state():
@@ -308,16 +351,17 @@ def admit_member(archive_kind, name, effective_name, member_type, size, state,
                 (len(parts) == 1 and member_type != tarfile.DIRTYPE)):
             fail(unexpected + public_text(name))
         logical = "/".join(parts[1:])
-    if key in state["names"] or _destination_key(key) in state.get("folded", ()):
-        fail("duplicate " + archive_kind + " member: " + public_text(name))
+    directory = name.endswith("/") if archive_kind == "wheel" else member_type == tarfile.DIRTYPE
+    exact_match = key in state["names"]
+    if exact_match or _destination_key(key) in state.get("folded", ()):
+        _, conflict = _component_claim(parts, directory, state, leaf_only=exact_match)
+        _refuse_duplicate(archive_kind, name, parts, conflict)
     # (b) A ZIP directory needs both the slash and consistent metadata, with
     # neither stored nor compressed bytes. Tar directories need zero size.
     if archive_kind == "wheel":
-        directory = name.endswith("/")
         valid_type = member_type in ((0, stat.S_IFDIR) if directory else (0, stat.S_IFREG))
         valid_shape = valid_type and (not directory or (size == 0 and compressed_size == 0))
     else:
-        directory = member_type == tarfile.DIRTYPE
         valid_shape = ((directory and size == 0) or
                        (member_type in (tarfile.REGTYPE, tarfile.AREGTYPE) and not name.endswith("/")))
     if not valid_shape or size < 0 or compressed_size < 0:
@@ -341,9 +385,9 @@ def admit_member(archive_kind, name, effective_name, member_type, size, state,
     # deliberately has no whole-tree file allowlist beyond (a)-(c).
     # Implied directories and explicit entries share one per-parent index.
     info = re.fullmatch(r"aegis_guardrails-[A-Za-z0-9_.+!-]+\.dist-info", parts[0])
-    claim = _component_claim(parts, directory, state)
+    claim, conflict = _component_claim(parts, directory, state)
     if claim == "duplicate":
-        fail("duplicate " + archive_kind + " member: " + public_text(name))
+        _refuse_duplicate(archive_kind, name, parts, conflict)
     if directory:
         allowed = claim == "ok"
     elif archive_kind == "sdist":
@@ -440,55 +484,100 @@ def _signed_basename(path):
 
 def _entry_kind(entry):
     """Classify one directory entry. Never follow a symlink to decide."""
-    try:
-        if entry.is_symlink():
-            return "symlink"
-    except OSError:
-        return "other"
-    try:
-        if entry.is_file(follow_symlinks=False):
-            return "file"
-    except OSError:
-        return "other"
+    if entry.is_symlink():
+        return "symlink"
+    if entry.is_file(follow_symlinks=False):
+        return "file"
+    if entry.is_dir(follow_symlinks=False):
+        return "directory"
+    # The predicates can all return false after an entry disappears.
+    mode = entry.stat(follow_symlinks=False).st_mode
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if stat.S_ISREG(mode):
+        return "file"
+    if stat.S_ISDIR(mode):
+        return "directory"
     return "other"
 
 
-def _dist_matches(directory):
-    """Every wheel or sdist name, in any case, including a dot-prefixed name.
+def _missing_path(error):
+    return (isinstance(error, FileNotFoundError) and
+            getattr(error, "winerror", None) in (None, _WIN_FILE_NOT_FOUND, _WIN_PATH_NOT_FOUND))
 
-    The directory fd is closed when the scan ends, including on OSError.
-    A missing directory is an empty inventory, not a traceback.
-    """
-    found = []
+
+def _check_scan_open_error(directory, error, stat_directory):
+    """Resolve ambiguous Windows scan-open errors with one target probe."""
+    winerror = getattr(error, "winerror", None)
+    if winerror in (_WIN_FILE_NOT_FOUND, _WIN_PATH_NOT_FOUND):
+        try:
+            mode = stat_directory(directory).st_mode
+        except (OSError, ValueError) as probe_error:
+            if _missing_path(probe_error):
+                fail("distribution directory is missing")
+        else:
+            if winerror == _WIN_FILE_NOT_FOUND and stat.S_ISDIR(mode):
+                return
+    elif _missing_path(error):
+        fail("distribution directory is missing")
+    fail("distribution directory is unreadable")
+
+
+def _dist_matches(directory, scan_directory, stat_directory):
+    """Count matching entries and keep only the first few in name order."""
+    counts = {"wheel": 0, "sdist": 0, "irregular": 0}
+    sample = []
     try:
-        with os.scandir(directory) as scan:
-            for entry in scan:
+        scan = scan_directory(directory)
+    except OSError as error:
+        _check_scan_open_error(directory, error, stat_directory)
+        return counts, sample
+    except ValueError:
+        fail("distribution directory is unreadable")
+    try:
+        with scan as entries:
+            for entry in entries:
                 name = entry.name
                 if not isinstance(name, str):
                     continue
-                lowered = name.lower()
+                lowered = name[-7:].lower()
                 if lowered.endswith(".whl"):
                     kind = "wheel"
                 elif lowered.endswith(".tar.gz"):
                     kind = "sdist"
                 else:
                     continue
-                found.append((kind, _entry_kind(entry), name))
+                shape = _entry_kind(entry)
+                counts[kind if shape == "file" else "irregular"] += 1
+                if len(sample) == DIST_SAMPLE_LIMIT:
+                    if name >= sample[-1][0]:
+                        continue
+                    sample.pop()
+                insort(sample, (name, kind, shape))
     except OSError:
-        return []
-    return found
+        fail("distribution directory is unreadable")
+    return counts, sample
 
 
-def dists(d):
+def _inventory_name(name):
+    if len(name) > NAME_LIMIT or not name.isprintable():
+        screened = _bounded_digest(name)
+    else:
+        screened = public_text(name)
+    return json.dumps(screened, ensure_ascii=False)
+
+
+def dists(d, *, scan_directory=os.scandir, stat_directory=os.stat):
     """The one regular wheel and the one regular sdist. Anything else refuses."""
-    matches = _dist_matches(d)
-    wheels = [name for kind, shape, name in matches if kind == "wheel" and shape == "file"]
-    sdists = [name for kind, shape, name in matches if kind == "sdist" and shape == "file"]
-    irregular = [name for kind, shape, name in matches if shape != "file"]
-    if irregular or len(wheels) != 1 or len(sdists) != 1:
-        shown = ", ".join(public_text(name) for _kind, _shape, name in sorted(matches, key=lambda item: item[2]))
-        fail("expected exactly one wheel and one sdist, found " + shown)
-    return [os.path.join(d, wheels[0]), os.path.join(d, sdists[0])]
+    counts, sample = _dist_matches(d, scan_directory, stat_directory)
+    wheels, sdists, irregular = counts["wheel"], counts["sdist"], counts["irregular"]
+    if irregular or wheels != 1 or sdists != 1:
+        shown = ", ".join(f"{kind} {shape} {_inventory_name(name)}" for name, kind, shape in sample)
+        omitted = wheels + sdists + irregular - len(sample)
+        fail(f"expected exactly one wheel and one sdist, found wheels={wheels}, sdists={sdists}, "
+             f"irregular={irregular}, sample=[{shown}], omitted={omitted}")
+    paths = {kind: os.path.join(d, name) for name, kind, _shape in sample}
+    return [paths["wheel"], paths["sdist"]]
 
 
 def check_sdist(path):
@@ -505,8 +594,8 @@ def check_sdist(path):
         fail("invalid sdist: " + public_text(str(exc)))
 
 
-def record(d):
-    paths = dists(d)
+def record(d, *, discover=dists):
+    paths = discover(d)
     bases = [_signed_basename(path) for path in paths]
     check_wheel(paths[0])
     check_sdist(paths[1])
@@ -548,12 +637,12 @@ def _sums_entries(path):
     return expected
 
 
-def verify(d):
+def verify(d, *, discover=dists):
+    wheel, sdist = discover(d)
     sums_path = os.path.join(d, SUMS)
     if not os.path.isfile(sums_path):
         fail(public_text(sums_path) + " is missing")
     expected = _sums_entries(sums_path)
-    wheel, sdist = dists(d)
     present = {os.path.basename(wheel): (wheel, check_wheel),
                os.path.basename(sdist): (sdist, check_sdist)}
     if present.keys() != expected.keys():
