@@ -461,18 +461,13 @@ class ProtectedCanonicalEnrollmentWriter(_ProtectedWriter):
             domain.evidence([approved_plan_ref])
             policy = domain.validate_policy({"schema": domain.POLICY, "authority": [copy.deepcopy(approved_plan_ref)], **plan})
             domain.require(len(domain.encoded(policy, limit=domain.MAX_BYTES - 1)) + 1 <= domain.MAX_BYTES, "bootstrap policy exceeds lifecycle byte limit")
-            domain.require(isinstance(reserved_enrollments, tuple), "bootstrap requires owned reservation tuple")
-            rows = []
-            for reservation in reserved_enrollments:
-                if type(reservation) is not host.ReservedEnrollment:
-                    raise CanonicalGenesisError("HOST_AUTHORITY_REFUSED")
-                rows.append(reservation.witness)
-            envelope = {"schema": domain.INITIAL_ENVELOPE, "id": "initial-genesis",
-                        "event": {"type": "initial_reservations", "approved_plan": copy.deepcopy(approved_plan_ref),
-                                  "channel_witness": owned_runtime.channel_witness, "reservations": rows}}
-            record, _ = prepare_initial(policy, domain.initial_state(policy), envelope, self.clock() if self.clock else self.mailbox.timestamp())
             with self.authority.bootstrap_fence(owned_runtime, approved_plan_ref, reserved_enrollments) as guard:
-                guard.require_reserved_genesis_current()
+                rows = guard.reserved_genesis_rows()
+                envelope = {"schema": domain.INITIAL_ENVELOPE, "id": "initial-genesis",
+                            "event": {"type": "initial_reservations", "approved_plan": copy.deepcopy(approved_plan_ref),
+                                      "channel_witness": owned_runtime.channel_witness, "reservations": rows}}
+                at = self.clock() if self.clock else self.mailbox.timestamp()
+                record, _ = prepare_initial(policy, domain.initial_state(policy), envelope, at)
                 # Existing-root refusal is known not to claim it. Other errors
                 # during this exclusive claim conservatively retain UNKNOWN.
                 if self.mailbox.store.exists(self.root):
@@ -483,6 +478,7 @@ class ProtectedCanonicalEnrollmentWriter(_ProtectedWriter):
                 with self.transaction() as reader:
                     guard.require_reserved_genesis_current()
                     self.publish_record(record)
+                    guard.require_reserved_genesis_current()
                     snapshot = reader.initial_bootstrap()
                     enrollments = []
                     for row in snapshot["reservations"]:
@@ -494,8 +490,8 @@ class ProtectedCanonicalEnrollmentWriter(_ProtectedWriter):
                               "policy_sha256": snapshot["policy_sha256"],
                               "checkpoint_sha256": snapshot["genesis_checkpoint"]["sha256"],
                               "enrollments": enrollments}
-                    guard.require_reserved_genesis_current()
-                    return answer
+                guard.require_reserved_genesis_current()
+                return answer
         except CanonicalGenesisError as exc:
             if claimed:
                 raise CanonicalGenesisError("GENESIS_PUBLICATION_UNKNOWN", possible=True) from exc
@@ -590,7 +586,7 @@ class ProtectedCanonicalBootstrapWriter(_ProtectedWriter):
                     if identifier in state["receipts"]:
                         return refused("INITIAL_EVENT_CONFLICT")
                     record, receipt = prepare_initial(policy, state, envelope, reader.clock())
-                    bootstrap_guard.require_initial_identity_current(reserved_enrollment)
+                    bootstrap_guard.require_initial_creation_new(reserved_enrollment, policy, state, row)
                     possible = True
                     self.publish_record(record)
                     bootstrap_guard.require_initial_identity_current(reserved_enrollment)
