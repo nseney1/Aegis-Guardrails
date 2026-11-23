@@ -361,6 +361,26 @@ def refused(code, action):
     assert caught.value.next_action
 
 
+def refusal_of(code, action):
+    """Same fixed-text checks as refused, returning the custodian refusal."""
+    with pytest.raises(mq.QueueRefused) as caught:
+        action()
+    assert caught.value.code == code
+    assert str(caught.value) == mq.REFUSALS[code]
+    assert caught.value.args == (mq.REFUSALS[code],)
+    assert caught.value.next_action["actor"] == "custodian"
+    assert caught.value.next_action["command"] == mq.REFUSALS[code]
+    return caught.value
+
+
+def _withdrawal_entry(lane, head, **changes):
+    reviews = changes.pop("reviews", None)
+    if reviews is None:
+        reviews = tuple(mq.Review(session, "c" * 40, "b" * 40, "ACCEPT", True)
+                        for session in ("reviewer-1", "reviewer-2"))
+    return replace(mq.QueueEntry(lane, "writer", head, reviews), **changes)
+
+
 @pytest.mark.parametrize("name", merge_queue_types.__all__)
 def test_model_and_queue_export_the_existing_record_type(name):
     from aegis_core import merge_queue_model as model
@@ -1276,6 +1296,218 @@ def test_archived_completion_refusal_is_distinct_from_ancestry(rig, shape):
     refused("archived_completion", lambda: direct_prepare(q, rig, tip))
     assert backend.commits[receipt.commit].landing == receipt
     assert tuple(backend.lanes) == ("a",)
+
+
+_WITHDRAWAL_HEAD = "a" * 40
+_SPLIT_HEAD = ("a" * 40) + "\n" + ("b" * 40)
+_SECRET_LANE = "ghp_" + ("a" * 20)
+
+
+@pytest.mark.parametrize("withdrawal", [
+    None,
+    "second",
+    {"lane": "second", "expected_head": _WITHDRAWAL_HEAD},
+    _withdrawal_entry("ab\ncd", _WITHDRAWAL_HEAD),
+    _withdrawal_entry("Second", _WITHDRAWAL_HEAD),
+    _withdrawal_entry("second", _SPLIT_HEAD),
+    _withdrawal_entry("second", "A" * 40),
+    _withdrawal_entry("second", _WITHDRAWAL_HEAD, reviews=()),
+    _withdrawal_entry("a" * 64, _WITHDRAWAL_HEAD),
+    _withdrawal_entry(_SECRET_LANE, _WITHDRAWAL_HEAD),
+    _withdrawal_entry("second", _WITHDRAWAL_HEAD, author="writer\ninjected"),
+    _withdrawal_entry("second", _WITHDRAWAL_HEAD, reviews=(
+        mq.Review("reviewer-1", _WITHDRAWAL_HEAD, "b" * 40, "ACCEPT", True),)),
+], ids=["missing", "text", "dict", "multiline-lane", "uppercase-lane", "multiline-head",
+        "uppercase-head", "no-reviews", "long-lane", "secret-lane", "multiline-author",
+        "one-review"])
+def test_archived_completion_rejects_unvalidated_withdrawal_operands(withdrawal):
+    """A refusal without a validated pending entry stays fixed and input-free.
+
+    Multi-line lane or head text is refused. It is not joined, redacted into
+    the message, or attached for withdrawal. A later valid record still works.
+    """
+    refused("state_unavailable", lambda: mq.QueueRefused("archived_completion", withdrawal))
+    caught = None
+    with pytest.raises(mq.QueueRefused) as recorded:
+        raise mq.QueueRefused("archived_completion", withdrawal)
+    caught = recorded.value
+    assert caught.code == "state_unavailable"
+    assert caught.args == (mq.REFUSALS["state_unavailable"],)
+    assert set(caught.next_action) == {"actor", "command"}
+    rendered = str(caught) + "\n" + caught.next_action["command"]
+    assert "\n" not in str(caught) and "\n" not in caught.next_action["command"]
+    assert _SPLIT_HEAD not in rendered
+    assert ("a" * 40) + ("b" * 40) not in rendered
+    assert "ab cd" not in rendered and "abcd" not in rendered
+    assert _SECRET_LANE not in rendered and "ghp_REDACTED" not in rendered
+    assert "writer\ninjected" not in rendered and "injected" not in rendered
+    if type(withdrawal) is mq.QueueEntry and type(withdrawal.lane) is str:
+        assert withdrawal.lane not in rendered
+    good = _withdrawal_entry("second", _WITHDRAWAL_HEAD)
+    restored = mq.QueueRefused("archived_completion", good)
+    assert restored.code == "archived_completion"
+    assert restored.args == (mq.REFUSALS["archived_completion"],)
+    assert restored.next_action == {
+        "actor": "custodian",
+        "command": mq.REFUSALS["archived_completion"],
+        "lane": "second",
+        "expected_head": _WITHDRAWAL_HEAD,
+    }
+    restored.next_action["lane"] = "mutated"
+    restored.next_action["command"] = "mutated"
+    again = mq.QueueRefused("archived_completion", good)
+    assert again.next_action["lane"] == "second"
+    assert again.next_action["command"] == mq.REFUSALS["archived_completion"]
+    assert again.next_action is not restored.next_action
+
+
+def test_other_refusals_reject_withdrawal_operands():
+    """Only archived completion carries withdrawal operands; fixed text stays put."""
+    good = _withdrawal_entry("second", _WITHDRAWAL_HEAD)
+    plain = mq.QueueRefused("already_integrated")
+    assert plain.next_action == {
+        "actor": "custodian",
+        "command": mq.REFUSALS["already_integrated"],
+    }
+    assert set(plain.next_action) == {"actor", "command"}
+    refused("invalid_request", lambda: mq.QueueRefused("already_integrated", good))
+    caught = refusal_of("invalid_request", lambda: mq.QueueRefused("git_failed", good))
+    assert good.lane not in str(caught) and good.head not in str(caught)
+    assert set(caught.next_action) == {"actor", "command"}
+    assert mq.QueueRefused("archived_completion", good).code == "archived_completion"
+
+
+def _archived_pair(rig, shape):
+    """Land one completion, rewind, and enqueue the selected lane plus a later one."""
+    passing(rig)
+    backend = CountingIndexBackend()
+    q = fresh_queue(rig, backend=backend)
+    assert q.enqueue(rig.store, entry(rig)) == "queued"
+    tip = rig.base if shape == "fast-forward" else rig.other
+    if shape == "merge":
+        assert q.restore_target(rig.store, mq.HostedResult(tip, True),
+                                read_target=lambda _: tip) == "green"
+    candidate = direct_prepare(q, rig, tip)
+    passing(rig, candidate.tree, candidate.commit)
+    candidate = direct_prepare(q, rig, tip)
+    assert candidate.status == "ready"
+    receipt = issue(q, rig, candidate)
+    assert q.observe_landed(rig.store, receipt, read_target=lambda _: receipt.commit) == "done"
+    assert q.restore_target(rig.store, mq.HostedResult(tip, True),
+                            read_target=lambda _: tip) == "green"
+    selected = entry(rig, lane="second")
+    later = entry(rig, lane="third")
+    assert q.enqueue(rig.store, selected) == "queued"
+    assert q.enqueue(rig.store, later) == "queued"
+    return q, backend, tip, receipt, selected, later
+
+
+def _archived_operands(q, rig, tip, receipt, backend):
+    start = len(backend.reads)
+    caught = refusal_of("archived_completion", lambda: direct_prepare(q, rig, tip))
+    assert [kind for kind, oid in backend.reads[start:]] == ["commit"]
+    assert backend.reads[-1][1] == receipt.commit
+    assert q.issued is None
+    return caught
+
+
+@pytest.mark.parametrize("shape", ["fast-forward", "merge"])
+def test_archived_completion_returns_selected_pending_operands(rig, shape):
+    """Withdrawal uses only the selected pending lane and expected head.
+
+    Fast-forward and merge both keep the fixed refusal text. A stale head
+    does not withdraw. Each refusal reads the commit index once and does not
+    issue. The later pending lane stays queued until it is selected.
+    """
+    q, backend, tip, receipt, selected, later = _archived_pair(rig, shape)
+    before = backend.state
+    archives = dict(backend.commits)
+    backend.reads.clear()
+    first = _archived_operands(q, rig, tip, receipt, backend)
+    second = _archived_operands(q, rig, tip, receipt, backend)
+    assert first.next_action == second.next_action
+    ops = first.next_action
+    assert list(ops) == ["actor", "command", "lane", "expected_head"]
+    assert ops["lane"] == selected.lane and ops["expected_head"] == selected.head
+    assert ops["lane"] != later.lane
+    assert ops["lane"] not in str(first) and ops["expected_head"] not in str(first)
+    if shape == "merge":
+        assert ops["expected_head"] != receipt.commit
+    else:
+        assert ops["expected_head"] == receipt.commit
+    assert "ancestor" not in ops["command"]
+    assert q.issued is None and backend.state == before and not backend.dirty
+    assert backend.commits == archives
+    assert [kind for kind, _ in backend.reads] == ["commit", "commit"]
+    stale = "0" * len(ops["expected_head"])
+    refused("request_conflict", lambda: q.withdraw(ops["lane"], expected_head=stale))
+    assert backend.state == before and backend.commits == archives and q.issued is None
+    assert q.withdraw(ops["lane"], expected_head=ops["expected_head"]) == "released"
+    assert tuple(item.lane for item in backend.state.entries) == (later.lane,)
+    assert q.issued is None and set(backend.commits) == set(archives)
+    backend.reads.clear()
+    follow = _archived_operands(q, rig, tip, receipt, backend)
+    assert follow.next_action["lane"] == later.lane
+    assert follow.next_action["expected_head"] == later.head
+    assert q.withdraw(follow.next_action["lane"],
+                      expected_head=follow.next_action["expected_head"]) == "released"
+    assert direct_prepare(q, rig, tip).status == "empty"
+    assert q.issued is None and set(backend.commits) == set(archives)
+
+
+@pytest.mark.parametrize("shape", ["fast-forward", "merge"])
+def test_concurrent_archived_completion_uses_returned_operands_once(rig, shape):
+    """Concurrent refusals share one pending operand pair and withdraw once.
+
+    A stale sibling racing the same lane conflicts and leaves the entry. The
+    commit index is read once per preparation. Nothing is issued.
+    """
+    q, backend, tip, receipt, selected, later = _archived_pair(rig, shape)
+    before = backend.state
+    archives = dict(backend.commits)
+    backend.reads.clear()
+    barrier = Barrier(2)
+
+    def plan(_):
+        barrier.wait(timeout=10)
+        return refusal_of("archived_completion", lambda: direct_prepare(q, rig, tip))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        errors = list(pool.map(plan, range(2), timeout=30))
+    assert errors[0].next_action == errors[1].next_action
+    ops = errors[0].next_action
+    assert ops["lane"] == selected.lane and ops["expected_head"] == selected.head
+    assert [kind for kind, oid in backend.reads] == ["commit", "commit"]
+    assert all(oid == receipt.commit for _, oid in backend.reads)
+    assert q.issued is None and backend.state == before and backend.commits == archives
+    stale_barrier = Barrier(2)
+    stale_head = "0" * len(ops["expected_head"])
+
+    def stale(_):
+        stale_barrier.wait(timeout=10)
+        refused("request_conflict", lambda: q.withdraw(ops["lane"], expected_head=stale_head))
+        return "refused"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(stale, range(2), timeout=30)) == ["refused", "refused"]
+    assert backend.state == before and q.issued is None and backend.commits == archives
+    release_barrier = Barrier(2)
+
+    def release(_):
+        release_barrier.wait(timeout=10)
+        return q.withdraw(ops["lane"], expected_head=ops["expected_head"])
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sorted(pool.map(release, range(2), timeout=30)) == ["already", "released"]
+    assert tuple(item.lane for item in backend.state.entries) == (later.lane,)
+    assert q.issued is None and set(backend.commits) == set(archives)
+    backend.reads.clear()
+    follow = _archived_operands(q, rig, tip, receipt, backend)
+    assert follow.next_action["lane"] == later.lane
+    assert q.withdraw(follow.next_action["lane"],
+                      expected_head=follow.next_action["expected_head"]) == "released"
+    assert direct_prepare(q, rig, tip).status == "empty"
+    assert q.issued is None
 
 
 @pytest.mark.parametrize("failure", ["commit-exception", "commit-invalid", "health", "health-invalid"])

@@ -12,6 +12,7 @@ import pytest
 from conftest import symlink_or_skip
 from aegis_core import team_mailbox_primitives as mailbox_primitives
 from aegis_core import team_native_rollout as core
+from aegis_core.diagnostic_messages import guidance_value
 from aegis_core.team_mailbox_primitives import MailboxRefusal, strict_json
 from tools import hierarchy_native as legacy
 
@@ -948,3 +949,300 @@ def test_malformed_deep_text_is_stable_across_threads():
 
     with ThreadPoolExecutor(max_workers=3) as pool:
         assert list(pool.map(check, range(6))) == [True] * 6
+
+
+_UNCHECKED_CWD = "cwd unchecked: no value was requested"
+_OUTSIDE = "write root is outside requested scope: "
+_POLICY = "path write comparison requires an explicit directory or roots: "
+_SPECIAL = "special write access was not requested: "
+
+
+def _shown_path(value):
+    """Same canonicalize, redact, then truncate pipeline as profile diagnostics."""
+    return guidance_value(value, limit=160)
+
+
+def _under_work(*parts):
+    path = Path(WORK).joinpath(*parts)
+    rendered = str(path)
+    assert str(Path(rendered)) == rendered and ".." not in path.parts and path.parent != path
+    return rendered
+
+
+def _prefix_trap(root):
+    """A name that shares the root's text prefix and is not a lexical child."""
+    return str(Path(root).with_name(Path(root).name + "-not"))
+
+
+def _path_entry(path, access="write"):
+    return {"path": {"type": "path", "path": path}, "access": access}
+
+
+def _special_entry(kind, access="write"):
+    return {"path": {"type": "special", "value": {"kind": kind}}, "access": access}
+
+
+def _permission_observation(entries):
+    profile = context()["payload"]
+    profile["permission_profile"]["file_system"]["entries"] = entries
+    return {"profile": profile, "requested_tier": "default", "served_tier": None}
+
+
+def _outside_reason(value):
+    return _OUTSIDE + _shown_path(value)
+
+
+def _policy_reason(value):
+    return _POLICY + _shown_path(value)
+
+
+def _lexically_outside(value, roots):
+    """Independent oracle: native path rules, then one lexical-parent membership."""
+    path = Path(value)
+    if not (path.is_absolute() and str(path) == value and ".." not in path.parts and path.parent != path):
+        return True
+    indexed = [Path(root) for root in roots]
+    return not any(path == root or root in path.parents for root in indexed)
+
+
+def test_supplied_roots_keep_legacy_decisions_and_native_display():
+    """Supplied directories stay on the legacy decision, including the prefix trap."""
+    trap = _prefix_trap(WORK)
+    nested = _under_work("src", "a.py")
+    cases = [
+        (_permission_observation([_path_entry(nested)]), WORK, ()),
+        (_permission_observation([_path_entry(trap)]), WORK, ()),
+        (_permission_observation([_path_entry(nested)]), None, (WORK,)),
+        (_permission_observation([_path_entry(nested), _path_entry(trap)]), WORK, (Path(WORK), _under_work("other"))),
+        (_permission_observation([
+            _special_entry("slash_tmp"), _path_entry(trap), _special_entry("tmpdir"),
+        ]), WORK, ()),
+    ]
+    for observation, cwd, roots in cases:
+        kwargs = {"write_roots": roots, "allow_special_writes": ("tmpdir",)}
+        actual = core.check_profile(deepcopy(observation), "model", "ultra", cwd, **kwargs)
+        expected = legacy.check_profile(deepcopy(observation), "model", "ultra", cwd, **kwargs)
+        assert actual["state"] == expected["state"]
+        assert actual["checks"] == expected["checks"]
+        assert actual["native_execution_qualified"] is False
+        assert [reason.startswith(_OUTSIDE) for reason in actual["reasons"]] == [
+            reason.startswith(_OUTSIDE) for reason in expected["reasons"]]
+        assert [reason for reason in actual["reasons"] if reason.startswith(_OUTSIDE)] == [
+            _outside_reason(reason[len(_OUTSIDE):]) for reason in expected["reasons"]
+            if reason.startswith(_OUTSIDE)]
+        assert [reason for reason in actual["reasons"] if not reason.startswith(_OUTSIDE)] == [
+            reason for reason in expected["reasons"] if not reason.startswith(_OUTSIDE)]
+        assert observation["profile"]["cwd"] == WORK
+
+
+def test_lexical_parents_cover_descendants_and_reject_prefix_traps():
+    """Each bounded write is covered only by an indexed lexical parent or itself."""
+    parent = _under_work("project")
+    other = _under_work("other")
+    exact = parent
+    nested = str(Path(parent) / "src" / "main.py")
+    sibling = _prefix_trap(parent)
+    relative = "relative/file"
+    escaped = str(Path(parent) / ".." / "escape")
+    entries = [
+        _path_entry(exact),
+        _path_entry(WORK, "read"),
+        _special_entry("tmpdir"),
+        _path_entry(nested),
+        _path_entry(sibling),
+        _path_entry(str(Path(other) / "file")),
+        _path_entry(relative),
+        _path_entry(escaped),
+    ]
+    roots = (parent + "/.", other, parent + "/")
+    observation = _permission_observation(entries)
+    before = deepcopy(observation)
+    result = core.check_profile(observation, "model", "ultra", WORK, write_roots=roots, allow_tmpdir=True)
+    assert observation == before
+    expected = [_outside_reason(value) for value in (sibling, relative, escaped) if _lexically_outside(value, roots)]
+    covered = [exact, nested, str(Path(other) / "file")]
+    assert all(not _lexically_outside(value, roots) for value in covered)
+    assert _lexically_outside(sibling, roots) and sibling.startswith(parent)
+    assert result["reasons"] == expected
+    assert result["state"] == "PROFILE_HOLD"
+    assert result["native_execution_qualified"] is False
+    assert result["next_action"]
+    duplicate = core.check_profile(
+        observation, "model", "ultra", WORK, write_roots=(other, parent, parent), allow_tmpdir=True)
+    reversed_roots = core.check_profile(
+        observation, "model", "ultra", WORK, write_roots=(parent, other), allow_tmpdir=True)
+    assert duplicate["reasons"] == reversed_roots["reasons"] == expected
+    deep = _permission_observation([_path_entry(_under_work("a", "b", "c"))])
+    assert core.check_profile(deep, "model", "ultra", WORK)["state"] == "PROFILE_MATCH"
+    assert core.check_profile(deep, "model", "ultra", WORK, write_roots=(Path(WORK),))["state"] == "PROFILE_MATCH"
+    path_cwd = core.check_profile(deep, "model", "ultra", Path(WORK))
+    assert path_cwd["checks"]["cwd"] == "mismatch"
+    assert path_cwd["reasons"] == ["working directory mismatch"]
+    assert core.bounded_write_path(nested) is True
+    assert core.bounded_write_path(relative) is False
+    assert core.bounded_write_path(escaped) is False
+    assert core.bounded_write_path(str(Path(WORK).anchor)) is False
+    assert core.bounded_write_path(parent + "/./child") is False
+
+
+def test_supplied_root_policy_refusals_retry_without_mutating_input():
+    """Invalid supplied roots refuse before comparison; a later call can match."""
+    observation = _permission_observation([_path_entry(WORK, "read")])
+    before = deepcopy(observation)
+    huge = "/" + "a" * core.MAX_RECORD_BYTES
+    many = tuple(str(Path(WORK) / str(index)) for index in range(10001))
+    boundary = tuple(str(Path(WORK) / str(index)) for index in range(10000))
+    cases = (
+        ((), "relative", "invalid_record"),
+        (("relative",), WORK, "invalid_record"),
+        ((Path(WORK).anchor,), None, "invalid_record"),
+        ((str(Path(WORK) / ".." / "x"),), WORK, "invalid_record"),
+        ((None,), WORK, "invalid_record"),
+        (None, WORK, "invalid_record"),
+        ("/", WORK, "invalid_record"),
+        ((huge,), WORK, "too_large"),
+        (("not-absolute", huge), WORK, "too_large"),
+        ((None, huge), WORK, "invalid_record"),
+        (many, None, "invalid_record"),
+    )
+    for roots, cwd, reason in cases:
+        refused(reason, core.check_profile, observation, "model", "ultra", cwd, write_roots=roots)
+        assert observation == before
+        retried = core.check_profile(observation, "model", "ultra", WORK)
+        assert retried["state"] == "PROFILE_MATCH"
+        assert retried["native_execution_qualified"] is False
+        assert "next_action" not in retried
+    covered = _permission_observation([_path_entry(str(Path(WORK) / "0" / "file"))])
+    assert core.check_profile(covered, "model", "ultra", WORK, write_roots=boundary)["state"] == "PROFILE_MATCH"
+    refused("too_large", core.bounded_write_path, "x" * (core.MAX_RECORD_BYTES + 1))
+    assert core.bounded_write_path("x" * 32) is False
+
+
+def test_omitted_directory_preserves_unchecked_hold_for_read_only_profiles():
+    """A missing directory stays unchecked and is not validated as a root."""
+    observation = _permission_observation([
+        _path_entry(WORK, "read"),
+        _special_entry("root", "read"),
+    ])
+    before = deepcopy(observation)
+    held = core.check_profile(observation, None, "ultra", None)
+    assert observation == before
+    assert held["state"] == "PROFILE_HOLD"
+    assert held["checks"] == {"model": "unchecked", "effort": "checked", "cwd": "unchecked"}
+    assert held["reasons"] == [
+        "model unchecked: no value was requested",
+        _UNCHECKED_CWD,
+    ]
+    assert held["native_execution_qualified"] is False
+    assert held["next_action"]
+    assert _OUTSIDE not in " ".join(held["reasons"])
+    assert "explicit directory" not in " ".join(held["reasons"])
+    assert core.check_profile(observation, None, "ultra", None, write_roots=[])["reasons"] == held["reasons"]
+    special_only = _permission_observation([_special_entry("tmpdir")])
+    assert core.check_profile(special_only, "model", "ultra", None, allow_tmpdir=True)["reasons"] == [
+        _UNCHECKED_CWD]
+    assert core.check_profile(special_only, "model", "ultra", None)["reasons"] == [
+        _UNCHECKED_CWD, _SPECIAL + _shown_path("tmpdir")]
+
+
+def test_omitted_directory_requests_comparison_policy_for_path_writes():
+    """Path writes without a directory or roots hold; supplied roots still compare."""
+    inside = _under_work("src", "a.py")
+    outside = _prefix_trap(WORK)
+    relative = "relative/nope"
+    observation = _permission_observation([
+        _special_entry("tmpdir"),
+        _path_entry(inside),
+        _special_entry("slash_tmp"),
+        _path_entry(outside),
+        _path_entry(relative),
+    ])
+    before = deepcopy(observation)
+    held = core.check_profile(observation, "model", "ultra", None, allow_tmpdir=True)
+    assert observation == before
+    assert held["state"] == "PROFILE_HOLD"
+    assert held["checks"]["cwd"] == "unchecked"
+    assert held["native_execution_qualified"] is False
+    assert held["reasons"] == [
+        _UNCHECKED_CWD,
+        _policy_reason(inside),
+        _SPECIAL + _shown_path("slash_tmp"),
+        _policy_reason(outside),
+        _outside_reason(relative),
+    ]
+    compared = core.check_profile(observation, "model", "ultra", None, write_roots=(WORK,), allow_tmpdir=True)
+    assert compared["reasons"] == [
+        _UNCHECKED_CWD,
+        _SPECIAL + _shown_path("slash_tmp"),
+        _outside_reason(outside),
+        _outside_reason(relative),
+    ]
+    refused("invalid_record", core.check_profile, observation, "model", "ultra", None, write_roots=("relative",))
+    assert observation == before
+    retried = core.check_profile(
+        _permission_observation([_path_entry(inside)]), "model", "ultra", WORK)
+    assert retried["state"] == "PROFILE_MATCH"
+    assert retried["native_execution_qualified"] is False
+
+
+def test_path_write_diagnostics_canonicalize_redact_then_truncate():
+    """Untrusted path fields are canonicalized, redacted, then truncated."""
+    secret = "sk-" + "A" * 40
+    split = _under_work("def\r" + secret)
+    long_path = _under_work("c" * 500)
+    multiline = _under_work("line\n" + "d" * 20)
+    observation = _permission_observation([
+        _path_entry(split), _path_entry(long_path), _path_entry(multiline),
+    ])
+    result = core.check_profile(observation, "model", "ultra", None)
+    assert result["reasons"] == [
+        _UNCHECKED_CWD, _policy_reason(split), _policy_reason(long_path), _policy_reason(multiline),
+    ]
+    for reason in result["reasons"]:
+        assert "\n" not in reason and "\r" not in reason
+        assert secret not in reason
+    assert long_path not in " ".join(result["reasons"])
+    assert len(_shown_path(long_path)) < len(long_path)
+    assert _shown_path(split) != split
+    outside = core.check_profile(
+        _permission_observation([_path_entry(split)]), "model", "ultra", _prefix_trap(WORK))
+    assert outside["reasons"] == ["working directory mismatch", _outside_reason(split)]
+    assert secret not in " ".join(outside["reasons"])
+    assert "\r" not in " ".join(outside["reasons"])
+
+
+def test_root_index_and_omitted_hold_are_independent_across_threads():
+    """Indexing and the omitted-directory hold share no mutable result state."""
+    read_only = _permission_observation([_path_entry(WORK, "read")])
+    inside = _under_work("leaf.py")
+    writing = _permission_observation([_path_entry(inside)])
+    other = _prefix_trap(WORK)
+
+    def check(index):
+        mode = index % 4
+        if mode == 0:
+            result = core.check_profile(read_only, "model", "ultra", None)
+            assert result["reasons"] == [_UNCHECKED_CWD]
+            assert result["native_execution_qualified"] is False
+        elif mode == 1:
+            try:
+                core.check_profile(writing, "model", "ultra", WORK, write_roots=("relative",))
+            except core.NativeRolloutRefusal as error:
+                assert error.reason == "invalid_record" and error.code == 2
+            else:
+                raise AssertionError("relative root must refuse")
+            retried = core.check_profile(writing, "model", "ultra", WORK)
+            assert retried["state"] == "PROFILE_MATCH" and retried["native_execution_qualified"] is False
+        elif mode == 2:
+            covered = core.check_profile(writing, "model", "ultra", None, write_roots=(WORK,))
+            assert covered["reasons"] == [_UNCHECKED_CWD]
+            held = core.check_profile(writing, "model", "ultra", None)
+            assert held["reasons"] == [_UNCHECKED_CWD, _policy_reason(inside)]
+        else:
+            rejected = core.check_profile(writing, "model", "ultra", WORK, write_roots=(other,))
+            assert rejected["reasons"] == [_outside_reason(inside)]
+            assert rejected["state"] == "PROFILE_HOLD"
+        return mode
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert sorted(pool.map(check, range(12))) == sorted(index % 4 for index in range(12))
