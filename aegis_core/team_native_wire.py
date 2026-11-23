@@ -344,7 +344,135 @@ def _freeze_reply(result, maximum):
     return _json_bytes(result)
 
 
-class ProtocolClient:
+class FrameTransport:
+    """Shared bounded frame encoding, readiness and descriptor I/O.
+
+    Until a frame is consumed, the next search skips bytes already examined.
+    After a frame is consumed, search starts at the buffered remainder.
+    Bytes already written keep an unknown outcome.
+    """
+
+    def _deadline_left(self, deadline):
+        if self._revoked():
+            self._fail()
+        left = deadline - time.monotonic()
+        if left <= 0:
+            self._fail("HOST_PROTOCOL_TIMEOUT", "host protocol deadline expired")
+        return left
+
+    def _prepare_frame(self, deadline):
+        """Hook for a borrowed transport that bounds preparation."""
+
+    def _guarded(self, operation, _deadline, *args):
+        """Run one non-blocking syscall on a live descriptor."""
+        with self._gate:
+            if self._revoked():
+                return _REVOKED
+            return operation(*args)
+
+    def _io_failure(self, cause):
+        try:
+            self._fail()
+        except HostAuthorityError as error:
+            raise error from cause
+
+    def _wait(self, fd, deadline, *, writing=False):
+        while True:
+            left = self._deadline_left(deadline)
+            try:
+                readable, writable, _unused = select.select(
+                    [] if writing else [fd], [fd] if writing else [], [],
+                    min(left, REVOCATION_POLL_SECONDS))
+            except InterruptedError:
+                continue
+            except (OSError, ValueError) as exc:
+                self._io_failure(exc)
+            if readable or writable:
+                return
+
+    def _read(self, deadline):
+        searched = 0
+        while True:
+            self._prepare_frame(deadline)
+            end = self._buffer.find(b"\n", searched)
+            if end >= 0:
+                with memoryview(self._buffer)[:end + 1] as frame:
+                    raw = bytes(frame)
+                return self._deliver(raw, end, deadline)
+            searched = len(self._buffer)
+            if searched >= self._maximum:
+                self._fail()
+            self._wait(self._read_fd, deadline)
+            chunk = self._take(deadline)
+            if chunk is _AGAIN:
+                continue
+            if chunk is _REVOKED or not chunk:
+                self._fail()
+            self._buffer.extend(chunk)
+
+    def _deliver(self, raw, end, _deadline):
+        del self._buffer[:end + 1]
+        return self._decode_frame(raw)
+
+    def _decode_frame(self, raw):
+        try:
+            return _decode(raw, self._maximum)
+        except HostAuthorityError:
+            self._fail()
+
+    def _take(self, deadline):
+        try:
+            return self._guarded(
+                os.read, deadline, self._read_fd,
+                min(65536, self._maximum - len(self._buffer)))
+        except HostAuthorityError:
+            raise
+        except (BlockingIOError, InterruptedError):
+            return _AGAIN
+        except OSError as exc:
+            self._io_failure(exc)
+
+    def _encode_frame(self, value):
+        """Encode one generic frame, including its newline.
+
+        Initialization and control writes use this encoder. An encoding refusal
+        closes the transport before it reaches the caller.
+        """
+        try:
+            return _encode(value, self._maximum)
+        except HostAuthorityError as exc:
+            self._fail(exc.code, exc.reason)
+        except (ValueError, RecursionError, UnicodeError):
+            self._fail()
+
+    def _send_frame(self, raw, deadline):
+        view = memoryview(raw)
+        offset = 0
+        while offset < len(raw):
+            self._wait(self._write_fd, deadline, writing=True)
+            written = self._send(view[offset:], deadline)
+            if written is _AGAIN:
+                continue
+            if written is _REVOKED or written <= 0:
+                self._fail()
+            offset += written
+
+    def _write(self, value, deadline):
+        self._prepare_frame(deadline)
+        self._send_frame(self._encode_frame(value), deadline)
+
+    def _send(self, payload, deadline):
+        try:
+            return self._guarded(os.write, deadline, self._write_fd, payload)
+        except HostAuthorityError:
+            raise
+        except (BlockingIOError, InterruptedError):
+            return _AGAIN
+        except OSError as exc:
+            self._io_failure(exc)
+
+
+class ProtocolClient(FrameTransport):
     """Single-owner POSIX pipe client; no callbacks, process launch, or grants.
 
     Reader and writer streams are closed on a terminal protocol error or
@@ -357,8 +485,7 @@ class ProtocolClient:
 
     def __init__(self, reader, writer, *, timeout_seconds=MAX_WAIT_SECONDS,
                  max_frame_bytes=MAX_FRAME_BYTES):
-        # Platform refusal matches the legacy leaf and runs before any stream use.
-        # Numeric limits are checked only once the host can own a pipe.
+        # Check the platform before touching either pipe.
         if os.name != "posix":
             raise HostAuthorityError(
                 "UNSUPPORTED_HOST", "bounded pipe transport requires POSIX")
@@ -405,13 +532,6 @@ class ProtocolClient:
         os.set_blocking(self._read_fd, False)
         os.set_blocking(self._write_fd, False)
 
-    def _guarded(self, operation, *args):
-        """Run one non-blocking syscall on an owned descriptor, never after revocation."""
-        with self._gate:
-            if self._revoked():
-                return _REVOKED
-            return operation(*args)
-
     def close(self):
         """Close both owned streams. Never signal a process id."""
         error = None
@@ -438,110 +558,12 @@ class ProtocolClient:
             raise HostAuthorityError(code, reason) from exc
         raise HostAuthorityError(code, reason)
 
+    def _operation_deadline(self):
+        return time.monotonic() + self._timeout
+
     def _live(self, *, initialized=True):
         if self._closed or (initialized and not self._initialized):
             self._fail()
-
-    def _wait(self, fd, deadline, *, writing=False):
-        while True:
-            if self._revoked():
-                self._fail()
-            left = deadline - time.monotonic()
-            if left <= 0:
-                self._fail("HOST_PROTOCOL_TIMEOUT", "host protocol deadline expired")
-            try:
-                readable, writable, _unused = select.select(
-                    [] if writing else [fd], [fd] if writing else [], [],
-                    min(left, REVOCATION_POLL_SECONDS))
-            except InterruptedError:
-                continue
-            except (OSError, ValueError) as exc:
-                try:
-                    self._fail()
-                except HostAuthorityError as error:
-                    raise error from exc
-            if readable or writable:
-                return
-
-    def _read(self, deadline):
-        # ControlIO also uses this reader and initializes an empty bytes buffer.
-        if type(self._buffer) is bytes:
-            self._buffer = bytearray(self._buffer)
-        searched = 0
-        while True:
-            end = self._buffer.find(b"\n", searched)
-            if end >= 0:
-                with memoryview(self._buffer)[:end + 1] as frame:
-                    raw = bytes(frame)
-                del self._buffer[:end + 1]
-                try:
-                    return _decode(raw, self._maximum)
-                except HostAuthorityError:
-                    self._fail()
-            searched = len(self._buffer)
-            if searched >= self._maximum:
-                self._fail()
-            self._wait(self._read_fd, deadline)
-            chunk = self._take()
-            if chunk is _AGAIN:
-                continue
-            if chunk is _REVOKED or not chunk:
-                self._fail()
-            self._buffer.extend(chunk)
-
-    def _take(self):
-        try:
-            return self._guarded(
-                os.read, self._read_fd, min(65536, self._maximum - len(self._buffer)))
-        except (BlockingIOError, InterruptedError):
-            return _AGAIN
-        except OSError as exc:
-            try:
-                self._fail()
-            except HostAuthorityError as error:
-                raise error from exc
-
-    def _encode_frame(self, value):
-        """Encode one generic frame, including its newline.
-
-        Initialization and control writes use this encoder. An encoding refusal
-        closes the transport before it reaches the caller.
-        """
-        try:
-            return _encode(value, self._maximum)
-        except HostAuthorityError as exc:
-            self._fail(exc.code, exc.reason)
-        except (ValueError, RecursionError, UnicodeError):
-            self._fail()
-
-    def _send_frame(self, raw, deadline):
-        view = memoryview(raw)
-        offset = 0
-        while offset < len(raw):
-            self._wait(self._write_fd, deadline, writing=True)
-            written = self._send(view[offset:])
-            if written is _AGAIN:
-                continue
-            if written is _REVOKED or written <= 0:
-                self._fail()
-            offset += written
-
-    def _write(self, value, deadline):
-        self._send_frame(self._encode_frame(value), deadline)
-
-    def _send(self, payload):
-        try:
-            return self._guarded(os.write, self._write_fd, payload)
-        except (BlockingIOError, InterruptedError):
-            return _AGAIN
-        except OSError as exc:
-            try:
-                self._fail()
-            except HostAuthorityError as error:
-                raise error from exc
-
-    def _operation_deadline(self):
-        return time.monotonic() + self._timeout
 
     def initialize(self):
         self._live(initialized=False)

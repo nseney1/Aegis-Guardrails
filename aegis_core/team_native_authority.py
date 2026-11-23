@@ -26,7 +26,7 @@ from aegis_core.team_native_keys import (
     BOUND_INITIAL_KEY, GUARD_KEY, NATIVE_IDENTITIES as native_identities, RESERVATION_KEY,
 )
 from aegis_core.team_native_wire import (
-    HostAuthorityError, MAX_DEPTH, MAX_FRAME_BYTES, MAX_WAIT_SECONDS, ProtocolClient,
+    HostAuthorityError, MAX_DEPTH, MAX_FRAME_BYTES, MAX_WAIT_SECONDS,
 )
 
 __all__ = [
@@ -364,48 +364,16 @@ def process_identity(pid):
         raise HostAuthorityError("UNPROTECTED_DEPLOYMENT", _UNPROTECTED) from None
 
 
-class ControlIO(ProtocolClient):
-    """Bounded private control frames using the binding's shared I/O gate."""
+class ControlIO:
+    """Check package control admission before refusing the borrow."""
 
     def __init__(self, owner):
         _require_descriptors()
         require(native_identities.is_instance("binding", owner),
                 "ROLE_OPERATION_FORBIDDEN", "control requires an owned binding")
         owner.require_owner_process()
-        self._owner = owner
-        self._gate = owner.io_gate
-        self._maximum, self._buffer = MAX_FRAME_BYTES, b""
-        self._closed = False
-        try:
-            with self._gate:
-                require(not owner.fenced, "STALE_INVOCATION", "runtime binding is closed")
-                self._read_fd = self._write_fd = owner.control_socket.fileno()
-                os.set_blocking(self._read_fd, False)
-        except HostAuthorityError:
-            raise
-        except (OSError, ValueError):
-            raise HostAuthorityError("UNPROTECTED_DEPLOYMENT", _UNPROTECTED) from None
-
-    def _revoked(self):
-        return self._closed or self._owner.fenced
-
-    def read(self, deadline):
-        self._owner.require_owner_process()
-        if self._revoked():
-            self._fail()
-        frame = self._read(deadline)
-        if self._revoked():
-            self._fail()
-        return frame
-
-    def write(self, value, deadline):
-        self._owner.require_owner_process()
-        if self._revoked():
-            self._fail()
-        self._write(value, deadline)
-
-    def close(self):
-        self._owner.close()
+        require(not owner.fenced, "STALE_INVOCATION", "runtime binding is closed")
+        raise HostAuthorityError("UNPROTECTED_DEPLOYMENT", _UNPROTECTED)
 
 
 def _mapping(record, name):

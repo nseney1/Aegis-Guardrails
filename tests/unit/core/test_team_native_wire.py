@@ -12,10 +12,12 @@ import os
 import select
 import threading
 from contextlib import ExitStack, closing, contextmanager
+from types import SimpleNamespace
 
 import pytest
 
 import aegis_core.team_native_wire as wire
+from aegis_core import team_native_keys, team_native_session
 
 
 legacy = importlib.import_module("tools.hierarchy_host_authority")
@@ -358,6 +360,14 @@ class _BlockFail:
 
     def set_blocking(self, fd, blocking):
         raise OSError("injected pipe setup failure")
+
+
+def test_frame_transport_stops_at_frames_and_protocol_client_keeps_the_session():
+    """Invariant: handshake and call correlation stay on ProtocolClient."""
+    assert issubclass(wire.ProtocolClient, wire.FrameTransport)
+    for name in ("initialize", "receive_call", "reply"):
+        assert hasattr(wire.ProtocolClient, name)
+        assert not hasattr(wire.FrameTransport, name)
 
 
 def test_public_surface_matches_the_legacy_constants_and_omits_dead_names():
@@ -1059,6 +1069,20 @@ def test_close_is_idempotent_and_a_fresh_client_can_retry():
         assert item.client.receive_call()["id"] == 7
 
 
+class _SearchBuffer(bytearray):
+    """Record each newline search as (start, length) for the public receiver."""
+
+    def __init__(self):
+        super().__init__()
+        self.spans = []
+
+    def find(self, needle, start=0, end=None):
+        self.spans.append((start, len(self)))
+        if end is None:
+            return bytearray.find(self, needle, start)
+        return bytearray.find(self, needle, start, end)
+
+
 def test_fragmented_read_reuses_its_prefix_and_keeps_coalesced_frames(monkeypatch):
     _posix()
     maximum = 512
@@ -1089,10 +1113,19 @@ def test_fragmented_read_reuses_its_prefix_and_keeps_coalesced_frames(monkeypatc
     with closing(Link(maximum=maximum)) as item:
         item.to_client.write(frame({"id": INIT_ID, "result": HANDSHAKE}))
         item.client.initialize()
+        observed = _SearchBuffer()
+        item.client._buffer = observed
         monkeypatch.setattr(wire, "os", FragmentedReader)
         item.to_client.write(incoming)
         assert item.client.receive_call() == first
+        during_fragments = list(observed.spans)
         assert item.client.receive_call() == second
+        after_consume = observed.spans[len(during_fragments):]
+        # A restart from zero on every fragment never records a positive start.
+        assert any(start > 0 for start, _length in during_fragments)
+        assert any(start == 4 and length >= 4 for start, length in during_fragments)
+        # The buffered successor is searched from its own beginning.
+        assert after_consume[0] == (0, len(frame(second)))
         assert requested == [maximum, maximum - 4, maximum - 4]
         item.to_client.write(frame(exact))
         assert item.client.receive_call() == exact
@@ -1106,6 +1139,188 @@ def test_fragmented_read_reuses_its_prefix_and_keeps_coalesced_frames(monkeypatc
         assert item.client.closed
         assert item._client_reader.closed and item._client_writer.closed
     assert recopied == []
+    monkeypatch.setattr(wire, "os", os)
+    with closing(Link()) as revoked:
+        revoked.to_client.write(frame({"id": INIT_ID, "result": HANDSHAKE}))
+        revoked.client.initialize()
+        revoked.to_client.write(frame(call(7)) + frame(call(8, "later")))
+        assert revoked.client.receive_call()["id"] == 7
+        revoked.client.close()
+        assert revoked.client.closed
+        with pytest.raises(wire.HostAuthorityError) as caught:
+            revoked.client.receive_call()
+        assert (caught.value.code, caught.value.reason) == (
+            "HOST_PROTOCOL_ERROR", "invalid host protocol frame")
+        assert "later" not in caught.value.reason
+        assert "later" not in caught.value.next_action
+
+
+class _FrozenClock:
+    def __init__(self, now):
+        self.now = now
+
+    def monotonic(self):
+        return self.now
+
+
+class _ExpireOnDecode:
+    def __init__(self, clock):
+        self.clock = clock
+        self.armed = False
+
+    def loads(self, *args, **kwargs):
+        if self.armed:
+            self.clock.now = 100
+        return json.loads(*args, **kwargs)
+
+    def dumps(self, *args, **kwargs):
+        return json.dumps(*args, **kwargs)
+
+
+def test_protocol_client_keeps_interrupted_coalesced_reads_and_the_cursor_bound(monkeypatch):
+    """Ordinary ProtocolClient I/O stays on the shared transport.
+
+    Handshake and correlation stay on ProtocolClient. An interrupted read
+    retries, coalesced frames keep the cursor bound, and a buffered frame
+    remains deliverable when its decode crosses the readiness deadline.
+    """
+    _posix()
+    assert not any(hasattr(wire.FrameTransport, name)
+                   for name in ("initialize", "receive_call", "reply"))
+    clock = _FrozenClock(0)
+    parser = _ExpireOnDecode(clock)
+    monkeypatch.setattr(wire, "time", clock)
+    monkeypatch.setattr(wire, "json", parser)
+    maximum = 512
+    first, second, third = call(7, "first"), call(8, "second"), call(9, "third")
+    incoming = frame(first) + frame(second) + frame(third)
+    requested = []
+
+    class Fragmented:
+        @staticmethod
+        def read(fd, size):
+            requested.append(size)
+            if len(requested) == 1:
+                return os.read(fd, 4)
+            if len(requested) == 2:
+                raise InterruptedError
+            return os.read(fd, size)
+
+        @staticmethod
+        def write(fd, data):
+            return os.write(fd, data)
+
+        @staticmethod
+        def set_blocking(fd, blocking):
+            return os.set_blocking(fd, blocking)
+
+    with closing(Link(timeout=3, maximum=maximum)) as item:
+        item.to_client.write(frame({"id": INIT_ID, "result": HANDSHAKE}))
+        item.client.initialize()
+        observed = _SearchBuffer()
+        item.client._buffer = observed
+        monkeypatch.setattr(wire, "os", Fragmented)
+        item.to_client.write(incoming)
+        assert item.client.receive_call() == first
+        during = list(observed.spans)
+        assert item.client.receive_call() == second
+        after = observed.spans[len(during):]
+        assert any(start > 0 for start, _length in during)
+        assert after[0] == (0, len(frame(second)) + len(frame(third)))
+        assert requested == [maximum, maximum - 4, maximum - 4]
+        parser.armed = True
+        assert item.client.receive_call() == third
+        assert not item.client.closed
+        assert requested == [maximum, maximum - 4, maximum - 4]
+
+
+@pytest.fixture(params=["standalone", "appserver"])
+def timed_pipe(request, monkeypatch):
+    clock = _FrozenClock(0)
+    monkeypatch.setattr(wire, "time", clock)
+    if request.param == "standalone":
+        with closing(Link(timeout=3)) as item:
+            yield clock, item
+        return
+
+    class Owner:
+        def __init__(self, reader, writer):
+            self.reader, self.writer = reader, writer
+            self.io_gate = threading.RLock()
+            self.fenced = False
+
+        def require_owner_process(self):
+            pass
+
+        def close(self):
+            with self.io_gate:
+                self.fenced = True
+                self.reader.close()
+                self.writer.close()
+
+    registry = team_native_keys.NativeIdentities()
+    registry.bind_type("binding", Owner)
+    monkeypatch.setattr(team_native_session, "native_identities", registry)
+    monkeypatch.setattr(team_native_session, "time",
+                        SimpleNamespace(monotonic_ns=lambda: clock.now * 10**9))
+
+    def appserver(reader, writer, **_limits):
+        owner = Owner(reader, writer)
+        registry.register_binding(team_native_keys.LIVE_KEY, owner)
+        return team_native_session.AppserverIO(owner)
+
+    with closing(Link(implementation=appserver)) as item:
+        with item.client.operation(3 * 10**9):
+            yield clock, item
+
+
+@pytest.mark.parametrize("operation", ["initialize", "receive", "reply", "replay"])
+def test_pipe_client_preserves_timing_after_readiness(monkeypatch, timed_pipe, operation):
+    clock, item = timed_pipe
+    original, repeat, later = call(7, "one"), call(8, "one"), call(9, "two")
+    answer = {"success": True, "contentItems": [{"type": "inputText", "text": "accepted"}]}
+    late_writes = []
+
+    class ReadyLate:
+        @staticmethod
+        def select(readable, writable, exceptional, timeout):
+            ready = select.select(readable, writable, exceptional, timeout)
+            if ready[1]:
+                late_writes.append(ready[1])
+                if operation != "initialize" or len(late_writes) == 2:
+                    clock.now = 100
+            return ready
+
+    os.set_blocking(item.to_peer, False)
+    item.to_client.write(frame({"id": INIT_ID, "result": HANDSHAKE}))
+    if operation == "initialize":
+        monkeypatch.setattr(wire, "select", ReadyLate)
+    item.client.initialize()
+    assert json.loads(item.peer.line())["method"] == "initialize"
+    assert json.loads(item.peer.line()) == {"method": "initialized"}
+    if operation == "initialize":
+        assert len(late_writes) == 2
+    else:
+        item.to_client.write(frame(original) + frame(repeat) + frame(later))
+        assert item.client.receive_call() == original
+        if operation == "receive":
+            parser = _ExpireOnDecode(clock)
+            parser.armed = True
+            monkeypatch.setattr(wire, "json", parser)
+            # The duplicate is pending and the next distinct call is buffered.
+            assert item.client.receive_call() == later
+            assert clock.now == 100
+        else:
+            if operation == "reply":
+                monkeypatch.setattr(wire, "select", ReadyLate)
+            item.client.reply(original["id"], answer)
+            assert json.loads(item.peer.line()) == {"id": 7, "result": answer}
+            if operation == "replay":
+                monkeypatch.setattr(wire, "select", ReadyLate)
+                assert item.client.receive_call() == later
+                assert json.loads(item.peer.line()) == {"id": 8, "result": answer}
+            assert len(late_writes) == 1
+    assert not item.client.closed
 
 
 def test_close_during_blocked_write_does_not_write_a_reused_descriptor(tmp_path, monkeypatch):
