@@ -19,10 +19,19 @@ LANE_MODULES = frozenset({"aegis_core/team_git.py", "aegis_core/team_git_snapsho
 
 __all__ = [
     "IDENTITY", "LANE_MODULES", "commit", "copy_immutable_repo", "copied_rig",
-    "filter_git_env", "git", "make_store", "new_store", "rig_template",
-    "shared_bytes", "state", "strict_program", "strict_program_guard",
+    "filter_git_env", "git", "make_store", "new_store", "queue_seed_env",
+    "rig_template", "shared_bytes", "state", "strict_program", "strict_program_guard",
 ]
 
+# Single-line pins. Launcher values are replaced whole and never joined in.
+_QUEUE_SEED_IDENTITY = (
+    ("GIT_AUTHOR_NAME", "Test"),
+    ("GIT_AUTHOR_EMAIL", "test@example.com"),
+    ("GIT_AUTHOR_DATE", "1700000000 +0000"),
+    ("GIT_COMMITTER_NAME", "Test"),
+    ("GIT_COMMITTER_EMAIL", "test@example.com"),
+    ("GIT_COMMITTER_DATE", "1700000000 +0000"),
+)
 
 def strict_program_guard(*, optional=False, native_fixture=False):
     """One capability check, exposed as a fixture and for conditional helper setup."""
@@ -41,8 +50,31 @@ def strict_program():
     return strict_program_guard()
 
 
-def filter_git_env(home):
-    return {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "XDG_CONFIG_HOME": str(home / ".config"), "LC_ALL": "C"}
+def filter_git_env(home, *, source=None):
+    base = os.environ if source is None else source
+    return {**base, "GIT_CONFIG_NOSYSTEM": "1", "XDG_CONFIG_HOME": str(home / ".config"), "LC_ALL": "C"}
+
+
+def queue_seed_env(repo, source=None):
+    """Keep OS inputs and supply Git controls owned by this seed's fixture."""
+    base = os.environ if source is None else source
+    repo = Path(repo).absolute()
+    home = repo.with_name(repo.name + "-seed-home")
+    xdg = home / ".config"
+    xdg.mkdir(parents=True, exist_ok=True)
+    env = {key: value for key, value in base.items()
+           if not key.casefold().startswith("git_")
+           and key.casefold() not in {"home", "xdg_config_home", "lc_all"}}
+    pinned = dict(_QUEUE_SEED_IDENTITY)
+    for value in pinned.values():
+        if type(value) is not str or not value or "\n" in value or "\r" in value:
+            raise AssertionError("queue seed identity must be a single line")
+    env.update(pinned)
+    # Older Git discovers global configuration through HOME and XDG directly.
+    env.update(HOME=str(home), XDG_CONFIG_HOME=str(xdg), LC_ALL="C",
+               GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
+               GIT_CONFIG_NOSYSTEM="1", GIT_ATTR_NOSYSTEM="1", GIT_DEFAULT_HASH="sha1")
+    return env
 
 
 def git(repo, *args, data=None, env=None):
@@ -54,11 +86,12 @@ def git(repo, *args, data=None, env=None):
         capture_output=True, check=True, env=env).stdout
 
 
-def commit(repo, name, content, *, env=None):
+def commit(repo, name, content, *, env=None, run_git=None):
+    run_git = git if run_git is None else run_git
     (repo / name).write_bytes(content)
-    git(repo, "add", "--", name, env=env)
-    git(repo, "commit", "-qm", "change " + name, env=env)
-    return git(repo, "rev-parse", "HEAD", env=env).decode().strip()
+    run_git(repo, "add", "--", name, env=env)
+    run_git(repo, "commit", "-qm", "change " + name, env=env)
+    return run_git(repo, "rev-parse", "HEAD", env=env).decode().strip()
 
 
 def make_store(repo):
@@ -93,11 +126,11 @@ def rig_template(tmp_path_factory):
     if shutil.which("git") is None:
         pytest.skip("needs git")
     repo = tmp_path_factory.mktemp("custody-template") / "repo"
-    repo.mkdir()
-    git(repo, "init", "-q", "-b", "lane/work")
-    context = make_store(repo)  # Capability guard before descriptor-only work.
+    context = make_store(repo)
     if not team_qualify.descriptor_supported():
         pytest.skip("qualification requires descriptor custody")
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "lane/work")
     (repo / "src").mkdir()
     head = commit(repo, "src/a.py", b"base\n")
     lease = team.claim(repo, "work", ["/src/**", "/shared.txt"], owner="team-1",
@@ -117,13 +150,12 @@ def rig_template(tmp_path_factory):
 
 
 @contextmanager
-def copied_rig(template, directory):
-    repo = directory / "repo"
-    shutil.copytree(template.repo, repo)
-    assert state(SimpleNamespace(repo=repo)) == template.baseline
+def copied_rig(template, directory, *, copy_file=None):
+    context = make_store(Path(directory) / "repo")
+    repo = copy_immutable_repo(template, directory, copy_file=copy_file)
     policy = team.parse_team(json.dumps({"v": 1, "shared": ["shared.txt"],
                                        "lanes": {"work": ["src/**"]}}).encode())
-    with make_store(repo) as store:
+    with context as store:
         def paths(old, new):
             # Trusted adapter sees the private object directory. No repository history needed.
             return tuple(p.decode() for p in git(repo, "diff-tree", "-r", "--no-renames",
@@ -144,15 +176,19 @@ def state(rig):
         for p in rig.repo.rglob("*") if ".git" not in p.parts})
 
 
-def copy_immutable_repo(template, directory):
+def copy_immutable_repo(template, directory, *, copy_file=None):
     """Copy one immutable Git template into directory/repo.
 
     The template is only read. The copy must match its baseline before the
     caller receives the path. The caller owns directory, including a partial
-    tree left behind when the copy raises.
+    tree left behind when the copy raises. copy_file replaces only the file
+    copy; the baseline check still runs after a copy that returns.
+    shutil.copy2 is selected only when copy_file is None. A falsey callable
+    is still invoked.
     """
     repo = Path(directory) / "repo"
-    shutil.copytree(template.repo, repo)
+    copier = shutil.copy2 if copy_file is None else copy_file
+    shutil.copytree(template.repo, repo, copy_function=copier)
     assert state(SimpleNamespace(repo=repo)) == template.baseline
     return repo
 

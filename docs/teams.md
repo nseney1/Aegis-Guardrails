@@ -31,15 +31,20 @@ These surfaces are in the tree. This page is the entry; the linked pages are the
 | Served identity | `aegis_core.model_served.observe_served` records host, model, level, family and a fallback reason; it adds no command | [Model selection](model-selection.md) |
 | Job recipes and packets | `aegis_core.team_jobs_recipes`; validation includes typed `unknown_recipe` and `invalid_packet` refusals and grants no execution authority | [Architecture](architecture.md#where-to-read-next) |
 | Hierarchy runs | `tools/hierarchy_team.py`, outside the installed wheel | [Runtime guide](agent-hierarchies.md) and [prerequisites](hierarchy-team.md#prerequisites) |
-| Git delivery | snapshot, plans, compare-and-swap publish, qualification and the publisher, as libraries | [Architecture](architecture.md#git-delivery) |
+| Git delivery | snapshots, plans, compare-and-swap publishing and qualification as libraries. Publisher activation is still unwired. | [Teams platform capabilities](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/architecture.md#teams-platform-capabilities) |
 | Proposals and lint | proposal records, including source `mine`; `aegis rule lint` reports and exits 0 | [Proposals and rule lint](how-it-works.md#proposals-and-rule-lint) |
 | Supervisor | profile-driven pauses and backoff | [Supervisor profile](teams-supervisor.md) |
 
-`aegis_core.merge_queue.MergeQueue` checks qualification for the exact landing tree. Automatic landing remains separate work. `revalidate` refuses `issued_unresolved` while an issued record or cleanup is set. `check_issued` refuses `issued_unresolved` when that issued checkpoint conflicts or results remain. A refusal's `next_action` names the custodian and a fixed recovery text, and it echoes no transport text. `tools/hierarchy_templates/` is outside the wheel. The wheel includes `job-recipes.json` and `role-registry.json` under `aegis_core/team_templates/`. `team_roles.registry` reads the role registry. An `invalid_registry` refusal keeps that reason; a missing field, a field type or routes puts the matching repair in `next_action`. [Absorption](teams-absorption.md) describes the package boundary for templates that are not moved yet.
+Worktree snapshots, supplied-object Git plans and tested commits, the work queue
+and the proposal store are unavailable on Windows. Plans and tested commits skip
+the snapshot check and still require descriptor procfs (`/proc/self/fd`) and
+native Git. Linux subreaper support is required for qualification writes and
+merge-queue admission, candidate preparation, issued checks, landing observation
+and reconciliation. Automatic landing remains separate work.
+Processes sharing the trusted owner UID can access owner records despite file
+modes. A separate OS principal is tracked in `OS-PRINCIPAL-1`.
 
-Snapshots refuse `unsupported_platform` unless `descriptor_support` is true: `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `stat` and `readlink`. The work queue refuses `unsupported_platform`, and the proposal store refuses `unsupported`, unless `storage.confined_descriptor_supported` is true: `os.name` is `posix`, `O_NOFOLLOW` and `O_DIRECTORY` exist, and directory descriptors support `open`, `mkdir`, `link`, `rename`, `unlink` and `stat`. That function does not use `readlink`. Both probes are false when `os.name` is not `posix`, so Windows fails them. Neither function tests for macOS.
-
-Qualification writes call `team_qualify.descriptor_supported` and otherwise refuse `unsupported_platform`. That function is true only when `team_git.descriptor_support` is true, `team_gitops.descriptor_supported` is true (`fcntl` is available and `storage.confined_descriptor_supported` is true), and `gitops_fds.descriptor_supported` confirms Linux subreaper support (`sys.platform` is `linux`, `os.name` is `posix`, and `prctl(37)` returns 0). The merge queue checks the snapshot and qualification probes before preparing a candidate and refuses `unsupported_platform` if either fails. Publisher activation is not wired. A separate OS principal is not in this branch (`OS-PRINCIPAL-1`). File modes do not isolate another process running as the owner.
+`tools/hierarchy_templates/` is outside the wheel. The wheel includes `job-recipes.json` and `role-registry.json` under `aegis_core/team_templates/`. `team_roles.registry` reads the role registry. An `invalid_registry` refusal keeps that reason; a missing field, a field type or routes puts the matching repair in `next_action`. [Absorption](teams-absorption.md) describes the package boundary for templates that are not moved yet.
 
 ## Setup and limits of each surface
 
