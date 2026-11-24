@@ -87,10 +87,17 @@ UNSTAGED_PLAN_KEYS = frozenset(("status", "code", "reason", "next_action"))
 STAGED_PLAN_KEYS = frozenset(("status", "code", "reason", "next_action", "stage"))
 _LAUNCHER_ENVIRONMENT_NOTE = "launcher_environment"
 LAUNCHER_ENVIRONMENT_REASON = "Retry from a clean launcher environment."
+_IMAGE_DOCUMENT_REASON = "Check local engine inspection for the configured image and retry."
 
 
 def _valid_stage(code, stage):
     return type(stage) is str and stage in PLAN_STAGES and code in DOCUMENT_CODES
+
+
+def _document_reason(code, stage):
+    if stage == "image-inspection" and code in ("document_invalid", "document_size"):
+        return _IMAGE_DOCUMENT_REASON
+    return REFUSALS[code]
 
 
 class IsolationRefusal(ValueError):
@@ -107,9 +114,9 @@ class IsolationRefusal(ValueError):
         if code != "image_inspect" or type(note) is not str or note != _LAUNCHER_ENVIRONMENT_NOTE:
             note = None
         self.note = note
-        self.message = LAUNCHER_ENVIRONMENT_REASON if note is not None else REFUSALS[code]
         self.code = self.reason = code
         self.stage = stage if _valid_stage(code, stage) else None
+        self.message = LAUNCHER_ENVIRONMENT_REASON if note is not None else _document_reason(code, self.stage)
         if code == "invalid_arguments":
             self.exit_code = 2
         self.next_action = {"actor": "operator", "command": self.message}
@@ -147,13 +154,13 @@ def plan_text(body):
     code, reason = body.get("code"), body.get("reason")
     if type(code) is not str or code not in REFUSALS or type(reason) is not str:
         return internal
-    if reason != REFUSALS[code] and (code != "image_inspect" or reason != LAUNCHER_ENVIRONMENT_REASON):
+    stage = body.get("stage")
+    if "stage" in body and not _valid_stage(code, stage):
         return internal
-    if "stage" not in body:
+    if reason != _document_reason(code, stage) and (code != "image_inspect" or reason != LAUNCHER_ENVIRONMENT_REASON):
+        return internal
+    if stage is None:
         return code + " — " + reason
-    stage = body["stage"]
-    if not _valid_stage(code, stage):
-        return internal
     return code + " — " + reason + " (" + stage + ")"
 
 

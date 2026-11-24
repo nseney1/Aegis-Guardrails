@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
 import hashlib
+import multiprocessing
 import os
 import select
 import stat
@@ -13,6 +14,7 @@ import traceback
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
@@ -1407,12 +1409,697 @@ def test_disappearing_pending_entry_never_hides_retained_binding(tmp_path, monke
 
         monkeypatch.setattr(store_module, "os", SimpleNamespace(**{**vars(os), "scandir": DisappearingEntries}))
         try:
-            with refusal("missing"):
-                box.bindings("alpha/front-door")
+            # Measured 2026-11-20: this assertion expected refusal("missing").
+            # PARK admitted the change: a vanished exact stage keeps the binding.
+            assert len(box.bindings("alpha/front-door")) == 1
         finally:
             monkeypatch.setattr(store_module, "os", os)
         assert record.read_bytes() == retained
         assert len(box.bindings("alpha/front-door")) == 1
+
+
+def test_reader_accepts_pre_link_stage_and_refuses_active_or_extra_link(tmp_path, monkeypatch):
+    """Before link, exact staging is ignored by mailbox readers; any two-link state refuses unsafe_path."""
+    root, box = populated(tmp_path)
+    before_link, allow_link, paused, release = (Event() for _ in range(4))
+    real_link, real_unlink = os.link, os.unlink
+
+    def pause_before_link(source, target, *args, **kwargs):
+        if type(target) is str and target.endswith(".md") and not before_link.is_set():
+            before_link.set()
+            assert allow_link.wait(5)
+        return real_link(source, target, *args, **kwargs)
+
+    def pause_staging_unlink(name, *args, **kwargs):
+        if type(name) is str and len(name) == 41 and name.startswith(".pending-") and before_link.is_set() and not paused.is_set():
+            paused.set()
+            assert release.wait(5)
+        return real_unlink(name, *args, **kwargs)
+
+    try:
+        with box, mailbox(root) as reader:
+            box.publish(request("prior"))
+            monkeypatch.setattr(store_module, "os", SimpleNamespace(
+                **{**vars(os), "link": pause_before_link, "unlink": pause_staging_unlink}))
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(box.publish, request("staged"))
+                try:
+                    assert before_link.wait(5)
+                    folder = root / "alpha" / "orchestrator"
+                    stages = [path for path in folder.iterdir() if path.name.startswith(".pending-")]
+                    assert len(stages) == 1 and stages[0].stat().st_nlink == 1
+                    assert set(reader.messages()) == {"prior"}
+                    allow_link.set()
+                    assert paused.wait(5)
+                    published = sorted(path for path in folder.iterdir() if path.suffix == ".md")
+                    stages = [path for path in folder.iterdir() if path.name.startswith(".pending-")]
+                    assert len(published) == 2 and len(stages) == 1
+                    linked = next(path for path in published if path.stat().st_nlink == 2)
+                    assert stages[0].stat().st_nlink == 2
+                    for operation in (
+                        reader.messages,
+                        lambda: reader.inbox("alpha/orchestrator"),
+                        lambda: reader.store.entries(folder),
+                        lambda: reader.store.exists(linked),
+                        lambda: reader.store.read(linked),
+                    ):
+                        with refusal("unsafe_path"):
+                            operation()
+                finally:
+                    allow_link.set()
+                    release.set()
+                published_result = future.result(timeout=5)
+            assert published_result["message"]["message_id"] == "staged"
+            path = Path(published_result["path"])
+            assert not list(path.parent.glob(".pending-*"))
+            assert set(reader.messages()) == {"prior", "staged"}
+            extra = path.parent / "extra-link"
+            os.link(path, extra)
+            try:
+                with refusal("unsafe_path"):
+                    reader.messages()
+            finally:
+                extra.unlink()
+            assert set(reader.messages()) == {"prior", "staged"}
+            assert path.read_bytes() == Path(published_result["path"]).read_bytes()
+    finally:
+        allow_link.set()
+        release.set()
+        monkeypatch.setattr(store_module, "os", os)
+        box.close()
+
+
+def test_records_live_link_cleanup_failure_and_later_writer(tmp_path, monkeypatch):
+    root, box = populated(tmp_path)
+    route = root / "alpha" / "orchestrator"
+    inner = root.parent / "mailbox-records" / ".publish.lock"
+    writer_claim = root / ".write.lock"
+    linked, release, failed_unlink = Event(), Event(), Event()
+    stages = []
+    args = {"message_id": "record", "to": "alpha/orchestrator", "type": "info",
+            "kind": "text", "content": json.dumps({"fields": {}, "body": "evidence", "refs": {}})}
+
+    def sender(endpoint):
+        return {"from": endpoint, "host": "test-host", "session": endpoint, "binding_generation": 1}
+
+    def link(source, target, *positional, **options):
+        os.link(source, target, *positional, **options)
+        if target.endswith(".md"):
+            stages.append(route / source)
+            linked.set()
+            assert release.wait(5)
+
+    def unlink_stage(name, *positional, **options):
+        if stages and name == stages[0].name:
+            failed_unlink.set()
+            raise OSError("injected stage cleanup failure")
+        return os.unlink(name, *positional, **options)
+
+    def unlink_writer(name, *positional, **options):
+        if name == ".write.lock" and failed_unlink.is_set():
+            raise OSError("injected writer cleanup failure")
+        return os.unlink(name, *positional, **options)
+
+    with box, mailbox(root) as reader_box:
+        writer = records_module.Records(box, sender("alpha/front-door"))
+        reader = records_module.Records(reader_box, sender("alpha/orchestrator"))
+        read = lambda: reader.call("mailbox_read_record", {"message_id": "record"})
+        digest = lambda: json.loads(reader.call("mailbox_digest", {}))
+        inbox = lambda: reader_box.inbox("alpha/orchestrator")
+
+        def check_refusals():
+            for operation in (read, digest, inbox):
+                with refusal("unsafe_path"):
+                    operation()
+
+        records_os, store_os = records_module.os, store_module.os
+        monkeypatch.setattr(records_module, "os", SimpleNamespace(**{**vars(os), "link": link, "unlink": unlink_stage}))
+        monkeypatch.setattr(store_module, "os", SimpleNamespace(**{**vars(os), "unlink": unlink_writer}))
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                send = pool.submit(writer.call, "mailbox_publish_record", args)
+                try:
+                    assert linked.wait(5)
+                    [stage] = stages
+                    assert stage.stat().st_nlink == 2
+                    assert inner.is_file() and writer_claim.is_file()
+                    check_refusals()
+                finally:
+                    release.set()
+                sent = send.result(timeout=5)
+        finally:
+            monkeypatch.setattr(store_module, "os", store_os)
+            monkeypatch.setattr(records_module, "os", records_os)
+
+        assert "note" in sent and "warnings" in sent
+        assert inner.is_file() and writer_claim.is_file()
+        check_refusals()
+        writer_claim.unlink()
+        with box.store.lock(root):
+            time = writer_claim.stat().st_ctime_ns
+            os.utime(stage, ns=(time, time))
+            check_refusals()
+            with refusal("unsafe_path"):
+                writer.call("mailbox_publish_record", args)
+        inner.unlink()
+        check_refusals()
+        unrelated = root.parent / ".records-store.lock"
+        unrelated.touch()
+        check_refusals()
+        stage.unlink()
+        assert json.loads(read())["from"] == "alpha/front-door"
+        assert [row["message_id"] for row in digest()["messages"]] == ["record"]
+        assert writer.call("mailbox_publish_record", args) == {"id": sent["id"], "message_id": "record"}
+        assert unrelated.is_file()
+
+
+def test_record_root_marker_refuses_during_live_link_then_reads(tmp_path, monkeypatch):
+    root, box = populated(tmp_path)
+    marker = root / ".root-id"
+    before_link, allow_link, linked, release = (Event() for _ in range(4))
+    stages = []
+    sender = {"from": "alpha/front-door", "host": "test-host", "session": "alpha/front-door",
+              "binding_generation": 1}
+    args = {"message_id": "first", "to": "alpha/orchestrator", "type": "info",
+            "kind": "text", "content": json.dumps({"fields": {}, "body": "evidence", "refs": {}})}
+
+    def link(source, target, *positional, **options):
+        if target == marker.name and not before_link.is_set():
+            stages.append(root / source)
+            before_link.set()
+            assert allow_link.wait(5)
+        result = os.link(source, target, *positional, **options)
+        if target == marker.name and not linked.is_set():
+            linked.set()
+            assert release.wait(5)
+        return result
+
+    with box, mailbox(root) as reader:
+        monkeypatch.setattr(records_module, "os", SimpleNamespace(**{**vars(os), "link": link}))
+        writer = records_module.Records(box, sender)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            send = pool.submit(writer.call, "mailbox_publish_record", args)
+            try:
+                assert before_link.wait(5)
+                [stage] = stages
+                assert stage.stat().st_nlink == 1
+                with reader.store.directory(root) as fd:
+                    assert reader.store.exists(marker, parent=fd) is False
+                    assert reader.store.exists(stage, parent=fd) is True
+                allow_link.set()
+                assert linked.wait(5)
+                assert marker.stat().st_nlink == 2
+                with reader.store.directory(root) as fd:
+                    for operation in (
+                        lambda: reader.store.entries(root, parent=fd),
+                        lambda: reader.store.exists(marker, parent=fd),
+                        lambda: reader.store.read(marker, parent=fd),
+                        lambda: reader.store.exists(stage, parent=fd),
+                        lambda: reader.store.read(stage, parent=fd),
+                    ):
+                        with refusal("unsafe_path"):
+                            operation()
+            finally:
+                allow_link.set()
+                release.set()
+            assert "id" in send.result(timeout=5)
+        assert marker.stat().st_nlink == 1
+        assert not list(root.glob(".pending-*"))
+        assert reader.store.read(marker).startswith(records_module.ROOT_MARKER)
+
+
+def _record_sender():
+    return {"from": "alpha/front-door", "host": "test-host", "session": "alpha/front-door",
+            "binding_generation": 1}
+
+
+def _record_args(message_id):
+    return {"message_id": message_id, "to": "alpha/orchestrator", "type": "info", "kind": "text",
+            "content": json.dumps({"fields": {}, "body": "evidence", "refs": {}})}
+
+
+def _fork_record_publish(root, owner_home, linked, pid_file, message_id):
+    import time
+
+    def fork_then_exit(name, *positional, **options):
+        if type(name) is str and name.startswith(".pending-") and not linked.is_set():
+            child = os.fork()
+            if child == 0:
+                # The at-fork closer has already dropped the inherited proof.
+                temporary = pid_file + ".tmp"
+                with open(temporary, "w", encoding="ascii") as handle:
+                    handle.write(str(os.getpid()))
+                os.replace(temporary, pid_file)
+                time.sleep(60)
+                os._exit(0)
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    with open(pid_file, encoding="ascii") as handle:
+                        seen = handle.read()
+                except OSError:
+                    seen = ""
+                if seen == str(child):
+                    break
+                if time.monotonic() >= deadline:
+                    os._exit(24)
+                time.sleep(0.01)
+            linked.set()
+            os._exit(23)
+        return os.unlink(name, *positional, **options)
+
+    account = SimpleNamespace(getpwuid=lambda uid: SimpleNamespace(pw_dir=str(owner_home)))
+    publication_os = SimpleNamespace(**{**vars(os), "unlink": fork_then_exit})
+    with mock.patch.object(store_module, "pwd", account), mock.patch.object(records_module, "os", publication_os):
+        with mailbox(Path(root)) as box:
+            records_module.Records(box, _record_sender()).call("mailbox_publish_record", _record_args(message_id))
+
+
+def test_board_cursor_replacement_refuses_lost_exact_stage_final(tmp_path, monkeypatch):
+    """Board cursor replacement drops the observed exact-stage final; that census refuses."""
+    if not store_module.descriptor_supported():
+        pytest.skip("descriptor-relative no-follow storage required")
+    roles = RoleTables(writes={"owner": frozenset({"initialize", "configure", "publish", "move_position"})})
+    options = dict(clock=lambda: NOW, roles=roles, hosts=HOSTS, caller_role="owner")
+    root = tmp_path / "board"
+    board_module.initialize(root, **options)
+    channel = {"channel": "alpha", "orchestrator": "a/orchestrator", "source": "owner"}
+    grant = {"channel": "alpha", "endpoint": "a/lane/one", "access": "post", "source": "owner"}
+    post = {"channel": "alpha", "key": "one", "kind": "note", "body": "hello"}
+    paused, release, replaced = Event(), Event(), Event()
+
+    def pause_stage(name, *positional, **options_unlink):
+        if type(name) is str and len(name) == 41 and name.startswith(".pending-") and not paused.is_set():
+            paused.set()
+            assert release.wait(5)
+        return os.unlink(name, *positional, **options_unlink)
+
+    def replace(source, target, *positional, **options_replace):
+        result = os.replace(source, target, *positional, **options_replace)
+        replaced.set()
+        return result
+
+    with board_module.Board(root, **options) as board, store_module.Store(root) as reader:
+        board.configure("channel", channel)
+        board.configure("grant", grant)
+        sent = board.publish("a/lane/one", post)
+        cursor = board.position_path("a/lane/one", "alpha")
+        positions = root / "positions"
+        store_os = store_module.os
+        released = []
+
+        def stat_and_replace(name, *positional, **options_stat):
+            info = os.stat(name, *positional, **options_stat)
+            if not released and type(name) is str and name.startswith(".pending-") and info.st_nlink == 2:
+                released.append(True)
+                release.set()
+                assert replaced.wait(5)
+            return info
+
+        monkeypatch.setattr(store_module, "os", SimpleNamespace(**{
+            **vars(os), "unlink": pause_stage, "stat": stat_and_replace}))
+        monkeypatch.setattr(board_module, "os", SimpleNamespace(**{**vars(os), "replace": replace}))
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(board.move_position, "a/lane/one", "alpha", sent["seq"])
+                try:
+                    assert paused.wait(5)
+                    with refusal("unsafe_path"):
+                        reader.entries(positions)
+                    assert released == [True]
+                    assert cursor.is_file()
+                    assert not list(positions.glob(".pending-*"))
+                    assert [path.name for path in reader.entries(positions)] == [cursor.name]
+                finally:
+                    release.set()
+                future.result(timeout=5)
+        finally:
+            release.set()
+            monkeypatch.setattr(store_module, "os", store_os)
+            monkeypatch.setattr(board_module, "os", os)
+        assert board.position("a/lane/one", "alpha") == sent["seq"]
+
+
+def test_root_marker_observed_two_link_refuses_then_reads_after_completion(tmp_path, monkeypatch):
+    if not records_module.supported():
+        pytest.skip("record store publication support required")
+    clean_root = tmp_path / "clean-root"
+    clean_root.mkdir(mode=0o700)
+    linking, allow_link, linked, allow_unlink = (Event() for _ in range(4))
+    stages = []
+
+    def link_clean(source, target, *positional, **options):
+        if target == ".root-id" and not stages:
+            stages.append(source)
+            linking.set()
+            assert allow_link.wait(5)
+        result = os.link(source, target, *positional, **options)
+        if target == ".root-id" and not linked.is_set():
+            linked.set()
+        return result
+
+    def unlink_clean(name, *positional, **options):
+        if stages and name == stages[0] and not allow_unlink.is_set():
+            assert allow_unlink.wait(5)
+        return os.unlink(name, *positional, **options)
+
+    def publish_marker():
+        state = {"committed": True, "uncertain": False}
+        with records_module.record_store(records_module._RecordCodec, clean_root, write=True, state=state):
+            pass
+
+    records_os, store_os = records_module.os, store_module.os
+    with store_module.Store.from_parent(tmp_path) as clean_reader:
+        monkeypatch.setattr(records_module, "os", SimpleNamespace(**{
+            **vars(os), "link": link_clean, "unlink": unlink_clean}))
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(publish_marker)
+                try:
+                    assert linking.wait(5)
+                    scans, settled = [], []
+                    clean_stat = clean_root.stat()
+
+                    @contextmanager
+                    def scan(fd):
+                        with os.scandir(fd) as entries:
+                            if not os.path.samestat(os.fstat(fd), clean_stat):
+                                yield entries
+                                return
+                            listed = list(entries)
+                        scans.append([entry.name for entry in listed])
+                        allow_link.set()
+                        assert linked.wait(5)
+                        yield listed
+
+                    def stat_and_finish(name, *positional, **options_stat):
+                        info = os.stat(name, *positional, **options_stat)
+                        if not settled and stages and name == stages[0] and info.st_nlink == 2:
+                            settled.append(True)
+                            allow_unlink.set()
+                            future.result(timeout=5)
+                        return info
+
+                    monkeypatch.setattr(store_module, "os", SimpleNamespace(**{
+                        **vars(store_os), "scandir": scan, "stat": stat_and_finish}))
+                    try:
+                        with refusal("unsafe_path"):
+                            clean_reader.entries(clean_root)
+                    finally:
+                        monkeypatch.setattr(store_module, "os", store_os)
+                    assert scans == [[stages[0]]] and settled == [True]
+                    assert clean_reader.entries(clean_root) == [clean_root / ".root-id"]
+                finally:
+                    allow_link.set()
+                    allow_unlink.set()
+                future.result(timeout=5)
+        finally:
+            allow_link.set()
+            allow_unlink.set()
+            monkeypatch.setattr(records_module, "os", records_os)
+
+    root, box = populated(tmp_path)
+    marker = root / ".root-id"
+    marker_linked, release = Event(), Event()
+
+    def link_box(source, target, *positional, **options):
+        result = os.link(source, target, *positional, **options)
+        if target == ".root-id" and not marker_linked.is_set():
+            marker_linked.set()
+            assert release.wait(5)
+        return result
+
+    monkeypatch.setattr(records_module, "os", SimpleNamespace(**{**vars(os), "link": link_box}))
+    try:
+        with box, mailbox(root) as reader:
+            writer = records_module.Records(box, _record_sender())
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(writer.call, "mailbox_publish_record", _record_args("first"))
+                try:
+                    assert marker_linked.wait(5)
+                    settled_read = []
+
+                    def fstat_and_finish(fd):
+                        info = os.fstat(fd)
+                        if not settled_read and stat.S_ISREG(info.st_mode) and info.st_nlink == 2:
+                            settled_read.append(True)
+                            release.set()
+                            future.result(timeout=5)
+                        return info
+
+                    monkeypatch.setattr(store_module, "os", SimpleNamespace(**{
+                        **vars(store_os), "fstat": fstat_and_finish}))
+                    try:
+                        with reader.store.directory(root) as fd:
+                            with refusal("unsafe_path"):
+                                reader.store.read(marker, parent=fd)
+                            assert reader.store.read(marker, parent=fd).startswith(records_module.ROOT_MARKER)
+                            assert reader.store.exists(marker, parent=fd) is True
+                    finally:
+                        monkeypatch.setattr(store_module, "os", store_os)
+                    assert settled_read == [True]
+                    assert marker.stat().st_nlink == 1
+                    assert not list(root.glob(".pending-*"))
+                finally:
+                    release.set()
+                assert "id" in future.result(timeout=5)
+    finally:
+        release.set()
+        monkeypatch.setattr(store_module, "os", store_os)
+        monkeypatch.setattr(records_module, "os", records_os)
+
+
+@pytest.mark.parametrize("stage_first", [True, False], ids=["stage-first", "final-first"])
+def test_record_message_observed_two_link_refuses_then_reads_after_completion(tmp_path, monkeypatch, stage_first):
+    root, box = populated(tmp_path)
+    linked, allow_unlink = Event(), Event()
+    stages, targets = [], []
+
+    def link(source, target, *positional, **options):
+        result = os.link(source, target, *positional, **options)
+        if isinstance(target, str) and target.endswith(".md") and not stages:
+            stages.append(source)
+            targets.append(target)
+            linked.set()
+        return result
+
+    def unlink(name, *positional, **options):
+        if stages and name == stages[0] and not allow_unlink.is_set():
+            assert allow_unlink.wait(5)
+        return os.unlink(name, *positional, **options)
+
+    with box, mailbox(root) as reader:
+        writer = records_module.Records(box, _record_sender())
+        writer.call("mailbox_publish_record", _record_args("record"))
+        records_os, store_os = records_module.os, store_module.os
+        monkeypatch.setattr(records_module, "os", SimpleNamespace(**{
+            **vars(os), "link": link, "unlink": unlink}))
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(writer.call, "mailbox_publish_record", _record_args("later"))
+                try:
+                    assert linked.wait(5)
+                    folder = root / "alpha" / "orchestrator"
+                    folder_stat = folder.stat()
+                    first = stages[0] if stage_first else targets[0]
+                    scans, settled = [], []
+
+                    @contextmanager
+                    def scan(fd):
+                        with os.scandir(fd) as entries:
+                            if not os.path.samestat(os.fstat(fd), folder_stat):
+                                yield entries
+                                return
+                            listed = sorted(entries, key=lambda entry: entry.name != first)
+                        scans.append([entry.name for entry in listed])
+                        yield listed
+
+                    def stat_and_finish(name, *positional, **options_stat):
+                        info = os.stat(name, *positional, **options_stat)
+                        if not settled and name == first and info.st_nlink == 2:
+                            settled.append(True)
+                            allow_unlink.set()
+                            future.result(timeout=5)
+                        return info
+
+                    monkeypatch.setattr(store_module, "os", SimpleNamespace(**{
+                        **vars(store_os), "scandir": scan, "stat": stat_and_finish}))
+                    try:
+                        with reader.store.directory(folder) as fd:
+                            with refusal("unsafe_path"):
+                                reader.store.entries(folder, parent=fd)
+                    finally:
+                        monkeypatch.setattr(store_module, "os", store_os)
+                    assert len(scans) == 1 and scans[0][0] == first and len(scans[0]) == 3
+                    assert settled == [True]
+                    with reader.store.directory(folder) as fd:
+                        names = [path.name for path in reader.store.entries(folder, parent=fd)]
+                    assert len(names) == 2 and all(name.endswith(".md") for name in names)
+                    assert set(reader.messages()) == {"record", "later"}
+                finally:
+                    allow_unlink.set()
+                future.result(timeout=5)
+        finally:
+            allow_unlink.set()
+            monkeypatch.setattr(store_module, "os", store_os)
+            monkeypatch.setattr(records_module, "os", records_os)
+
+
+def test_record_and_root_marker_keep_data_and_directory_syncs(tmp_path, monkeypatch, owner_plane):
+    root, box = populated(tmp_path)
+    counts = {"proof": 0, "data": 0, "directory": 0, "proof_open": 0}
+    proof_fds = set()
+    checkpoint = {}
+    linked, release = Event(), Event()
+
+    def tracked_open(path, *positional, **options):
+        descriptor = os.open(path, *positional, **options)
+        if isinstance(path, str) and path.startswith(".mailbox-stage-"):
+            proof_fds.add(descriptor)
+            counts["proof_open"] += 1
+        return descriptor
+
+    def tracked_fsync(descriptor):
+        if descriptor in proof_fds:
+            counts["proof"] += 1
+        elif stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            counts["directory"] += 1
+        else:
+            counts["data"] += 1
+        return os.fsync(descriptor)
+
+    def link(source, target, *positional, **options):
+        os.link(source, target, *positional, **options)
+        if target == ".root-id" and "at_root" not in checkpoint:
+            checkpoint["at_root"] = dict(counts)
+            linked.set()
+            assert release.wait(5)
+
+    store_os, records_os = store_module.os, records_module.os
+    proof_free_store_os = SimpleNamespace(
+        name="posix",
+        supports_dir_fd=os.supports_dir_fd,
+        supports_fd=os.supports_fd,
+        O_NOFOLLOW=os.O_NOFOLLOW,
+        O_DIRECTORY=os.O_DIRECTORY,
+        O_RDONLY=os.O_RDONLY,
+        O_WRONLY=os.O_WRONLY,
+        O_CREAT=os.O_CREAT,
+        O_EXCL=os.O_EXCL,
+        O_NONBLOCK=os.O_NONBLOCK,
+        open=tracked_open,
+        close=os.close,
+        dup=os.dup,
+        fstat=os.fstat,
+        stat=os.stat,
+        mkdir=os.mkdir,
+        rmdir=os.rmdir,
+        link=os.link,
+        unlink=os.unlink,
+        read=os.read,
+        write=os.write,
+        fsync=tracked_fsync,
+        scandir=os.scandir,
+        geteuid=os.geteuid,
+        fsencode=os.fsencode,
+        path=os.path,
+    )
+    monkeypatch.setattr(store_module, "os", proof_free_store_os)
+    monkeypatch.setattr(records_module, "os", SimpleNamespace(**{
+        **vars(records_os), "open": tracked_open, "fsync": tracked_fsync, "link": link}))
+    try:
+        with box:
+            writer = records_module.Records(box, _record_sender())
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(writer.call, "mailbox_publish_record", _record_args("synced"))
+                try:
+                    assert linked.wait(5)
+                    assert checkpoint["at_root"]["proof"] == 0
+                    assert checkpoint["at_root"]["proof_open"] == 0
+                    assert checkpoint["at_root"]["data"] >= 1
+                finally:
+                    release.set()
+                assert "id" in future.result(timeout=5)
+        assert counts["proof"] == 0
+        assert counts["proof_open"] == 0
+        assert counts["data"] > checkpoint["at_root"]["data"]
+        assert counts["directory"] >= 1
+        assert not list(owner_plane.iterdir())
+    finally:
+        release.set()
+        monkeypatch.setattr(store_module, "os", store_os)
+        monkeypatch.setattr(records_module, "os", records_os)
+
+
+@pytest.mark.parametrize("marker", [True, False], ids=["root-marker", "message"])
+def test_fork_child_surviving_record_writer_exit_keeps_two_link_refused(tmp_path, owner_plane, marker):
+    if not hasattr(os, "fork"):
+        pytest.skip("fork survival test requires os.fork")
+    root, box = populated(tmp_path)
+    try:
+        if not marker:
+            records_module.Records(box, _record_sender()).call("mailbox_publish_record", _record_args("first"))
+    finally:
+        box.close()
+    context = multiprocessing.get_context("spawn")
+    linked = context.Event()
+    pid_file = tmp_path / "child-pid"
+    message_id = "marker" if marker else "second"
+    process = context.Process(
+        target=_fork_record_publish,
+        args=(str(root), str(owner_plane.parent), linked, str(pid_file), message_id))
+    process.start()
+    try:
+        assert linked.wait(30)
+        process.join(30)
+        assert process.exitcode == 23
+        pid = int(pid_file.read_text(encoding="ascii"))
+        os.kill(pid, 0)
+        assert not list(owner_plane.glob(".mailbox-stage-*"))
+        with mailbox(root) as reader:
+            if marker:
+                marker_path = root / ".root-id"
+                [stage] = root.glob(".pending-*")
+                with reader.store.directory(root) as fd:
+                    for operation in (lambda: reader.store.entries(root, parent=fd),
+                                      lambda: reader.store.exists(marker_path, parent=fd),
+                                      lambda: reader.store.read(marker_path, parent=fd)):
+                        with refusal("unsafe_path"):
+                            operation()
+                os.kill(pid, 0)
+                stage.unlink()
+                assert reader.store.read(marker_path).startswith(records_module.ROOT_MARKER)
+            else:
+                folder = root / "alpha" / "orchestrator"
+                [stage] = folder.glob(".pending-*")
+                with reader.store.directory(folder) as fd:
+                    with refusal("unsafe_path"):
+                        reader.store.entries(folder, parent=fd)
+                    with refusal("unsafe_path"):
+                        reader.messages()
+                os.kill(pid, 0)
+                stage.unlink()
+                assert set(reader.messages()) == {"first", "second"}
+            for lock_file in (root.parent / "mailbox-records" / ".publish.lock",
+                              root.parent / ".records-store.lock", root / ".write.lock",
+                              owner_plane / primitives.OWNER_EVIDENCE_LOCK):
+                if lock_file.exists():
+                    lock_file.unlink()
+            assert "id" in records_module.Records(reader, _record_sender()).call(
+                "mailbox_publish_record", _record_args("recovered"))
+            assert "recovered" in reader.messages()
+            os.kill(pid, 0)
+    finally:
+        process.join(5)
+        if process.is_alive():
+            process.kill()
+            process.join(5)
+        process.close()
+        if pid_file.exists():
+            try:
+                os.kill(int(pid_file.read_text(encoding="ascii")), 9)
+            except (OSError, ValueError):
+                pass
 
 
 def test_trusted_parent_mode_checked_at_construction_and_each_use(tmp_path):

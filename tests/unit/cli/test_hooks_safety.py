@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import sys
 from threading import Barrier
+from types import MappingProxyType
 
 import pytest
 
@@ -398,6 +399,73 @@ def test_safety_gate_logs_an_empty_command_for_non_string_payload(tmp_path: Path
     assert result == (0, {"decision": "force_ask", "reason": f"🛡️ Safety Gate: {reason}"})
     (row,) = _rows(tmp_path)
     assert (row["command"], row["decision"], row["reason"]) == ("", "BLOCKED", reason)
+
+
+@pytest.mark.parametrize("kwargs", [
+    pytest.param({"payload": ["echo ignored"]}, id="payload-list"),
+    pytest.param({"payload": "echo ignored"}, id="payload-str"),
+    pytest.param({"payload": 1}, id="payload-int"),
+    pytest.param({"payload": None}, id="payload-none"),
+    pytest.param({}, id="payload-missing"),
+    pytest.param({"payload": {"toolCall": ["echo ignored"]}}, id="tool-call-list"),
+    pytest.param({"payload": {"toolCall": "echo ignored"}}, id="tool-call-str"),
+    pytest.param({"payload": {"toolCall": 1}}, id="tool-call-int"),
+    pytest.param({"payload": {"toolCall": None}}, id="tool-call-none"),
+    pytest.param({"payload": {}}, id="tool-call-missing"),
+    pytest.param({"payload": {"toolCall": {"args": ["echo ignored"]}}}, id="args-list"),
+    pytest.param({"payload": {"toolCall": {"args": "echo ignored"}}}, id="args-str"),
+    pytest.param({"payload": {"toolCall": {"args": 1}}}, id="args-int"),
+    pytest.param({"payload": {"toolCall": {"args": None}}}, id="args-none"),
+    pytest.param({"payload": {"toolCall": {}}}, id="args-missing"),
+])
+def test_safety_gate_refuses_malformed_payload_shapes(tmp_path: Path, capsys, kwargs):
+    (tmp_path / ".aegis").mkdir()
+    reason = "Unable to parse command — requesting confirmation"
+
+    assert run_safety_gate(workspace=tmp_path, **kwargs) == (
+        0, {"decision": "force_ask", "reason": f"🛡️ Safety Gate: {reason}"},
+    )
+
+    (row,) = _rows(tmp_path)
+    assert row == {"timestamp": row["timestamp"], "command": "", "decision": "BLOCKED", "reason": reason}
+    assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.parametrize("mapping", [dict, MappingProxyType], ids=["dict", "read-only-mapping"])
+def test_safety_gate_accepts_mapping_payload(tmp_path: Path, mapping):
+    (tmp_path / ".aegis").mkdir()
+    payload = mapping({"toolCall": mapping({"args": mapping({"CommandLine": "echo payload"})})})
+
+    assert run_safety_gate(payload=payload, workspace=tmp_path) == (0, {"decision": "allow"})
+    assert run_safety_gate(cmd="echo explicit", payload=payload, workspace=tmp_path) == (0, {"decision": "allow"})
+
+    assert [(row["command"], row["decision"]) for row in _rows(tmp_path)] == [
+        ("echo payload", "ALLOWED"), ("echo explicit", "ALLOWED"),
+    ]
+
+
+def test_safety_gate_retries_independently_after_concurrent_malformed_payloads(tmp_path: Path):
+    ready = Barrier(2, timeout=5)
+    reason = "Unable to parse command — requesting confirmation"
+    refusal = (0, {"decision": "force_ask", "reason": f"🛡️ Safety Gate: {reason}"})
+
+    def refuse_then_retry(case):
+        label, payload = case
+        workspace = tmp_path / label
+        (workspace / ".aegis").mkdir(parents=True)
+        command = f"echo {label}"
+        ready.wait()
+
+        assert run_safety_gate(payload=payload, workspace=workspace) == refusal
+        valid = {"toolCall": {"args": {"CommandLine": command}}}
+        assert run_safety_gate(payload=valid, workspace=workspace) == (0, {"decision": "allow"})
+
+        assert [(row["command"], row["decision"], row.get("reason")) for row in _rows(workspace)] == [
+            ("", "BLOCKED", reason), (command, "ALLOWED", None),
+        ]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(refuse_then_retry, [("first", {"toolCall": []}), ("second", {"toolCall": {"args": []}})]))
 
 
 def test_gate_log_masks_a_split_key_that_extends_past_the_log_limit(tmp_path: Path):

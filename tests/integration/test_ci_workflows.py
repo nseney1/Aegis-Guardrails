@@ -14,6 +14,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
@@ -231,13 +232,23 @@ def test_required_check_rejects_unexpected_upstream_results(expected, actual, pa
     assert (proc.returncode == 0) is passed, proc.stderr
     if not passed:
         assert "build-wheel" in proc.stderr and "Unexpected upstream job results" in proc.stderr
-# Run 44219204536, validate ubuntu-latest 3.11: the suite finished in 6516.67s.
-# A test-fast timeout below twice that cancels a green run (the 45 min cap did).
-SUITE_GREEN_SECONDS = 6516.67
-SUITE_GREEN_RUN = "44219204536"
+_FAST_SHARDS = (
+    "test-fast-unit-core",
+    "test-fast-unit-rest",
+    "test-fast-integration",
+    "test-fast-contract",
+)
+# Each entry starts with the whole-suite fallback from validate ubuntu-latest 3.11.
+# Replace a row only after reviewing the corresponding shard's green job wall clock.
+_REVIEWED_FAST_MEASUREMENTS = {
+    "test-fast-unit-core": ("6516.67", "44219204536"),
+    "test-fast-unit-rest": ("6516.67", "44219204536"),
+    "test-fast-integration": ("6516.67", "44219204536"),
+    "test-fast-contract": ("6516.67", "44219204536"),
+}
+_FAST_MEASUREMENT_PREFIX = "# test-fast-measurement:"
 _MEASUREMENT_LINE = re.compile(
-    r"^# test-fast-measurement: ([A-Za-z0-9_-]+) ([0-9]+(?:\.[0-9]+)?)s run ([0-9]+)\s*$",
-    re.M,
+    r" ([A-Za-z0-9_-]+) ([0-9]+(?:\.[0-9]+)?)s run ([1-9][0-9]*)[ \t]*",
 )
 
 
@@ -259,9 +270,14 @@ def _fast_jobs(workflow=None):
 
 def _recorded_fast_measurements(text):
     found = {}
-    for job, seconds, run in _MEASUREMENT_LINE.findall(text):
-        assert job not in found, job
-        found[job] = (float(seconds), run)
+    for line in text.splitlines():
+        if not line.startswith(_FAST_MEASUREMENT_PREFIX):
+            continue
+        match = _MEASUREMENT_LINE.fullmatch(line, len(_FAST_MEASUREMENT_PREFIX))
+        assert match is not None, "invalid fast measurement row"
+        job, seconds, run = match.groups()
+        assert job not in found, "duplicate fast measurement row"
+        found[job] = (seconds, run)
     return found
 
 
@@ -348,8 +364,7 @@ def test_wave_prs_run_the_fast_linux_leg_with_a_read_only_token_and_no_secrets()
         assert "if" not in job and "needs" not in job, name
         assert job["runs-on"] == "ubuntu-latest"
         assert job.get("permissions", {"contents": "read"}) == {"contents": "read"}
-        # Twice the 6516.67s suite measurement is 218 minutes, above the old 60 cap.
-        # GitHub's own ceiling is 360; the twice-measured floor is a separate test.
+        # The evidence-specific floor is checked separately.
         assert type(job.get("timeout-minutes")) is int and job["timeout-minutes"] <= 360
         text = yaml.safe_dump(job)
         # Any spelling of a secret or the workflow token: secrets.X, secrets['X'], toJSON(secrets),
@@ -369,7 +384,8 @@ def test_the_fast_leg_runs_the_whole_suite_with_xdist_from_its_own_venv():
     """Each shard installs the same venv as validate and runs the canonical suite step.
 
     The selectors together are the whole suite (see the exact-coverage test). The whole
-    job equals one template, so a narrowed command or an earlier step is a different job.
+    job equals one template with an independently checked timeout, so a narrowed
+    command or an earlier step is a different job.
     """
     jobs = _fast_jobs()
     validate_install = next(s["run"] for s in _load("validate.yml")["jobs"]["validate"]["steps"]
@@ -422,24 +438,27 @@ def test_linux_legs_install_bubblewrap_and_prove_it_runs_before_the_suite():
         assert not steps[probe].get("continue-on-error") and "|| true" not in steps[probe]["run"]
 
 
-def test_each_test_fast_timeout_is_at_least_twice_its_recorded_measurement():
-    """A cap below twice the measured green duration cancels a slow green run.
-
-    The unsharded job's 45 min cap is not twice the 6516.67s suite measurement.
-    Each shard records that duration until a green run of the shard itself exists.
-    """
-    text = _read("validate.yml")
+def _guard_fast_timeouts(workflow, text, reviewed):
+    required = set(_FAST_SHARDS)
+    jobs = dict(_fast_jobs(workflow))
+    assert jobs.keys() == required, "fast jobs must match the required shard IDs"
+    assert reviewed.keys() == required, "reviewed fast measurement rows must cover each required shard"
     recorded = _recorded_fast_measurements(text)
-    floor = _minimum_timeout_minutes(SUITE_GREEN_SECONDS)
-    problems = []
-    for name, job in _fast_jobs():
-        timeout = job.get("timeout-minutes")
-        seconds, run = recorded.get(name, (None, None))
-        if (type(timeout) is not int or timeout < floor or timeout > 360
-                or seconds is None or seconds + 1e-9 < SUITE_GREEN_SECONDS or run != SUITE_GREEN_RUN
-                or timeout < _minimum_timeout_minutes(seconds)):
-            problems.append((name, timeout, seconds, run, floor, SUITE_GREEN_SECONDS))
-    assert problems == []
+    assert recorded.keys() == required, "workflow fast measurement rows must cover each required shard"
+    for name in _FAST_SHARDS:
+        assert recorded[name] == reviewed[name], f"{name}: fast measurement does not match reviewed evidence"
+        seconds, _run = reviewed[name]
+        # Each minute allows 30 measured seconds at twice the duration. Keep the decimal exact.
+        floor = math.ceil(Fraction(seconds) / 30)
+        timeout = jobs[name].get("timeout-minutes")
+        assert type(timeout) is int and 1 <= floor <= timeout <= 360, (
+            f"{name}: fast timeout is outside its measured bounds"
+        )
+
+
+def test_each_test_fast_timeout_is_at_least_twice_its_recorded_measurement():
+    text = _read("validate.yml")
+    _guard_fast_timeouts(yaml.safe_load(text), text, _REVIEWED_FAST_MEASUREMENTS)
 
 
 # One template for every shard. The run text is byte-identical; only TEST_FAST_PATHS changes.
@@ -524,11 +543,11 @@ def _canonical_suite_step(selectors):
     }
 
 
-def _canonical_fast_job(selectors):
-    """One test-fast job. The only value that changes per shard is TEST_FAST_PATHS."""
+def _canonical_fast_job(selectors, timeout):
+    """One test-fast job with a separately checked selector and timeout."""
     return {
         "runs-on": "ubuntu-latest",
-        "timeout-minutes": 218,
+        "timeout-minutes": timeout,
         "steps": [
             *copy.deepcopy(_CANONICAL_STEPS_BEFORE),
             _canonical_suite_step(selectors),
@@ -632,8 +651,8 @@ def _selector_text(job):
 def _guard_test_fast_allowlist(workflow):
     """Whole-job equality for every shard and for aegis-check.
 
-    The only value that may differ across shards is TEST_FAST_PATHS. Selectors match
-    one fixed character class and are the positive paths of the suite partition.
+    Each timeout is checked against reviewed evidence by _guard_fast_timeouts.
+    TEST_FAST_PATHS matches one character class and partitions the suite.
     The workflow has no env mapping. aegis-check equals one job, so an inherited
     SHELLOPTS, BASHOPTS, or BASH_ENV cannot be added on either object.
     """
@@ -645,7 +664,9 @@ def _guard_test_fast_allowlist(workflow):
     owned = {}
     for name, job in jobs:
         raw = _selector_text(job)
-        assert job == _canonical_fast_job(raw), name
+        assert job == _canonical_fast_job(raw, job.get("timeout-minutes")), (
+            f"{name}: unexpected fast job execution settings"
+        )
         for selector in raw.split():
             assert _positive_selector(selector, files), (name, selector)
             for path in _selected_test_files(selector, files):
@@ -661,7 +682,7 @@ def _shard_paths(job):
     """Selectors for one shard whose whole job equals the canonical template."""
     raw = _selector_text(job)
     files = _suite_test_files()
-    assert job == _canonical_fast_job(raw)
+    assert job == _canonical_fast_job(raw, job.get("timeout-minutes"))
     selectors = raw.split()
     assert all(_positive_selector(selector, files) for selector in selectors), selectors
     return selectors
@@ -767,12 +788,6 @@ def _mutate_upstream_continue_on_error(workflow):
 
 _GITHUB_ENV_COLLECT = "echo 'PYTEST_ADDOPTS=--collect-only' >> \"$GITHUB_ENV\""
 _GITHUB_ENV_IGNORE = "echo 'PYTEST_ADDOPTS=--ignore-glob=*test_team.py' >> \"$GITHUB_ENV\""
-_FAST_SHARDS = (
-    "test-fast-unit-core",
-    "test-fast-unit-rest",
-    "test-fast-integration",
-    "test-fast-contract",
-)
 
 
 def _mutate_github_env(shard, line):
@@ -871,6 +886,100 @@ def test_bracket_selector_is_refused_even_when_its_literal_test_file_exists():
 def test_test_fast_allowlist_holds():
     """The shipped shards and aegis-check equal their templates, and the workflow has no env."""
     _guard_test_fast_allowlist(_load("validate.yml"))
+
+
+@pytest.fixture
+def mixed_fast_measurements():
+    """Synthetic shard evidence alongside the historical whole-suite fallback."""
+    workflow = _load("validate.yml")
+    reviewed = dict.fromkeys(_FAST_SHARDS, ("6516.67", "44219204536"))
+    for name in _FAST_SHARDS:
+        workflow["jobs"][name]["timeout-minutes"] = 218
+    name = _FAST_SHARDS[0]
+    # Twice this duration is just over two minutes.
+    reviewed[name] = ("60.000000001", "12345")
+    workflow["jobs"][name]["timeout-minutes"] = 3
+    text = "\n".join(f"{_FAST_MEASUREMENT_PREFIX} {job} {seconds}s run {run}"
+                     for job, (seconds, run) in reviewed.items())
+    return workflow, text, reviewed
+
+
+def test_fast_timeout_guard_accepts_a_shard_measurement(mixed_fast_measurements):
+    workflow, text, reviewed = mixed_fast_measurements
+    _guard_fast_timeouts(workflow, text, reviewed)
+
+
+def test_fast_execution_allowlist_accepts_an_independent_timeout(mixed_fast_measurements):
+    workflow, _text, _reviewed = mixed_fast_measurements
+    _guard_test_fast_allowlist(workflow)
+    _shard_paths(workflow["jobs"][_FAST_SHARDS[0]])
+
+
+def test_fast_timeout_guard_requires_each_reviewed_row(mixed_fast_measurements):
+    workflow, text, reviewed = mixed_fast_measurements
+    missing = dict(reviewed)
+    del missing[_FAST_SHARDS[0]]
+    with pytest.raises(AssertionError, match="reviewed fast measurement rows must cover each required shard"):
+        _guard_fast_timeouts(workflow, text, missing)
+    _guard_fast_timeouts(workflow, text, reviewed)
+
+
+def test_fast_timeout_guard_requires_the_exact_shard_ids(mixed_fast_measurements):
+    workflow, text, reviewed = mixed_fast_measurements
+    changed = copy.deepcopy(workflow)
+    jobs = changed["jobs"]
+    jobs["test-fast-unreviewed"] = jobs.pop(_FAST_SHARDS[0])
+    with pytest.raises(AssertionError, match="fast jobs must match the required shard IDs"):
+        _guard_fast_timeouts(changed, text, reviewed)
+    _guard_fast_timeouts(workflow, text, reviewed)
+
+
+@pytest.mark.parametrize("replacement, reason", [
+    ("", "workflow fast measurement rows must cover each required shard"),
+    ("60.000000002s run 12345", "fast measurement does not match reviewed evidence"),
+    ("60.000000001s run 12346", "fast measurement does not match reviewed evidence"),
+    ("60.000000001s\n# run 12345", "invalid fast measurement row"),
+])
+def test_fast_timeout_guard_rejects_changed_annotations(mixed_fast_measurements, replacement, reason):
+    workflow, text, reviewed = mixed_fast_measurements
+    name = _FAST_SHARDS[0]
+    prefix = f"{_FAST_MEASUREMENT_PREFIX} {name} "
+    seconds, run = reviewed[name]
+    changed = text.replace(f"{prefix}{seconds}s run {run}", prefix + replacement if replacement else "")
+    with pytest.raises(AssertionError, match=reason):
+        _guard_fast_timeouts(workflow, changed, reviewed)
+    _guard_fast_timeouts(workflow, text, reviewed)
+
+
+def test_fast_timeout_guard_rejects_duplicate_annotations(mixed_fast_measurements):
+    workflow, text, reviewed = mixed_fast_measurements
+    with pytest.raises(AssertionError, match="duplicate fast measurement row"):
+        _guard_fast_timeouts(workflow, text + "\n" + text, reviewed)
+
+
+@pytest.mark.parametrize("shard, cap", [(0, 2), (0, 3.0), (0, 361), (1, 217)])
+def test_fast_timeout_guard_rejects_invalid_caps(mixed_fast_measurements, shard, cap):
+    workflow, text, reviewed = mixed_fast_measurements
+    changed = copy.deepcopy(workflow)
+    changed["jobs"][_FAST_SHARDS[shard]]["timeout-minutes"] = cap
+    with pytest.raises(AssertionError, match="fast timeout is outside its measured bounds"):
+        _guard_fast_timeouts(changed, text, reviewed)
+    _guard_fast_timeouts(workflow, text, reviewed)
+
+
+@pytest.mark.parametrize("field", ["steps", "permissions"])
+def test_fast_execution_allowlist_rejects_changed_job_settings(mixed_fast_measurements, field):
+    workflow, text, reviewed = mixed_fast_measurements
+    changed = copy.deepcopy(workflow)
+    job = changed["jobs"][_FAST_SHARDS[0]]
+    if field == "steps":
+        job["steps"][0]["with"]["persist-credentials"] = True
+    else:
+        job["permissions"] = {"contents": "write"}
+    _guard_fast_timeouts(changed, text, reviewed)
+    with pytest.raises(AssertionError, match="unexpected fast job execution settings"):
+        _guard_test_fast_allowlist(changed)
+    _guard_test_fast_allowlist(workflow)
 
 
 @pytest.mark.parametrize("mutate", [
