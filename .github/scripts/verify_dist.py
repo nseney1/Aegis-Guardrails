@@ -28,7 +28,7 @@ TEMPLATE_PREFIX = "aegis_core/ast/drivers/templates/"
 TEMPLATES = {TEMPLATE_PREFIX + name for name in (
     "__init__.py", "go_ast.go", "go.mod")}
 ASSETS = {"aegis_sdk/py.typed", "aegis_core/benchmark_corpus/corpus.json",
-          "aegis_core/benchmark_corpus/ast.json"}
+          "aegis_core/benchmark_corpus/ast.json", "aegis_core/manager_starter.json"}
 ASSETS.update("aegis_core/_data/rules/" + name for name in (
     "__init__.py", "META.md", "cost-optimization.md", "destructive-ops.md", "no-eval.md",
     "providence.md", "subagent-delegation.md", ".oracles/architectural-tenets.md",
