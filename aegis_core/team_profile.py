@@ -29,7 +29,8 @@ from aegis_core.team_profile_display import (
 from aegis_core.workspace.layout import AEGIS_DIRNAME, UserLayout
 
 __all__ = [
-    "CAPACITY_DEFAULTS", "CAPACITY_KINDS", "JSON_SCHEMA", "MAX_BYTES", "MAX_DEPTH", "MAX_ITEMS",
+    "CAPACITY_DEFAULTS", "CAPACITY_KINDS", "CAPACITY_WINDOW_PATTERN", "MAX_CAPACITY_WINDOWS",
+    "JSON_SCHEMA", "MAX_BYTES", "MAX_DEPTH", "MAX_ITEMS",
     "MAX_NODES", "MAX_STRING", "MAX_HOSTS", "MAX_FALLBACK_CHAIN", "MAX_LENSES", "MAX_FALLBACK_EDGES",
     "PRESET_DATA", "PROFILE_SCHEMA", "REPO_PATH", "USER_PATH", "USER_JSON_SCHEMA", "ProfileError",
     "capacity_thresholds", "descriptor_supported", "doctor", "plan", "governance_status", "initialize",
@@ -48,6 +49,8 @@ MAX_FALLBACK_EDGES = 64
 CAPACITY_KINDS = ("writer", "review", "extra-review", "doc", "research",
                   "reviewer.correctness", "reviewer.security", "lens.extra")
 CAPACITY_DEFAULTS = {"hold_pct": 99, "route_pct": 95, "flex_route_pct": 80}
+MAX_CAPACITY_WINDOWS = 8
+CAPACITY_WINDOW_PATTERN = r"^[1-9][0-9]{0,7}(?:s|m|h|d|w|mo)$"
 _CAPACITY_ALIASES = {"review": "reviewer.correctness", "extra-review": "lens.extra"}
 # Bounds, declarations and required bindings precede these route-kind checks.
 _ROUTE_REFUSAL_ORDER = {
@@ -132,8 +135,8 @@ class ProfileError(ValueError):
         self.exit_code = exit_code
 
 
-def _map(items, limit=MAX_ITEMS, reserved=()):
-    return {"type": "object", "patternProperties": {_IDENTIFIER_PATTERN: items},
+def _map(items, limit=MAX_ITEMS, reserved=(), *, pattern=_IDENTIFIER_PATTERN):
+    return {"type": "object", "patternProperties": {pattern: items},
             "additionalProperties": False, "maxProperties": limit,
             **({"propertyNames": {"not": {"enum": list(reserved)}}} if reserved else {})}
 
@@ -155,10 +158,14 @@ _HOST = _object({"kind": {"type": "string", "enum": list(PRESET_DATA["hosts"])},
                  "auth_mode": {"type": "string", "enum": ["sso", "api", "token"], "user_layer_only": True}})
 _ROLE = _object({"hosts": _array(_IDENTIFIER, MAX_HOSTS), "model": _TEXT, "effort": _TEXT,
                  "optional": _BOOL, "pinned_family": _BOOL})
-_CAPACITY = _object({"usage_source": {"type": "string", "enum": ["subscription-window", "credits", "none"]},
-                     "thresholds": _object({name: {"type": "number", "minimum": 0, "maximum": 100}
-                                            for name in ("hold_pct", "route_pct", "flex_route_pct")}),
-                     "fallback": _object({kind: _array(_IDENTIFIER, MAX_FALLBACK_CHAIN) for kind in CAPACITY_KINDS})})
+_THRESHOLDS = _object({name: {"type": "number", "minimum": 0, "maximum": 100} for name in CAPACITY_DEFAULTS})
+_USER_CAPACITY = _object({"usage_source": {"type": "string", "enum": ["subscription-window", "credits", "none"]},
+                          "thresholds": _THRESHOLDS,
+                          "fallback": _object({kind: _array(_IDENTIFIER, MAX_FALLBACK_CHAIN) for kind in CAPACITY_KINDS})})
+_CAPACITY = _object({**_USER_CAPACITY["properties"],
+                     "window_thresholds": {
+                         **_map(_THRESHOLDS, MAX_CAPACITY_WINDOWS, pattern=CAPACITY_WINDOW_PATTERN),
+                         "unknown_key_refusal": "invalid capacity window name"}})
 _RUNNER = _object({"cpus": _INT, "image": _TEXT, "provider": _TEXT,
                    "pool": _USER_TEXT, "credentials": _USER_TEXT,
                    "budget_usd_month": {"type": "number", "minimum": 0, "maximum": 1000000,
@@ -221,7 +228,7 @@ _USER_SETTINGS = {**JSON_SCHEMA["properties"]["model_settings"], "properties": {
     **JSON_SCHEMA["properties"]["model_settings"]["properties"],
     "hosts": _object({kind: _object({"auth_mode": _HOST["properties"]["auth_mode"]})
                       for kind in PRESET_DATA["hosts"]}),
-    "capacity": _object({kind: _CAPACITY for kind in PRESET_DATA["hosts"]}),
+    "capacity": _object({kind: _USER_CAPACITY for kind in PRESET_DATA["hosts"]}),
 }}
 USER_JSON_SCHEMA = {**JSON_SCHEMA, "$id": "aegis.team.profile.user/v1",
                     "properties": {**JSON_SCHEMA["properties"], "model_settings": _USER_SETTINGS}}
@@ -268,13 +275,25 @@ def _leaves(value, prefix=()):
             yield path, child
 
 
-def capacity_thresholds(capacity):
-    """Defaults fit a lower explicit hold/route threshold without changing it."""
+def capacity_thresholds(capacity, *, window=None):
+    """Inherited values fit a lower explicit hold/route threshold."""
     supplied = capacity.get("thresholds", {})
-    hold = supplied.get("hold_pct", CAPACITY_DEFAULTS["hold_pct"])
-    route = supplied.get("route_pct", min(hold, CAPACITY_DEFAULTS["route_pct"]))
-    flex = supplied.get("flex_route_pct", min(route, CAPACITY_DEFAULTS["flex_route_pct"]))
+    defaults = CAPACITY_DEFAULTS
+    if window is not None:
+        defaults = capacity_thresholds(capacity)
+        supplied = capacity.get("window_thresholds", {}).get(window, {})
+    hold = supplied.get("hold_pct", defaults["hold_pct"])
+    route = supplied.get("route_pct", min(hold, defaults["route_pct"]))
+    flex = supplied.get("flex_route_pct", min(route, defaults["flex_route_pct"]))
     return {"hold_pct": hold, "route_pct": route, "flex_route_pct": flex}
+
+
+def _invalid_threshold_path(capacity):
+    for window in (None, *sorted(capacity.get("window_thresholds", {}))):
+        thresholds = capacity_thresholds(capacity, window=window)
+        if not thresholds["flex_route_pct"] <= thresholds["route_pct"] <= thresholds["hold_pct"]:
+            return "thresholds" if window is None else "window_thresholds." + window
+    return None
 
 
 def _capacity_complete(settings):
@@ -284,10 +303,10 @@ def _capacity_complete(settings):
         path = "model_settings.capacity." + name
         if name not in hosts:
             raise ProfileError("capacity references undeclared host", path=path)
-        thresholds = capacity_thresholds(capacity)
-        if not thresholds["flex_route_pct"] <= thresholds["route_pct"] <= thresholds["hold_pct"]:
+        invalid_path = _invalid_threshold_path(capacity)
+        if invalid_path:
             raise ProfileError("capacity thresholds must satisfy flex_route_pct <= route_pct <= hold_pct",
-                               path=path + ".thresholds")
+                               path=path + "." + invalid_path)
         fallbacks = capacity.get("fallback", {})
         for kind in sorted(fallbacks):
             chain = fallbacks[kind]
@@ -521,7 +540,8 @@ def _policy_layer(document, layer):
                 or any((name.startswith("reviewer.") or name == "lens.extra") and
                        any(key in value for key in ("hosts", "optional", "pinned_family"))
                        for name, value in settings.get("roles", {}).items())
-                or any("kind" in value for value in settings.get("hosts", {}).values()))
+                or any("kind" in value for value in settings.get("hosts", {}).values())
+                or any("window_thresholds" in value for value in settings.get("capacity", {}).values()))
     if governed:
         raise _context(ProfileError("governance policy is repository-only; use the approval-before-merge path"), layer)
 
@@ -546,9 +566,9 @@ def _set_leaf(document, path, value):
 def _user_threshold_hosts(repository, names, entry):
     compatible = []
     for name in names:
-        prior = repository["model_settings"]["capacity"].get(name, {}).get("thresholds", {})
-        thresholds = capacity_thresholds({"thresholds": {**prior, **entry.get("thresholds", {})}})
-        if thresholds["flex_route_pct"] <= thresholds["route_pct"] <= thresholds["hold_pct"]:
+        prior = repository["model_settings"]["capacity"].get(name, {})
+        thresholds = {**prior.get("thresholds", {}), **entry.get("thresholds", {})}
+        if _invalid_threshold_path({**prior, "thresholds": thresholds}) is None:
             compatible.append(name)
     return compatible
 

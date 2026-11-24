@@ -862,11 +862,22 @@ def prepare(repository, base, candidate, out, *, expect_base_tree=None, expect_c
 
     The port supplies its validated absolute executable as ``git_spawn.executable``
     and accepts full argv and a borrowed cwd descriptor.
+
+    Retain the returned ``manifest_sha256`` independently of the copy and pass it
+    to the reviewer as the trusted ``expect_manifest`` for ``verify``.
     """
     ports = (object_read_argv, object_read_env, child_environment, git_spawn)
     return _prepare_impl(repository, base, candidate, out, expect_base_tree, expect_candidate_tree, planned, ports, preparation_dir)
 @_guard
 def verify(out, *, expect_manifest=None):
+    """Check the folder against its own manifest.
+
+    Supply the independently retained ``manifest_sha256`` from ``prepare`` to also
+    check the manifest against that trusted digest. On supported hosts, a value
+    other than 64 lowercase hexadecimal characters yields status 2
+    (``invalid_input``) before folder access. A well-formed unequal digest on an
+    otherwise verifiable copy yields status 3 (``copy_differs``).
+    """
     from aegis_core.team_review_verify import verify_copy
     return verify_copy(out, expect_manifest, _verify_host())
 @_guard

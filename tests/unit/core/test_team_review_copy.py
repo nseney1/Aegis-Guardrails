@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import errno
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import importlib
 import json
@@ -450,6 +451,79 @@ def test_prepare_verify_remove_follow_the_dogfood_flow(tmp_path):
     assert Counter(commands.values()) == {"cat-file": 4, "init": 1, "rev-parse": 6, "ls-tree": 2, "diff": 2, "log": 1}
     for sid in children:
         assert not markers.keys() & {event.get("param") for event in events if event["sid"] == sid}
+
+@pytest.mark.parametrize("supplied", [
+    False, b"a" * 64, "", "a" * 63, "a" * 65, "A" * 64, "g" * 64,
+    "ａ" + "a" * 63, "a" * 63 + " ", "a" * 63 + "\0", "a" * 63 + "\n",
+    "a" * 31 + "\u2028" + "a" * 32,
+])
+def test_verify_refuses_malformed_expected_manifest_before_folder_access(monkeypatch, tmp_path, supplied):
+    opened = []
+
+    def track_open(*args, **kwargs):
+        opened.append(args)
+        raise OSError(errno.EACCES, "unexpected folder access")
+
+    monkeypatch.setattr(review_copy, "descriptor_support", lambda: True)
+    monkeypatch.setattr(review_copy, "os", SimpleNamespace(**{**vars(os), "open": track_open}))
+    assert review_copy.verify(str(tmp_path / "missing"), expect_manifest=supplied) == (2, {
+        "reason": "invalid_input",
+        "code": "invalid_input",
+        "next_action": "Pass expect_manifest as a 64-character lowercase hexadecimal SHA-256 digest.",
+    })
+    assert opened == []
+
+
+def test_verify_unsupported_platform_takes_precedence_over_malformed_expected_manifest(monkeypatch, tmp_path):
+    monkeypatch.setattr(review_copy, "descriptor_support", lambda: False)
+    assert review_copy.verify(str(tmp_path / "missing"), expect_manifest="typo") == (2, {
+        "reason": "unsupported_platform",
+        "code": "unsupported_platform",
+        "next_action": "Use a platform with directory descriptors and no-follow opens.",
+    })
+
+
+def test_verify_uses_the_retained_prepare_digest_for_concurrent_comparisons(tmp_path):
+    repo, base, _, candidate, _ = make_repo(tmp_path)
+    out = tmp_path / "review"
+    status, prepared = _prepare(repo, base, candidate, out)
+    assert status == 0
+    retained = prepared["manifest_sha256"]
+    clean = {
+        "ok": True, "manifest_sha256": retained, "base": base, "candidate": candidate,
+        "problems": [], "problem_count": 0,
+    }
+    assert review_copy.verify(str(out), expect_manifest=retained) == (0, clean)
+
+    manifest = out / "manifest.json"
+    changed_bytes = manifest.read_bytes() + b"\n"
+    mode = stat.S_IMODE(manifest.stat().st_mode)
+    manifest.chmod(mode | stat.S_IWUSR)
+    manifest.write_bytes(changed_bytes)
+    manifest.chmod(mode)
+    changed = {**clean, "manifest_sha256": hashlib.sha256(changed_bytes).hexdigest()}
+    mismatch = {
+        **changed, "ok": False, "reason": "copy_differs", "code": "copy_differs",
+        "next_action": "Inspect the named side and problem, then prepare a fresh copy.",
+        "problems": ["manifest.json does not match the recorded hash"], "problem_count": 1,
+    }
+    before = _snapshot(out)
+    expected = (None, retained, "typo")
+    start = threading.Barrier(len(expected))
+
+    def verify(supplied):
+        start.wait(timeout=5)
+        return review_copy.verify(str(out), expect_manifest=supplied)
+
+    with ThreadPoolExecutor(max_workers=len(expected)) as pool:
+        jobs = [pool.submit(verify, supplied) for supplied in expected]
+        consistent, differs, refused = [job.result(timeout=10) for job in jobs]
+    assert consistent == (0, changed)
+    assert differs == (3, mismatch)
+    assert (refused[0], refused[1]["code"]) == (2, "invalid_input")
+    assert review_copy.verify(str(out), expect_manifest=changed["manifest_sha256"]) == (0, changed)
+    assert _snapshot(out) == before
+
 
 def test_remove_refuses_a_checkout_with_a_planted_manifest(tmp_path):
     repo, base, _, candidate, _ = make_repo(tmp_path)
