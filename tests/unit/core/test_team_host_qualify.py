@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 import stat
@@ -21,6 +22,7 @@ import pytest
 from aegis_core import hosts
 from aegis_core import team_host_qualify as qualify
 from aegis_core.primitives import utc_stamp
+from aegis_core.storage import file_lock
 from conftest import symlink_or_skip
 
 
@@ -293,8 +295,122 @@ def _path(state, spec):
     return state.joinpath(*relative)
 
 
+def _lock_leaf(spec):
+    """Basename of the stable per-host lock beside the receipt leaf."""
+    relative = qualify.record_relative(spec.id)
+    assert relative is not None
+    leaf = relative[-1]
+    assert leaf.endswith(".json") and "/" not in leaf and "\\" not in leaf
+    return relative, leaf[:-len(".json")] + ".lock"
+
+
+def _canonical(body):
+    return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+
+
 def _quiet(result):
     assert CANARY not in json.dumps(result)
+
+
+_WORKER_BOUND = 10.0
+
+
+class _WorkerFailure(Exception):
+    """Both worker failures, so one thread cannot hide the other."""
+
+    def __init__(self, errors):
+        self.errors = tuple(errors)
+        super().__init__("worker failures: %s" % (self.errors,))
+
+
+def _run_workers(functions, bound=_WORKER_BOUND):
+    """Start independent writers. Bound the start and the join. Propagate every exception."""
+    outcomes = [None] * len(functions)
+    failures = [None] * len(functions)
+    started = threading.Barrier(len(functions))
+
+    def invoke(index, function):
+        try:
+            started.wait(bound)
+        except threading.BrokenBarrierError as exc:
+            failures[index] = exc
+            return
+        try:
+            outcomes[index] = function()
+        except Exception as exc:
+            failures[index] = exc
+
+    threads = [threading.Thread(target=invoke, args=(index, function)) for index, function in enumerate(functions)]
+    for thread in threads:
+        thread.start()
+    deadline = time.monotonic() + bound
+    for thread in threads:
+        thread.join(max(0.0, deadline - time.monotonic()))
+    if any(thread.is_alive() for thread in threads):
+        raise AssertionError("worker did not finish within %ss" % bound)
+    found = [item for item in failures if item is not None]
+    if found:
+        raise _WorkerFailure(found)
+    return outcomes
+
+
+def _publish_pair(state, spec, payloads, reader):
+    def attempt(payload):
+        return qualify.record(str(state), spec.id, payload, version_reader=reader, clock=CLOCK)
+
+    return _run_workers([lambda payload=payload: attempt(payload) for payload in payloads])
+
+
+def _assert_one_winner(results, state, spec):
+    assert sorted(item["reason"] for item in results) == ["receipt_recorded", "record_exists"]
+    winner = next(item for item in results if item["reason"] == "receipt_recorded")
+    loser = next(item for item in results if item["reason"] == "record_exists")
+    assert "record" not in loser
+    assert _path(state, spec).read_bytes() == _canonical(winner["record"])
+    _quiet(winner)
+    _quiet(loser)
+    return winner
+
+
+def _short_lock_wait(monkeypatch):
+    if hasattr(qualify, "_LOCK_TIMEOUT"):
+        monkeypatch.setattr(qualify, "_LOCK_TIMEOUT", 0.05)
+
+
+def _hold_lock(state, spec):
+    """Hold the per-host lock on another thread until the caller releases it."""
+    relative, lock_name = _lock_leaf(spec)
+    held = threading.Event()
+    release = threading.Event()
+    errors = []
+
+    def occupy():
+        try:
+            with qualify.confined_file(str(state), relative) as handle:
+                with file_lock(lock_name, timeout=2.0, dir_fd=handle.parent_fd):
+                    held.set()
+                    release.wait()
+        except Exception as exc:
+            errors.append(exc)
+            held.set()
+
+    thread = threading.Thread(target=occupy)
+    thread.start()
+    if not held.wait(2.0):
+        release.set()
+        thread.join(2.0)
+        raise AssertionError("publication lock was not acquired")
+    if errors:
+        release.set()
+        thread.join(2.0)
+        raise errors[0]
+    return thread, release
+
+
+def _release_lock(thread, release):
+    release.set()
+    thread.join(2.0)
+    assert not thread.is_alive()
 
 
 def test_probe_runners_come_from_host_shape_without_a_fixed_id():
@@ -501,22 +617,138 @@ def test_second_record_leaves_bytes_unchanged(tmp_path):
 
 
 def test_concurrent_records_keep_one_payload(tmp_path):
+    """First creation: one winner, a record_exists loser, and the winner's bytes on disk."""
     state, spec = _state(tmp_path), _spec()
-    gate = threading.Barrier(2)
-    results = []
+    payloads = [_report(spec, probe_id=name) for name in ("probe-a", "probe-b")]
+    results = _publish_pair(state, spec, payloads, _reader())
+    winner = _assert_one_winner(results, state, spec)
+    assert winner["record"]["probe_id"] in ("probe-a", "probe-b")
+    assert winner["record"]["host_version"] == VERSION
+    assert not (state / "host-qualification" / (_lock_leaf(spec)[1])).is_symlink()
 
-    def worker(probe_id):
-        gate.wait()
-        results.append(_record(state, spec, _report(spec, probe_id=probe_id)))
 
-    threads = [threading.Thread(target=worker, args=(name,)) for name in ("probe-a", "probe-b")]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    assert sorted(item["reason"] for item in results) == ["receipt_recorded", "record_exists"]
-    stored = json.loads(_path(state, spec).read_text(encoding="utf-8"))
-    assert stored["probe_id"] in ("probe-a", "probe-b")
+def test_concurrent_same_version_renewal_keeps_the_winner_bytes(tmp_path):
+    """Same-version renewal is a separate decision from first creation."""
+    state, spec = _state(tmp_path), _spec()
+    assert _record(state, spec)["reason"] == "receipt_recorded"
+    prior = _path(state, spec).read_bytes()
+    payloads = [_report(spec, probe_id=name) for name in ("probe-a", "probe-b")]
+    results = _publish_pair(state, spec, payloads, _reader("9.9.9"))
+    winner = _assert_one_winner(results, state, spec)
+    assert winner["record"]["host_version"] == "9.9.9"
+    assert winner["record"]["probe_id"] in ("probe-a", "probe-b")
+    assert _path(state, spec).read_bytes() != prior
+
+
+def test_creation_timeout_writes_nothing_then_retries(tmp_path, monkeypatch):
+    state, spec = _state(tmp_path), _spec()
+    relative, _lock_name = _lock_leaf(spec)
+    folder = state.joinpath(*relative[:-1])
+    folder.mkdir(mode=0o700)
+    os.chmod(folder, 0o700)
+    _short_lock_wait(monkeypatch)
+    calls = {"n": 0}
+
+    def reader():
+        calls["n"] += 1
+        return "4.5.6"
+
+    thread, release = _hold_lock(state, spec)
+    try:
+        found = _record(state, spec, _report(spec, probe_id="probe-a"), version_reader=reader)
+    finally:
+        _release_lock(thread, release)
+    assert found["status"] == "refused" and found["reason"] == "record_busy"
+    assert calls["n"] == 1
+    assert not _path(state, spec).exists()
+    dumped = json.dumps(found)
+    assert ".lock" not in dumped and str(state) not in dumped and CANARY not in dumped
+    retried = _record(state, spec, _report(spec, probe_id="probe-a"), version_reader=reader)
+    assert retried["reason"] == "receipt_recorded"
+    assert retried["record"]["host_version"] == "4.5.6"
+    assert retried["record"]["probe_id"] == "probe-a"
+    assert calls["n"] == 2
+
+
+def test_renewal_timeout_keeps_prior_bytes_then_retries(tmp_path, monkeypatch):
+    state, spec = _state(tmp_path), _spec()
+    assert _record(state, spec)["reason"] == "receipt_recorded"
+    prior = _path(state, spec).read_bytes()
+    _short_lock_wait(monkeypatch)
+    calls = {"n": 0}
+
+    def reader():
+        calls["n"] += 1
+        return "9.9.9"
+
+    thread, release = _hold_lock(state, spec)
+    try:
+        found = _record(state, spec, _report(spec, probe_id="probe-9"), version_reader=reader)
+    finally:
+        _release_lock(thread, release)
+    assert found["status"] == "refused" and found["reason"] == "record_busy"
+    assert calls["n"] == 1
+    assert _path(state, spec).read_bytes() == prior
+    dumped = json.dumps(found)
+    assert ".lock" not in dumped and str(state) not in dumped and "probe-9" not in dumped
+    retried = _record(state, spec, _report(spec, probe_id="probe-9"), version_reader=reader)
+    assert retried["reason"] == "receipt_recorded"
+    assert retried["record"]["host_version"] == "9.9.9"
+    assert retried["record"]["probe_id"] == "probe-9"
+    assert _path(state, spec).read_bytes() == _canonical(retried["record"])
+    assert calls["n"] == 2
+
+
+def test_lock_symlink_refuses_renewal_without_echo(tmp_path):
+    state, spec = _state(tmp_path), _spec()
+    assert _record(state, spec)["reason"] == "receipt_recorded"
+    prior = _path(state, spec).read_bytes()
+    _relative, lock_name = _lock_leaf(spec)
+    lock = state.joinpath(*_relative[:-1], lock_name)
+    if lock.exists() or lock.is_symlink():
+        lock.unlink()
+    secret = state / "secret"
+    secret.write_text(CANARY, encoding="utf-8")
+    symlink_or_skip(secret, lock)
+    found = _record(state, spec, _report(spec, probe_id="probe-9"), version_reader=_reader("9.9.9"))
+    assert found["reason"] == "record_unsafe"
+    assert _path(state, spec).read_bytes() == prior
+    assert secret.read_text(encoding="utf-8") == CANARY
+    _quiet(found)
+    assert ".lock" not in json.dumps(found)
+
+
+class _ProbeError(Exception):
+    pass
+
+
+def test_publication_worker_failures_propagate_and_retry(tmp_path, monkeypatch):
+    state, spec = _state(tmp_path), _spec()
+    assert _record(state, spec)["reason"] == "receipt_recorded"
+    prior = _path(state, spec).read_bytes()
+    real = qualify.confined_file
+
+    @contextmanager
+    def wrapped(root, parts, create_parents=False):
+        with real(root, parts, create_parents=create_parents) as handle:
+            def publish_bytes(data, replace=False, mode=0o600):
+                raise _ProbeError("publication refused")
+
+            handle.publish_bytes = publish_bytes
+            yield handle
+
+    monkeypatch.setattr(qualify, "confined_file", wrapped)
+    payloads = [_report(spec, probe_id=name) for name in ("probe-a", "probe-b")]
+    with pytest.raises(_WorkerFailure) as caught:
+        _publish_pair(state, spec, payloads, _reader("9.9.9"))
+    assert len(caught.value.errors) == 2
+    assert all(type(item) is _ProbeError for item in caught.value.errors)
+    assert _path(state, spec).read_bytes() == prior
+    monkeypatch.setattr(qualify, "confined_file", real)
+    retried = _record(state, spec, _report(spec, probe_id="probe-9"), version_reader=_reader("9.9.9"))
+    assert retried["reason"] == "receipt_recorded"
+    assert retried["record"]["probe_id"] == "probe-9"
+    assert _path(state, spec).read_bytes() == _canonical(retried["record"])
 
 
 def test_weak_parent_and_mode_and_symlink_are_unsafe(tmp_path):
