@@ -114,16 +114,15 @@ class Records:
     def call(self, name, arguments, *, _with_result=False):
         """Return the original tool payload."""
         require(supported(), reason="unsupported_platform")
-        require(type(name) is str and name in (
-            "mailbox_publish_record", "mailbox_read_record", "mailbox_digest"))
+        require(type(name) is str and name in ("mailbox_publish_record", "mailbox_read_record", "mailbox_digest"))
         require(isinstance(self.mailbox, Mailbox))
         handlers = {"mailbox_publish_record": self._publish_record,
                     "mailbox_read_record": self._read_record, "mailbox_digest": self._digest}
         codec = _RecordCodec
         try:
-            _arguments(codec, arguments, (), {"message_id", "to", "type", "kind", "content", "brief",
-                "in_reply_to", "acknowledgment", "readiness", "result", "receipt", "ref", "refs", "fields",
-                "outline", "expand", "max_chars", "after_message_id", "limit"})
+            _arguments(codec, arguments, (), {"message_id", "to", "type", "kind", "content", "brief", "in_reply_to",
+                "acknowledgment", "readiness", "result", "receipt", "ref", "refs", "fields", "outline", "expand",
+                "max_chars", "after_message_id", "limit"})
             result = handlers[name](arguments)
             return result if _with_result else result.payload
         except MailboxRefusal as error:
@@ -218,15 +217,13 @@ def record_store(codec, root, *, write=False, state=None, wait=_wait_for_lock):
             directory = os.open(path.name, flags, dir_fd=parent)
             stack.callback(os.close, directory)
             expected = os.fstat(directory)
-            codec.require(stat.S_ISDIR(expected.st_mode) and expected.st_uid == os.geteuid()
-                          and not expected.st_mode & 0o022, "E_AUTH")
+            codec.require(stat.S_ISDIR(expected.st_mode) and expected.st_uid == os.geteuid() and not expected.st_mode & 0o022, "E_AUTH")
             codec.require(created_identity is None or _is_root_or_ancestor(created_identity, (expected,)), "E_AUTH")
             _check_store_identity(codec, expected, root)
             store = codec.Store(path)
             stack.callback(store.close)
             actual = os.fstat(store.fd)
             codec.require((expected.st_dev, expected.st_ino) == (actual.st_dev, actual.st_ino), "E_AUTH")
-            # Release the inner lease before the rollback can remove a new store.
             with ExitStack() as publishing:
                 if write and state is not None:
                     state["publication_lease"] = publishing.enter_context(wait(lambda: _publication_lock(codec, store.fd)))
@@ -238,15 +235,17 @@ def record_store(codec, root, *, write=False, state=None, wait=_wait_for_lock):
                         raw = ROOT_MARKER + uuid.uuid4().hex.encode("ascii") + b"\n"
                         fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=rootfd)
                         try:
-                            identity = os.fstat(fd)
-                            with os.fdopen(fd, "wb", closefd=False) as stream:
-                                stream.write(raw)
-                                stream.flush()
-                                os.fsync(fd)
+                            try:
+                                identity = os.fstat(fd)
+                                with os.fdopen(fd, "wb", closefd=False) as stream:
+                                    stream.write(raw)
+                                    stream.flush()
+                                    os.fsync(fd)
+                            finally:
+                                os.close(fd)
                             os.link(pending, ".root-id", src_dir_fd=rootfd, dst_dir_fd=rootfd, follow_symlinks=False)
                             os.fsync(rootfd)
                         finally:
-                            os.close(fd)
                             os.unlink(pending, dir_fd=rootfd)
                 yield store
         finally:
@@ -266,9 +265,7 @@ def record_store(codec, root, *, write=False, state=None, wait=_wait_for_lock):
                         try:
                             current = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
                             if created_identity is None or _is_root_or_ancestor(created_identity, (current,)):
-                                # If the first stat failed, reconcile through the parent while peers are excluded.
-                                codec.require(stat.S_ISDIR(current.st_mode) and current.st_uid == os.geteuid()
-                                              and not current.st_mode & 0o022, "E_AUTH")
+                                codec.require(stat.S_ISDIR(current.st_mode) and current.st_uid == os.geteuid() and not current.st_mode & 0o022, "E_AUTH")
                                 os.rmdir(path.name, dir_fd=parent)
                                 os.fsync(parent)
                         except OSError as error:
@@ -793,15 +790,13 @@ def _commit_record(codec, mailbox, sender, value, path, raw, state, wait):
             _bounded(codec, _value_view(codec, store, sender, value, options, access), MAX_CHARS)
             changes = _grant_changes(codec, access, value, sender["to"])
             publication = store.begin_publication()
-            created = warning = False
+            created, warning = False, False
             try:
                 if _staged_exists(codec, destination, pending):
                     os.unlink(pending, dir_fd=destination)
-                fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                             0o600, dir_fd=destination)
+                fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=destination)
                 created = True
                 try:
-                    # The raw fd remains ours even when fdopen or stream entry fails.
                     with os.fdopen(fd, "wb", closefd=False) as stream:
                         stream.write(raw)
                         stream.flush()
