@@ -2,6 +2,7 @@
 from collections import Counter, deque
 from copy import deepcopy
 from dataclasses import replace
+from datetime import datetime, timezone
 import json
 import importlib
 from pathlib import Path
@@ -16,6 +17,9 @@ from tools import hierarchy_hosts
 
 
 RESET = "2026-11-16T22:00:00Z"
+WEEK_RESET = "2026-11-19T22:00:00Z"
+BEFORE_RESET = datetime(2026, 11, 16, 21, tzinfo=timezone.utc)
+AT_RESET = datetime(2026, 11, 16, 22, tzinfo=timezone.utc)
 KINDS = ("writer", "review", "extra-review", "doc", "research")
 
 
@@ -673,6 +677,148 @@ def test_flexible_jobs_route_before_lane_votes():
     service = hosts.HostCapacity(resolved(), adapter=adapter(75))
     assert service.check("primary", "review")["decision"] == "go"
     assert service.check("primary", "doc")["decision"] == "hold"
+
+
+def measured_windows(short=10, long=75):
+    return {"windows": {"5h": {"used_pct": short, "resets_at": RESET},
+                        "7d": {"used_pct": long, "resets_at": WEEK_RESET}}}
+
+
+@pytest.mark.parametrize("long,holds", [
+    (60, {"doc"}), (75, {"doc", "review"}), (90, {"doc", "review", "writer"}),
+])
+def test_each_window_uses_its_own_role_thresholds(long, holds):
+    config = profile.resolve(repo={"model_settings": {"capacity": {"primary": {
+        "usage_source": "subscription-window", "window_thresholds": {
+            "7d": {"hold_pct": 90, "route_pct": 75, "flex_route_pct": 60}}}}}})
+    snapshot = measured_windows(long=long)
+    reader = hosts.FakeUsageAdapter({"primary": snapshot})
+    service = hosts.HostCapacity(config, adapter=reader, now=BEFORE_RESET)
+    for role in ("writer", "review", "doc"):
+        decision = service.check("primary", role)
+        assert decision["exit_code"] == (3 if role in holds else 0)
+        if role in holds:
+            assert decision["next_action"] == f"Wait for the window reset at {WEEK_RESET}; rerun this check."
+    assert service.usage()[0]["usage"] == snapshot
+    assert reader.calls == [("primary", "subscription-window")]
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_wait_names_the_last_blocking_reset(reverse):
+    snapshot = measured_windows(100, 100)
+    if reverse:
+        snapshot["windows"] = dict(reversed(tuple(snapshot["windows"].items())))
+    reader = hosts.FakeUsageAdapter({"primary": snapshot})
+    result = hosts.HostCapacity(resolved("writer"), adapter=reader, now=BEFORE_RESET).check("primary", "writer")
+    assert result["exit_code"] == 3
+    assert result["next_action"] == f"Wait for the window reset at {WEEK_RESET}; rerun this check."
+
+
+def test_window_expiry_and_concurrent_rechecks_use_independent_snapshots():
+    from concurrent.futures import ThreadPoolExecutor
+
+    snapshot = measured_windows(100, 10)
+    config = resolved("writer")
+
+    def check(now, value):
+        reader = hosts.FakeUsageAdapter({"primary": value})
+        service = hosts.HostCapacity(config, adapter=reader, now=now)
+        first = service.check("primary", "writer")
+        assert service.check("primary", "writer") == first
+        assert reader.calls == [("primary", "subscription-window")]
+        return first
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        before = workers.submit(check, BEFORE_RESET, snapshot)
+        after = workers.submit(check, AT_RESET, snapshot)
+        held, released = before.result(timeout=5), after.result(timeout=5)
+    assert held["exit_code"] == 3
+    assert released["exit_code"] == 0
+    assert released["reason"] == "usage below capacity threshold"
+    held["usage"]["usage"]["windows"]["7d"]["used_pct"] = 100
+    assert released["usage"]["usage"]["windows"]["7d"]["used_pct"] == 10
+    assert snapshot == measured_windows(100, 10)
+    renewed = measured_windows(100, 10)
+    renewed["windows"]["5h"]["resets_at"] = WEEK_RESET
+    assert check(AT_RESET, renewed)["exit_code"] == 3
+
+
+def test_all_expired_windows_are_unknown_but_legacy_decisions_are_unchanged():
+    now = datetime(2026, 11, 20, tzinfo=timezone.utc)
+    multi_reader = hosts.FakeUsageAdapter({"primary": measured_windows(100, 100)})
+    multi = hosts.HostCapacity(resolved(), adapter=multi_reader, now=now).check("primary", "doc")
+    assert multi["exit_code"] == 0
+    assert multi["usage"]["usage_status"] == "unknown"
+    assert multi["reason"] == "unknown: no current usage windows"
+    legacy = hosts.HostCapacity(resolved(), adapter=adapter(100), now=now).check("primary", "doc")
+    assert legacy["exit_code"] == 3
+    assert legacy["usage"]["usage_status"] == "known"
+    assert legacy["usage"]["usage"] == {"window": {"used_pct": 100, "resets_at": RESET}}
+
+
+@pytest.mark.parametrize("short,code,reason", [
+    (10, 0, "unknown: configured usage window evidence missing or expired"),
+    (100, 3, "usage reaches capacity threshold; fallback chain exhausted or held"),
+])
+@pytest.mark.parametrize("missing", ["absent", "expired"])
+def test_missing_window_evidence_cannot_hide_a_known_hold(short, code, reason, missing):
+    config = profile.resolve(repo={"model_settings": {"capacity": {"primary": {
+        "usage_source": "subscription-window", "window_thresholds": {"7d": {"hold_pct": 90}}}}}})
+    snapshot = measured_windows(short, 100)
+    if missing == "absent":
+        del snapshot["windows"]["7d"]
+    else:
+        snapshot["windows"]["7d"]["resets_at"] = "2026-11-16T20:00:00Z"
+    reader = hosts.FakeUsageAdapter({"primary": snapshot})
+    result = hosts.HostCapacity(config, adapter=reader, now=BEFORE_RESET).check("primary", "writer")
+    assert result["exit_code"] == code
+    assert result["reason"] == reason
+    assert result["usage"]["usage_status"] == "unknown"
+
+
+@pytest.mark.parametrize("pinned,decision", [(False, "fallback:other"), (True, "hold")])
+def test_exhausted_writer_window_respects_pin(pinned, decision):
+    config = profile.resolve(preset="ci-only", repo={"model_settings": {
+        "hosts": {"primary": {"kind": "codex-cli"},
+                  "other": {"kind": "codex-cli" if pinned else "claude-code"}},
+        "roles": {"writer": {"hosts": ["primary", "other"], "pinned_family": pinned}},
+        "capacity": {name: {"usage_source": "subscription-window"} for name in ("primary", "other")},
+    }})
+    reader = hosts.FakeUsageAdapter({"primary": measured_windows(10, 100), "other": measured_windows(10, 10)})
+    result = hosts.HostCapacity(config, adapter=reader, now=BEFORE_RESET).check("primary", "writer")
+    assert result["decision"] == decision
+    assert result["exit_code"] == (3 if pinned else 4)
+    assert [name for name, _ in reader.calls] == (["primary"] if pinned else ["primary", "other"])
+
+
+@pytest.mark.parametrize("snapshot,refusal", [
+    ({"windows": []}, "invalid usage windows"),
+    ({"windows": {}}, "invalid usage windows"),
+    ({"windows": {str(i): None for i in range(9)}}, "invalid usage windows"),
+    ({"windows": {}, "window": {}}, "invalid usage fields"),
+    ({"windows": {"other\nprivate": None}}, "invalid usage window name"),
+    ({"windows": {"5h": {"used_pct": 100}}}, "invalid usage window"),
+    ({"windows": {"5h": {"used_pct": 100, "resets_at": "private\n" + "x" * 12}}}, "invalid usage reset"),
+])
+def test_invalid_windows_have_fixed_refusals_and_allow_a_fresh_retry(snapshot, refusal):
+    with pytest.raises(ValueError, match=f"^{refusal}$"):
+        hosts.normalize_usage(snapshot, "subscription-window")
+    config = resolved()
+    reader = hosts.FakeUsageAdapter({"primary": snapshot})
+    malformed = hosts.HostCapacity(config, adapter=reader, now=BEFORE_RESET).check("primary", "doc")
+    assert malformed["exit_code"] == 0
+    assert malformed["usage"]["usage"] == {}
+    assert malformed["reason"] == "unknown: usage adapter unavailable or invalid snapshot"
+    reader.snapshots["primary"] = {**measured_windows(85, 10), "tokens": 10, "runs": 2}
+    retry = hosts.HostCapacity(config, adapter=reader, now=BEFORE_RESET).check("primary", "doc")
+    assert retry["exit_code"] == 3
+    assert retry["usage"]["usage"] == reader.snapshots["primary"]
+
+
+@pytest.mark.parametrize("now", ["2026-11-16T21:00:00Z", datetime(2026, 11, 16, 21)])
+def test_capacity_clock_refuses_inputs_without_an_explicit_timezone(now):
+    with pytest.raises(ValueError, match="^capacity clock must be an aware datetime$"):
+        hosts.HostCapacity(resolved(), now=now)
 
 
 @pytest.mark.parametrize("kind", ("research", "reviewer.security", "security-audit"))
