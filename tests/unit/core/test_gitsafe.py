@@ -14,7 +14,8 @@ import time
 
 import pytest
 
-from aegis_core import gitsafe, gitsafe_run, gitops_fds
+import aegis_core.workspace.hooks as workspace_hooks
+from aegis_core import gitsafe, gitsafe_bound, gitsafe_run, gitops_fds
 from tests.helpers_team_git import strict_program, strict_program_guard
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
@@ -2335,6 +2336,7 @@ def test_undecodable_git_paths_refuse_and_retry(tmp_path, monkeypatch, query):
 
 @pytest.mark.skipif(os.name == "nt", reason="Windows normalizes trailing whitespace in paths")
 @pytest.mark.parametrize("bad", [False, True])
+@pytest.mark.usefixtures("retained_hook_backends")
 def test_hook_gitfile_and_commondir_preserve_whitespace_or_refuse(tmp_path, bad):
     from aegis_core.workspace import hooks
     root = tmp_path / "root"
@@ -2355,6 +2357,7 @@ def test_hook_gitfile_and_commondir_preserve_whitespace_or_refuse(tmp_path, bad)
 
 
 @pytest.mark.parametrize("bad_file", ["gitfile", "commondir"])
+@pytest.mark.usefixtures("retained_hook_backends")
 def test_hook_path_decoding_refuses_invalid_bytes_and_recovers(tmp_path, bad_file):
     from concurrent.futures import ThreadPoolExecutor
     from aegis_core.workspace import hooks
@@ -2387,6 +2390,2646 @@ def test_hook_non_gitfile_retains_discovery_fallthrough(tmp_path, content):
     from aegis_core.workspace import hooks
     (tmp_path / ".git").write_bytes(content)
     assert hooks._find_git_dirs(tmp_path) == (None, None)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="exercises POSIX pathname semantics")
+@pytest.mark.parametrize("platform", ["darwin", "freebsd14"])
+def test_hook_procfs_less_posix_preserves_pathname_fallback(tmp_path, monkeypatch, platform):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(workspace_hooks, "sys", SimpleNamespace(platform=platform))
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: None)
+    root = tmp_path.resolve() / "checkout"
+    root.mkdir()
+    admin = tmp_path.resolve() / "absent" / "admin"
+    (root / ".git").write_bytes(b"gitdir: ../absent/admin\n")
+
+    assert workspace_hooks._git_dirs_at(root) == (admin, admin)
+    assert workspace_hooks._find_git_dirs(root) == (admin, admin)
+    assert workspace_hooks.resolve_git_hooks_dir(root) == admin / "hooks"
+    assert workspace_hooks.resolve_git_hooks_dir(root / "missing") is None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="exercises POSIX pathname semantics")
+def test_hook_procfs_less_posix_preserves_external_marker_spelling(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from conftest import symlink_or_skip
+
+    monkeypatch.setattr(workspace_hooks, "sys", SimpleNamespace(platform="darwin"))
+    checkout = tmp_path.resolve() / "checkout"
+    checkout.mkdir()
+    metadata = tmp_path.resolve() / "metadata"
+    metadata.mkdir()
+    marker = checkout / ".git"
+    symlink_or_skip(metadata, marker, target_is_directory=True)
+    configured = tmp_path / "hooks local"
+
+    def git_path(root, name):
+        assert (root, name) == (checkout, "hooks")
+        return configured
+
+    monkeypatch.setattr(gitsafe, "git_path", git_path)
+    assert workspace_hooks._find_git_dirs(checkout) == (marker, marker)
+    assert workspace_hooks.resolve_git_hooks_dir(checkout) == configured
+
+
+def test_hook_windows_preserves_pathname_fallback(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(workspace_hooks, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(**{**vars(os), "name": "nt"}))
+    root = _clean_real_path(tmp_path) / "checkout"
+    root.mkdir()
+    marker = root / ".git"
+    marker.write_bytes(b"gitdir: ../absent/admin\r\n")
+    admin = root.parent / "absent" / "admin"
+    configured = root / "local hooks"
+
+    def git_path(checkout, name):
+        assert (checkout, name) == (root, "hooks")
+        return configured
+
+    monkeypatch.setattr(gitsafe, "git_path", git_path)
+    assert workspace_hooks.resolve_git_hooks_dir(root) == configured
+    assert workspace_hooks._git_dirs_at(root) == (admin, admin)
+    assert workspace_hooks._find_git_dirs(root) == (admin, admin)
+
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: None)
+    assert workspace_hooks.resolve_git_hooks_dir(root) == admin / "hooks"
+    marker.unlink()
+    assert workspace_hooks.resolve_git_hooks_dir(root) is None
+
+
+def _clean_real_path(path: Path) -> Path:
+    raw = os.path.realpath(path)
+    if os.name == "nt":
+        if raw.startswith(("\\\\?\\UNC\\", "\\\\?\\unc\\")):
+            raw = "\\\\" + raw[8:]
+        elif raw.startswith("\\\\?\\"):
+            raw = raw[4:]
+    return Path(raw)
+
+
+@pytest.fixture
+def retained_hook_backends(monkeypatch):
+    """Exercise the intermediate descriptor and portable implementations."""
+    monkeypatch.setattr(workspace_hooks, "_uses_linux_metadata", lambda: False)
+    monkeypatch.setattr(workspace_hooks, "_uses_pathname_metadata", lambda: False)
+
+
+@pytest.fixture(params=["descriptor", "portable"])
+def hook_record_backend(request, monkeypatch, tmp_path, retained_hook_backends):
+    from types import SimpleNamespace
+
+    if request.param == "descriptor":
+        if not workspace_hooks.descriptor_supported():
+            pytest.skip("requires descriptor-relative nofollow operations")
+    else:
+        def no_dir_fd_open(path, flags, mode=0o777, *, dir_fd=None):
+            if dir_fd is not None:
+                pytest.fail("portable backend attempted a dir_fd open")
+            return os.open(path, flags, mode)
+
+        def no_dir_fd_stat(path, *, dir_fd=None, follow_symlinks=True):
+            if dir_fd is not None:
+                pytest.fail("portable backend attempted a dir_fd stat")
+            return os.stat(path, follow_symlinks=follow_symlinks)
+
+        monkeypatch.setattr(workspace_hooks, "descriptor_supported", lambda: False)
+        monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(
+            **{**vars(os), "open": no_dir_fd_open, "stat": no_dir_fd_stat}))
+    return _clean_real_path(tmp_path)
+
+
+@pytest.mark.parametrize("record", ["gitfile", "commondir"])
+@pytest.mark.parametrize("case", ["normal", "oversized", "undecodable", "multiline"])
+def test_hook_records_are_bounded_and_retryable(hook_record_backend, monkeypatch, record, case):
+    from types import SimpleNamespace
+    from aegis_core.git_path_codec import MAX_PATH_BYTES
+
+    root = hook_record_backend
+    admin = root / "records" / "admin"
+    common = admin.parent / "shared"
+    admin.mkdir(parents=True)
+    common.mkdir()
+    gitfile = root / ".git"
+    commondir = admin / "commondir"
+    gitfile.write_bytes(b"gitdir: records/admin\r\n")
+    commondir.write_bytes(b"../shared\r\n")
+    path, prefix, value = ((gitfile, b"gitdir: ", b"records/admin") if record == "gitfile"
+                           else (commondir, b"", b"../shared"))
+    valid = prefix + value + b"\r\n"
+    if case == "normal":
+        # Git permits a trailing CR/LF run. The exact byte limit is inclusive.
+        path.write_bytes(valid.ljust(MAX_PATH_BYTES, b"\n"))
+    else:
+        data, code, message = {
+            "oversized": (prefix + b"\xff" * (MAX_PATH_BYTES + 1),
+                          "git_path_limit", "Git path output exceeds its byte limit."),
+            "undecodable": (prefix + b"opaque-\xff\n",
+                            "git_path_encoding", "Git path is not decodable."),
+            "multiline": (valid + b"extra\n", "git_path_record_invalid",
+                          "Git path record must contain one nonempty line."),
+        }[case]
+        path.write_bytes(data)
+        oversized = path.stat()
+        limit_expected = case == "oversized"
+
+        def read(fd, amount):
+            if limit_expected and os.path.samestat(os.fstat(fd), oversized):
+                assert record == "gitfile" and amount == len(prefix)
+            return os.read(fd, amount)
+
+        monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(**{**vars(os), "read": read}))
+        for _ in range(2):
+            with pytest.raises(gitsafe.GitError) as caught:
+                workspace_hooks._find_git_dirs(root)
+            assert (caught.value.code, str(caught.value)) == (code, message)
+        path.write_bytes(valid)
+        limit_expected = False
+    assert workspace_hooks._find_git_dirs(root) == (admin, common)
+
+
+@pytest.mark.parametrize("parent", ["worktree", "admin"])
+def test_hook_records_refuse_parent_replacement_and_retry(hook_record_backend, monkeypatch, parent):
+    from types import SimpleNamespace
+
+    outer = hook_record_backend
+    root = outer / "checkout"
+    admin = root / "records" / "admin"
+    common = admin / "common"
+    common.mkdir(parents=True)
+    gitfile = root / ".git"
+    commondir = admin / "commondir"
+    gitfile.write_bytes(b"gitdir: records/admin\n")
+    commondir.write_bytes(b"common\n")
+    trigger = (gitfile if parent == "worktree" else commondir).stat()
+    replaced = root if parent == "worktree" else admin.parent
+    moved = replaced.with_name("moved")
+    replacements = []
+
+    def close(fd):
+        matches = os.path.samestat(os.fstat(fd), trigger)
+        os.close(fd)
+        if matches and not replacements:
+            replaced.rename(moved)
+            replaced.mkdir()
+            replacements.append(replaced)
+
+    monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(**{**vars(os), "close": close}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks._find_git_dirs(root)
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.")
+    assert replacements == [replaced]
+    replaced.rmdir()
+    moved.rename(replaced)
+    assert workspace_hooks._find_git_dirs(root) == (admin, common)
+
+
+@pytest.mark.parametrize("failure", ["growth", "io"])
+def test_hook_record_read_failure_closes_leaf_and_recovers(hook_record_backend, monkeypatch, failure):
+    from types import SimpleNamespace
+    from aegis_core.git_path_codec import MAX_PATH_BYTES
+
+    root = hook_record_backend
+    admin = root / "admin"
+    admin.mkdir()
+    (root / ".git").write_bytes(b"gitdir: admin\n")
+    record = admin / "commondir"
+    record.write_bytes(b".\n")
+    seen = record.stat()
+    reads = []
+    inject = True
+
+    def read(fd, amount):
+        if not inject or not os.path.samestat(os.fstat(fd), seen):
+            return os.read(fd, amount)
+        reads.append((fd, amount))
+        if failure == "io":
+            raise OSError("private operating-system text")
+        assert 0 < amount <= 8192
+        return b"x" * amount
+
+    monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(**{**vars(os), "read": read}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks._find_git_dirs(root)
+    expected = ("git_path_limit", "Git path output exceeds its byte limit.") if failure == "growth" else (
+        "git_path_unavailable", "Git metadata path is unavailable.")
+    assert (caught.value.code, str(caught.value)) == expected
+    if failure == "growth":
+        assert sum(amount for _, amount in reads) == MAX_PATH_BYTES + 1
+    with pytest.raises(OSError):
+        os.fstat(reads[-1][0])
+    inject = False
+    assert workspace_hooks._find_git_dirs(root) == (admin, admin)
+
+
+@pytest.mark.parametrize("read_number", [1, 2])
+def test_hook_refuses_replaced_admin_between_record_reads(hook_record_backend, monkeypatch, read_number):
+    from types import SimpleNamespace
+
+    root = hook_record_backend / "checkout"
+    admin = root / "records" / "admin"
+    common = admin / "common"
+    common.mkdir(parents=True)
+    gitfile = root / ".git"
+    gitfile.write_bytes(b"gitdir: records/admin\n")
+    (admin / "commondir").write_bytes(b"common\n")
+    seen = gitfile.stat()
+    moved = admin.with_name("moved")
+    reads = []
+
+    def close(fd):
+        matches = os.path.samestat(os.fstat(fd), seen)
+        os.close(fd)
+        if matches:
+            reads.append(fd)
+            if len(reads) == read_number:
+                admin.rename(moved)
+                admin.mkdir()
+
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: None)
+    monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(**{**vars(os), "close": close}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks.resolve_git_hooks_dir(root)
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.")
+    assert len(reads) == read_number
+    admin.rmdir()
+    moved.rename(admin)
+    assert workspace_hooks.resolve_git_hooks_dir(root) == common / "hooks"
+
+
+def test_hook_checks_each_gitdir_component_before_parent_step(hook_record_backend, monkeypatch):
+    from conftest import symlink_or_skip
+
+    root = hook_record_backend
+    child = root / "records" / "child"
+    child.mkdir(parents=True)
+    admin = child.parent / "admin"
+    admin.mkdir()
+    alias = child.with_name("alias")
+    symlink_or_skip(child, alias, target_is_directory=True)
+    gitfile = root / ".git"
+    gitfile.write_bytes(b"gitdir: records/alias/../admin\n")
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: None)
+
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks.resolve_git_hooks_dir(root)
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.")
+    gitfile.write_bytes(b"gitdir: records/child/../admin\n")
+    assert workspace_hooks.resolve_git_hooks_dir(root) == admin / "hooks"
+
+
+@pytest.mark.parametrize("record", ["gitdir", "commondir"])
+@pytest.mark.parametrize("traversal", ["parent-step", "direct-link"])
+def test_hook_resolves_and_rejects_symlinks_across_gitdir_and_commondir(
+        hook_record_backend, monkeypatch, record, traversal):
+    from concurrent.futures import ThreadPoolExecutor
+    from conftest import symlink_or_skip
+
+    root = hook_record_backend
+    child = root / "records" / "child"
+    child.mkdir(parents=True)
+    admin = child.parent / "admin"
+    admin.mkdir()
+    shared = child.parent / "shared"
+    (shared / "hooks").mkdir(parents=True)
+    alias = child.with_name("alias")
+    target = (admin if record == "gitdir" else shared) if traversal == "direct-link" else child
+    symlink_or_skip(target, alias, target_is_directory=True)
+    gitfile = root / ".git"
+    commondir = admin / "commondir"
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: None)
+
+    if record == "gitdir":
+        bad_gitdir = b"records/alias\n" if traversal == "direct-link" else b"records/alias/../admin\n"
+        gitfile.write_bytes(b"gitdir: " + bad_gitdir)
+        commondir.write_bytes(b"../child/../shared\n")
+    else:
+        gitfile.write_bytes(b"gitdir: records/child/../admin\n")
+        bad_common = b"../alias\n" if traversal == "direct-link" else b"../alias/../shared\n"
+        commondir.write_bytes(bad_common)
+
+    for _ in range(2):
+        with pytest.raises(gitsafe.GitError) as caught:
+            workspace_hooks.resolve_git_hooks_dir(root)
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_unavailable", "Git metadata path is unavailable.")
+
+    gitfile.write_bytes(b"gitdir: records/child/../admin\n")
+    commondir.write_bytes(b"../child/../shared\n")
+    assert workspace_hooks._find_git_dirs(root) == (admin, shared)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(workspace_hooks.resolve_git_hooks_dir, [root, root], timeout=10)) == [
+            shared / "hooks", shared / "hooks"]
+
+
+@pytest.mark.parametrize("read_number", [1, 2])
+def test_hook_refuses_invalid_or_replaced_common_directory_and_recovers(
+        hook_record_backend, monkeypatch, read_number):
+    from types import SimpleNamespace
+
+    root = hook_record_backend / "checkout"
+    admin = root / "records" / "admin"
+    shared = admin.parent / "shared"
+    (shared / "hooks").mkdir(parents=True)
+    admin.mkdir(parents=True)
+    regular = admin.parent / "not-a-directory"
+    regular.write_bytes(b"plain\n")
+    gitfile = root / ".git"
+    gitfile.write_bytes(b"gitdir: records/admin\n")
+    commondir = admin / "commondir"
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: None)
+
+    for invalid in (b"../missing/../shared\n", b"../missing\n", b"../not-a-directory\n"):
+        commondir.write_bytes(invalid)
+        with pytest.raises(gitsafe.GitError) as caught:
+            workspace_hooks.resolve_git_hooks_dir(root)
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_unavailable", "Git metadata path is unavailable.")
+
+    worktree_admin = shared / "worktrees" / "linked"
+    worktree_admin.mkdir(parents=True)
+    gitfile.write_bytes(b"gitdir: records/shared/worktrees/linked\n")
+    assert workspace_hooks.resolve_git_hooks_dir(root) == shared / "hooks"
+    gitfile.write_bytes(b"gitdir: records/admin\n")
+
+    commondir.write_bytes(b"../shared\n")
+    seen = commondir.stat()
+    moved = shared.with_name("moved-shared")
+    reads = []
+
+    def close(fd):
+        matches = os.path.samestat(os.fstat(fd), seen)
+        os.close(fd)
+        if matches:
+            reads.append(fd)
+            if len(reads) == read_number and not moved.exists():
+                shared.rename(moved)
+                shared.mkdir()
+
+    monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(**{**vars(os), "close": close}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks.resolve_git_hooks_dir(root)
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.")
+    assert len(reads) == read_number
+    shared.rmdir()
+    moved.rename(shared)
+    assert workspace_hooks.resolve_git_hooks_dir(root) == shared / "hooks"
+
+
+def _windows_hook_os(backing, state):
+    """Model Win32 drive, UNC, ctime and NTFS junction semantics over tmp_path."""
+    import hashlib
+    from types import SimpleNamespace
+
+    drive_c = backing / "drive_c"
+    drive_d = backing / "drive_d"
+    unc_share = backing / "unc_share"
+    for folder in (drive_c, drive_d, unc_share):
+        folder.mkdir(exist_ok=True)
+
+    def _norm(raw):
+        text = os.fspath(raw)
+        if isinstance(text, bytes):
+            text = text.decode("utf-8")
+        return text.replace("/", "\\")
+
+    def _split_win(text):
+        norm = _norm(text)
+        lower = norm.lower()
+        if lower.startswith("\\\\server\\share") and (len(norm) == 14 or norm[14] == "\\"):
+            tail = norm[14:].lstrip("\\")
+            base, root_key = unc_share, "\\\\server\\share"
+        elif len(norm) >= 2 and lower[:2] in ("c:", "d:") and (len(norm) == 2 or norm[2] == "\\"):
+            if len(norm) == 2:
+                raise FileNotFoundError(text)
+            tail = norm[3:].lstrip("\\")
+            base = drive_c if lower[0] == "c" else drive_d
+            root_key = lower[:2].upper()
+        else:
+            raise FileNotFoundError(text)
+        raw_parts = [p for p in tail.split("\\") if p and p != "."]
+        collapsed = []
+        for part in raw_parts:
+            if part == "..":
+                if root_key.startswith("\\\\") and not collapsed:
+                    raise OSError("cannot traverse above UNC share")
+                if collapsed:
+                    collapsed.pop()
+            else:
+                collapsed.append(part)
+        key = root_key + ("\\" + "\\".join(collapsed) if collapsed else "\\")
+        return base, collapsed, key.lower()
+
+    def _resolve_backing(text, *, follow_leaf=True, depth=0):
+        if depth > 16:
+            raise OSError("reparse loop")
+        base, parts, _ = _split_win(text)
+        prefix_root = (
+            "\\\\server\\share"
+            if base is unc_share
+            else ("C:" if base is drive_c else "D:")
+        )
+        built = []
+        for idx, part in enumerate(parts):
+            built.append(part)
+            cand_key = (prefix_root + "\\" + "\\".join(built)).lower()
+            is_last = idx == len(parts) - 1
+            if cand_key in state["reparse_tags"] and (follow_leaf or not is_last):
+                raise OSError("unsupported reparse")
+            if cand_key in state["junctions"] and (follow_leaf or not is_last):
+                target = state["junctions"][cand_key]
+                if target is None:
+                    raise FileNotFoundError(text)
+                remainder = parts[idx + 1 :]
+                next_win = target.rstrip("\\/") + ("\\" + "\\".join(remainder) if remainder else "")
+                return _resolve_backing(next_win, follow_leaf=follow_leaf, depth=depth + 1)
+        host_parts = [
+            ("_u16_" + hashlib.sha256(p.encode("utf-8")).hexdigest()[:16])
+            if len(p.encode("utf-8")) > 200
+            else p
+            for p in parts
+        ]
+        host_path = base.joinpath(*host_parts) if host_parts else base
+        return host_path, (prefix_root + ("\\" + "\\".join(built) if built else "\\")).lower()
+
+    def _wrap_stat(info, *, file_attrs=0, reparse_tag=0, ctime_delta=0, mtime_delta=0):
+        return SimpleNamespace(
+            st_mode=info.st_mode,
+            st_ino=info.st_ino,
+            st_dev=info.st_dev,
+            st_size=info.st_size,
+            st_mtime_ns=info.st_mtime_ns + mtime_delta,
+            st_ctime_ns=info.st_ctime_ns + ctime_delta,
+            st_file_attributes=file_attrs,
+            st_reparse_tag=reparse_tag,
+        )
+
+    def lstat_fn(path):
+        cb = state.get("on_lstat")
+        if cb is not None:
+            cb(_norm(path))
+        host_path, key = _resolve_backing(path, follow_leaf=False)
+        info = os.lstat(host_path)
+        if key in state["reparse_tags"]:
+            tag = state["reparse_tags"][key]
+            mode = (stat.S_IFLNK | 0o777) if tag == 0xA000000C else info.st_mode
+            return _wrap_stat(info, file_attrs=0x400, reparse_tag=tag) if mode == info.st_mode else SimpleNamespace(
+                st_mode=mode, st_ino=info.st_ino, st_dev=info.st_dev, st_size=info.st_size,
+                st_mtime_ns=info.st_mtime_ns, st_ctime_ns=info.st_ctime_ns,
+                st_file_attributes=0x400, st_reparse_tag=tag)
+        if key in state["junctions"]:
+            return _wrap_stat(info, file_attrs=0x400, reparse_tag=0xA0000003)
+        return _wrap_stat(info)
+
+    def stat_fn(path, *, dir_fd=None, follow_symlinks=True):
+        if dir_fd is not None:
+            pytest.fail("Windows backend attempted dir_fd stat")
+        if not follow_symlinks:
+            return lstat_fn(path)
+        host_path, _ = _resolve_backing(path, follow_leaf=True)
+        return _wrap_stat(os.stat(host_path))
+
+    def open_fn(path, flags, mode=0o777, *, dir_fd=None):
+        if dir_fd is not None:
+            pytest.fail("Windows backend attempted dir_fd open")
+        host_path, key = _resolve_backing(path, follow_leaf=False)
+        if key in state["junctions"] or key in state["reparse_tags"]:
+            raise OSError("cannot open reparse as regular file")
+        return os.open(host_path, flags, mode)
+
+    def fstat_fn(fd):
+        info = os.fstat(fd)
+        mode = state.get("stamp_mode")
+        if mode == "ctime":
+            return _wrap_stat(info, ctime_delta=1_000_000_000)
+        if mode == "mtime":
+            return _wrap_stat(info, mtime_delta=1_000_000_000)
+        return _wrap_stat(info)
+
+    def close_fn(fd):
+        info = os.fstat(fd)
+        os.close(fd)
+        cb = state.get("on_close")
+        if cb is not None:
+            cb(info)
+
+    def _resolve_win_spelling(text, *, follow_leaf=True, depth=0):
+        if depth > 16:
+            raise OSError("reparse loop")
+        base, parts, _ = _split_win(text)
+        prefix_root = (
+            "\\\\server\\share"
+            if base is unc_share
+            else ("C:" if base is drive_c else "D:")
+        )
+        built = []
+        for idx, part in enumerate(parts):
+            built.append(part)
+            cand_key = (prefix_root + "\\" + "\\".join(built)).lower()
+            is_last = idx == len(parts) - 1
+            if cand_key in state["reparse_tags"] and (follow_leaf or not is_last):
+                raise OSError("unsupported reparse")
+            if cand_key in state["junctions"] and (follow_leaf or not is_last):
+                target = state["junctions"][cand_key]
+                if target is None:
+                    raise FileNotFoundError(text)
+                remainder = parts[idx + 1 :]
+                next_win = target.rstrip("\\/") + ("\\" + "\\".join(remainder) if remainder else "")
+                return _resolve_win_spelling(next_win, follow_leaf=follow_leaf, depth=depth + 1)
+        return prefix_root + ("\\" + "\\".join(built) if built else "\\")
+
+    def realpath_fn(path):
+        norm = _norm(path)
+        if norm.startswith(("\\\\?\\", "\\\\.\\")):
+            return norm
+        try:
+            resolved = _resolve_win_spelling(norm, follow_leaf=True)
+        except OSError:
+            try:
+                _, parts, key = _split_win(norm)
+            except OSError:
+                resolved = norm
+            else:
+                if key.startswith("\\\\server\\share"):
+                    resolved = "\\\\server\\share" + ("\\" + "\\".join(parts) if parts else "\\")
+                else:
+                    resolved = norm[:2].upper() + ("\\" + "\\".join(parts) if parts else "\\")
+        cb = state.get("on_realpath")
+        if cb is not None:
+            cb(norm, resolved)
+        return resolved
+
+    def lexists_fn(path):
+        try:
+            lstat_fn(path)
+            return True
+        except OSError:
+            return False
+
+    def isfile_fn(path):
+        try:
+            return stat.S_ISREG(stat_fn(path).st_mode)
+        except OSError:
+            return False
+
+    def isdir_fn(path):
+        try:
+            return stat.S_ISDIR(stat_fn(path).st_mode)
+        except OSError:
+            return False
+
+    win_path_mod = SimpleNamespace(
+        **{
+            **vars(os.path),
+            "realpath": realpath_fn,
+            "islink": lambda p: _norm(p).lower() in state["reparse_tags"],
+            "lexists": lexists_fn,
+            "isfile": isfile_fn,
+            "isdir": isdir_fn,
+        }
+    )
+    return SimpleNamespace(
+        **{
+            **vars(os),
+            "name": "nt",
+            "sep": "\\",
+            "altsep": "/",
+            "lstat": lstat_fn,
+            "stat": stat_fn,
+            "open": open_fn,
+            "fstat": fstat_fn,
+            "close": close_fn,
+            "path": win_path_mod,
+        }
+    )
+
+
+@pytest.mark.parametrize("platform_name", ["nt", "posix"])
+@pytest.mark.usefixtures("retained_hook_backends")
+def test_hook_windows_record_ctime_divergence_and_real_modification(
+        tmp_path, monkeypatch, platform_name):
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: None)
+    if platform_name == "nt":
+        state = {"junctions": {}, "reparse_tags": {}, "stamp_mode": "ctime"}
+        win_os = _windows_hook_os(tmp_path.resolve(), state)
+        checkout_host = tmp_path.resolve() / "drive_c" / "checkout"
+        admin_host = checkout_host / "records" / "admin"
+        shared_host = admin_host.parent / "shared"
+        (shared_host / "hooks").mkdir(parents=True)
+        admin_host.mkdir(parents=True)
+        (checkout_host / ".git").write_bytes(b"gitdir: records/admin\n")
+        (admin_host / "commondir").write_bytes(b"../shared\n")
+        monkeypatch.setattr(workspace_hooks, "descriptor_supported", lambda: False)
+        monkeypatch.setattr(workspace_hooks, "os", win_os)
+        root_arg = r"C:\checkout"
+        expected_hooks = Path(r"C:\checkout\records\shared\hooks")
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert list(pool.map(workspace_hooks.resolve_git_hooks_dir, [root_arg, root_arg], timeout=10)) == [
+                expected_hooks, expected_hooks]
+
+        state["stamp_mode"] = "mtime"
+        with pytest.raises(gitsafe.GitError) as caught:
+            workspace_hooks.resolve_git_hooks_dir(root_arg)
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_unavailable", "Git metadata path is unavailable.")
+
+        state["stamp_mode"] = "clean"
+        assert workspace_hooks.resolve_git_hooks_dir(root_arg) == expected_hooks
+        return
+
+    root = tmp_path.resolve() / "checkout"
+    admin = root / "records" / "admin"
+    shared = admin.parent / "shared"
+    (shared / "hooks").mkdir(parents=True)
+    admin.mkdir(parents=True)
+    gitfile = root / ".git"
+    commondir = admin / "commondir"
+    gitfile.write_bytes(b"gitdir: records/admin\n")
+    commondir.write_bytes(b"../shared\n")
+    targets = [gitfile.stat(), commondir.stat()]
+    posix_state = {"mode": "ctime"}
+
+    def bumped(info, *, mtime_delta=0, ctime_delta=0):
+        return SimpleNamespace(
+            st_mode=info.st_mode,
+            st_ino=info.st_ino,
+            st_dev=info.st_dev,
+            st_size=info.st_size,
+            st_mtime_ns=info.st_mtime_ns + mtime_delta,
+            st_ctime_ns=info.st_ctime_ns + ctime_delta,
+            st_file_attributes=getattr(info, "st_file_attributes", 0),
+        )
+
+    def fstat(fd):
+        info = os.fstat(fd)
+        if any(os.path.samestat(info, item) for item in targets):
+            if posix_state["mode"] == "ctime":
+                return bumped(info, ctime_delta=1_000_000_000)
+            if posix_state["mode"] == "mtime":
+                return bumped(info, mtime_delta=1_000_000_000)
+        return info
+
+    monkeypatch.setattr(workspace_hooks, "descriptor_supported", lambda: False)
+    monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(**{**vars(os), "fstat": fstat}))
+
+    if os.name == "nt":
+        assert workspace_hooks.resolve_git_hooks_dir(root) == shared / "hooks"
+    else:
+        with pytest.raises(gitsafe.GitError) as caught:
+            workspace_hooks.resolve_git_hooks_dir(root)
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_unavailable", "Git metadata path is unavailable.")
+
+    posix_state["mode"] = "mtime"
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks.resolve_git_hooks_dir(root)
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.")
+
+    posix_state["mode"] = "clean"
+    assert workspace_hooks.resolve_git_hooks_dir(root) == shared / "hooks"
+
+
+@pytest.mark.parametrize("mode", [
+    "missing-publication",
+    "missing-dir-fd-open",
+    "missing-dir-fd-stat",
+    "missing-follow-symlinks",
+    "missing-nofollow-flag",
+    "mid-walk-loss",
+])
+@pytest.mark.usefixtures("retained_hook_backends")
+def test_hook_read_walk_capability_selection_vs_missing_publication_support(
+        tmp_path, monkeypatch, mode):
+    from concurrent.futures import ThreadPoolExecutor
+    import errno
+    from types import SimpleNamespace
+    from aegis_core.git_path_codec import MAX_PATH_BYTES
+
+    if mode in ("missing-publication", "mid-walk-loss") and not workspace_hooks.descriptor_supported():
+        pytest.skip("requires POSIX read-walk descriptor primitives")
+
+    root = tmp_path.resolve() / "workspace"
+    nested = root / "sub"
+    nested.mkdir(parents=True)
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: None)
+
+    dir_fd_calls = []
+    loss_active = {"fail": True}
+
+    def tracked_open(path, flags, mode_bits=0o777, *, dir_fd=None):
+        if dir_fd is not None:
+            dir_fd_calls.append(path)
+            if mode == "mid-walk-loss" and loss_active["fail"]:
+                raise OSError(errno.ENOSYS, "capability lost mid-walk")
+            if mode not in ("missing-publication", "mid-walk-loss"):
+                pytest.fail("portable fallback invoked dir_fd open")
+        return os.open(path, flags, mode_bits, dir_fd=dir_fd)
+
+    def tracked_stat(path, *, dir_fd=None, follow_symlinks=True):
+        if dir_fd is not None and mode not in ("missing-publication", "mid-walk-loss"):
+            pytest.fail("portable fallback invoked dir_fd stat")
+        return os.stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    dir_fd_set = (
+        {os.open, os.stat}
+        if mode == "missing-publication"
+        else (
+            {os.stat}
+            if mode == "missing-dir-fd-open"
+            else ({os.open} if mode == "missing-dir-fd-stat" else os.supports_dir_fd)
+        )
+    )
+    follow_set = set() if mode == "missing-follow-symlinks" else os.supports_follow_symlinks
+    nofollow_flag = 0 if mode == "missing-nofollow-flag" else getattr(os, "O_NOFOLLOW", 0)
+
+    monkeypatch.setattr(
+        workspace_hooks,
+        "os",
+        SimpleNamespace(
+            **{
+                **vars(os),
+                "open": tracked_open,
+                "stat": tracked_stat,
+                "supports_dir_fd": dir_fd_set,
+                "supports_follow_symlinks": follow_set,
+                "O_NOFOLLOW": nofollow_flag,
+            }
+        ),
+    )
+
+    if mode in ("missing-publication", "mid-walk-loss"):
+        assert workspace_hooks.descriptor_supported() is True
+    else:
+        assert workspace_hooks.descriptor_supported() is False
+
+    admin = root / "records" / "admin"
+    shared = admin.parent / "shared"
+    (shared / "objects").mkdir(parents=True)
+    (shared / "refs").mkdir()
+    (shared / "hooks").mkdir()
+    admin.mkdir(parents=True)
+    (admin / "HEAD").write_bytes(b"ref: refs/heads/main\n")
+    (admin / "commondir").write_bytes(b"../shared\n")
+    gitfile = root / ".git"
+
+    if mode != "mid-walk-loss":
+        assert workspace_hooks.resolve_git_hooks_dir(root) is None
+
+    gitfile.write_bytes(b"gitdir: records/admin\n")
+    if mode == "mid-walk-loss":
+        with pytest.raises(gitsafe.GitError) as caught:
+            workspace_hooks.resolve_git_hooks_dir(root)
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_unavailable", "Git metadata path is unavailable.")
+        loss_active["fail"] = False
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(workspace_hooks.resolve_git_hooks_dir, [root, root], timeout=10)) == [
+            shared / "hooks", shared / "hooks"]
+    if mode in ("missing-publication", "mid-walk-loss"):
+        assert dir_fd_calls
+    else:
+        assert not dir_fd_calls
+
+    gitfile.write_bytes(b"gitdir: " + b"x" * (MAX_PATH_BYTES + 1))
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks.resolve_git_hooks_dir(root)
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_limit", "Git path output exceeds its byte limit.")
+    gitfile.write_bytes(b"gitdir: records/admin\n")
+    assert workspace_hooks._find_git_dirs(nested) == (admin, shared)
+    assert workspace_hooks.resolve_git_hooks_dir(root) == shared / "hooks"
+
+
+@pytest.mark.parametrize("transition", [
+    "child-to-child",
+    "parent-step-both",
+    "abs-gitdir-rel-common",
+    "rel-gitdir-abs-common",
+])
+def test_hook_relative_transitions_bind_verified_parents_without_rewalk(
+        hook_record_backend, monkeypatch, transition):
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+
+    outer = hook_record_backend
+    checkout = outer / "checkout"
+    checkout.mkdir()
+    ext_admin = outer / "ext_admin"
+    ext_common = outer / "ext_common"
+    in_admin = checkout / "records" / "admin"
+    in_common = in_admin / "common"
+    for folder in (ext_admin, ext_common, in_admin, in_common):
+        (folder / "hooks").mkdir(parents=True)
+
+    gitfile = checkout / ".git"
+    if transition == "child-to-child":
+        gitfile.write_bytes(b"gitdir: records/admin\n")
+        (in_admin / "commondir").write_bytes(b"common\n")
+        expected = in_common / "hooks"
+    elif transition == "parent-step-both":
+        gitfile.write_bytes(b"gitdir: ../ext_admin\n")
+        (ext_admin / "commondir").write_bytes(b"../ext_common\n")
+        expected = ext_common / "hooks"
+    elif transition == "abs-gitdir-rel-common":
+        gitfile.write_bytes(b"gitdir: " + os.fsencode(str(ext_admin)) + b"\n")
+        (ext_admin / "commondir").write_bytes(b"../ext_common\n")
+        expected = ext_common / "hooks"
+    else:
+        gitfile.write_bytes(b"gitdir: records/admin\n")
+        (in_admin / "commondir").write_bytes(os.fsencode(str(ext_common)) + b"\n")
+        expected = ext_common / "hooks"
+
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: None)
+
+    opened_checkout = []
+    is_descriptor = workspace_hooks.descriptor_supported()
+    if is_descriptor:
+        def counting_open(path, flags, mode_bits=0o777, *, dir_fd=None):
+            if path == "checkout":
+                opened_checkout.append(dir_fd)
+            return os.open(path, flags, mode_bits, dir_fd=dir_fd)
+
+        monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(**{**vars(os), "open": counting_open}))
+
+    assert workspace_hooks.resolve_git_hooks_dir(checkout) == expected
+    if is_descriptor and transition in ("child-to-child", "parent-step-both", "rel-gitdir-abs-common"):
+        # Relative targets step from the bound checkout chain rather than re-walking from '/'.
+        assert len(opened_checkout) == 1
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(workspace_hooks.resolve_git_hooks_dir, [checkout, checkout], timeout=10)) == [
+            expected, expected]
+
+    # If checkout is replaced while reading .git, a relative gitdir must not enter the decoy path.
+    if is_descriptor and transition == "child-to-child":
+        seen_git = gitfile.stat()
+        moved = outer / "moved-checkout"
+        decoy_touched = []
+        swap_state = {"armed": True}
+
+        def swap_on_read(fd, amount):
+            data = os.read(fd, amount)
+            if swap_state["armed"] and os.path.samestat(os.fstat(fd), seen_git) and not moved.exists():
+                checkout.rename(moved)
+                (checkout / "records" / "admin").mkdir(parents=True)
+                (checkout / "records" / "admin" / "commondir").write_bytes(b"common\n")
+            return data
+
+        def spy_open(path, flags, mode_bits=0o777, *, dir_fd=None):
+            fd = os.open(path, flags, mode_bits, dir_fd=dir_fd)
+            if moved.exists() and path == "admin":
+                decoy = (checkout / "records" / "admin").stat()
+                if os.path.samestat(os.fstat(fd), decoy):
+                    decoy_touched.append(True)
+            return fd
+
+        monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(
+            **{**vars(os), "read": swap_on_read, "open": spy_open}))
+        with pytest.raises(gitsafe.GitError) as caught:
+            workspace_hooks.resolve_git_hooks_dir(checkout)
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_unavailable", "Git metadata path is unavailable.")
+        assert not decoy_touched
+        swap_state["armed"] = False
+        shutil.rmtree(checkout)
+        moved.rename(checkout)
+        assert workspace_hooks.resolve_git_hooks_dir(checkout) == expected
+
+
+@pytest.mark.parametrize("mutation", [
+    "replace-dot-git",
+    "symlink-dot-git",
+    "dangling-symlink-dot-git",
+    "fifo-dot-git",
+])
+def test_hook_directory_marker_verifies_leaf_and_ancestry_through_return(
+        hook_record_backend, monkeypatch, mutation):
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+    from conftest import symlink_or_skip
+
+    if mutation == "fifo-dot-git" and (os.name != "posix" or not hasattr(os, "mkfifo")):
+        pytest.skip("FIFO requires POSIX mkfifo")
+
+    root = hook_record_backend / "repo"
+    dot_git = root / ".git"
+    (dot_git / "hooks").mkdir(parents=True)
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: None)
+
+    if mutation == "replace-dot-git":
+        moved = root / "moved-git"
+        state = {"count": 0, "armed": True}
+        is_descriptor = workspace_hooks.descriptor_supported()
+
+        def swap_dot_git():
+            if state["armed"] and not moved.exists():
+                dot_git.rename(moved)
+                (dot_git / "hooks").mkdir(parents=True)
+
+        def stat_hook(path, *, dir_fd=None, follow_symlinks=True):
+            info = os.stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+            if is_descriptor and path == ".git" and not follow_symlinks:
+                state["count"] += 1
+                if state["count"] == 1:
+                    swap_dot_git()
+            return info
+
+        def lstat_hook(path):
+            info = os.lstat(path)
+            if not is_descriptor and os.fspath(path) == str(dot_git):
+                state["count"] += 1
+                if state["count"] == 2:
+                    swap_dot_git()
+            return info
+
+        base_os = workspace_hooks.os
+        monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(
+            **{**vars(base_os), "stat": stat_hook, "lstat": lstat_hook}))
+        with pytest.raises(gitsafe.GitError) as caught:
+            workspace_hooks.resolve_git_hooks_dir(root)
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_unavailable", "Git metadata path is unavailable.")
+        assert moved.exists()
+        state["armed"] = False
+        shutil.rmtree(dot_git)
+        moved.rename(dot_git)
+    else:
+        shutil.rmtree(dot_git)
+        if mutation == "symlink-dot-git":
+            real_git = hook_record_backend / "real-git"
+            (real_git / "hooks").mkdir(parents=True)
+            symlink_or_skip(real_git, dot_git, target_is_directory=True)
+        elif mutation == "dangling-symlink-dot-git":
+            symlink_or_skip(hook_record_backend / "absent-git", dot_git, target_is_directory=True)
+        else:
+            os.mkfifo(dot_git)
+        with pytest.raises(gitsafe.GitError) as caught:
+            workspace_hooks.resolve_git_hooks_dir(root)
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_unavailable", "Git metadata path is unavailable.")
+        dot_git.unlink()
+        (dot_git / "hooks").mkdir(parents=True)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(workspace_hooks.resolve_git_hooks_dir, [root, root], timeout=10)) == [
+            dot_git / "hooks", dot_git / "hooks"]
+
+
+@pytest.mark.parametrize("case", [
+    "short-chunks",
+    "short-non-markers",
+    "eof-prefix-marker",
+    "eof-prefix-short",
+    "growth-short-non-marker",
+    "tear-non-marker-to-marker",
+    "eof-body-gitfile",
+    "eof-body-commondir",
+    "growth-within-cap",
+    "exact-cap-and-overflow",
+])
+def test_hook_bounded_reader_verifies_prefix_and_opened_size_across_chunks_and_eof(
+        hook_record_backend, monkeypatch, case):
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+    from aegis_core.git_path_codec import MAX_PATH_BYTES
+
+    outer = hook_record_backend / "enclosing"
+    (outer / ".git" / "objects").mkdir(parents=True)
+    (outer / ".git" / "refs").mkdir()
+    (outer / ".git" / "hooks").mkdir()
+    (outer / ".git" / "HEAD").write_bytes(b"ref: refs/heads/main\n")
+
+    root = outer / "checkout"
+    admin = root / "records" / "admin"
+    shared = root / "records" / "shared"
+    (shared / "hooks").mkdir(parents=True)
+    admin.mkdir(parents=True)
+    gitfile = root / ".git"
+    commondir = admin / "commondir"
+    gitfile.write_bytes(b"gitdir: records/admin\n")
+    commondir.write_bytes(b"../shared\n")
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: None)
+
+    base_os = workspace_hooks.os
+    state = {"active": True, "calls": 0}
+
+    if case == "short-chunks":
+        def chunked_read(fd, amount):
+            return os.read(fd, min(2, amount))
+
+        monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(**{**vars(base_os), "read": chunked_read}))
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert list(pool.map(workspace_hooks.resolve_git_hooks_dir, [root, root], timeout=10)) == [
+                shared / "hooks", shared / "hooks"]
+        return
+
+    if case == "short-non-markers":
+        standalone = hook_record_backend / "standalone"
+        standalone.mkdir()
+
+        def tiny_read(fd, amount):
+            return os.read(fd, min(2, amount))
+
+        monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(**{**vars(base_os), "read": tiny_read}))
+        for payload in (b"", b"x", b"gitdir:", b"not-a-marker\n", b"z" * (MAX_PATH_BYTES + 9)):
+            gitfile.write_bytes(payload)
+            (standalone / ".git").write_bytes(payload)
+            assert workspace_hooks.resolve_git_hooks_dir(standalone) is None
+            assert workspace_hooks.resolve_git_hooks_dir(root) == outer / ".git" / "hooks"
+        gitfile.write_bytes(b"gitdir: records/admin\n")
+        assert workspace_hooks.resolve_git_hooks_dir(root) == shared / "hooks"
+        return
+
+    if case == "exact-cap-and-overflow":
+        for target_file, prefix_bytes, rel_bytes in (
+            (gitfile, b"gitdir: ", b"records/admin"),
+            (commondir, b"", b"../shared"),
+        ):
+            good = prefix_bytes + rel_bytes + b"\n"
+            target_file.write_bytes(good.ljust(MAX_PATH_BYTES, b"\n"))
+            assert workspace_hooks.resolve_git_hooks_dir(root) == shared / "hooks"
+            target_file.write_bytes(prefix_bytes + b"a" * (MAX_PATH_BYTES + 1 - len(prefix_bytes)))
+            with pytest.raises(gitsafe.GitError) as caught:
+                workspace_hooks.resolve_git_hooks_dir(root)
+            assert (caught.value.code, str(caught.value)) == (
+                "git_path_limit", "Git path output exceeds its byte limit.")
+            target_file.write_bytes(good)
+            assert workspace_hooks.resolve_git_hooks_dir(root) == shared / "hooks"
+        return
+
+    if case == "eof-prefix-short":
+        gitfile.write_bytes(b"plain")
+    elif case == "growth-short-non-marker":
+        gitfile.write_bytes(b"abc")
+    elif case == "tear-non-marker-to-marker":
+        gitfile.write_bytes(b"not-git: records/admin\n")
+
+    target_stat = (commondir if case in ("eof-body-commondir", "growth-within-cap") else gitfile).stat()
+    open_seen = {"n": 0}
+
+    per_fd = {}
+
+    def faulty_read(fd, amount):
+        if not state["active"] or not os.path.samestat(os.fstat(fd), target_stat):
+            return os.read(fd, amount)
+        call_no = per_fd[fd] = per_fd.get(fd, 0) + 1
+        if case == "tear-non-marker-to-marker":
+            if call_no == 1:
+                open_seen["n"] += 1
+            if open_seen["n"] == 1:
+                return os.read(fd, amount)
+            payload = b"gitdir:  records/admin\n"
+            start = (call_no - 1) * amount
+            return payload[start : start + amount]
+        if case == "eof-prefix-marker":
+            return b"gitd"[:amount] if call_no == 1 else b""
+        if case == "eof-prefix-short":
+            return b"pl"[:amount] if call_no == 1 else b""
+        if case == "growth-short-non-marker":
+            return b"abcd"[:amount] if call_no == 1 else b""
+        if case == "eof-body-gitfile":
+            # Truncated at 'records' (an existing directory) to catch premature body EOF.
+            if call_no == 1:
+                return b"gitdir: "[:amount]
+            if call_no == 2:
+                return b"records"[:amount]
+            return b""
+        if case == "eof-body-commondir":
+            return b".."[:amount] if call_no == 1 else b""
+        if case == "growth-within-cap":
+            return b"../shared\n\n"[:amount] if call_no == 1 else b""
+        return os.read(fd, amount)
+
+    def faulty_close(fd):
+        per_fd.pop(fd, None)
+        os.close(fd)
+
+    monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(
+        **{**vars(base_os), "read": faulty_read, "close": faulty_close}))
+    for _ in range(2):
+        per_fd.clear()
+        open_seen["n"] = 0
+        with pytest.raises(gitsafe.GitError) as caught:
+            workspace_hooks.resolve_git_hooks_dir(root)
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_unavailable", "Git metadata path is unavailable.")
+
+    state["active"] = False
+    gitfile.write_bytes(b"gitdir: records/admin\n")
+    commondir.write_bytes(b"../shared\n")
+    assert workspace_hooks.resolve_git_hooks_dir(root) == shared / "hooks"
+
+
+@pytest.mark.parametrize("field", ["st_ino", "st_dev"])
+@pytest.mark.parametrize("site", ["directory", "record"])
+def test_hook_refuses_indeterminate_stat_identities_and_recovers(
+        hook_record_backend, monkeypatch, field, site):
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+
+    root = hook_record_backend / "checkout"
+    admin = root / "records" / "admin"
+    shared = root / "records" / "shared"
+    (shared / "hooks").mkdir(parents=True)
+    admin.mkdir(parents=True)
+    gitfile = root / ".git"
+    commondir = admin / "commondir"
+    gitfile.write_bytes(b"gitdir: records/admin\n")
+    commondir.write_bytes(b"../shared\n")
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: None)
+
+    target_info = (admin if site == "directory" else gitfile).stat()
+    state = {"inject": True}
+    base_os = workspace_hooks.os
+
+    def zeroed(info):
+        if state["inject"] and os.path.samestat(info, target_info):
+            return SimpleNamespace(
+                st_mode=info.st_mode,
+                st_ino=0 if field == "st_ino" else info.st_ino,
+                st_dev=0 if field == "st_dev" else info.st_dev,
+                st_size=info.st_size,
+                st_mtime_ns=info.st_mtime_ns,
+                st_ctime_ns=info.st_ctime_ns,
+                st_file_attributes=getattr(info, "st_file_attributes", 0),
+                st_reparse_tag=getattr(info, "st_reparse_tag", 0),
+            )
+        return info
+
+    monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(
+        **{
+            **vars(base_os),
+            "lstat": lambda p: zeroed(base_os.lstat(p)),
+            "fstat": lambda fd: zeroed(base_os.fstat(fd)),
+            "stat": lambda p, *, dir_fd=None, follow_symlinks=True: zeroed(
+                base_os.stat(p, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+            ),
+        }
+    ))
+
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks.resolve_git_hooks_dir(root)
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.")
+
+    state["inject"] = False
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(workspace_hooks.resolve_git_hooks_dir, [root, root], timeout=10)) == [
+            shared / "hooks", shared / "hooks"]
+
+
+@pytest.mark.usefixtures("retained_hook_backends")
+def test_hook_windows_roots_components_and_junction_identities(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: None)
+    monkeypatch.setattr(workspace_hooks, "descriptor_supported", lambda: False)
+
+    # 1. POSIX component boundaries (255 vs 256 UTF-8 bytes and component count budget)
+    if os.name != "nt":
+        pos_root = tmp_path.resolve() / "posix_bounds"
+        pos_root.mkdir()
+        ok_utf8 = "\u00e9" * 127 + "a"  # 255 UTF-8 bytes
+        bad_utf8 = "\u00e9" * 128       # 256 UTF-8 bytes
+        (pos_root / ok_utf8 / "hooks").mkdir(parents=True)
+        (pos_root / ".git").write_bytes(b"gitdir: " + os.fsencode(ok_utf8) + b"\n")
+        assert workspace_hooks.resolve_git_hooks_dir(pos_root) == pos_root / ok_utf8 / "hooks"
+        for invalid_posix in (
+            os.fsencode(bad_utf8),
+            b"a" * 256,
+            b"/".join([b"d"] * 513),
+            b"//unc-like/share",
+        ):
+            (pos_root / ".git").write_bytes(b"gitdir: " + invalid_posix + b"\n")
+            with pytest.raises(gitsafe.GitError) as caught:
+                workspace_hooks.resolve_git_hooks_dir(pos_root)
+            assert (caught.value.code, str(caught.value)) == (
+                "git_path_unavailable", "Git metadata path is unavailable.")
+
+    # 2. Windows drive & UNC roots, component boundaries, and junction identities
+    backing = tmp_path.resolve() / "win_vfs"
+    backing.mkdir()
+    state = {"junctions": {}, "reparse_tags": {}, "on_close": None, "on_lstat": None}
+    win_os = _windows_hook_os(backing, state)
+    monkeypatch.setattr(workspace_hooks, "os", win_os)
+
+    drive_c = backing / "drive_c"
+    drive_d = backing / "drive_d"
+    unc = backing / "unc_share"
+
+    # Valid drive checkout -> absolute UNC gitdir -> absolute D: commondir, and UNC checkout
+    (drive_c / "ws" / "checkout").mkdir(parents=True)
+    (unc / "meta" / "admin").mkdir(parents=True)
+    (drive_d / "shared" / "common" / "hooks").mkdir(parents=True)
+    (drive_c / "ws" / "checkout" / ".git").write_bytes(b"gitdir: //server/share/meta/admin\n")
+    (unc / "meta" / "admin" / "commondir").write_bytes(b"D:/shared/common\n")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(workspace_hooks.resolve_git_hooks_dir, [r"C:\ws\checkout", r"C:\ws\checkout"], timeout=10)) == [
+            Path(r"D:\shared\common\hooks"), Path(r"D:\shared\common\hooks")]
+
+    (unc / "checkout").mkdir(parents=True)
+    (unc / "checkout" / ".git").write_bytes(b"gitdir: ../meta/admin\n")
+    assert workspace_hooks.resolve_git_hooks_dir(r"\\server\share\checkout") == Path(r"D:\shared\common\hooks")
+
+    # Component boundary on Windows: 255 UTF-16 units (127 surrogate pairs + 'a') vs 256 (128 pairs)
+    import hashlib
+
+    ok_win_comp = "\U0001f600" * 127 + "a"
+    bad_win_comp = "\U0001f600" * 128
+    ok_host_comp = "_u16_" + hashlib.sha256(ok_win_comp.encode("utf-8")).hexdigest()[:16]
+    (drive_c / "ws" / ok_host_comp / "hooks").mkdir(parents=True)
+    (drive_c / "ws" / "checkout" / ".git").write_bytes(("gitdir: ../" + ok_win_comp + "\n").encode("utf-8"))
+    assert workspace_hooks.resolve_git_hooks_dir(r"C:\ws\checkout") == Path("C:\\ws\\" + ok_win_comp + "\\hooks")
+
+    (drive_c / "ws" / "nul .git" / "hooks").mkdir(parents=True)
+    for bad_target in (
+        "../" + bad_win_comp,
+        "C:relative_drive",
+        "C:",
+        r"\rooted_without_drive",
+        "/rooted_without_drive",
+        r"\\?\C:\ws\admin",
+        r"\\.\C:\ws\admin",
+        r"\\server",
+        r"\\server\\",
+        r"\\server\\share\admin",
+        r"\\\server\share\admin",
+        r"\\server\..",
+        "admin.",
+        "admin ",
+        r"..\.. \admin",
+        "admin:stream",
+        "CON",
+        "nul.git",
+        "../nul .git",
+        "com1",
+    ):
+        (drive_c / "ws" / "checkout" / ".git").write_bytes(("gitdir: " + bad_target + "\n").encode("utf-8"))
+        with pytest.raises(gitsafe.GitError) as caught:
+            workspace_hooks.resolve_git_hooks_dir(r"C:\ws\checkout")
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_unavailable", "Git metadata path is unavailable.")
+
+    # 3. Stable Windows directory junctions (including directory .git, gitdir and commondir)
+    (drive_c / "real_dot_git" / "hooks").mkdir(parents=True)
+    (drive_c / "junc_repo" / ".git").mkdir(parents=True)
+    state["junctions"][r"c:\junc_repo\.git"] = r"C:\real_dot_git"
+    assert workspace_hooks.resolve_git_hooks_dir(r"C:\junc_repo") == Path(r"C:\junc_repo\.git\hooks")
+
+    # Dangling junction and non-junction reparse tags refuse with git_path_unavailable
+    state["junctions"][r"c:\junc_repo\.git"] = None
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks.resolve_git_hooks_dir(r"C:\junc_repo")
+    assert caught.value.code == "git_path_unavailable"
+    del state["junctions"][r"c:\junc_repo\.git"]
+
+    for bad_tag in (0xA000000C, 0x8000001B):
+        state["reparse_tags"][r"c:\junc_repo\.git"] = bad_tag
+        with pytest.raises(gitsafe.GitError) as caught:
+            workspace_hooks.resolve_git_hooks_dir(r"C:\junc_repo")
+        assert caught.value.code == "git_path_unavailable"
+    state["reparse_tags"].clear()
+    state["junctions"][r"c:\junc_repo\.git"] = r"C:\real_dot_git"
+    assert workspace_hooks.resolve_git_hooks_dir(r"C:\junc_repo") == Path(r"C:\junc_repo\.git\hooks")
+
+    # Stable vs changed junction entry identity and changed junction resolved target identity
+    (drive_c / "target_admin_1").mkdir()
+    (drive_c / "target_admin_2").mkdir()
+    (drive_c / "target_common_1" / "hooks").mkdir(parents=True)
+    (drive_c / "target_common_2" / "hooks").mkdir(parents=True)
+    (drive_c / "target_admin_1" / "commondir").write_bytes(b"../junc_common\n")
+    (drive_c / "target_admin_2" / "commondir").write_bytes(b"../junc_common\n")
+    (drive_c / "ws" / "junc_admin").mkdir()
+    (drive_c / "junc_common").mkdir()
+    state["junctions"][r"c:\ws\junc_admin"] = r"C:\target_admin_1"
+    state["junctions"][r"c:\junc_common"] = r"C:\target_common_1"
+    (drive_c / "ws" / "checkout" / ".git").write_bytes(b"gitdir: ../junc_admin\n")
+    assert workspace_hooks.resolve_git_hooks_dir(r"C:\ws\checkout") == Path(r"C:\target_common_1\hooks")
+
+    commondir_stat = (drive_c / "target_admin_1" / "commondir").stat()
+
+    # Case A: Same junction entry inode, resolved target identity changes (in-place retarget)
+    def retarget_on_close(info):
+        if os.path.samestat(info, commondir_stat):
+            state["junctions"][r"c:\junc_common"] = r"C:\target_common_2"
+
+    state["on_close"] = retarget_on_close
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks.resolve_git_hooks_dir(r"C:\ws\checkout")
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.")
+    state["on_close"] = None
+    state["junctions"][r"c:\junc_common"] = r"C:\target_common_1"
+    assert workspace_hooks.resolve_git_hooks_dir(r"C:\ws\checkout") == Path(r"C:\target_common_1\hooks")
+
+    # Case B: Same resolved target, junction entry inode itself is replaced
+    moved_junc = drive_c / "moved_junc_common"
+
+    def replace_entry_on_close(info):
+        if os.path.samestat(info, commondir_stat) and not moved_junc.exists():
+            (drive_c / "junc_common").rename(moved_junc)
+            (drive_c / "junc_common").mkdir()
+
+    state["on_close"] = replace_entry_on_close
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks.resolve_git_hooks_dir(r"C:\ws\checkout")
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.")
+    state["on_close"] = None
+    (drive_c / "junc_common").rmdir()
+    moved_junc.rename(drive_c / "junc_common")
+    assert workspace_hooks.resolve_git_hooks_dir(r"C:\ws\checkout") == Path(r"C:\target_common_1\hooks")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native NTFS junctions require Windows")
+def test_hook_windows_native_junctions_preserve_pathname_fallback(tmp_path, monkeypatch):
+    from aegis_core.verification.windows_junction import create_directory_junction
+
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: None)
+    base = _clean_real_path(tmp_path)
+    real_git = base / "real_git"
+    real_git.mkdir()
+    repo = base / "checkout"
+    repo.mkdir()
+    marker = repo / ".git"
+    create_directory_junction(real_git, marker)
+    try:
+        assert workspace_hooks._find_git_dirs(repo) == (marker, marker)
+        assert workspace_hooks.resolve_git_hooks_dir(repo) == marker / "hooks"
+    finally:
+        marker.rmdir()
+
+    admin = real_git / "worktrees" / "linked"
+    admin.mkdir(parents=True)
+    alias = base / "admin_link"
+    create_directory_junction(admin, alias)
+    try:
+        marker.write_bytes(b"gitdir: " + os.fsencode(alias) + b"\r\n")
+        assert workspace_hooks._find_git_dirs(repo) == (alias, alias)
+        assert workspace_hooks.resolve_git_hooks_dir(repo) == alias / "hooks"
+
+        marker.write_bytes(b"gitdir: ../admin_link\r\n")
+        assert workspace_hooks._find_git_dirs(repo) == (admin, real_git)
+        assert workspace_hooks.resolve_git_hooks_dir(repo) == real_git / "hooks"
+
+        (admin / "commondir").write_bytes(b"../..\r\n")
+        assert workspace_hooks._find_git_dirs(repo) == (admin, real_git)
+    finally:
+        alias.rmdir()
+
+
+@pytest.mark.usefixtures("retained_hook_backends")
+def test_hook_preserves_dot_git_gate_and_git_first_precedence(tmp_path, monkeypatch):
+    parent = tmp_path.resolve() / "parent_repo"
+    (parent / ".git" / "objects").mkdir(parents=True)
+    (parent / ".git" / "refs").mkdir()
+    (parent / ".git" / "hooks").mkdir()
+    (parent / ".git" / "HEAD").write_bytes(b"ref: refs/heads/main\n")
+    sub = parent / "packages" / "child"
+    sub.mkdir(parents=True)
+
+    git_queries = []
+    custom_hooks = parent / ".githooks"
+    custom_hooks.mkdir()
+    state = {"answer": custom_hooks}
+
+    def fake_git_path(root, rel):
+        git_queries.append((root, rel))
+        return state["answer"]
+
+    monkeypatch.setattr(gitsafe, "git_path", fake_git_path)
+
+    # Earlier gate: absent .git returns None immediately without invoking gitsafe.git_path or walking up.
+    assert workspace_hooks.resolve_git_hooks_dir(sub) is None
+    assert git_queries == []
+
+    # Normal Git-first path: when .git is present and Git answers, its core.hooksPath wins.
+    assert workspace_hooks.resolve_git_hooks_dir(parent) == custom_hooks
+    assert git_queries == [(parent, "hooks")]
+
+    # Git-free fallback: when Git returns None, confined pure-Python resolution takes over.
+    state["answer"] = None
+    assert workspace_hooks.resolve_git_hooks_dir(parent) == parent / ".git" / "hooks"
+
+
+def _linked_hook_worktree(base: Path, name: str = "linked") -> tuple[Path, Path, Path, Path]:
+    """Create a real linked repository when Git runs, or an identical Git worktree layout."""
+    main_repo = base / "main_repo"
+    linked = base / name
+    git_prog = shutil.which("git")
+    git_usable = False
+    if git_prog is not None:
+        try:
+            git_usable = subprocess.run(
+                [git_prog, "--version"], capture_output=True, timeout=5
+            ).returncode == 0
+        except OSError:
+            git_usable = False
+    if git_usable:
+        _repo(main_repo)
+        (main_repo / "tracked.txt").write_text("seed\n", encoding="utf-8")
+        _commit(main_repo, "seed")
+        _git(main_repo, "worktree", "add", "--detach", str(linked))
+        real_main = _clean_real_path(main_repo)
+        real_linked = _clean_real_path(linked)
+        common = real_main / ".git"
+        admin = common / "worktrees" / name
+        (common / "hooks").mkdir(exist_ok=True)
+        return real_main, real_linked, admin, common
+    common = main_repo / ".git"
+    admin = common / "worktrees" / name
+    for folder in (common / "objects", common / "refs", common / "hooks", admin, linked):
+        folder.mkdir(parents=True, exist_ok=True)
+    (common / "HEAD").write_bytes(b"ref: refs/heads/main\n")
+    (admin / "HEAD").write_bytes(b"0" * 40 + b"\n")
+    (admin / "commondir").write_bytes(b"../..\n")
+    (admin / "gitdir").write_bytes(os.fsencode(str(linked / ".git")) + b"\n")
+    (linked / ".git").write_bytes(b"gitdir: " + os.fsencode(str(admin)) + b"\n")
+    return main_repo, linked, admin, common
+
+
+@pytest.fixture(params=["directory", "absolute", "relative"])
+def bound_metadata_layout(request, tmp_path, fake_home):
+    if (
+        sys.platform != "linux"
+        or not workspace_hooks.descriptor_supported()
+        or not hasattr(os, "memfd_create")
+        or not Path("/proc/self/fd").is_dir()
+    ):
+        pytest.skip("requires Linux procfs and descriptor-relative reads")
+    base = tmp_path / "shared repo "
+    base.mkdir()
+    main, linked, admin, common = _linked_hook_worktree(base)
+    if request.param == "directory":
+        return main, common, common
+    if request.param == "relative":
+        (linked / ".git").write_bytes(b"gitdir: .././main_repo/.git/worktrees/linked\r\n")
+    return linked, admin, common
+
+
+@contextlib.contextmanager
+def _held_git_metadata(checkout):
+    directory = os.open(checkout, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        marker = os.open(".git", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+        try:
+            yield directory, marker
+        finally:
+            os.close(marker)
+    finally:
+        os.close(directory)
+
+
+_LINUX_METADATA = pytest.mark.skipif(
+    sys.platform != "linux" or not workspace_hooks.descriptor_supported()
+    or not Path("/proc/self/fd").is_dir(), reason="requires the Linux metadata backend",
+)
+
+
+@_LINUX_METADATA
+@pytest.mark.parametrize("entry", ["hooks", "dirs", "direct"])
+def test_hook_linux_binds_the_public_lookup(tmp_path, fake_home, monkeypatch, entry):
+    main, linked, admin, common = _linked_hook_worktree(tmp_path)
+    _git(main, "config", "core.hooksPath", "chosen hooks")
+    (linked / ".git").write_bytes(b"gitdir: ../main_repo/.git/worktrees/linked\n")
+    bound = gitsafe.bound_git_metadata
+    calls = []
+
+    def observe(checkout_fd, marker_fd, request, **options):
+        calls.append(request)
+        return bound(checkout_fd, marker_fd, request, **options)
+
+    monkeypatch.setattr(gitsafe, "bound_git_metadata", observe)
+    if entry == "hooks":
+        assert workspace_hooks.resolve_git_hooks_dir(linked) == linked / "chosen hooks"
+        assert calls == ["hooks"]
+    else:
+        lookup = workspace_hooks._git_dirs_at if entry == "direct" else workspace_hooks._find_git_dirs
+        assert lookup(linked) == (admin, common)
+        assert calls == ["dirs"]
+
+
+@_LINUX_METADATA
+def test_hook_linux_refuses_restored_ancestor_during_bound_lookup(tmp_path, fake_home, monkeypatch):
+    parent = tmp_path / "parent"
+    repo = _repo(parent / "repo")
+    _git(repo, "config", "core.hooksPath", "chosen hooks")
+    moved = tmp_path / "moved"
+    bound = gitsafe.bound_git_metadata
+    calls = []
+
+    def notify(checkout_fd, marker_fd, query, **options):
+        answer = bound(checkout_fd, marker_fd, query, **options)
+        calls.append(query)
+        parent.rename(moved)
+        moved.rename(parent)
+        return answer
+
+    monkeypatch.setattr(gitsafe, "bound_git_metadata", notify)
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks.resolve_git_hooks_dir(repo)
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.",
+    )
+    assert calls == ["hooks"]
+    monkeypatch.setattr(gitsafe, "bound_git_metadata", bound)
+    assert workspace_hooks.resolve_git_hooks_dir(repo) == repo / "chosen hooks"
+
+
+@_LINUX_METADATA
+@pytest.mark.parametrize(("entry", "operand"), [
+    ("hooks", None), ("hooks", "."), ("hooks", "child"),
+    ("dirs", "."), ("dirs", "child"),
+    ("direct", "."), ("direct", "child"),
+])
+def test_hook_linux_refuses_cwd_dependent_lookup(tmp_path, monkeypatch, entry, operand):
+    (tmp_path / "child" / ".git").mkdir(parents=True)
+
+    def unexpected_lookup(*args, **kwargs):
+        pytest.fail("cwd-dependent input reached metadata lookup")
+
+    monkeypatch.setattr(gitsafe_bound, "_metadata_fd_root", unexpected_lookup)
+    monkeypatch.setattr(gitsafe_bound, "_Namespace", unexpected_lookup)
+    monkeypatch.setattr(gitsafe, "bound_git_metadata", unexpected_lookup)
+    monkeypatch.setattr(workspace_hooks, "git_discovery_paths", unexpected_lookup)
+    lookup = {
+        "hooks": workspace_hooks.resolve_git_hooks_dir,
+        "dirs": workspace_hooks._find_git_dirs,
+        "direct": workspace_hooks._git_dirs_at,
+    }[entry]
+    args = () if operand is None else (Path(operand),)
+    with _temporary_cwd(tmp_path), pytest.raises(gitsafe.GitError) as caught:
+        lookup(*args)
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.",
+    )
+
+
+@_LINUX_METADATA
+def test_hook_linux_preserves_absolute_discovery_ceiling(tmp_path, fake_home):
+    repo = _repo(tmp_path / "repo")
+    child = repo / "child"
+    child.mkdir()
+    marker = repo / ".git"
+    assert workspace_hooks._find_git_dirs(child) == (marker, marker)
+    with _temporary_env({"GIT_CEILING_DIRECTORIES": str(repo)}):
+        assert workspace_hooks._find_git_dirs(child) == (None, None)
+
+
+@_LINUX_METADATA
+def test_hook_linux_queries_git_for_directory_marker_with_common_dir(tmp_path, fake_home):
+    repo = _repo(tmp_path / "repo")
+    marker = repo / ".git"
+    common = repo / "common"
+    common.mkdir()
+    for name in ("objects", "refs", "config"):
+        (marker / name).rename(common / name)
+    (marker / "commondir").write_text("../common\n", encoding="utf-8")
+    _git(repo, "config", "core.hooksPath", "chosen hooks")
+    assert gitsafe.git_path(repo, "hooks") == repo / "chosen hooks"
+    assert workspace_hooks.resolve_git_hooks_dir(repo) == repo / "chosen hooks"
+
+
+@_LINUX_METADATA
+def test_hook_linux_rechecks_ancestry_before_git_launch(tmp_path, monkeypatch):
+    parent = tmp_path / "parent"
+    repo = _repo(parent / "repo")
+    moved = tmp_path / "moved"
+    executable = gitsafe.git_executable
+    launches = []
+
+    def lookup(**options):
+        program = executable(**options)
+        parent.rename(moved)
+        moved.rename(parent)
+        return program
+
+    def unexpected_launch(*args, **options):
+        launches.append(True)
+        raise gitsafe.GitError("fixture refused Git launch")
+
+    monkeypatch.setattr(gitsafe, "git_executable", lookup)
+    monkeypatch.setattr(gitsafe_run, "capture", unexpected_launch)
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks.resolve_git_hooks_dir(repo)
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.",
+    )
+    assert launches == []
+
+
+@_LINUX_METADATA
+def test_hook_linux_refuses_gitfile_when_git_is_missing(tmp_path, fake_home, monkeypatch):
+    outer = _repo(tmp_path / "outer")
+    main, linked, admin, common = _linked_hook_worktree(outer)
+    subdir = linked / "subdir"
+    subdir.mkdir()
+    executable = gitsafe.git_executable
+
+    monkeypatch.setattr(gitsafe, "git_executable", lambda **options: None)
+    assert workspace_hooks.resolve_git_hooks_dir(main) == common / "hooks"
+    for resolve, path in (
+        (workspace_hooks.resolve_git_hooks_dir, linked),
+        (workspace_hooks._find_git_dirs, subdir),
+    ):
+        with pytest.raises(gitsafe.GitError) as caught:
+            resolve(path)
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_unavailable", "Git metadata path is unavailable.",
+        )
+    monkeypatch.setattr(gitsafe, "git_executable", executable)
+    assert workspace_hooks._find_git_dirs(subdir) == (admin, common)
+
+
+@_LINUX_METADATA
+@pytest.mark.parametrize("phase", ["first_edge", "directory_fallback"])
+def test_hook_linux_refuses_restored_edges_through_directory_fallback(tmp_path, monkeypatch, phase):
+    from types import SimpleNamespace
+
+    parent = tmp_path / "parent"
+    repo = _repo(parent / "repo")
+    moved = tmp_path / "moved"
+    changes = []
+    executable = gitsafe.git_executable
+    metadata_os = gitsafe_bound.os
+
+    def replace_and_restore():
+        parent.rename(moved)
+        moved.rename(parent)
+        changes.append(True)
+
+    def observe(path, *, dir_fd=None, follow_symlinks=True):
+        result = os.stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+        if path == "parent" and dir_fd is not None and not changes:
+            replace_and_restore()
+        return result
+
+    def missing_git(**options):
+        if phase == "directory_fallback":
+            replace_and_restore()
+        return None
+
+    monkeypatch.setattr(gitsafe, "git_executable", missing_git)
+    if phase == "first_edge":
+        monkeypatch.setattr(gitsafe_bound, "os", SimpleNamespace(**{**vars(os), "stat": observe}))
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks.resolve_git_hooks_dir(repo)
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.",
+    )
+    assert changes == [True]
+    monkeypatch.setattr(gitsafe, "git_executable", executable)
+    monkeypatch.setattr(gitsafe_bound, "os", metadata_os)
+    assert workspace_hooks.resolve_git_hooks_dir(repo) == repo / ".git" / "hooks"
+
+
+@_LINUX_METADATA
+def test_hook_linux_reuses_descriptors_and_checks_unique_edges(tmp_path, monkeypatch):
+    from collections import Counter
+    from types import SimpleNamespace
+    from conftest import symlink_or_skip
+
+    root = tmp_path / "tree"
+    parts = ("node",) * 48
+    root.joinpath(*parts).mkdir(parents=True)
+    alias = root / "alias"
+    symlink_or_skip(root, alias, target_is_directory=True)
+    opened = set()
+    stat_calls = Counter()
+
+    def observe(path, *, dir_fd=None, follow_symlinks=True):
+        if dir_fd is not None:
+            stat_calls[dir_fd, path] += 1
+        return os.stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    def open_dir(path, flags, *, dir_fd=None):
+        fd = os.open(path, flags, dir_fd=dir_fd)
+        if flags & os.O_DIRECTORY:
+            info = os.fstat(fd)
+            identity = info.st_dev, info.st_ino
+            assert identity not in opened
+            opened.add(identity)
+        return fd
+
+    monkeypatch.setattr(gitsafe_bound, "os", SimpleNamespace(
+        **{**vars(os), "stat": observe, "open": open_dir},
+    ))
+    assert workspace_hooks._find_git_dirs(alias.joinpath(*parts)) == (None, None)
+    marker_calls = [calls for (_, name), calls in stat_calls.items() if name == ".git"]
+    assert len(marker_calls) >= len(parts) + 1
+    assert set(marker_calls) == {2}
+
+
+@_LINUX_METADATA
+@pytest.mark.parametrize("probe", ["procfs", "filesystem", "overflow"])
+def test_hook_linux_refuses_when_observer_cannot_bind(monkeypatch, tmp_path, probe):
+    import struct
+    from types import SimpleNamespace
+
+    if probe == "procfs":
+        monkeypatch.setattr(gitsafe_bound, "_metadata_fd_root", lambda: None)
+    elif probe == "filesystem":
+        monkeypatch.setattr(gitsafe_bound, "_filesystem_supported", lambda *_: False)
+    else:
+        overflow = struct.pack("iIII", -1, 0x4000, 0, 0)
+        monkeypatch.setattr(gitsafe_bound, "os", SimpleNamespace(
+            **{**vars(os), "read": lambda *_: overflow},
+        ))
+    with pytest.raises(gitsafe.GitError) as caught:
+        workspace_hooks.resolve_git_hooks_dir(tmp_path)
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.",
+    )
+
+
+def test_bound_git_metadata_real_git(bound_metadata_layout):
+    checkout, admin, common = bound_metadata_layout
+    with _held_git_metadata(checkout) as handles:
+        assert gitsafe.bound_git_metadata(*handles, "hooks") == common / "hooks"
+        assert gitsafe.bound_git_metadata(*handles, "dirs") == (admin, common)
+        _git(checkout, "config", "core.hooksPath", "hooks local ")
+        assert gitsafe.bound_git_metadata(*handles, "hooks") == checkout / "hooks local "
+
+
+def test_bound_git_metadata_keeps_absolute_hooks_path_spelling(bound_metadata_layout):
+    from conftest import symlink_or_skip
+
+    checkout, _, _ = bound_metadata_layout
+    target = checkout / "hooks target"
+    target.mkdir()
+    alias = checkout / "hooks alias"
+    symlink_or_skip(target, alias, target_is_directory=True)
+    _git(checkout, "config", "core.hooksPath", str(alias))
+    with _held_git_metadata(checkout) as handles:
+        assert gitsafe.bound_git_metadata(*handles, "hooks") == alias
+
+
+def test_bound_git_metadata_survives_or_refuses_marker_substitution(
+    bound_metadata_layout, tmp_path, monkeypatch,
+):
+    checkout, _, _ = bound_metadata_layout
+    held_hooks = checkout / "held hooks"
+    _git(checkout, "config", "core.hooksPath", str(held_hooks))
+    staged = _repo(tmp_path / "alternate")
+    _git(staged, "config", "core.hooksPath", "alternate hooks")
+    marker = checkout / ".git"
+    spare = checkout / "held-marker"
+    other = staged / ".git"
+    if marker.is_file():
+        other = staged / "gitfile"
+        other.write_bytes(b"gitdir: " + os.fsencode(staged / ".git") + b"\n")
+    capture = gitsafe_run.capture
+    observed = []
+
+    def substitute_before_launch(*args, **kwargs):
+        marker.rename(spare)
+        other.rename(marker)
+        try:
+            result = capture(*args, **kwargs)
+            observed.append((result.returncode, result.stdout))
+            return result
+        finally:
+            marker.rename(other)
+            spare.rename(marker)
+
+    with _held_git_metadata(checkout) as handles:
+        monkeypatch.setattr(gitsafe_run, "capture", substitute_before_launch)
+        try:
+            result = gitsafe.bound_git_metadata(*handles, "hooks")
+        except gitsafe.GitError as error:
+            assert (error.code, str(error)) == (
+                "git_path_unavailable", "Git metadata path is unavailable.",
+            )
+        else:
+            assert result == held_hooks
+        assert observed == [(0, os.fsencode(held_hooks) + b"\n")]
+        monkeypatch.setattr(gitsafe_run, "capture", capture)
+        assert gitsafe.bound_git_metadata(*handles, "hooks") == held_hooks
+
+
+def test_bound_git_metadata_refuses_when_procfs_probe_is_unavailable(monkeypatch):
+    monkeypatch.setattr(gitsafe_bound, "_metadata_fd_root", lambda: None)
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.bound_git_metadata(-1, -1, "hooks")
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.",
+    )
+
+
+@pytest.mark.parametrize("record, code, message", [
+    (b"gitdir: " + b"x" * 65536, "git_path_limit", "Git path output exceeds its byte limit."),
+    (b"gitdir: first\nsecond\n", "git_path_record_invalid", "Git path record must contain one nonempty line."),
+    (b"gitdir: private-\xff\n", "git_path_encoding", "Git path is not decodable."),
+], ids=["oversized", "multiline", "encoding"])
+def test_bound_git_metadata_validates_marker_before_git(bound_metadata_layout, record, code, message, monkeypatch):
+    checkout, _, _ = bound_metadata_layout
+    marker = checkout / ".git"
+    if marker.is_dir():
+        pytest.skip("regular marker diagnostics")
+    marker.write_bytes(record)
+
+    def unexpected_git(*args, **kwargs):
+        pytest.fail("invalid marker reached the Git runner")
+
+    monkeypatch.setattr(gitsafe_run, "capture", unexpected_git)
+    with _held_git_metadata(checkout) as handles, pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.bound_git_metadata(*handles, "hooks")
+    assert (caught.value.code, str(caught.value)) == (code, message)
+
+
+def test_bound_git_metadata_closes_copy_on_short_write(bound_metadata_layout, monkeypatch):
+    import errno
+    from types import SimpleNamespace
+
+    checkout, _, _ = bound_metadata_layout
+    if (checkout / ".git").is_dir():
+        pytest.skip("regular marker copy")
+    copies = []
+
+    def create_copy(name, flags):
+        fd = os.memfd_create(name, flags)
+        copies.append(fd)
+        return fd
+
+    monkeypatch.setattr(gitsafe_bound, "os", SimpleNamespace(
+        **{**vars(os), "memfd_create": create_copy, "write": lambda fd, data: len(data) - 1},
+    ))
+    with _held_git_metadata(checkout) as handles, pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.bound_git_metadata(*handles, "hooks")
+    assert (caught.value.code, str(caught.value)) == (
+        "git_path_unavailable", "Git metadata path is unavailable.",
+    )
+    assert len(copies) == 1
+    with pytest.raises(OSError) as closed:
+        os.fstat(copies[0])
+    assert closed.value.errno == errno.EBADF
+
+
+@pytest.mark.parametrize("scenario", [
+    "checkout-rename-after-realpath",
+    "checkout-symlink-after-realpath",
+    "descriptor-root-witness",
+    "gitdir-unconfirmed-no-open",
+    "commondir-unconfirmed-no-open",
+    "torn-unlinked-record-before-decode",
+    "ancestor-post-record-swap",
+    "selecting-read-swap-gitdir",
+    "selecting-read-swap-commondir",
+])
+def test_hook_witnesses_target_identity_before_selecting_read_and_open(
+        hook_record_backend, monkeypatch, scenario):
+    from conftest import symlink_or_skip
+    from types import SimpleNamespace
+
+    outer = hook_record_backend
+    _main_repo, linked, admin, common = _linked_hook_worktree(outer)
+    expected_hooks = common / "hooks"
+    if shutil.which("git") is not None:
+        try:
+            if subprocess.run(["git", "--version"], capture_output=True, timeout=5).returncode == 0:
+                resolved_via_git = workspace_hooks.resolve_git_hooks_dir(linked)
+                assert resolved_via_git is not None
+                if subprocess.run(["git", "config", "--get", "core.hooksPath"], cwd=str(linked), capture_output=True, timeout=5).returncode != 0:
+                    assert _clean_real_path(resolved_via_git) == _clean_real_path(expected_hooks)
+        except OSError:
+            pass
+    real_pl = gitsafe.pathlookup
+    monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(**{**vars(real_pl), "which": lambda *a, **kw: None}))
+    gitsafe._reset_for_tests()
+    try:
+        assert workspace_hooks.resolve_git_hooks_dir(linked) == expected_hooks
+
+        base_os = workspace_hooks.os
+        is_descriptor = workspace_hooks.descriptor_supported()
+
+        if scenario == "descriptor-root-witness":
+            if not is_descriptor:
+                pytest.skip("descriptor-root witness exercises descriptor backend")
+            root_str = str(Path("/"))
+            real_root = os.stat(root_str, follow_symlinks=False)
+            armed = {"active": True}
+
+            def fake_stat(path, *, dir_fd=None, follow_symlinks=True):
+                info = base_os.stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+                if armed["active"] and dir_fd is None and os.fspath(path) == root_str and not follow_symlinks:
+                    return SimpleNamespace(
+                        st_mode=info.st_mode,
+                        st_ino=info.st_ino + 999999,
+                        st_dev=info.st_dev,
+                        st_size=info.st_size,
+                        st_mtime_ns=info.st_mtime_ns,
+                        st_ctime_ns=info.st_ctime_ns,
+                        st_file_attributes=getattr(info, "st_file_attributes", 0),
+                    )
+                return info
+
+            monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(**{**vars(base_os), "stat": fake_stat}))
+            with pytest.raises(gitsafe.GitError) as caught:
+                workspace_hooks.resolve_git_hooks_dir(linked)
+            assert (caught.value.code, str(caught.value)) == (
+                "git_path_unavailable", "Git metadata path is unavailable.")
+            assert real_root.st_ino != 0
+            armed["active"] = False
+            assert workspace_hooks.resolve_git_hooks_dir(linked) == expected_hooks
+            return
+
+        if scenario in ("checkout-rename-after-realpath", "checkout-symlink-after-realpath"):
+            decoy = outer / "decoy_checkout"
+            (decoy / ".git" / "hooks").mkdir(parents=True)
+            moved = outer / "moved_linked"
+            if scenario == "checkout-symlink-after-realpath":
+                probe = outer / "probe_link"
+                symlink_or_skip(decoy, probe, target_is_directory=True)
+                probe.unlink()
+            swapped = {"done": False}
+
+            def swap_after_realpath(path):
+                res = base_os.path.realpath(path)
+                if not swapped["done"] and os.path.normcase(res) == os.path.normcase(str(linked)):
+                    swapped["done"] = True
+                    linked.rename(moved)
+                    if scenario == "checkout-rename-after-realpath":
+                        decoy.rename(linked)
+                    else:
+                        os.symlink(decoy, linked, target_is_directory=True)
+                return res
+
+            patched_path = SimpleNamespace(**{**vars(base_os.path), "realpath": swap_after_realpath})
+            monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(**{**vars(base_os), "path": patched_path}))
+            with pytest.raises(gitsafe.GitError) as caught:
+                workspace_hooks.resolve_git_hooks_dir(linked)
+            assert (caught.value.code, str(caught.value)) == (
+                "git_path_unavailable", "Git metadata path is unavailable.")
+            assert swapped["done"] is True
+            if scenario == "checkout-rename-after-realpath":
+                linked.rename(decoy)
+            else:
+                linked.unlink()
+            moved.rename(linked)
+            assert workspace_hooks.resolve_git_hooks_dir(linked) == expected_hooks
+            return
+
+        if scenario == "torn-unlinked-record-before-decode":
+            gitfile = linked / ".git"
+            orig_bytes = gitfile.read_bytes()
+            bad_bytes = b"gitdir: " + b"\xff" * (len(orig_bytes) - 9) + b"\n"
+            rec_stat = gitfile.stat()
+            torn_done = {"done": False}
+
+            def unlink_and_tear_read(fd, amount):
+                chunk = base_os.read(fd, amount)
+                if not torn_done["done"] and os.path.samestat(base_os.fstat(fd), rec_stat) and chunk:
+                    torn_done["done"] = True
+                    if os.name != "nt":
+                        gitfile.unlink()
+                        gitfile.write_bytes(orig_bytes)
+                    return bad_bytes[: len(chunk)]
+                return chunk
+
+            def torn_lstat(path):
+                info = base_os.lstat(path)
+                if os.name == "nt" and torn_done["done"] and os.path.samestat(info, rec_stat):
+                    return SimpleNamespace(
+                        st_mode=info.st_mode,
+                        st_ino=info.st_ino + 1,
+                        st_dev=info.st_dev,
+                        st_size=info.st_size,
+                        st_mtime_ns=info.st_mtime_ns,
+                        st_ctime_ns=info.st_ctime_ns,
+                        st_file_attributes=getattr(info, "st_file_attributes", 0),
+                        st_reparse_tag=getattr(info, "st_reparse_tag", 0),
+                    )
+                return info
+
+            monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(
+                **{**vars(base_os), "read": unlink_and_tear_read, "lstat": torn_lstat}))
+            with pytest.raises(gitsafe.GitError) as caught:
+                workspace_hooks._find_git_dirs(linked)
+            assert (caught.value.code, str(caught.value)) == (
+                "git_path_unavailable", "Git metadata path is unavailable.")
+            monkeypatch.setattr(workspace_hooks, "os", base_os)
+            assert workspace_hooks.resolve_git_hooks_dir(linked) == expected_hooks
+            return
+
+        if scenario in ("gitdir-unconfirmed-no-open", "commondir-unconfirmed-no-open"):
+            decoy_dir = outer / "unconfirmed_decoy"
+            (decoy_dir / "hooks").mkdir(parents=True)
+            (decoy_dir / "commondir").write_bytes(b".\n")
+            decoy_stat = decoy_dir.stat()
+            target_record = (linked / ".git") if scenario == "gitdir-unconfirmed-no-open" else (admin / "commondir")
+            orig_bytes = target_record.read_bytes()
+            prefix = b"gitdir: " if scenario == "gitdir-unconfirmed-no-open" else b""
+            decoy_bytes = prefix + os.fsencode(str(decoy_dir)) + b"\n"
+            target_record.write_bytes(decoy_bytes)
+            rec_stat = target_record.stat()
+            opened_decoy = []
+            closed_once = {"done": False}
+
+            def spy_open(path, flags, mode_bits=0o777, *, dir_fd=None):
+                fd = base_os.open(path, flags, mode_bits, dir_fd=dir_fd)
+                if os.path.samestat(os.fstat(fd), decoy_stat):
+                    opened_decoy.append(path)
+                return fd
+
+            def rewrite_on_first_close(fd):
+                matches = os.path.samestat(os.fstat(fd), rec_stat)
+                base_os.close(fd)
+                if matches and not closed_once["done"]:
+                    closed_once["done"] = True
+                    target_record.write_bytes(orig_bytes)
+
+            monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(
+                **{**vars(base_os), "open": spy_open, "close": rewrite_on_first_close}))
+            with pytest.raises(gitsafe.GitError) as caught:
+                workspace_hooks.resolve_git_hooks_dir(linked)
+            assert (caught.value.code, str(caught.value)) == (
+                "git_path_unavailable", "Git metadata path is unavailable.")
+            assert opened_decoy == []
+            target_record.write_bytes(orig_bytes)
+            monkeypatch.setattr(workspace_hooks, "os", base_os)
+            assert workspace_hooks.resolve_git_hooks_dir(linked) == expected_hooks
+            return
+
+        if scenario == "ancestor-post-record-swap":
+            nested = linked / "sub" / "leaf"
+            nested.mkdir(parents=True)
+            decoy_common = outer / "decoy_common"
+            (decoy_common / "objects").mkdir(parents=True)
+            (decoy_common / "refs").mkdir()
+            (decoy_common / "hooks").mkdir()
+            (decoy_common / "worktrees" / "linked").mkdir(parents=True)
+            (decoy_common / "worktrees" / "linked" / "HEAD").write_bytes(b"0" * 40 + b"\n")
+            moved_common = outer / "moved_main_git"
+
+            def trigger_swap():
+                if not moved_common.exists():
+                    common.rename(moved_common)
+                    decoy_common.rename(common)
+
+            def swap_isfile(path):
+                if os.fspath(path).endswith("HEAD"):
+                    trigger_swap()
+                return base_os.path.isfile(path)
+
+            def swap_stat(path, *, dir_fd=None, follow_symlinks=True):
+                if os.fspath(path) == "HEAD" or os.fspath(path).endswith(os.sep + "HEAD"):
+                    trigger_swap()
+                return base_os.stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+            def swap_lstat(path):
+                if os.fspath(path).endswith("HEAD"):
+                    trigger_swap()
+                return base_os.lstat(path)
+
+            patched_path = SimpleNamespace(**{**vars(base_os.path), "isfile": swap_isfile})
+            monkeypatch.setattr(
+                workspace_hooks,
+                "os",
+                SimpleNamespace(**{**vars(base_os), "path": patched_path, "stat": swap_stat, "lstat": swap_lstat}),
+            )
+            with pytest.raises(gitsafe.GitError) as caught:
+                workspace_hooks._find_git_dirs(nested)
+            assert (caught.value.code, str(caught.value)) == (
+                "git_path_unavailable", "Git metadata path is unavailable.")
+            assert moved_common.exists()
+            common.rename(decoy_common)
+            moved_common.rename(common)
+            monkeypatch.setattr(workspace_hooks, "os", base_os)
+            assert workspace_hooks._find_git_dirs(nested) == (admin, common)
+            return
+
+        # selecting-read-swap-gitdir / selecting-read-swap-commondir
+        is_gitdir = scenario == "selecting-read-swap-gitdir"
+        alt_admin = outer / "alt_admin"
+        alt_common = outer / "alt_common"
+        alt_admin.mkdir()
+        (alt_common / "hooks").mkdir(parents=True)
+        (alt_admin / "commondir").write_bytes(os.fsencode(str(alt_common)) + b"\n")
+        decoy_target = outer / "swap_decoy"
+        (decoy_target / "hooks").mkdir(parents=True)
+        (decoy_target / "commondir").write_bytes(os.fsencode(str(alt_common)) + b"\n")
+        (linked / ".git").write_bytes(b"gitdir: " + os.fsencode(str(alt_admin)) + b"\n")
+        record_file = (linked / ".git") if is_gitdir else (alt_admin / "commondir")
+        victim_dir = alt_admin if is_gitdir else alt_common
+        moved_victim = outer / "moved_victim"
+        rec_stat = record_file.stat()
+        opens = {"n": 0}
+
+        def swap_on_selecting_open(path, flags, mode_bits=0o777, *, dir_fd=None):
+            fd = base_os.open(path, flags, mode_bits, dir_fd=dir_fd)
+            if os.path.samestat(os.fstat(fd), rec_stat):
+                opens["n"] += 1
+                if opens["n"] == 2 and not moved_victim.exists():
+                    victim_dir.rename(moved_victim)
+                    decoy_target.rename(victim_dir)
+            return fd
+
+        monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(
+            **{**vars(base_os), "open": swap_on_selecting_open}))
+        with pytest.raises(gitsafe.GitError) as caught:
+            workspace_hooks.resolve_git_hooks_dir(linked)
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_unavailable", "Git metadata path is unavailable.")
+        victim_dir.rename(decoy_target)
+        moved_victim.rename(victim_dir)
+        monkeypatch.setattr(workspace_hooks, "os", base_os)
+        assert workspace_hooks.resolve_git_hooks_dir(linked) == alt_common / "hooks"
+    finally:
+        gitsafe._reset_for_tests()
+
+
+@pytest.mark.parametrize("route", ["git_answer", "fallback"])
+@pytest.mark.parametrize("mutated", ["checkout", "checkout_alias", "gitfile_marker", "dir_marker", "absent_marker"])
+def test_hook_carries_checkout_and_marker_continuity_through_git_and_fallback(
+        hook_record_backend, monkeypatch, route, mutated):
+    from conftest import symlink_or_skip
+    from types import SimpleNamespace
+
+    outer = hook_record_backend
+    _main_repo, linked, _admin, common = _linked_hook_worktree(outer)
+    std_repo = outer / "std_repo"
+    (std_repo / ".git" / "hooks").mkdir(parents=True)
+    plain_dir = outer / "plain_dir"
+    plain_dir.mkdir()
+    custom_hooks = outer / "custom_hooks"
+    custom_hooks.mkdir()
+    decoy_hooks = outer / "decoy_hooks"
+    decoy_hooks.mkdir()
+    decoy_checkout = outer / "decoy_checkout"
+    (decoy_checkout / ".git" / "hooks").mkdir(parents=True)
+
+    real_pl = gitsafe.pathlookup
+    monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(**{**vars(real_pl), "which": lambda *a, **kw: None}))
+    gitsafe._reset_for_tests()
+    try:
+        if mutated == "absent_marker":
+            base_os = workspace_hooks.os
+            created = {"done": False}
+
+            def appear_stat(path, *, dir_fd=None, follow_symlinks=True):
+                res = base_os.stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+                return res
+
+            orig_lstat = base_os.lstat
+            seen_absent = {"n": 0}
+
+            def create_after_absent_lstat(path):
+                try:
+                    return orig_lstat(path)
+                except FileNotFoundError:
+                    if os.fspath(path).endswith(".git") and not created["done"]:
+                        seen_absent["n"] += 1
+                        if seen_absent["n"] == 1:
+                            created["done"] = True
+                            (plain_dir / ".git").write_bytes(b"gitdir: " + os.fsencode(str(decoy_hooks)) + b"\n")
+                    raise
+
+            def create_after_absent_dir_stat(path, *, dir_fd=None, follow_symlinks=True):
+                try:
+                    return base_os.stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+                except FileNotFoundError:
+                    if path == ".git" and not follow_symlinks and not created["done"]:
+                        created["done"] = True
+                        (plain_dir / ".git").write_bytes(b"gitdir: " + os.fsencode(str(decoy_hooks)) + b"\n")
+                    raise
+
+            monkeypatch.setattr(
+                workspace_hooks,
+                "os",
+                SimpleNamespace(
+                    **{
+                        **vars(base_os),
+                        "lstat": create_after_absent_lstat,
+                        "stat": create_after_absent_dir_stat if workspace_hooks.descriptor_supported() else appear_stat,
+                    }
+                ),
+            )
+            with pytest.raises(gitsafe.GitError) as caught:
+                workspace_hooks.resolve_git_hooks_dir(plain_dir)
+            assert (caught.value.code, str(caught.value)) == (
+                "git_path_unavailable", "Git metadata path is unavailable.")
+            (plain_dir / ".git").unlink()
+            monkeypatch.setattr(workspace_hooks, "os", base_os)
+            assert workspace_hooks.resolve_git_hooks_dir(plain_dir) is None
+            return
+
+        alias_root = outer / "checkout_alias"
+        if mutated == "checkout_alias":
+            symlink_or_skip(linked, alias_root, target_is_directory=True)
+            target_root = alias_root
+        elif mutated == "dir_marker":
+            target_root = std_repo
+        else:
+            target_root = linked
+
+        moved = outer / "continuity_moved"
+        armed = {"active": True}
+
+        def perform_mutation():
+            if armed["active"] and not moved.exists():
+                if mutated == "checkout":
+                    target_root.rename(moved)
+                    (target_root / ".git" / "hooks").mkdir(parents=True)
+                elif mutated == "checkout_alias":
+                    moved.mkdir()
+                    alias_root.unlink()
+                    os.symlink(decoy_checkout, alias_root, target_is_directory=True)
+                elif mutated == "gitfile_marker":
+                    (linked / ".git").rename(moved)
+                    (linked / ".git").write_bytes(b"gitdir: " + os.fsencode(str(decoy_hooks)) + b"\n")
+                else:
+                    (std_repo / ".git").rename(moved)
+                    (std_repo / ".git" / "hooks").mkdir(parents=True)
+
+        if route == "git_answer":
+            def fake_git_path(root, rel):
+                perform_mutation()
+                return custom_hooks
+
+            monkeypatch.setattr(gitsafe, "git_path", fake_git_path)
+        else:
+            def mutating_which(name, **options):
+                perform_mutation()
+                return None
+
+            monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(**{**vars(real_pl), "which": mutating_which}))
+
+        with pytest.raises(gitsafe.GitError) as caught:
+            workspace_hooks.resolve_git_hooks_dir(target_root)
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_unavailable", "Git metadata path is unavailable.")
+
+        armed["active"] = False
+        gitsafe._reset_for_tests()
+        if mutated == "checkout":
+            shutil.rmtree(target_root)
+            moved.rename(target_root)
+        elif mutated == "checkout_alias":
+            shutil.rmtree(moved)
+            alias_root.unlink()
+            os.symlink(linked, alias_root, target_is_directory=True)
+        elif mutated == "gitfile_marker":
+            (linked / ".git").unlink()
+            moved.rename(linked / ".git")
+        else:
+            shutil.rmtree(std_repo / ".git")
+            moved.rename(std_repo / ".git")
+
+        expected = (
+            custom_hooks
+            if route == "git_answer"
+            else ((std_repo / ".git" / "hooks") if mutated == "dir_marker" else (common / "hooks"))
+        )
+        assert workspace_hooks.resolve_git_hooks_dir(target_root) == expected
+    finally:
+        gitsafe._reset_for_tests()
+
+
+@pytest.mark.usefixtures("retained_hook_backends")
+def test_hook_windows_junctions_keep_head_selection(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    backing = tmp_path.resolve() / "win_head_junc"
+    backing.mkdir()
+    state = {"junctions": {}, "reparse_tags": {}, "on_close": None, "on_lstat": None}
+    win_os = _windows_hook_os(backing, state)
+    real_pl = gitsafe.pathlookup
+    monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(**{**vars(real_pl), "which": lambda *a, **kw: None}))
+    gitsafe._reset_for_tests()
+    monkeypatch.setattr(workspace_hooks, "descriptor_supported", lambda: False)
+    monkeypatch.setattr(workspace_hooks, "os", win_os)
+    try:
+        drive_c = backing / "drive_c"
+        drive_d = backing / "drive_d"
+
+        # 1. Linked worktree behind a junction with standard '../..' commondir and absent commondir
+        wt_meta = drive_d / "repo" / ".git" / "worktrees" / "wt1"
+        (drive_d / "repo" / ".git" / "objects").mkdir(parents=True)
+        (drive_d / "repo" / ".git" / "refs").mkdir()
+        (drive_d / "repo" / ".git" / "hooks").mkdir()
+        wt_meta.mkdir(parents=True)
+        (wt_meta / "HEAD").write_bytes(b"0" * 40 + b"\n")
+        (wt_meta / "commondir").write_bytes(b"../..\n")
+        (drive_c / "ws" / "checkout").mkdir(parents=True)
+        (drive_c / "ws" / "junc_wt").mkdir(parents=True)
+        state["junctions"][r"c:\ws\junc_wt"] = r"D:\repo\.git\worktrees\wt1"
+        (drive_c / "ws" / "checkout" / ".git").write_bytes(b"gitdir: ../junc_wt\n")
+
+        expected_pair = (
+            Path(r"D:\repo\.git\worktrees\wt1"),
+            Path(r"D:\repo\.git"),
+        )
+        assert workspace_hooks._find_git_dirs(Path(r"C:\ws\checkout")) == expected_pair
+        assert workspace_hooks._find_git_dirs(Path(r"C:\ws\checkout\missing_sub")) == expected_pair
+        assert workspace_hooks.resolve_git_hooks_dir(r"C:\ws\checkout") == Path(r"D:\repo\.git\hooks")
+
+        # Absent commondir under worktrees/ still resolves '../..' from the resolved junction target
+        (wt_meta / "commondir").unlink()
+        assert workspace_hooks.resolve_git_hooks_dir(r"C:\ws\checkout") == Path(r"D:\repo\.git\hooks")
+        (wt_meta / "commondir").write_bytes(b"../..\n")
+
+        # 2. Checkout itself passed through a Windows junction
+        (drive_c / "alias_checkout").mkdir(parents=True)
+        state["junctions"][r"c:\alias_checkout"] = r"C:\ws\checkout"
+        assert workspace_hooks.resolve_git_hooks_dir(r"C:\alias_checkout") == Path(r"D:\repo\.git\hooks")
+    finally:
+        gitsafe._reset_for_tests()
+
+
+@pytest.mark.usefixtures("retained_hook_backends")
+def test_hook_public_entries_return_concrete_native_paths(tmp_path, monkeypatch):
+    from pathlib import PurePath, PurePosixPath, PureWindowsPath
+    from types import SimpleNamespace
+
+    native_cls = type(Path("."))
+    outer = _clean_real_path(tmp_path)
+    _main_repo, linked, admin, common = _linked_hook_worktree(outer)
+    real_git_path = gitsafe.git_path
+    real_pl = gitsafe.pathlookup
+
+    # 1. gitsafe.git_path returning a PurePath still yields a concrete native Path
+    pure_custom = PureWindowsPath(str(common / "hooks")) if os.name == "nt" else PurePosixPath(str(common / "hooks"))
+    monkeypatch.setattr(gitsafe, "git_path", lambda *_: pure_custom)
+    via_git = workspace_hooks.resolve_git_hooks_dir(linked)
+    assert isinstance(via_git, Path) and type(via_git) is native_cls
+    monkeypatch.setattr(gitsafe, "git_path", real_git_path)
+
+    # 2. Fallback with Git unavailable on native linked worktree returns concrete native Paths
+    monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(**{**vars(real_pl), "which": lambda *a, **kw: None}))
+    gitsafe._reset_for_tests()
+    try:
+        via_fallback = workspace_hooks.resolve_git_hooks_dir(linked)
+        git_dir, common_dir = workspace_hooks._find_git_dirs(linked)
+        for item in (via_fallback, git_dir, common_dir):
+            assert isinstance(item, Path) and type(item) is native_cls and isinstance(item, PurePath)
+        assert (git_dir, common_dir, via_fallback) == (admin, common, common / "hooks")
+
+        # 3. Modeled Windows with Git unavailable also returns concrete native Paths, never PureWindowsPath
+        backing = outer / "win_concrete"
+        backing.mkdir()
+        state = {"junctions": {}, "reparse_tags": {}}
+        win_os = _windows_hook_os(backing, state)
+        (backing / "drive_c" / "repo" / ".git" / "hooks").mkdir(parents=True)
+        monkeypatch.setattr(workspace_hooks, "descriptor_supported", lambda: False)
+        monkeypatch.setattr(workspace_hooks, "os", win_os)
+        win_hooks = workspace_hooks.resolve_git_hooks_dir(r"C:\repo")
+        win_git, win_common = workspace_hooks._find_git_dirs(Path(r"C:\repo"))
+        for item in (win_hooks, win_git, win_common):
+            assert isinstance(item, Path) and type(item) is native_cls
+        assert str(win_hooks) == r"C:\repo\.git\hooks"
+    finally:
+        gitsafe._reset_for_tests()
+
+
+@pytest.mark.parametrize("layout", [
+    "abs-gitdir-rel-common",
+    "abs-both",
+    "revisit-detour",
+    "ancestor-walk",
+    "dir-marker-fallback",
+])
+@pytest.mark.usefixtures("retained_hook_backends")
+def test_hook_one_live_descriptor_chain_without_duplicate_reopens(tmp_path, monkeypatch, layout):
+    from types import SimpleNamespace
+
+    outer = _clean_real_path(tmp_path)
+    main_repo, linked, admin, common = _linked_hook_worktree(outer)
+    real_pl = gitsafe.pathlookup
+    monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(**{**vars(real_pl), "which": lambda *a, **kw: None}))
+    gitsafe._reset_for_tests()
+    try:
+        if not workspace_hooks.descriptor_supported():
+            monkeypatch.setattr(workspace_hooks, "descriptor_supported", lambda: False)
+            assert workspace_hooks.resolve_git_hooks_dir(linked) == common / "hooks"
+            return
+
+        if layout == "abs-both":
+            (admin / "commondir").write_bytes(os.fsencode(str(common)) + b"\n")
+        elif layout == "revisit-detour":
+            detour = common / "worktrees" / "linked"
+            rel = f"../main_repo/.git/worktrees/{detour.name}/../{detour.name}\n"
+            (linked / ".git").write_bytes(b"gitdir: " + os.fsencode(rel))
+            (admin / "commondir").write_bytes(b"../../worktrees/..\n")
+
+        nested = linked / "a" / "b" / "c"
+        nested.mkdir(parents=True)
+
+        opened_dirs = []
+        live_fds = set()
+        base_os = workspace_hooks.os
+
+        def tracking_open(path, flags, mode_bits=0o777, *, dir_fd=None):
+            fd = base_os.open(path, flags, mode_bits, dir_fd=dir_fd)
+            live_fds.add(fd)
+            if flags & getattr(os, "O_DIRECTORY", 0):
+                st = base_os.fstat(fd)
+                opened_dirs.append((st.st_dev, st.st_ino, path))
+            return fd
+
+        def tracking_close(fd):
+            live_fds.discard(fd)
+            base_os.close(fd)
+
+        monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(
+            **{**vars(base_os), "open": tracking_open, "close": tracking_close}))
+
+        if layout == "ancestor-walk":
+            assert workspace_hooks._find_git_dirs(nested) == (admin, common)
+        elif layout == "dir-marker-fallback":
+            assert workspace_hooks.resolve_git_hooks_dir(main_repo) == common / "hooks"
+        else:
+            assert workspace_hooks.resolve_git_hooks_dir(linked) == common / "hooks"
+
+        dir_identities = [(dev, ino) for dev, ino, _ in opened_dirs]
+        assert dir_identities
+        assert len(dir_identities) == len(set(dir_identities)), f"duplicate directory reopens: {opened_dirs}"
+        assert live_fds == set()
+    finally:
+        gitsafe._reset_for_tests()
+
+
+@pytest.mark.usefixtures("retained_hook_backends")
+def test_hook_ctime_expectation_follows_native_generation(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    outer = _clean_real_path(tmp_path)
+    _main_repo, linked, _admin, common = _linked_hook_worktree(outer)
+    gitfile_stat = (linked / ".git").stat()
+    real_pl = gitsafe.pathlookup
+    monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(**{**vars(real_pl), "which": lambda *a, **kw: None}))
+    gitsafe._reset_for_tests()
+    monkeypatch.setattr(workspace_hooks, "descriptor_supported", lambda: False)
+    try:
+        def bumped_fstat(fd):
+            st = os.fstat(fd)
+            if os.path.samestat(st, gitfile_stat):
+                return SimpleNamespace(
+                    st_mode=st.st_mode,
+                    st_ino=st.st_ino,
+                    st_dev=st.st_dev,
+                    st_size=st.st_size,
+                    st_mtime_ns=st.st_mtime_ns,
+                    st_ctime_ns=st.st_ctime_ns + 5_000_000_000,
+                    st_file_attributes=getattr(st, "st_file_attributes", 0),
+                )
+            return st
+
+        monkeypatch.setattr(workspace_hooks, "os", SimpleNamespace(**{**vars(os), "fstat": bumped_fstat}))
+        if os.name == "nt":
+            assert workspace_hooks.resolve_git_hooks_dir(linked) == common / "hooks"
+        else:
+            with pytest.raises(gitsafe.GitError) as caught:
+                workspace_hooks.resolve_git_hooks_dir(linked)
+            assert caught.value.code == "git_path_unavailable"
+    finally:
+        gitsafe._reset_for_tests()
+
+
+@pytest.mark.parametrize("modeled", [False, True])
+def test_hook_posix_parser_and_parent_predicate_agree_on_backslash(
+        hook_record_backend, monkeypatch, modeled):
+    from types import SimpleNamespace
+
+    real_pl = gitsafe.pathlookup
+    monkeypatch.setattr(gitsafe, "pathlookup", SimpleNamespace(**{**vars(real_pl), "which": lambda *a, **kw: None}))
+    gitsafe._reset_for_tests()
+    try:
+        if not modeled:
+            if os.name == "nt":
+                pytest.skip("literal backslash in directory names requires POSIX filesystem")
+            root = hook_record_backend / "bs_checkout"
+            records = root / "records"
+            child_bs = records / "child\\"
+            admin_bs = records / "admin\\"
+            decoy_dotdot = records / "child\\.."
+            shared = records / "shared"
+            for folder in (child_bs, admin_bs, decoy_dotdot / "hooks", shared / "hooks"):
+                folder.mkdir(parents=True)
+            (root / ".git").write_bytes(b"gitdir: records/child\\/../admin\\\n")
+            (admin_bs / "commondir").write_bytes(b"../shared\n")
+            assert workspace_hooks.resolve_git_hooks_dir(root) == shared / "hooks"
+            assert workspace_hooks._find_git_dirs(root) == (admin_bs, shared)
+            return
+
+        # Modeled POSIX portable VFS so Windows CI also exercises POSIX backslash component + '..' spelling
+        monkeypatch.setattr(workspace_hooks, "descriptor_supported", lambda: False)
+        vfs_dirs = {
+            "/": (1, 10),
+            "/ws": (1, 11),
+            "/ws/checkout": (1, 12),
+            "/ws/checkout/child\\": (1, 13),
+            "/ws/checkout/admin\\": (1, 14),
+            "/ws/checkout/shared": (1, 15),
+            "/ws/checkout/child\\..": (1, 99),
+        }
+        vfs_files = {
+            "/ws/checkout/.git": (1, 20, b"gitdir: child\\/../admin\\\n"),
+            "/ws/checkout/admin\\/commondir": (1, 21, b"../shared\n"),
+        }
+
+        def _collapse_posix(raw_p):
+            text = os.fspath(raw_p)
+            if not text.startswith("/"):
+                raise FileNotFoundError(text)
+            out = []
+            for part in text.split("/"):
+                if part in ("", "."):
+                    continue
+                if part == "..":
+                    if out:
+                        out.pop()
+                else:
+                    out.append(part)
+            return "/" + "/".join(out)
+
+        def fake_lstat(p):
+            norm = _collapse_posix(p)
+            if norm in vfs_dirs:
+                dev, ino = vfs_dirs[norm]
+                return SimpleNamespace(
+                    st_mode=stat.S_IFDIR | 0o755, st_dev=dev, st_ino=ino,
+                    st_size=0, st_mtime_ns=100, st_ctime_ns=100, st_file_attributes=0)
+            if norm in vfs_files:
+                dev, ino, data = vfs_files[norm]
+                return SimpleNamespace(
+                    st_mode=stat.S_IFREG | 0o644, st_dev=dev, st_ino=ino,
+                    st_size=len(data), st_mtime_ns=100, st_ctime_ns=100, st_file_attributes=0)
+            raise FileNotFoundError(norm)
+
+        fd_table = {}
+        next_fd = {"n": 500}
+
+        def fake_open(p, flags, mode_bits=0o777, *, dir_fd=None):
+            norm = _collapse_posix(p)
+            if norm not in vfs_files:
+                raise FileNotFoundError(norm)
+            fd = next_fd["n"]
+            next_fd["n"] += 1
+            dev, ino, data = vfs_files[norm]
+            fd_table[fd] = [dev, ino, data, 0]
+            return fd
+
+        def fake_fstat(fd):
+            dev, ino, data, _pos = fd_table[fd]
+            return SimpleNamespace(
+                st_mode=stat.S_IFREG | 0o644, st_dev=dev, st_ino=ino,
+                st_size=len(data), st_mtime_ns=100, st_ctime_ns=100, st_file_attributes=0)
+
+        def fake_read(fd, amount):
+            entry = fd_table[fd]
+            chunk = entry[2][entry[3] : entry[3] + amount]
+            entry[3] += len(chunk)
+            return chunk
+
+        def fake_close(fd):
+            fd_table.pop(fd, None)
+
+        posix_path_mod = SimpleNamespace(
+            **{
+                **vars(os.path),
+                "realpath": _collapse_posix,
+                "islink": lambda _p: False,
+                "lexists": lambda p: _collapse_posix(p) in vfs_dirs or _collapse_posix(p) in vfs_files,
+            }
+        )
+        monkeypatch.setattr(
+            workspace_hooks,
+            "os",
+            SimpleNamespace(
+                **{
+                    **vars(os),
+                    "name": "posix",
+                    "sep": "/",
+                    "altsep": None,
+                    "fsencode": lambda s: s.encode("utf-8"),
+                    "fsdecode": lambda b: b.decode("utf-8"),
+                    "lstat": fake_lstat,
+                    "stat": lambda p, *, dir_fd=None, follow_symlinks=True: fake_lstat(p),
+                    "open": fake_open,
+                    "fstat": fake_fstat,
+                    "read": fake_read,
+                    "close": fake_close,
+                    "path": posix_path_mod,
+                }
+            ),
+        )
+        resolved = workspace_hooks.resolve_git_hooks_dir("/ws/checkout")
+        assert isinstance(resolved, Path) and type(resolved) is type(Path("."))
+        assert resolved.as_posix() == "/ws/checkout/shared/hooks"
+    finally:
+        gitsafe._reset_for_tests()
 
 
 def test_a_memo_scope_asks_git_once_for_the_top_level_and_the_common_dir(repo: Path, git_calls):
