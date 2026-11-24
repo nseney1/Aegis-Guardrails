@@ -7,6 +7,13 @@ from aegis_core.message_codec_format import MAX_OUTPUT_CHARS, frontend_error, re
 from aegis_core.workspace.base import Workspace
 
 
+_FLAT_LAYOUT_MESSAGE = (
+    "flat message store layout is unsupported. Ask the workspace owner to preserve the old "
+    ".aegis/state/messages directory by moving it aside, then prepare a fresh default store. "
+    "Old references are unavailable in the fresh store."
+)
+
+
 class MessageText(str):
     """Already rendered by the codec; the transport must preserve these characters."""
 
@@ -38,7 +45,7 @@ def handle_msg_read(args):
         with _store(args.get("workspace"), write=False) as store:
             return MessageText(codec.read_stored_view(store, args.get("ref"), prepared))
     except codec.CodecError as error:
-        return frontend_error(error, detail=error.detail)
+        return frontend_error(error, detail=error.detail, flat_layout_message=_FLAT_LAYOUT_MESSAGE)
     except WorkspaceError:
         return codec.CodecError("E_AUTH").as_dict()
     except OSError:
@@ -58,7 +65,8 @@ def handle_msg_write(args):
             rid = store.write(value)
             return {"id": rid, "ref": rid[:16]}
     except codec.CodecError as error:
-        return frontend_error(error, detail="write_ref" if error.code == "E_REF" else error.detail)
+        detail = "write_ref" if error.code == "E_REF" else error.detail
+        return frontend_error(error, detail=detail, flat_layout_message=_FLAT_LAYOUT_MESSAGE)
     except WorkspaceError:
         return codec.CodecError("E_AUTH").as_dict()
     except OSError:
