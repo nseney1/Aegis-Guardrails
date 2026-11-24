@@ -7,6 +7,10 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shutil
+import subprocess
+
+import pytest
 
 from aegis_cli.doctor import _check_precommit_hook
 from aegis_cli.init import (
@@ -16,32 +20,30 @@ from aegis_cli.init import (
 )
 from aegis_core.workspace.hooks import resolve_git_hooks_dir
 
+_NEEDS_GIT = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-c", "user.email=t@example.com", "-c", "user.name=T", "-c", "commit.gpgsign=false", *args],
+        cwd=str(cwd),
+        check=True,
+        capture_output=True,
+    )
+
 
 def _setup_mock_worktree(tmp_path: Path) -> tuple[Path, Path]:
-    """Create a mock main git repo and an attached worktree layout.
-    
+    """Create a main git repo and an attached worktree layout.
+
     Returns (main_repo_path, worktree_path).
     """
     main_repo = tmp_path / "main_repo"
     main_repo.mkdir()
-    git_dir = main_repo / ".git"
-    git_dir.mkdir()
-    hooks_dir = git_dir / "hooks"
-    hooks_dir.mkdir()
-    
-    worktrees_meta = git_dir / "worktrees" / "my_worktree"
-    worktrees_meta.mkdir(parents=True)
-    
-    # In git worktrees, commondir points back to the main .git dir
-    (worktrees_meta / "commondir").write_text("../..\n", encoding="utf-8")
-    (worktrees_meta / "gitdir").write_text(str(tmp_path / "my_worktree" / ".git") + "\n", encoding="utf-8")
-    
+    _git(main_repo, "init", "-q", "-b", "main")
+    _git(main_repo, "commit", "-q", "--allow-empty", "-m", "init")
+    (main_repo / ".git" / "hooks").mkdir(exist_ok=True)
     worktree = tmp_path / "my_worktree"
-    worktree.mkdir()
-    
-    # .git in worktree is a file pointing to worktrees_meta
-    (worktree / ".git").write_text(f"gitdir: {worktrees_meta}\n", encoding="utf-8")
-    
+    _git(main_repo, "worktree", "add", "-q", "--detach", str(worktree))
     return main_repo, worktree
 
 
@@ -59,6 +61,7 @@ class TestGitHooksDirResolution:
         assert resolved is not None
         assert resolved.resolve() == hooks.resolve()
 
+    @_NEEDS_GIT
     def test_worktree_resolves_main_repo_hooks(self, tmp_path: Path):
         """Worktree with .git file resolves to main repository hooks directory."""
         main_repo, worktree = _setup_mock_worktree(tmp_path)
@@ -68,17 +71,16 @@ class TestGitHooksDirResolution:
         assert resolved is not None
         assert resolved.resolve() == expected_hooks.resolve()
 
+    @_NEEDS_GIT
     def test_worktree_with_relative_gitdir(self, tmp_path: Path):
         """Worktree with relative gitdir path resolves properly."""
         main_repo = tmp_path / "main_repo"
         main_repo.mkdir()
-        (main_repo / ".git" / "hooks").mkdir(parents=True)
-        worktrees_meta = main_repo / ".git" / "worktrees" / "wt1"
-        worktrees_meta.mkdir(parents=True)
-        (worktrees_meta / "commondir").write_text("../..\n", encoding="utf-8")
-
+        _git(main_repo, "init", "-q", "-b", "main")
+        _git(main_repo, "commit", "-q", "--allow-empty", "-m", "init")
+        (main_repo / ".git" / "hooks").mkdir(exist_ok=True)
         worktree = tmp_path / "wt1"
-        worktree.mkdir()
+        _git(main_repo, "worktree", "add", "-q", "--detach", str(worktree))
         (worktree / ".git").write_text("gitdir: ../main_repo/.git/worktrees/wt1\n", encoding="utf-8")
 
         resolved = resolve_git_hooks_dir(worktree)
@@ -93,6 +95,7 @@ class TestGitHooksDirResolution:
         assert resolve_git_hooks_dir(plain_dir) is None
 
 
+@_NEEDS_GIT
 class TestWorktreeHookInstallation:
     """Tests for install_hook and doctor in worktrees."""
 
