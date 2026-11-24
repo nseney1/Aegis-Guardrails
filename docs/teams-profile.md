@@ -173,7 +173,7 @@ generic object merge: the repository layer may only narrow them. See
 | `policy` | `landing` | target_branch, strategy (combined-full/batch/direct), batch_max, signature_required_for array; publish object with remote and app |
 | `model_settings` | `hosts` | Named objects with registered `kind`; user-only auth_mode (sso/api/token) |
 | `model_settings` | `roles` | writer, reviewer.correctness, reviewer.security, lens.extra, research; each has hosts (an ordered declared chain), optional model and effort strings, optional and pinned_family booleans |
-| `model_settings` | `capacity` | Per declared host: usage_source (subscription-window/credits/none), thresholds (hold_pct/route_pct/flex_route_pct), fallback (per-kind arrays of declared hosts or hold/skip terminals) |
+| `model_settings` | `capacity` | Per declared host: usage_source (subscription-window/credits/none), thresholds (hold_pct/route_pct/flex_route_pct), window_thresholds (repository overrides by usage window), fallback (per-kind arrays of declared hosts or hold/skip terminals) |
 | `run_config` | `runners` | Named objects with cpus, image, provider; user-only pool, credentials and budget_usd_month |
 | `run_config` | `autopilot` | queue_full_on_ready, claim_next, resume_writer booleans; rulings |
 | `run_config` | `limits` | Repository-only writers_max, votes_max, research_max |
@@ -397,8 +397,12 @@ KIND is `writer`, `research`, a declared reviewer role or lens, or generic `doc`
 Undeclared or disabled role/lens bindings refuse.
 
 Per-host `usage_source` is `subscription-window`, `credits` or `none` (default).
-Adapters normalize a subscription snapshot to `window.used_pct` and UTC
-`window.resets_at`, or a credit snapshot to `credits_left`; zero credits hold.
+Subscription adapters can return `windows`, an object with one to eight entries
+such as `5h` and `7d`. Each entry has `used_pct` (0–100) and `resets_at` in
+`YYYY-MM-DDTHH:MM:SSZ` format. Window keys are durations with a positive
+one- to eight-digit count and a suffix of `s`, `m`, `h`, `d`, `w`, or `mo`.
+The original `window` snapshot keeps its single-window threshold and decision
+semantics. A credit snapshot uses `credits_left`, and zero credits hold.
 `none` disables usage tracking. Real host readers are extension points: no
 credential reader ships here. An unconfigured, failing or malformed reader
 produces `unknown` for that host and does not block work by capacity advice alone;
@@ -410,6 +414,19 @@ Usage at or above the relevant threshold holds or follows a fallback. Profile
 overrides must satisfy `flex_route_pct <= route_pct <= hold_pct`; unspecified
 lower thresholds clamp to an explicitly lower hold/route value. User preferences
 that conflict with repository thresholds are recorded as ignored.
+
+The repository can set `model_settings.capacity.<host>.window_thresholds` for
+specific durations. Each window inherits the host's thresholds and may override
+any of the three values. The same ordering and clamping rules apply within
+each window.
+
+With a `windows` snapshot, any measurement that reaches the job's threshold
+before its reset can hold the job or advance its fallback chain. A hold names
+the latest reset among the windows that reached the threshold. At and after its
+reset, a measurement no longer counts toward the decision. With no current
+measurements, or when a configured duration is missing or expired, the usage
+status is `unknown`. A current measurement that reaches the threshold still
+holds or advances the chain when another window's evidence is unknown.
 
 Canonical role-specific fallback keys override generic chains, including empty
 overrides. Aliases resolve before key selection. The first `hold` or `skip`
