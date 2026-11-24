@@ -1,10 +1,8 @@
 # Teams tooling absorption
 
-TA-0 establishes the package boundary for the accepted tools absorption ADR
-(2026-11-11, sections 2 and 5). It adds the template resource namespace and a
-mandatory size rule. It does not move templates, port commands, register tools,
-switch an existing run, or change host-plan discovery. TA-4 owns the template
-move, including the currently leased model bindings.
+TA-0 established the package boundary and mandatory size rule for the accepted
+tools absorption ADR (2026-11-11, sections 2 and 5). TA-4 owns migration of the
+legacy templates, including the leased model bindings.
 
 ## Package layout and size rule
 
@@ -36,52 +34,91 @@ measurement matches.
 
 ## Templates and distribution
 
-`aegis_core.team_templates` is an explicitly registered Python package. Its
-package-data patterns cover root and nested assets; explicit package-data
-exclusions keep `__pycache__` contents and `.pyc`/`.pyo`/`.pyd` out of wheels
-built directly from dirty checkouts. The existing
-`recursive-include aegis_core *` in `MANIFEST.in` carries those sources into the
-sdist; no additional manifest directive is needed. Read installed trusted assets
-with `importlib.resources.files("aegis_core.team_templates").joinpath(...)` using
-fixed resource names. Python 3.9 supports this API. User paths must never become
-resource names. Do not resolve templates relative to the working directory or
-import from an editable checkout at runtime. `.github/scripts/verify_dist.py`
-uses one admission rule for wheel members and sdist members beneath their one
+`aegis_core.team_templates` ships `role-registry.json` and `job-recipes.json`.
+[`team_roles.registry()`](../aegis_core/team_roles.py) reads the installed role
+registry using a fixed resource name.
+
+1. Add the resource under `aegis_core/team_templates/`. The package-data
+   patterns in [`pyproject.toml`](../pyproject.toml) cover root and nested assets.
+   The `recursive-include aegis_core *` directive in
+   [`MANIFEST.in`](../MANIFEST.in) includes them in the sdist. Register any new
+   Python family package in the explicit setuptools package list.
+2. For a resource added at `roles/builder.md`, read the installed bytes with
+   one fixed child per `joinpath` call for Python 3.9 compatibility. Keep user
+   input out of resource lookup.
+
+   ```python
+   from importlib import resources
+
+   package = resources.files("aegis_core.team_templates")
+   template = package.joinpath("roles").joinpath("builder.md")
+   template_bytes = template.read_bytes()
+   ```
+
+3. Run `python -m build` from the Aegis source root with a clean `dist/`. Check
+   that the wheel and sdist contain the resource at the expected package-relative
+   path (beneath the sdist's top-level directory) and that its bytes match the
+   source. Install the wheel and read back the resource with the checkout hidden.
+   See [archive admission](#archive-admission) and the
+   [build-parity test](../tests/unit/cli/test_install_package_data.py),
+   `test_verify_dist_record_matches_the_built_team_templates`, which checks
+   the wheel's template inventory and runs both verifier commands on built
+   artifacts. The dirty-checkout wheel test also checks that nested resources
+   ship and bytecode is excluded.
+
+Record the checked artifacts and verify the same files in this order.
+
+```sh
+python .github/scripts/verify_dist.py record dist
+python .github/scripts/verify_dist.py verify dist
+```
+
+`record` checks both archives before writing `dist/SHA256SUMS`. `verify`
+checks the recorded digests and archive contents again. Use its printed paths
+only after it exits successfully. The [validation workflow](../.github/workflows/validate.yml)
+builds and records the artifacts. The [publish workflow](../.github/workflows/publish.yml)
+downloads that artifact and verifies it before staging files for upload.
+
+### Archive admission
+
+[`verify_dist.py`](../.github/scripts/verify_dist.py) shares checks for portable
+names, member shape, namespace collisions and protected locations across both
+formats. Member shape is checked against ZIP metadata for the wheel and tar
+metadata for the sdist. The sdist applies these checks beneath its single
 validated root. Every component must match one portable grammar (ASCII letters,
 digits, and `._+-`, or an NFKC-stable letter), must not be a Windows device name
 (`CON`, `NUL`, `AUX`, `PRN`, `COM1`–`COM9`, `LPT1`–`LPT9`) in any case or with
 any extension. One protected-prefix table lists `aegis_core/ast/drivers/templates`,
 `aegis_core/team_templates`, `aegis_core/_data`, the package roots (`aegis_core`,
 `aegis_cli`, `aegis_mcp`, `aegis_sdk`) and the forbidden directories. That table
-supplies both the canonical spelling of every component after NFC and casefold
-and the case-folded location match checked before generic package `.py`
-admission, so a noncanonical spelling of `ast`, `drivers` or `templates` is
-refused. A second member whose case-folded
-destination collides with an admitted member is refused in both formats. Template
-files under `aegis_core/team_templates/` must have regular-file metadata, one
-unchanged normalized relative POSIX name with no trailing space or dot in any
-component, no ZIP Unicode Path extra record, no `_data` component, a `.json`,
-`.md` or `.py` suffix, and no execute bit. Directory entries must have consistent
-metadata, zero bytes and an admitted descendant. The verifier refuses special
-members, traversal, `__pycache__`, bytecode and forbidden suffixes before
-admission. Both record and verify admit `dist/` only when it holds exactly one
-regular wheel and one regular sdist: a directory, symlink, dot-prefixed extra
-archive, or any other name matching either suffix in any case is refused.
+supplies canonical component spellings and protected location matches using
+NFC and case folding before generic package `.py` admission. Within each
+parent, files and directories share one case-folded namespace, including
+directories implied by children. A case alias, a file/directory collision or a
+duplicate archive entry is refused.
 
-The namespace is empty until TA-4 moves the templates. Its installation does not
-make legacy tooling available. Each future family package must be added to the
-explicit setuptools package list. Packaging tests catch an unlisted package and
-check anchored root/nested coverage with a top-level-only negative control and
-always check the parsed exclusion patterns against source-directory-joined
-cache, bytecode and nested template paths with `fnmatch`. They also build a
-wheel from a temporary dirty checkout to verify nested assets and reject
-bytecode. The wheel regression uses available declared build dependencies and
-skips explicitly if neither the test interpreter nor its base has them; it
-never installs dependencies. Family acceptance must also build a wheel from an
-sdist and read the moved assets from that wheel with the checkout hidden.
-`tools/`, the coordinator kit, GCP/VM runners and test harnesses are not added to
-the package list. Testing and GCP/VM tooling stay local; replay and fixture
-harnesses move to `tests/support/` in their owning items.
+Template files under `aegis_core/team_templates/` must be regular files with
+normalized relative POSIX names, a `.json`, `.md` or `.py` suffix and no execute
+bit. The verifier refuses trailing spaces or dots, ZIP Unicode Path extra
+records, `_data` components within the template tree, special members,
+traversal, `__pycache__`, bytecode and forbidden suffixes. Directory entries
+must have consistent metadata, zero bytes and an admitted descendant.
+
+Ordinary sdist source files that pass the shared checks are admitted without a
+whole-tree file allowlist. The wheel uses a closed file allowlist covering the
+named driver templates, permitted `.dist-info` entries, explicit assets,
+eligible package `.py` files and admitted team templates. The wheel must contain
+the complete driver-template inventory (`TEMPLATES`), one `.dist-info` root and
+exactly one `METADATA` file bounded to 1 MiB and validated for package name,
+extras and dependency declarations.
+
+Both commands require exactly one regular wheel and one regular sdist. Extra
+entries with either archive suffix count even when dot-prefixed or differently
+cased.
+
+`tools/`, the coordinator kit, GCP/VM runners and test harnesses stay outside
+the package list. Replay and fixture harnesses move to `tests/support/` in
+their owning items.
 
 ## CLI and MCP registration pattern
 
