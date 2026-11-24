@@ -1,0 +1,78 @@
+{
+  "schema": "aegis.manager-policy/v1",
+  "workspace_id": null,
+  "rules": [
+    {
+      "id": "ground-rulings",
+      "actions": ["policy_change", "escalation"],
+      "match": {},
+      "text": "Ground the proposed ruling in current evidence and the applicable authority. Record the exact question, the evidence and uncertainty behind the answer, and who can decide it. Keep a ruling pending when its evidence or authority is missing."
+    },
+    {
+      "id": "reconcile-due-work",
+      "actions": ["checkpoint"],
+      "match": {},
+      "text": "Compare expected starts and terminal outcomes with current queue and worker observations. Keep every overdue or unobserved transition open with its work identity, last observation and next action."
+    },
+    {
+      "id": "reconcile-before-intervention",
+      "actions": ["hierarchy", "escalation"],
+      "match": {},
+      "text": "Before intervening in interrupted work, reconcile pending intent, the current operator and observed side effects. A timeout may follow a successful side effect. Identify what already happened and stop at the first unmet prerequisite before resuming or replacing the operation."
+    },
+    {
+      "id": "validate-assignment",
+      "actions": ["delegation"],
+      "match": {},
+      "text": "Review the final issued assignment against the approved scope before starting work. Verify that it identifies the inputs, authorized work, expected response and outcome checks for this decision. Return each missing or conflicting item to the issuer before admission."
+    },
+    {
+      "id": "carry-decisions-forward",
+      "actions": ["handoff"],
+      "match": {},
+      "text": "Reconcile open obligations, standing decisions and their source references with the checkpoint the successor will receive. Resolve or explicitly carry forward anything missing or superseded before acknowledging the handoff."
+    },
+    {
+      "id": "reconcile-required-evidence",
+      "actions": ["evidence_review"],
+      "match": {},
+      "text": "Compare every required check with its successful observation on the candidate revision. Preserve failed, pending and unrun checks when a retry covers only part of the requirement. Record the remaining evidence needed for a decision."
+    },
+    {
+      "id": "bind-owner-answers",
+      "actions": ["policy_change", "escalation"],
+      "match": {},
+      "text": "Bind the owner's answer to the exact question, proposed action, scope and revision it resolves. Record its conditions and obtain a fresh answer if a later proposal changes a material term."
+    },
+    {
+      "id": "reconcile-custody-transfers",
+      "actions": ["ownership", "handoff"],
+      "match": {},
+      "text": "Before accepting a transfer, confirm who may write, the current claim, revision, scope and duration. Require the outgoing writer to stop and the successor to acknowledge custody. Verify the resulting claims and record any duty to return custody."
+    },
+    {
+      "id": "check-retry-budgets",
+      "actions": ["resource_budget"],
+      "match": {},
+      "text": "Compare the failed attempt and work still due with the effective reservation, remaining time and deadline before scheduling a retry. Record the limiting reason and the next feasible action when the retry cannot fit."
+    },
+    {
+      "id": "verify-reported-state",
+      "actions": ["checkpoint", "evidence_review"],
+      "match": {},
+      "text": "Report each transition from its own observed result and exact work identity. When only a request, declaration or related event is available, mark the state unknown or inferred and identify the observation needed to confirm it."
+    },
+    {
+      "id": "verify-served-assignment",
+      "actions": ["hierarchy", "checkpoint"],
+      "match": {},
+      "text": "At launch or resume, compare the assignment and execution identity actually observed with the approved assignment and binding. Surface any missing observation or unapproved substitution before acknowledging the work as correctly started."
+    },
+    {
+      "id": "measure-round-benefit",
+      "actions": ["resource_budget", "policy_change"],
+      "match": {},
+      "text": "Before authorizing another round, compare the previous result with the agreed baseline and objective. Record the observed benefit, remaining gap, cost and proposed success measure. Ask for the missing measurement before approving further work."
+    }
+  ]
+}

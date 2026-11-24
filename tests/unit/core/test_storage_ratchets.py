@@ -110,6 +110,7 @@ AUDIT_WRITERS = {
     ("aegis_core/lifecycle/creation.py", "create_rule"): "existing mkdir; source lines 168",
     ("aegis_core/lifecycle/promotion.py", "_move"): "existing mkdir; source lines 121",
     ("aegis_core/lifecycle/selection.py", "_park"): "existing mkdir, replace; source lines 87, 93",
+    ("aegis_core/manager_adjudication.py", "_bounded_git"): "Private temporary scratch directory for bounded Git reads during owner adjudication. The context cleans up on success and refusal.",
     ("aegis_core/manager_config.py", "initialize.create"): "existing mkdir; source lines 110, 116",
     ("aegis_core/manager_config.py", "verify_owner"): "existing TemporaryDirectory; source lines 144",
     ("aegis_core/manager_store.py", "ManagerStore._anchor.missing"): "RF-32: mkdir mode 0700 relative to the held parent, after _anchor_check of the already opened prefix; fsync parent; concurrent creator is reopened without following links",
