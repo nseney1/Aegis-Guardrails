@@ -1,6 +1,6 @@
 ---
 id: trap-shared-table-entry-at-common-position
-domain: maintainability
+domain: architecture
 type: trap
 enforcement: advisory
 hypothesis: Entries added by different branches at the same position of a shared table conflict textually even when they are unrelated.
