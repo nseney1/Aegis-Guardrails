@@ -314,13 +314,14 @@ def _state_dir_at(layout, directory):
 @contextmanager
 def message_store(workspace: Any, *, write: bool = False):
     """Default message store, admitted by anchored descriptors before any record I/O."""
-    from . import message_codec as codec
+    from . import message_codec as codec, message_codec_store
     from .storage_confined import ConfinedFileError, open_directory
 
     capabilities = {function.__name__ for function in os.supports_dir_fd}
     nofollow = {function.__name__ for function in os.supports_follow_symlinks}
     codec.require({"open", "mkdir", "stat", "link", "unlink"} <= capabilities and "stat" in nofollow
-                  and hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW") and hasattr(os, "geteuid"), "E_AUTH")
+                  and hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW") and hasattr(os, "geteuid")
+                  and (not write or message_codec_store.store_supported()), "E_AUTH")
     layout = workspace.layout
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     message_path = layout.state_dir / "messages"
