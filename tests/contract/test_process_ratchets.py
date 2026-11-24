@@ -25,6 +25,12 @@ POPEN_POSITIONAL_APIS = {"subprocess." + name for name in ("Popen", "run", "call
 # Coordinator ruling 2026-11-15T04:52:12Z: this reviewed source inventory is
 # the completeness gate. Resolver precision does not grant admission to a site.
 SELECTOR_SITE_TABLE = (
+    ('aegis_core/manager_runtime.py', 'main', 'lexer-or-message', 'Label the argument parser with the public Python module invocation.'),
+    ('aegis_core/manager_runtime.py', '_smoke', 'reviewed-dynamic', 'Probe installed import origins and run the fixed manager MCP module over isolated stdio.'),
+    ('aegis_core/manager_runtime.py', '_run', 'reviewed-dynamic', 'Launch only fixed stage recipes on the explicit build or generated runtime Python with no shell, a scrubbed environment and bounded stdio.'),
+    ('aegis_core/manager_runtime.py', '_git_source', 'reviewed-dynamic', 'Forward bounded read-only Git object and index queries through existing gitsafe custody.'),
+    ('aegis_core/manager_runtime.py', '_builder_run', 'reviewed-dynamic', 'Use the fixed isolated builder bootstrap with the offline backend, venv, and pip target stage recipes.'),
+    ('aegis_core/manager_runtime.py', '_Base.command', 'reviewed-dynamic', 'Construct the fixed isolated CPython command from the checked physical startup profile for builder, generation and host launches.'),
     ('aegis_core/team_native_codemode.py', '_typed_text', 'lexer-or-message', 'Recognize recorded shell selectors for evidence correlation only.'),
     ("aegis_core/ast/runner.py", "_run_driver", "reviewed-dynamic",
      "Review AST driver argv from the validated driver plan; no shell, no stdin, bounded timeout."),

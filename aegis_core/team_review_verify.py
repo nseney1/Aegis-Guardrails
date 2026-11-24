@@ -188,10 +188,14 @@ def _added_problems(dir_fd, prefix, host):
 def verify_copy(out, expect_manifest, host):
     if not host.descriptor_support():
         raise host.refusal("unsupported_platform")
-    if expect_manifest is not None and type(expect_manifest) is not str:
-        raise host.refusal("invalid_input")
-    if type(expect_manifest) is str and (len(expect_manifest) > 64 or host.broken(expect_manifest)):
-        raise host.refusal("invalid_input")
+    if expect_manifest is not None and (
+        type(expect_manifest) is not str or len(expect_manifest) != 64
+        or any(char not in _HEX for char in expect_manifest)
+    ):
+        return 2, {
+            **host.refusal_envelope("invalid_input"),
+            "next_action": "Pass expect_manifest as a 64-character lowercase hexadecimal SHA-256 digest.",
+        }
     prefix = ProblemPrefix(host.max_problems, host.single_line, lambda text: _proved(text, host.broken))
     dest = host.absolute_path(out)
     with host.held(host.walk(dest, "not_review_copy")) as fd:

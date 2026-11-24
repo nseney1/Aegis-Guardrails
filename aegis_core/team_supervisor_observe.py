@@ -8,6 +8,7 @@ Lease declarations never prove actor liveness (SUPERVISOR-WRITER-LIVENESS).
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 
@@ -206,43 +207,39 @@ def _host_text(host):
     return sanitize_display(redact_command_secrets(canonical), max_len=64)
 
 
-def _host_snapshot(row, host, settings):
-    unknown = {"host": _host_text(host), **_unknown("usage_unavailable")}
-    if (type(row) is not dict or len(row) > 10 or row.get("host") != host
-            or row.get("usage_status") != "known"):
-        return unknown, dict(unknown)
-    source = settings["capacity"].get(host, {}).get("usage_source", "none")
-    if source not in ("subscription-window", "credits") or row.get("usage_source") != source:
-        return unknown, dict(unknown)
-    usage = team_hosts.normalize_usage(row.get("usage"), source)
-    thresholds = team_profile.capacity_thresholds(settings["capacity"].get(host, {}))
-    held = (usage["credits_left"] == 0 if source == "credits"
-            else usage["window"]["used_pct"] >= thresholds["hold_pct"])
-    return ({"host": _host_text(host), "state": "known", "source": source, "usage": usage},
-            {"host": _host_text(host), "state": "at_limit" if held else "available"})
+def _host_snapshot(measurement, host):
+    row, capacity_state = measurement
+    label = _host_text(host)
+    unknown = {"host": label, **_unknown("usage_unavailable")}
+    measured = {"host": label, "state": "known"} if row["usage_status"] == "known" else dict(unknown)
+    if row["usage"]:
+        measured.update(source=row["usage_source"], usage=row["usage"])
+    limit = unknown if capacity_state == "unknown" else {"host": label, "state": capacity_state}
+    return measured, limit
 
 
-def _hosts(resolved, adapter):
+def _hosts(resolved, adapter, now):
     settings = resolved["profile"]["model_settings"]
     try:
-        # One service per call, one usage() pass. It owns the per-host cache and
-        # catches adapter failures separately; capacity never reads it again.
-        rows = team_hosts.HostCapacity(resolved, adapter=adapter).usage()
+        observed_at = datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=now)
+        service = team_hosts.HostCapacity(resolved, adapter=adapter, now=observed_at)
+        rows = service.writer_capacity()
         if (type(rows) is not list or len(rows) > team_profile.MAX_HOSTS
                 or len(rows) != len(settings["hosts"])):
             raise ValueError("usage_unavailable")
         usage, capacity = [], []
         for host, row in zip(settings["hosts"], rows):
             try:
-                measured, limit = _host_snapshot(row, host, settings)
+                measured, limit = _host_snapshot(row, host)
             except Exception:
                 measured = {"host": _host_text(host), **_unknown("usage_unavailable")}
                 limit = dict(measured)
             usage.append(measured)
             capacity.append(limit)
         complete = bool(rows) and all(row["state"] == "known" for row in usage)
-        capacity_state = ("at_limit" if any(row["state"] == "at_limit" for row in capacity)
-                          else "available") if complete else "unknown"
+        capacity_state = "available" if complete else "unknown"
+        if any(row["state"] == "at_limit" for row in capacity):
+            capacity_state = "at_limit"
         return ({"state": "known" if complete else "unknown", "hosts": usage},
                 {"state": capacity_state, "hosts": capacity})
     except Exception:
@@ -267,7 +264,7 @@ def observe(resolved, *, workspace_root, now, usage_adapter=None, user_root=None
         team_profile.validate_resolved(resolved)
     except Exception:
         return _refused("invalid_profile")
-    usage, capacity = _hosts(resolved, usage_adapter)
+    usage, capacity = _hosts(resolved, usage_adapter, now)
     floor = resolved["profile"]["supervisor"]["health"]["disk_floor_mib"]
     disk, writer, audit = _workspace_observations(workspace_root, now, floor, user_root)
     return {"schema": SCHEMA, "status": "ok", "starts_nothing": True, "writes_nothing": True,

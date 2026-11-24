@@ -151,6 +151,8 @@ SPAWN_SITES = {
     "aegis_core/release_verify.py": ("`gh`",),
     "aegis_core/team_native_bridge.py": ("owner-configured evidence-only provider argv (absolute executable, no shell)",),
     "aegis_cli/team_isolation.py": ("`podman`", "`docker`"),
+    # MANAGER-RULES-SERVING-a: the pinned manager runtime launches the offline builder and the dedicated venv Python.
+    "aegis_core/manager_runtime.py": ("owner-selected isolated Python for manager runtime",),
 }
 _SPAWN_MODULES = {"subprocess", "pty", "multiprocessing"}
 _OS_SPAWN = re.compile(r"^(system|popen|startfile|exec\w*|spawn\w*|posix_spawn\w*)$")

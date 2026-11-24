@@ -127,6 +127,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_isolation_verify": 0,
     "aegis_core.team_jobs_recipes": 0,
     "aegis_core.team_jobs_source": 0,
+    "aegis_core.team_land_plan": 0,
     "aegis_core.team_lease_custody": 0,
     "aegis_core.team_lifecycle": 1,
     "aegis_core.team_lifecycle_writers": 1,
@@ -169,6 +170,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.model_select": 1,
     # Manager-only policy and append-only audit domain; no repository credit imports.
     "aegis_core.manager_policy": 1,
+    "aegis_core.manager_runtime": 2,
     "aegis_core.manager_store": 1,
     "aegis_core.manager_adjudication": 3,
     # Startup-pinned configuration and owner approval over the audit domain.
