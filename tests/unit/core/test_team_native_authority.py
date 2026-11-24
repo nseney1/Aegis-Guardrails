@@ -1131,6 +1131,9 @@ class OSBoundary:
         self.after_read = lambda: None
         self.after_xattr = lambda info: None
         self.read_sizes = []
+        self.read_cap = None
+        self.first_read = None
+        self.reported_sizes = {}
         self.socket_inode = None
         self.O_RDONLY = os.O_RDONLY
         self.O_DIRECTORY = os.O_DIRECTORY
@@ -1160,11 +1163,16 @@ class OSBoundary:
     def _normalize(self, info):
         identity = info.st_dev, info.st_ino
         socket_leaf = identity == self.socket_inode
-        if identity not in self.ancestors and not socket_leaf:
+        if identity not in self.ancestors and not socket_leaf and identity not in self.reported_sizes:
             return info
-        mode = stat.S_IFSOCK | stat.S_IMODE(info.st_mode) if socket_leaf else info.st_mode & ~0o022
-        return SimpleNamespace(st_mode=mode, st_uid=os.getuid(), st_gid=info.st_gid,
-                               st_dev=info.st_dev, st_ino=info.st_ino, st_size=info.st_size,
+        mode, uid = info.st_mode, info.st_uid
+        if socket_leaf:
+            mode = stat.S_IFSOCK | stat.S_IMODE(mode)
+        if identity in self.ancestors:
+            mode, uid = mode & ~0o022, os.getuid()
+        return SimpleNamespace(st_mode=mode, st_uid=uid, st_gid=info.st_gid,
+                               st_dev=info.st_dev, st_ino=info.st_ino,
+                               st_size=self.reported_sizes.get(identity, info.st_size),
                                st_mtime_ns=info.st_mtime_ns, st_ctime_ns=info.st_ctime_ns)
 
     def listxattr(self, target, *, follow_symlinks=True):
@@ -1179,7 +1187,11 @@ class OSBoundary:
 
     def read(self, descriptor, size):
         self.read_sizes.append(size)
+        if self.read_cap is not None:
+            size = min(size, self.read_cap)
         raw = os.read(descriptor, size)
+        if len(self.read_sizes) == 1:
+            self.first_read = raw
         self.after_read()
         return raw
 
@@ -1211,6 +1223,76 @@ def test_protected_reads_check_size_and_mode_before_read_and_allow_retry(protect
     assert authority.protected_bytes(leaf, owners, -1, maximum=5) == b"owned"
     assert boundary.read_sizes[-1] == 1
     assert stat.S_ISDIR(authority.protected_path(leaf.parent, owners, -1, directory=True).st_mode)
+
+
+def test_stable_protected_read_reuses_the_sized_bytes_after_eof_probe(protected):
+    leaf, boundary, owners = protected
+    data = b"a" * (2 * 65536 + 37)
+    leaf.write_bytes(data)
+
+    raw = authority.protected_bytes(leaf, owners, -1, maximum=len(data))
+
+    assert raw == data
+    assert raw is boundary.first_read
+    assert boundary.read_sizes == [len(data), 1]
+    assert not boundary.opened
+
+
+@pytest.mark.parametrize(("reported_size", "read_cap"), [(0, None), (2, None), (8, None), (5, 2)],
+                         ids=["virtual", "underreported", "overreported", "short-read"])
+def test_protected_read_handles_size_disagreement(protected, reported_size, read_cap):
+    leaf, boundary, owners = protected
+    info = leaf.stat()
+    boundary.reported_sizes[info.st_dev, info.st_ino] = reported_size
+    boundary.read_cap = read_cap
+
+    assert authority.protected_bytes(leaf, owners, -1, maximum=8) == b"owned"
+    assert not boundary.opened
+
+
+def test_protected_read_enforces_limit_on_zero_size_virtual_file_and_allows_retry(protected):
+    leaf, boundary, owners = protected
+    info = leaf.stat()
+    boundary.reported_sizes[info.st_dev, info.st_ino] = 0
+
+    with refusal("UNPROTECTED_DEPLOYMENT", "unprotected host deployment"):
+        authority.protected_bytes(leaf, owners, -1, maximum=0)
+    assert boundary.read_sizes == [1]
+    assert not boundary.opened
+    assert authority.protected_bytes(leaf, owners, -1, maximum=5) == b"owned"
+    leaf.write_bytes(b"")
+    assert authority.protected_bytes(leaf, owners, -1, maximum=0) == b""
+
+
+@pytest.mark.parametrize("failure_read", [1, 2], ids=["first-read", "eof-probe"])
+def test_protected_read_maps_io_failure_and_releases_descriptors_before_retry(protected, failure_read):
+    leaf, boundary, owners = protected
+
+    def fail_read():
+        if len(boundary.read_sizes) == failure_read:
+            raise OSError("private read diagnostic")
+
+    boundary.after_read = fail_read
+    with refusal("UNPROTECTED_DEPLOYMENT", "unprotected host deployment") as error:
+        authority.protected_bytes(leaf, owners, -1, maximum=5)
+    assert error.value.__suppress_context__
+    assert not boundary.opened
+    assert authority.protected_bytes(leaf, owners, -1, maximum=5) == b"owned"
+
+
+def test_protected_read_refuses_a_leaf_replaced_during_eof_probe_and_allows_retry(protected):
+    leaf, boundary, owners = protected
+
+    def replace_leaf():
+        if len(boundary.read_sizes) == 2:
+            leaf.rename(leaf.with_name("original"))
+            leaf.write_bytes(b"other")
+
+    boundary.after_read = replace_leaf
+    with refusal("UNPROTECTED_DEPLOYMENT", "unprotected host deployment"):
+        authority.protected_bytes(leaf, owners, -1, maximum=5)
+    assert not boundary.opened
+    assert authority.protected_bytes(leaf, owners, -1, maximum=5) == b"other"
 
 
 @pytest.mark.parametrize("mode", [0o444, 0o400], ids=["read-only", "owner-read-only"])
@@ -1283,7 +1365,7 @@ def test_protected_read_refuses_growth_and_releases_the_chain(protected):
     boundary.after_read = grow
     with refusal("UNPROTECTED_DEPLOYMENT", "unprotected host deployment"):
         authority.protected_bytes(leaf, owners, -1, maximum=5)
-    assert boundary.read_sizes == [6, 1]
+    assert boundary.read_sizes == [5, 1]
     assert not boundary.opened
     assert authority.protected_bytes(leaf, owners, -1) == b"ownedexcess"
 

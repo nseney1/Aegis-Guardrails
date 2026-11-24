@@ -4,6 +4,9 @@ The registry is tools/hierarchy_templates/role-registry.json, at a fixed path be
 or environment cannot point a role at a wider copy. Every action a role lists comes from a closed vocabulary,
 and a role may not both allow and prohibit the same action.
 
+The Git capability table also names service principals and session helpers, which have no mailbox endpoint.
+The packaged Git policy is available from aegis_core.team_roles.
+
 hierarchy_mailbox.py keeps the endpoint grammar and vertical routes as constants, because the native
 foundation acceptance pins that file's bytes and imports it with no other files present. Loading refuses
 when the registry and those constants disagree, so the two places cannot drift apart silently.
@@ -56,6 +59,77 @@ DECISION_TOOL_READS = {"team_status": {"lifecycle", "loop_status", "team_evidenc
 ROLE_FIELDS = {"title", "kind", "m1", "responsibility", "endpoint", "hat_of", "service", "lifecycle_role", "reads",
                "writes", "calls", "approvals", "prohibitions", "independence", "model_profile", "reports_to",
                "provision"}
+
+
+# Git permissions describe scoped requests and effects. The installed registry may
+# remove grants, but can never assign an effect beyond the ADR's principal boundary.
+_STATUS = frozenset({"team:status"})
+_GIT_READ = _STATUS | {"git:read"}
+_OWN_LANE = _STATUS | {"git:read-own-lane", "lane:commit-own", "lane:sync-own"}
+_EXACT_REVIEW = _STATUS | {"git:read-exact-head", "review:record-exact-head"}
+_GIT_LIMITS = {
+    "root": _GIT_READ,
+    "router": _STATUS | {"queue:add"},
+    "orchestrator": _GIT_READ | {
+        "queue:list", "queue:claim-team", "queue:release-team", "queue:done-team",
+        "lane:start-team", "lane:commit-team", "lane:sync-team", "lane:land-team",
+        "lane:resume-team", "lane:done-preview", "lane:gc-preview",
+    },
+    "reviewer": _EXACT_REVIEW,
+    "decider": _GIT_READ,
+    "implementer": _OWN_LANE,
+    "test-author": _OWN_LANE,
+    "owner": _GIT_READ | {
+        "lane:start-owner", "lane:commit-owner", "lane:sync-owner", "lane:resume-owner",
+        "lane:done-preview", "lane:gc-preview", "lane:done-apply", "lane:gc-apply",
+        "git:recover", "git:prune", "git:configure", "forge:merge-review-target",
+        "forge:merge-signed-target", "git:sign-signature-target", "forge:owner-admin",
+    },
+    "watch-supervisor": _STATUS,
+    "provider-bridge": _STATUS,
+    "job-executor": _STATUS | {
+        "git:read-exact-head", "job:run-exact-export", "job:write-evidence", "broker:route-git-requests",
+    },
+    "architect": _GIT_READ,
+    "validation-operator": _EXACT_REVIEW | {"qualification:request-exact-tree"},
+    "integrator": _OWN_LANE,
+    "specialist-reviewer": _EXACT_REVIEW,
+    "release-operator": _GIT_READ | {
+        "release:open-review-or-signature-pr", "lane:land-repair-red-target", "lane:start-revert-red-target",
+    },
+    "front-door": _STATUS,
+    "session-helper": _STATUS | {"git:read-parent-scope"},
+    "git-custodian": _GIT_READ | {
+        "git:manage-leased-worktree", "git:snapshot-private-index", "git:create-tested-commit",
+        "git:create-queue-merge", "git:fast-forward-leased-lane-ref", "git:write-qualification-and-queue-refs",
+        "git:write-lane-records", "git:write-operation-journal",
+    },
+    "publisher": _GIT_READ | {
+        "forge:use-publisher-identity", "forge:push-qualified-none-target-without-rule-changes",
+        "forge:open-qualified-draft-pr", "forge:open-release-pr", "forge:cancel-superseded-run",
+        "forge:delete-merged-lane-branch", "forge:record-intent-result",
+    },
+}
+
+
+def _git_principal(name):
+    return type(name) is str and len(name) <= 64 and name in _GIT_LIMITS
+
+
+def _valid_git_capabilities(policy):
+    if type(policy) is not dict or len(policy) != len(_GIT_LIMITS):
+        return False
+    for name, grants in policy.items():
+        if not _git_principal(name):
+            return False
+        limit = _GIT_LIMITS[name]
+        if type(grants) is not list or len(grants) > len(limit):
+            return False
+        if any(type(grant) is not str or len(grant) > 64 or grant not in limit for grant in grants):
+            return False
+        if len(set(grants)) != len(grants):
+            return False
+    return True
 
 
 def actions(role, name, group):
@@ -156,8 +230,10 @@ def validate_role(name, role):
 
 
 def validate(registry):
-    fields(registry, {"schema", "routes", "roles"})
+    fields(registry, {"schema", "routes", "roles"}, {"git_capabilities"})
     require(registry["schema"] == SCHEMA, "unsupported role registry schema")
+    if "git_capabilities" in registry:
+        require(_valid_git_capabilities(registry["git_capabilities"]), "role registry refused: invalid_registry")
     roles = registry["roles"]
     require(isinstance(roles, dict) and 0 < len(roles) <= 64, "invalid registry roles")
     endpoints = {}
@@ -196,7 +272,10 @@ _LOADED = {}
 def registry():
     if "registry" not in _LOADED:
         _LOADED["registry"] = validate(read_json(PATH))
-    return _LOADED["registry"]
+    view = dict(_LOADED["registry"])
+    if "git_capabilities" in view:
+        view["git_capabilities"] = {name: list(grants) for name, grants in view["git_capabilities"].items()}
+    return view
 
 
 def role_name(endpoint, kind=None):
