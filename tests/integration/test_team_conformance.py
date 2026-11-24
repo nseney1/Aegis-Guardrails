@@ -5,6 +5,7 @@ trusted. The fakes record process entry and supply fixture observations.
 """
 
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import errno
 import hashlib
@@ -19,6 +20,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -51,13 +53,35 @@ AEGIS_POLICY = {
 }
 MINIMAL_POLICY = {"landing": {"target_branch": "delivery/trunk"}, "gates": []}
 CHECKOUT_BRANCH = "working/seed"
+MAX_JSON_RESPONSE_CHARS = 1024 * 1024
 
 
-def cli(root, capsys, *words):
-    code = main(["team", *words, "--workspace", str(root), "--json"])
+def command_json(command, code, stdout, stderr, *, expect=None):
+    # Labels come from fixture-owned command words. Captures never enter a diagnostic.
+    label = f"{command} (exit {code})"
+    if stderr:
+        pytest.fail(f"{label}: unexpected stderr", pytrace=False)
+    if expect is not None and code != expect:
+        pytest.fail(f"{label}: unexpected exit code", pytrace=False)
+    if len(stdout) > MAX_JSON_RESPONSE_CHARS:
+        pytest.fail(f"{label}: JSON response exceeds limit", pytrace=False)
+    try:
+        payload = json.loads(stdout)
+    except (ValueError, RecursionError):
+        payload = None
+    if not isinstance(payload, dict):
+        pytest.fail(f"{label}: invalid JSON object", pytrace=False)
+    return payload
+
+
+def cli(root, capsys, command, *arguments):
+    code = main(["team", *command, *arguments, "--workspace", str(root), "--json"])
     captured = capsys.readouterr()
-    assert captured.err == ""
-    return code, json.loads(captured.out)
+    return code, command_json(" ".join(("aegis", "team", *command)), code, captured.out, captured.err)
+
+
+def script_json(script, verb, result, expect):
+    return command_json(f"{script.name} {verb}", result.returncode, result.stdout, result.stderr, expect=expect)
 
 
 def refusal(result, code, schema, reason, next_action):
@@ -65,6 +89,56 @@ def refusal(result, code, schema, reason, next_action):
     assert (exit_code, payload["schema"], payload["status"], payload["reason"], payload["next_action"]) == (
         code, schema, "refused", reason, next_action
     )
+
+
+def other_family_host(hosts, pinned):
+    catalogue = team_profile.PRESET_DATA["hosts"]
+    family = catalogue[hosts[pinned]["kind"]]["family"]
+    return next(name for name, host in hosts.items() if catalogue[host["kind"]]["family"] != family)
+
+
+@pytest.mark.parametrize("stdout,stderr,failure", [
+    pytest.param('{"fixture": "stdout marker"}', "stderr marker\n\x1b[31m", "unexpected stderr", id="stderr"),
+    pytest.param("malformed stdout marker", "", "invalid JSON object", id="malformed-json"),
+])
+def test_cli_json_failure_names_only_the_command(isolated, capsys, stdout, stderr, failure):
+    workspace = isolated / "workspace marker"
+    workspace.mkdir()
+
+    def capture_failure():
+        capsys.readouterr()
+        return SimpleNamespace(out=stdout, err=stderr)
+
+    with pytest.raises(pytest.fail.Exception) as error:
+        cli(workspace, SimpleNamespace(readouterr=capture_failure), ("config", "presets"))
+    assert str(error.value) == f"aegis team config presets (exit 0): {failure}"
+
+    code, payload = cli(workspace, capsys, ("config", "presets"))
+    assert (code, payload["schema"], payload["status"]) == (0, "aegis.team.config.presets/v1", "done")
+
+
+def test_script_json_failures_and_retries_are_independent(isolated):
+    script = isolated / "workspace marker" / "hierarchy_team.py"
+    cases = (
+        (2, "stdout marker", "stderr marker", "unexpected stderr"),
+        (3, "stdout marker", "", "unexpected exit code"),
+        (2, " " * MAX_JSON_RESPONSE_CHARS + "{}", "", "JSON response exceeds limit"),
+        (2, "[]", "", "invalid JSON object"),
+    )
+
+    def check(case):
+        code, stdout, stderr, failure = case
+        result = SimpleNamespace(returncode=code, stdout=stdout, stderr=stderr)
+        with pytest.raises(pytest.fail.Exception) as error:
+            script_json(script, "approve", result, expect=2)
+        assert str(error.value) == f"hierarchy_team.py approve (exit {code}): {failure}"
+        retry = SimpleNamespace(returncode=2, stdout='{"error": "refused"}', stderr="")
+        assert script_json(script, "approve", retry, expect=2) == {"error": "refused"}
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        futures = [workers.submit(check, case) for case in cases]
+        for future in futures:
+            future.result(timeout=5)
 
 
 def same_snapshot(cli_payload, tool, arguments):
@@ -797,16 +871,16 @@ def repository(request, isolated):
 @pytest.mark.parametrize("kind", PROFILE_HOSTS)
 def test_profile_and_capacity_conformance(repository, isolated, sealed_hosts, monkeypatch, capsys, preset, kind):
     root, policy = repository
-    init_args = ("config", "init", "--preset", preset, "--host", kind)
+    init_args = ("--preset", preset, "--host", kind)
     path = root.joinpath(*team_profile.REPO_PATH)
     if not team_profile.PRESET_DATA["hosts"][kind]["writer"]:
         for _ in range(2):
-            refusal(cli(root, capsys, *init_args), 2, "aegis.team.config.init/v1",
+            refusal(cli(root, capsys, ("config", "init"), *init_args), 2, "aegis.team.config.init/v1",
                     "host kind is not qualified for a preset binding", CONFIG_ACTION)
             assert not path.exists()
         return
 
-    code, initialized = cli(root, capsys, *init_args)
+    code, initialized = cli(root, capsys, ("config", "init"), *init_args)
     assert (code, initialized["schema"], initialized["status"]) == (0, "aegis.team.config.init/v1", "done")
     configured = json.loads(path.read_text(encoding="utf-8"))
     settings = initialized["profile"]["model_settings"]
@@ -820,15 +894,14 @@ def test_profile_and_capacity_conformance(repository, isolated, sealed_hosts, mo
     if preset != "solo":
         pinned_role = "reviewer.security"
         pinned = settings["roles"][pinned_role]["hosts"][0]
-        other_family = next(name for name, host in settings["hosts"].items()
-                            if host["kind"] != settings["hosts"][pinned]["kind"])
+        other_family = other_family_host(settings["hosts"], pinned)
         same_family = "security-spare"
         model_settings["hosts"][same_family] = dict(settings["hosts"][pinned])
         capacity[same_family] = {"usage_source": "credits"}
         capacity[pinned]["fallback"] = {"doc": [other_family], pinned_role: [other_family]}
         path.write_text(json.dumps(configured), encoding="utf-8")
         for _ in range(2):
-            refusal(cli(root, capsys, "config", "show"), 1, "aegis.team.config.show/v1",
+            refusal(cli(root, capsys, ("config", "show")), 1, "aegis.team.config.show/v1",
                     "pinned lens fallback changes family", CONFIG_ACTION)
         del capacity[pinned]["fallback"][pinned_role]
         model_settings.setdefault("roles", {})[pinned_role] = {
@@ -837,7 +910,7 @@ def test_profile_and_capacity_conformance(repository, isolated, sealed_hosts, mo
     path.write_text(json.dumps(configured), encoding="utf-8")
     before = path.read_bytes()
 
-    code, shown = cli(root, capsys, "config", "show")
+    code, shown = cli(root, capsys, ("config", "show"))
     assert (code, shown["schema"], shown["status"]) == (0, "aegis.team.config.show/v1", "done")
     same_snapshot(shown, "aegis_team_config", {"workspace": str(root)})
     assert shown["profile"]["preset"] == preset
@@ -861,7 +934,7 @@ def test_profile_and_capacity_conformance(repository, isolated, sealed_hosts, mo
         return adapter
 
     monkeypatch.setattr(team_hosts, "usage_adapter", usage_adapter)
-    code, doctor = cli(root, capsys, "doctor")
+    code, doctor = cli(root, capsys, ("doctor",))
     assert (code, doctor["schema"], doctor["status"], doctor["healthy"]) == (
         0, "aegis.team.doctor/v1", "done", True
     )
@@ -872,7 +945,7 @@ def test_profile_and_capacity_conformance(repository, isolated, sealed_hosts, mo
     for verb in ("status", "usage"):
         requested.clear()
         adapter.calls.clear()
-        code, result = cli(root, capsys, "hosts", verb)
+        code, result = cli(root, capsys, ("hosts", verb))
         schema = "aegis.team.hosts." + verb + "/v1"
         assert (code, result["schema"], result["status"]) == (0, schema, "done")
         actual = {row["host"]: (row["host_kind"], row["usage"]) for row in result["hosts"]}
@@ -880,11 +953,10 @@ def test_profile_and_capacity_conformance(repository, isolated, sealed_hosts, mo
         assert adapter.calls == [(name, "credits") for name in settings["hosts"]]
         assert requested == [settings["hosts"][name]["kind"] for name, _ in adapter.calls]
 
-    check = ("hosts", "check", writer, "writer")
     for snapshot in (OSError(FAKE_FAILURE), OSError(FAKE_FAILURE), {"credits_left": 0}, {"credits_left": 42}):
         adapter.calls.clear()
         snapshots[writer] = snapshot
-        code, checked = cli(root, capsys, *check)
+        code, checked = cli(root, capsys, ("hosts", "check"), writer, "writer")
         assert checked["schema"] == "aegis.team.hosts.check/v1"
         assert checked["selected_host"] == writer and adapter.calls == [(writer, "credits")]
         if isinstance(snapshot, OSError):
@@ -911,7 +983,7 @@ def test_profile_and_capacity_conformance(repository, isolated, sealed_hosts, mo
     executable = sealed_hosts.executable(missing)
     removed = executable.rename(isolated / "removed-host-cli")
     try:
-        refusal(cli(root, capsys, "doctor"), 1, "aegis.team.doctor/v1", "a declared host CLI is missing from PATH",
+        refusal(cli(root, capsys, ("doctor",)), 1, "aegis.team.doctor/v1", "a declared host CLI is missing from PATH",
                 "Install the missing declared CLI: " + missing + "; rerun aegis team doctor --json.")
     finally:
         removed.rename(executable)
@@ -922,9 +994,51 @@ def test_profile_and_capacity_conformance(repository, isolated, sealed_hosts, mo
         configured["policy"] = {**policy, "gates": [{**policy["gates"][0], "runner": "unknown-runner"}]}
         path.write_text(json.dumps(configured), encoding="utf-8")
         requested.clear()
-        refusal(cli(root, capsys, "doctor"), 1, "aegis.team.doctor/v1",
+        refusal(cli(root, capsys, ("doctor",)), 1, "aegis.team.doctor/v1",
                 "gate references undeclared runner", CONFIG_ACTION)
         assert requested == []
+
+
+def test_pinned_fallback_uses_declared_family(repository, monkeypatch, capsys):
+    root, _ = repository
+    catalogue = team_profile.PRESET_DATA["hosts"]
+    # Exercise the policy with two qualified kinds in the catalogue's Codex family.
+    monkeypatch.setattr(team_profile, "PRESET_DATA", {
+        **team_profile.PRESET_DATA,
+        "hosts": {**catalogue, "codex": {**catalogue["codex"], "writer": True}},
+    })
+    pinned_role = "reviewer.security"
+    hosts = {
+        "primary": {"kind": "codex-cli"},
+        "security-spare": {"kind": "codex"},
+        "review": {"kind": "claude-code"},
+    }
+    fallback = {pinned_role: [other_family_host(hosts, "primary")]}
+    document = {
+        "version": 1,
+        "preset": "pair",
+        "model_settings": {
+            "hosts": hosts,
+            "roles": {pinned_role: {"hosts": ["primary", "security-spare"]}},
+            "capacity": {"primary": {"fallback": fallback}},
+        },
+    }
+    path = root.joinpath(*team_profile.REPO_PATH)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(document), encoding="utf-8")
+    before = path.read_bytes()
+    for _ in range(2):
+        result = cli(root, capsys, ("config", "show"))
+        assert result[0] == 1
+        refusal(result, 1, "aegis.team.config.show/v1", "pinned lens fallback changes family", CONFIG_ACTION)
+    assert path.read_bytes() == before
+
+    fallback[pinned_role] = ["security-spare"]
+    path.write_text(json.dumps(document), encoding="utf-8")
+    code, shown = cli(root, capsys, ("config", "show"))
+    assert (code, shown["schema"], shown["status"]) == (0, "aegis.team.config.show/v1", "done")
+    route = team_profile.plan(shown["profile"], pinned_role, start_host="primary")
+    assert [entry["host"] for entry in route["entries"]] == ["primary", "security-spare"]
 
 
 def check_capacity_routes(root, capsys, settings, adapter, requested, primary, alternate, spare):
@@ -933,7 +1047,7 @@ def check_capacity_routes(root, capsys, settings, adapter, requested, primary, a
     adapter.snapshots[spare] = {"credits_left": 42}
     adapter.calls.clear()
     requested.clear()
-    code, healthy = cli(root, capsys, "hosts", "check", spare, "reviewer.security")
+    code, healthy = cli(root, capsys, ("hosts", "check"), spare, "reviewer.security")
     assert code == 0, healthy
     assert (code, healthy["decision"], healthy["selected_host"], healthy["reason"]) == (
         0, "go", spare, "credits available",
@@ -949,7 +1063,7 @@ def check_capacity_routes(root, capsys, settings, adapter, requested, primary, a
         for _ in range(2):
             adapter.calls.clear()
             requested.clear()
-            code, row = cli(root, capsys, "hosts", "check", primary, kind)
+            code, row = cli(root, capsys, ("hosts", "check"), primary, kind)
             assert (code, row["decision"], row["selected_host"], row["reason"], row["next_action"]) == outcome
             assert adapter.calls == [(alias, "credits") for alias in hosts]
             assert requested == [settings["hosts"][alias]["kind"] for alias in hosts]
@@ -960,12 +1074,12 @@ def test_profile_refusals_match_cli_and_mcp(isolated, monkeypatch, capsys):
     path.parent.mkdir(parents=True)
     path.write_bytes(b'{"version": 1, "preset": "solo", "preset": "pair"}')
     if team_profile.descriptor_supported():
-        result = cli(isolated, capsys, "config", "show")
+        result = cli(isolated, capsys, ("config", "show"))
         refusal(result, 1, "aegis.team.config.show/v1", "duplicate key in profile JSON", CONFIG_ACTION)
         same_snapshot(result[1], "aegis_team_config", {"workspace": str(isolated)})
 
     monkeypatch.setattr(team_profile, "descriptor_supported", lambda: False)
-    result = cli(isolated, capsys, "config", "show")
+    result = cli(isolated, capsys, ("config", "show"))
     refusal(result, 1, "aegis.team.config.show/v1", UNSUPPORTED_PROFILE, CONFIG_ACTION)
     same_snapshot(result[1], "aegis_team_config", {"workspace": str(isolated)})
 
@@ -993,13 +1107,12 @@ def test_queue_round_trip_and_stale_retry(repository, capsys):
             json.dumps({"v": 1, "lanes": {"writer": ["src/**"]}}), encoding="utf-8"
         )
     item = {"id": "ONE", "title": "Conformance work", "paths": ["src/**"], "capabilities": ["test"]}
-    code, added = cli(root, capsys, "queue", "add", "--item", json.dumps(item))
+    code, added = cli(root, capsys, ("queue", "add"), "--item", json.dumps(item))
     assert (code, added["schema"], added["refused"]) == (0, "aegis.team.queue.add/v1", False), added
-    claim = ("queue", "claim", "ONE", "--expect", added["item"]["revision"],
-             "--lane", "writer", "--capability", "test")
+    claim = ("ONE", "--expect", added["item"]["revision"], "--lane", "writer", "--capability", "test")
     expected_item = added["item"]
     if has_queue_policy:
-        code, claimed = cli(root, capsys, *claim)
+        code, claimed = cli(root, capsys, ("queue", "claim"), *claim)
         assert code == 0 and claimed["refused"] is False, claimed
         expected_item = claimed["item"]
         assert expected_item["state"] == "claimed"
@@ -1009,11 +1122,11 @@ def test_queue_round_trip_and_stale_retry(repository, capsys):
         reason = "blocked"
         action = "Resolve the listed blockers, then list and retry the current revision."
     for _ in range(2):
-        code, refused = cli(root, capsys, *claim)
+        code, refused = cli(root, capsys, ("queue", "claim"), *claim)
         assert (code, refused["refused"], refused["reason"], refused["next_action"]) == (
             1, True, reason, action
         )
-    code, listed = cli(root, capsys, "queue", "list")
+    code, listed = cli(root, capsys, ("queue", "list"))
     assert (code, listed["schema"]) == (0, "aegis.team.queue.list/v1")
     [item] = listed["items"]
     assert (item["id"], item["revision"], item["state"]) == ("ONE", expected_item["revision"], expected_item["state"])
@@ -1066,8 +1179,9 @@ def test_unqualified_root_is_refused_at_run_init(isolated, sealed_hosts, root_ho
     for _ in range(2):
         result = sealed_hosts.run_script(script, "--config", str(config), "init", env=environment)
         sealed_hosts.expect()
-        assert result.returncode == 2 and result.stderr == ""
-        assert json.loads(result.stdout)["error"].startswith(f"hosts.{field} must be claude-code or codex-cli")
+        assert script_json(script, "init", result, expect=2)["error"].startswith(
+            f"hosts.{field} must be claude-code or codex-cli"
+        )
         assert not run.exists()
 
 
@@ -1093,28 +1207,30 @@ def test_resume_refuses_mismatched_host_profile(isolated, sealed_hosts):
                    "FAKE_CODEX_LOG": str(codex_log), "FAKE_HOST_LOG": str(host_log), "FAKE_HOST_PLAN": str(host_plan),
                    "FAKE_CODEX_THREAD": "019a6c3e-1111-7222-8333-444455556666"}
 
-    def run(script, *words, document=None, expect=0):
+    def run(script, verb, *arguments, flags=(), document=None, expect=0):
         if document is not None:
             request.write_text(json.dumps(document), encoding="utf-8")
-            words = (*words, "--request", str(request))
-        result = sealed_hosts.run_script(script, *words, env=environment, timeout=60)
-        assert result.returncode == expect and result.stderr == "", (result.stdout, result.stderr)
-        return json.loads(result.stdout)
+            arguments = (*arguments, "--request", str(request))
+        result = sealed_hosts.run_script(script, *flags, verb, *arguments, env=environment, timeout=60)
+        return script_json(script, verb, result, expect)
+
+    mailbox_flags = ("--root", str(mailbox))
+    launcher_flags = ("--base", str(base))
 
     def binding():
-        return run(HELPER, "--root", str(mailbox), "status")["bindings"].get(REVIEW)
+        return run(HELPER, "status", flags=mailbox_flags)["bindings"].get(REVIEW)
 
-    run(SOURCE / "tools" / "hierarchy_workspace.py", "--store", str(store), "init",
+    run(SOURCE / "tools" / "hierarchy_workspace.py", "init", flags=("--store", str(store)),
         document={"writer_limit": 3, "heavy_limit": 3})
     build_source(source)
     run(PROVISION, "init", document={"store": str(store), "base": str(base), "source": str(source),
                                      "initiative": INITIATIVE, "lanes": LANES})
     sealed_hosts.expect()
-    started = run(LAUNCHER, "--base", str(base), "start", document={"endpoint": REVIEW})
+    started = run(LAUNCHER, "start", flags=launcher_flags, document={"endpoint": REVIEW})
     sealed_hosts.expect(executable)
     sender = run(PROVISION, "add-role", document={"base": str(base), "endpoint": "pilot/orchestrator",
                                                  "host": team_host_registry.CLAUDE, "cwd": str(isolated)})
-    run(HELPER, "--root", str(mailbox), "publish", document={
+    run(HELPER, "publish", flags=mailbox_flags, document={
         "message_id": "for-review", "from": "pilot/orchestrator", "to": REVIEW,
         "host": sender["host"], "session": sender["session"], "binding_generation": sender["generation"],
         "type": "info", "body": "UNTRUSTED-BODY",
@@ -1127,7 +1243,7 @@ def test_resume_refuses_mismatched_host_profile(isolated, sealed_hosts):
     profile.write_text(json.dumps({**document, "host": team_host_registry.CLAUDE}), encoding="utf-8")
     start_calls = codex_log.read_bytes()
     for _ in range(2):
-        refused = run(LAUNCHER, "--base", str(base), "resume", "--endpoint", REVIEW, expect=2)
+        refused = run(LAUNCHER, "resume", "--endpoint", REVIEW, flags=launcher_flags, expect=2)
         sealed_hosts.expect()
         assert (refused["state"], refused["error"], refused["wake_exit_code"]) == (
             "refused", "profile does not match the current binding", 2,
@@ -1136,7 +1252,7 @@ def test_resume_refuses_mismatched_host_profile(isolated, sealed_hosts):
         assert codex_log.read_bytes() == start_calls and not host_log.exists()
 
     profile.write_bytes(original)
-    assert run(LAUNCHER, "--base", str(base), "resume", "--endpoint", REVIEW)["state"] == "resumed"
+    assert run(LAUNCHER, "resume", "--endpoint", REVIEW, flags=launcher_flags)["state"] == "resumed"
     sealed_hosts.expect(executable)
     assert host_log.exists() and binding() == original_binding
 
@@ -1170,7 +1286,7 @@ def root_run_fixture(isolated, sealed_hosts, team_host, policy, capsys):
     profile_path = project.joinpath(*team_profile.REPO_PATH)
     profile_path.parent.mkdir(parents=True)
     profile_path.write_text(json.dumps({"version": 1, "preset": "solo", "policy": policy}), encoding="utf-8")
-    code, shown = cli(project, capsys, "config", "show")
+    code, shown = cli(project, capsys, ("config", "show"))
     assert code == 0
     resolved = shown["profile"]["policy"]
     target = resolved["landing"]["target_branch"]
@@ -1253,11 +1369,11 @@ def test_fake_codex_root_records_one_restricted_turn(isolated, sealed_hosts, tea
     }
     script = SOURCE / "tools" / "hierarchy_team.py"
 
-    def team(*words, expect=0, executables=()):
-        result = sealed_hosts.run_script(script, "--config", str(config), *words, env=environment, timeout=60)
+    def team(verb, *arguments, expect=0, executables=()):
+        result = sealed_hosts.run_script(script, "--config", str(config), verb, *arguments,
+                                         env=environment, timeout=60)
         sealed_hosts.expect(*executables)
-        assert result.returncode == expect and result.stderr == "", (result.stdout, result.stderr)
-        return json.loads(result.stdout)
+        return script_json(script, verb, result, expect)
 
     assert team("init")["init"] == "complete"
     plan = json.loads((run / "initiatives" / "pilot" / "host-plan.json").read_text(encoding="utf-8"))
@@ -1319,10 +1435,9 @@ def assert_target_branch_routing(run, isolated, sealed_hosts, environment, polic
                               env=environment, capture_output=True, text=True, check=True, timeout=15).stdout.strip()
     assert checkout == CHECKOUT_BRANCH and checkout != target
 
-    def workspace(expect, *words):
-        result = sealed_hosts.run_script(script, "--store", str(run / "store"), *words, env=environment)
-        assert result.returncode == expect and result.stderr == "", (result.stdout, result.stderr)
-        return json.loads(result.stdout)
+    def workspace(expect, verb, *arguments):
+        result = sealed_hosts.run_script(script, "--store", str(run / "store"), verb, *arguments, env=environment)
+        return script_json(script, verb, result, expect)
 
     def mark_merge(branch):
         path = isolated / "merge.json"
