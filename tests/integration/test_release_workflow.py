@@ -10,6 +10,8 @@ import os
 import ast
 import binascii
 import contextlib
+from copy import deepcopy
+import cProfile
 from functools import partial
 import hashlib
 import importlib.util
@@ -1683,17 +1685,22 @@ def distribution_verifier():
 
 
 @pytest.mark.parametrize("kind", ["wheel", "sdist"])
-def test_member_admission_requires_one_name(distribution_verifier, capsys, kind):
+@pytest.mark.parametrize("populated", [False, True], ids=["empty", "populated"])
+def test_member_admission_requires_one_name(distribution_verifier, capsys, kind, populated):
     prefix = "release/" if kind == "sdist" else ""
     name = prefix + "aegis_core/team_templates/probe.json"
     other = prefix + "aegis_core/team_templates/other.json"
-    state = {"root": None, "names": set(), "ancestors": set(), "templates": set(), "info_roots": set()}
+    state = distribution_verifier._admission_state()
     mode = stat.S_IFREG if kind == "wheel" else tarfile.REGTYPE
+    if populated:
+        assert distribution_verifier.admit_member(kind, other, other, mode, 0, state) == "admitted"
+    snapshot = deepcopy(state)
     with pytest.raises(SystemExit) as error:
         distribution_verifier.admit_member(kind, name, other, mode, 0, state)
     assert error.value.code == 1
     assert capsys.readouterr().err == "verify_dist: forbidden " + kind + " member: " + name + "\n"
-    assert state == {"root": None, "names": set(), "ancestors": set(), "templates": set(), "info_roots": set()}
+    assert state == snapshot
+    assert distribution_verifier.admit_member(kind, name, name, mode, 0, state) == "admitted"
 
 
 def test_tip_duplicate_wheel_refusal_survives(tmp_path):
@@ -1897,13 +1904,19 @@ def test_zip_name_concurrent_records_do_not_share_validation(tmp_path):
     ("sdist", "release/payload.exe "),
 ], ids=["wheel-parent-spaces", "sdist-executable-dot", "sdist-executable-space"])
 def test_member_admission_refuses_windows_component_aliases(distribution_verifier, capsys, tmp_path, kind, name):
-    state = {"root": None, "names": set(), "ancestors": set(), "templates": set(), "info_roots": set()}
+    state = distribution_verifier._admission_state()
     mode = stat.S_IFREG if kind == "wheel" else tarfile.REGTYPE
+    prefix = "release/" if kind == "sdist" else ""
+    valid = prefix + "aegis_core/probe.py"
+    assert distribution_verifier.admit_member(kind, valid, valid, mode, 0, state) == "admitted"
+    snapshot = deepcopy(state)
     with pytest.raises(SystemExit) as error:
         distribution_verifier.admit_member(kind, name, name, mode, 0, state)
     assert error.value.code == 1
     assert capsys.readouterr().err == "verify_dist: forbidden " + kind + " member: " + name + "\n"
-    assert state["root"] is None and not state["names"] and not state["ancestors"]
+    assert state == snapshot
+    retry = prefix + "aegis_core/other.py"
+    assert distribution_verifier.admit_member(kind, retry, retry, mode, 0, state) == "admitted"
     _assert_both_admission_commands(
         _admission_dist(tmp_path, kind, [(name, mode, b"x")]), False, name)
 
@@ -2767,19 +2780,24 @@ def test_component_index_records_spelling_kind_and_explicit_state(distribution_v
     state = distribution_verifier._admission_state()
     assert distribution_verifier.admit_member(
         kind, file_name, file_name, file_type, 2, state, mode=0o644) == "admitted"
-    parent = distribution_verifier._fold_key(prefix + "aegis_core/team_templates")
-    assert state["components"][parent]["roles"] == ("roles", "directory", False)
+    packages = state["components"]
+    if kind == "sdist":
+        root = packages["release"]
+        assert (root.spelling, root.kind, root.explicit) == ("release", "directory", False)
+        packages = root.children
+    parent = packages["aegis_core"].children["team_templates"].children
+    roles = parent["roles"]
+    assert (roles.spelling, roles.kind, roles.explicit) == ("roles", "directory", False)
     assert distribution_verifier.admit_member(
         kind, other_name, other_name, file_type, 2, state, mode=0o644) == "admitted"
-    assert state["components"][parent]["roles"] == ("roles", "directory", False)
+    assert not parent["roles"].explicit
     assert distribution_verifier.admit_member(
         kind, dir_name, dir_name, dir_type, 0, state, mode=0) == "admitted"
-    assert state["components"][parent]["roles"] == ("roles", "directory", True)
-    leaf_parent = distribution_verifier._fold_key(prefix + "aegis_core/team_templates/roles")
-    assert state["components"][leaf_parent]["probe.json"] == ("probe.json", "file", False)
-    root_part = "release" if kind == "sdist" else "aegis_core"
-    assert state["components"][""][distribution_verifier._fold_part(root_part)] == (
-        root_part, "directory", False)
+    roles = parent["roles"]
+    assert (roles.spelling, roles.kind, roles.explicit) == ("roles", "directory", True)
+    assert set(roles.children) == {"probe.json", "other.json"}
+    probe = roles.children["probe.json"]
+    assert (probe.spelling, probe.kind, probe.explicit) == ("probe.json", "file", False)
 
 
 @pytest.mark.parametrize("first,second,incoming,existing", [
@@ -2790,12 +2808,10 @@ def test_component_index_records_spelling_kind_and_explicit_state(distribution_v
 ], ids=["kind-conflict", "spelling-conflict"])
 def test_component_conflict_does_not_mutate_admission_state(
         distribution_verifier, capsys, first, second, incoming, existing):
-    import copy
-
     state = distribution_verifier._admission_state()
     assert distribution_verifier.admit_member(
         "wheel", first, first, stat.S_IFREG, 1, state, mode=0o644) == "admitted"
-    snapshot = copy.deepcopy(state)
+    snapshot = deepcopy(state)
     with pytest.raises(SystemExit) as error:
         distribution_verifier.admit_member(
             "wheel", second, second, stat.S_IFREG, 1, state, mode=0o644)
@@ -2803,6 +2819,65 @@ def test_component_conflict_does_not_mutate_admission_state(
     assert state == snapshot
     expected = _namespace_conflict_message("wheel", second, incoming, existing)
     assert capsys.readouterr().err == "verify_dist: " + expected + "\n"
+
+
+def test_wheel_allowlist_refusal_does_not_publish_staged_components(distribution_verifier, capsys):
+    state = distribution_verifier._admission_state()
+    snapshot = deepcopy(state)
+    rejected = "aegis_core/Upper/child/probe.txt"
+    with pytest.raises(SystemExit) as error:
+        distribution_verifier.admit_member("wheel", rejected, rejected, stat.S_IFREG, 0, state)
+    assert error.value.code == 1
+    assert capsys.readouterr() == ("", "verify_dist: unexpected wheel member: " + rejected + "\n")
+    assert state == snapshot
+    corrected = "aegis_core/upper/child/probe.py"
+    assert distribution_verifier.admit_member(
+        "wheel", corrected, corrected, stat.S_IFREG, 0, state) == "admitted"
+
+
+@pytest.mark.parametrize("name,member_type", [
+    ("rejected/child", tarfile.SYMTYPE),
+    ("rejected/orphan", tarfile.DIRTYPE),
+], ids=["invalid-shape", "orphan-directory"])
+def test_refused_first_sdist_member_leaves_root_available_for_retry(
+        distribution_verifier, capsys, name, member_type):
+    state = distribution_verifier._admission_state()
+    snapshot = deepcopy(state)
+    with pytest.raises(SystemExit) as error:
+        distribution_verifier.admit_member("sdist", name, name, member_type, 0, state)
+    assert error.value.code == 1
+    assert capsys.readouterr() == ("", "verify_dist: unexpected sdist member: " + name + "\n")
+    assert state == snapshot
+    corrected = "release/child.py"
+    assert distribution_verifier.admit_member(
+        "sdist", corrected, corrected, tarfile.REGTYPE, 0, state) == "admitted"
+
+
+@pytest.mark.parametrize("kind", ["wheel", "sdist"])
+def test_deep_member_folds_each_component_once(distribution_verifier, kind):
+    state = distribution_verifier._admission_state()
+    file_type = stat.S_IFREG if kind == "wheel" else tarfile.REGTYPE
+    parent = "aegis_core/" + "child/" * 128
+    for leaf in ("first.py", "second.py"):
+        name = _namespace_shown(kind, parent + leaf, "file")
+        profile = cProfile.Profile()
+        assert profile.runcall(
+            distribution_verifier.admit_member, kind, name, name, file_type, 0, state) == "admitted"
+        fold_code = distribution_verifier._fold_part.__code__
+        folds = sum(entry.callcount for entry in profile.getstats() if entry.code is fold_code)
+        assert folds == len(name.split("/"))
+
+
+@pytest.mark.parametrize("kind", ["wheel", "sdist"])
+def test_deep_namespace_works_at_name_limit(tmp_path, kind):
+    parent = "aegis_core/top/"
+    tail = "file.py"
+    remaining = 4096 - len(_namespace_shown(kind, parent + tail, "file"))
+    name = parent + "d/" * (remaining // 2) + "x" * (remaining % 2) + tail
+    assert len(_namespace_shown(kind, name, "file")) == 4096
+    entries = _namespace_entries(kind, [(parent, "directory"), (name, "file")])
+    dist = _admission_dist(tmp_path, kind, entries)
+    _assert_both_admission_commands(dist, True)
 
 
 def test_component_index_threads_do_not_share_state(distribution_verifier):
@@ -2831,15 +2906,20 @@ def test_component_index_threads_do_not_share_state(distribution_verifier):
 
 
 def test_explicit_directory_missing_descendant_is_refused(distribution_verifier, capsys):
-    state = {"components": {"": {"roles": ("roles", "directory", True)}}}
+    state = distribution_verifier._admission_state()
+    name = "aegis_core/roles/probe.py"
+    assert distribution_verifier.admit_member("wheel", name, name, stat.S_IFREG, 0, state) == "admitted"
+    directory = "aegis_core/roles/"
+    assert distribution_verifier.admit_member(
+        "wheel", directory, directory, stat.S_IFDIR, 0, state) == "admitted"
+    distribution_verifier._refuse_orphan_directories("wheel", state)
+    # Exercise the final consistency check by removing the already-admitted child.
+    state["components"]["aegis_core"].children["roles"].children.clear()
     with pytest.raises(SystemExit) as error:
         distribution_verifier._refuse_orphan_directories("wheel", state)
     assert error.value.code == 1
     assert capsys.readouterr().err == "verify_dist: unexpected wheel member: directory\n"
-    state["components"]["roles"] = {"probe.json": ("probe.json", "file", False)}
-    distribution_verifier._refuse_orphan_directories("sdist", state)
-    assert capsys.readouterr().err == ""
-    distribution_verifier._refuse_orphan_directories("wheel", {"components": {}})
+    distribution_verifier._refuse_orphan_directories("wheel", distribution_verifier._admission_state())
 
 
 @pytest.mark.parametrize("kind", ["wheel", "sdist"])
@@ -2914,6 +2994,10 @@ def test_namespace_exact_name_refusal_consults_only_leaf(distribution_verifier, 
             lookups.append(key)
             return super().get(key, default)
 
+        def __getitem__(self, key):
+            lookups.append(key)
+            return super().__getitem__(key)
+
     state = distribution_verifier._admission_state()
     path = "aegis_core/" + "parent/" * 64 + "probe.py"
     file_type = stat.S_IFREG if kind == "wheel" else tarfile.REGTYPE
@@ -2931,7 +3015,7 @@ def test_namespace_exact_name_refusal_consults_only_leaf(distribution_verifier, 
     with pytest.raises(SystemExit) as error:
         admit(path, second)
     assert error.value.code == 1
-    assert lookups == [_namespace_shown(kind, path, "file").rsplit("/", 1)[0]]
+    assert lookups == []
     name = _namespace_shown(kind, path, second)
     prefix = _namespace_shown(kind, path, "file")
     if first == second:
