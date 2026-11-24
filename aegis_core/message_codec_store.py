@@ -103,12 +103,6 @@ def _bind_read(value, rid, length):
     return bound
 
 
-class _FlatStoreError(CodecError):
-    def __init__(self):
-        super().__init__("E_AUTH")
-        self.args = ("flat message store layout is unsupported; use a new empty store directory",)
-
-
 def _record_name(name):
     return len(name) == 69 and name.endswith(".json") and SHA.fullmatch(name[:64]) is not None
 
@@ -215,7 +209,7 @@ class Store:
                 # Check the layout once when binding the owner-controlled root.
                 with os.scandir(held.fd) as entries:
                     if any(_record_name(entry.name) for entry in entries):
-                        raise _FlatStoreError()
+                        raise CodecError("E_AUTH", detail="flat_layout")
                 self._identity = held.identity
                 self.fd = held.detach()
             self._finalizer = weakref.finalize(self, _release, self.fd)
