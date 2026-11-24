@@ -1,10 +1,14 @@
 """Manager audit behavior never establishes repository credit or native execution."""
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, local
+from types import SimpleNamespace
 
 import pytest
 
-from aegis_core import manager as manager_module
+from aegis_core import gitsafe as git_discovery
+from aegis_core import gitsafe_run
 from aegis_core.manager import ManagerService
 from aegis_core.manager_policy import ManagerError
 from tests.helpers_manager import active, approve, git, manager_root, prepare
@@ -15,42 +19,254 @@ def env(manager_root):
     return prepare(manager_root)
 
 
-@pytest.mark.parametrize("bad", [False, True])
-def test_manager_gitdir_preserves_whitespace_or_refuses(tmp_path, monkeypatch, bad):
-    import os
-    import subprocess
-    from types import SimpleNamespace
-    root = tmp_path / "root"
-    root.mkdir()
-    common = root / "common"
-    common.mkdir()
-    gitdir = root / (" leading" if os.name == "nt" else " leading ")
-    gitdir.mkdir()
-    member = {"id": "aegis", "common_dir": str(common),
-              "worktrees": [{"id": "main", "path": str(root)}]}
-    candidate = {"workspace_id": "test", "control_commit": "a" * 40,
-                 "policy_digest": "b" * 64, "membership_digest": "c" * 64,
-                 "membership": {"repositories": [member]}}
-    config = {"workspace_id": "test", "store_root": tmp_path / "audit", "control_root": root}
-    row = {"kind": "init", "config_digest": "config", "workspace_id": "test",
-           "seq": 0, "prev": "0" * 64, "hash": "1" * 64}
-    monkeypatch.setattr(manager_module, "load_config", lambda *a: (config, "config"))
-    monkeypatch.setattr(manager_module, "ManagerStore", lambda *a, **kw: SimpleNamespace(read=lambda: [row]))
-    monkeypatch.setattr(manager_module, "read_candidate", lambda *a: dict(candidate))
-    def answer(args, cwd, **kwargs):
-        assert args == ["rev-parse", "--absolute-git-dir"]
-        path = b"secret-\xff" if bad else os.fsencode(str(gitdir))
-        return subprocess.CompletedProcess(args, 0, path + b"\n", b"")
-    monkeypatch.setattr(manager_module, "gitsafe", SimpleNamespace(**{**vars(manager_module.gitsafe),
-        "run": answer, "common_dir": lambda *a: common, "toplevel": lambda *a: root}))
-    service = manager_module.ManagerService(tmp_path / "config")
-    if bad:
+_LAYOUT = ("rev-parse", "--git-common-dir", "--show-prefix", "--is-shallow-repository", "--show-toplevel")
+_COMMON = ("rev-parse", "--git-common-dir")
+_TOP = ("rev-parse", "--show-toplevel")
+_GIT_DIR = ("rev-parse", "--absolute-git-dir")
+
+
+def _member_transport(env, monkeypatch, respond):
+    def execute(args, cwd, **kwargs):
+        def run():
+            return gitsafe_run.execute(args, cwd, **kwargs)
+
+        return respond(tuple(args), run) if cwd == env["member"] else run()
+
+    transport = SimpleNamespace(**{**vars(gitsafe_run), "execute": execute})
+    monkeypatch.setattr(git_discovery, "gitsafe_run", transport)
+
+
+def _declare_member(env, path, common):
+    payload = env["control"] / "manager-policy" / "membership.json"
+    membership = json.loads(payload.read_text())
+    member = membership["repositories"][0]
+    member["common_dir"] = str(common)
+    member["worktrees"][0]["path"] = str(path)
+    payload.write_text(json.dumps(membership))
+    git(env["control"], "add", "manager-policy/membership.json")
+    git(env["control"], "commit", "--allow-empty", "-qm", "member placement")
+    return git(env["control"], "rev-parse", "HEAD")
+
+
+def _pending_source_report(service, env):
+    scan = service.scan("handoff", env["context"])
+    rule = scan["rules"][0]
+    evidence = {"member_id": "aegis", "worktree_id": "main",
+                "source_tree": git(env["member"], "rev-parse", "HEAD^{tree}"),
+                "check": "pytest", "rule_id": rule["id"], "rule_revision": rule["revision"],
+                "reference": "log:member-source"}
+    return scan["decision_ref"], [rule["id"]], "success", [evidence], "member-source"
+
+
+def _assert_source_report(service, audit, report, state):
+    receipt = service.report(*report)
+    assert receipt["evidence"][0]["source_status"] == state
+    stored = json.loads(audit.read_bytes().splitlines()[-1])
+    assert stored["result"]["evidence"][0]["source_status"] == state
+
+
+def _reply(code, stdout=b"", stderr=b""):
+    return SimpleNamespace(returncode=code, stdout=stdout, stderr=stderr)
+
+
+@pytest.mark.parametrize(("site", "failure"), [
+    (site, failure)
+    for site in ("validation-layout", "runtime-layout", "git-dir")
+    for failure in ("timeout", "empty-1", "empty-128", "partial-1", "incomplete", "framing", "encoding", "limit")
+] + [
+    (site, failure)
+    for site in ("validation-layout", "runtime-layout")
+    for failure in ("malformed-128", "lookalike-128", "extra-field", "missing-common", "missing-top",
+                    "bad-shallow", "bad-prefix", "extra-prefix-field")
+] + [
+    (site, failure)
+    for site in ("validation-common", "validation-top", "runtime-common", "runtime-top")
+    for failure in ("partial-1", "incomplete", "encoding")
+] + [("git-dir", "relative")])
+def test_manager_git_discovery_refuses_before_publication_and_recovers(env, monkeypatch, site, failure):
+    service = active(env)
+    before = service.status()
+    audit = env["store"] / "audit.jsonl"
+    audit_before = audit.read_bytes()
+    candidate = service.candidate(env["revision"])
+    approval = approve(env, candidate)
+    request = local()
+    concurrent = (site, failure) == ("runtime-layout", "partial-1")
+    together = Barrier(3, timeout=20)
+    top = os.fsencode(env["member"].as_posix())
+    ambiguous_top = top + b"\ncontinued"
+    ambiguous = b".git\n\nfalse\n" + ambiguous_top + b"\n"
+    target = {"layout": _LAYOUT, "common": _COMMON, "top": _TOP, "dir": _GIT_DIR}[site.split("-", 1)[1]]
+    faults = {
+        "empty-1": _reply(1), "empty-128": _reply(128), "partial-1": _reply(1, b".git\n"),
+        "malformed-128": _reply(128, b".git\nwrong\nfalse\n", b"fatal: this operation must be run in a work tree\n"),
+        "lookalike-128": _reply(128, b".git\n\nfalse\n", b"fatal: other failure\n"),
+        "extra-field": _reply(0, ambiguous),
+        "missing-common": _reply(0, b"\n\nfalse\n" + top + b"\n"),
+        "missing-top": _reply(0, b".git\n\nfalse\n\n"),
+        "bad-shallow": _reply(0, b".git\n\nunknown\n" + top + b"\n"),
+        "bad-prefix": _reply(0, b".git\nunexpected/\nfalse\n" + top + b"\n"),
+        "extra-prefix-field": _reply(0, b".git\nextra\nunexpected/\nfalse\n" + top + b"\n"),
+        "incomplete": _reply(0, b".git\n\nfalse\n" if target == _LAYOUT else b"\n"),
+        "encoding": _reply(0, b"invalid-\xff\n"),
+        "framing": _reply(0, b"invalid\0path\n"),
+        "limit": _reply(0, b"x" * 65536 + b"\n"),
+        "relative": _reply(0, b".git\n"),
+    }
+    fault_active = True
+
+    def invoke(operation, *args):
+        request.layout = 0
+        request.failed = False
+        runtime_only = operation in (service.status, _assert_source_report)
+        request.fault_at = 2 if site.startswith("runtime-") and not runtime_only else 1
+        request.synchronize = concurrent and operation != _assert_source_report
+        return operation(*args)
+
+    def respond(args, run):
+        if not fault_active or request.failed:
+            return run()
+        if args == _LAYOUT:
+            request.layout += 1
+        if args == target and (target == _GIT_DIR or request.layout == request.fault_at):
+            request.failed = True
+            if request.synchronize:
+                together.wait()
+            if failure == "timeout":
+                raise git_discovery.GitError("test transport timed out", code="git_timeout")
+            return faults[failure]
+        if args == _LAYOUT and target in (_COMMON, _TOP) and request.layout == request.fault_at:
+            return _reply(0, ambiguous)
+        return run()
+
+    _member_transport(env, monkeypatch, respond)
+    refusal = "membership_unavailable" if failure in ("encoding", "framing", "limit") else "git_unavailable"
+    if concurrent:
+        with ThreadPoolExecutor(max_workers=3) as workers:
+            preview = workers.submit(invoke, service.candidate, env["revision"])
+            activation = workers.submit(invoke, service.activate, env["revision"], before["active_revision"], approval)
+            observation = workers.submit(invoke, service.status)
+            for result in (preview, activation):
+                with pytest.raises(ManagerError, match=f"^{refusal}$"):
+                    result.result(timeout=30)
+            status = observation.result(timeout=30)
+    else:
+        with pytest.raises(ManagerError, match=f"^{refusal}$"):
+            invoke(service.candidate, env["revision"])
+        with pytest.raises(ManagerError, match=f"^{refusal}$"):
+            invoke(service.activate, env["revision"], before["active_revision"], approval)
+        status = invoke(service.status)
+    assert status["membership"][0]["state"] == "unavailable"
+    assert status["audit_head"] == before["audit_head"]
+    assert audit.read_bytes() == audit_before
+
+    fault_active = False
+    report = _pending_source_report(service, env)
+    fault_active = True
+    invoke(_assert_source_report, service, audit, report, "unavailable")
+    fault_active = False
+    restored = service.status()
+    assert restored["membership"][0]["state"] == "available"
+    assert restored["evidence"][0]["source_status"] == "source_match"
+    fresh = service.candidate(env["revision"])
+    assert fresh["bindings"] == candidate["bindings"]
+    activation = service.activate(env["revision"], before["active_revision"], approve(env, fresh))
+    assert activation["status"] == "activated"
+    assert service.status()["active_revision"] == activation["active_revision"]
+
+
+@pytest.mark.parametrize("kind", ["bare", "git-directory", "core-bare"])
+def test_manager_real_no_worktree_is_a_verified_mismatch(env, kind):
+    service = active(env)
+    report = _pending_source_report(service, env)
+    member = env["member"]
+    common = member / ".git"
+    saved = member.with_name("saved-member")
+    if kind == "core-bare":
+        git(member, "config", "core.bare", "true")
+    else:
+        member.rename(saved)
+        common = member
+        if kind == "bare":
+            member.mkdir()
+            git(member, "init", "--bare", "-q")
+        else:
+            (saved / ".git").rename(member)
+    revision = _declare_member(env, member, common)
+    audit = env["store"] / "audit.jsonl"
+    before = audit.read_bytes()
+    head = json.loads(before.splitlines()[-1])["hash"]
+    with pytest.raises(ManagerError, match="^membership_identity_mismatch$"):
+        service.candidate(revision)
+    with pytest.raises(ManagerError, match="^membership_identity_mismatch$"):
+        service.activate(revision, None, {})
+    status = service.status()
+    assert status["membership"][0]["state"] == "mismatched"
+    assert status["audit_head"] == head
+    assert audit.read_bytes() == before
+    _assert_source_report(service, audit, report, "mismatched")
+
+    if kind == "core-bare":
+        git(member, "config", "core.bare", "false")
+    else:
+        if kind == "git-directory":
+            member.rename(saved / ".git")
+        else:
+            member.rename(member.with_name("saved-bare"))
+        saved.rename(member)
+    assert service.status()["membership"][0]["state"] == "available"
+    assert service.status()["evidence"][0]["source_status"] == "source_match"
+
+
+def test_manager_no_worktree_detected_after_live_validation_refuses_binding(env, monkeypatch):
+    service = active(env)
+    member = env["member"]
+    before = service.status()
+    candidate = service.candidate(env["revision"])
+    approval = approve(env, candidate)
+    audit = env["store"] / "audit.jsonl"
+    audit_before = audit.read_bytes()
+    switch = SimpleNamespace(pending=False)
+
+    def respond(args, run):
+        answer = run()
+        if switch.pending and args == _LAYOUT:
+            git(member, "config", "core.bare", "true")
+            switch.pending = False
+        return answer
+
+    _member_transport(env, monkeypatch, respond)
+    for operation, args in ((service.candidate, (env["revision"],)),
+                            (service.activate, (env["revision"], before["active_revision"], approval))):
+        switch.pending = True
         with pytest.raises(ManagerError, match="^membership_unavailable$"):
-            service.candidate("a" * 40)
-        bad = False
-    for _ in range(2):
-        result = service.candidate("a" * 40)
-        assert result["bindings"]["aegis/main"]["git_dir"]["path"] == str(gitdir)
+            operation(*args)
+        assert service.status()["membership"][0]["state"] == "mismatched"
+        assert audit.read_bytes() == audit_before
+        git(member, "config", "core.bare", "false")
+
+    assert service.status() == before
+    assert service.activate(env["revision"], before["active_revision"], approval)["status"] == "activated"
+
+
+@pytest.mark.parametrize("newline", [
+    False, pytest.param(True, marks=pytest.mark.skipif(os.name == "nt", reason="Windows paths cannot contain newline")),
+])
+def test_manager_git_discovery_preserves_paths(env, newline):
+    member = env["member"].with_name(" member\nfalse\n root " if newline else " member")
+    env["member"].rename(member)
+    git_dir_name = " git\nfalse\n dir " if newline else " git-dir"
+    common = member.with_name(git_dir_name if os.name == "nt" or newline else git_dir_name + " ")
+    git(member, "init", "-q", "--separate-git-dir", str(common))
+    revision = _declare_member(env, member, common)
+    service = ManagerService(env["config"])
+    candidate = service.candidate(revision)
+    binding = candidate["bindings"]["aegis/main"]
+    assert {key: item["path"] for key, item in binding.items()} == {
+        "root": str(member), "common_dir": str(common), "git_dir": str(common),
+    }
+    assert service.activate(revision, None, approve(env, candidate))["status"] == "activated"
+    assert service.status()["membership"][0]["state"] == "available"
 
 
 @pytest.mark.parametrize("operation", ["report", "status"])

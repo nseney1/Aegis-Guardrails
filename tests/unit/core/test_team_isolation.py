@@ -69,8 +69,11 @@ def direct(value, **options):
 
 
 def refused_as(code, stage=None):
-    body = {"status": "refused", "code": code, "reason": mounts.REFUSALS[code],
-            "next_action": {"actor": "operator", "command": mounts.REFUSALS[code]}}
+    reason = mounts.REFUSALS[code]
+    if stage == "image-inspection" and code in ("document_invalid", "document_size"):
+        reason = "Check local engine inspection for the configured image and retry."
+    body = {"status": "refused", "code": code, "reason": reason,
+            "next_action": {"actor": "operator", "command": reason}}
     if stage is not None:
         body["stage"] = stage
     return body
