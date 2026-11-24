@@ -68,6 +68,7 @@ FRONTEND_MESSAGES = MappingProxyType({
 _SPECIAL_MESSAGES = MappingProxyType({"operation":
     "store operation unavailable; check permissions, free space, write access and file descriptor limits",
     "format": "invalid format; choose json, md or tsv",
+    "flat_layout": "flat message store layout is unsupported; use a new empty store directory",
     "private": "store access refused; use a private store directory",
     "path": "store access refused; pass a canonical absolute path",
     "resolution": "reference not found or ambiguous; use the full id or a longer handle",
@@ -104,13 +105,15 @@ class CodecError(ValueError):
         return {"error": {"code": self.code, "message": str(self)}}
 
 
-def frontend_error(error, *, detail=None):
+def frontend_error(error, *, detail=None, flat_layout_message=None):
     """Explicit front-end next actions, leaving codec failures host-neutral."""
     value = error.as_dict()
     if error.code == "E_SELECTOR":
         value["error"]["message"] = _SELECTOR_REFUSAL
     if type(detail) is str and detail in FRONTEND_MESSAGES:
         value["error"]["message"] = FRONTEND_MESSAGES[detail]
+    elif error.code == "E_AUTH" and error.detail == "flat_layout" and flat_layout_message is not None:
+        value["error"]["message"] = flat_layout_message
     return value
 
 

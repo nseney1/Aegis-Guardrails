@@ -593,14 +593,20 @@ active dispatches, open job requests, their briefs, lease refs and source witnes
 from the record. Its output is the request for `bind`. `hierarchy_handoff.py` drafts
 and binds each entry in `tools/hierarchy_templates/handoff-spec.json`, reports a failure
 on one without hiding or blocking the others, and leaves finished entries alone when
-run again. Each successor still acknowledges separately through its own connection.
+run again.
 
 With a governing host plan, the next checkpoint keeps briefs for open work, the
 last touching brief and `entries[].briefs`, so standing briefs must be relisted
 there or they silently leave the next checkpoint. The last inherited brief is
 kept when none qualifies. A standalone `draft-handoff` preview still lists every
-brief. Under a governing host plan, the preview checkpoint sha differs from
-the bound one when a brief is omitted. Without a plan, briefs carry forward unchanged.
+brief. When a governing host plan omits a brief, the preview and bound checkpoint
+have different SHA-256 digests. Without a plan, briefs carry forward unchanged.
+
+Each successor reads its bound checkpoint and inbox, then uses the successful
+replacement entry's `acknowledge` object for its own acknowledgment. For the CLI,
+submit that object with `ack-handoff --request` against the entry's mailbox root.
+Through its own mailbox connection, the successor calls `mailbox_ack_handoff` with
+the object's `checkpoint_sha256`. The connection supplies the binding identity.
 
 With `delivery_dir`, the draft includes every unread message ID, including messages
 that were woken but not read. The delivery status page's 100-ID display limit does
@@ -614,11 +620,8 @@ Ordinary unread messages retain their hash-bound brief references in the inbox.
 The successor reads them with `include_briefs` and follows `next_after` while
 `remaining` is nonzero. Their contents stay pageable instead of accumulating in
 mandatory checkpoint metadata. Active/job, explicit and still-carried inherited
-checkpoint briefs retain their existing validation and response limits. With a
-governing host plan, an inherited brief is carried only when it is open work,
-the last touching brief, listed in `entries[].briefs`, or the last inherited
-brief when none qualifies. Without a plan, inherited briefs carry forward
-unchanged.
+checkpoint briefs retain their existing validation and response limits. The
+brief-retention rule above determines which inherited briefs stay in the checkpoint.
 
 For a mailbox move, current carry briefs retain each open job's original full ID
 and the path and SHA-256 of its original request. Missing terminal receipts can
@@ -645,9 +648,12 @@ native enforcement.
 
 Publish a replacement binding request with the same endpoint, a new host/session,
 `expected_generation` equal to the current generation, and the checkpoint object.
-The new binding is immutable and initially not ready. Its returned
-`checkpoint_sha256` hashes canonical checkpoint JSON. The successor reads the
-checkpoint and inbox, then acknowledges it:
+The new binding is immutable and initially not ready. The successor reads its
+bound checkpoint and inbox, then uses the `checkpoint_sha256` returned by `bind`
+to acknowledge the checkpoint. This is the SHA-256 of the canonical checkpoint JSON.
+Through the successor's mailbox connection, pass the digest to `mailbox_ack_handoff`.
+For the CLI command below, fill the request file with the returned binding's
+`endpoint`, `generation`, `session` and `checkpoint_sha256`.
 
 ```sh
 python3 /absolute/prototype/tools/hierarchy_mailbox.py \
@@ -666,9 +672,8 @@ result, a review or a `completed` ack are not checked. The ack output adds
 dirty_state_sha256}` per checked worktree, in checkpoint order, or an empty list. The
 `.ack` file and the binding are unchanged.
 
-The acknowledgment JSON has exactly `endpoint`, `generation`, `session` and
-`checkpoint_sha256`. The old sender generation is rejected after replacement; the
-successor cannot publish or receive a new dispatch until this acknowledgment.
+The old sender generation is rejected after replacement. The successor cannot
+publish or receive a new dispatch until this acknowledgment.
 Historical messages retain their original provenance. Existing accepted assignments
 belong to the stable endpoint and survive the handoff. The protocol cannot prevent
 the old same-user process from editing directly. Rotate root after 90 active minutes
