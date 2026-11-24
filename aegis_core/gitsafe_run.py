@@ -106,7 +106,7 @@ __all__ = ["BASE_ENV", "DEFAULT_HARDENING", "HARDENING_KEEP_HOOKS_PATH", "LOCAL_
            "capture", "checked", "completed", "custody", "custody_active",
            "execute", "memo_context", "output", "path_text", "query_result", "validate_review_preparation",
            "private_headers", "private_object", "private_objects", "scrubbed", "text", "update_once",
-           "strict_active", "lane_update_ref", "validate_update_input", "find_executable", "git_path",
+           "strict_active", "lane_update_ref", "validate_update_input", "find_executable", "git_path", "bound_metadata_reader",
            "LaneRunner", "hashed_blob", "check_ref_name", "CustodyRefusal", "request_environment", "Environment", "outside_roots", "AMBIENT_ENV", "custody_inputs", "merge_inputs", "transport_services", "REPLACEMENT_UNSET"]
 _SCRUB = contextvars.ContextVar("aegis_git_scrub", default=False)
 _CUSTODY = contextvars.ContextVar("aegis_git_custody", default=None)
@@ -358,6 +358,30 @@ def git_path(cwd, name, *, runner, hardening):
     if not text: return None
     path = Path(text)
     return path if path.is_absolute() else (Path(cwd) / path).resolve()
+
+
+def bound_metadata_reader(program, checkout, git_dir, deadline):
+    from aegis_core.git_path_codec import MAX_PATH_BYTES
+
+    if custody_active():
+        raise GitError("Git metadata path is unavailable.", code="git_path_unavailable")
+    env = request_environment(scrub=_SCRUB.get())
+    for key in tuple(env):
+        if key.upper() in LOCATION_ENV:
+            del env[key]
+    env.update(GIT_DIR=str(git_dir), GIT_WORK_TREE=str(checkout))
+    policy = _Policy(checkout, {}, MAX_PATH_BYTES, MAX_PATH_BYTES, False)
+    command = (program, *HARDENING_KEEP_HOOKS_PATH, "rev-parse")
+
+    def read(args):
+        if args not in (("--git-path", "hooks"), ("--path-format=absolute", "--git-path", "hooks"),
+                        ("--path-format=absolute", "--git-dir"), ("--path-format=absolute", "--git-common-dir")):
+            raise GitError("Git metadata path is unavailable.", code="git_path_unavailable")
+        return capture((*command, *args), cwd=checkout, env=env, stdin=None,
+                       timeout=deadline - time.monotonic(), _policy=policy)
+    return read
+
+
 def hashed_blob(cwd, data, write, *, runner, hasher, error):
     # From stdin with no --path, hash-object applies no attribute, filter or line-ending
     # conversion: the blob is exactly ``data``, named in the repository's hash format.
