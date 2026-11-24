@@ -16,13 +16,13 @@ from aegis_core.workspace.layout import RULES_RELDIR
 
 NO_DRIVER_NOTE_TOOL = 'forbid_ast_no_driver'
 AST_SIZE_NOTE_TOOL = 'ast_unverified'
-# The one action a size advisory tells the user to take. Card text shows it once.
+# Preserve the original wording in per-advisory evidence.
 SIZE_RECOVERY_HINT = 'use target_paths to exclude generated bundles (aegis doctor)'
-_SIZE_DETAIL = re.compile(r'exceeds ([0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?) MiB(?:;|$)')
-_SIZE_COVERAGE_REASON = re.compile(
-    r'size limit \(too_large(?:; exceeds [0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)? MiB)?\)')
-# Longer than any reason size_limit_reason can emit (the captured limit is at most 64 characters).
-_SIZE_REASON_LIMIT = 128
+_SIZE_DETAIL = re.compile(r'exceeds [0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)? MiB')
+_SIZE_DETAIL_LIMIT = 64
+_SIZE_REASON = 'size limit (too_large'
+_SIZE_REASON_PREFIX = f'{_SIZE_REASON}; '
+_SIZE_REASON_LIMIT = len(_SIZE_REASON_PREFIX) + _SIZE_DETAIL_LIMIT + 1
 
 
 def too_large_note(path: str, language: str = 'unknown', *, reason: str | None = None,
@@ -45,8 +45,13 @@ def size_limit_reason(path: str, detail: str) -> str:
     supply a fake limit. A legacy or unquantified refusal stays unquantified.
     """
     prefix = f'unverified too_large: {path} '
-    match = _SIZE_DETAIL.match(detail[len(prefix):len(prefix) + 64]) if detail.startswith(prefix) else None
-    return f'size limit (too_large; exceeds {match[1]} MiB)' if match else 'size limit (too_large)'
+    if detail.startswith(prefix):
+        start = len(prefix)
+        match = _SIZE_DETAIL.match(detail, start, start + _SIZE_DETAIL_LIMIT)
+        # Check the delimiter in the original detail, beyond the match window if needed.
+        if match and (match.end() == len(detail) or detail.startswith(';', match.end())):
+            return f'{_SIZE_REASON_PREFIX}{match[0]})'
+    return f'{_SIZE_REASON})'
 
 
 def is_size_coverage_reason(reason: object) -> bool:
@@ -58,7 +63,10 @@ def is_size_coverage_reason(reason: object) -> bool:
     """
     if not isinstance(reason, str) or len(reason) > _SIZE_REASON_LIMIT:
         return False
-    return _SIZE_COVERAGE_REASON.fullmatch(reason) is not None
+    return reason == f'{_SIZE_REASON})' or (
+        reason.startswith(_SIZE_REASON_PREFIX) and reason.endswith(')')
+        and _SIZE_DETAIL.fullmatch(reason, len(_SIZE_REASON_PREFIX), len(reason) - 1) is not None
+    )
 
 
 def site_key(path: str, line: int, pattern: str) -> tuple[str, int, str]:
