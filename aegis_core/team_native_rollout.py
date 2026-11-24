@@ -8,6 +8,7 @@ Wire data and witnesses remain unrendered data; diagnostic reasons use the share
 canonicalize/redact/clip pipeline. Structural JSON bounds are the recorded TA-3f
 round-1b parity exceptions. Byte ceilings retain the legacy values.
 """
+from contextlib import closing
 from functools import wraps
 import errno
 import hashlib
@@ -56,14 +57,24 @@ _NEXT = {
     "unsupported_platform": "Use a platform supporting descriptor-relative no-follow observation.",
     "unqualified": "Keep execution disabled until an owner-approved native authority design is implemented.",
 }
+_INVALID_RECORD_NEXT = {
+    "session_mismatch": "Select the rollout for the requested session, then retry.",
+    "missing_metadata": "Restore session metadata from trusted rollout evidence, then retry.",
+    "pending_context": "Wait for the current turn context to be recorded, then retry.",
+}
 
 
 class NativeRolloutRefusal(ValueError):
     """Fixed refusal data; untrusted record and path text never enter diagnostics."""
-    def __init__(self, reason):
+    def __init__(self, reason, *, cause=None, line=None):
         self.reason = reason if type(reason) is str and reason in _NEXT else "invalid_record"
         self.state, self.status, self.code = "NATIVE_HOLD", "refused", 2
         self.next_action = _NEXT[self.reason]
+        if self.reason == "invalid_record":
+            if type(line) is int and 1 <= line <= MAX_ROLLOUT_BYTES:
+                self.next_action = f"Restore a valid native rollout record at line {line} from trusted evidence, then retry."
+            elif type(cause) is str:
+                self.next_action = _INVALID_RECORD_NEXT.get(cause, self.next_action)
         super().__init__("native rollout refused: " + self.reason)
 
     def as_dict(self):
@@ -125,6 +136,20 @@ def _rollout_json(raw):
     return strict_json(raw, limit=MAX_RECORD_BYTES, max_atom=MAX_RECORD_BYTES, source_bytes=True)
 
 
+def _require_record(condition, line):
+    if not condition:
+        raise NativeRolloutRefusal("invalid_record", line=line)
+
+
+def _record_value(read, value, line):
+    try:
+        return read(value)
+    except NativeRolloutRefusal as error:
+        if error.reason != "invalid_record":
+            raise
+        raise NativeRolloutRefusal(error.reason, line=line) from None
+
+
 def _embedded_json(raw):
     """Distinguish plain legacy text from JSON refused by a structural bound.
 
@@ -172,6 +197,7 @@ def rollout_records(rollout, tolerant=False):
     before parsing, including if a producer appends while observation is running.
     Closing this generator releases the stream, leaf and Store descriptors.
     """
+    line = None
     try:
         if not descriptor_supported():
             raise NativeRolloutRefusal("unsupported_platform")
@@ -185,22 +211,27 @@ def rollout_records(rollout, tolerant=False):
                 require(info.st_size <= MAX_ROLLOUT_BYTES, reason="too_large")
                 # The leaf has exactly one closer, even when fdopen raises.
                 with os.fdopen(fd, "rb", closefd=False) as stream:
-                    yield from _stream_records(path, stream, tolerant)
+                    for number, raw in _stream_lines(stream, tolerant):
+                        line = number
+                        record = _rollout_json(raw)
+                        require(type(record) is dict)
+                        line = None
+                        yield path, number, raw, record
             finally:
                 os.close(fd)
     except NativeRolloutRefusal:
         raise
     except MailboxRefusal as error:
-        raise NativeRolloutRefusal(render_mailbox_refusal(error)["reason"]) from None
+        raise NativeRolloutRefusal(render_mailbox_refusal(error)["reason"], line=line) from None
     except FileNotFoundError:
         raise NativeRolloutRefusal("missing") from None
     except OSError as error:
         raise NativeRolloutRefusal(_io_reason(error)) from None
     except (ValueError, UnicodeError, RecursionError, OverflowError):
-        raise NativeRolloutRefusal("invalid_record") from None
+        raise NativeRolloutRefusal("invalid_record", line=line) from None
 
 
-def _stream_records(path, stream, tolerant):
+def _stream_lines(stream, tolerant):
     total, number = 0, 0
     while True:
         raw = stream.readline(min(MAX_RECORD_BYTES, MAX_ROLLOUT_BYTES - total) + 1)
@@ -213,9 +244,7 @@ def _stream_records(path, stream, tolerant):
             break
         if not raw.endswith(b"\n"):
             raise NativeRolloutRefusal("incomplete_record")
-        record = _rollout_json(raw)
-        require(type(record) is dict)
-        yield path, number, raw, record
+        yield number, raw
 
 
 @_boundary
@@ -261,47 +290,52 @@ def inspect_codex(rollout, cid, requested_tier="default", tolerant=False, *, qua
     started_turn, running = None, False
     applied, pending = None, None
     witnesses = {}
-    for path, number, raw, record in rollout_records(rollout, tolerant):
-        kind, payload = record.get("type"), record.get("payload")
-        require(type(kind) not in (list, dict))
-        event = event_type(record)
-        if event == "task_started":
-            started_turn, running = turn_start(payload), True
-            context = None
-            witnesses.pop("turn_record", None)
-            applied = None
-            if pending is not None and pending[0].get("turn_id") in (None, started_turn):
-                applied = pending
-            pending = None
-            continue
-        if event in ("task_complete", "turn_aborted"):
-            running = False
-            continue
-        if event == "thread_settings_applied":
-            values = payload.get("thread_settings")
-            require(type(values) is dict)
-            entry = ({"turn_id": payload.get("turn_id"), "values": values}, witness_of(path, number, raw, record))
-            named = payload.get("turn_id")
-            if running and (named == started_turn or (named is None and applied is None)):
-                applied = entry
+    with closing(rollout_records(rollout, tolerant)) as records:
+        for path, number, raw, record in records:
+            kind, payload = record.get("type"), record.get("payload")
+            _require_record(type(kind) not in (list, dict), number)
+            event = event_type(record)
+            if event == "task_started":
+                started_turn, running = _record_value(turn_start, payload, number), True
+                context = None
+                witnesses.pop("turn_record", None)
+                applied = None
+                if pending is not None and pending[0].get("turn_id") in (None, started_turn):
+                    applied = pending
+                pending = None
+                continue
+            if event in ("task_complete", "turn_aborted"):
+                running = False
+                continue
+            if event == "thread_settings_applied":
+                values = payload.get("thread_settings")
+                _require_record(type(values) is dict, number)
+                entry = ({"turn_id": payload.get("turn_id"), "values": values}, witness_of(path, number, raw, record))
+                named = payload.get("turn_id")
+                if running and (named == started_turn or (named is None and applied is None)):
+                    applied = entry
+                else:
+                    pending = entry
+                continue
+            if kind not in ("session_meta", "turn_context"):
+                continue
+            _require_record(type(payload) is dict, number)
+            witness = witness_of(path, number, raw, record)
+            if kind == "session_meta":
+                recorded_cid = payload.get("id")
+                if type(recorded_cid) is not str or not recorded_cid:
+                    raise NativeRolloutRefusal("invalid_record", cause="missing_metadata")
+                if recorded_cid != cid:
+                    raise NativeRolloutRefusal("invalid_record", cause="session_mismatch")
+                metadata, witnesses["session_record"] = payload, witness
             else:
-                pending = entry
-            continue
-        if kind not in ("session_meta", "turn_context"):
-            continue
-        require(type(payload) is dict)
-        witness = witness_of(path, number, raw, record)
-        if kind == "session_meta":
-            require(payload.get("id") == cid)
-            metadata, witnesses["session_record"] = payload, witness
-        else:
-            context, witnesses["turn_record"] = payload, witness
+                context, witnesses["turn_record"] = payload, witness
     if started_turn is None and pending is not None:
         applied = pending
-    require(metadata is not None)
-    if started_turn is not None:
-        require(context is not None and context.get("turn_id") == started_turn)
-    require(context is not None)
+    if metadata is None:
+        raise NativeRolloutRefusal("invalid_record", cause="missing_metadata")
+    if context is None or (started_turn is not None and context.get("turn_id") != started_turn):
+        raise NativeRolloutRefusal("invalid_record", cause="pending_context")
     profile = {key: context.get(key) for key in ("model", "effort", "cwd", "approval_policy",
                                                 "approvals_reviewer", "sandbox_policy", "permission_profile")}
     served, source, settings = None, None, None
@@ -316,10 +350,11 @@ def inspect_codex(rollout, cid, requested_tier="default", tolerant=False, *, qua
         witnesses["settings_record"] = applied[1]
     applied_settings = None if settings is None else {
         key: settings.get(key) for key in ("model", "service_tier", "approval_policy", "approvals_reviewer")}
+    permissions = _record_value(observed_permissions, profile, witnesses["turn_record"]["line"])
     return {"schema": "aegis.native-observation/v1", "cid": cid,
             "host": "codex-cli" if metadata.get("source") == "exec" else "codex",
             "recorded_source": metadata.get("source"), "profile": profile,
-            "observed_permissions": observed_permissions(profile),
+            "observed_permissions": permissions,
             "requested_tier": requested_tier, "served_tier": served, "served_tier_source": source,
             "applied_settings": applied_settings, "environment_cid_matches": os.environ.get("CODEX_THREAD_ID") == cid,
             "identity_authenticated": False, "tool_allowlist_verified": False,
