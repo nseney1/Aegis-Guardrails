@@ -197,6 +197,67 @@ def test_credits_capacity(tmp_path, services, credits, state):
     assert rows["usage"]["hosts"][0]["usage"] == {"credits_left": credits}
 
 
+def test_plural_window_observation_reports_the_weekly_limit(tmp_path, services):
+    snapshot = {"windows": {
+        "5h": {"used_pct": 10, "resets_at": "1970-01-01T05:00:00Z"},
+        "7d": {"used_pct": 100, "resets_at": "1970-01-08T00:00:00Z"},
+    }, "tokens": 40, "runs": 2}
+    reader = adapter(pair=True)
+    reader.snapshots["primary"] = snapshot
+    rows = observations(run(tmp_path, profile(pair=True), reader))
+    assert rows["usage"]["state"] == "known"
+    assert rows["usage"]["hosts"][0] == {
+        "host": "primary", "state": "known", "source": "subscription-window", "usage": snapshot,
+    }
+    assert rows["capacity"] == {"state": "at_limit", "hosts": [
+        {"host": "primary", "state": "at_limit"},
+        {"host": "review", "state": "available"},
+    ]}
+    assert reader.calls == [(host, "subscription-window") for host in ("primary", "review")]
+
+
+@pytest.mark.parametrize("short", ["absent", "expires"])
+def test_plural_window_observation_preserves_partial_evidence_and_known_blockers(tmp_path, services, short):
+    resolved = team_profile.resolve(preset="pair", repo={"model_settings": {"capacity": {
+        "primary": {"usage_source": "subscription-window", "window_thresholds": {
+            "5h": {}, "7d": {"hold_pct": 95},
+        }},
+        "review": {"usage_source": "subscription-window"},
+    }}})
+
+    def observe_window(used, now=100, *, renew=False):
+        windows = {"7d": {"used_pct": used, "resets_at": "1970-01-08T00:00:00Z"}}
+        if short == "expires" or renew:
+            reset = "1970-01-01T05:00:00Z" if renew else "1970-01-01T00:01:40Z"
+            windows["5h"] = {"used_pct": 10, "resets_at": reset}
+        snapshot = {"windows": windows}
+        reader = adapter(pair=True)
+        reader.snapshots["primary"] = snapshot
+        rows = observations(run(tmp_path, resolved, reader, now=now))
+        assert reader.calls == [(host, "subscription-window") for host in ("primary", "review")]
+        assert rows["usage"]["hosts"][0]["usage"] == snapshot
+        return rows
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        limited = workers.submit(observe_window, 95)
+        incomplete = workers.submit(observe_window, 94)
+        held, clear = limited.result(timeout=5), incomplete.result(timeout=5)
+
+    for rows, capacity in ((held, "at_limit"), (clear, "unknown")):
+        assert rows["usage"]["state"] == rows["usage"]["hosts"][0]["state"] == "unknown"
+        assert rows["usage"]["hosts"][0]["source"] == "subscription-window"
+        assert rows["capacity"]["state"] == rows["capacity"]["hosts"][0]["state"] == capacity
+        assert rows["capacity"]["hosts"][1] == {"host": "review", "state": "available"}
+
+    retried = observe_window(94, now=101, renew=True)
+    assert retried["usage"]["state"] == retried["usage"]["hosts"][0]["state"] == "known"
+    assert retried["capacity"]["state"] == retried["capacity"]["hosts"][0]["state"] == "available"
+    if short == "expires":
+        before_reset = observe_window(94, now=99)
+        assert before_reset["usage"]["state"] == "known"
+        assert before_reset["capacity"]["state"] == "available"
+
+
 @pytest.mark.parametrize("source", ["none", "missing", "bad", "raises"])
 def test_missing_disabled_or_bad_usage_never_healthy(tmp_path, services, source):
     body = profile("none") if source == "none" else profile()
