@@ -16,6 +16,7 @@ import os
 import select
 import threading
 import time
+from json import encoder as json_encoder
 
 
 MAX_FRAME_BYTES = 1024 * 1024
@@ -33,6 +34,9 @@ _REPLY_PREFIX = b'{"id":'
 _REPLY_SEPARATOR = b',"result":'
 _REPLY_END = b"}\n"
 _REPLY_OVERHEAD = len(_REPLY_PREFIX) + len(_REPLY_SEPARATOR) + len(_REPLY_END)
+_REPLY_REPAIR = "Shorten the result to fit in one bounded host protocol frame."
+_REPLY_RECONCILE = "Reconcile the original call before attempting another host call."
+_STRING_CHUNK_CHARS = 8192
 _NEXT = {
     "UNSUPPORTED_HOST":
         "Retry on a POSIX host; the bounded pipe transport is unavailable here.",
@@ -78,6 +82,7 @@ class HostAuthorityError(PermissionError):
             raise ValueError("invalid host authority error")
         self._code = code
         self._reason = reason
+        self._next_action = _NEXT[code]
         super().__init__(reason)
 
     @property
@@ -90,7 +95,7 @@ class HostAuthorityError(PermissionError):
 
     @property
     def next_action(self):
-        return _NEXT[self._code]
+        return self._next_action
 
 
 def _invalid():
@@ -230,18 +235,20 @@ def _call(value):
 
 
 def _string_size(text, ceiling):
-    """ASCII JSON string length, quotes included, without building the text."""
+    """ASCII JSON string length, with bounded temporary encoder output."""
+    length = len(text)
     total = 2
-    for char in text:
-        code = ord(char)
-        if char in '"\\\b\f\n\r\t':
-            total += 2
-        elif code < 0x20 or code > 0x7E:
-            total += 12 if code > 0xFFFF else 6
-        else:
-            total += 1
-        if total > ceiling:
-            return total
+    if length + total > ceiling:
+        return length + total
+    start = 0
+    while start < length and total <= ceiling:
+        # One code point uses at most 12 bytes. Near the limit, encode at
+        # least one so a short escape can still fit exactly.
+        width = max(1, min(_STRING_CHUNK_CHARS, (ceiling - total) // 12))
+        stop = min(start + width, length)
+        encoded = json_encoder.encode_basestring_ascii(text[start:stop])
+        total += len(encoded) - 2  # Ignore the temporary slice's quotes.
+        start = stop
     return total
 
 
@@ -267,19 +274,17 @@ def _json_size(value, maximum):
     """
     _bounded(value)
 
-    def walk(item):
+    def walk(item, ceiling):
         kind = type(item)
         if kind is dict:
             total = 2
-            index = 0
-            for key, child in item.items():
-                if type(key) is not str:
-                    _invalid()
-                if index:
-                    total += 1
-                index += 1
-                total += _string_size(key, maximum) + 1 + walk(child)
-                if total > maximum:
+            for index, (key, child) in enumerate(item.items()):
+                total += 2 if index else 1  # Colon and optional comma.
+                total += _string_size(key, ceiling - total)
+                if total > ceiling:
+                    return total
+                total += walk(child, ceiling - total)
+                if total > ceiling:
                     return total
             return total
         if kind is list:
@@ -287,16 +292,16 @@ def _json_size(value, maximum):
             for index, child in enumerate(item):
                 if index:
                     total += 1
-                total += walk(child)
-                if total > maximum:
+                total += walk(child, ceiling - total)
+                if total > ceiling:
                     return total
             return total
         if kind is str:
-            return _string_size(item, maximum)
+            return _string_size(item, ceiling)
         if kind is bool:
             return 4 if item else 5
         if kind is int:
-            return _int_size(item, maximum)
+            return _int_size(item, ceiling)
         if item is None:
             return 4
         if kind is float:
@@ -306,7 +311,7 @@ def _json_size(value, maximum):
                 _invalid()
         _invalid()
 
-    return walk(value)
+    return walk(value, maximum)
 
 
 def _json_bytes(value):
@@ -329,19 +334,36 @@ def _fingerprint(params):
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
-def _freeze_reply(result, maximum):
-    if (type(result) is not dict or set(result) != {"success", "contentItems"}
-            or type(result["success"]) is not bool
-            or type(result["contentItems"]) is not list
-            or len(result["contentItems"]) > 64):
+def _reply_fields(value):
+    if type(value) is not dict or len(value) != 2:
         _invalid()
-    for item in result["contentItems"]:
-        if (type(item) is not dict or set(item) != {"type", "text"}
-                or item["type"] != "inputText" or type(item["text"]) is not str):
+    fields = {}
+    try:
+        for key, item in value.items():
+            if len(fields) == 2 or type(key) is not str:
+                _invalid()
+            fields[key] = item
+    except RuntimeError:
+        _invalid()
+    return fields
+
+
+def _reply_snapshot(result):
+    """Keep the validated strings for both sizing and canonical encoding."""
+    result = _reply_fields(result)
+    success, contents = result.get("success"), result.get("contentItems")
+    if type(success) is not bool or type(contents) is not list or len(contents) > 64:
+        _invalid()
+    items = []
+    for item in contents:
+        if len(items) == 64:
             _invalid()
-    if _json_size(result, maximum) > maximum:
-        _invalid()
-    return _json_bytes(result)
+        fields = _reply_fields(item)
+        kind, text = fields.get("type"), fields.get("text")
+        if type(kind) is not str or kind != "inputText" or type(text) is not str:
+            _invalid()
+        items.append({"type": kind, "text": text})
+    return {"success": success, "contentItems": items}
 
 
 class FrameTransport:
@@ -629,14 +651,14 @@ class ProtocolClient(FrameTransport):
         if previous["fingerprint"] != fingerprint:
             self._fail("HOST_CALL_CONFLICT", "host call correlation conflicts")
         self._ids[rpc] = key
-        if previous["result"] is not None:
+        identifier = value["id"]
+        with self._gate:
             body = previous["result"]
-            identifier = value["id"]
-            self._check_reply_size(identifier, body)
-            self._send_reply(identifier, body, deadline)
-            return
-        if rpc not in previous["aliases"]:
-            previous["aliases"][rpc] = value["id"]
+            if body is None:
+                previous["aliases"].setdefault(rpc, identifier)
+                return
+        self._check_reply_sizes((identifier,), len(body), replay=True)
+        self._send_reply(identifier, body, deadline)
 
     def _reserve(self, rpc, key, fingerprint, value):
         if len(self._calls) >= MAX_CALLS or len(self._ids) >= MAX_CALLS:
@@ -653,7 +675,7 @@ class ProtocolClient(FrameTransport):
         try:
             self._reply(rpc_id, result)
         except HostAuthorityError as exc:
-            if not self._closed:
+            if not self._revoked():
                 self._fail(exc.code, exc.reason)
             raise
 
@@ -662,19 +684,45 @@ class ProtocolClient(FrameTransport):
         row = self._calls.get(self._ids.get(rpc))
         if row is None or row["result"] is not None:
             self._fail("HOST_CALL_CONFLICT", "host reply has no pending call")
-        body = _freeze_reply(result, self._maximum)
-        # Every alias envelope is a complete frame. Refuse before the first write.
-        for identifier in row["aliases"].values():
-            self._check_reply_size(identifier, body)
+        snapshot = _reply_snapshot(result)
+        body_size = _json_size(snapshot, self._maximum)
+        with self._gate:
+            aliases = tuple(row["aliases"].values())
+        self._check_reply_sizes(aliases, body_size)
+        body = _json_bytes(snapshot)
+        # Encoding can overlap a receive. Include aliases added before the
+        # fan-out starts, keeping checks and writes outside the descriptor gate.
+        with self._gate:
+            initial = tuple(row["aliases"].values())
+        self._check_reply_sizes(initial[len(aliases):], body_size)
         deadline = self._operation_deadline()
-        for identifier in row["aliases"].values():
-            self._send_reply(identifier, body, deadline)
-        row["result"] = body
+        self._send_reply_batch(row, initial, body, deadline)
 
-    def _check_reply_size(self, identifier, body):
-        remaining = self._maximum - len(body) - _REPLY_OVERHEAD
-        if remaining < 0 or _json_size(identifier, remaining) > remaining:
+    def _send_reply_batch(self, row, aliases, body, deadline):
+        sent = 0
+        while True:
+            for identifier in aliases:
+                self._send_reply(identifier, body, deadline)
+            sent += len(aliases)
+            with self._gate:
+                aliases = tuple(row["aliases"].values())[sent:]
+                if not aliases:
+                    row["result"] = body
+                    return
+            # A retry admitted during a write uses the already established body.
+            self._check_reply_sizes(aliases, len(body), replay=True)
+
+    def _check_reply_sizes(self, aliases, body_size, *, replay=False):
+        remaining = self._maximum - body_size - _REPLY_OVERHEAD
+        if remaining >= 0 and all(_json_size(identifier, remaining) <= remaining
+                                  for identifier in aliases):
+            return
+        try:
             self._fail()
+        except HostAuthorityError as exc:
+            # Preserve the usual close or owner fence and the public error code.
+            exc._next_action = _REPLY_RECONCILE if replay else _REPLY_REPAIR
+            raise
 
     def _send_reply(self, identifier, body, deadline):
         raw = b"".join((_REPLY_PREFIX, _json_bytes(identifier), _REPLY_SEPARATOR,

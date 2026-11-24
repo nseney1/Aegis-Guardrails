@@ -38,6 +38,10 @@ _HEX = "0123456789abcdef"
 def _require_descriptors():
     if os.name != "posix" or not review_copy.descriptor_support():
         pytest.skip("dir_fd and O_NOFOLLOW are unavailable")
+
+
+def _require_git_descriptors():
+    _require_descriptors()
     fd = os.open(os.sep, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         if not os.path.isdir(f"/proc/{os.getpid()}/fd/{fd}/."):
@@ -198,7 +202,7 @@ def _scripted_repo(tmp_path):
 
 
 def make_repo(tmp):
-    _require_descriptors()
+    _require_git_descriptors()
     path = tmp / "repository"
     path.mkdir()
     _init_repo(path)
@@ -280,6 +284,7 @@ def test_missing_ports_refuse_without_output(tmp_path):
     out = tmp_path / "review"
     code, result = review_copy.prepare(str(tmp_path), _HEX * 5, _HEX * 5, str(out))
     assert code == 2 and result["code"] == "port_required"
+    assert result["reason"] == "port_required"
     assert not out.exists()
 
 
@@ -296,7 +301,7 @@ def test_invalid_commit_ids_refuse_before_git(tmp_path, base, candidate):
     out = tmp_path / "review"
     code, result = review_copy.prepare(
         str(tmp_path / "repository"), base, candidate, str(out),
-        **_keywords(lambda *args, **kwargs: calls.append(args), tmp_path),
+        **_keywords(lambda *args, **kwargs: calls.append(args), tmp_path, program=sys.executable),
     )
     assert code == 2 and result["code"] == "invalid_commit"
     assert calls == []
@@ -332,7 +337,7 @@ def test_tree_mismatch_leaves_no_folder(tmp_path):
 
 
 def test_missing_object_refuses_without_fetch(tmp_path):
-    _require_descriptors()
+    _require_git_descriptors()
     repo = tmp_path / "repository"
     repo.mkdir()
     _init_repo(repo)
@@ -404,7 +409,7 @@ def test_filters_symlink_and_submodule_match_the_legacy_copy(tmp_path):
     assert removed == 0 and gone["removed"] == str(out) and not out.exists()
 
 
-def test_verify_names_the_side_and_problem_then_remove_refuses_a_foreign_folder(tmp_path):
+def test_verify_names_the_side_and_problem(tmp_path):
     repo, base, _base_tree, candidate, _candidate_tree = make_repo(tmp_path)
     out = tmp_path / "review"
     code, _ready = _prepare(repo, base, candidate, out)
@@ -418,12 +423,37 @@ def test_verify_names_the_side_and_problem_then_remove_refuses_a_foreign_folder(
     assert body["code"] == "copy_differs" and body["reason"] == "copy_differs"
     assert any(row == "candidate/src/app.py changed" for row in body["problems"])
     assert body["problem_count"] == len(body["problems"]) or body["problem_count"] >= 1
+
+
+def test_verify_and_remove_refuse_a_foreign_folder_without_a_manifest(tmp_path):
+    _require_descriptors()
     foreign = tmp_path / "precious"
     foreign.mkdir()
-    (foreign / "keep.txt").write_text("keep\n")
-    status, refused = review_copy.remove(str(foreign), preparation_dir=_records(tmp_path))
+    keep = foreign / "keep.txt"
+    keep.write_text("keep\n")
+    records = _records(tmp_path)
+
+    checked, missing = review_copy.verify(str(foreign))
+    assert checked == 2 and missing["code"] == missing["reason"] == "not_review_copy"
+    status, refused = review_copy.remove(str(foreign), preparation_dir=records)
     assert status == 2 and refused["code"] == "not_review_copy"
-    assert (foreign / "keep.txt").read_text() == "keep\n"
+    assert refused["reason"] == "not_review_copy"
+    assert keep.read_text() == "keep\n"
+
+    start = threading.Barrier(2, timeout=10)
+
+    def retry(operation, **kwargs):
+        start.wait()
+        return operation(str(foreign), **kwargs)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        verify_again = pool.submit(retry, review_copy.verify)
+        remove_again = pool.submit(retry, review_copy.remove, preparation_dir=records)
+        assert verify_again.result(timeout=10) == (checked, missing)
+        assert remove_again.result(timeout=10) == (status, refused)
+    assert list(foreign.iterdir()) == [keep]
+    assert keep.read_text() == "keep\n"
+    assert list(Path(records).iterdir()) == []
 
 
 def test_prepare_verify_remove_follow_the_dogfood_flow(tmp_path):
@@ -1433,7 +1463,7 @@ def test_multiline_problem_text_is_refused_instead_of_joined(tmp_path):
 
 
 def test_problem_fields_are_canonicalized_then_redacted_then_truncated(monkeypatch, tmp_path):
-    _require_descriptors()
+    _require_git_descriptors()
     calls = []
 
     def sanitize(text, max_len=80):
@@ -1467,7 +1497,7 @@ def test_problem_fields_are_canonicalized_then_redacted_then_truncated(monkeypat
 
 
 def test_listing_limit_is_enforced_before_parse(monkeypatch, tmp_path):
-    _require_descriptors()
+    _require_git_descriptors()
     monkeypatch.setattr(review_copy, "MAX_LISTING_BYTES", 8)
     repo = _scripted_repo(tmp_path)
     out = tmp_path / "review"
@@ -1488,7 +1518,7 @@ def test_listing_limit_is_enforced_before_parse(monkeypatch, tmp_path):
 
 
 def test_child_environment_is_applied_unless_explicitly_unplanned(tmp_path):
-    _require_descriptors()
+    _require_git_descriptors()
     seen = []
 
     def child(env, purpose):
@@ -1589,7 +1619,7 @@ def test_claim_failure_closes_the_descriptor_and_retry_succeeds(monkeypatch, tmp
 
 
 def test_entry_count_is_refused_before_parse_and_retry_succeeds(monkeypatch, tmp_path):
-    _require_descriptors()
+    _require_git_descriptors()
     repo = _scripted_repo(tmp_path)
     out = tmp_path / "review"
     commit, tree, oid = "a" * 40, "b" * 40, "c" * 40
@@ -1647,7 +1677,7 @@ def test_listing_rows_stop_before_parse_when_the_entry_cap_is_exceeded(monkeypat
 
 
 def test_object_header_limit_is_enforced_before_parsing(monkeypatch, tmp_path):
-    _require_descriptors()
+    _require_git_descriptors()
     repo = _scripted_repo(tmp_path)
     out = tmp_path / "review"
     commit = "a" * 40
@@ -1684,7 +1714,7 @@ def test_object_header_limit_is_enforced_before_parsing(monkeypatch, tmp_path):
 
 
 def test_timeout_refuses_and_closes_without_a_copy(tmp_path):
-    _require_descriptors()
+    _require_git_descriptors()
     repo = _scripted_repo(tmp_path)
     out = tmp_path / "review"
 
@@ -1912,7 +1942,7 @@ def test_review_verification_is_a_public_facade_over_bounded_retention():
 
 
 def test_problem_cap_keeps_order_total_and_the_entry_limit(monkeypatch, tmp_path):
-    _require_descriptors()
+    _require_git_descriptors()
     repo, base, _base_tree, candidate, _candidate_tree = make_repo(tmp_path)
     out = tmp_path / "review"
     assert _prepare(repo, base, candidate, out)[0] == 0
@@ -1960,7 +1990,7 @@ def test_problem_cap_keeps_order_total_and_the_entry_limit(monkeypatch, tmp_path
 
 
 def test_scaffold_summary_precedes_modes_and_proved_lines_skip_render(monkeypatch, tmp_path):
-    _require_descriptors()
+    _require_git_descriptors()
     calls = []
 
     def sanitize(text, max_len=80):
@@ -2002,7 +2032,7 @@ def test_scaffold_summary_precedes_modes_and_proved_lines_skip_render(monkeypatc
 
 
 def test_late_multiline_refusal_survives_the_cap_and_retries_clean(monkeypatch, tmp_path):
-    _require_descriptors()
+    _require_git_descriptors()
     repo, base, _base_tree, candidate, _candidate_tree = make_repo(tmp_path)
     out = tmp_path / "review"
     assert _prepare(repo, base, candidate, out)[0] == 0
@@ -2039,7 +2069,7 @@ def test_late_multiline_refusal_survives_the_cap_and_retries_clean(monkeypatch, 
 
 
 def test_concurrent_verify_stays_read_only_and_a_stat_swap_stays_typed(monkeypatch, tmp_path):
-    _require_descriptors()
+    _require_git_descriptors()
     repo, base, _base_tree, candidate, _candidate_tree = make_repo(tmp_path)
     out = tmp_path / "review"
     assert _prepare(repo, base, candidate, out)[0] == 0
