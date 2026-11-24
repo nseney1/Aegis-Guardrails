@@ -108,6 +108,7 @@ aegis_core = [
     "ast/drivers/templates/go.mod",
     "benchmark_corpus/corpus.json",
     "benchmark_corpus/ast.json",
+    "manager_starter.json",
 ]
 "aegis_core._data.rules" = ["*.md", ".oracles/*.md"]
 "aegis_core._data.skills" = ["*/SKILL.md"]
