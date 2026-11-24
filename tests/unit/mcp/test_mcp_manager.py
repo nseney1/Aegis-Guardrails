@@ -45,6 +45,31 @@ def test_manager_advertises_three_separate_schemas(tmp_path):
     assert not (tmp_path / ".aegis").exists()
 
 
+def test_manager_initialize_publishes_the_decision_workflow(tmp_path):
+    result = exchange(tmp_path, environment={"AEGIS_MANAGER_CONFIG": str(tmp_path / "draft.json")})
+    instructions = result[0]["result"]["instructions"]
+    steps = (
+        "Call aegis_list_rules",
+        "member_id and worktree_id",
+        "Call aegis_scan before deciding",
+        "each action in a compound decision",
+        "decision_ref",
+        "rule revisions",
+        "policy_digest and membership_digest",
+        "Call aegis_report_outcome",
+        "idempotency_key",
+        "identical report",
+    )
+    positions = [instructions.index(step) for step in steps]
+    assert positions == sorted(positions)
+    assert "Stop and request review" in instructions
+    assert "missing activation" in instructions
+    assert "unavailable subject" in instructions
+    assert "unexpected empty match" in instructions
+    assert "self-reported" in instructions
+    assert "native Teams enforcement" in instructions
+
+
 @pytest.mark.parametrize("field", ["scope", "workspace", "identity", "host", "session", "approval",
                                     "_host", "_session", "_binding", "files", "native_identity"])
 def test_manager_refuses_forged_server_fields_before_config_read(tmp_path, field):
