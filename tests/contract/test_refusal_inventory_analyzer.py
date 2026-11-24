@@ -36,7 +36,7 @@ def test_real_tree_inventory_matches_the_pre_change_golden():
     # ROUND-5f admits the symbolic representation; the embedded historical
     # payload above remains covered. Widening contributors are recorded in the
     # integration golden. This digest is an oracle, never an analyzer input.
-    assert digest == "fd988e56e554cb3104e7d6f0ecd99a34ebe67864849b1c46ef87ea54fd7d0bca"
+    assert digest == "dc1be44c69f99ddc7e2027f63c0988aee935ce13ceec3a98d28638549fe0eac7"
 
 
 def insert(source, name, body):

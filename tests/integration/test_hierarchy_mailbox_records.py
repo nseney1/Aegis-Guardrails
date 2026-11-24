@@ -4460,6 +4460,15 @@ def test_exercised_refusals_match_closed_table_dispositions(bound, monkeypatch):
     retry_calls = ((writer, "mailbox_publish_record", request("base")),
                    (reader, "mailbox_read_record", {"message_id": "base"}),
                    (reader, "mailbox_digest", {"limit": 1}))
+    flat_path = payload_path.parent.parent / payload_path.name
+    payload_path.rename(flat_path)
+    for who, tool, arguments in retry_calls:
+        cover(tool, "E_AUTH", "flat_layout", data(call(who, tool, arguments)))
+    assert flat_path.read_bytes() == record_bytes
+    flat_path.rename(payload_path)
+    for who, tool, arguments in retry_calls:
+        assert not call(who, tool, arguments).get("isError")
+
     for damaged, code, detail in ((b"HOSTILE", "E_HASH", ""),
                                   (b"x" * (codec.MAX_BYTES + 1), "E_LIMIT", "record")):
         payload_path.write_bytes(damaged)
