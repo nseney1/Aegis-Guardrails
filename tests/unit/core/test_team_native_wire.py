@@ -1508,6 +1508,257 @@ def test_escaped_reply_over_the_cap_is_refused_before_encoding(monkeypatch):
     assert all("result" not in row for row in rows)
 
 
+_REPAIR_REPLY = "Shorten the result to fit in one bounded host protocol frame."
+_RECONCILE_REPLY = "Reconcile the original call before attempting another host call."
+
+
+def _answer(text):
+    return {"success": True, "contentItems": [{"type": "inputText", "text": text}]}
+
+
+def _watch_reply_encoding(monkeypatch, encode_string, before_body=lambda: None):
+    bodies = []
+
+    def dumps(value, *args, **kwargs):
+        if type(value) is dict and set(value) == {"success", "contentItems"}:
+            before_body()
+            raw = json.dumps(value, *args, **kwargs)
+            bodies.append(raw.encode("ascii"))
+            return raw
+        return json.dumps(value, *args, **kwargs)
+
+    monkeypatch.setattr(wire, "json", SimpleNamespace(loads=json.loads, dumps=dumps))
+    monkeypatch.setattr(wire, "json_encoder", SimpleNamespace(encode_basestring_ascii=encode_string))
+    return bodies
+
+
+@pytest.mark.parametrize("extra", ["", "z"], ids=["exact", "over"])
+def test_reply_text_frame_limit_matches_stdlib_bytes(monkeypatch, extra):
+    text = ('a"\\\b\f\n\r\t\x00\x1f\x7fé\ud800😀' * 700) + "tail"
+    expected = _response_bytes(7, _answer(text))
+    chunks = []
+
+    def encode_string(piece):
+        if piece and piece in text + extra:
+            chunks.append(piece)
+        return json.encoder.encode_basestring_ascii(piece)
+
+    bodies = _watch_reply_encoding(monkeypatch, encode_string)
+    with link(frames=[frame(call())], maximum=len(expected)) as item:
+        item.client.initialize()
+        assert item.client.receive_call() == call()
+        if extra:
+            with pytest.raises(wire.HostAuthorityError) as caught:
+                item.client.reply(7, _answer(text + extra))
+            _assert_encoding_refusal_is_terminal(item, caught)
+            assert caught.value.next_action == _REPAIR_REPLY
+        else:
+            item.client.reply(7, _answer(text))
+    assert b"".join(item.seen[2:]) == (b"" if extra else expected)
+    assert len(bodies) == (0 if extra else 1)
+    if not extra:
+        assert ascii("".join(chunks)) == ascii(text)
+        assert len(chunks) > 1
+        assert max(map(len, chunks)) <= 8192
+
+
+def test_over_budget_escape_sizing_stops_before_the_text_tail(monkeypatch):
+    maximum = 8192
+    text = "😀" * 4000 + "unencoded tail"
+    chunks = []
+
+    def encode_string(piece):
+        if piece and (piece[0] == "😀" or "tail" in piece):
+            chunks.append(piece)
+        return json.encoder.encode_basestring_ascii(piece)
+
+    bodies = _watch_reply_encoding(monkeypatch, encode_string)
+    with link(frames=[frame(call())], maximum=maximum) as item:
+        item.client.initialize()
+        item.client.receive_call()
+        with pytest.raises(wire.HostAuthorityError) as caught:
+            item.client.reply(7, _answer(text))
+        _assert_encoding_refusal_is_terminal(item, caught)
+        assert caught.value.next_action == _REPAIR_REPLY
+    assert chunks and 0 < sum(map(len, chunks)) < len(text)
+    assert all("tail" not in piece for piece in chunks)
+    assert bodies == []
+    assert item.seen[2:] == []
+
+
+@pytest.mark.parametrize("replay", [False, True], ids=["pending", "cached"])
+@pytest.mark.parametrize("extra", ["", "z"], ids=["exact", "over"])
+def test_escaped_alias_frame_limit_preserves_fanout_and_replay(monkeypatch, replay, extra):
+    answer = _answer("private body " + "b" * 600)
+    alias = 'private id "\\\n\x7f\ud800😀'
+    expected_original = _response_bytes(7, answer)
+    expected_alias = _response_bytes(alias, answer)
+    original, duplicate, later = call(7), call(alias + extra), call(8, "later")
+    bodies = _watch_reply_encoding(monkeypatch, json.encoder.encode_basestring_ascii)
+    with link(frames=list(map(frame, (original, duplicate, later))),
+              maximum=len(expected_alias)) as item:
+        item.client.initialize()
+        assert item.client.receive_call() == original
+        if replay:
+            item.client.reply(7, answer)
+            answer["contentItems"][0]["text"] = "changed after first reply"
+            operation = item.client.receive_call
+        else:
+            assert item.client.receive_call() == later
+
+            def operation():
+                item.client.reply(7, answer)
+
+        if extra:
+            with pytest.raises(wire.HostAuthorityError) as caught:
+                operation()
+            _assert_encoding_refusal_is_terminal(item, caught)
+            assert caught.value.next_action == (_RECONCILE_REPLY if replay else _REPAIR_REPLY)
+        else:
+            assert operation() == (later if replay else None)
+    expected = [expected_original] if replay or not extra else []
+    if not extra:
+        expected.append(expected_alias)
+    assert item.seen[2:] == expected
+    assert len(bodies) == (1 if expected else 0)
+
+
+@pytest.mark.parametrize("arrival,extra", [
+    ("encoding", "z"), ("writing", ""), ("writing", "z"),
+], ids=["encoding-over", "writing-exact", "writing-over"])
+def test_reply_preflights_aliases_admitted_during_fanout(monkeypatch, arrival, extra):
+    answer = _answer("body " + "b" * 600)
+    alias = "concurrent alias " + "😀" * 8
+    expected_original = _response_bytes(7, answer)
+    expected_alias = _response_bytes(alias, answer)
+    later = call(8, "later")
+    paused, resume = threading.Event(), threading.Event()
+    errors = []
+
+    def pause():
+        paused.set()
+        assert resume.wait(5)
+
+    def select_before_write(readers, writers, exceptional, timeout):
+        if writers and not paused.is_set():
+            pause()
+        return select.select(readers, writers, exceptional, timeout)
+
+    with link(frames=[frame(call())], maximum=len(expected_alias)) as item:
+        item.client.initialize()
+        item.client.receive_call()
+        if arrival == "encoding":
+            _watch_reply_encoding(monkeypatch, json.encoder.encode_basestring_ascii, pause)
+        else:
+            monkeypatch.setattr(wire, "select", SimpleNamespace(select=select_before_write))
+
+        def reply():
+            try:
+                item.client.reply(7, answer)
+            except Exception as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=reply, daemon=True)
+        worker.start()
+        try:
+            assert paused.wait(5)
+            item.to_client.write(frame(call(alias + extra)) + frame(later))
+            assert item.client.receive_call() == later
+        finally:
+            resume.set()
+            worker.join(5)
+        assert not worker.is_alive()
+        if extra:
+            assert len(errors) == 1
+            assert type(errors[0]) is wire.HostAuthorityError
+            assert errors[0].code == "HOST_PROTOCOL_ERROR"
+            expected_action = _REPAIR_REPLY if arrival == "encoding" else _RECONCILE_REPLY
+            assert errors[0].next_action == expected_action
+            assert item.client.closed
+        else:
+            assert errors == []
+    expected = [] if arrival == "encoding" else [expected_original]
+    if not extra:
+        expected.append(expected_alias)
+    assert item.seen[2:] == expected
+
+
+@pytest.mark.parametrize("revoke", [False, True], ids=["producer-mutation", "revocation"])
+def test_reply_preflight_uses_owned_text_and_obeys_revocation(monkeypatch, revoke):
+    text = "original " + "a" * 9000
+    answer = _answer(text)
+    expected = _response_bytes(7, answer)
+    sizing = threading.Event()
+    resume = threading.Event()
+    errors = []
+
+    def encode_string(piece):
+        if piece.startswith("original "):
+            sizing.set()
+            assert resume.wait(5)
+        return json.encoder.encode_basestring_ascii(piece)
+
+    _watch_reply_encoding(monkeypatch, encode_string)
+    with link(frames=[frame(call())], maximum=len(expected)) as item:
+        item.client.initialize()
+        item.client.receive_call()
+
+        def reply():
+            try:
+                item.client.reply(7, answer)
+            except Exception as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=reply, daemon=True)
+        worker.start()
+        try:
+            assert sizing.wait(5), "reply did not enter the bounded encoder"
+            if revoke:
+                item.client.close()
+            else:
+                answer["contentItems"][0]["text"] = "outside the cap " + text
+        finally:
+            resume.set()
+            worker.join(5)
+        assert not worker.is_alive()
+    if revoke:
+        assert len(errors) == 1
+        assert type(errors[0]) is wire.HostAuthorityError
+        assert (errors[0].code, str(errors[0])) == (
+            "HOST_PROTOCOL_ERROR", "invalid host protocol frame")
+        assert item.seen[2:] == []
+    else:
+        assert errors == []
+        assert item.seen[2:] == [expected]
+
+
+def test_size_refusal_advice_survives_transport_fencing(timed_pipe):
+    _clock, item = timed_pipe
+    item.to_client.write(frame({"id": INIT_ID, "result": HANDSHAKE}))
+    item.client.initialize()
+    assert json.loads(item.peer.line())["method"] == "initialize"
+    assert json.loads(item.peer.line()) == {"method": "initialized"}
+    item.to_client.write(frame(call()))
+    item.client.receive_call()
+    with pytest.raises(wire.HostAuthorityError) as caught:
+        item.client.reply(7, _answer("x" * (wire.MAX_FRAME_BYTES + 1)))
+    assert caught.value.code == "HOST_PROTOCOL_ERROR"
+    assert caught.value.next_action == _REPAIR_REPLY
+    assert item._client_reader.closed and item._client_writer.closed
+    assert item.peer.line() == b""
+
+
+def test_malformed_inbound_frame_keeps_generic_recovery_advice():
+    with link(frames=[b'{"private input":\n']) as item:
+        item.client.initialize()
+        with pytest.raises(wire.HostAuthorityError) as caught:
+            item.client.receive_call()
+        _assert_encoding_refusal_is_terminal(item, caught)
+        assert caught.value.next_action == (
+            "Close the transport and retry with one bounded host protocol frame.")
+    assert item.seen[2:] == []
+
+
 def test_pending_duplicate_is_one_dispatch_and_one_reply_covers_both_ids():
     _posix()
     original, duplicate, later = call(7), call("retry"), call(8, "later")

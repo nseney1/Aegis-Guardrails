@@ -9,6 +9,7 @@ import copy
 import re
 import tempfile
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 
 from aegis_core import approval_shape, gitsafe, gitsafe_run
@@ -23,6 +24,9 @@ from aegis_core.manager_store import ManagerStore
 __all__ = ["ManagerService", "initialize"]
 _HEX = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _REF = re.compile(r"[0-9a-f]{64}")
+_GIT_PATH_REFUSALS = frozenset({"git_path_limit", "git_path_invalid", "git_path_encoding", "git_path_record_invalid"})
+_NO_WORKTREE = b"fatal: this operation must be run in a work tree"
+_SHALLOW_FIELDS = ("true", "false", "--is-shallow-repository")
 
 
 def _bounded(value, limit):
@@ -75,22 +79,109 @@ def _member(candidate, member_id, worktree_id):
 
 
 def _safe_runtime_path(path):
-    return path.is_dir() and path.resolve() == path and not any(
-        p.is_symlink() or (getattr(p, "is_junction", lambda: False)()) for p in (path, *path.parents))
+    return not any(p.is_symlink() or (getattr(p, "is_junction", lambda: False)())
+                   for p in (path, *path.parents)) and path.is_dir() and path.resolve() == path
+
+
+def _live_member_directory(path):
+    try:
+        safe = _safe_runtime_path(path)
+    except (OSError, RuntimeError, ValueError):
+        raise ManagerError("unsafe_path") from None
+    if not safe:
+        raise ManagerError("unsafe_path")
+    return path
+
+
+def _member_git_scope():
+    if gitsafe.custody_active():
+        return nullcontext()
+    try:
+        scratch = Path(tempfile.gettempdir()).resolve()
+    except (OSError, RuntimeError):
+        raise gitsafe.GitError("Member Git discovery scratch is unavailable.", code="git_failed") from None
+    return gitsafe.custody(scratch=scratch, stdout_limit=1024 * 1024)
+
+
+def _git_discovery_failure():
+    return gitsafe.GitError("Member Git discovery did not return a complete answer.", code="git_failed")
+
+
+def _member_path_output(stdout):
+    value = gitsafe_run.path_text(stdout)
+    if not value or not stdout.endswith(b"\n"):
+        raise _git_discovery_failure()
+    return value
+
+
+def _member_git_path(path, option):
+    result = gitsafe.run(["rev-parse", option], path, timeout=5)
+    if result.returncode:
+        raise _git_discovery_failure()
+    return _member_path_output(result.stdout)
+
+
+def _split_member_layout(path, answer):
+    common = _member_git_path(path, "--git-common-dir")
+    start = common + "\n"
+    if not answer.startswith(start):
+        raise _git_discovery_failure()
+    top = _member_git_path(path, "--show-toplevel")
+    end = "\n" + top
+    if not answer.endswith(end):
+        raise _git_discovery_failure()
+    prefix, separator, shallow = answer[len(start):-len(end)].rpartition("\n")
+    if not separator:
+        raise _git_discovery_failure()
+    return common, prefix, shallow, top
+
+
+def _member_layout(path):
+    result = gitsafe.run(["rev-parse", "--git-common-dir", "--show-prefix",
+                         "--is-shallow-repository", "--show-toplevel"], path, timeout=5)
+    # Git reports these three fields before refusing --show-toplevel outside a worktree.
+    no_worktree = result.returncode == 128 and result.stderr in (_NO_WORKTREE + b"\n", _NO_WORKTREE + b"\r\n")
+    if result.returncode and not no_worktree:
+        raise _git_discovery_failure()
+    answer = _member_path_output(result.stdout)
+    if no_worktree:
+        common, separator, shallow = answer.rpartition("\n\n")
+        if common and separator and shallow in _SHALLOW_FIELDS:
+            return path / common, None
+        raise _git_discovery_failure()
+
+    fields = answer.split("\n", 4)
+    if len(fields) == 4:
+        common, prefix, shallow, top = fields
+    elif len(fields) == 5 and any("\n" + flag + "\n" in answer for flag in _SHALLOW_FIELDS):
+        # Both split answers must fit the original record, including embedded newlines.
+        common, prefix, shallow, top = _split_member_layout(path, answer)
+    else:
+        raise _git_discovery_failure()
+    top = Path(top)
+    if not common or not top.is_absolute() or shallow not in _SHALLOW_FIELDS:
+        raise _git_discovery_failure()
+    if prefix and (top == path or not prefix.endswith("/")):
+        raise _git_discovery_failure()
+    return path / common, top
+
+
+def _binding_git_error(exc):
+    code = "membership_unavailable" if exc.code in _GIT_PATH_REFUSALS else "git_unavailable"
+    return ManagerError(code)
 
 
 @gitsafe.scrubbed()
 def _runtime_paths(member, worktree):
     path = Path(worktree["path"])
-    common = gitsafe.common_dir(path)
-    result = gitsafe.run(["rev-parse", "--absolute-git-dir"], path, timeout=5)
-    if result.returncode or common is None:
-        raise ManagerError("membership_unavailable")
-    try:
-        gitdir = Path(gitsafe_run.path_text(result.stdout))
-    except gitsafe.GitError:
-        raise ManagerError("membership_unavailable") from None
-    if gitsafe.toplevel(path) != path or common != Path(member["common_dir"]):
+    with _member_git_scope():
+        common, top = _member_layout(path)
+        if top is None:
+            raise ManagerError("membership_unavailable")
+        gitdir = Path(_member_git_path(path, "--absolute-git-dir"))
+        if not gitdir.is_absolute():
+            raise _git_discovery_failure()
+    if top != path or common != Path(member["common_dir"]):
         raise ManagerError("membership_unavailable")
     return {"root": path, "common_dir": common, "git_dir": gitdir}
 
@@ -107,19 +198,43 @@ def _path_identity(path):
 @gitsafe.scrubbed()
 def _bindings(candidate):
     result = {}
-    for member in candidate["membership"]["repositories"]:
-        for worktree in member["worktrees"]:
-            result[member["id"] + "/" + worktree["id"]] = {
-                key: _path_identity(path) for key, path in _runtime_paths(member, worktree).items()}
+    try:
+        for member in candidate["membership"]["repositories"]:
+            for worktree in member["worktrees"]:
+                result[member["id"] + "/" + worktree["id"]] = {
+                    key: _path_identity(path) for key, path in _runtime_paths(member, worktree).items()}
+    except gitsafe.GitError as exc:
+        raise _binding_git_error(exc) from None
     return result
+
+
+def _verify_live_membership(membership):
+    with _member_git_scope():
+        for member in membership["repositories"]:
+            declared_common = _live_member_directory(Path(member["common_dir"]))
+            for worktree in member["worktrees"]:
+                path = _live_member_directory(Path(worktree["path"]))
+                common, top = _member_layout(path)
+                if top != path or _live_member_directory(common) != declared_common:
+                    raise ManagerError("membership_identity_mismatch")
+
+
+def _read_binding_candidate(control_root, revision):
+    # Verify live membership here so control-repository Git errors keep their own refusal.
+    candidate = read_candidate(control_root, revision, verify_membership=False)
+    try:
+        _verify_live_membership(candidate["membership"])
+    except gitsafe.GitError as exc:
+        raise _binding_git_error(exc) from None
+    return candidate
 
 
 @gitsafe.scrubbed()
 def _identity(member, worktree, bindings=None):
     path = Path(worktree["path"])
-    if not path.is_dir():
-        return "missing"
     try:
+        if not path.is_dir():
+            return "missing"
         current = {key: _path_identity(value) for key, value in _runtime_paths(member, worktree).items()}
         if bindings is not None and current != bindings.get(member["id"] + "/" + worktree["id"]):
             return "mismatched"
@@ -453,7 +568,7 @@ class ManagerService:
 
     def candidate(self, revision):
         rows = self._rows()
-        candidate = read_candidate(self.config["control_root"], revision)
+        candidate = _read_binding_candidate(self.config["control_root"], revision)
         if candidate["workspace_id"] != self.config["workspace_id"]:
             raise ManagerError("workspace_mismatch")
         candidate["bindings"] = _bindings(candidate)
@@ -464,7 +579,7 @@ class ManagerService:
                 "pending_decisions": _pending(rows), "fitness_credit": 0}
 
     def activate(self, revision, expected, approval):
-        candidate = read_candidate(self.config["control_root"], revision)
+        candidate = _read_binding_candidate(self.config["control_root"], revision)
         if candidate["workspace_id"] != self.config["workspace_id"]:
             raise ManagerError("workspace_mismatch")
         candidate["bindings"] = _bindings(candidate)

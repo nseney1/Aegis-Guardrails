@@ -800,6 +800,78 @@ def _configure_action_parsers(sub, common, parser):
     isolation_cli.configure_parser(sub, common, parser)
 
 
+def _configure_lease_parsers(sub, common):
+    lane_help = f"Lane name: {team.LANE_GRAMMAR}"
+    expect_help = "The lease oid the lane must hold now (printed by claim, renew, transfer and list)"
+
+    claim = sub.add_parser(
+        "claim", parents=[common], help="Lease a lane's paths; prints the lease oid",
+        description=(
+            "Refuse when a live lease of another lane may overlap the paths; otherwise create the "
+            "lane's lease, or take over its expired lease. Prints the new lease oid."
+        ),
+    )
+    claim.add_argument("lane", metavar="LANE", help=lane_help)
+    claim.add_argument("--paths", nargs="+", required=True, metavar="GLOB",
+                       help="Globs the lane will change (the conflict scope)")
+    claim.add_argument("--role", default=None, help=f"Display label (default: {team.DEFAULT_ROLE})")
+    claim.add_argument("--owner", default=None, help="Display label (default: <user>@<hostname>)")
+    claim.add_argument("--ttl", type=int, default=team.DEFAULT_TTL_S, metavar="SECONDS",
+                       help=f"Seconds until the lease expires, at most {team.MAX_TTL_S}")
+    claim.add_argument("--branch", default=None, help="The lane's branch; when recorded, it must exist for CLI renewal")
+
+    renew = sub.add_parser(
+        "renew", parents=[common], help="Extend a lease; prints the new lease oid",
+        description="Renew by compare-and-swap; an expired lease is re-claimed, overlap check included. "
+               "CLI preflight: a missing recorded branch refuses with lease_branch_missing; an attached "
+               "worktree is not required. Unavailable Git evidence refuses with liveness_unknown.",
+    )
+    renew.add_argument("lane", metavar="LANE", help=lane_help)
+    renew.add_argument("--expect", required=True, metavar="OID", help=expect_help)
+    renew.add_argument("--ttl", type=int, default=None, metavar="SECONDS",
+                       help=f"New lifetime in seconds, at most {team.MAX_TTL_S} (default: keep it)")
+
+    transfer = sub.add_parser("transfer", parents=[common], help="Give a live lease to another owner",
+                              description="Change a live lease's owner (and role) by compare-and-swap.")
+    transfer.add_argument("lane", metavar="LANE", help=lane_help)
+    transfer.add_argument("--expect", required=True, metavar="OID", help=expect_help)
+    transfer.add_argument("--owner", required=True, help="The new owner label")
+    transfer.add_argument("--role", default=None, help="The new role label (default: keep it)")
+
+    release = sub.add_parser(
+        "release", parents=[common], help="Delete a lease",
+        description="Delete a lease by compare-and-swap. Anyone may release; the events log records the caller.",
+    )
+    release.add_argument("lane", metavar="LANE", help=lane_help)
+    release.add_argument("--expect", required=True, metavar="OID", help=expect_help)
+
+    sub.add_parser("gc", parents=[common], help="Delete expired leases",
+                   description="Delete every expired lease by compare-and-swap; unreadable leases are kept. "
+                          "CLI preflight: expired_with_worktree JSON lane_warnings rows report attached worktrees; "
+                          "expired leases are still collected. Unavailable Git evidence refuses with liveness_unknown.")
+    sub.add_parser("list", parents=[common], help="Show leases (conflict input, not liveness proof)",
+                   description=team.LEASE_NOTE)
+    status = sub.add_parser("status", parents=[common], help="Inspect every lane, branch and optional tip verdict",
+                            description=team.LEASE_NOTE + " Inspection changes no leases, worktrees or events.")
+    status.add_argument("--base", default=None, metavar="REF",
+                        help="Compare branch tips to this commit (default: the base resolved by check --lane)")
+    status.add_argument("--check", action="store_true",
+                        help="Check each live lane's captured branch tip; exit 1 for failed or unavailable verdicts")
+    metrics = sub.add_parser(
+        "metrics", parents=[common], help="Lease events and merge outcomes",
+        description=(
+            "Claims and denials from the events log, and for each first-parent merge since --base: "
+            "whether both sides changed a common path and whether git merge-tree reports a conflict "
+            "(unavailable before git 2.38). GitHub's synthetic refs/pull/*/merge commits are excluded."
+        ),
+    )
+    metrics.add_argument("--base", default=None, metavar="REF",
+                         help="Count merges since this commit (default: the branch base, as for "
+                              "aegis check --lane: origin/$GITHUB_BASE_REF, the branch origin/HEAD names, then main, "
+                              "develop or master; "
+                              "with none, the whole first-parent history)")
+
+
 class TeamCommand(AegisCommand):
     """Lane leases: cooperative conflict input for parallel agents."""
 
@@ -843,75 +915,7 @@ class TeamCommand(AegisCommand):
         hosts.add_argument("hosts_action", nargs="?", metavar="VERB", help="status, check or usage")
         hosts.add_argument("host", nargs="?", metavar="HOST", help="Declared host alias (see status --json)")
         hosts.add_argument("kind", nargs="?", metavar="KIND", help="Job kind or declared role/lens")
-        lane_help = f"Lane name: {team.LANE_GRAMMAR}"
-        expect_help = "The lease oid the lane must hold now (printed by claim, renew, transfer and list)"
-
-        claim = sub.add_parser(
-            "claim", parents=[common], help="Lease a lane's paths; prints the lease oid",
-            description=(
-                "Refuse when a live lease of another lane may overlap the paths; otherwise create the "
-                "lane's lease, or take over its expired lease. Prints the new lease oid."
-            ),
-        )
-        claim.add_argument("lane", metavar="LANE", help=lane_help)
-        claim.add_argument("--paths", nargs="+", required=True, metavar="GLOB",
-                           help="Globs the lane will change (the conflict scope)")
-        claim.add_argument("--role", default=None, help=f"Display label (default: {team.DEFAULT_ROLE})")
-        claim.add_argument("--owner", default=None, help="Display label (default: <user>@<hostname>)")
-        claim.add_argument("--ttl", type=int, default=team.DEFAULT_TTL_S, metavar="SECONDS",
-                           help=f"Seconds until the lease expires, at most {team.MAX_TTL_S}")
-        claim.add_argument("--branch", default=None, help="The lane's branch; when recorded, it must exist for CLI renewal")
-
-        renew = sub.add_parser(
-            "renew", parents=[common], help="Extend a lease; prints the new lease oid",
-            description="Renew by compare-and-swap; an expired lease is re-claimed, overlap check included. "
-                   "CLI preflight: a missing recorded branch refuses with lease_branch_missing; an attached "
-                   "worktree is not required. Unavailable Git evidence refuses with liveness_unknown.",
-        )
-        renew.add_argument("lane", metavar="LANE", help=lane_help)
-        renew.add_argument("--expect", required=True, metavar="OID", help=expect_help)
-        renew.add_argument("--ttl", type=int, default=None, metavar="SECONDS",
-                           help=f"New lifetime in seconds, at most {team.MAX_TTL_S} (default: keep it)")
-
-        transfer = sub.add_parser("transfer", parents=[common], help="Give a live lease to another owner",
-                                  description="Change a live lease's owner (and role) by compare-and-swap.")
-        transfer.add_argument("lane", metavar="LANE", help=lane_help)
-        transfer.add_argument("--expect", required=True, metavar="OID", help=expect_help)
-        transfer.add_argument("--owner", required=True, help="The new owner label")
-        transfer.add_argument("--role", default=None, help="The new role label (default: keep it)")
-
-        release = sub.add_parser(
-            "release", parents=[common], help="Delete a lease",
-            description="Delete a lease by compare-and-swap. Anyone may release; the events log records the caller.",
-        )
-        release.add_argument("lane", metavar="LANE", help=lane_help)
-        release.add_argument("--expect", required=True, metavar="OID", help=expect_help)
-
-        sub.add_parser("gc", parents=[common], help="Delete expired leases",
-                       description="Delete every expired lease by compare-and-swap; unreadable leases are kept. "
-                              "CLI preflight: expired_with_worktree JSON lane_warnings rows report attached worktrees; "
-                              "expired leases are still collected. Unavailable Git evidence refuses with liveness_unknown.")
-        sub.add_parser("list", parents=[common], help="Show leases (conflict input, not liveness proof)",
-                       description=team.LEASE_NOTE)
-        status = sub.add_parser("status", parents=[common], help="Inspect every lane, branch and optional tip verdict",
-                                description=team.LEASE_NOTE + " Inspection changes no leases, worktrees or events.")
-        status.add_argument("--base", default=None, metavar="REF",
-                            help="Compare branch tips to this commit (default: the base resolved by check --lane)")
-        status.add_argument("--check", action="store_true",
-                            help="Check each live lane's captured branch tip; exit 1 for failed or unavailable verdicts")
-        metrics = sub.add_parser(
-            "metrics", parents=[common], help="Lease events and merge outcomes",
-            description=(
-                "Claims and denials from the events log, and for each first-parent merge since --base: "
-                "whether both sides changed a common path and whether git merge-tree reports a conflict "
-                "(unavailable before git 2.38). GitHub's synthetic refs/pull/*/merge commits are excluded."
-            ),
-        )
-        metrics.add_argument("--base", default=None, metavar="REF",
-                             help="Count merges since this commit (default: the branch base, as for "
-                                  "aegis check --lane: origin/$GITHUB_BASE_REF, the branch origin/HEAD names, then main, "
-                                  "develop or master; "
-                                  "with none, the whole first-parent history)")
+        _configure_lease_parsers(sub, common)
         _preserve_team_prefix_output(parser, sub)
 
     def execute(self, args: argparse.Namespace) -> int:
