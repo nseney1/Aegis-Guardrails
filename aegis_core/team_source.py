@@ -11,6 +11,7 @@ The raw entry points validate immutable snapshots of allowed non-grep reads.
 """
 from __future__ import annotations
 
+from array import array
 from functools import wraps
 from io import BytesIO
 import json
@@ -43,6 +44,8 @@ MAX_GREP_OUTPUT_BYTES = 4194304
 MAX_GREP_PATHS = 64
 MAX_PATH_CHARS = 1024
 MAX_PATTERN_CHARS = 256
+_LINE_INDEX_STRIDE = 256
+_LINE_BLOCK = re.compile(rf"(?:[^\n]*\n){{{_LINE_INDEX_STRIDE}}}")
 _OID = re.compile(r"[0-9a-f]{40}\Z")
 _NEXT = {
     "invalid_arguments": "Supply the documented source-view fields and page limits.",
@@ -137,6 +140,35 @@ _GREP_PREFIX = (
 class _ReadRequest(NamedTuple):
     arguments: tuple[str, ...]
     data: Optional[bytes]
+
+
+class _SourceBlob(NamedTuple):
+    spec: str
+    blob: str
+    text: str
+    total: int
+    offsets: array
+
+
+def _index_blob(spec, blob, text):
+    total = text.count("\n") + int(bool(text) and not text.endswith("\n"))
+    # Each checkpoint starts a real line. Line 1 needs no stored offset.
+    count = max(0, total - 1) // _LINE_INDEX_STRIDE
+    empty = array("L")
+    entry = _SourceBlob(spec, blob, text, total, empty)
+    retained = sys.getsizeof(entry) + sum(map(sys.getsizeof, entry))
+    if retained + count * empty.itemsize > MAX_CACHED_BYTES:
+        return entry, False
+    if count:
+        offsets = array("L", [0]) * count
+        position = 0
+        # Match complete blocks in C and publish the offsets only after filling them.
+        for index in range(count):
+            position = _LINE_BLOCK.match(text, position).end()
+            offsets[index] = position
+        entry = entry._replace(offsets=offsets)
+        retained += sys.getsizeof(offsets) - sys.getsizeof(empty)
+    return entry, retained <= MAX_CACHED_BYTES
 
 
 def _argument_snapshot(arguments, maximum):
@@ -249,10 +281,10 @@ class SourceViews:
         _require(kind.returncode == 0 and kind.stdout.strip() == b"commit", "unknown_commit")
         return value
 
-    def _show_lines(self, spec, path):
+    def _show_blob(self, spec):
         with self._cache_lock:
-            if self._show_cache is not None and self._show_cache[0] == spec:
-                return self._show_cache[1:]
+            if self._show_cache is not None and self._show_cache.spec == spec:
+                return self._show_cache
             self._show_cache = None
             kind = self.git("cat-file", "-t", spec, check=False)
             _require(kind.returncode == 0 and kind.stdout.strip() == b"blob", "unknown_path")
@@ -265,14 +297,11 @@ class SourceViews:
             raw = self.git("cat-file", "blob", blob, output_limit=size).stdout
             _require(len(raw) == size, "source_git_failed")
             _require(b"\0" not in raw[:8000], "binary_file")
-            # One bounded string avoids a list allocation proportional to tiny lines.
             text = raw.decode("utf-8", errors="replace")
-            cached = (spec, blob, text)
-            retained = (sys.getsizeof(cached) + sys.getsizeof(spec) + sys.getsizeof(blob)
-                        + sys.getsizeof(text))
-            if retained <= MAX_CACHED_BYTES:
-                self._show_cache = cached
-            return blob, text
+            entry, cacheable = _index_blob(spec, blob, text)
+            if cacheable:
+                self._show_cache = entry
+            return entry
 
     @_guarded
     def show(self, arguments):
@@ -283,12 +312,15 @@ class SourceViews:
         limit = arguments.get("max_lines", DEFAULT_SHOW_LINES)
         _require(type(limit) is int and 1 <= limit <= MAX_SHOW_LINES)
         commit = self.commit(arguments["commit"])
-        blob, text = self._show_lines(commit + ":" + path, path)
-        total = text.count("\n") + int(bool(text) and not text.endswith("\n"))
+        _, blob, text, total, offsets = self._show_blob(commit + ":" + path)
         _require(start <= max(total, 1), "page_out_of_range")
         page, cut, used = [], [], _rendered_size({"commit": commit, "path": path, "blob": blob})
-        position = 0
-        for _ in range(start - 1):
+        position, skip = 0, start - 1
+        if offsets:
+            block, skip = divmod(skip, _LINE_INDEX_STRIDE)
+            if block:
+                position = offsets[block - 1]
+        for _ in range(skip):
             position = text.find("\n", position) + 1
         for number in range(start, min(total, start + limit - 1) + 1):
             end = text.find("\n", position)
