@@ -12,18 +12,19 @@ then apply Git text conversions to descriptor-read bytes. Filter attributes
 (including LFS) are inert only with zero configured drivers; otherwise filter
 states and attribute-source tokens refuse. Unsupported descriptor platforms refuse snapshots, but can plan and
 commit already supplied trees. Submodules and special files refuse explicitly.
-All refusals have a stable code and a constant, input-free message. Conflict paths
-are display-only, canonicalized, redacted, then truncated; never use them as paths.
+All refusals have a stable code and a constant, input-free message. Conflict labels
+are canonicalized, redacted, then truncated; exact path bytes stay beside them.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 import errno
 import os
 from pathlib import Path
 import re
 import stat
+from sys import exc_info
 from threading import Lock
 from types import MappingProxyType
 from typing import Optional, Sequence, Tuple, Union
@@ -142,6 +143,11 @@ class Plan:
     tree: Optional[str] = None
     commits: Tuple[str, ...] = ()
     conflicts: Tuple[str, ...] = ()
+    paths: Tuple[bytes, ...] = field(default=(), repr=False)
+    origin: str = "absent"
+    certainty: str = "unknown"
+    errno: Optional[int] = None
+    exit_status: Optional[int] = None
 
 
 def descriptor_support() -> bool:
@@ -213,13 +219,15 @@ def _lane_operation(function=None, *, effect_aware=False, requires_active=True):
             raise GitRefusal("lane_runner_required")
         if "effect_fds" in kwargs and not effect_aware:
             raise GitRefusal("effect_runner_refused")
+        ambient = exc_info()[1]
         try:
             effect_fds = kwargs.get("effect_fds") if effect_aware else None
             runner = store._lane if store._temp is not None and effect_fds is None else gitsafe.lane_runner(
                 store.repo, store.scratch, effect_fds=effect_fds, worktree_root=store.repo)
             return function(store, *args, _runner=runner, **kwargs)
         except AegisError as exc:
-            raise GitRefusal(_error_code(exc), next_action=getattr(exc, "next_action", None)) from None
+            raise GitRefusal(_error_code(exc), next_action=getattr(exc, "next_action", None),
+                             **team_git_snapshot.failure_cause(exc, ambient)) from None
     return wrapped
 
 
@@ -263,9 +271,9 @@ class GitStore:
             self.env = _runner.environment()
             self._run(["read-tree", "--empty"])
             return self
-        except OSError:
+        except OSError as exc:
             self.__exit__(None, None, None)
-            raise GitRefusal("git_failed") from None
+            raise GitRefusal("git_failed", errno=exc.errno) from None
         except (ValueError, RuntimeError):
             self.__exit__(None, None, None)
             raise GitRefusal("unsafe_scratch") from None
@@ -286,7 +294,7 @@ class GitStore:
         result = _runner.run(args, self.repo, stdin=stdin, _env=extra_env,
                              stdout_limit=stdout_limit, options=options, real_index=real_index)
         if result.returncode not in allowed:
-            raise GitRefusal("git_failed")
+            raise GitRefusal("git_failed", exit_status=result.returncode)
         return result
 
     @_lane_operation
@@ -337,14 +345,15 @@ def _path_parts(raw: bytes) -> Tuple[str, ...]:
 
 
 def _close_descriptors(descriptors):
-    failed = False
+    failure = None
     for fd in descriptors:
         try:
             os.close(fd)
-        except OSError:
-            failed = True
-    if failed:
-        raise GitRefusal("descriptor_cleanup_failed") from None
+        except OSError as exc:
+            if failure is None or failure.errno is None:
+                failure = exc
+    if failure is not None:
+        raise GitRefusal("descriptor_cleanup_failed", errno=failure.errno) from None
 
 
 def _attribute_stamp(observed):
@@ -411,17 +420,18 @@ def _read_path(root_fd: int, raw: bytes, remaining: int, *, attribute=False, att
         if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
             raise GitRefusal("worktree_changed")
         return mode, team_git_snapshot.STAT_CLEAN if clean else b"".join(chunks), before
-    except FileNotFoundError:
+    except FileNotFoundError as exc:
         if observed:
-            raise GitRefusal("conversion_unavailable" if attribute else "worktree_changed") from None
+            code = "conversion_unavailable" if attribute else "worktree_changed"
+            raise GitRefusal(code, errno=exc.errno) from None
         return None
     except OSError as exc:
         if attribute:
             if exc.errno == errno.ENOTDIR:
                 return None
-            raise GitRefusal("conversion_unavailable") from None
+            raise GitRefusal("conversion_unavailable", errno=exc.errno) from None
         code = "unsafe_path" if exc.errno in (errno.ELOOP, errno.ENOTDIR) else "path_unreadable"
-        raise GitRefusal(code) from None
+        raise GitRefusal(code, errno=exc.errno) from None
     finally:
         _close_descriptors(reversed(opened))
 
@@ -444,14 +454,15 @@ _CONFIG_QUERY = r"^core\.(autocrlf|safecrlf|filemode|symlinks|eol|trustctime|che
 
 def _conversion_run(store, argv, **kw):
     """Map conversion-observation transport failures to the stable refusal."""
+    ambient = exc_info()[1]
     try:
         return store._run(argv, **kw)
-    except OSError:
-        raise GitRefusal("conversion_unavailable") from None
+    except OSError as exc:
+        raise GitRefusal("conversion_unavailable", errno=exc.errno) from None
     except AegisError as exc:
         if _error_code(exc) not in ("git_failed", "git_timeout", "git_output_limit", "git_cleanup_failed"):
             raise
-        raise GitRefusal("conversion_unavailable") from None
+        raise GitRefusal("conversion_unavailable", **team_git_snapshot.failure_cause(exc, ambient)) from None
 
 
 def _snapshot_filters(store):
@@ -524,7 +535,7 @@ def _snapshot_attribute_candidates(root_fd, paths):
                     if exc.errno in (errno.ENOENT, errno.ENOTDIR):
                         absent = directory
                         break
-                    raise GitRefusal("conversion_unavailable") from None
+                    raise GitRefusal("conversion_unavailable", errno=exc.errno) from None
                 opened.append(child)
                 components += (part,)
             if absent is not None:
@@ -678,8 +689,6 @@ def snapshot_tree(store: GitStore, *, _runner=None) -> str:
                              real_index=True).stdout
         tracked = store._run(["ls-files", "--stage", "--debug", "-z"],
                              real_index=True)
-        if tracked.returncode:
-            raise GitRefusal("git_failed")
         baseline = _index_records(tracked.stdout, max_paths=MAX_PATHS, max_path_bytes=MAX_PATH_BYTES,
                                   max_bytes=MAX_RESPONSE_BYTES)
         for path in baseline:
@@ -721,8 +730,8 @@ def snapshot_tree(store: GitStore, *, _runner=None) -> str:
             raise GitRefusal("conversion_unavailable")
         store._run(["read-tree", "--empty"])
         return _write_snapshot(store, entries, _runner)
-    except OSError:
-        raise GitRefusal("path_unreadable") from None
+    except OSError as exc:
+        raise GitRefusal("path_unreadable", errno=exc.errno) from None
     finally:
         try:
             if root_fd is not None:
@@ -763,10 +772,12 @@ def _check_ref(store: GitStore, ref: str) -> None:
 
 def _current(store: GitStore, ref: str, runner) -> Optional[str]:
     _require_runner(runner)
+    ambient = exc_info()[1]
     try:
         return runner.read_ref(store.repo, ref)
     except AegisError as exc:
-        raise GitRefusal(_error_code(exc, "ref_unreadable"), next_action=getattr(exc, "next_action", None)) from None
+        raise GitRefusal(_error_code(exc, "ref_unreadable"), next_action=getattr(exc, "next_action", None),
+                         **team_git_snapshot.failure_cause(exc, ambient)) from None
 
 
 @_lane_operation
@@ -779,8 +790,8 @@ def ref_oid(store: GitStore, ref: str, *, _runner=None) -> Optional[str]:
     _require_runner(_runner)
     try:
         return _current(store, ref, _runner)
-    except OSError:
-        raise GitRefusal("ref_unreadable") from None
+    except OSError as exc:
+        raise GitRefusal("ref_unreadable", errno=exc.errno) from None
 
 
 def _publish(store: GitStore, new: str, runner) -> None:
@@ -798,10 +809,10 @@ def _publish(store: GitStore, new: str, runner) -> None:
     pack = runner.run(["pack-objects", "--stdout"], store.repo, stdin=request,
                       stdout_limit=MAX_SNAPSHOT_BYTES)
     if pack.returncode:
-        raise GitRefusal("git_failed")
+        raise GitRefusal("git_failed", exit_status=pack.returncode)
     result = runner.publish(pack.stdout, shared=True)
     if result.returncode:
-        raise GitRefusal("git_failed")
+        raise GitRefusal("git_failed", exit_status=result.returncode)
 
 
 @_lane_operation(effect_aware=True)
@@ -835,26 +846,28 @@ def cas_fast_forward(store: GitStore, ref: str, expected: Optional[str], new: st
     if current == new:
         return "already"
     _publish(store, new, _runner)
+    ambient = exc_info()[1]
     try:
         status = _runner.cas(ref, new, expected)
         if status == "already":
             return "already"
     except AegisError as exc:
         code = _error_code(exc)
+        cause = team_git_snapshot.failure_cause(exc, ambient)
         if code not in UNKNOWN_OUTCOME_CODES and code not in ("git_failed", "ref_update_failed"):
-            raise GitRefusal(_error_code(exc), next_action=getattr(exc, "next_action", None)) from None
+            raise GitRefusal(code, next_action=getattr(exc, "next_action", None), **cause) from None
         if (effect_fds is not None
                 and (code in UNKNOWN_OUTCOME_CODES
                      or code == "git_failed" and getattr(exc, "process_started", None) is True)):
-            raise GitRefusal("ref_update_unknown") from None
+            raise GitRefusal("ref_update_unknown", **cause) from None
         observed = _current(store, ref, _runner)
         if observed == new:
             return "already"
         if observed != expected:
             raise GitRefusal("cas_mismatch") from None
         if code == "ref_update_failed" or (code == "git_failed" and getattr(exc, "process_started", None) is False):
-            raise GitRefusal("ref_update_failed") from None
-        raise GitRefusal("ref_update_unknown") from None
+            raise GitRefusal("ref_update_failed", **cause) from None
+        raise GitRefusal("ref_update_unknown", **cause) from None
     return "updated"
 
 
@@ -879,23 +892,15 @@ def _merge(store: GitStore, tip: str, head: str, base: Optional[str] = None) -> 
     args.extend((tip, head))
     result = store._run(args, options=flags, allowed=(0, 1, 129))
     if result.returncode == 129:
-        raise GitRefusal("merge_unavailable")
-    if len(result.stdout) > MAX_PATHS * (MAX_PATH_BYTES + 1):
+        raise GitRefusal("merge_unavailable", exit_status=result.returncode)
+    if len(result.stdout) > MAX_RESPONSE_BYTES:
         raise GitRefusal("size_limit")
-    fields = result.stdout.split(b"\0")
-    if not fields:
-        raise GitRefusal("invalid_object")
-    tree = validate_oid(fields[0].decode("ascii"))
+    oid, start = team_git_snapshot.merge_tree_oid(result.stdout)
+    tree = validate_oid(oid)
     if result.returncode == 0:
         return Plan("clean", tree)
-    paths = []
-    for path in fields[1:]:
-        if not path:
-            break
-        if len(paths) >= MAX_PATHS or len(path) > MAX_PATH_BYTES:
-            raise GitRefusal("size_limit")
-        paths.append(_display(path))
-    return Plan("conflict", conflicts=tuple(paths))
+    labels, exact = team_git_snapshot.conflict_paths(result.stdout, start, _display, MAX_PATHS, MAX_PATH_BYTES)
+    return Plan("conflict", conflicts=labels, paths=exact, origin="conflict", certainty="confirmed")
 
 
 @_lane_operation

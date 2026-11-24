@@ -4,12 +4,14 @@ from dataclasses import replace
 import ast
 import errno
 import json
+import locale
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from threading import Barrier, Event, Lock, Thread
 from types import SimpleNamespace
 
@@ -3755,8 +3757,9 @@ def test_cas_classifies_failed_acknowledgments_and_never_retries(repo, monkeypat
         if observation != "old":
             git(repo, "update-ref", namespace, new if observation == "new" else winner)
         if failure == "nonzero":
-            return subprocess.CompletedProcess(args, 1, b"", b"private error")
-        raise gitsafe.GitError("private error", code=failure, process_started=True)
+            return subprocess.CompletedProcess(args, 128, b"", PLANNER_DIAGNOSTIC.encode())
+        raise gitsafe.GitError(PLANNER_DIAGNOSTIC, code=failure, process_started=True)
+    _install_planner_launch(monkeypatch)
     with new_store(repo) as store:
         monkeypatch.setattr(gitsafe_run, "capture", fail)
         if observation == "new":
@@ -3766,8 +3769,10 @@ def test_cas_classifies_failed_acknowledgments_and_never_retries(repo, monkeypat
                 tg.cas_fast_forward(store, namespace, None, new)
             expected = "cas_mismatch" if observation == "winner" else (
                 "ref_update_failed" if failure == "nonzero" else "ref_update_unknown")
-            assert caught.value.code == expected
-            assert "private" not in str(caught.value)
+            if expected == "ref_update_failed":
+                _assert_provenance(caught.value, expected, "exit_status", "confirmed", exit_status=128)
+            else:
+                _assert_provenance(caught.value, expected, "absent", "unknown")
         assert len(writes) == 1
         monkeypatch.setattr(gitsafe_run, "capture", real)
         if observation == "old" and failure == "nonzero":
@@ -5566,7 +5571,8 @@ def test_pick_cached_message_refusal_stays_after_conflict_and_retries(repo, mess
     with new_store(repo) as store:
         for _ in range(2):
             if conflict:
-                assert tg.plan_pick(store, tip, (source,), IDENTITY) == tg.Plan("conflict", conflicts=("x",))
+                plan = tg.plan_pick(store, tip, (source,), IDENTITY)
+                assert (plan.status, plan.conflicts, plan.paths) == ("conflict", ("x",), (b"x",))
             else:
                 with pytest.raises(tg.GitRefusal) as caught:
                     tg.plan_pick(store, tip, (source,), IDENTITY)
@@ -6037,3 +6043,575 @@ def test_attribute_entries_malformed_body_refuses_before_hash_and_retries(monkey
         (b"a/.gitattributes", "100644", real(good, 40), True),
         (b"b/.gitattributes", "100644", real(good, 40), True)]
     assert calls == [(id(good), 40)]
+
+
+# fr_FR.UTF-8 is the specified non-English locale. Classification must not read prose,
+# so the same assertions hold when that locale is not installed.
+SPECIFIED_LOCALE = "fr_FR.UTF-8"
+PLANNER_DIAGNOSTIC = "délai 1\ntimeout 30 errno 28\naucun espace; erreur d'entrée/sortie"
+
+
+def _french_locale_ready():
+    previous = locale.setlocale(locale.LC_ALL)
+    try:
+        locale.setlocale(locale.LC_ALL, SPECIFIED_LOCALE)
+    except locale.Error:
+        return False
+    finally:
+        locale.setlocale(locale.LC_ALL, previous)
+    return True
+
+
+def _planner_history(repo, planner):
+    parent = git(repo, "rev-parse", "HEAD").decode().strip()
+    if planner == "merge":
+        return parent, lambda store: tg.plan_merge(store, parent, parent)
+    if planner == "pick":
+        child = commit(repo, "y", b"side\n")
+        return parent, lambda store: tg.plan_pick(store, parent, (child,), IDENTITY)
+    git(repo, "checkout", "-qb", "side")
+    commit(repo, "y", b"side\n")
+    git(repo, "checkout", "-q", "main")
+    git(repo, "merge", "--no-ff", "-qm", "merge side", "side")
+    merge = git(repo, "rev-parse", "HEAD").decode().strip()
+    return merge, lambda store: tg.plan_revert(store, merge, merge)
+
+
+def _conflict_pair(repo):
+    git(repo, "checkout", "-qb", "topic")
+    source = commit(repo, "x", b"topic\n")
+    git(repo, "checkout", "-q", "main")
+    tip = commit(repo, "x", b"main\n")
+    return tip, source
+
+
+def _label_paths():
+    """Distinct bytes that share one label only after canonicalize-then-truncate."""
+    return b"\x1b[31m" + b"a" * 250 + b"LEFT", b"\x1b[32m" + b"a" * 250 + b"RIGHT"
+
+
+def _ordered_label(raw):
+    """Canonicalize, then truncate. These bytes hold no secret, so this matches the product label."""
+    from aegis_core.primitives import sanitize_display
+    canonical = sanitize_display(os.fsdecode(raw), max_len=None)
+    return sanitize_display(canonical, max_len=240)
+
+
+def _truncated_first(raw):
+    """Truncate the raw text, then canonicalize. That is the opposite of the product order."""
+    from aegis_core.primitives import sanitize_display
+    text = os.fsdecode(raw)
+    clipped = text[:237] + "..." if len(text) > 240 else text
+    return sanitize_display(clipped, max_len=None)
+
+
+def _install_planner_launch(monkeypatch, launch=subprocess.Popen):
+    """Supply the optional locale at the child launch boundary."""
+    available = _french_locale_ready()
+
+    def popen(argv, **kwargs):
+        if available and ("merge-tree" in argv or "update-ref" in argv):
+            assert kwargs["env"]["LC_ALL"] == "C"
+            kwargs["env"] = dict(kwargs["env"], LANG=SPECIFIED_LOCALE, LC_ALL=SPECIFIED_LOCALE)
+            assert kwargs["env"]["LANG"] == kwargs["env"]["LC_ALL"] == SPECIFIED_LOCALE
+        return launch(argv, **kwargs)
+
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(
+        **{**vars(subprocess), "Popen": popen}))
+
+
+def _status_process(status, env):
+    script = "import sys; sys.stderr.buffer.write(sys.argv[1].encode()); raise SystemExit(int(sys.argv[2]))"
+    return subprocess.Popen(
+        [sys.executable, "-c", script, PLANNER_DIAGNOSTIC, str(status)],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=os.name == "posix")
+
+
+def _holding_process(env):
+    script = "import sys, time; sys.stderr.buffer.write(sys.argv[1].encode()); sys.stderr.flush(); time.sleep(30)"
+    return subprocess.Popen(
+        [sys.executable, "-c", script, PLANNER_DIAGNOSTIC],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=os.name == "posix")
+
+
+def _release_processes(held):
+    for proc in held:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
+        finally:
+            proc.stdout.close()
+            proc.stderr.close()
+
+
+def _assert_stable_refusal(refusal, code):
+    assert type(refusal).__module__ == "aegis_core.team_git"
+    assert (refusal.code, str(refusal), refusal.next_action) == (
+        code, "Lane Git operation refused: " + code, None)
+    rendered = str(refusal)
+    assert PLANNER_DIAGNOSTIC not in rendered and "délai" not in rendered and "espace" not in rendered
+    assert "\n" not in rendered and "merge-tree" not in rendered and "private" not in rendered
+
+
+def _assert_provenance(refusal, code, origin, certainty, errno=None, exit_status=None):
+    """Landing record: an integer is present only when certainty is confirmed."""
+    _assert_stable_refusal(refusal, code)
+    assert (refusal.origin, refusal.certainty, refusal.errno, refusal.exit_status) == (
+        origin, certainty, errno, exit_status)
+    if certainty == "confirmed" and origin == "errno":
+        assert type(refusal.errno) is int
+    if certainty == "confirmed" and origin == "exit_status":
+        assert type(refusal.exit_status) is int
+    assert getattr(refusal, "timeout", None) is None
+
+
+@pytest.mark.parametrize("ref", ["refs/heads/lane/cause", "refs/aegis/qual/cause"])
+@pytest.mark.parametrize("observation", ["old", "new", "other"])
+@pytest.mark.parametrize(
+    "failure, code, origin, certainty, os_errno, exit_status",
+    [
+        ("prelaunch", "ref_update_failed", "errno", "confirmed", errno.ENOSPC, None),
+        ("postlaunch", "ref_update_unknown", "errno", "confirmed", errno.EIO, None),
+        ("adapter", "ref_update_unknown", "exit_status", "confirmed", None, 124),
+        ("nonzero", "ref_update_failed", "exit_status", "confirmed", None, 128),
+        ("expiry", "ref_update_unknown", "absent", "unknown", None, None),
+    ],
+    ids=["prelaunch", "postlaunch", "adapter", "nonzero", "expiry"],
+)
+def test_cas_preserves_write_cause_across_observation(
+        repo, monkeypatch, ref, observation, failure, code, origin, certainty, os_errno, exit_status):
+    old = git(repo, "rev-parse", "HEAD").decode().strip()
+    new = commit(repo, "candidate", b"new\n")
+    other = commit(repo, "winner", b"competing\n")
+    git(repo, "update-ref", ref, old)
+    observed = {"old": old, "new": new, "other": other}[observation]
+    writes, children = [], []
+
+    def launch(argv, **kwargs):
+        if "update-ref" not in argv:
+            return subprocess.Popen(argv, **kwargs)
+        writes.append(argv)
+        if len(writes) > 1:
+            return subprocess.Popen(argv, **kwargs)
+        if observed != old:
+            git(repo, "update-ref", ref, observed, old)
+        if failure == "prelaunch":
+            raise OSError(errno.ENOSPC, PLANNER_DIAGNOSTIC)
+        if failure in ("adapter", "expiry"):
+            expired = subprocess.TimeoutExpired(argv, 17, stderr=PLANNER_DIAGNOSTIC.encode())
+            if failure == "adapter":
+                expired.returncode = 124
+            raise expired
+        child = _status_process(128, kwargs["env"])
+        children.append(child)
+        if failure == "postlaunch":
+            original_wait = child.wait
+
+            def wait(*args, **options):
+                child.wait = original_wait
+                raise OSError(errno.EIO, PLANNER_DIAGNOSTIC)
+
+            child.wait = wait
+        return child
+
+    _install_planner_launch(monkeypatch, launch)
+    try:
+        with new_store(repo) as store:
+            try:
+                raise OSError(errno.ENOENT, "unrelated filesystem operation")
+            except OSError:
+                if observation == "new":
+                    assert tg.cas_fast_forward(store, ref, old, new) == "already"
+                else:
+                    with pytest.raises(tg.GitRefusal) as caught:
+                        tg.cas_fast_forward(store, ref, old, new)
+                    if observation == "other":
+                        _assert_provenance(caught.value, "cas_mismatch", "absent", "unknown")
+                    else:
+                        _assert_provenance(caught.value, code, origin, certainty, os_errno, exit_status)
+            assert len(writes) == 1
+            assert tg.ref_oid(store, ref) == observed
+            if observation == "old":
+                assert tg.cas_fast_forward(store, ref, old, new) == "updated"
+                assert tg.cas_fast_forward(store, ref, old, new) == "already"
+                assert len(writes) == 2 and tg.ref_oid(store, ref) == new
+            elif observation == "new":
+                assert tg.cas_fast_forward(store, ref, old, new) == "already"
+                assert len(writes) == 1
+        assert all(child.returncode is not None and child.stdout.closed and child.stderr.closed
+                   for child in children)
+    finally:
+        _release_processes(children)
+
+
+@pytest.mark.parametrize("stage", ["preflight", "observation"])
+def test_cas_preserves_boundary_refusal(repo, monkeypatch, stage):
+    new = git(repo, "rev-parse", "HEAD").decode().strip()
+    ref = "refs/heads/lane/boundary"
+    real = gitsafe_run.capture
+    attempts, launched = [], []
+    action = "Inspect the ref under a fresh lease."
+
+    def launch(argv, **kwargs):
+        if "update-ref" in argv:
+            launched.append(argv)
+            raise OSError(errno.ENOSPC, PLANNER_DIAGNOSTIC)
+        return subprocess.Popen(argv, **kwargs)
+
+    def capture(argv, **kwargs):
+        if "update-ref" in argv:
+            attempts.append(argv)
+            if stage == "preflight":
+                raise gitsafe.GitError(PLANNER_DIAGNOSTIC, code="git_custody_refused", next_action=action)
+        if attempts and "for-each-ref" in argv:
+            raise gitsafe.GitError(PLANNER_DIAGNOSTIC, code="ref_unreadable", next_action=action, errno=errno.EACCES)
+        return real(argv, **kwargs)
+
+    _install_planner_launch(monkeypatch, launch)
+    monkeypatch.setattr(gitsafe_run, "capture", capture)
+    with new_store(repo) as store:
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.cas_fast_forward(store, ref, None, new)
+        refusal = caught.value
+        if stage == "preflight":
+            assert len(launched) == 0
+            expected = "git_custody_refused", "absent", "unknown", None
+        else:
+            assert len(launched) == 1
+            expected = "ref_unreadable", "errno", "confirmed", errno.EACCES
+        assert (refusal.code, refusal.origin, refusal.certainty, refusal.errno) == expected
+        assert (str(refusal), refusal.next_action, refusal.exit_status) == (
+            "Lane Git operation refused: " + expected[0], action, None)
+        assert len(attempts) == 1
+        monkeypatch.setattr(gitsafe_run, "capture", real)
+        _install_planner_launch(monkeypatch)
+        assert tg.ref_oid(store, ref) is None
+        assert tg.cas_fast_forward(store, ref, None, new) == "updated"
+
+
+@pytest.mark.parametrize("started", [False, True])
+def test_cas_effect_fd_acknowledgment_carries_cause(repo, monkeypatch, started):
+    from aegis_core import team_gitops
+    if not gitops_fds.descriptor_supported():
+        pytest.skip("effect custody requires Linux child subreaper support")
+    new = git(repo, "rev-parse", "HEAD").decode().strip()
+    ref = "refs/aegis/qual/effect-cause"
+    real = gitsafe_run.capture
+    attempts = []
+
+    def capture(argv, **kwargs):
+        if "update-ref" in argv:
+            attempts.append(kwargs["effect_fds"])
+            try:
+                raise OSError(errno.EIO, PLANNER_DIAGNOSTIC)
+            except OSError:
+                raise gitsafe.GitError(PLANNER_DIAGNOSTIC, code="git_failed", process_started=True,
+                                       effect_process_started=started) from None
+        return real(argv, **kwargs)
+
+    with make_store(repo) as store:
+        monkeypatch.setattr(gitsafe_run, "capture", capture)
+        journal = team_gitops.GitOpsJournal(repo / ".git")
+        with journal.record_intent(op="ref_update", lane="lane-1", request_id="effect-cause",
+                                   expected_old=None, expected_new=new, actor="custodian-1") as receipt:
+            descriptors = receipt.inheritable_fds()
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.cas_fast_forward(store, ref, None, new, effect_fds=descriptors)
+            code = "ref_update_unknown" if started else "ref_update_failed"
+            _assert_provenance(caught.value, code, "errno", "confirmed", errno=errno.EIO)
+            assert attempts == [descriptors]
+            assert os.fstat(descriptors[0])
+        assert tg.ref_oid(store, ref) is None
+
+
+def test_cas_write_causes_stay_local_across_concurrent_runners(repo, monkeypatch):
+    new = git(repo, "rev-parse", "HEAD").decode().strip()
+    barrier = Barrier(2)
+    refs = ["refs/heads/lane/cause", "refs/aegis/qual/cause"]
+    attempts = {ref: [] for ref in refs}
+    real = gitsafe_run.capture
+
+    def capture(argv, **kwargs):
+        if "update-ref" not in argv:
+            return real(argv, **kwargs)
+        ref = kwargs["stdin"].split(b"\0", 1)[0].removeprefix(b"create ").decode("ascii")
+        attempts[ref].append(argv)
+        if len(attempts[ref]) > 1:
+            return real(argv, **kwargs)
+        barrier.wait(timeout=5)
+        if ref == refs[0]:
+            raise gitsafe.GitError(PLANNER_DIAGNOSTIC, code="git_failed", process_started=False, errno=errno.ENOSPC)
+        return subprocess.CompletedProcess(argv, 128, b"", PLANNER_DIAGNOSTIC.encode())
+
+    def worker(store, ref):
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.cas_fast_forward(store, ref, None, new)
+        return caught.value
+
+    monkeypatch.setattr(gitsafe_run, "capture", capture)
+    with new_store(repo) as first, new_store(repo) as second:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            enospc = pool.submit(worker, first, refs[0])
+            nonzero = pool.submit(worker, second, refs[1])
+            _assert_provenance(enospc.result(timeout=30), "ref_update_failed", "errno", "confirmed", errno=errno.ENOSPC)
+            _assert_provenance(nonzero.result(timeout=30), "ref_update_failed", "exit_status", "confirmed", exit_status=128)
+        for store, ref in zip((first, second), refs):
+            assert len(attempts[ref]) == 1 and tg.ref_oid(store, ref) is None
+            assert tg.cas_fast_forward(store, ref, None, new) == "updated"
+            assert len(attempts[ref]) == 2
+
+
+@pytest.mark.parametrize("planner", ["merge", "pick", "revert"])
+@pytest.mark.parametrize("kind", ["enospc", "eio", "etimedout", "exit", "exit124", "adapter", "duration", "absent"])
+def test_planner_preserves_numeric_cause_and_retries(repo, monkeypatch, planner, kind):
+    """Observed errno and process exit stay beside the refusal. A wait duration is not an exit."""
+    _head, operation = _planner_history(repo, planner)
+    state = {"armed": True}
+    real = subprocess.Popen
+    held = []
+
+    def launch(argv, **kwargs):
+        if state["armed"] and "merge-tree" in argv:
+            if kind == "enospc":
+                raise OSError(errno.ENOSPC, PLANNER_DIAGNOSTIC)
+            if kind == "eio":
+                raise OSError(errno.EIO, PLANNER_DIAGNOSTIC)
+            if kind == "etimedout":
+                raise OSError(errno.ETIMEDOUT, PLANNER_DIAGNOSTIC)
+            if kind in ("exit", "exit124"):
+                proc = _status_process(128 if kind == "exit" else 124, kwargs["env"])
+                held.append(proc)
+                return proc
+            if kind == "adapter":
+                expired = subprocess.TimeoutExpired(argv, 17, stderr=PLANNER_DIAGNOSTIC.encode())
+                expired.returncode = 124
+                raise expired
+            if kind == "duration":
+                raise subprocess.TimeoutExpired(argv, 17, stderr=PLANNER_DIAGNOSTIC.encode())
+            raise OSError(None, PLANNER_DIAGNOSTIC)
+        return real(argv, **kwargs)
+
+    _install_planner_launch(monkeypatch, launch)
+    before = shared_bytes(repo)
+    try:
+        with new_store(repo) as store:
+            with pytest.raises(tg.GitRefusal) as caught:
+                try:
+                    raise OSError(errno.EACCES, "unrelated filesystem operation")
+                except OSError:
+                    operation(store)
+            refusal = caught.value
+            if kind == "enospc":
+                _assert_provenance(refusal, "git_failed", "errno", "confirmed", errno=errno.ENOSPC)
+            elif kind == "eio":
+                _assert_provenance(refusal, "git_failed", "errno", "confirmed", errno=errno.EIO)
+            elif kind == "etimedout":
+                _assert_provenance(refusal, "git_failed", "errno", "confirmed", errno=errno.ETIMEDOUT)
+            elif kind in ("exit", "exit124"):
+                _assert_provenance(refusal, "git_failed", "exit_status", "confirmed",
+                                   exit_status=128 if kind == "exit" else 124)
+            elif kind == "adapter":
+                _assert_provenance(refusal, "git_timeout", "exit_status", "confirmed", exit_status=124)
+            elif kind == "duration":
+                _assert_provenance(refusal, "git_timeout", "absent", "unknown")
+            else:
+                _assert_provenance(refusal, "git_failed", "absent", "unknown")
+            state["armed"] = False
+            retried = operation(store)
+            assert retried.status == "clean" and retried.paths == () and retried.conflicts == ()
+            again = operation(store)
+            assert again == retried
+        assert shared_bytes(repo) == before
+    finally:
+        _release_processes(held)
+
+
+def test_planner_capture_deadline_has_no_numeric_cause(repo, monkeypatch):
+    _, operation = _planner_history(repo, "merge")
+    children = []
+    armed = True
+
+    def launch(argv, **kwargs):
+        if armed and "merge-tree" in argv:
+            child = _holding_process(kwargs["env"])
+            children.append(child)
+            return child
+        return subprocess.Popen(argv, **kwargs)
+
+    def monotonic():
+        return time.monotonic() + (61 if armed and children else 0)
+
+    _install_planner_launch(monkeypatch, launch)
+    monkeypatch.setattr(gitsafe_run, "time", SimpleNamespace(**{**vars(time), "monotonic": monotonic}))
+    try:
+        with new_store(repo) as store:
+            with pytest.raises(tg.GitRefusal) as caught:
+                operation(store)
+            _assert_provenance(caught.value, "git_timeout", "absent", "unknown")
+            assert len(children) == 1 and children[0].returncode is not None
+            assert children[0].stdout.closed and children[0].stderr.closed
+            armed = False
+            assert operation(store).status == "clean"
+    finally:
+        _release_processes(children)
+
+
+def test_planner_conflict_exit_is_not_a_numeric_failure(repo, monkeypatch):
+    """Exit 1 is a semantic conflict even when diagnostics name a timeout or errno."""
+    tip, source = _conflict_pair(repo)
+    _install_planner_launch(monkeypatch)
+    real_run = gitsafe_run.LaneRunner.run
+
+    def call(runner, args, *rest, **kwargs):
+        result = real_run(runner, args, *rest, **kwargs)
+        if "merge-tree" in args:
+            assert result.returncode == 1
+            stderr = PLANNER_DIAGNOSTIC.encode() + b"\nCONFLICT (content): Merge conflict in x\n"
+            return subprocess.CompletedProcess(result.args, result.returncode, result.stdout, stderr)
+        return result
+
+    monkeypatch.setattr(gitsafe_run.LaneRunner, "run", call)
+    before = shared_bytes(repo)
+    with new_store(repo) as store:
+        plans = []
+        for _attempt in (1, 2):
+            merged = tg.plan_merge(store, tip, source)
+            picked = tg.plan_pick(store, tip, (source,), IDENTITY)
+            plans.append((merged, picked))
+        for merged, picked in plans:
+            assert type(merged) is tg.Plan and type(picked) is tg.Plan
+            for plan in (merged, picked):
+                assert plan.status == "conflict" and plan.tree is None and plan.commits == ()
+                assert plan.paths == (b"x",) and plan.conflicts == ("x",)
+                assert (plan.origin, plan.certainty, plan.errno, plan.exit_status) == (
+                    "conflict", "confirmed", None, None)
+                assert PLANNER_DIAGNOSTIC not in "".join(plan.conflicts)
+                assert "timeout" not in "".join(plan.conflicts) and "délai" not in "".join(plan.conflicts)
+            assert merged == picked
+        assert plans[0] == plans[1]
+    assert shared_bytes(repo) == before
+
+
+def test_planner_keeps_exact_paths_when_labels_collide(repo, monkeypatch):
+    """Two path byte strings can share one clipped label; identities stay exact."""
+    tip, source = _conflict_pair(repo)
+    left, right = _label_paths()
+    expected = _ordered_label(left)
+    assert expected == _ordered_label(right)
+    assert expected != _truncated_first(left) and "LEFT" not in expected and "\x1b" not in expected
+    _install_planner_launch(monkeypatch)
+    state = {"overlay": True}
+    real_run = gitsafe_run.LaneRunner.run
+
+    def call(runner, args, *rest, **kwargs):
+        result = real_run(runner, args, *rest, **kwargs)
+        if not state["overlay"] or "merge-tree" not in args:
+            return result
+        assert result.returncode == 1
+        oid = result.stdout.split(b"\0", 1)[0]
+        decoy = "délai d'attente dépassé timeout 30".encode()
+        stdout = b"\0".join((oid, left, right, b"", b"1", b"timeout", decoy, b""))
+        return subprocess.CompletedProcess(result.args, 1, stdout, PLANNER_DIAGNOSTIC.encode())
+
+    monkeypatch.setattr(gitsafe_run.LaneRunner, "run", call)
+    before = shared_bytes(repo)
+    with new_store(repo) as store:
+        first = tg.plan_merge(store, tip, source)
+        second = tg.plan_pick(store, tip, (source,), IDENTITY)
+        assert first == second
+        assert first.paths == (left, right) and first.conflicts == (expected, expected)
+        assert len(set(first.conflicts)) == 1 and len(set(first.paths)) == 2
+        diagnostic = repr(first)
+        assert expected in diagnostic
+        for raw in ("LEFT", "RIGHT", "\x1b", r"\x1b"):
+            assert raw not in diagnostic
+        retried = tg.plan_merge(store, tip, source)
+        assert retried == first
+        left, right = right, left
+        reordered = tg.plan_merge(store, tip, source)
+        assert reordered.paths == (left, right)
+        assert reordered.conflicts == first.conflicts and reordered != first
+        state["overlay"] = False
+        restored = tg.plan_merge(store, tip, source)
+        assert restored.paths == (b"x",) and restored.conflicts == ("x",)
+        assert tg.plan_pick(store, tip, (source,), IDENTITY) == restored
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("bad, code", [("path", "size_limit"), ("count", "size_limit"), ("oid", "invalid_object")])
+def test_planner_refuses_malformed_conflict_output(repo, monkeypatch, bad, code):
+    tip, source = _conflict_pair(repo)
+    _install_planner_launch(monkeypatch)
+    state = {"overlay": True}
+    real_run = gitsafe_run.LaneRunner.run
+
+    def call(runner, args, *rest, **kwargs):
+        result = real_run(runner, args, *rest, **kwargs)
+        if not state["overlay"] or "merge-tree" not in args:
+            return result
+        oid = result.stdout.split(b"\0", 1)[0]
+        if bad == "path":
+            stdout = b"\0".join((oid, b"p" * (tg.MAX_PATH_BYTES + 1), b""))
+        elif bad == "count":
+            stdout = oid + b"\0" + b"p\0" * (tg.MAX_PATHS + 1) + b"\0"
+        else:
+            stdout = b"\xff" * len(oid) + b"\0x\0\0"
+        return subprocess.CompletedProcess(result.args, 1, stdout, PLANNER_DIAGNOSTIC.encode())
+
+    monkeypatch.setattr(gitsafe_run.LaneRunner, "run", call)
+    before = shared_bytes(repo)
+    with new_store(repo) as store:
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.plan_merge(store, tip, source)
+        _assert_provenance(caught.value, code, "absent", "unknown")
+        state["overlay"] = False
+        plan = tg.plan_merge(store, tip, source)
+        assert plan.paths == (b"x",) and plan.conflicts == ("x",)
+        assert tg.plan_merge(store, tip, source) == plan
+    assert shared_bytes(repo) == before
+
+
+def test_planner_causes_stay_local_across_concurrent_runners(repo, tmp_path, monkeypatch):
+    """One runner's ENOSPC cannot become another runner's conflict or timeout."""
+    tip, source = _conflict_pair(repo)
+    other = tmp_path / "other"
+    other.mkdir()
+    git(other, "init", "-q", "-b", "main")
+    commit(other, "x", b"base\n")
+    parent = git(other, "rev-parse", "HEAD").decode().strip()
+    barrier = Barrier(2)
+    failure_armed = Event()
+    failure_armed.set()
+
+    def launch(argv, **kwargs):
+        if "merge-tree" in argv and kwargs["cwd"] == str(other) and failure_armed.is_set():
+            raise OSError(errno.ENOSPC, PLANNER_DIAGNOSTIC)
+        return subprocess.Popen(argv, **kwargs)
+
+    def conflict_worker():
+        with new_store(repo) as store:
+            barrier.wait(5)
+            plan = tg.plan_merge(store, tip, source)
+            assert (plan.origin, plan.certainty, plan.paths) == ("conflict", "confirmed", (b"x",))
+            assert tg.plan_merge(store, tip, source) == plan
+
+    def enospc_worker():
+        with new_store(other) as store:
+            barrier.wait(5)
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.plan_merge(store, parent, parent)
+            _assert_provenance(caught.value, "git_failed", "errno", "confirmed", errno=errno.ENOSPC)
+            failure_armed.clear()
+            assert tg.plan_merge(store, parent, parent).status == "clean"
+
+    _install_planner_launch(monkeypatch, launch)
+    before = shared_bytes(repo), shared_bytes(other)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        conflict = pool.submit(conflict_worker)
+        failed = pool.submit(enospc_worker)
+        conflict.result(timeout=60)
+        failed.result(timeout=60)
+    assert (shared_bytes(repo), shared_bytes(other)) == before

@@ -11,13 +11,14 @@ import hashlib
 import re
 import zlib
 
-from aegis_core import gitsafe, gitsafe_policy
+from aegis_core import gitsafe_policy
 from aegis_core.workspace.git_objects import object_id
 
 __all__ = ["GitRefusal", "OID_PATTERN", "STAT_CLEAN", "baseline_requests", "binary_text", "blob_pack", "check_filter_bytes", "check_filter_sources", "clean_bytes",
            "clean_eol", "conversion_settings", "decode_worktree", "eol_rule", "filter_drivers", "index_clean", "index_matches",
            "index_records", "is_attribute_path", "preserved_paths", "snapshot_attributes", "snapshot_entries", "snapshot_rules",
-           "attribute_version", "attribute_entries", "attribute_fallbacks", "deleted_attribute_rules"]
+           "attribute_version", "attribute_entries", "attribute_fallbacks", "deleted_attribute_rules",
+           "conflict_paths", "failure_cause", "failure_observation", "merge_tree_oid"]
 
 OID_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 # Captured row state: payload reading was skipped under the index stat proof.
@@ -31,16 +32,23 @@ _INDEX_STAT = re.compile(rb"  ctime: ([0-9]{1,20}):([0-9]{1,10})\n  mtime: ([0-9
     rb"  size: ([0-9]{1,20})\tflags: ([0-9a-fA-F]{1,16})\n")
 
 
-class GitRefusal(gitsafe.GitError):
-    """Stable library refusal. code is the machine-readable refusal, never stderr."""
+class GitRefusal(gitsafe_policy.GitError):
+    """Stable library refusal. code is the machine-readable refusal, never stderr.
+
+    The landing cause fields describe a numeric observation when available.
+    """
 
     # Retain the public facade's exception identity and serialized type name.
     __module__ = "aegis_core.team_git"
 
-    def __init__(self, code: str, *, next_action=None) -> None:
+    def __init__(self, code: str, *, next_action=None, errno=None, exit_status=None) -> None:
         actions = {"index_flags_unsupported": "Clear assume-unchanged and skip-worktree flags, then retry.",
                    "index_stat_unprovable": "Run `git update-index --refresh` in the worktree, then retry."}
         super().__init__("Lane Git operation refused: " + code, code=code, next_action=actions.get(code, next_action))
+        self.errno = errno if type(errno) is int else None
+        self.exit_status = exit_status if self.errno is None and type(exit_status) is int else None
+        self.origin = "errno" if self.errno is not None else "exit_status" if self.exit_status is not None else "absent"
+        self.certainty = "unknown" if self.origin == "absent" else "confirmed"
 
 
 def _index_refuse(code="conversion_unavailable"):
@@ -488,3 +496,63 @@ def blob_pack(blobs, oid_length, *, max_bytes):
     digest = (hashlib.sha256 if oid_length == 64 else hashlib.sha1)(pack).digest()
     pack.extend(digest)
     return bytes(pack)
+
+
+_CAUSE_DEPTH = 8
+
+
+def failure_observation(source, ambient=None, *, stop_at=()):
+    """Return the nearest observed errno or exit status within this operation."""
+    current = source
+    for _ in range(_CAUSE_DEPTH):
+        if current is None or current is ambient:
+            break
+        os_errno = getattr(current, "errno", None)
+        if type(os_errno) is int:
+            return os_errno, None
+        for name in ("exit_status", "returncode"):
+            status = getattr(current, name, None)
+            if type(status) is int:
+                return None, status
+        if not isinstance(current, BaseException) or isinstance(current, stop_at):
+            break
+        linked = current.__cause__
+        current = current.__context__ if linked is None else linked
+    return None, None
+
+
+def failure_cause(exc, ambient=None):
+    """Find the nearest numeric observation in this operation's exception chain."""
+    os_errno, status = failure_observation(exc, ambient, stop_at=GitRefusal)
+    if os_errno is not None:
+        return {"errno": os_errno}
+    if status is not None:
+        return {"exit_status": status}
+    return {}
+
+
+def merge_tree_oid(out):
+    """Read only the bounded object ID from a merge result."""
+    end = out.find(b"\0", 0, 65)
+    if end == -1:
+        end = len(out)
+    if end not in (40, 64):
+        raise GitRefusal("invalid_oid")
+    try:
+        return out[:end].decode("ascii"), end + 1
+    except UnicodeError:
+        raise GitRefusal("invalid_object") from None
+
+
+def conflict_paths(out, start, display, max_paths, max_path_bytes):
+    """Collect bounded path bytes up to Git's empty separator, then label them."""
+    exact = []
+    while start < len(out) and out[start] != 0:
+        end = out.find(b"\0", start, start + max_path_bytes + 1)
+        if end == -1:
+            end = len(out)
+        if len(exact) >= max_paths or end - start > max_path_bytes:
+            raise GitRefusal("size_limit")
+        exact.append(out[start:end])
+        start = end + 1
+    return tuple(display(path) for path in exact), tuple(exact)

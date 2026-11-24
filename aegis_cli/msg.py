@@ -221,6 +221,7 @@ class MsgCommand(AegisCommand):
 
     def execute(self, args: argparse.Namespace) -> int:
         from aegis_core import message_codec as codec
+        from aegis_core.message_codec_store import store_supported
         from aegis_core.workspace.layout import is_aegis_workspace
 
         try:
@@ -234,10 +235,11 @@ class MsgCommand(AegisCommand):
             if args.msg_action == "read":
                 if args.json and args.format != "json":
                     return emit_error(codec.CodecError("E_FORMAT", detail="format"))
-                options = codec.preflight_read(True, selectors=args.fields, spans=args.spans, outline=args.outline,
-                                               since=args.since, expand=args.expand, format=args.format,
-                                               max_chars=args.max_chars).options
-            if not _anchored_operations_supported():
+                prepared = codec.preflight_read(True, selectors=args.fields, spans=args.spans, outline=args.outline,
+                                                since=args.since, expand=args.expand, format=args.format,
+                                                max_chars=args.max_chars)
+            default_write = args.msg_action == "write" and args.store is None
+            if not _anchored_operations_supported() or (default_write and not store_supported()):
                 return emit_error(codec.CodecError("E_AUTH"), detail="platform")
             # Validate caller content before creating even the default store.
             if args.msg_action == "write":
@@ -257,13 +259,11 @@ class MsgCommand(AegisCommand):
                     rid = store.write(value)
                     rendered = json.dumps({"id": rid, "ref": rid[:16]}, separators=(",", ":")) + "\n"
                 elif args.msg_action == "verify":
-                    rid = store.resolve(args.ref)
-                    store.read(rid)
+                    rid = store.verified(args.ref).rid
                     rendered = json.dumps({"id": rid, "ref": rid[:16], "verified": True},
                                           separators=(",", ":")) + "\n"
                 else:
-                    value = store.read(args.ref)
-                    rendered = codec.read_view(value, store=store, **options)
+                    rendered = codec.read_stored_view(store, args.ref, prepared)
         except codec.CodecError as error:
             detail = "write_ref" if args.msg_action == "write" and error.code == "E_REF" else error.detail
             return emit_error(error, detail=detail)

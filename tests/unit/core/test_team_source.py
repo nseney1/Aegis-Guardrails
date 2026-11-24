@@ -1,10 +1,12 @@
 """Source views preserve pinned answers and refuse bounded transport failures."""
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -390,3 +392,288 @@ def test_child_environment_port_bad_result_is_a_fixed_refusal(repository, value)
         source.SourceViews(repo, child_environment=lambda values, purpose: value)
     envelope(caught, "invalid_environment")
     assert source.SourceViews(repo).repository == repo
+
+
+# Command and record expectations here are independent of the structured builder.
+GREP_ORACLE = (
+    "grep", "-z", "-n", "-I", "-F", "--no-color", "--no-column", "--no-textconv",
+    "--no-recurse-submodules", "--full-name", "-f", "-",
+)
+GREP_INPUT = b"other\n"
+GREP_OVERFLOW_ADVICE = (
+    "Narrow paths and the fixed string, then retry. Output over the capture cap refuses the whole "
+    "result before the post-capture returned-match limit; a capture that fits can still truncate at "
+    "that limit. For a known eligible blob, use paged source_show."
+)
+GREP_BYTE_LIMIT = "🙂" * 256
+GREP_CR_LIMIT = GREP_BYTE_LIMIT[:-1] + "\r"
+GREP_ROWS = {
+    "lf.txt": ("needle", "-literal [x]", "café 雪", GREP_BYTE_LIMIT),
+    "crlf.txt": ("before\r", "needle\r", "needle\r\r", GREP_CR_LIMIT),
+}
+
+
+def _install_runner(monkeypatch, run):
+    monkeypatch.setattr(source, "gitsafe", SimpleNamespace(**{**vars(gitsafe), "run": run}))
+
+
+def _command_tail(argv):
+    argv = tuple(argv)
+    return argv[argv.index("--literal-pathspecs") + 1:]
+
+
+@pytest.mark.parametrize("api", ["git", "unchecked", "bounded"])
+def test_raw_grep_refuses_before_git(repository, monkeypatch, api):
+    repo, oid = repository
+    view = source.SourceViews(repo, planned=False)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("raw grep reached Git")
+
+    _install_runner(monkeypatch, unexpected)
+    canonical = (*GREP_ORACLE, oid, "--", "other")
+    commands = (
+        canonical,
+        ("grep",),
+        ("grep", "other"),
+        ("grep", "-F", oid),
+        ("grep", "-e", "other"),
+        ("grep", "-F", "other", "--", "other"),
+    )
+    for argv in commands:
+        for data in (GREP_INPUT, None, b"", b"\n", b"\r\n", b"\n\r\n\n", b"other\nneedle\n"):
+            with pytest.raises(source.SourceRefusal) as caught:
+                if api == "bounded":
+                    view.bounded(list(argv), data, source.MAX_GREP_OUTPUT_BYTES)
+                else:
+                    view.git(*argv, data=data, check=api == "git")
+            envelope(caught, "invalid_arguments")
+            assert str(caught.value) == "source refused: invalid_arguments"
+            assert caught.value.next_action == "Supply the documented source-view fields and page limits."
+
+
+@pytest.fixture
+def grep_repository(repository):
+    repo, _ = repository
+    for path, rows in GREP_ROWS.items():
+        (repo / path).write_bytes(("\n".join(rows) + "\n").encode("utf-8"))
+    git(repo, "add", "lf.txt", "crlf.txt")
+    git(repo, "commit", "-qm", "grep fixture")
+    oid = git(repo, "rev-parse", "HEAD").decode().strip()
+    for path in GREP_ROWS:
+        (repo / path).write_bytes(b"needle in the working tree\r\n")
+    return repo, oid
+
+
+@pytest.mark.parametrize("pattern,stdin,locations", [
+    pytest.param("\r", b"\r\r\n", [("crlf.txt", n) for n in range(1, 5)], id="cr-only"),
+    pytest.param("needle\r", b"needle\r\r\n", [("crlf.txt", 2), ("crlf.txt", 3)], id="trailing-cr"),
+    pytest.param("needle\r\r", b"needle\r\r\r\n", [("crlf.txt", 3)], id="two-trailing-crs"),
+    pytest.param("needle", b"needle\n", [("crlf.txt", 2), ("crlf.txt", 3), ("lf.txt", 1)], id="plain"),
+    pytest.param("-literal [x]", b"-literal [x]\n", [("lf.txt", 2)], id="leading-option"),
+    pytest.param("café 雪", "café 雪\n".encode("utf-8"), [("lf.txt", 3)], id="unicode"),
+    pytest.param(GREP_BYTE_LIMIT, "🙂".encode("utf-8") * 256 + b"\n", [("lf.txt", 4)], id="byte-ceiling"),
+    pytest.param(GREP_CR_LIMIT, "🙂".encode("utf-8") * 255 + b"\r\r\n", [("crlf.txt", 4)], id="cr-ceiling"),
+])
+def test_structured_grep_preserves_literal_committed_pattern(grep_repository, monkeypatch, pattern, stdin, locations):
+    repo, oid = grep_repository
+    view = source.SourceViews(repo, planned=False)
+    real, seen = gitsafe.run, []
+
+    def run(argv, *rest, **kwargs):
+        seen.append((_command_tail(argv), kwargs["stdin"]))
+        return real(argv, *rest, **kwargs)
+
+    _install_runner(monkeypatch, run)
+    paths = ["lf.txt", "crlf.txt"]
+    matches = [{"path": path, "line": line, "text": GREP_ROWS[path][line - 1]} for path, line in locations]
+    answer = view.call("source_grep", {"commit": oid, "pattern": pattern, "paths": paths})
+    assert answer == {"commit": oid, "pattern": pattern, "paths": paths, "matches": matches, "truncated": False}
+    assert seen == [(("cat-file", "-t", oid), None), ((*GREP_ORACLE, oid, "--", *paths), stdin)]
+
+
+def test_structured_grep_refuses_invalid_request_before_git_then_retries(repository, monkeypatch):
+    repo, oid = repository
+    view = source.SourceViews(repo, planned=False)
+    real, seen = gitsafe.run, []
+
+    def run(argv, *rest, **kwargs):
+        seen.append(_command_tail(argv))
+        return real(argv, *rest, **kwargs)
+
+    _install_runner(monkeypatch, run)
+    valid = {"commit": oid, "pattern": "other", "paths": ["other"]}
+    for pattern in ("", "\n", "\0", "\ud800", GREP_BYTE_LIMIT + "x"):
+        with pytest.raises(source.SourceRefusal) as caught:
+            view.grep({**valid, "pattern": pattern})
+        envelope(caught, "invalid_arguments")
+    for revision in ("HEAD", oid[:7], oid[:39], oid + "0", "A" * 40, "g" * 40):
+        with pytest.raises(source.SourceRefusal) as caught:
+            view.grep({**valid, "commit": revision})
+        envelope(caught, "invalid_commit")
+    for path in ("", "../outside", "/other", "a/./b", "a//b", "a\\b", "--cached", "x" * 1025, "\ud800"):
+        with pytest.raises(source.SourceRefusal) as caught:
+            view.grep({**valid, "paths": [path]})
+        envelope(caught, "invalid_path")
+    assert seen == []
+
+    absent = ("0" if oid[0] != "0" else "1") + oid[1:]
+    with pytest.raises(source.SourceRefusal) as caught:
+        view.grep({**valid, "commit": absent})
+    envelope(caught, "unknown_commit")
+    assert seen == [("cat-file", "-t", absent)]
+    assert view.grep(valid) == {**valid, "matches": [{"path": "other", "line": 1, "text": "other"}],
+                                "truncated": False}
+    assert seen == [("cat-file", "-t", absent), ("cat-file", "-t", oid), (*GREP_ORACLE, oid, "--", "other")]
+    assert view.show({"commit": oid, "path": "other"})["lines"] == ["other"]
+
+
+def test_concurrent_raw_refusals_keep_structured_reads(repository):
+    repo, oid = repository
+    view = source.SourceViews(repo, planned=False)
+
+    def attempt(index):
+        if index % 2:
+            argv = (*GREP_ORACLE, oid, "--", "other")
+            with pytest.raises(source.SourceRefusal) as caught:
+                if index % 4 == 1:
+                    view.git(*argv, data=GREP_INPUT, check=False)
+                else:
+                    view.bounded(list(argv), GREP_INPUT, source.MAX_GREP_OUTPUT_BYTES)
+            envelope(caught, "invalid_arguments")
+            return "refused"
+        shown = view.show({"commit": oid, "path": "other"})["lines"]
+        matched = view.grep({"commit": oid, "pattern": "other"})["matches"][0]["text"]
+        return "read", shown, matched
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        result = list(pool.map(attempt, range(8)))
+    assert result == [("read", ["other"], "other") if index % 2 == 0 else "refused" for index in range(8)]
+    assert view.grep({"commit": oid, "pattern": "other", "paths": ["page.txt"]})["matches"] == []
+
+
+def test_grep_overflow_advice_names_narrowing_paging_and_result_limit(repository, monkeypatch):
+    repo, oid = repository
+    view = source.SourceViews(repo, planned=False)
+    original = source.MAX_GREP_OUTPUT_BYTES
+    monkeypatch.setattr(source, "MAX_GREP_OUTPUT_BYTES", 500)
+    def overflow():
+        with pytest.raises(source.SourceRefusal) as caught:
+            view.grep({"commit": oid, "pattern": "line", "paths": ["page.txt"]})
+        envelope(caught, "source_grep_output_limit")
+        assert caught.value.next_action == GREP_OVERFLOW_ADVICE
+        assert "\n" not in caught.value.next_action and "line" not in caught.value.next_action
+        assert "page.txt" not in str(caught.value) and not hasattr(caught.value, "stdout")
+        return caught.value.reason
+    assert overflow() == "source_grep_output_limit"
+    narrowed = view.grep({"commit": oid, "pattern": "line", "paths": ["other"]})
+    assert narrowed == {"commit": oid, "pattern": "line", "paths": ["other"], "matches": [], "truncated": False}
+    fixed = view.grep({"commit": oid, "pattern": "other", "paths": ["other"]})
+    assert fixed["matches"][0]["text"] == "other" and fixed["truncated"] is False
+    page = view.show({"commit": oid, "path": "page.txt", "start_line": 1, "max_lines": 2})
+    assert page["lines"] == ["line", "line"] and page["next_start_line"] == 3 and page["total_lines"] == 150
+    def attempt(index):
+        if index % 2:
+            return overflow()
+        return view.grep({"commit": oid, "pattern": "other", "paths": ["other"]})["matches"][0]["text"]
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        concurrent = list(pool.map(attempt, range(6)))
+    assert concurrent == ["source_grep_output_limit" if index % 2 else "other" for index in range(6)]
+    monkeypatch.setattr(source, "MAX_GREP_OUTPUT_BYTES", original)
+    captured = view.grep({"commit": oid, "pattern": "line", "paths": ["page.txt"], "limit": 2})
+    assert len(captured["matches"]) == 2 and captured["truncated"] is True
+    assert captured["matches"][0]["text"] == "line"
+    retry = view.grep({"commit": oid, "pattern": "line", "paths": ["page.txt"], "limit": 150})
+    assert len(retry["matches"]) == 150 and retry["truncated"] is False
+
+
+def test_bounded_list_mutation_does_not_change_the_launched_snapshot(repository, monkeypatch):
+    """Custody entry mutates the caller list after an allowed read is validated."""
+    repo, oid = repository
+    view = source.SourceViews(repo, planned=False)
+    original = ("cat-file", "-t", oid)
+    shared = list(original)
+    launched = []
+    entered, mutated = threading.Event(), threading.Event()
+
+    def custody(*args, **kwargs):
+        entered.set()
+        assert mutated.wait(5), "list mutation did not arrive before the process boundary"
+        return nullcontext()
+
+    def run(argv, *rest, **kwargs):
+        launched.append((_command_tail(argv), kwargs["stdin"]))
+        return subprocess.CompletedProcess(argv, 0, b"commit\n", b"")
+
+    def change():
+        if entered.wait(5):
+            shared[:] = ["rev-parse", "--git-dir"]
+            mutated.set()
+
+    monkeypatch.setattr(source, "gitsafe", SimpleNamespace(**{**vars(gitsafe), "run": run, "custody": custody}))
+    worker = threading.Thread(target=change)
+    worker.start()
+    try:
+        assert view.bounded(shared, b"", 65536) == (b"commit\n", False, 0)
+    finally:
+        worker.join(5)
+    assert worker.is_alive() is False
+    assert shared == ["rev-parse", "--git-dir"]
+    assert launched == [(original, b"")]
+
+
+def test_structured_grep_checks_path_count_before_git(repository, monkeypatch):
+    repo, oid = repository
+    view = source.SourceViews(repo, planned=False)
+    real, seen = gitsafe.run, []
+
+    def run(argv, *rest, **kwargs):
+        seen.append((_command_tail(argv), kwargs["stdin"]))
+        return real(argv, *rest, **kwargs)
+
+    _install_runner(monkeypatch, run)
+    maximum = ["other"] + ["p" + str(index) for index in range(63)]
+    args = {"commit": oid, "pattern": "other"}
+    assert len(maximum) == 64
+    with pytest.raises(source.SourceRefusal) as caught:
+        view.grep({**args, "paths": [*maximum, "extra"]})
+    envelope(caught, "invalid_arguments")
+    assert seen == []
+
+    for paths in ([], maximum):
+        answer = view.grep({**args, "paths": paths})
+        assert answer == {**args, "paths": paths, "matches": [{"path": "other", "line": 1, "text": "other"}],
+                          "truncated": False}
+    assert seen == [
+        (("cat-file", "-t", oid), None), ((*GREP_ORACLE, oid, "--"), GREP_INPUT),
+        (("cat-file", "-t", oid), None), ((*GREP_ORACLE, oid, "--", *maximum), GREP_INPUT),
+    ]
+
+
+def test_structured_grep_snapshots_path_count_before_validation(repository, monkeypatch):
+    repo, oid = repository
+    view = source.SourceViews(repo, planned=False)
+    paths = ["other"] + ["p" + str(index) for index in range(63)]
+    expected = paths.copy()
+    validate = source.relative_path
+
+    def append_during_validation(path):
+        if len(paths) == 64:
+            paths.append("extra")
+        return validate(path)
+
+    monkeypatch.setattr(source, "relative_path", append_during_validation)
+    answer = view.grep({"commit": oid, "pattern": "other", "paths": paths})
+    assert paths == [*expected, "extra"]
+    assert answer["paths"] == expected
+    assert answer["matches"] == [{"path": "other", "line": 1, "text": "other"}]
+
+
+def test_non_grep_raw_calls_keep_their_return_types(repository):
+    repo, oid = repository
+    view = source.SourceViews(repo, planned=False)
+    arguments = ("cat-file", "-t", oid)
+    result = view.git(*arguments)
+    assert isinstance(result, subprocess.CompletedProcess)
+    assert (result.stdout, result.returncode) == (b"commit\n", 0)
+    assert view.bounded(arguments, b"", 65536) == (b"commit\n", False, 0)

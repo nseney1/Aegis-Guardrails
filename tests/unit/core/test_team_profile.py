@@ -2165,3 +2165,743 @@ def test_display_accepts_large_valid_pure_resolver_output():
     shown = profile.display_profile(resolved)
     assert len(shown["profile"]["policy"]["gates"]) == 58
     assert len(shown["profile"]["policy"]["gates"][0]["tests"][0]) == 512
+
+
+# Invariant: policy.landing is the only landing policy. Omitted keys use the
+# documented empty defaults (speculation off, no slot move, no leg override).
+# Malformed or unknown fields refuse before any landing write or profile replace.
+_LANDING_DEFAULTS = {
+    "target_branch": "main", "strategy": "combined-full", "batch_max": 1,
+    "signature_required_for": ["main"], "publish": {"remote": "origin", "app": ""},
+    "registries": [], "jobs": {}, "flake_rerun_count": 0, "requalify_repeats": 1,
+    "speculative_wait_s": 0, "speculative_enabled": False,
+}
+_LANDING_ROW = {"path": "tables/rows", "encoding": "line_table", "key": "name", "separator": "|"}
+_LANDING_JOB = {"marker_dir": "marks/build", "slot": "fast", "encoding": "json_line"}
+
+
+def _landing_document(landing):
+    return {"policy": {"landing": landing}}
+
+
+def _assert_landing_refusal(landing, message, path):
+    document = _landing_document(landing)
+    before = json.dumps(document)
+    with pytest.raises(profile.ProfileError) as refused:
+        profile.resolve(repo=document)
+    error = refused.value
+    assert (str(error), error.exit_code, error.layer, error.path) == (message, 1, "repo", path)
+    assert "\n" not in str(error) and "\r" not in str(error)
+    assert json.dumps(document) == before
+
+
+def test_empty_landing_defaults_keep_speculation_off():
+    resolved = profile.resolve()
+    landing = resolved["profile"]["policy"]["landing"]
+    assert landing == _LANDING_DEFAULTS
+    assert "reliable_slot" not in landing and "required_legs" not in landing
+    assert "max_title_chars" not in landing and "host" not in landing
+    values = resolved["values"]
+    assert values["policy.landing.speculative_enabled"]["value"] is False
+    assert values["policy.landing.speculative_enabled"]["layer"] == "defaults"
+    assert values["policy.landing.speculative_wait_s"]["value"] == 0
+    assert "policy.landing.reliable_slot" not in values
+    assert "policy.landing.required_legs" not in values
+    again = profile.resolve()["profile"]["policy"]["landing"]
+    again["registries"].append({"path": "mutated"})
+    again["jobs"]["mutated"] = dict(_LANDING_JOB)
+    assert profile.resolve()["profile"]["policy"]["landing"] == _LANDING_DEFAULTS
+    for name in ("solo", "pair", "ci-only"):
+        assert profile.resolve(preset=name)["profile"]["policy"]["landing"] == _LANDING_DEFAULTS
+    mixed = profile.resolve(preset="mixed")["profile"]["policy"]["landing"]
+    assert mixed["batch_max"] == 4 and {**mixed, "batch_max": 1} == _LANDING_DEFAULTS
+
+
+def test_two_unrelated_profiles_resolve_landing_policy():
+    alpha = {
+        "target_branch": "alpha-trunk",
+        "registries": [{"path": "alpha/rows.list", "encoding": "line_table", "key": "alpha_key", "separator": "|"}],
+        "jobs": {"alpha-job": {"marker_dir": "alpha/markers", "slot": "alpha-slot", "encoding": "json_line"}},
+        "reliable_slot": "alpha-hold", "required_legs": ["alpha-leg"],
+        "flake_rerun_count": 1, "requalify_repeats": 4, "speculative_wait_s": 15,
+        "speculative_enabled": True,
+    }
+    beta = {
+        "target_branch": "beta-trunk",
+        "registries": [{"path": "beta/table.txt", "encoding": "whole_file", "key": "beta_key", "separator": "\t"}],
+        "jobs": {"beta-job": {"marker_dir": "beta/markers", "slot": "beta-slot", "encoding": "json_line"}},
+        "flake_rerun_count": 0, "requalify_repeats": 8, "speculative_wait_s": 0,
+        "speculative_enabled": False,
+    }
+    left = profile.resolve(repo=_landing_document(alpha))["profile"]["policy"]["landing"]
+    right = profile.resolve(repo=_landing_document(beta))["profile"]["policy"]["landing"]
+    assert left["target_branch"] == "alpha-trunk" and right["target_branch"] == "beta-trunk"
+    assert left["registries"] == alpha["registries"] and right["registries"] == beta["registries"]
+    assert left["registries"][0]["encoding"] != right["registries"][0]["encoding"]
+    assert left["jobs"] == alpha["jobs"] and right["jobs"] == beta["jobs"]
+    assert "beta-job" not in left["jobs"] and "alpha-job" not in right["jobs"]
+    assert left["reliable_slot"] == "alpha-hold" and "reliable_slot" not in right
+    assert left["required_legs"] == ["alpha-leg"] and "required_legs" not in right
+    assert left["speculative_enabled"] is True and right["speculative_enabled"] is False
+    assert left["strategy"] == "combined-full" and left["signature_required_for"] == ["main"]
+    explicit = profile.resolve(repo=_landing_document({"required_legs": []}))
+    assert explicit["profile"]["policy"]["landing"]["required_legs"] == []
+    assert "required_legs" not in profile.resolve()["profile"]["policy"]["landing"]
+
+
+def _landing_git_root(path):
+    import os
+    from pathlib import Path
+    import shutil
+
+    from tests.helpers_team_git import git
+
+    root = make_store(path)
+    if shutil.which("git") is None:
+        pytest.skip("needs git")
+    root.mkdir()
+    env = {**{key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
+           "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
+    git(root, "init", "-q", env=env)
+    assert Path(git(root, "rev-parse", "--show-toplevel", env=env).decode().strip()).resolve() == root
+    return root
+
+
+def _landing_repo_entries(root):
+    return {str(entry.relative_to(root)) for entry in root.rglob("*")
+            if entry.relative_to(root).parts[0] != ".git"}
+
+
+def test_git_repository_landing_defaults(tmp_path):
+    root = _landing_git_root(tmp_path / "empty")
+    resolved = profile.load(root, user_root=root)
+    assert resolved["profile"]["policy"]["landing"] == _LANDING_DEFAULTS
+    assert resolved["repository_profile_exists"] is False
+    assert _landing_repo_entries(root) == set()
+    assert profile.initialize(root, "solo", force=True) == {"version": 1, "preset": "solo"}
+    target = root.joinpath(*profile.REPO_PATH)
+    before = target.read_bytes()
+    entries = _landing_repo_entries(root)
+    resolved = profile.load(root, user_root=root)
+    assert resolved["profile"]["policy"]["landing"] == _LANDING_DEFAULTS
+    assert resolved["repository_profile_exists"] is True
+    assert target.read_bytes() == before
+    assert entries == _landing_repo_entries(root) == {str(part.relative_to(root)) for part in (
+        target, target.parent, target.parent.parent)}
+
+
+def test_two_repositories_load_landing_without_a_sidecar(tmp_path):
+    def write(name, landing):
+        root = _landing_git_root(tmp_path / name)
+        target = root.joinpath(*profile.REPO_PATH)
+        target.parent.mkdir(mode=0o700, parents=True)
+        raw = json.dumps({"version": 1, **_landing_document(landing)}).encode("utf-8")
+        target.write_bytes(raw)
+        return root, target, raw, _landing_repo_entries(root)
+
+    alpha, alpha_file, alpha_bytes, alpha_entries = write("alpha-repo", {"target_branch": "alpha-trunk", "registries": [
+        {"path": "alpha/rows.list", "encoding": "line_table", "key": "alpha_key", "separator": "|"}],
+        "jobs": {"alpha-job": {"marker_dir": "alpha/markers", "slot": "alpha-slot", "encoding": "json_line"}}})
+    beta, beta_file, beta_bytes, beta_entries = write("beta-repo", {"target_branch": "beta-trunk", "registries": [
+        {"path": "beta/table.txt", "encoding": "whole_file", "key": "beta_key", "separator": "\t"}],
+        "jobs": {"beta-job": {"marker_dir": "beta/markers", "slot": "beta-slot", "encoding": "json_line"}}})
+    loaded_alpha = profile.load(alpha, user_root=alpha)["profile"]["policy"]["landing"]
+    loaded_beta = profile.load(beta, user_root=beta)["profile"]["policy"]["landing"]
+    assert loaded_alpha["target_branch"] == "alpha-trunk" and loaded_beta["target_branch"] == "beta-trunk"
+    assert loaded_alpha["registries"][0]["encoding"] == "line_table"
+    assert loaded_beta["registries"][0]["encoding"] == "whole_file"
+    assert loaded_alpha["jobs"]["alpha-job"]["slot"] == "alpha-slot"
+    assert loaded_beta["jobs"]["beta-job"]["slot"] == "beta-slot"
+    assert "alpha-job" not in loaded_beta["jobs"] and "beta-job" not in loaded_alpha["jobs"]
+    assert loaded_alpha["speculative_enabled"] is False and loaded_beta["speculative_enabled"] is False
+    loaded_alpha["jobs"].clear()
+    loaded_beta["registries"].clear()
+    assert profile.load(alpha, user_root=alpha)["profile"]["policy"]["landing"]["jobs"] == {
+        "alpha-job": {"marker_dir": "alpha/markers", "slot": "alpha-slot", "encoding": "json_line"}}
+    assert profile.load(beta, user_root=beta)["profile"]["policy"]["landing"]["registries"] == [
+        {"path": "beta/table.txt", "encoding": "whole_file", "key": "beta_key", "separator": "\t"}]
+    assert alpha_file.read_bytes() == alpha_bytes and beta_file.read_bytes() == beta_bytes
+    assert _landing_repo_entries(alpha) == alpha_entries and _landing_repo_entries(beta) == beta_entries
+
+
+def _landing_path_case(field, value):
+    if field == "registry":
+        return {"registries": [{**_LANDING_ROW, "path": value}]}, "policy.landing.registries.0.path"
+    return {"jobs": {"build": {**_LANDING_JOB, "marker_dir": value}}}, "policy.landing.jobs.build.marker_dir"
+
+
+def _assert_landing_path_case(field, value, accepted):
+    landing, path = _landing_path_case(field, value)
+    if accepted:
+        result = profile.resolve(repo=_landing_document(landing))
+        assert result["profile"]["policy"]["landing"] == {**_LANDING_DEFAULTS, **landing}
+        profile.validate_resolved(result)
+        return
+    _assert_landing_refusal(landing, "invalid value: " + path, path)
+    resolved = profile.resolve()
+    resolved["profile"]["policy"]["landing"].update(landing)
+    with pytest.raises(profile.ProfileError) as refused:
+        profile.validate_resolved(resolved)
+    assert (str(refused.value), refused.value.path, refused.value.layer, refused.value.exit_code) == (
+        "invalid value: " + path, path, "repo", 1)
+
+
+@pytest.mark.parametrize("field", ["registry", "marker"])
+@pytest.mark.parametrize("value", ["rows//leaf", "rows/./leaf", "rows/", "rows/\ud800",
+                                   "rows/a\rb", "rows/a\x00b", "C:rows"])
+def test_round_1c_landing_paths_refuse_noncanonical_spellings(field, value):
+    _assert_landing_path_case(field, value, False)
+
+
+@pytest.mark.parametrize("field,value,accepted", [
+    ("registry", ".git/rows", False),
+    ("registry", "rows/.git/value", False),
+    ("registry", "r/" + "é" * 2047, True),
+    ("registry", "r/" + "é" * 2047 + "x", False),
+    ("marker", "marks/" + "é" * 127 + "x", True),
+    ("marker", "marks/" + "é" * 128, False),
+    ("marker", "/".join(["a"] * 127), True),
+    ("marker", "/".join(["a"] * 128), False),
+    ("marker", "marks/.git/leaf", True),
+    ("marker", "marks/with\\backslash", False),
+], ids=["git-root", "git-nested", "git-4096-bytes", "git-4097-bytes", "state-255-bytes",
+        "state-256-bytes", "state-127-components", "state-128-components", "state-dotgit",
+        "state-backslash"])
+def test_round_1c_landing_path_consumer_limits(field, value, accepted):
+    import os
+
+    if accepted:
+        # A path at the UTF-8 boundary still has to fit the native byte limit.
+        try:
+            native = os.fsencode(value)
+        except UnicodeError:
+            accepted = False
+        else:
+            accepted = (len(native) <= 4096 if field == "registry"
+                        else all(len(part) <= 255 for part in native.split(b"/")))
+    _assert_landing_path_case(field, value, accepted)
+
+
+@pytest.mark.parametrize("value", ["rows/with\\backslash", "rows/with:colon"])
+def test_round_1c_registry_path_platform_grammar(value):
+    import os
+
+    _assert_landing_path_case("registry", value, os.name != "nt")
+
+
+def test_round_1c_required_legs_follow_the_profile_bound():
+    from aegis_core.team_qualify import qualification_ref
+
+    names = ["3.12-linux", "a" * 65, "9" + "x" * 127]
+    assert all(qualification_ref("a" * 40, name).endswith("/" + name) for name in names)
+    resolved = profile.resolve(repo=_landing_document({"required_legs": names}))
+    profile.validate_resolved(resolved)
+    assert resolved["profile"]["policy"]["landing"]["required_legs"] == names
+    assert resolved["values"]["policy.landing.required_legs"]["value"] == names
+    path = "policy.landing.required_legs.0"
+    _assert_landing_refusal({"required_legs": ["a" * 129]}, "profile string size limit exceeded", path)
+    for value in ("", "leg\nnext", "leg\rnext", "leg\0next"):
+        _assert_landing_refusal({"required_legs": [value]}, "invalid identifier: " + path, path)
+
+
+@pytest.mark.parametrize("document,reason,path", [
+    ({"policy": {"landing_backup": {}}}, "unknown key", "policy.landing_backup"),
+    ({"policy": {"landing.extra": 1}}, "unknown key", "policy.landing.extra"),
+    ({"policy.landing.extra": 1}, "unknown key", "policy.landing.extra"),
+    ({"policy": {"landing.extra": 1, "landing": {"extra": 1}}}, "profile_unavailable", "policy.landing.extra"),
+    (_landing_document({"extra": 1}), "profile_unavailable", "policy.landing.extra"),
+    (_landing_document({"publish": {"extra": 1}}), "profile_unavailable", "policy.landing.publish.extra"),
+    (_landing_document({"registries": [{**_LANDING_ROW, "extra": 1}]}), "profile_unavailable",
+     "policy.landing.registries.0.extra"),
+    (_landing_document({"jobs": {"\nunsafe": _LANDING_JOB}}), "profile_unavailable", "policy.landing.jobs"),
+    (_landing_document({"jobs": {"build.alt": {**_LANDING_JOB, "extra": 1}}}), "profile_unavailable",
+     "policy.landing.jobs.build.alt.extra"),
+    (_landing_document({"publish": {"unsafe\nkey": 1}}), "profile_unavailable", "policy.landing.publish"),
+])
+def test_round_1c_unknown_reason_uses_the_rejecting_object(document, reason, path):
+    expected = "unknown key: " + path if reason == "unknown key" else reason
+    before = json.dumps(document)
+    resolved = profile.resolve()
+    _overlay_test_fields(resolved["profile"], document)
+    for operation in (lambda: profile.resolve(repo=document), lambda: profile.validate_resolved(resolved)):
+        with pytest.raises(profile.ProfileError) as refused:
+            operation()
+        error = refused.value
+        assert (str(error), error.path, error.layer, error.file, error.exit_code) == (
+            expected, path, "repo", "/".join(profile.REPO_PATH), 1)
+    assert json.dumps(document) == before
+
+
+@pytest.mark.parametrize("layer,file", [("user", "~/" + "/".join(profile.USER_PATH)),
+                                        ("flags", "<command-line>")])
+def test_round_1c_unknown_sibling_keeps_its_layer(layer, file):
+    with pytest.raises(profile.ProfileError) as refused:
+        profile.resolve(**{layer: {"policy": {"landing.extra": 1}}})
+    error = refused.value
+    assert (str(error), error.path, error.layer, error.file, error.exit_code) == (
+        "unknown key: policy.landing.extra", "policy.landing.extra", layer, file, 1)
+
+
+def test_round_1c_unknown_registry_key_in_copied_provenance():
+    resolved = profile.resolve()
+    resolved["values"]["policy.landing.registries"]["value"] = [{**_LANDING_ROW, "extra": True}]
+    with pytest.raises(profile.ProfileError) as refused:
+        profile.display_profile(resolved)
+    error = refused.value
+    assert (str(error), error.path, error.layer, error.exit_code) == (
+        "profile_unavailable", "policy.landing.registries.0.extra", "repo", 1)
+
+
+@pytest.mark.parametrize("field,label", [("registry", "policy.landing.registries"),
+                                         ("marker", "policy.landing.jobs.build.marker_dir")])
+def test_round_1c_landing_path_in_copied_provenance(field, label):
+    good, path = _landing_path_case(field, "dir/leaf")
+    resolved = profile.resolve(repo=_landing_document(good))
+    record = resolved["values"][label]
+    if field == "registry":
+        record["value"] = [{**record["value"][0], "path": "dir/./leaf"}]
+    else:
+        record["value"] = "dir/./leaf"
+    with pytest.raises(profile.ProfileError) as refused:
+        profile.validate_resolved(resolved)
+    error = refused.value
+    assert (str(error), error.path, error.layer, error.exit_code) == (
+        "invalid value: " + path, path, "repo", 1)
+
+
+def _assert_repository_landing_refusal(root, document, message, path):
+    target = root.joinpath(*profile.REPO_PATH)
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    raw = json.dumps({"version": 1, **document}, indent=2).encode("utf-8") + b"\n"
+    target.write_bytes(raw)
+    landing_state = root / ".aegis" / "state" / "landing.json"
+    assert not landing_state.exists()
+    entries = _landing_repo_entries(root)
+    for operation in (lambda: profile.load(root, user_root=root),
+                      lambda: profile.initialize(root, "pair", force=True)):
+        with pytest.raises(profile.ProfileError) as refused:
+            operation()
+        error = refused.value
+        assert (str(error), error.path, error.layer, error.file, error.exit_code) == (
+            message, path, "repo", str(target), 1)
+        assert not landing_state.exists()
+        assert target.read_bytes() == raw
+        assert _landing_repo_entries(root) == entries
+    return target, entries
+
+
+@pytest.mark.parametrize("field", ["registry", "marker", "unknown", "sibling"])
+def test_round_1c_git_repository_refusal_preserves_bytes_and_retries(tmp_path, field):
+    root = _landing_git_root(tmp_path / "invalid")
+    if field == "unknown":
+        document, path = _landing_document({"publish": {"extra": 1}}), "policy.landing.publish.extra"
+        reason = "profile_unavailable"
+    elif field == "sibling":
+        document, path = {"policy": {"landing.extra": 1}}, "policy.landing.extra"
+        reason = "unknown key: " + path
+    else:
+        landing, path = _landing_path_case(field, "dir/./leaf")
+        document, reason = _landing_document(landing), "invalid value: " + path
+    target, entries = _assert_repository_landing_refusal(root, document, reason, path)
+    corrected = b'{"version":1,"policy":{"landing":{"target_branch":"retry-trunk"}}}\n'
+    target.write_bytes(corrected)
+    assert profile.load(root, user_root=root)["profile"]["policy"]["landing"] == {
+        **_LANDING_DEFAULTS, "target_branch": "retry-trunk"}
+    assert target.read_bytes() == corrected
+    assert profile.initialize(root, "pair", force=True) == {"version": 1, "preset": "pair"}
+    assert profile.load(root, user_root=root)["profile"]["policy"]["landing"] == _LANDING_DEFAULTS
+    assert _landing_repo_entries(root) == entries
+
+
+@pytest.mark.parametrize("landing,message,path", [
+    ({"max_title_chars": 80}, "profile_unavailable", "policy.landing.max_title_chars"),
+    ({"host": {"adapter": "local"}}, "profile_unavailable", "policy.landing.host"),
+    ({"registries": [{**_LANDING_ROW, "owner": "kit"}]}, "profile_unavailable", "policy.landing.registries.0.owner"),
+    ({"jobs": {"build": {**_LANDING_JOB, "timeout": 1}}}, "profile_unavailable", "policy.landing.jobs.build.timeout"),
+    ({"bad\nkey": True}, "profile_unavailable", "policy.landing"),
+    ({"registries": [{**_LANDING_ROW, "path": "/etc/passwd"}]}, "invalid value: policy.landing.registries.0.path", "policy.landing.registries.0.path"),
+    ({"registries": [{**_LANDING_ROW, "path": "\\\\server\\share"}]}, "invalid value: policy.landing.registries.0.path", "policy.landing.registries.0.path"),
+    ({"registries": [{**_LANDING_ROW, "path": "C:/rows"}]}, "invalid value: policy.landing.registries.0.path", "policy.landing.registries.0.path"),
+    ({"registries": [{**_LANDING_ROW, "path": "../rows"}]}, "invalid value: policy.landing.registries.0.path", "policy.landing.registries.0.path"),
+    ({"registries": [{**_LANDING_ROW, "path": "rows/../secret"}]}, "invalid value: policy.landing.registries.0.path", "policy.landing.registries.0.path"),
+    ({"registries": [{**_LANDING_ROW, "path": "rows/foo..bar"}]}, "invalid value: policy.landing.registries.0.path", "policy.landing.registries.0.path"),
+    ({"registries": [{**_LANDING_ROW, "path": "rows/a\nb"}]}, "invalid value: policy.landing.registries.0.path", "policy.landing.registries.0.path"),
+    ({"registries": [{**_LANDING_ROW, "path": ""}]}, "invalid value: policy.landing.registries.0.path", "policy.landing.registries.0.path"),
+    ({"registries": [{**_LANDING_ROW, "encoding": "csv"}]}, "invalid value: policy.landing.registries.0.encoding", "policy.landing.registries.0.encoding"),
+    ({"registries": [{**_LANDING_ROW, "separator": "\n"}]}, "invalid value: policy.landing.registries.0.separator", "policy.landing.registries.0.separator"),
+    ({"registries": [{**_LANDING_ROW, "key": "a\nb"}]}, "invalid value: policy.landing.registries.0.key", "policy.landing.registries.0.key"),
+    ({"registries": [{"encoding": "line_table", "key": "name", "separator": "|"}]}, "invalid value: policy.landing.registries.0.path", "policy.landing.registries.0.path"),
+    ({"jobs": {"build": {"marker_dir": "a/../b", "slot": "fast", "encoding": "json_line"}}}, "invalid value: policy.landing.jobs.build.marker_dir", "policy.landing.jobs.build.marker_dir"),
+    ({"jobs": {"build": {"marker_dir": "marks", "slot": "fast", "encoding": "line_table"}}}, "invalid value: policy.landing.jobs.build.encoding", "policy.landing.jobs.build.encoding"),
+    ({"jobs": {"build": {"slot": "fast", "encoding": "json_line"}}}, "invalid value: policy.landing.jobs.build.marker_dir", "policy.landing.jobs.build.marker_dir"),
+    ({"flake_rerun_count": 2}, "value out of range: policy.landing.flake_rerun_count", "policy.landing.flake_rerun_count"),
+    ({"flake_rerun_count": True}, "wrong type: policy.landing.flake_rerun_count", "policy.landing.flake_rerun_count"),
+    ({"requalify_repeats": 0}, "value out of range: policy.landing.requalify_repeats", "policy.landing.requalify_repeats"),
+    ({"requalify_repeats": 9}, "value out of range: policy.landing.requalify_repeats", "policy.landing.requalify_repeats"),
+    ({"speculative_wait_s": 3601}, "value out of range: policy.landing.speculative_wait_s", "policy.landing.speculative_wait_s"),
+    ({"speculative_wait_s": -1}, "value out of range: policy.landing.speculative_wait_s", "policy.landing.speculative_wait_s"),
+    ({"speculative_enabled": "false"}, "wrong type: policy.landing.speculative_enabled", "policy.landing.speculative_enabled"),
+    ({"registries": [{**_LANDING_ROW, "path": "tables/r%d" % i} for i in range(33)]}, "profile array size limit exceeded: policy.landing.registries", "policy.landing.registries"),
+    ({"reliable_slot": "bad slot"}, "invalid identifier: policy.landing.reliable_slot", "policy.landing.reliable_slot"),
+    ({"required_legs": ["leg\nnext"]}, "invalid identifier: policy.landing.required_legs.0", "policy.landing.required_legs.0"),
+    ({"max_title_chars": 40, "registries": [{**_LANDING_ROW, "path": "/abs"}]}, "profile_unavailable", "policy.landing.max_title_chars"),
+])
+def test_landing_fields_refuse_before_any_landing_write(tmp_path, landing, message, path):
+    _assert_landing_refusal(landing, message, path)
+    root = _landing_git_root(tmp_path / "invalid")
+    _assert_repository_landing_refusal(root, _landing_document(landing), message, path)
+
+
+@pytest.mark.parametrize("layer", ["user", "flags"])
+def test_landing_policy_stays_repository_only(layer):
+    with pytest.raises(profile.ProfileError, match="governance policy is repository-only") as refused:
+        profile.resolve(**{layer: _landing_document({"speculative_enabled": False, "flake_rerun_count": 0})})
+    assert refused.value.exit_code == 1 and refused.value.layer == layer
+
+
+def test_landing_refusal_retries_without_joining_lines(tmp_path):
+    raw = "marks/a\nb"
+    bad = {"jobs": {"build": {"marker_dir": raw, "slot": "fast", "encoding": "json_line"}}}
+    before = json.dumps(bad)
+    path = "policy.landing.jobs.build.marker_dir"
+    _assert_landing_refusal(bad, "invalid value: " + path, path)
+    assert json.dumps(bad) == before and "marks/a b" not in json.dumps(bad) and "marks/ab" not in json.dumps(bad)
+    root = _landing_git_root(tmp_path / "invalid")
+    target, entries = _assert_repository_landing_refusal(
+        root, _landing_document(bad), "invalid value: " + path, path)
+    corrected = _landing_document({"jobs": {"build": dict(_LANDING_JOB)}})
+    landing = profile.resolve(repo=corrected)
+    assert landing["profile"]["policy"]["landing"]["jobs"]["build"]["marker_dir"] == "marks/build"
+    assert landing["profile"]["policy"]["landing"]["speculative_enabled"] is False
+    profile.validate_resolved(landing)
+    shown = profile.display_profile(landing)
+    assert shown["profile"]["policy"]["landing"]["jobs"]["build"]["marker_dir"] == "marks/build"
+    target.write_text(json.dumps({"version": 1, **corrected}), encoding="utf-8")
+    loaded = profile.load(root, user_root=root)
+    assert loaded["profile"]["policy"]["landing"] == landing["profile"]["policy"]["landing"]
+    assert _landing_repo_entries(root) == entries
+
+
+@pytest.mark.parametrize("surface", ["validate_resolved", "display"])
+def test_resolved_landing_defect_refuses_on_every_consumer(surface):
+    resolved = profile.resolve()
+    resolved["profile"]["policy"]["landing"]["registries"] = [
+        {**_LANDING_ROW, "path": "rows/a\nb"}]
+    before = json.dumps(resolved["profile"]["policy"]["landing"]["registries"])
+    with pytest.raises(profile.ProfileError) as refused:
+        if surface == "validate_resolved":
+            profile.validate_resolved(resolved)
+        else:
+            profile.display_profile(resolved)
+    assert str(refused.value) == "invalid value: policy.landing.registries.0.path"
+    assert refused.value.exit_code == 1 and "\n" not in str(refused.value)
+    assert json.dumps(resolved["profile"]["policy"]["landing"]["registries"]) == before
+
+
+def test_landing_bounds_round_trip_and_display_redacts_untrusted_text():
+    secret = "token=\x1b[31msuper-secret-credential"
+    plain = "token=super-secret-credential"
+    landing = {
+        "flake_rerun_count": 1, "requalify_repeats": 8, "speculative_wait_s": 3600,
+        "speculative_enabled": False,
+        "registries": [{"path": "tables/" + secret, "encoding": "whole_file", "key": secret, "separator": "|"}],
+        "jobs": {"build": {"marker_dir": "marks/" + plain, "slot": "fast", "encoding": "json_line"}},
+    }
+    resolved = profile.resolve(repo=_landing_document(landing))
+    stored = resolved["profile"]["policy"]["landing"]
+    assert stored["flake_rerun_count"] == 1 and stored["requalify_repeats"] == 8
+    assert stored["speculative_wait_s"] == 3600 and stored["speculative_enabled"] is False
+    assert stored["registries"][0]["path"] == "tables/" + secret
+    assert stored["registries"][0]["key"] == secret
+    assert stored["jobs"]["build"]["marker_dir"] == "marks/" + plain
+    profile.validate_resolved(resolved)
+    shown = profile.display_profile(resolved)
+    rendered = json.dumps(shown)
+    assert "super-secret" not in rendered and "\x1b" not in rendered
+    visible = shown["profile"]["policy"]["landing"]
+    copied = shown["values"]["policy.landing.registries"]["value"][0]
+    assert visible["registries"][0]["path"] == "tables/token=REDACTED"
+    assert copied["path"] == "tables/token=REDACTED"
+    assert visible["registries"][0]["key"] == "token=REDACTED"
+    assert copied["key"] == "token=REDACTED"
+    assert visible["jobs"]["build"]["marker_dir"] == "marks/token=REDACTED"
+    assert stored["registries"][0]["path"] == "tables/" + secret
+    assert stored["registries"] is resolved["values"]["policy.landing.registries"]["value"]
+    wide = profile.resolve(repo=_landing_document({"registries": [
+        {**_LANDING_ROW, "path": "tables/r%d" % index} for index in range(32)]}))
+    assert len(wide["profile"]["policy"]["landing"]["registries"]) == 32
+
+
+def test_registry_path_display_keeps_source_and_clip_order():
+    """Both views redact registry paths after canonicalization and before the 512 clip.
+
+    A control split inside the key is not a secret until canonicalization joins it.
+    Padding leaves the replacement across the clip boundary. The metadata path
+    array and other path fields stay schema references. The caller's document
+    keeps the raw characters.
+    """
+    ordered = "rows/" + ("n" * 494) + "/tok\x1b[31men=super-secret-credential" + ("y" * 40)
+    plain = "tables/token=super-secret-credential"
+    benign = "tables/plain"
+    resolved = profile.resolve(repo=_landing_document({"registries": [
+        {"path": ordered, "encoding": "line_table", "key": ordered, "separator": "|"},
+        {"path": plain, "encoding": "whole_file", "key": "plain", "separator": "\t"},
+        {"path": benign, "encoding": "line_table", "key": "name", "separator": "|"},
+    ]}))
+    stored = resolved["profile"]["policy"]["landing"]["registries"]
+    assert resolved["values"]["policy.landing.registries"]["value"] is stored
+    assert [row["path"] for row in stored] == [ordered, plain, benign]
+    before = json.dumps(resolved)
+    reference = {"path": "model_settings.roles.token=super-secret-credential"}
+    for capacity in (False, True):
+        shown = profile.display_profile(resolved, capacity=capacity)
+        bare = profile.display_profile(resolved["profile"], capacity=capacity)
+        views = (
+            shown["profile"]["policy"]["landing"]["registries"],
+            shown["values"]["policy.landing.registries"]["value"],
+            bare["policy"]["landing"]["registries"],
+        )
+        for view in views:
+            rendered = json.dumps(view)
+            assert [row["separator"] for row in view] == ["|", "\t", "|"]
+            assert "super-secret" not in rendered and "\x1b" not in rendered
+            assert view[0]["path"].endswith("/token=RED...") and len(view[0]["path"]) == 512
+            assert view[0]["key"] == view[0]["path"]
+            assert "[REDACTED]" not in view[0]["path"] and "super-secret" not in view[0]["path"]
+            assert view[1]["path"] == "tables/token=REDACTED"
+            assert view[2]["path"] == benign
+        assert shown["values"]["policy.landing.registries"]["path"] == [
+            "policy", "landing", "registries"]
+        assert profile.display_profile(reference, capacity=capacity)["path"] == reference["path"]
+        assert profile.display_profile({"separator": "\t"}, capacity=capacity)["separator"] == " "
+        assert json.dumps(resolved) == before
+    assert stored[0]["path"] == ordered and stored[1]["path"] == plain
+    assert resolved["values"]["policy.landing.registries"]["value"] is stored
+
+
+@pytest.mark.parametrize("depth", [1, 2, 3], ids=["policy", "landing", "registries"])
+@pytest.mark.parametrize("prefix", [[], ["user"]], ids=["repo", "user"])
+@pytest.mark.parametrize("capacity", [False, True], ids=["config", "capacity"])
+def test_round_1d_registry_copy_uses_validated_field_policy(depth, prefix, capacity):
+    body_row = {**_LANDING_ROW, "path": "body/token=private-value", "separator": "|"}
+    resolved = profile.resolve(repo=_landing_document({"registries": [body_row]}))
+    components = ["policy", "landing", "registries"]
+    ordered = "rows/" + "n" * 494 + "/tok\x1b[31men=private-value" + "y" * 40
+    copy_row = {**_LANDING_ROW, "path": ordered, "key": ordered, "separator": "\t"}
+    copied = [copy_row]
+    for name in reversed(components[depth:]):
+        copied = {name: copied}
+    label = "policy.landing.jobs.build.alt.marker_dir"
+    metadata = {"path": prefix + components[:depth], "layer": "user" if prefix else "repo",
+                "applied_paths": [["policy", "landing", "jobs", "build.alt", "marker_dir"]]}
+    resolved["values"] = {label: {**metadata, "value": copied}}
+    before = json.dumps(resolved)
+
+    profile.validate_resolved(resolved)
+    shown = profile.display_profile(resolved, capacity=capacity)
+    bare = profile.display_profile(resolved["profile"], capacity=capacity)
+    for view in (shown["profile"], bare):
+        assert view["policy"]["landing"]["registries"] == [{**body_row, "path": "body/token=REDACTED"}]
+    displayed_record = shown["values"][label]
+    assert {key: displayed_record[key] for key in metadata} == metadata
+    displayed_copy = displayed_record["value"]
+    for name in components[depth:]:
+        displayed_copy = displayed_copy[name]
+    clipped = "rows/" + "n" * 494 + "/token=RED..."
+    assert displayed_copy[0]["separator"] == "\t"
+    assert displayed_copy[0]["path"] == displayed_copy[0]["key"] == clipped
+    assert json.dumps(resolved) == before
+
+
+def _assert_round_1d_refusal(operation, reason, path, *, file=None):
+    with pytest.raises(profile.ProfileError) as refused:
+        operation()
+    error = refused.value
+    assert (str(error), error.path, error.layer, error.exit_code) == (reason, path, "repo", 1)
+    if file is not None:
+        assert error.file == str(file)
+
+
+@pytest.mark.parametrize("field", ["registry", "marker"])
+@pytest.mark.parametrize("reverse", [False, True], ids=["forward", "reverse"])
+def test_round_1d_copy_and_body_structure_precede_landing_paths(field, reverse):
+    bad_landing, path = _landing_path_case(field, "dir/./leaf")
+    section = "registries" if field == "registry" else "jobs"
+    row = bad_landing[section][0 if field == "registry" else "build"]
+    row["z_extra"] = True
+
+    def snapshots():
+        body, copy = profile.resolve(), profile.resolve()
+        body["profile"]["policy"]["landing"].update(_reordered_objects(bad_landing, reverse))
+        # Copy from the array root for registry rows and the job record root for jobs.
+        components = ["policy", "landing", section] + ([] if field == "registry" else ["build"])
+        value = bad_landing[section] if field == "registry" else row
+        copy["values"]["independent"] = {"path": components, "value": _reordered_objects(value, reverse)}
+        return body, copy
+
+    unknown = path.rsplit(".", 1)[0] + ".z_extra"
+    for resolved in snapshots():
+        _assert_round_1d_refusal(lambda: profile.validate_resolved(resolved), "profile_unavailable", unknown)
+    del row["z_extra"]
+    for resolved in snapshots():
+        _assert_round_1d_refusal(lambda: profile.display_profile(resolved), "invalid value: " + path, path)
+
+
+def test_round_1d_landing_semantic_order_matches_for_ancestor_copies():
+    landing = {"registries": [{**_LANDING_ROW, "path": "dir/./leaf", "key": ""}],
+               "jobs": {"build.alt": {**_LANDING_JOB, "marker_dir": "marks/./leaf"}}}
+    for field in ("path", "key", "marker_dir"):
+        path = ("policy.landing.jobs.build.alt." if field == "marker_dir" else "policy.landing.registries.0.") + field
+        body, copy = profile.resolve(), profile.resolve()
+        body["profile"]["policy"]["landing"].update(_reordered_objects(landing, False))
+        copy["values"]["ancestor"] = {"path": ["user", "policy"], "value": _landing_document(
+            _reordered_objects(landing, True))["policy"]}
+        for resolved in (body, copy):
+            _assert_round_1d_refusal(lambda: profile.validate_resolved(resolved), "invalid value: " + path, path)
+        if field != "marker_dir":
+            landing["registries"][0][field] = _LANDING_ROW[field]
+
+
+def _round_1d_marker_operation(root, placement):
+    marker = "marks/" + "\u00e9" * 127 + "x"
+    jobs = {"build.alt": {**_LANDING_JOB, "marker_dir": marker}}
+    document = _landing_document({"jobs": jobs})
+    if placement == "resolve":
+        return lambda: profile.resolve(repo=document)
+    if placement == "load":
+        return lambda: profile.load(root, user_root=root)
+    if placement == "force":
+        return lambda: profile.initialize(root, "pair", force=True)
+    resolved = profile.resolve()
+    if placement == "body":
+        resolved["profile"]["policy"]["landing"]["jobs"] = jobs
+    elif placement == "ancestor":
+        resolved["values"]["independent"] = {"path": ["user", "policy", "landing"], "value": document["policy"]["landing"]}
+    else:
+        resolved["values"]["independent"] = {
+            "path": ["policy", "landing", "jobs", "build.alt", "marker_dir"], "value": marker}
+    return lambda: profile.display_profile(resolved)
+
+
+def _assert_round_1d_ascii_marker(root, placement):
+    import sys
+
+    assert sys.getfilesystemencoding() == "ascii"
+    assert profile.descriptor_supported()
+    target = root.joinpath(*profile.REPO_PATH)
+    raw = target.read_bytes()
+    entries = _landing_repo_entries(root)
+    path = "policy.landing.jobs.build.alt.marker_dir"
+    file = target if placement in ("load", "force") else None
+    _assert_round_1d_refusal(_round_1d_marker_operation(root, placement), "invalid value: " + path, path, file=file)
+    assert not (root / "marks").exists()
+    assert target.read_bytes() == raw and _landing_repo_entries(root) == entries
+
+    # Only a successfully loaded profile can supply components to marker storage.
+    corrected = raw.replace(b"\\u00e9" * 127 + b"x", b"retry")
+    assert corrected != raw
+    target.write_bytes(corrected)
+    loaded = profile.load(root, user_root=root)
+    marker = loaded["profile"]["policy"]["landing"]["jobs"]["build.alt"]["marker_dir"]
+    assert marker == "marks/retry"
+    with storage.confined_file(root, (*marker.split("/"), "attempt.json"), create_parents=True) as handle:
+        handle.publish_bytes(b"{}\n")
+    assert (root / "marks" / "retry" / "attempt.json").read_bytes() == b"{}\n"
+    assert target.read_bytes() == corrected
+    assert profile.initialize(root, "pair", force=True) == {"version": 1, "preset": "pair"}
+
+
+@pytest.mark.parametrize("placement", ["resolve", "body", "ancestor", "leaf", "load", "force"])
+def test_round_1d_marker_refuses_native_ascii_encoding(tmp_path, placement):
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+
+    if sys.platform != "linux":
+        pytest.skip("requires a filesystem encoding selected by the POSIX locale")
+    root = _landing_git_root(tmp_path / "ascii-repo")
+    target = root.joinpath(*profile.REPO_PATH)
+    target.parent.mkdir(mode=0o700, parents=True)
+    jobs = {"build.alt": {**_LANDING_JOB, "marker_dir": "marks/" + "\u00e9" * 127 + "x"}}
+    raw = json.dumps({"version": 1, **_landing_document({"jobs": jobs})}, indent=2).encode("ascii") + b"\n"
+    target.write_bytes(raw)
+    program = ("from pathlib import Path\nimport sys\n"
+               "from tests.unit.core.test_team_profile import _assert_round_1d_ascii_marker\n"
+               "_assert_round_1d_ascii_marker(Path(sys.argv[1]), sys.argv[2])\n")
+    result = subprocess.run([sys.executable, "-c", program, str(root), placement],
+                            cwd=Path(__file__).resolve().parents[3], capture_output=True, timeout=30,
+                            env={**os.environ, "LC_ALL": "C", "PYTHONCOERCECLOCALE": "0", "PYTHONUTF8": "0"})
+    assert result.returncode == 0, result.stderr.decode("ascii", errors="backslashreplace")
+
+
+def test_round_1d_marker_utf8_limit_reaches_confined_storage(tmp_path):
+    import sys
+
+    root = make_store(tmp_path)
+    if sys.getfilesystemencoding() != "utf-8":
+        pytest.skip("requires a UTF-8 filesystem encoding")
+    marker = "marks/" + "\u00e9" * 127 + "x"
+    resolved = _round_1d_marker_operation(root, "resolve")()
+    profile.validate_resolved(resolved)
+    assert resolved["profile"]["policy"]["landing"]["jobs"]["build.alt"]["marker_dir"] == marker
+    with storage.confined_file(root, (*marker.split("/"), "attempt.json"), create_parents=True) as handle:
+        handle.publish_bytes(b"{}\n")
+    assert root.joinpath(*marker.split("/"), "attempt.json").read_bytes() == b"{}\n"
+
+
+def test_concurrent_landing_profiles_do_not_share_state():
+    import threading
+    documents = {
+        "alpha": _landing_document({"target_branch": "alpha-trunk", "jobs": {
+            "alpha-job": {"marker_dir": "alpha/markers", "slot": "alpha-slot", "encoding": "json_line"}}}),
+        "beta": _landing_document({"target_branch": "beta-trunk", "registries": [
+            {"path": "beta/table.txt", "encoding": "whole_file", "key": "beta_key", "separator": "|"}]}),
+    }
+    barrier = threading.Barrier(2)
+    found, errors = {}, []
+
+    def worker(name):
+        try:
+            barrier.wait(timeout=5)
+            for _ in range(6):
+                landing = profile.resolve(repo=documents[name])["profile"]["policy"]["landing"]
+                assert landing["target_branch"] == name + "-trunk"
+                landing["registries"].append({"path": "mutated"})
+                landing["jobs"]["mutated"] = {"marker_dir": "mutated", "slot": "fast", "encoding": "json_line"}
+                found[name] = landing["target_branch"]
+        except Exception as exc:
+            errors.append((name, type(exc), str(exc)))
+
+    threads = [threading.Thread(target=worker, args=(name,)) for name in documents]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert errors == [] and found == {"alpha": "alpha-trunk", "beta": "beta-trunk"}
+    assert all(not thread.is_alive() for thread in threads)
+    assert profile.resolve()["profile"]["policy"]["landing"] == _LANDING_DEFAULTS
+
+
+def test_malformed_landing_file_is_not_replaced(tmp_path):
+    root = make_store(tmp_path)
+    profile.initialize(root, "solo")
+    bad, path = _landing_path_case("registry", "rows/a\nb")
+    target, entries = _assert_repository_landing_refusal(root, _landing_document(bad), "invalid value: " + path, path)
+    target.write_text(json.dumps({"version": 1, "policy": {"landing": {"target_branch": "retry-trunk"}}}),
+                      encoding="utf-8")
+    loaded = profile.load(root, user_root=root)
+    assert loaded["profile"]["policy"]["landing"]["target_branch"] == "retry-trunk"
+    assert loaded["profile"]["policy"]["landing"]["speculative_enabled"] is False
+    assert _landing_repo_entries(root) == entries
+
+
+def test_unsupported_platform_writes_no_landing_document(tmp_path, monkeypatch):
+    monkeypatch.setattr(profile, "descriptor_supported", lambda: False)
+    with pytest.raises(profile.ProfileError, match="unsupported platform") as refused:
+        profile.initialize(tmp_path, "solo")
+    assert refused.value.exit_code == 1
+    assert list(tmp_path.iterdir()) == []
+    with pytest.raises(profile.ProfileError, match="unsupported platform"):
+        profile.load(tmp_path, user_root=tmp_path)
+    assert list(tmp_path.iterdir()) == []

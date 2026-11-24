@@ -25,6 +25,7 @@ POPEN_POSITIONAL_APIS = {"subprocess." + name for name in ("Popen", "run", "call
 # Coordinator ruling 2026-11-15T04:52:12Z: this reviewed source inventory is
 # the completeness gate. Resolver precision does not grant admission to a site.
 SELECTOR_SITE_TABLE = (
+    ('aegis_core/team_native_codemode.py', '_typed_text', 'lexer-or-message', 'Recognize recorded shell selectors for evidence correlation only.'),
     ("aegis_core/ast/runner.py", "_run_driver", "reviewed-dynamic",
      "Review AST driver argv from the validated driver plan; no shell, no stdin, bounded timeout."),
     ("aegis_cli/doctor.py", "_run_host_cli", "reviewed-dynamic",

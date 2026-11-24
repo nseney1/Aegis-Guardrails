@@ -1,4 +1,5 @@
 """Public message CLI contracts; codec output is passed through verbatim."""
+from concurrent.futures import ThreadPoolExecutor
 import copy
 from datetime import datetime, timezone
 import hashlib
@@ -10,6 +11,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+from threading import Barrier
 from types import SimpleNamespace
 
 import pytest
@@ -17,7 +19,9 @@ from conftest import symlink_or_skip
 
 from aegis_cli.cli import main
 from aegis_core import message_codec as codec
-from tests.unit.core.test_message_codec import make_store
+from aegis_core import message_codec_store
+from tests.unit.core.test_message_codec import (make_store, stored_log, _counting, _CANONICAL, _ISOLATE,
+                                                _LOOKUP, _PARSE, _STORE_READ, _STORE_VERIFIED)
 
 
 GOLDENS = json.loads((Path(__file__).parents[1] / "core" / "message_codec_goldens.json").read_text(encoding="utf-8"))
@@ -344,6 +348,132 @@ def test_round6_missing_anchored_capabilities_refuse_fixed_json(
         separators=(",", ":")) + "\n"
     assert list(directory.iterdir()) == []
     assert not (workspace / ".aegis" / "state").exists()
+
+
+@pytest.fixture
+def without_descriptor_scandir(tmp_path, monkeypatch):
+    make_store(tmp_path).close()
+    unsupported_os = SimpleNamespace(
+        supports_dir_fd=os.supports_dir_fd,
+        supports_follow_symlinks=os.supports_follow_symlinks,
+        supports_fd=os.supports_fd - {os.scandir},
+        O_DIRECTORY=os.O_DIRECTORY,
+        O_NOFOLLOW=os.O_NOFOLLOW,
+        geteuid=os.geteuid,
+    )
+    monkeypatch.setattr(message_codec_store, "os", unsupported_os)
+
+
+@pytest.mark.parametrize("entry", ["cli", "storage"])
+@pytest.mark.parametrize("existing_state", [False, True])
+@pytest.mark.usefixtures("without_descriptor_scandir")
+def test_default_write_preflights_descriptor_scandir(
+        entry, existing_state, workspace, tmp_path, monkeypatch, capsys):
+    from aegis_core import storage
+    from aegis_core.workspace.base import Workspace
+
+    state = workspace / ".aegis" / "state"
+    if existing_state:
+        state.mkdir()
+        (state / "sentinel").write_bytes(b"unchanged")
+    source = tmp_path / "content.json"
+    source.write_text(json.dumps(content(GOLDENS[0]["record"])), encoding="utf-8")
+    argv = ["msg", "write", "--kind", "text", "--in", str(source)]
+    bound = Workspace(workspace)
+    ready = Barrier(2, timeout=5)
+
+    def refuse_storage_write():
+        ready.wait()
+        with pytest.raises(codec.CodecError) as caught:
+            with storage.message_store(bound, write=True):
+                pytest.fail("unsupported store admitted a writer")
+        assert caught.value.as_dict() == codec.CodecError("E_AUTH").as_dict()
+
+    if entry == "cli":
+        assert main(argv) == 2
+        refusal = capsys.readouterr()
+    else:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            writers = [pool.submit(refuse_storage_write) for _ in range(2)]
+            for writer in writers:
+                writer.result(timeout=5)
+    if existing_state:
+        assert sorted(path.name for path in state.iterdir()) == ["sentinel"]
+        assert (state / "sentinel").read_bytes() == b"unchanged"
+    else:
+        assert not state.exists()
+    if entry == "cli":
+        assert refusal.err == ""
+        assert json.loads(refusal.out) == {"error": {"code": "E_AUTH", "message":
+            "platform unsupported; message stores require anchored file operations"}}
+
+    monkeypatch.setattr(message_codec_store, "os", os)
+    if entry == "cli":
+        assert main(argv) == 0
+        rid = json.loads(capsys.readouterr().out)["id"]
+    else:
+        with storage.message_store(bound, write=True) as default_store:
+            rid = default_store.write(GOLDENS[0]["record"])
+    assert (state / "messages" / rid[:2] / (rid + ".json")).is_file()
+
+
+@pytest.mark.usefixtures("without_descriptor_scandir")
+@pytest.mark.parametrize("action", ["read", "verify"])
+@pytest.mark.parametrize("present", [False, True])
+def test_default_cli_reads_preserve_refusals_without_descriptor_scandir(action, present, workspace, capsys):
+    directory = workspace / ".aegis" / "state" / "messages"
+    if present:
+        directory.mkdir(parents=True, mode=0o700)
+    assert main(["msg", action, "a" * 64]) == 2
+    assert_error(capsys.readouterr(), "E_AUTH" if present else "E_REF", None if present else "resolution")
+    assert directory.exists() == present
+    assert not (directory.parent / ".gitignore").exists()
+
+
+@pytest.mark.usefixtures("without_descriptor_scandir")
+@pytest.mark.parametrize("action, payload, code", [
+    ("read", None, "E_AUTH"),
+    ("verify", None, "E_AUTH"),
+    ("write", '{"fields":{},"body":"","refs":{}}', "E_AUTH"),
+    ("write", '{"body":', "E_FORMAT"),
+], ids=["read", "verify", "valid-write", "malformed-write"])
+def test_explicit_store_preserves_refusals_without_descriptor_scandir(action, payload, code, workspace, tmp_path, capsys):
+    directory = tmp_path / "explicit"
+    directory.mkdir(mode=0o700)
+    if payload is None:
+        args = ["a" * 64]
+    else:
+        source = tmp_path / "content.json"
+        source.write_text(payload, encoding="utf-8")
+        args = ["--kind", "text", "--in", str(source)]
+    assert main(["msg", "--store", str(directory), action, *args]) == 2
+    assert_error(capsys.readouterr(), code)
+    assert list(directory.iterdir()) == []
+    assert not (workspace / ".aegis" / "state").exists()
+
+
+@pytest.mark.usefixtures("without_descriptor_scandir")
+@pytest.mark.parametrize("entry", ["storage", "mcp"])
+@pytest.mark.parametrize("present", [False, True])
+def test_default_core_reads_preserve_refusals_without_descriptor_scandir(entry, present, workspace):
+    from aegis_core import storage
+    from aegis_core.workspace.base import Workspace
+    from aegis_mcp.handlers.msg import handle_msg_read
+
+    directory = workspace / ".aegis" / "state" / "messages"
+    if present:
+        directory.mkdir(parents=True, mode=0o700)
+    bound = Workspace(workspace)
+    expected = (codec.CodecError("E_AUTH") if present else codec.CodecError("E_REF", detail="resolution")).as_dict()
+    if entry == "storage":
+        with pytest.raises(codec.CodecError) as caught:
+            with storage.message_store(bound):
+                pytest.fail("unavailable store admitted a reader")
+        assert caught.value.as_dict() == expected
+    else:
+        assert handle_msg_read({"workspace": bound, "ref": "a" * 64}) == expected
+    assert directory.exists() == present
+    assert not (directory.parent / ".gitignore").exists()
 
 
 @pytest.mark.parametrize("token", [
@@ -1163,3 +1293,135 @@ def test_invalid_read_options_have_identical_frontend_refusals_before_io(
     assert not opened
     if record_state == "no-store":
         assert not directory.parent.exists()
+
+
+def _observe(codes):
+    seen = {code: [] for code in codes}
+    previous = sys.getprofile()
+
+    def observe(frame, event, _arg):
+        # A generator resume after yield is another call event for the same scope.
+        if (event == "call" and frame.f_code in seen and
+                frame.f_lineno == frame.f_code.co_firstlineno):
+            seen[frame.f_code].append(frame.f_locals.get("reference"))
+
+    sys.setprofile(observe)
+    return seen, previous
+
+
+@pytest.mark.parametrize("width", [16, 64])
+def test_verify_one_scope_both_widths(store, workspace, capsys, width):
+    rid = store.write(GOLDENS[0]["record"])
+    lookup, canonical = codec.Store._lookup.__wrapped__.__code__, codec.canonical.__code__
+    seen, previous = _observe((lookup, canonical))
+    try:
+        status = invoke(store, "verify", rid[:width])
+    finally:
+        sys.setprofile(previous)
+    output = capsys.readouterr()
+    assert status == 0 and not output.err
+    assert json.loads(output.out) == {"id": rid, "ref": rid[:16], "verified": True}
+    assert seen[lookup] == [rid[:width]]
+    assert len(seen[canonical]) == 1
+
+
+def test_verify_failure_is_one_scope_and_retries(store, workspace, capsys):
+    value = GOLDENS[0]["record"]
+    rid = store.write(value)
+    path = store.root / rid[:2] / (rid + ".json")
+    original = path.read_bytes()
+    path.write_bytes(b"HOSTILE_MARKER")
+    lookup = codec.Store._lookup.__wrapped__.__code__
+    seen, previous = _observe((lookup,))
+    try:
+        status = invoke(store, "verify", rid)
+    finally:
+        sys.setprofile(previous)
+    assert status == 2
+    assert_error(capsys.readouterr(), "E_HASH")
+    assert seen[lookup] == [rid]
+    assert path.read_bytes() == b"HOSTILE_MARKER"
+    assert list(path.parent.iterdir()) == [path]
+    path.write_bytes(original)
+    assert invoke(store, "verify", rid[:16]) == 0
+    assert json.loads(capsys.readouterr().out) == {"id": rid, "ref": rid[:16], "verified": True}
+    assert invoke(store, "verify", "abcd\n" + "e" * 16) == 2
+    assert_error(capsys.readouterr(), "E_REF", "handle")
+
+
+def test_verify_sharded_ambiguity_preserves_bytes(store, workspace, capsys):
+    rid = store.write(GOLDENS[0]["record"])
+    sibling = rid[:16] + ("b" * 48 if rid[16:] != "b" * 48 else "c" * 48)
+    sibling_path = store.root / sibling[:2] / (sibling + ".json")
+    sibling_path.write_bytes(b"{}")
+    real = store.root / rid[:2] / (rid + ".json")
+    before = real.read_bytes()
+    assert invoke(store, "verify", rid[:16]) == 2
+    assert_error(capsys.readouterr(), "E_REF", "resolution")
+    assert real.read_bytes() == before and sibling_path.read_bytes() == b"{}"
+    assert invoke(store, "verify", rid) == 0
+    assert json.loads(capsys.readouterr().out) == {"id": rid, "ref": rid[:16], "verified": True}
+    assert real.read_bytes() == before and sibling_path.read_bytes() == b"{}"
+
+
+@pytest.mark.parametrize("fmt", ["json", "md", "tsv"])
+def test_stored_outline_encode_count_matches_one_verified_read(store, workspace, capsys, fmt):
+    value = copy.deepcopy(GOLDENS[0]["record"])
+    value["body"] = "outline\n" + "x" * 2000
+    rid = store.write(value)
+    canonical = codec.canonical.__code__
+    seen, previous = _observe((canonical,))
+    try:
+        status = invoke(store, "read", rid[:16], "--outline", "--format", fmt)
+    finally:
+        sys.setprofile(previous)
+    output = capsys.readouterr()
+    assert status == 0 and not output.err
+    assert len(seen[canonical]) == 1
+    assert output.out == codec.read_view(store.read(rid), outline=True, format=fmt, store=store)
+
+
+def test_stored_selection_still_encodes_after_verification(store, workspace, capsys):
+    rid = store.write(GOLDENS[0]["record"])
+    canonical = codec.canonical.__code__
+    seen, previous = _observe((canonical,))
+    try:
+        status = invoke(store, "read", rid, "--fields", "body", "--outline")
+    finally:
+        sys.setprofile(previous)
+    output = capsys.readouterr()
+    assert status == 0 and not output.err
+    assert len(seen[canonical]) == 2
+    assert output.out == codec.read_view(store.read(rid), selectors=["body"], outline=True, store=store)
+
+
+@pytest.mark.parametrize("width", [16, 64])
+@pytest.mark.parametrize("action,flags,options", [
+    ("verify", [], {}),
+    ("read", ["--outline"], {"outline": True}),
+    ("read", [], {}),
+    ("read", ["--outline", "--fields", "body"], {"outline": True, "selectors": ["body"]}),
+    ("read", ["--outline", "--spans", "0"], {"outline": True, "spans": [0]}),
+    ("read", ["--outline", "--since", "0", "--fields", "rows.0"],
+     {"outline": True, "since": "0", "selectors": ["rows.0"]}),
+    ("read", ["--outline", "--expand", "child"], {"outline": True, "expand": ["child"]}),
+], ids=["verify", "outline", "default", "selected", "span", "cursor", "expand"])
+def test_cli_stored_operation_has_no_record_copy(store, workspace, capsys, width, action, flags, options):
+    value, rid = stored_log(store, with_child="expand" in options)
+    with _counting(_LOOKUP, _PARSE, _CANONICAL, _ISOLATE, _STORE_READ, _STORE_VERIFIED) as seen:
+        status = invoke(store, action, rid[:width], *flags)
+
+    output = capsys.readouterr()
+    assert status == 0 and not output.err
+    if action == "verify":
+        assert output.out == json.dumps({"id": rid, "ref": rid[:16], "verified": True}, separators=(",", ":")) + "\n"
+    else:
+        assert output.out == codec.read_view(value, store=store, **options)
+    child = list(value["refs"].values())
+    assert seen[_LOOKUP] == [rid[:width], *child]
+    assert len(seen[_PARSE]) == 1 + len(child)
+    assert len(seen[_ISOLATE]) == 0
+    verified = action == "verify" or options == {"outline": True}
+    assert seen[_STORE_VERIFIED] == ([rid[:width]] if verified else [])
+    assert seen[_STORE_READ] == ([] if verified else [rid[:width], *child])
+    assert len(seen[_CANONICAL]) == (1 if verified else 2 + len(child))

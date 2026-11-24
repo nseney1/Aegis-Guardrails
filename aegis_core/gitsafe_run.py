@@ -14,6 +14,7 @@ from threading import Event, Thread
 import signal
 import stat
 import subprocess
+from sys import exc_info
 import tempfile
 import time
 from types import MappingProxyType
@@ -914,6 +915,13 @@ def text(args, cwd, *, output, **kwargs):
     value = os.fsdecode(out.strip())
     return value or None
 
+
+@dataclass(frozen=True)
+class _RefUpdateFailure:
+    definite: bool
+    cause: tuple[Optional[int], Optional[int]]
+
+
 def update_once(cwd, ref, new, old, command, *, runner, observer, error, conflict):
     """Execute one prevalidated ref transaction and classify its acknowledgment.
 
@@ -922,20 +930,27 @@ def update_once(cwd, ref, new, old, command, *, runner, observer, error, conflic
     acknowledgment. Preflight refusals retain their code; a definite rejection
     with the old value intact is explicitly retriable by the caller.
     """
+    # Keep snapshot helpers off the ordinary Git import path.
+    from aegis_core.team_git_snapshot import failure_observation
+
+    ambient = exc_info()[1]
     try:
         result = runner(["update-ref", "--no-deref", "-z", "--stdin"], cwd, stdin=command)
     except error as exc:
         if exc.code not in ("git_timeout", "git_failed", "ERR_AEGIS", "git_cleanup_failed", "git_output_limit"): raise
         definite = exc.code == "git_failed" and getattr(exc, "effect_process_started", getattr(exc, "process_started", None)) is False
-        result = None
+        failure = _RefUpdateFailure(definite, failure_observation(exc, ambient))
     else:
-        definite = True
-    if result is not None and result.returncode == 0: return "updated"
+        if result is not None and result.returncode == 0: return "updated"
+        failure = _RefUpdateFailure(True, failure_observation(result))
+        del result
     current = observer(cwd, ref)
     if current == new: return "already"
     if current != old: raise conflict("ref compare-and-swap mismatch", ref=ref, expected=old, current=current)
-    if definite: raise error("ref update failed", code="ref_update_failed")
-    raise error("ref update outcome unknown", code="ref_update_unknown")
+    os_errno, status = failure.cause
+    if failure.definite:
+        raise error("ref update failed", code="ref_update_failed", errno=os_errno, returncode=status)
+    raise error("ref update outcome unknown", code="ref_update_unknown", errno=os_errno, returncode=status)
 
 def validate_update_input(single_attempt, new, old, *, error):
     """Original public update_ref validation; strict mode has a fixed refusal."""

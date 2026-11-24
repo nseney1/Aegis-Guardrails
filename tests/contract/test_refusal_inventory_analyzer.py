@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+from threading import Barrier
 
 import pytest
 
@@ -2273,3 +2274,160 @@ def test_round5h_unknown_binding_forwarded_to_consumer_keeps_pool(closed_invento
     sources, codec_sources, _expected = closed_inventory('external(callback)', extra)
     pairs, _history = _reachable_refusal_pairs(sources=sources, codec_sources=codec_sources)
     assert ("E_AUTH", "alias_probe") in pairs["mailbox_digest"]
+
+
+def _guidance_module():
+    """Load the record-guidance renderer without inserting a path at import time."""
+    import importlib.util
+    path = REPO / "tools" / "hierarchy_mailbox_records_guidance.py"
+    spec = importlib.util.spec_from_file_location("closed_table_guidance", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_closed_table_rejects_wildcard_and_malformed_rows():
+    """The loader refuses wildcard, multiline, and oversized rows before use."""
+    helper = helpers_refusal_inventory
+    long_code = "E_" + ("A" * 40)
+    cases = (
+        ((("mailbox_digest", helper.ANY, "binding", "accepted-action"),), "wildcard_row"),
+        ((("mailbox_digest", "E_AUTH", helper.ANY, "accepted-action"),), "wildcard_row"),
+        ((("mailbox_digest", "E_AUTH*", "binding", "accepted-action"),), "wildcard_row"),
+        ((("mailbox_digest", "E_AUTH", "bad\nline", "accepted-action"),), "multiline_field"),
+        ((("mailbox_digest", "E_AUTH", "binding", "accepted-action"),) * 2, "duplicate_row"),
+        ((("other_tool", "E_AUTH", "binding", "accepted-action"),), "unknown_tool"),
+        ((("mailbox_digest", "E_AUTH", "binding", "unlisted-kind"),), "unknown_kind"),
+        ("not-a-table", "malformed_table"),
+        ((("mailbox_digest", "E_AUTH"),), "malformed_row"),
+        ((("mailbox_digest", long_code, "binding", "accepted-action"),), "field_limit"),
+        (tuple(("mailbox_digest", "E_AUTH", "d" + str(index), "pinned-no-action") for index in range(257)), "table_limit"),
+    )
+    for rows, code in cases:
+        with pytest.raises(helper.ClosedRefusalError) as failure:
+            helper.load_closed_refusal_table(rows)
+        assert failure.value.code == code
+        text = str(failure.value)
+        assert "\n" not in text and "\r" not in text
+        assert "SECRET" not in text and "bad" not in text and helper.ANY not in text
+        assert long_code not in text
+    # A refusal does not keep a partial table: the same loader accepts the closed rows on retry.
+    loaded = helper.load_closed_refusal_table(helper.CLOSED_REFUSAL_TABLE)
+    assert loaded[("mailbox_digest", "E_AUTH", "binding")] == "accepted-action"
+
+
+def test_missing_refusal_row_fails_and_explicit_retry_passes():
+    """A new detail that a wildcard would cover fails until an explicit row exists."""
+    helper = helpers_refusal_inventory
+    table = helper.load_closed_refusal_table(helper.CLOSED_REFUSAL_TABLE)
+    missing = ("mailbox_digest", "E_AUTH", "brand_new")
+    assert helper.covers_refusal([(helper.ANY, helper.ANY)], ("E_AUTH", "brand_new"))
+    assert helper.closed_refusal_gaps([missing], table) == (missing,)
+    repaired = helper.CLOSED_REFUSAL_TABLE + (("mailbox_digest", "E_AUTH", "brand_new", "pinned-no-action"),)
+    retried = helper.load_closed_refusal_table(repaired)
+    assert helper.closed_refusal_gaps([missing], retried) == ()
+    assert helper.closed_refusal_gaps([missing], table) == (missing,)
+
+
+def test_wildcard_emission_cannot_satisfy_the_closed_table():
+    """An ANY row, even placed by hand, does not cover a concrete triple."""
+    helper = helpers_refusal_inventory
+    planted = {( "mailbox_digest", helper.ANY, helper.ANY): "accepted-action",
+               ("mailbox_digest", "E_AUTH", helper.ANY): "accepted-action"}
+    missing = ("mailbox_digest", "E_AUTH", "brand_new")
+    wildcard = ("mailbox_digest", helper.ANY, helper.ANY)
+    assert helper.closed_refusal_gaps([missing], planted) == (missing,)
+    assert helper.closed_refusal_gaps([wildcard], planted) == (wildcard,)
+    assert helper.covers_refusal([(helper.ANY, helper.ANY)], ("E_AUTH", "brand_new"))
+
+
+def test_every_closed_row_matches_renderer_disposition():
+    """Each explicit row is an accepted action or a pinned no-action, matching the renderer."""
+    helper = helpers_refusal_inventory
+    guidance = _guidance_module()
+    table = helper.load_closed_refusal_table(helper.CLOSED_REFUSAL_TABLE)
+
+    class Rendered:
+        def __init__(self, code, detail):
+            self.code, self.detail = code, detail
+
+        def as_dict(self):
+            return {"error": {"code": self.code, "message": "m"}}
+
+    saw_action = saw_no_action = False
+    for (tool, code, detail), kind in sorted(table.items()):
+        assert helper.closed_refusal_gaps([(tool, code, detail)], table) == ()
+        payload = guidance.error_result(Rendered(code, detail), tool=tool, max_chars=guidance.MAX_CHARS)
+        action = payload["error"].get("next_action")
+        if kind == "accepted-action":
+            assert type(action) is str and "\n" not in action and "\r" not in action
+            saw_action = True
+        else:
+            assert kind == "pinned-no-action" and action is None
+            saw_no_action = True
+        neighbor = (tool, code, "not_a_row")
+        assert helper.closed_refusal_gaps([neighbor], table) == (neighbor,)
+    assert saw_action and saw_no_action
+
+
+def test_closed_table_lists_bounded_refusals_and_pins():
+    """The real-tree inventory checks concrete bounded rows and explicit pins."""
+    helper = helpers_refusal_inventory
+    table = helper.load_closed_refusal_table(helper.CLOSED_REFUSAL_TABLE)
+    pairs, _history = _reachable_refusal_pairs()
+    concrete = {(tool, code, detail) for tool, rows in pairs.items()
+                for code, detail in rows if helper.ANY not in (code, detail)}
+    assert concrete <= set(table)
+    assert set(helper.PINNED_EXPLICIT_REFUSALS) <= set(table)
+    assert all(helper.ANY not in field for key in table for field in key)
+
+
+def test_real_tree_refuses_a_dropped_row_then_retries(monkeypatch):
+    """Dropping one explicit row refuses the real tree; restoring the table retries."""
+    helper = helpers_refusal_inventory
+    original = helper.CLOSED_REFUSAL_TABLE
+    dropped = ("mailbox_digest", "E_AUTH", "binding", "accepted-action")
+    assert dropped in original
+    monkeypatch.setattr(helpers_refusal_inventory, "CLOSED_REFUSAL_TABLE",
+                        tuple(row for row in original if row != dropped))
+    with pytest.raises(helper.ClosedRefusalError) as failure:
+        _reachable_refusal_pairs()
+    assert failure.value.code == "untabled_refusal"
+    assert failure.value.triples == (("mailbox_digest", "E_AUTH", "binding"),)
+    assert "\n" not in str(failure.value)
+    monkeypatch.setattr(helpers_refusal_inventory, "CLOSED_REFUSAL_TABLE", original)
+    pairs, _history = _reachable_refusal_pairs()
+    assert ("E_AUTH", "binding") in pairs["mailbox_digest"]
+
+
+def test_closed_table_checks_are_isolated_across_threads():
+    """Concurrent checks keep each input table and its exact gaps independent."""
+    helper = helpers_refusal_inventory
+    original = helper.CLOSED_REFUSAL_TABLE
+    row = ("mailbox_digest", "E_AUTH", "binding", "accepted-action")
+    triple = row[:3]
+    missing = tuple(candidate for candidate in original if candidate != row)
+    repaired = missing + (row,)
+    invalid = repaired + ((triple[0], triple[1], helper.ANY, row[3]),)
+    cases = (
+        (original, ()),
+        (missing, (triple,)),
+        (repaired, ()),
+        (invalid, None),
+    )
+    start = Barrier(len(cases))
+
+    def once(case):
+        rows, expected = case
+        start.wait(timeout=10)
+        if expected is None:
+            with pytest.raises(helper.ClosedRefusalError) as failure:
+                helper.load_closed_refusal_table(rows)
+            assert failure.value.code == "wildcard_row"
+            assert failure.value.triples == ()
+        else:
+            table = helper.load_closed_refusal_table(rows)
+            assert helper.closed_refusal_gaps([triple], table) == expected
+
+    with ThreadPoolExecutor(max_workers=len(cases)) as pool:
+        list(pool.map(once, cases, timeout=30))

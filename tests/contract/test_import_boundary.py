@@ -145,6 +145,8 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_metrics": 1,
     "aegis_core.team_native_authority": 1,
     "aegis_core.team_native_bridge": 1,
+    "aegis_core.team_native_codemode": 0,
+    "aegis_core.team_native_events": 0,
     "aegis_core.team_native_keys": 0,
     "aegis_core.team_native_rollout": 0,
     "aegis_core.team_native_session": 1,
@@ -157,7 +159,9 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_supervisor_start": 1,
     "aegis_core.team_templates": 0,
     "aegis_core.team_host_plan": 0,
+    "aegis_core.team_host_qualify": 0,
     "aegis_core.team_host_qualify_evidence": 0,
+    "aegis_core.team_host_qualify_report": 0,
     "aegis_core.team_host_registry": 0,
     "aegis_core.team_hosts": 2,
     "aegis_core.team_git_snapshot": 0,
@@ -166,6 +170,7 @@ CORE_LAYERS: Dict[str, int] = {
     # Manager-only policy and append-only audit domain; no repository credit imports.
     "aegis_core.manager_policy": 1,
     "aegis_core.manager_store": 1,
+    "aegis_core.manager_adjudication": 3,
     # Startup-pinned configuration and owner approval over the audit domain.
     "aegis_core.manager_config": 2,
     # Shared manager decision/report service over the pinned activation service.
