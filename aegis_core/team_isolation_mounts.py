@@ -512,16 +512,13 @@ def protected_roots(owners, observed, identities, *, protected_names=None):
 class _MountContext:
     """One call's qualified homes, metadata and protected roots. Not reusable."""
 
-    __slots__ = ("home", "observed", "owner_uid", "private_gids", "owner_homes", "owners",
-                 "protected_names", "qualified", "identities", "protected")
+    __slots__ = ("observed", "owner_uid", "private_gids", "owners", "protected_names",
+                 "qualified", "identities", "protected")
 
-    def __init__(self, home, observed, owner_uid, private_gids, owner_homes, owners,
-                 protected_names, qualified):
-        self.home = home
+    def __init__(self, observed, owner_uid, private_gids, owners, protected_names, qualified):
         self.observed = observed
         self.owner_uid = owner_uid
         self.private_gids = private_gids
-        self.owner_homes = owner_homes
         self.owners = owners
         self.protected_names = protected_names
         self.qualified = qualified
@@ -553,7 +550,7 @@ def _prepare_mount_context(*, home, observed, owner_uid, private_gids=(), owner_
             and all(type(g) is int and 0 <= g < LINUX_ID_LIMIT for g in private_gids), "mount_metadata")
     # Every role is validated before equal paths are collapsed in protected_roots.
     owners = validated_owner_homes(home, owner_homes)
-    return _MountContext(home, observed, owner_uid, tuple(private_gids), owner_homes, owners,
+    return _MountContext(observed, owner_uid, tuple(private_gids), owners,
                          protected_names, _QualifiedMetadata(observed))
 
 
@@ -580,6 +577,9 @@ def _enforce_mount_policy(rows, observed, identities, protected, *, owner_uid, p
         for root, kind in protected:
             unsafe = aliases_overlap(path, root, identities) if kind == "secret" else inside_alias(root, path, identities)
             require(not unsafe, "unsafe_mount")
+    # mount_rows checked lexical overlap. Distinct paths can only alias through a repeated identity.
+    if len(set(identities.values())) == len(identities):
+        return rows
     # Bind aliases share an ancestor identity. Compare the remaining suffixes,
     # including missing lexical relationships, across both access domains.
     for index, row in enumerate(rows):
