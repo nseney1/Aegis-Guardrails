@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from aegis_core import gitsafe, gitsafe_policy, gitsafe_run, team_git, team_host_plan, team_source as source
-from tests.helpers_team_git import git
+from tests.helpers_team_git import commit, git
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "tools"))
 import hierarchy_source as legacy  # noqa: E402
@@ -420,6 +420,109 @@ def _install_runner(monkeypatch, run):
 def _command_tail(argv):
     argv = tuple(argv)
     return argv[argv.index("--literal-pathspecs") + 1:]
+
+
+def test_sparse_page_offsets_count_toward_cache_admission(repository, monkeypatch):
+    repo, _ = repository
+    text = "row\n" * 65536 + "last"
+    oid = commit(repo, "dense.txt", text.encode())
+    args = {"commit": oid, "path": "dense.txt", "start_line": 65536, "max_lines": 2}
+    blob = git(repo, "rev-parse", oid + ":dense.txt").decode().strip()
+    view = source.SourceViews(repo)
+    real, reads = gitsafe.run, []
+
+    def run(argv, *rest, **kwargs):
+        if _command_tail(argv) == ("cat-file", "blob", blob):
+            reads.append(blob)
+        return real(argv, *rest, **kwargs)
+
+    _install_runner(monkeypatch, run)
+    text_only = (oid + ":dense.txt", blob, text)
+    text_only_bytes = sys.getsizeof(text_only) + sum(map(sys.getsizeof, text_only))
+    # Leave room for fixed metadata but less than the sparse offsets need.
+    monkeypatch.setattr(source, "MAX_CACHED_BYTES", text_only_bytes + 256)
+    expected = {"commit": oid, "path": "dense.txt", "blob": blob, "start_line": 65536,
+                "total_lines": 65537, "lines": ["row", "last"], "cut_lines": [], "next_start_line": None}
+    for _ in range(2):
+        assert view.show(args) == expected
+    assert reads == [blob, blob]
+
+    monkeypatch.setattr(source, "MAX_CACHED_BYTES", text_only_bytes + 16384)
+    for _ in range(2):
+        assert view.show(args) == expected
+    assert reads == [blob, blob, blob]
+
+
+@pytest.mark.parametrize("ending", [b"", b"\n"])
+def test_sparse_pages_keep_lf_boundaries_when_cache_entries_alternate(repository, ending):
+    repo, _ = repository
+    rows = [str(n).encode() for n in range(1, 770)]
+    rows[255:258] = ["é🙂\r".encode(), b"", b"bad\xff"]
+    rows[511] = b"x" * 5000
+    oid = commit(repo, "mixed.txt", b"\n".join(rows) + ending)
+    blob = git(repo, "rev-parse", oid + ":mixed.txt").decode().strip()
+    view = source.SourceViews(repo)
+
+    def read(start):
+        if start == 0:
+            return view.show({"commit": oid, "path": "other"})["lines"]
+        return view.show({"commit": oid, "path": "mixed.txt", "start_line": start, "max_lines": 2})
+
+    def expected(start):
+        if start == 0:
+            return ["other"]
+        return {"commit": oid, "path": "mixed.txt", "blob": blob, "start_line": start, "total_lines": len(rows),
+                "lines": [row.decode("utf-8", errors="replace")[:4096] for row in rows[start - 1:start + 1]],
+                "cut_lines": [512] if start in (511, 512) else [],
+                "next_start_line": start + 2 if start + 1 < len(rows) else None}
+
+    starts = [255, 256, 257, 0, 258, 511, 512, 0, 513, 768, 769]
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        pending = [pool.submit(read, start) for start in starts]
+        assert [task.result(timeout=15) for task in pending] == [expected(start) for start in starts]
+    with pytest.raises(source.SourceRefusal) as caught:
+        read(770)
+    envelope(caught, "page_out_of_range")
+    assert read(769) == expected(769)
+
+
+def test_warm_source_pages_validate_commit_and_retry_after_refusals(repository, monkeypatch):
+    repo, oid = repository
+    view = source.SourceViews(repo)
+    real, commands = gitsafe.run, []
+    reject_commit = False
+
+    def run(argv, *rest, **kwargs):
+        command = _command_tail(argv)
+        commands.append(command)
+        if reject_commit and command == ("cat-file", "-t", oid):
+            return subprocess.CompletedProcess(argv, 1, b"", b"fixture diagnostic")
+        return real(argv, *rest, **kwargs)
+
+    _install_runner(monkeypatch, run)
+    args = {"commit": oid, "path": "page.txt", "start_line": 150}
+    page = view.show(args)
+    assert page["lines"] == ["line"]
+    commands.clear()
+    reject_commit = True
+    with pytest.raises(source.SourceRefusal) as caught:
+        view.show(args)
+    envelope(caught, "unknown_commit")
+    assert str(caught.value) == "source refused: unknown_commit"
+    reject_commit = False
+    assert view.show(args) == page
+    assert commands == [("cat-file", "-t", oid)] * 2
+
+    for alternate in ("absent", "other"):
+        commands.clear()
+        if alternate == "absent":
+            with pytest.raises(source.SourceRefusal) as caught:
+                view.show({**args, "path": alternate})
+            envelope(caught, "unknown_path")
+        else:
+            assert view.show({"commit": oid, "path": alternate})["lines"] == ["other"]
+        assert view.show(args) == page
+        assert ("cat-file", "blob", page["blob"]) in commands
 
 
 @pytest.mark.parametrize("api", ["git", "unchecked", "bounded"])
