@@ -6574,6 +6574,115 @@ def test_planner_refuses_malformed_conflict_output(repo, monkeypatch, bad, code)
     assert shared_bytes(repo) == before
 
 
+@pytest.mark.parametrize("planner", ["merge", "pick", "revert"])
+@pytest.mark.parametrize("case, code", [
+    ("clean", None),
+    ("empty_conflict", None),
+    ("partial_clean_oid", "invalid_object"),
+    ("unterminated_clean_oid", "invalid_object"),
+    ("unterminated_conflict_oid", "invalid_object"),
+    ("unterminated_path", "invalid_object"),
+    ("missing_separator", "invalid_object"),
+    ("missing_empty_separator", "invalid_object"),
+    ("oversized_oid", "size_limit"),
+    ("oversized_unterminated_path", "size_limit"),
+    ("oversized_response", "size_limit"),
+])
+def test_planner_requires_complete_merge_tree_records(repo, monkeypatch, planner, case, code):
+    context = make_store(repo)
+    _, operation = _planner_history(repo, planner)
+    first, last = b"dir/name\nwith space", b"name-\xff"
+    overlay = True
+    real_run = gitsafe_run.LaneRunner.run
+
+    def call(runner, args, *rest, **kwargs):
+        result = real_run(runner, args, *rest, **kwargs)
+        if "merge-tree" not in args or case == "clean":
+            return result
+        assert result.returncode == 0
+        oid, terminator, tail = result.stdout.partition(b"\0")
+        assert terminator and not tail
+        framed = oid + b"\0"
+        if not overlay:
+            output = framed + b"\0".join((first, last, b"", b""))
+            return subprocess.CompletedProcess(result.args, 1, output, b"")
+        replies = {
+            "empty_conflict": (1, framed + b"\0"),
+            "partial_clean_oid": (0, oid[:-1]),
+            "unterminated_clean_oid": (0, oid),
+            "unterminated_conflict_oid": (1, oid),
+            "unterminated_path": (1, framed + first + b"\0" + last),
+            "missing_separator": (1, framed + first + b"\0"),
+            "missing_empty_separator": (1, framed),
+            "oversized_oid": (1, b"a" * 65 + b"\0\0"),
+            "oversized_unterminated_path": (1, framed + b"p" * (tg.MAX_PATH_BYTES + 1)),
+            "oversized_response": (1, framed + b"\0" + b"m" * 256),
+        }
+        status, output = replies[case]
+        return subprocess.CompletedProcess(result.args, status, output, PLANNER_DIAGNOSTIC.encode())
+
+    monkeypatch.setattr(gitsafe_run.LaneRunner, "run", call)
+    if case == "oversized_response":
+        monkeypatch.setattr(tg, "MAX_RESPONSE_BYTES", 128)
+    before = shared_bytes(repo)
+    with context as store:
+        if case == "clean":
+            plan = operation(store)
+            assert plan.status == "clean" and plan.tree and plan.paths == () and plan.conflicts == ()
+            assert operation(store) == plan
+        elif case == "empty_conflict":
+            plan = operation(store)
+            assert (plan.status, plan.origin, plan.certainty) == ("conflict", "conflict", "confirmed")
+            assert plan.paths == () and plan.conflicts == () and plan.tree is None
+        else:
+            with pytest.raises(tg.GitRefusal) as caught:
+                operation(store)
+            _assert_provenance(caught.value, code, "absent", "unknown")
+            overlay = False
+            plan = operation(store)
+            assert (plan.status, plan.origin, plan.certainty) == ("conflict", "conflict", "confirmed")
+            assert plan.paths == (first, last) and plan.conflicts == (_ordered_label(first), _ordered_label(last))
+            assert plan.tree is None and plan.commits == ()
+            assert operation(store) == plan
+    assert shared_bytes(repo) == before
+
+
+def test_concurrent_planners_keep_merge_tree_framing_local(repo, monkeypatch):
+    first_store, second_store = make_store(repo), make_store(repo)
+    tip, source = _conflict_pair(repo)
+    barrier = Barrier(2)
+    overlay = True
+    real_run = gitsafe_run.LaneRunner.run
+
+    def call(runner, args, *rest, **kwargs):
+        result = real_run(runner, args, *rest, **kwargs)
+        if overlay and "merge-tree" in args:
+            barrier.wait(timeout=10)
+            if args[-1] == source:
+                oid = result.stdout.split(b"\0", 1)[0]
+                return subprocess.CompletedProcess(result.args, 1, oid + b"\0x\0", b"")
+        return result
+
+    def plan(context, left, right):
+        with context as store:
+            return tg.plan_merge(store, left, right)
+
+    monkeypatch.setattr(gitsafe_run.LaneRunner, "run", call)
+    before = shared_bytes(repo)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        incomplete = pool.submit(plan, first_store, tip, source)
+        complete = pool.submit(plan, second_store, source, tip)
+        witness = complete.result(timeout=30)
+        assert (witness.status, witness.certainty, witness.paths) == ("conflict", "confirmed", (b"x",))
+        with pytest.raises(tg.GitRefusal) as caught:
+            incomplete.result(timeout=30)
+        _assert_provenance(caught.value, "invalid_object", "absent", "unknown")
+    overlay = False
+    with make_store(repo) as store:
+        assert tg.plan_merge(store, tip, source) == witness
+    assert shared_bytes(repo) == before
+
+
 def test_planner_causes_stay_local_across_concurrent_runners(repo, tmp_path, monkeypatch):
     """One runner's ENOSPC cannot become another runner's conflict or timeout."""
     tip, source = _conflict_pair(repo)
