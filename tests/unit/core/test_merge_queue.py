@@ -1307,7 +1307,7 @@ def test_unknown_cleanup_resolution_reopen_refuses_and_declared_retry_recovers(r
 
 # Resolutions that are not in the durable declaration. Built directly so recovery
 # is tested without validate_state rewriting or refusing them first.
-UNDECLARED_CLEANUP_RESOLUTIONS = ("retry", "forced")
+UNDECLARED_CLEANUP_RESOLUTIONS = ("retry", "forced", "done\n", None, [])
 
 
 def _issuing_checkpoint(rig):
@@ -1444,9 +1444,7 @@ def test_recovery_dispatch_keys_match_declaration_and_reach_each_handler(rig, mo
     from aegis_core import merge_queue_model as model
 
     declared = model.CLEANUP_RESOLUTIONS
-    assert tuple(mq._CLEANUP_RECOVERY) == declared
-    assert set(mq._CLEANUP_RECOVERY) == set(DURABLE_CLEANUP_OUTCOMES)
-    assert len(mq._CLEANUP_RECOVERY) == len(declared)
+    assert declared == tuple(DURABLE_CLEANUP_OUTCOMES)
     backend, baseline, receipt = _issuing_checkpoint(rig)
     validations = []
 
@@ -1487,28 +1485,63 @@ def test_recovery_dispatch_keys_match_declaration_and_reach_each_handler(rig, mo
     assert acknowledge(retried) == "already"
     assert retried.issued is None
 
-    runners = {"abort": reconcile, "acknowledge": acknowledge, "settle": reconcile, "release": release}
-    for resolution in declared:
+    runners = {"not_applied": reconcile, "already": acknowledge, "released": release}
+    for resolution, expected in DURABLE_CLEANUP_OUTCOMES.items():
         git(rig.repo, "update-ref", baseline.cleanup.ref, baseline.cleanup.expected)
         opened = _bind_direct_cleanup(rig, backend, baseline, resolution)
-        handler = mq._CLEANUP_RECOVERY[resolution]
+        recover = runners[expected]
         if resolution in ("issuing", "aborted"):
-            assert handler == mq._CLEANUP_RECOVERY["issuing"] == mq._CLEANUP_RECOVERY["aborted"]
             refused("landing_unconfirmed", lambda opened=opened: reconcile(opened, "pending"))
             assert opened.issued == receipt
             assert opened._state.cleanup.resolution == resolution
         else:
             # A finish-only handler must not rewrite the resolution before the failing save.
             backend.fail = "cleanup-before"
-            refused("state_unavailable", lambda opened=opened, handler=handler: runners[handler](opened))
+            refused("state_unavailable", lambda opened=opened, recover=recover: recover(opened))
             backend.fail = None
             assert opened._state.cleanup.resolution == resolution
             assert opened._faulted is True
             git(rig.repo, "update-ref", baseline.cleanup.ref, baseline.cleanup.expected)
             opened = _bind_direct_cleanup(rig, backend, baseline, resolution)
-        assert runners[handler](opened) == DURABLE_CLEANUP_OUTCOMES[resolution]
+        assert recover(opened) == expected
         assert opened.issued is None
     assert validations == []
+
+
+def test_concurrent_cleanup_recovery_does_not_depend_on_export_order(rig, monkeypatch):
+    original = queue(rig)
+    passing(rig)
+    receipt = issue(original, rig, prepare(original, rig))
+    backend = rig.backends[original]
+
+    def acknowledge(active, read_target):
+        return active.observe_landed(rig.store, receipt, read_target=read_target)
+
+    backend.fail = "cleanup-before"
+    refused("state_unavailable", lambda: acknowledge(original, lambda _: receipt.commit))
+    backend.fail = None
+    checkpoint = backend.state
+    assert checkpoint.cleanup.resolution == "done"
+    completion = backend.commits[receipt.commit]
+    monkeypatch.setattr(mq.model, "CLEANUP_RESOLUTIONS", tuple(reversed(DURABLE_CLEANUP_OUTCOMES)))
+
+    restarted = fresh_queue(rig, backend=backend, initialize=False)
+    barrier = Barrier(2)
+
+    def unexpected_target(_):
+        pytest.fail("saved landed cleanup consulted the target again")
+
+    def recover(_):
+        barrier.wait(timeout=10)
+        return acknowledge(restarted, unexpected_target)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(recover, range(2))) == ["already", "already"]
+    assert restarted.issued is None
+    assert backend.state.generation == checkpoint.generation + 1
+    assert backend.commits[receipt.commit] == backend.lanes[receipt.lane] == completion
+    assert acknowledge(restarted, unexpected_target) == "already"
+    assert backend.state.generation == checkpoint.generation + 1
 
 
 @pytest.mark.parametrize("phase", ["empty", "queued", "issued", "cleanup", "completed"])

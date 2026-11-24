@@ -1,11 +1,8 @@
 """Mailbox storage: held roots, bounded reads, exclusive publication and locks.
 
-Only owner-selected roots are trusted. Every component is opened relative to a
-held directory with O_NOFOLLOW; a rename cannot redirect an in-flight operation.
-The mailbox root and its parent are retained until close, so sibling briefs and
-delivery ledgers have the same confinement boundary as the legacy wire format.
-Reads never create state. Hard links, special files and writable directories
-are refused. All descriptors have one closer; no fdopen wrapper is needed.
+Only owner-selected roots are trusted; components open relative to held parents
+with O_NOFOLLOW. Reads never create state; only singly linked regular files are
+readable, and exact staging names vanishing before first stat are ignored.
 """
 from contextlib import contextmanager, nullcontext
 import errno
@@ -16,7 +13,6 @@ import stat
 from threading import Lock, local
 import uuid
 import weakref
-
 try:
     import pwd
 except ImportError:
@@ -24,9 +20,9 @@ except ImportError:
 
 from aegis_core.workspace.layout import UserLayout
 from aegis_core.team_mailbox_primitives import (
-    render_mailbox_refusal,
-    BusyError, MailboxRefusal, MAX_BYTES, MAX_RECORDS, MAX_STATUS_EVIDENCE_BYTES, MAX_RELEASE_WARNINGS,
-    SHA256, SLUG, LockReleaseWarning, lock_path, matching, require, safe_path, strict_json, validate_warnings,
+    BusyError, LockReleaseWarning, MAX_BYTES, MAX_RECORDS, MAX_RELEASE_WARNINGS, MAX_STATUS_EVIDENCE_BYTES,
+    MailboxRefusal, SHA256, SLUG, lock_path, matching, render_mailbox_refusal, require, safe_path, strict_json,
+    validate_warnings,
 )
 
 __all__ = ["Store", "descriptor_supported", "initialize_store"]
@@ -35,8 +31,7 @@ __all__ = ["Store", "descriptor_supported", "initialize_store"]
 def descriptor_supported():
     names = {function.__name__ for function in os.supports_dir_fd}
     return (os.name == "posix" and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")
-            and {"open", "mkdir", "link", "unlink", "stat", "rmdir"} <= names
-            and os.scandir in os.supports_fd)
+            and {"open", "mkdir", "link", "unlink", "stat", "rmdir"} <= names and os.scandir in os.supports_fd)
 
 
 @contextmanager
@@ -50,13 +45,11 @@ def refusals():
 
 
 def _close_all(descriptors):
-    # Close once, including on a partially failed constructor.
     for fd in descriptors:
         try:
             os.close(fd)
         except OSError:
             pass
-
 
 def _open_absolute(path):
     fd = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -70,10 +63,60 @@ def _open_absolute(path):
         os.close(fd)
         raise
 
-
 def _regular(info):
     require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, reason="unsafe_path")
 
+_STAGING_PREFIX, _STAGING_MARKS = ".pending-", "0123456789abcdef"
+
+def _exact_staging_name(name):
+    return (type(name) is str and len(name) == 41 and name.startswith(_STAGING_PREFIX)
+            and all(ch in _STAGING_MARKS for ch in name[len(_STAGING_PREFIX):]))
+
+def _optional_stat(parent, name):
+    try:
+        return os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+def _ctime_key(info):
+    ns = getattr(info, "st_ctime_ns", None)
+    return (int(info.st_ctime * 1000000000) if ns is None else int(ns)) & ((1 << 64) - 1)
+
+def _census(parent):
+    with os.scandir(parent) as scanned:
+        names = []
+        for entry in scanned:
+            require(len(names) < MAX_RECORDS + 1, reason="too_large")
+            names.append(entry.name)
+    present, seen = [], set()
+    for name in names:
+        info = _optional_stat(parent, name)
+        if info is None:
+            require(_exact_staging_name(name), reason="missing")
+            continue
+        _regular(info)
+        key = (info.st_dev, info.st_ino)
+        require(key not in seen, reason="unsafe_path")
+        seen.add(key)
+        require(len(present) < MAX_RECORDS, reason="too_large")
+        present.append(name)
+    return present
+
+def _sample(parent, name, observed):
+    _regular(observed)
+    current = _optional_stat(parent, name)
+    require(current is not None and os.path.samestat(current, observed), reason="unsafe_path")
+    _regular(current)
+    return current
+
+def _verify_read(parent, name, before, after, size):
+    require(os.path.samestat(before, after), reason="unsafe_path")
+    # Re-stat the directory entry after reading so loss, replacement or extra links refuse unsafe_path.
+    _sample(parent, name, after)
+    require(size == before.st_size and
+            (before.st_mode, before.st_size, before.st_mtime_ns, _ctime_key(before)) ==
+            (after.st_mode, after.st_size, after.st_mtime_ns, _ctime_key(after)),
+            reason="invalid_record")
 
 def _private_directory(fd, *, mode=None):
     info = os.fstat(fd)
@@ -81,9 +124,7 @@ def _private_directory(fd, *, mode=None):
             and not info.st_mode & 0o022 and (mode is None or stat.S_IMODE(info.st_mode) == mode),
             reason="unsafe_path")
 
-
 def _account_home():
-    """Use the effective owner's account record, independently of process HOME."""
     require(pwd is not None, reason="missing")
     try:
         record = pwd.getpwuid(os.geteuid())
@@ -97,13 +138,15 @@ def _account_home():
         render_mailbox_refusal(error)
         raise MailboxRefusal("missing") from None
 
-
-def _write(fd, raw):
+def _emit(fd, raw):
     view = memoryview(raw)
     while view:
         count = os.write(fd, view)
         require(count > 0, reason="io")
         view = view[count:]
+
+def _write(fd, raw):
+    _emit(fd, raw)
     os.fsync(fd)
 
 
@@ -116,8 +159,7 @@ class _WitnessStage(str):
 
     def _publish(self, raw, sha256):
         store = self.store
-        require(getattr(store._local, "stage", None) is self
-                and self.fd in getattr(store._local, "directories", ())
+        require(getattr(store._local, "stage", None) is self and self.fd in getattr(store._local, "directories", ())
                 and getattr(store._local, "evidence", None) is not None)
         path = Path(self) / (sha256 + ".status")
         if not store.exists(path, parent=self.fd):
@@ -130,30 +172,19 @@ class Store:
     """Use as a context or close explicitly. Paths are lexical names under held roots."""
     def __init__(self, root, *, delivery_roots=()):
         self._initialize(root, delivery_roots=delivery_roots, parent_anchor=False)
-
     @classmethod
     def from_parent(cls, parent):
-        """Bind an initializer's selected parent without trusting its grandparent.
-
-        The selected directory must be owner-held and non-writable by others.
-        Reopen through the shared no-follow walk to refuse replacement during
-        validation, then confine every operation to this held parent's subtree.
-        """
+        """Bind an initializer's selected parent without trusting its grandparent."""
         store = cls.__new__(cls)
         store._initialize(parent, delivery_roots=(), parent_anchor=True)
         return store
-
     def _initialize(self, root, *, delivery_roots, parent_anchor):
         require(descriptor_supported(), reason="unsupported_platform")
-        self.root = safe_path(root)
-        self._parent_anchor = parent_anchor
+        self.root, self._parent_anchor = safe_path(root), parent_anchor
         require(type(delivery_roots) in (tuple, list) and len(delivery_roots) <= 256)
         self.delivery_roots = tuple(safe_path(path) for path in delivery_roots)
         self.fd = self.parent_fd = None
-        self._local = local()
-        self.warnings = []
-        self._warnings_guard = Lock()
-        self._warning_reservations = 0
+        self._local, self.warnings, self._warnings_guard, self._warning_reservations = local(), [], Lock(), 0
         try:
             with refusals():
                 self.parent_fd = _open_absolute(self.root if parent_anchor else self.root.parent)
@@ -164,27 +195,22 @@ class Store:
                     after = os.fstat(self.fd)
                     require((before.st_dev, before.st_ino) == (after.st_dev, after.st_ino), reason="unsafe_path")
                 else:
-                    self.fd = os.open(self.root.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                                      dir_fd=self.parent_fd)
+                    self.fd = os.open(self.root.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.parent_fd)
                 _private_directory(self.fd)
             self._finalizer = weakref.finalize(self, _close_all, (self.fd, self.parent_fd))
         except BaseException:
             _close_all(fd for fd in (self.fd, self.parent_fd) if fd is not None)
             self.fd = self.parent_fd = None
             raise
-
     def __enter__(self):
         require(self.fd is not None, reason="closed")
         return self
-
     def __exit__(self, *error):
         self.close()
-
     def close(self):
         if self.fd is not None:
             self._finalizer()
             self.fd = self.parent_fd = None
-
     def _parts(self, path):
         require(self.fd is not None, reason="closed")
         path = safe_path(path)
@@ -196,10 +222,8 @@ class Store:
                 return self.parent_fd, path.relative_to(self.root.parent).parts
             except ValueError:
                 raise MailboxRefusal("unsafe_path") from None
-
     @contextmanager
     def creation(self, kind):
-        """The validated caller declares which tree it is creating."""
         require(type(kind) is str and kind in ("mailbox", "delivery-ledger", "evidence-destination"))
         previous = getattr(self._local, "creation_kind", "evidence-destination")
         self._local.creation_kind = kind
@@ -207,10 +231,8 @@ class Store:
             yield
         finally:
             self._local.creation_kind = previous
-
     def _leaf_only(self):
         return getattr(self._local, "creation_kind", "evidence-destination") == "evidence-destination"
-
     @contextmanager
     def _warning_listener(self, warnings):
         validate_warnings(warnings, limit=MAX_RELEASE_WARNINGS)
@@ -223,14 +245,11 @@ class Store:
             yield
         finally:
             self._local.warning_listeners = previous
-
     def drain_warnings(self):
-        """Drain the one Store sink without replacing its observable list."""
         with self._warnings_guard:
             result = self.warnings[:]
             self.warnings.clear()
             return result
-
     @contextmanager
     def _release_slot(self, path):
         current = getattr(self._local, "release_slot", None)
@@ -252,7 +271,6 @@ class Store:
             with self._warnings_guard:
                 if slot is None or not slot["recorded"]:
                     self._warning_reservations -= 1
-
     def _record_release_warning(self, slot):
         with self._warnings_guard:
             if slot["recorded"]:
@@ -262,10 +280,8 @@ class Store:
             slot["recorded"] = True
         for sink in getattr(self._local, "warning_listeners", ()):
             sink.append(slot["warning"])
-
     @contextmanager
     def evidence_transaction(self, warnings=None):
-        """Owner first; nested operations share exclusion, commit and warnings."""
         with self._warning_listener(warnings):
             transaction = getattr(self._local, "evidence", None)
             if transaction is not None:
@@ -279,7 +295,6 @@ class Store:
                     transaction["committed"] = True
                 finally:
                     self._local.evidence = None
-
     @contextmanager
     def _mutation_directory(self, path, create, **options):
         with self.evidence_transaction():
@@ -291,7 +306,6 @@ class Store:
             else:
                 with self.directory(path, create=create, **options) as fd:
                     yield fd
-
     def _directory_parts(self, path, create, verification, temporary, temporary_parent, parent, held):
         require(verification is None or type(verification) is dict and not create)
         base, parts = self._parts(path)
@@ -303,10 +317,8 @@ class Store:
         if temporary_parent is not None:
             require(temporary and type(temporary_parent) is int and temporary_parent in active and not held)
             base, parts = temporary_parent, (safe_path(path).name,)
-        require(not temporary or temporary_parent is not None or
-                create and safe_path(path).parent == self.root)
+        require(not temporary or temporary_parent is not None or create and safe_path(path).parent == self.root)
         return base, parts, active
-
     @contextmanager
     def directory(self, path, create=False, *, verification=None, temporary=False, undo=None, temporary_parent=None,
                   parent=None, held=False):
@@ -319,10 +331,7 @@ class Store:
             return
         base, parts, active = self._directory_parts(path, create, verification, temporary, temporary_parent, parent, held)
         with refusals():
-            fd = os.dup(base)
-            created = []
-            failed = True
-            ready = False
+            fd, created, failed, ready = os.dup(base), [], True, False
             try:
                 _private_directory(fd)
                 if verification is not None:
@@ -383,15 +392,11 @@ class Store:
                 finally:
                     self._local.directories = getattr(self._local, "directories", set()) - {fd}
                     _close_all((fd, *(parent for parent, _name in created)))
-
     def mkdir(self, path):
         with self.directory(path, create=True):
             pass
-
     def disjoint_directories(self, first, second):
-        """Compare verified no-follow ancestors, including not-yet-created tails."""
         left, right = {}, {}
-
         def inside(parent, child):
             if parent["path"] == child["path"] or parent["path"] in child["path"].parents:
                 return True
@@ -401,64 +406,47 @@ class Store:
             index = child["chain"].index(anchor)
             suffix = tuple(child["names"][index:]) + child["tail"]
             return suffix[:len(parent["tail"])] == parent["tail"]
-
         with self.directory(first, verification=left), self.directory(second, verification=right):
             require(not inside(left, right) and not inside(right, left))
-
     def exists(self, path, *, parent=None):
         path = safe_path(path)
         require(parent is None or type(parent) is int and parent in getattr(self._local, "directories", ()))
         try:
-            with self.directory(path.parent) if parent is None else nullcontext(parent) as parent:
-                with refusals():
-                    info = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
-                    if stat.S_ISDIR(info.st_mode):
-                        require(not info.st_mode & 0o022, reason="unsafe_path")
-                    else:
-                        _regular(info)
-                    return True
+            with self.directory(path.parent) if parent is None else nullcontext(parent) as parent, refusals():
+                info = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+                if stat.S_ISDIR(info.st_mode):
+                    require(not info.st_mode & 0o022, reason="unsafe_path")
+                else:
+                    _regular(info)
+                return True
         except MailboxRefusal as error:
             if render_mailbox_refusal(error)["reason"] == "missing":
                 return False
             render_mailbox_refusal(error, reraise=True)
-
     def entries(self, path, *, missing=False, parent=None):
-        """Stream the census under a cap before allocating a sortable name list."""
-        result = []
-        opened = False
+        path, opened = safe_path(path), False
         require(parent is None or type(parent) is int and parent in getattr(self._local, "directories", ()))
         try:
             with self.directory(path) if parent is None else nullcontext(parent) as parent:
                 opened = True
-                with refusals(), os.scandir(parent) as entries:
-                    for entry in entries:
-                        require(len(result) < MAX_RECORDS, reason="too_large")
-                        _regular(entry.stat(follow_symlinks=False))
-                        result.append(Path(path) / entry.name)
+                with refusals():
+                    return [path / name for name in sorted(_census(parent))]
         except MailboxRefusal as error:
             if missing and render_mailbox_refusal(error)["reason"] == "missing" and not opened:
                 return []
             render_mailbox_refusal(error, reraise=True)
-        return sorted(result)
-
     def require_room(self, directory, needed=1):
-        """Use the reader's entry census, including acknowledgments and pending files."""
         require(type(needed) is int and 0 <= needed <= MAX_RECORDS)
         directory = safe_path(directory)
         entries = self.entries(directory, missing=True)
-        # Our ledger lock is removed before the operation returns. Other
-        # recognized pending/control entries receive no publication credit.
         owned_lock = (str(directory) in getattr(self._local, "held", ())
                       and any(path.name == ".write.lock" for path in entries))
         require(len(entries) - int(owned_lock) + needed <= MAX_RECORDS, reason="too_large")
-
     def admit(self, path, raw, retained_bytes, max_bytes):
-        """Preflight a complete append against the validated reader's byte total."""
         require(type(raw) is bytes and type(retained_bytes) is int and type(max_bytes) is int)
         require(0 <= retained_bytes <= max_bytes and len(raw) <= MAX_BYTES
                 and retained_bytes + len(raw) <= max_bytes, reason="too_large")
         self.require_room(safe_path(path).parent)
-
     def read(self, path, *, limit=MAX_BYTES, parent=None):
         require(type(limit) is int and 0 <= limit <= 67108864)
         path = safe_path(path)
@@ -467,7 +455,7 @@ class Store:
             fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
             try:
                 before = os.fstat(fd)
-                _regular(before)
+                _sample(parent, path.name, before)
                 require(before.st_size <= limit, reason="too_large")
                 raw = bytearray()
                 while len(raw) <= limit:
@@ -476,24 +464,18 @@ class Store:
                         break
                     raw.extend(chunk)
                 require(len(raw) <= limit, reason="too_large")
-                after = os.fstat(fd)
-                _regular(after)
-                require((before.st_size, before.st_mtime_ns, before.st_ctime_ns) ==
-                        (after.st_size, after.st_mtime_ns, after.st_ctime_ns))
+                _verify_read(parent, path.name, before, os.fstat(fd), len(raw))
                 return bytes(raw)
             finally:
                 os.close(fd)
-
     def read_json(self, path):
         return strict_json(self.read(path))
-
     def _mutation_publish(self, path, raw, limit, parent, undo):
         undo = [] if undo is None else undo
         with self.evidence_transaction():
             with self.directory(path.parent, create=parent is None, undo=undo,
                                 parent=parent, held=parent is not None) as directory:
                 self.publish(path, raw, limit=limit, parent=directory, undo=undo)
-
     def publish(self, path, raw, *, limit=MAX_BYTES, parent=None, undo=None):
         require(type(raw) is bytes and type(limit) is int)
         require(len(raw) <= limit <= 67108864, reason="too_large")
@@ -501,8 +483,8 @@ class Store:
         require(parent is None or type(parent) is int and parent in getattr(self._local, "directories", ()))
         if getattr(self._local, "evidence", None) is None or parent is None or undo is None:
             return self._mutation_publish(path, raw, limit, parent, undo)
-        with self.directory(path.parent, create=True) if parent is None else nullcontext(parent) as parent, refusals():
-            pending = ".pending-" + uuid.uuid4().hex
+        with refusals():
+            pending = _STAGING_PREFIX + uuid.uuid4().hex
             fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
             try:
                 try:
@@ -515,22 +497,17 @@ class Store:
             finally:
                 os.unlink(pending, dir_fd=parent)
             os.fsync(parent)
-
     @contextmanager
     def witness_stage(self, path, parent):
-        """Lend the host a capability for an already-held staging descriptor."""
         capability = _WitnessStage(path, self, parent)
         self._local.stage = capability
         try:
             yield capability
         finally:
             self._local.stage = None
-
     @contextmanager
     def owner_lock(self, transaction):
-        """Serialize every evidence destination in the existing Aegis user plane."""
-        layout = UserLayout(_account_home())
-        path = safe_path(layout.aegis_dir)
+        path = safe_path(UserLayout(_account_home()).aegis_dir)
         with refusals():
             parent = _open_absolute(path)
             try:
@@ -543,19 +520,12 @@ class Store:
                 self._local.directories = getattr(self._local, "directories", set()) - {parent}
                 self._local.owner = None
                 _close_all((parent,))
-
     @contextmanager
     def witness_lock(self, directory, transaction):
-        """One stable existing parent; never create evidence ancestors.
-
-        Hold this parent for both locking and leaf creation, so a concurrent
-        ancestor rename cannot redirect either operation to a different tree.
-        """
         directory = safe_path(directory)
         with self.directory(directory.parent) as parent:
             with self.publication_lock(directory.parent, transaction, destination=directory, parent=parent):
                 yield parent
-
     @contextmanager
     def publication_lock(self, directory, transaction, *, destination=None, parent=None, owner=False):
         with self._release_slot(lock_path(directory, destination, owner=owner)) as slot:
@@ -571,9 +541,7 @@ class Store:
                     render_mailbox_refusal(error, reraise=not completed or not transaction["committed"])
                 elif not completed or not transaction["committed"]:
                     raise
-
     def publish_status_evidence(self, directory, raw, sha256, *, warnings=None):
-        """Bound and verify content-addressed status evidence under the held root."""
         validate_warnings(warnings, limit=MAX_RELEASE_WARNINGS)
         require(type(raw) is bytes)
         require(len(raw) <= MAX_STATUS_EVIDENCE_BYTES, reason="too_large")
@@ -581,18 +549,15 @@ class Store:
         require(hashlib.sha256(raw).hexdigest() == sha256)
         if isinstance(directory, _WitnessStage):
             return directory._publish(raw, sha256)
-        path = safe_path(directory) / (sha256 + ".status")
-        undo = []
+        path, undo = safe_path(directory) / (sha256 + ".status"), []
         with self.creation("evidence-destination"), self.evidence_transaction(warnings), self.directory(path.parent, create=True, undo=undo) as parent:
             if self.exists(path, parent=parent):
                 require(hashlib.sha256(self.read(path, limit=MAX_STATUS_EVIDENCE_BYTES, parent=parent)).hexdigest() == sha256)
             else:
                 self.publish(path, raw, limit=MAX_STATUS_EVIDENCE_BYTES, parent=parent, undo=undo)
         return str(path)
-
     @contextmanager
     def lock(self, directory, create=False, *, destination=None, parent=None, owner=False):
-        """No polling: one typed BusyError. Reentrant only in this thread/context."""
         directory = safe_path(directory)
         if not owner and getattr(self._local, "evidence", None) is None:
             with self.evidence_transaction():
@@ -601,8 +566,7 @@ class Store:
             return
         require(not owner or getattr(self._local, "owner", None) == (directory, parent))
         path = lock_path(directory, destination, owner=owner)
-        name = path.name
-        key = str(directory if destination is None and not owner else path)
+        name, key = path.name, str(directory if destination is None and not owner else path)
         held = getattr(self._local, "held", set())
         require(parent is None or type(parent) is int and parent in getattr(self._local, "directories", ()))
         if key in held:
@@ -611,18 +575,15 @@ class Store:
         with self._release_slot(path) as slot:
             with self.directory(directory, create=create) if parent is None else nullcontext(parent) as parent, refusals():
                 try:
-                    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                                 0o600, dir_fd=parent)
+                    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
                 except FileExistsError:
                     try:
                         _regular(os.stat(name, dir_fd=parent, follow_symlinks=False))
                     except FileNotFoundError:
-                        # The observed contender released between O_EXCL and stat.
                         pass
                     raise BusyError(path) from None
                 completed = False
                 try:
-                    # The lock is a coordination claim, not authority or authentication.
                     os.close(fd)
                     self._local.held = held | {key}
                     yield
@@ -678,8 +639,7 @@ def initialize_store(root, raw, folders):
                             os.close(previous)
                     finally:
                         os.close(current)
-                record = os.open("manifest.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                                 0o600, dir_fd=fd)
+                record = os.open("manifest.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
                 manifest_created = True
                 try:
                     _write(record, raw)

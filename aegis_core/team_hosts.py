@@ -1,7 +1,8 @@
 """Read-only capacity advice from resolved policy and injected usage adapters.
 
 Adapters return bounded Python snapshots, never paths or credential material.
-Subscription snapshots use UTC RFC3339 resets_at and used_pct in [0, 100];
+Subscription snapshots contain a legacy window or several measured windows
+with UTC RFC3339 resets_at and used_pct in [0, 100];
 credits snapshots use nonnegative credits_left (zero holds). Optional tokens
 and runs are per-host counters. No cross-host totals are calculated.
 
@@ -10,9 +11,10 @@ and invalid host/KIND arguments remain 2. Advice does not authorize execution.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from importlib import import_module
 import math
+import re
 
 from aegis_core import hosts as host_registry, team_profile
 from aegis_core.team_host_adapter import (
@@ -122,29 +124,49 @@ def _number(value, maximum):
     return value
 
 
+def _normalize_window(window):
+    if (type(window) is not dict or len(window) != 2
+            or any(type(key) is not str or key not in ("used_pct", "resets_at") for key in window)):
+        raise ValueError("invalid usage window")
+    reset = window["resets_at"]
+    if type(reset) is not str or len(reset) != 20:
+        raise ValueError("invalid usage reset")
+    # Refuse multiline and noncanonical resets without exposing parser input.
+    try:
+        parsed = datetime.strptime(reset, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        raise ValueError("invalid usage reset") from None
+    if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != reset:
+        raise ValueError("invalid usage reset")
+    return {"used_pct": _number(window["used_pct"], 100), "resets_at": reset}
+
+
+def _normalize_windows(windows):
+    if type(windows) is not dict or not 1 <= len(windows) <= team_profile.MAX_CAPACITY_WINDOWS:
+        raise ValueError("invalid usage windows")
+    if any(type(name) is not str or len(name) > 10
+           or not re.fullmatch(team_profile.CAPACITY_WINDOW_PATTERN, name) for name in windows):
+        raise ValueError("invalid usage window name")
+    return {name: _normalize_window(window) for name, window in windows.items()}
+
+
 def normalize_usage(value, source):
     """Validate bounded shapes before copying or parsing adapter data."""
-    if type(value) is not dict or len(value) > 3:
+    if type(value) is not dict or len(value) > 3 or any(type(key) is not str for key in value):
         raise ValueError("invalid usage snapshot")
-    expected = "window" if source == "subscription-window" else "credits_left"
+    if type(source) is not str or source not in ("subscription-window", "credits"):
+        raise ValueError("invalid usage source")
+    expected = "credits_left"
+    if source == "subscription-window":
+        expected = "windows" if "windows" in value else "window"
     if expected not in value or any(key not in (expected, "tokens", "runs") for key in value):
         raise ValueError("invalid usage fields")
-    if source == "subscription-window":
-        window = value["window"]
-        if type(window) is not dict or len(window) != 2 or "used_pct" not in window or "resets_at" not in window:
-            raise ValueError("invalid usage window")
-        reset = window["resets_at"]
-        if type(reset) is not str or len(reset) != 20:
-            raise ValueError("invalid usage reset")
-        # Refuse multiline and noncanonical reset values rather than joining.
-        parsed = datetime.strptime(reset, "%Y-%m-%dT%H:%M:%SZ")
-        if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != reset:
-            raise ValueError("invalid usage reset")
-        result = {"window": {"used_pct": _number(window["used_pct"], 100), "resets_at": reset}}
-    elif source == "credits":
-        result = {"credits_left": _number(value["credits_left"], 10**15)}
+    if expected == "windows":
+        result = {"windows": _normalize_windows(value["windows"])}
+    elif expected == "window":
+        result = {"window": _normalize_window(value["window"])}
     else:
-        raise ValueError("invalid usage source")
+        result = {"credits_left": _number(value["credits_left"], 10**15)}
     for counter in ("tokens", "runs"):
         if counter in value:
             if type(value[counter]) is not int or not 0 <= value[counter] <= 10**15:
@@ -154,14 +176,22 @@ def normalize_usage(value, source):
 
 
 class HostCapacity:
-    """One command's per-host snapshot cache; policy checks precede advice."""
+    """One command's per-host snapshot cache with a fixed, aware observation time."""
 
-    def __init__(self, resolved, *, adapter=None):
+    def __init__(self, resolved, *, adapter=None, now=None):
         team_profile.validate_resolved(resolved)
         self.profile = resolved["profile"]
         self.settings = self.profile["model_settings"]
         self.adapter = adapter
         self.snapshots = {}
+        if now is not None and (type(now) is not datetime or now.utcoffset() is None):
+            raise ValueError("capacity clock must be an aware datetime")
+        observed_at = datetime.now(timezone.utc) if now is None else now.astimezone(timezone.utc)
+        self._observed_at = observed_at.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+    def _current_windows(self, usage):
+        return {name: window for name, window in usage["windows"].items()
+                if window["resets_at"] > self._observed_at}
 
     def _usage(self, host):
         if host in self.snapshots:
@@ -177,29 +207,43 @@ class HostCapacity:
             try:
                 reader = self.adapter if self.adapter is not None else usage_adapter(binding["kind"])
                 row["usage"] = normalize_usage(reader.read(host, source), source)
-                row.update(usage_status="known", reason="per-host usage snapshot available",
-                           next_action="Use aegis team hosts check HOST KIND --json before starting work.")
             except Exception:
-                # Availability applies to this host's capacity observation only.
-                # Exception text and partial snapshots never cross the boundary.
+                # Exception text and partial snapshots stay inside the adapter boundary.
                 row.update(usage_status="unknown", usage={}, reason="unknown: usage adapter unavailable or invalid snapshot",
                            next_action="Configure or repair this host kind's usage adapter; capacity advice alone does not block work.")
+            else:
+                row.update(usage_status="known", reason="per-host usage snapshot available",
+                           next_action="Use aegis team hosts check HOST KIND --json before starting work.")
+                if "windows" in row["usage"]:
+                    current = self._current_windows(row["usage"])
+                    if not current:
+                        row.update(usage_status="unknown", reason="unknown: no current usage windows")
+                    elif capacity.get("window_thresholds", {}).keys() - current.keys():
+                        row.update(usage_status="unknown", reason="unknown: configured usage window evidence missing or expired")
+                    if row["usage_status"] == "unknown":
+                        row["next_action"] = "Refresh the host's usage snapshot, then recheck."
         self.snapshots[host] = row
         return row
 
     def _rule(self, host, kind, voting):
         row = self._usage(host)
+        usage = row["usage"]
+        threshold_key = "hold_pct" if kind == "writer" else ("route_pct" if voting else "flex_route_pct")
+        if "windows" in usage:
+            capacity = self.settings["capacity"][host]
+            blockers = [window["resets_at"] for name, window in self._current_windows(usage).items()
+                        if window["used_pct"] >= team_profile.capacity_thresholds(capacity, window=name)[threshold_key]]
+            if blockers:
+                next_action = "Wait for the window reset at " + max(blockers) + "; rerun this check."
+                return True, "usage reaches capacity threshold", next_action
+            if row["usage_status"] == "known":
+                return False, "usage below capacity threshold", row["next_action"]
         if row["usage_status"] != "known":
             return False, row["reason"], row["next_action"]
-        usage = row["usage"]
         if "credits_left" in usage:
             held = usage["credits_left"] == 0
             return held, "credits exhausted" if held else "credits available", "Replenish this host's credits, then recheck."
-        thresholds = row["thresholds"]
-        threshold = thresholds["route_pct"] if voting else thresholds["flex_route_pct"]
-        if kind == "writer":
-            threshold = thresholds["hold_pct"]
-        held = usage["window"]["used_pct"] >= threshold
+        held = usage["window"]["used_pct"] >= row["thresholds"][threshold_key]
         reason = "usage reaches capacity threshold" if held else "usage below capacity threshold"
         return held, reason, "Wait for the window reset at " + usage["window"]["resets_at"] + "; rerun this check."
 
@@ -249,6 +293,16 @@ class HostCapacity:
     def usage(self):
         """Per-host measurements, with no aggregation across host accounts."""
         return [dict(self._usage(host)) for host in self.settings["hosts"]]
+
+    def writer_capacity(self):
+        """Pair each measured row with its writer capacity state before routing."""
+        result = []
+        for host in self.settings["hosts"]:
+            row = self._usage(host)
+            held, _, _ = self._rule(host, "writer", False)
+            state = "at_limit" if held else "available" if row["usage_status"] == "known" else "unknown"
+            result.append((dict(row), state))
+        return result
 
     def status(self):
         """List the same effective role decisions exposed by direct checks."""

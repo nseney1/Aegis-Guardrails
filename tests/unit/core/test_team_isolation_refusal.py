@@ -3,6 +3,7 @@ import ast
 from concurrent.futures import ThreadPoolExecutor
 import importlib
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
@@ -127,6 +128,38 @@ def test_plan_projection_is_isolated_across_concurrent_callers():
         else:
             assert "stage" not in body and body["reason"] == shared.LAUNCHER_ENVIRONMENT_REASON
             assert "container-inspection" not in text
+
+
+@pytest.mark.parametrize(("code", "supplied_reason"), [
+    ("document_invalid", "Supply a valid bounded JSON document."),
+    ("document_size", "Reduce the isolation input to its documented size limits."),
+])
+def test_image_document_repair_advice_is_bound_to_stage(code, supplied_reason):
+    shared = importlib.import_module("aegis_core.team_isolation_refusal")
+    image_reason = "Check local engine inspection for the configured image and retry."
+    stages = (None, "config", "container-inspection", "image-inspection")
+    barrier = Barrier(len(stages), timeout=10)
+
+    def project(stage):
+        barrier.wait()
+        error = shared.with_document_stage(shared.IsolationRefusal(code), stage)
+        body = shared.plan_response(error)
+        reason, wrong_reason = ((image_reason, supplied_reason) if stage == "image-inspection"
+                                else (supplied_reason, image_reason))
+        expected = {"status": "refused", "code": code, "reason": reason,
+                    "next_action": {"actor": "operator", "command": reason}}
+        suffix = ""
+        if stage is not None:
+            expected["stage"] = stage
+            suffix = " (" + stage + ")"
+        assert error.exit_code == 1 and str(error) == code
+        assert body == expected
+        assert shared.plan_text(body) == code + " — " + reason + suffix
+        assert shared.plan_text(dict(body, reason=wrong_reason)) == (
+            "internal — Report an internal isolation check failure.")
+
+    with ThreadPoolExecutor(max_workers=len(stages)) as pool:
+        list(pool.map(project, stages))
 
 
 @pytest.mark.parametrize(("code", "stage", "note", "expected_stage"), [
