@@ -274,13 +274,14 @@ def _assert_verified(store, capsys, arguments):
     assert invoke(store, capsys, *arguments, output="--plain") == (0, "Isolation verified\n")
 
 
-@pytest.mark.parametrize(("stage", "code"), [
-    ("config", "document_invalid"),
-    ("container-inspection", "document_invalid"),
-    ("image-inspection", "document_invalid"),
-    ("image-inspection", "document_read"),
-], ids=["config", "container", "image", "image-read"])
-def test_each_document_stage_refuses_then_verifies_in_both_modes(mount_inputs, capsys, monkeypatch, stage, code):
+@pytest.mark.parametrize(("stage", "code", "reason"), [
+    ("config", "document_invalid", "Supply a valid bounded JSON document."),
+    ("container-inspection", "document_invalid", "Supply a valid bounded JSON document."),
+    ("image-inspection", "document_invalid", "Check local engine inspection for the configured image and retry."),
+    ("image-inspection", "document_read", "Supply an accessible regular JSON file without symlink components."),
+    ("image-inspection", "document_size", "Check local engine inspection for the configured image and retry."),
+], ids=["config", "container", "image", "image-read", "image-size"])
+def test_each_document_stage_refuses_then_verifies_in_both_modes(mount_inputs, capsys, monkeypatch, stage, code, reason):
     store = mount_inputs
     config, image = container_inputs(store)
     configured = config.read_bytes()
@@ -302,6 +303,8 @@ def test_each_document_stage_refuses_then_verifies_in_both_modes(mount_inputs, c
             return _image_document(image)
         if code == "document_read":
             raise IsolationRefusal(code)
+        if code == "document_size":
+            return b"untrusted-image" + b"x" * (1024 * 1024)
         return b'{"untrusted-image":'
 
     if stage == "config":
@@ -312,7 +315,7 @@ def test_each_document_stage_refuses_then_verifies_in_both_modes(mount_inputs, c
         monkeypatch.setattr(adapter, "observe", unexpected)
     monkeypatch.setattr(adapter, "inspect_image", inspector)
     before = _open_fds()
-    _assert_cli_refusal(store, capsys, arguments, code, REFUSALS[code], stage)
+    _assert_cli_refusal(store, capsys, arguments, code, reason, stage)
     failed_calls = 2 if stage == "image-inspection" else 0
     assert calls == [["docker", "image", "inspect", image]] * failed_calls
     assert _open_fds() == before
@@ -463,6 +466,8 @@ def test_image_process_status_and_timeout(engine_store, monkeypatch, script, cod
         with pytest.raises(ValueError, match="^" + code + "$") as caught:
             adapter.inspect_image(argv, workspace=workspace, search_path=search_path)
         assert caught.value.stage == ("image-inspection" if code == "document_size" else None)
+        if code == "document_size":
+            assert caught.value.message == "Check local engine inspection for the configured image and retry."
         if code == "image_inspect":
             assert caught.value.message == REFUSALS["image_inspect"]
             assert caught.value.note is None
