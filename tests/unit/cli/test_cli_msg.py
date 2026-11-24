@@ -784,23 +784,45 @@ def test_verify_checks_bytes_and_reports_full_id(store, workspace, capsys):
 
 
 @pytest.mark.parametrize("action", ["read", "verify", "write"])
-def test_rf44_cli_refuses_flat_store(action, store, workspace, capsys):
+@pytest.mark.parametrize("use_default", [False, True], ids=["explicit", "default"])
+def test_rf44_cli_refuses_flat_store(action, use_default, store, workspace, tmp_path, capsys):
+    directory = store.root
+    store_options = ["--store", str(directory)]
+    if use_default:
+        directory = workspace / ".aegis" / "state" / "messages"
+        directory.mkdir(parents=True, mode=0o700)
+        store_options = []
     value = GOLDENS[0]["record"]
     data = codec.canonical(value)
     rid = hashlib.sha256(data).hexdigest()
-    path = store.root / (rid + ".json")
+    path = directory / (rid + ".json")
     path.write_bytes(data)
     arguments = [rid[:16]]
     if action == "write":
         source = workspace / "content.json"
         source.write_bytes(json.dumps(content(value)).encode())
         arguments = ["--kind", value["kind"], "--in", str(source)]
-    assert invoke(store, action, *arguments) == 2
-    output = capsys.readouterr()
-    assert not output.err
-    assert json.loads(output.out) == {"error": {"code": "E_AUTH", "message":
-        "flat message store layout is unsupported; use a new empty store directory"}}
-    assert list(store.root.iterdir()) == [path]
+    expected = {"error": {"code": "E_AUTH", "message":
+        "flat message store layout is unsupported. Retry with --store DIR pointing to a new empty store "
+        "directory. Old references are unavailable in the new store."}}
+    for _ in range(2):
+        assert main(["msg", *store_options, action, *arguments]) == 2
+        output = capsys.readouterr()
+        assert not output.err
+        assert output.out == json.dumps(expected, separators=(",", ":")) + "\n"
+
+    fresh = tmp_path / "fresh"
+    fresh.mkdir(mode=0o700)
+    retry = ["msg", "--store", str(fresh)]
+    if action == "write":
+        assert main([*retry, action, *arguments]) == 0
+        written = json.loads(capsys.readouterr().out)["id"]
+        assert main([*retry, "read", written]) == 0
+        assert json.loads(capsys.readouterr().out)["data"]["body"] == value["body"]
+    else:
+        assert main([*retry, action, *arguments]) == 2
+        assert_error(capsys.readouterr(), "E_REF", "resolution")
+    assert list(directory.iterdir()) == [path]
     assert path.read_bytes() == data
 
 
