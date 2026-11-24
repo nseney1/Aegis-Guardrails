@@ -72,6 +72,7 @@ REVIEWED_REDACTION_IMPORTERS = frozenset({
     "aegis_core/team_custody_checks.py",
     "aegis_core/team_git.py",
     "aegis_core/team_jobs_recipes.py",
+    "aegis_core/team_land_plan.py",
     "aegis_core/team_mailbox_primitives.py",
     "aegis_core/team_paths.py",
     "aegis_core/team_profile_display.py",
