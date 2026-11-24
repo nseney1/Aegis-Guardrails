@@ -18,6 +18,7 @@ import re
 import stat
 import sys
 import tarfile
+from typing import NamedTuple, Optional
 import unicodedata
 import zipfile
 
@@ -28,7 +29,7 @@ TEMPLATE_PREFIX = "aegis_core/ast/drivers/templates/"
 TEMPLATES = {TEMPLATE_PREFIX + name for name in (
     "__init__.py", "go_ast.go", "go.mod")}
 ASSETS = {"aegis_sdk/py.typed", "aegis_core/benchmark_corpus/corpus.json",
-          "aegis_core/benchmark_corpus/ast.json"}
+          "aegis_core/benchmark_corpus/ast.json", "aegis_core/manager_starter.json"}
 ASSETS.update("aegis_core/_data/rules/" + name for name in (
     "__init__.py", "META.md", "cost-optimization.md", "destructive-ops.md", "no-eval.md",
     "providence.md", "subagent-delegation.md", ".oracles/architectural-tenets.md",
@@ -86,10 +87,6 @@ def _fold_part(part):
     return unicodedata.normalize("NFC", part).casefold()
 
 
-def _fold_key(text):
-    return "/".join(_fold_part(part) for part in text.split("/"))
-
-
 def _canonical_components(prefixes):
     """Every component of the one prefix table, one spelling each."""
     mapping = {}
@@ -106,24 +103,21 @@ def _canonical_components(prefixes):
 _CANONICAL_COMPONENT = _canonical_components(_PROTECTED_PREFIXES)
 # A package root is a spelling constraint, not a location that hides children.
 _LOCATION_FOLDED = tuple(
-    (prefix, _fold_key(prefix)) for prefix in _PROTECTED_PREFIXES if "/" in prefix)
+    (prefix, _fold_part(prefix) + "/") for prefix in _PROTECTED_PREFIXES if "/" in prefix)
 
 
-def _matched_location(logical):
+def _matched_location(folded_logical):
     """Longest multi-component protected prefix that contains logical as a child."""
-    if not logical:
-        return None
-    folded = _fold_key(logical)
     best = None
     best_len = -1
     for prefix, folded_prefix in _LOCATION_FOLDED:
-        if len(folded_prefix) > best_len and folded.startswith(folded_prefix + "/"):
+        if len(folded_prefix) > best_len and folded_logical.startswith(folded_prefix):
             best = prefix
             best_len = len(folded_prefix)
     return best
 
 
-def _portable_component(part):
+def _portable_component(part, folded):
     """True when one component matches the portable allowlist."""
     if not part or part in (".", "..") or part.endswith("."):
         return False
@@ -134,86 +128,58 @@ def _portable_component(part):
                 unicodedata.normalize("NFKC", char) == char):
             continue
         return False
-    stem = unicodedata.normalize("NFC", part).split(".", 1)[0].casefold()
+    stem = folded.split(".", 1)[0]
     if stem in _DEVICE_STEMS or _DEVICE_NUMBERED.fullmatch(stem):
         return False
     return True
 
 
-def _canonical_component(part):
+def _canonical_component(part, folded):
     """Protected prefix components compare NFC plus casefold. Only one spelling passes."""
-    canonical = _CANONICAL_COMPONENT.get(_fold_part(part))
+    canonical = _CANONICAL_COMPONENT.get(folded)
     return canonical is None or part == canonical
 
 
-def _destination_key(key):
-    """Case-folded destination. Windows installs these as one path."""
-    return _fold_key(key)
+class _Component(NamedTuple):
+    spelling: str
+    kind: str
+    explicit: bool
+    children: Optional[dict]
 
 
-def _component_parent(parts, index):
-    """Folded path of the components before index. The root parent is empty."""
-    return _fold_key("/".join(parts[:index]))
-
-
-def _component_claim(parts, directory, state, *, leaf_only=False):
-    """Compare one member with the per-parent index. Do not mutate state.
-
-    Each destination component has one spelling and one kind. An explicit
-    directory needs a descendant that already admitted that directory.
-    """
-    index = state.get("components") or {}
-    absent = False
-    start = len(parts) - 1 if leaf_only else 0
-    for offset in range(start, len(parts)):
-        part = parts[offset]
-        parent = _component_parent(parts, offset)
-        folded = _fold_part(part)
-        leaf = offset == len(parts) - 1
-        kind = "file" if leaf and not directory else "directory"
-        explicit = bool(leaf and directory)
-        slot = index.get(parent, {}).get(folded)
-        if slot is None:
-            if directory:
-                absent = True
-            continue
-        spelling, previous_kind, previous_explicit = slot
-        if spelling != part or previous_kind != kind:
-            return "duplicate", (offset, spelling, kind, previous_kind)
-        if kind == "file" or (explicit and previous_explicit):
-            return "duplicate", None
-    if absent:
-        return "absent", None
-    return "ok", None
-
-
-def _record_components(parts, directory, state):
-    """Record spelling, kind and explicit-directory state under each parent."""
-    index = state.setdefault("components", {})
-    for offset, part in enumerate(parts):
-        parent = _component_parent(parts, offset)
-        folded = _fold_part(part)
-        leaf = offset == len(parts) - 1
-        kind = "file" if leaf and not directory else "directory"
-        explicit = bool(leaf and directory)
-        children = index.setdefault(parent, {})
+def _stage_components(parts, folded_parts, leaf_kind, children):
+    """Decide each component once. The caller applies changes after admission."""
+    changes = []
+    leaf_offset = len(parts) - 1
+    for offset, (part, folded) in enumerate(zip(parts, folded_parts)):
+        leaf = offset == leaf_offset
+        kind = leaf_kind if leaf else "directory"
+        explicit = leaf and kind == "directory"
         slot = children.get(folded)
         if slot is None:
-            children[folded] = (part, kind, explicit)
-            continue
-        spelling, previous_kind, previous_explicit = slot
-        children[folded] = (spelling, previous_kind, previous_explicit or explicit)
+            # An explicit directory needs a descendant that already implied it.
+            if leaf_kind == "directory":
+                return "absent", None, ()
+            slot = _Component(part, kind, explicit, {} if kind == "directory" else None)
+            changes.append((children, folded, slot))
+        elif slot.spelling != part or slot.kind != kind:
+            return "duplicate", (offset, slot.spelling, kind, slot.kind), ()
+        elif kind == "file" or (explicit and slot.explicit):
+            return "duplicate", None, ()
+        elif explicit:
+            changes.append((children, folded, slot._replace(explicit=True)))
+        children = slot.children
+    return "ok", None, changes
 
 
 def _explicit_directories_have_descendants(state):
     """Every explicit directory component has an admitted child."""
-    index = state.get("components") or {}
-    for parent, children in index.items():
-        for folded, (_spelling, kind, explicit) in children.items():
-            if not explicit or kind != "directory":
-                continue
-            child_key = folded if parent == "" else parent + "/" + folded
-            if not index.get(child_key):
+    pending = [state["components"]]
+    while pending:
+        for slot in pending.pop().values():
+            if slot.children:
+                pending.append(slot.children)
+            elif slot.explicit:
                 return False
     return True
 
@@ -291,7 +257,7 @@ def _refuse_duplicate(archive_kind, name, parts, conflict):
 
 
 def _admission_state():
-    return {"root": None, "names": set(), "components": {},
+    return {"root": None, "names": {}, "folded": set(), "components": {},
             "templates": set(), "info_roots": set()}
 
 
@@ -335,26 +301,36 @@ def admit_member(archive_kind, name, effective_name, member_type, size, state,
             unicodedata.normalize("NFC", name) != name or
             any(part.lower() in FORBIDDEN_DIRS for part in parts) or
             any(PurePosixPath(part).suffix.lower() in FORBIDDEN_SUFFIXES for part in parts) or
-            parts != raw_parts or
-            any(not _portable_component(part) for part in parts) or
-            any(not _canonical_component(part) for part in parts)):
+            parts != raw_parts):
+        fail(forbidden + public_text(name))
+    folded_parts = [_fold_part(part) for part in parts]
+    if (any(not _portable_component(part, folded) for part, folded in zip(parts, folded_parts)) or
+            any(not _canonical_component(part, folded) for part, folded in zip(parts, folded_parts))):
         fail(forbidden + public_text(name))
     logical = key
+    root = state["root"]
     if archive_kind == "sdist":
-        if state["root"] is None:
+        if root is None:
             root = parts[0]
             if (root in PACKAGES or root.endswith(".dist-info") or
                     not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+!-]*", root)):
                 fail(unexpected + public_text(name))
-            state["root"] = root
-        if (parts[0] != state["root"] or
+        if (parts[0] != root or
                 (len(parts) == 1 and member_type != tarfile.DIRTYPE)):
             fail(unexpected + public_text(name))
-        logical = "/".join(parts[1:])
+        logical = key.partition("/")[2]
     directory = name.endswith("/") if archive_kind == "wheel" else member_type == tarfile.DIRTYPE
-    exact_match = key in state["names"]
-    if exact_match or _destination_key(key) in state.get("folded", ()):
-        _, conflict = _component_claim(parts, directory, state, leaf_only=exact_match)
+    leaf_kind = "directory" if directory else "file"
+    previous_kind = state["names"].get(key)
+    if previous_kind is not None:
+        # An exact full name has identical ancestors. Only its leaf kind can conflict.
+        conflict = None
+        if leaf_kind != previous_kind:
+            conflict = (len(parts) - 1, parts[-1], leaf_kind, previous_kind)
+        _refuse_duplicate(archive_kind, name, parts, conflict)
+    folded_key = "/".join(folded_parts)
+    if folded_key in state["folded"]:
+        _, conflict, _ = _stage_components(parts, folded_parts, leaf_kind, state["components"])
         _refuse_duplicate(archive_kind, name, parts, conflict)
     # (b) A ZIP directory needs both the slash and consistent metadata, with
     # neither stored nor compressed bytes. Tar directories need zero size.
@@ -371,7 +347,8 @@ def admit_member(archive_kind, name, effective_name, member_type, size, state,
         fail(unexpected + public_text(name))
     # (c) The same prefix table, case-folded, before any generic admission.
     # An exact asset is a file permission, never a directory exception.
-    location = _matched_location(logical)
+    folded_logical = folded_key.partition("/")[2] if archive_kind == "sdist" else folded_key
+    location = _matched_location(folded_logical)
     if "_data" in parts and (directory or logical not in ASSETS):
         fail(unexpected + public_text(name))
     if location == _TEAM_TEMPLATES_LOCATION and not directory:
@@ -385,7 +362,7 @@ def admit_member(archive_kind, name, effective_name, member_type, size, state,
     # deliberately has no whole-tree file allowlist beyond (a)-(c).
     # Implied directories and explicit entries share one per-parent index.
     info = re.fullmatch(r"aegis_guardrails-[A-Za-z0-9_.+!-]+\.dist-info", parts[0])
-    claim, conflict = _component_claim(parts, directory, state)
+    claim, conflict, changes = _stage_components(parts, folded_parts, leaf_kind, state["components"])
     if claim == "duplicate":
         _refuse_duplicate(archive_kind, name, parts, conflict)
     if directory:
@@ -404,9 +381,11 @@ def admit_member(archive_kind, name, effective_name, member_type, size, state,
     if not allowed:
         fail(unexpected + public_text(name))
     # (e) All checks completed. Record the member and its components together.
-    state["names"].add(key)
-    state.setdefault("folded", set()).add(_destination_key(key))
-    _record_components(parts, directory, state)
+    state["root"] = root
+    state["names"][key] = leaf_kind
+    state["folded"].add(folded_key)
+    for children, folded, slot in changes:
+        children[folded] = slot
     if not directory and archive_kind == "wheel":
         state["templates"].update({logical} & TEMPLATES)
         if info:

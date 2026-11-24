@@ -49,6 +49,7 @@ REVIEWED_REDACTION_IMPORTERS = frozenset({
     "aegis_cli/doctor_git_report.py",
     "aegis_cli/hooks/redaction.py",
     "aegis_cli/language_capabilities.py",
+    "aegis_cli/manager_adjudication.py",
     "aegis_cli/status.py",
     "aegis_cli/team.py",
     "aegis_cli/ui/theme.py",
