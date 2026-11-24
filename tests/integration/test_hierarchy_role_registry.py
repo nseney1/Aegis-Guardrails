@@ -250,6 +250,23 @@ def test_the_registry_path_is_fixed_beside_the_loader():
     assert hierarchy_roles.PATH == ROOT / "tools" / "hierarchy_templates" / "role-registry.json"
 
 
+def test_git_capabilities_keep_service_principals_out_of_mailbox_roles():
+    registry = hierarchy_roles.registry()
+    for name in ("git-custodian", "publisher", "session-helper"):
+        assert name in registry["git_capabilities"]
+        assert name not in registry["roles"]
+        assert name not in hierarchy_roles.session_roles()
+    policy = registry["git_capabilities"]
+    assert "git:create-tested-commit" in policy["git-custodian"]
+    assert "forge:use-publisher-identity" in policy["publisher"]
+    assert policy["session-helper"] == ["team:status", "git:read-parent-scope"]
+
+
+def test_git_capabilities_preserve_legacy_registry_validation():
+    registry = changed(lambda data: data.pop("git_capabilities"))
+    assert hierarchy_roles.validate(registry) == registry
+
+
 # Router and Decider endpoints
 
 
