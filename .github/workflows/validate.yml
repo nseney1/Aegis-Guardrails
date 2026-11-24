@@ -43,10 +43,11 @@ permissions:
 # test-windows-measurement: test-windows-language 3.12 Windows job wall clocks pending (run 45089040698 interim).
 # test-fast shards: run 44219204536 measured the whole suite at 6516.67s (108.6 min) on
 # validate ubuntu-latest 3.11. The old single test-fast job ran that same work and the 45 min
-# cap cancelled it (run 44562897709, still at 23% after 43 min). No per-shard green run exists
-# yet, so each shard records that full-suite duration as its ceiling and uses timeout-minutes
-# 218 (at least twice 108.6 min, at most 360). Lower a shard only after a measurement of that
-# shard. The four jobs are separate ids so ALWAYS_SUCCESS names every shard: a strategy.matrix
+# cap cancelled it (run 44562897709, still at 23% after 43 min). Each shard starts with the
+# whole-suite fallback and a 218-minute cap. Before tuning a shard, review its elapsed time
+# in a green run, including setup. Update its annotation and the corresponding reviewed test row.
+# Round twice the measured duration up to whole minutes for the minimum cap, with a ceiling
+# of 360 minutes. The four jobs use separate IDs so ALWAYS_SUCCESS names each shard: a matrix
 # collapses every leg to one needs key, and a dropped leg would not be "missing" there.
 # test-fast-measurement: test-fast-unit-core 6516.67s run 44219204536
 # test-fast-measurement: test-fast-unit-rest 6516.67s run 44219204536
