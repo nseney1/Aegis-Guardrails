@@ -127,10 +127,16 @@ def _anchored_operations_supported():
 
 
 def emit_error(error, *, detail=None) -> int:
-    """Errors contain only the shared core's fixed next-action guidance."""
+    """Render fixed next-action guidance in the shared error envelope."""
     from aegis_core.message_codec_format import frontend_error
 
-    value = frontend_error(error, detail=detail)
+    value = frontend_error(
+        error, detail=detail,
+        flat_layout_message=(
+            "flat message store layout is unsupported. Retry with --store DIR pointing to a new empty store "
+            "directory. Old references are unavailable in the new store."
+        ),
+    )
     messages = {
         "pin": "workspace pin refused; check or unset AEGIS_WORKSPACE",
         "workspace_store": "workspace is not initialized; pass --workspace PROJECT",
