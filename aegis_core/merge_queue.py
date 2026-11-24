@@ -43,29 +43,6 @@ __all__ = ["MergeQueue", "QueueEntry", "Review", "Landing", "QueueRefused", "REF
 
 MAX_COMMIT_BYTES = 128 * 1024
 
-# One handler per declared cleanup resolution, in declaration order. Recovery
-# looks this table up and refuses state_unavailable for every other value,
-# including a resolution that never passed validate_state.
-_CLEANUP_RECOVERY = {
-    "issuing": "abort",
-    "aborted": "abort",
-    "done": "acknowledge",
-    "not_applied": "settle",
-    "released": "release",
-}
-
-
-def _cleanup_handler(resolution):
-    """Return the one recovery handler for a declared cleanup resolution."""
-    if tuple(_CLEANUP_RECOVERY) != model.CLEANUP_RESOLUTIONS:
-        raise QueueRefused("state_unavailable")
-    if type(resolution) is not str:
-        raise QueueRefused("state_unavailable")
-    handler = _CLEANUP_RECOVERY.get(resolution)
-    if type(handler) is not str:
-        raise QueueRefused("state_unavailable")
-    return handler
-
 
 def descriptor_supported():
     return team_git.descriptor_support() and team_qualify.descriptor_supported()
@@ -241,7 +218,7 @@ class MergeQueue:
         record = self._state.cleanup
         if record is None:
             return
-        if _cleanup_handler(record.resolution) != "abort":
+        if model.cleanup_handler(record.resolution) != "abort":
             return
         record = replace(record, result=self._retained(record.landing.commit))
         self._retire(store, self._state, record, "aborted")
@@ -306,7 +283,7 @@ class MergeQueue:
                     raise QueueRefused("request_conflict")
                 if store is None:
                     raise QueueRefused("issued_unresolved")
-                handler = _cleanup_handler(cleanup.resolution)
+                handler = model.cleanup_handler(cleanup.resolution)
                 if handler == "abort":
                     self._abort_intent(store)
                 elif handler == "release":
@@ -524,7 +501,7 @@ class MergeQueue:
         if not model.ready_landing(candidate) or candidate.issuance == 0:
             raise QueueRefused("stale_candidate")
         if self._state.cleanup is not None and self._state.cleanup.landing == candidate:
-            if _cleanup_handler(self._state.cleanup.resolution) == "acknowledge":
+            if model.cleanup_handler(self._state.cleanup.resolution) == "acknowledge":
                 self._finish_cleanup(store)
                 self._target_checked = False
                 return "already"
@@ -565,7 +542,7 @@ class MergeQueue:
         if not model.ready_landing(candidate) or candidate.issuance == 0:
             raise QueueRefused("stale_candidate")
         if self._state.cleanup is not None and self._state.cleanup.landing == candidate:
-            handler = _cleanup_handler(self._state.cleanup.resolution)
+            handler = model.cleanup_handler(self._state.cleanup.resolution)
             if handler == "abort":
                 if _read(read_outcome, candidate) != "not_applied":
                     raise QueueRefused("landing_unconfirmed")
@@ -636,7 +613,7 @@ class MergeQueue:
             raise QueueRefused("invalid_request")
         # Refuse an undeclared cleanup resolution before this restore writes health.
         if self._state.cleanup is not None:
-            _cleanup_handler(self._state.cleanup.resolution)
+            model.cleanup_handler(self._state.cleanup.resolution)
         try:
             tip = self._tip(read_target)
         except QueueRefused:
