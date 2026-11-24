@@ -87,6 +87,10 @@
     "count": 1,
     "reason": "Explicit user-configured model command boundary."
   },
+  "process:aegis_core/manager_runtime.py:_run:subprocess.Popen": {
+    "count": 1,
+    "reason": "Bounded isolated Python launch for the offline manager build and verified runtime probes"
+  },
   "process:aegis_core/team_native_bridge.py:ProcessBridge._run:subprocess.Popen": {
     "count": 1,
     "reason": "TA-3h: explicit owner-configured evidence-only provider argv; bounded correlated I/O, deadline, held cwd and WNOWAIT group cancellation; no native execution qualification."
