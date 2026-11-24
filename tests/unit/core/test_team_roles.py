@@ -20,6 +20,8 @@ from tools import hierarchy_roles as legacy
 ROOT = Path(__file__).resolve().parents[3]
 RAW = (ROOT / "tools/hierarchy_templates/role-registry.json").read_bytes()
 BASE = json.loads(RAW)
+# Preserve the input shape of the established mailbox traversal counts.
+MAILBOX_BASE = {key: BASE[key] for key in ("schema", "routes", "roles")}
 
 
 def refused(reason, call, *args):
@@ -33,6 +35,137 @@ def refused(reason, call, *args):
     assert error.as_dict() == {"reason": reason, "code": 1, "status": "refused",
                                "next_action": error.next_action}
     assert "private-marker" not in str(error) + repr(error.as_dict())
+
+
+def test_git_capabilities_match_the_adr_for_each_principal():
+    status = {"team:status"}
+    read = status | {"git:read"}
+    own_lane = status | {"git:read-own-lane", "lane:commit-own", "lane:sync-own"}
+    review = status | {"git:read-exact-head", "review:record-exact-head"}
+    expected = {
+        "root": read,
+        "router": status | {"queue:add"},
+        "orchestrator": read | {"queue:list", "queue:claim-team", "queue:release-team", "queue:done-team",
+                                "lane:start-team", "lane:commit-team", "lane:sync-team", "lane:land-team",
+                                "lane:resume-team", "lane:done-preview", "lane:gc-preview"},
+        "reviewer": review,
+        "decider": read,
+        "implementer": own_lane,
+        "test-author": own_lane,
+        "owner": read | {"lane:start-owner", "lane:commit-owner", "lane:sync-owner", "lane:resume-owner",
+                         "lane:done-preview", "lane:gc-preview", "lane:done-apply", "lane:gc-apply",
+                         "git:recover", "git:prune", "git:configure", "forge:merge-review-target",
+                         "forge:merge-signed-target", "git:sign-signature-target", "forge:owner-admin"},
+        "watch-supervisor": status,
+        "provider-bridge": status,
+        "job-executor": status | {"git:read-exact-head", "job:run-exact-export", "job:write-evidence",
+                                  "broker:route-git-requests"},
+        "architect": read,
+        "validation-operator": review | {"qualification:request-exact-tree"},
+        "integrator": own_lane,
+        "specialist-reviewer": review,
+        "release-operator": read | {"release:open-review-or-signature-pr", "lane:land-repair-red-target",
+                                    "lane:start-revert-red-target"},
+        "front-door": status,
+        "session-helper": status | {"git:read-parent-scope"},
+        "git-custodian": read | {"git:manage-leased-worktree", "git:snapshot-private-index",
+                                 "git:create-tested-commit", "git:create-queue-merge",
+                                 "git:fast-forward-leased-lane-ref", "git:write-qualification-and-queue-refs",
+                                 "git:write-lane-records", "git:write-operation-journal"},
+        "publisher": read | {"forge:use-publisher-identity",
+                             "forge:push-qualified-none-target-without-rule-changes",
+                             "forge:open-qualified-draft-pr", "forge:open-release-pr",
+                             "forge:cancel-superseded-run", "forge:delete-merged-lane-branch",
+                             "forge:record-intent-result"},
+    }
+    assert set(BASE["git_capabilities"]) == expected.keys()
+    legacy_policy = legacy.registry()["git_capabilities"]
+    for name, grants in expected.items():
+        assert set(roles.git_capabilities(name)) == grants
+        assert roles.git_capabilities(name) == tuple(legacy_policy[name])
+
+
+@pytest.mark.parametrize("change", [
+    lambda grants: grants.update({"private-marker": []}),
+    lambda grants: grants.pop("publisher"),
+    lambda grants: grants.update(root={"private-marker": True}),
+    lambda grants: grants.update(root=["private-marker\nsecret"]),
+    lambda grants: grants.update(root=[{}]),
+    lambda grants: grants.update(root=["team:status"] * 3),
+    lambda grants: grants.update(root=["team:status", "team:status"]),
+    lambda grants: grants.update(root=["git:fast-forward-leased-lane-ref"]),
+    lambda grants: grants.update(router=["queue:claim-team"]),
+    lambda grants: grants.update(implementer=["lane:commit-team"]),
+    lambda grants: grants.update(orchestrator=["lane:done-apply"]),
+    lambda grants: grants.update(reviewer=["git:write-qualification-and-queue-refs"]),
+    lambda grants: grants.update({"session-helper": ["review:record-exact-head"]}),
+    lambda grants: grants.update({"session-helper": ["lane:commit-own"]}),
+    lambda grants: grants.update({"release-operator": ["forge:merge-review-target"]}),
+    lambda grants: grants.update({"job-executor": ["forge:use-publisher-identity"]}),
+    lambda grants: grants.update({"job-executor": ["git:write-qualification-and-queue-refs"]}),
+    lambda grants: grants.update({"git-custodian": ["job:run-exact-export"]}),
+    lambda grants: grants.update({"git-custodian": ["forge:use-publisher-identity"]}),
+    lambda grants: grants.update(publisher=["git:fast-forward-leased-lane-ref"]),
+    lambda grants: grants.update(publisher=["forge:push-qualified-none-target-with-rule-changes"]),
+    lambda grants: grants.update(publisher=["forge:merge-signed-target"]),
+    lambda grants: grants.update(publisher=["forge:force-push"]),
+])
+def test_git_capabilities_refuse_malformed_or_widened_policy_then_retry(change):
+    invalid = deepcopy(BASE)
+    change(invalid["git_capabilities"])
+    before = deepcopy(invalid)
+    refused("invalid_registry", roles.validate, invalid)
+    with pytest.raises(ValueError, match="^role registry refused: invalid_registry$"):
+        legacy.validate(invalid)
+    assert invalid == before
+    assert roles.validate(deepcopy(BASE)) == BASE
+    assert legacy.validate(deepcopy(BASE)) == BASE
+
+
+@pytest.mark.parametrize("registry_module", [roles, legacy], ids=["core", "legacy"])
+def test_git_capabilities_isolate_concurrent_reads(registry_module):
+    def attempt(index):
+        exposed = registry_module.registry()["git_capabilities"]
+        exposed["root"].clear()
+        exposed["private-marker"] = ["git:read"]
+        fresh = registry_module.registry()["git_capabilities"]
+        assert fresh == BASE["git_capabilities"]
+        assert roles.git_capabilities("root") == tuple(fresh["root"])
+        return index
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(attempt, range(6))) == list(range(6))
+
+
+@pytest.mark.parametrize("principal", ["private-marker", "root\n", "x" * 65], ids=["unknown", "newline", "oversized"])
+def test_git_capabilities_refuse_bad_principal_before_resource_read(monkeypatch, principal):
+    original = roles.resources
+
+    def never_read(name):
+        pytest.fail("invalid principal reached the policy reader")
+
+    monkeypatch.setattr(roles, "resources", SimpleNamespace(files=never_read))
+    refused("not_permitted", roles.git_capabilities, principal)
+    monkeypatch.setattr(roles, "resources", original)
+    assert roles.git_capabilities("root") == ("team:status", "git:read")
+
+
+def test_git_capabilities_legacy_data_grants_nothing_and_a_tightened_policy_stays_tight(monkeypatch):
+    package = deepcopy(BASE)
+    original = roles.resources
+
+    def files(name):
+        return SimpleNamespace(joinpath=lambda filename: SimpleNamespace(
+            open=lambda mode: BytesIO(json.dumps(package).encode("utf-8"))))
+
+    monkeypatch.setattr(roles, "resources", SimpleNamespace(files=files))
+    package.pop("git_capabilities")
+    assert roles.validate(package) == package
+    refused("not_permitted", roles.git_capabilities, "root")
+    package["git_capabilities"] = {**BASE["git_capabilities"], "root": []}
+    assert roles.git_capabilities("root") == ()
+    monkeypatch.setattr(roles, "resources", original)
+    assert roles.git_capabilities("root") == ("team:status", "git:read")
 
 
 def legacy_cases():
@@ -635,7 +768,7 @@ def test_other_invalid_registry_checks_keep_the_fallback_repair():
 
 
 def test_validation_bounds_each_caller_tree_once():
-    registry = deepcopy(BASE)
+    registry = deepcopy(MAILBOX_BASE)
     result, expanded, ordered = _trace_visits(lambda: roles.validate(registry))
     assert result == registry and not ordered and len(expanded) == 1759
     for role in registry["roles"].values():
@@ -648,13 +781,13 @@ def test_validation_bounds_each_caller_tree_once():
     result, expanded, ordered = _trace_visits(lambda: roles.validate_role("root", role))
     assert result is None and len(expanded) + len(ordered) == 120
     assert expanded.count(id(role)) == 1
-    table_input = deepcopy(BASE)
+    table_input = deepcopy(MAILBOX_BASE)
     result, expanded, ordered = _trace_visits(lambda: roles.role_tables(table_input))
     # role_tables and its nested validate each bound the registry in their own call.
     assert result.endpoint_roles == RoleTables().endpoint_roles and len(expanded) + len(ordered) == 3110
     for role in table_input["roles"].values():
         assert expanded.count(id(role)) == 2
-    huge = deepcopy(BASE)
+    huge = deepcopy(MAILBOX_BASE)
     huge["roles"]["root"]["title"] = "x" * 262145
     error, expanded, ordered = _trace_visits(lambda: refusal(roles.validate, huge))
     assert error.reason == "too_large" and error.next_action == TOO_LARGE_ACTION
@@ -1260,7 +1393,7 @@ def test_early_refusal_skips_nodes_the_walk_never_reaches(uncached_roles, fallba
 
 def test_stock_registry_node_visits_show_the_cache_pays(uncached_roles):
     """Measure both modes through the same twelve public entry points."""
-    registry = deepcopy(BASE)
+    registry = deepcopy(MAILBOX_BASE)
     role = deepcopy(BASE["roles"]["root"])
     # Each pair is positional, keyword.
     cases = (

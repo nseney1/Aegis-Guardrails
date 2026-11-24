@@ -265,8 +265,19 @@ def _protected_leaf(stack, directory, name, owners, model_uid, *, socket_path, r
     return fd, info
 
 
-def _read_bytes(fd, maximum):
-    chunks, length = [], 0
+def _read_bytes(fd, size, maximum):
+    first = os.read(fd, size) if size else b""
+    if size and not first:
+        return first  # A read with a positive count already found EOF.
+    probe = os.read(fd, 1)
+    if not probe:
+        return first
+
+    # Short reads and files whose contents exceed their reported size still
+    # use bounded chunks when the probe finds more data.
+    length = len(first) + len(probe)
+    require(length <= maximum)
+    chunks = [first, probe]
     while True:
         chunk = os.read(fd, min(65536, maximum + 1 - length))
         if not chunk:
@@ -291,8 +302,8 @@ def _inspect_protected(path, owners, model_uid, *, directory, socket_path, maxim
                                          socket_path=socket_path, read_bytes=maximum is not None)
             raw = None
             if maximum is not None:
-                require(opened.st_size <= maximum)
-                raw = _read_bytes(fd, maximum)
+                require(0 <= opened.st_size <= maximum)
+                raw = _read_bytes(fd, opened.st_size, maximum)
             _verify_directories(edges, parent, owners, model_uid)
             require(_identity(os.stat(parts[-1], dir_fd=parent, follow_symlinks=False))
                     == _identity(os.fstat(fd)) == _identity(opened))
