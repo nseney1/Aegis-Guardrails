@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 import ast
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import errno
 import io
 import json
@@ -2267,17 +2267,49 @@ def test_exact_budget_with_an_empty_first_subdirectory_has_no_false_cap(tmp_path
     assert "scan_capped" not in _codes(report)
 
 
+@contextmanager
+def _track_scratch_duplicates(monkeypatch):
+    calls = []
+    outstanding = set()
+
+    def duplicate(parent):
+        fd = os.dup(parent)
+        outstanding.add(fd)
+        calls.append((parent, fd))
+        return fd
+
+    def close(fd):
+        # Drop ownership before the kernel can recycle this number.
+        outstanding.discard(fd)
+        os.close(fd)
+
+    monkeypatch.setattr(doctor_git_observe, "os", types.SimpleNamespace(
+        **{**vars(doctor_git_observe.os), "dup": duplicate, "close": close}))
+    try:
+        yield calls
+    finally:
+        while outstanding:
+            os.close(outstanding.pop())
+
+
+@contextmanager
+def _recycled_descriptor(fd, replacement):
+    recycled = os.dup2(replacement, fd, inheritable=False)
+    try:
+        yield recycled
+    finally:
+        try:
+            os.close(recycled)
+        except OSError as error:
+            # Keep a regression failure visible if teardown already closed it.
+            if error.errno != errno.EBADF:
+                raise
+
+
 def test_scratch_duplicate_closes_on_exit_failure_and_on_successful_retry(tmp_path, monkeypatch):
     if not doctor_git_observe.descriptor_support():
         pytest.skip("directory descriptors unsupported")
-    duplicates = []
     fail_exit = True
-
-    def duplicate(fd):
-        assert fd == borrowed
-        owned = os.dup(fd)
-        duplicates.append(owned)
-        return owned
 
     @contextmanager
     def anchor(*args):
@@ -2286,37 +2318,39 @@ def test_scratch_duplicate_closes_on_exit_failure_and_on_successful_retry(tmp_pa
             raise doctor_git_observe.ConfinedFileError("io")
 
     def validate(root, fd, dev, ino):
-        assert fd == duplicates[-1] and fd != borrowed
+        assert duplicates[-1] == (borrowed, fd) and fd != borrowed
         assert not os.get_inheritable(fd)
         original = os.fstat(borrowed)
         assert (dev, ino) == (original.st_dev, original.st_ino)
         return "/held-test-scratch"
 
-    monkeypatch.setattr(doctor_git_observe, "os", types.SimpleNamespace(
-        **{**vars(doctor_git_observe.os), "dup": duplicate}))
     monkeypatch.setattr(doctor_git_observe, "_confined", anchor)
     monkeypatch.setattr(doctor_git_observe, "_scratch_ok", validate)
     monkeypatch.setattr(doctor_git_observe, "_scratch_env", lambda: {"AEGIS_SCRATCH": str(tmp_path)})
     monkeypatch.setattr(doctor_git, "_run_git", lambda *args: "git_missing")
     monkeypatch.setattr(doctor_git_observe, "walk", lambda *args: None)
-    borrowed = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        for count, code in enumerate(("scratch_unsupported", "scratch_outside"), start=1):
-            report = doctor_git.collect(tmp_path, tier="A", now=10)
-            assert code in _codes(report)
-            assert len(duplicates) == count
-            with pytest.raises(OSError) as error:
-                os.fstat(duplicates[-1])
-            assert error.value.errno == errno.EBADF
-            os.fstat(borrowed)
-            fail_exit = False
-    finally:
-        os.close(borrowed)
-        for fd in duplicates:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+    with (tmp_path / "replacement").open("w+b") as replacement, ExitStack() as recycled_owner:
+        borrowed = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            original = os.fstat(borrowed)
+            with _track_scratch_duplicates(monkeypatch) as duplicates:
+                for count, code in enumerate(("scratch_unsupported", "scratch_outside"), start=1):
+                    report = doctor_git.collect(tmp_path, tier="A", now=10)
+                    assert code in _codes(report)
+                    assert len(duplicates) == count
+                    parent, fd = duplicates[-1]
+                    assert parent == borrowed
+                    with pytest.raises(OSError) as error:
+                        os.fstat(fd)
+                    assert error.value.errno == errno.EBADF
+                    assert os.path.samestat(os.fstat(borrowed), original)
+                    if fail_exit:
+                        recycled = recycled_owner.enter_context(_recycled_descriptor(fd, replacement.fileno()))
+                    fail_exit = False
+            assert os.path.samestat(os.fstat(borrowed), original)
+            assert os.path.samestat(os.fstat(recycled), os.fstat(replacement.fileno()))
+        finally:
+            os.close(borrowed)
 
 
 def test_disk_walk_refuses_closed_parent_and_retries_with_public_borrow(tmp_path, monkeypatch):
@@ -2384,7 +2418,8 @@ def test_missing_descriptor_binding_refuses_a_replaced_scratch(tmp_path, monkeyp
     assert report["disk"]["budget_slots"] is None and entered == []
 
 
-def test_scratch_validation_error_is_a_refusal_and_closes_the_descriptor(tmp_path, monkeypatch):
+@pytest.mark.parametrize("early_assertion", [False, True], ids=["refusal", "early-assertion"])
+def test_scratch_validation_error_is_a_refusal_and_closes_the_descriptor(tmp_path, monkeypatch, early_assertion):
     if not doctor_git_observe.descriptor_support():
         pytest.skip("directory descriptors unsupported")
     scratch = _outside_dir(tmp_path, "error-")
@@ -2392,24 +2427,27 @@ def test_scratch_validation_error_is_a_refusal_and_closes_the_descriptor(tmp_pat
 
     def denied(root, fd, dev, ino):
         held.append(fd)
+        if early_assertion:
+            raise AssertionError("scratch validation interrupted")
         raise OSError("password=hunter2hunter")
 
     monkeypatch.setattr(doctor_git_observe, "_scratch_env", lambda: {"AEGIS_SCRATCH": str(scratch)})
     monkeypatch.setattr(doctor_git_observe, "_scratch_ok", denied)
     monkeypatch.setattr(doctor_git, "_run_git", lambda *args: "git_missing")
-    try:
-        report = doctor_git.collect(tmp_path, tier="A", now=10)
-        assert "scratch_unsupported" in _codes(report) and "hunter2hunter" not in _blob(report)
-        assert len(held) == 1
-        with pytest.raises(OSError) as error:
-            os.fstat(held[0])
-        assert error.value.errno == 9
-    finally:
-        for fd in held:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+    with (tmp_path / "replacement").open("w+b") as replacement, ExitStack() as recycled_owner:
+        with _track_scratch_duplicates(monkeypatch):
+            if early_assertion:
+                with pytest.raises(AssertionError, match="^scratch validation interrupted$"):
+                    doctor_git.collect(tmp_path, tier="A", now=10)
+            else:
+                report = doctor_git.collect(tmp_path, tier="A", now=10)
+                assert "scratch_unsupported" in _codes(report) and "hunter2hunter" not in _blob(report)
+            assert len(held) == 1
+            with pytest.raises(OSError) as error:
+                os.fstat(held[0])
+            assert error.value.errno == errno.EBADF
+            recycled = recycled_owner.enter_context(_recycled_descriptor(held[0], replacement.fileno()))
+        assert os.path.samestat(os.fstat(recycled), os.fstat(replacement.fileno()))
 
 
 @pytest.mark.parametrize("count", [None, False, -1])
