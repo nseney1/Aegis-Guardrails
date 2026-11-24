@@ -7,7 +7,6 @@ import inspect
 import json
 import os
 from pathlib import Path, PurePosixPath
-import posixpath
 import stat
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -16,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 from aegis_core import hosts, team_host_registry, team_isolation
+from tests.helpers_isolation_catalogue import catalogue_config_parts
 
 
 IMAGE = "localhost/aegis-teams@sha256:" + "a" * 64
@@ -35,34 +35,8 @@ def verifier():
 
 
 def _catalogue_names(rows):
-    """Casefolded top-level roots of home-relative catalogue paths.
-
-    Twin of _normalized_catalogue_root in tests/unit/core/test_team_isolation.py.
-    The path is PurePosixPath(HOME).joinpath of the components after '~/', then
-    posixpath.normpath of that absolute path. HOME is /owner, the same anchor as
-    that twin. The result must be strictly below HOME. HOME itself or a path
-    outside it raises AssertionError catalogue-defect. Callers do not skip that
-    entry. The top-level root is the first component below HOME.
-    """
-    HOME = "/owner"
-    found = set()
-    for host in rows:
-        paths = host.config_paths
-        if type(paths) not in (tuple, list):
-            continue
-        for config_path in paths:
-            if type(config_path) is not str or not config_path.startswith("~/"):
-                continue
-            absolute = PurePosixPath(HOME).joinpath(*config_path[2:].split("/"))
-            normalized = PurePosixPath(posixpath.normpath(str(absolute)))
-            try:
-                below = normalized.relative_to(PurePosixPath(HOME))
-            except ValueError:
-                raise AssertionError("catalogue-defect: config path normalizes outside the home directory")
-            if not below.parts:
-                raise AssertionError("catalogue-defect: config path normalizes to the home directory")
-            found.add(below.parts[0].casefold())
-    return found
+    """Keep normalized top-level roots in their original case."""
+    return {parts[0] for parts in catalogue_config_parts(rows, "/owner")}
 
 
 def _non_teams_host(config_paths):
@@ -71,9 +45,13 @@ def _non_teams_host(config_paths):
     return dataclasses.replace(source, config_paths=tuple(config_paths))
 
 
-def facts(*paths, catalogue=None):
-    """Model descriptor observations, including a second unchanged metadata sample."""
-    from pathlib import PurePosixPath
+def _observation_names(catalogue):
+    minimum = {".ssh", ".gnupg", ".config", ".aws", ".kube", ".docker", ".netrc", ".git-credentials", ".local"}
+    exact = _catalogue_names(hosts.HOSTS if catalogue is None else catalogue)
+    return minimum | exact | {name.casefold() for name in exact}
+
+
+def _facts(paths, names):
     result = {}
     for path in paths:
         value = PurePosixPath(path)
@@ -83,12 +61,15 @@ def facts(*paths, catalogue=None):
             record = dict(device=1, inode=len(result) + 1, uid=1000, gid=1000,
                           mode=stat.S_IFDIR | 0o700, acl=None)
             result[str(part)] = dict(record, after=copy.deepcopy(record))
-    names = {".ssh", ".gnupg", ".config", ".aws", ".kube", ".docker", ".netrc", ".git-credentials", ".local"}
-    names.update(_catalogue_names(hosts.HOSTS if catalogue is None else catalogue))
     owner = next((path for path in paths if path.endswith("/home") or path == "/owner"), "/owner")
     for name in names:
         result.setdefault(owner + "/" + name, None)
     return result
+
+
+def facts(*paths, catalogue=None):
+    """Model descriptor observations, including a second unchanged metadata sample."""
+    return _facts(paths, _observation_names(catalogue))
 
 
 def plan(core, **changes):
@@ -400,10 +381,8 @@ def test_malformed_field_shapes_use_the_public_refusal_contract(core, verifier):
 
 
 def round2_facts(homes, *extra, catalogue=None):
-    observed = facts("/work/run", "/work/project", "/source", "/venv", *homes.values(), *extra,
-                     catalogue=catalogue)
-    names = {".ssh", ".gnupg", ".config", ".aws", ".kube", ".docker", ".netrc", ".git-credentials", ".local"}
-    names.update(_catalogue_names(hosts.HOSTS if catalogue is None else catalogue))
+    names = _observation_names(catalogue)
+    observed = _facts(("/work/run", "/work/project", "/source", "/venv", *homes.values(), *extra), names)
     for home in homes.values():
         for name in names:
             observed.setdefault(home + "/" + name, None)
@@ -1318,6 +1297,10 @@ def test_catalogue_entry_outside_home_is_a_catalogue_defect(config_path):
     with pytest.raises(AssertionError) as observed:
         facts("/owner", catalogue=(host,))
     assert str(observed.value) == message
+    homes = dict.fromkeys(("explicit", "ambient", "password"), "/owner")
+    with pytest.raises(AssertionError) as recorded:
+        round2_facts(homes, catalogue=(host,))
+    assert str(recorded.value) == message
 
 
 _DOTTED_NEXT = ("~/./.next-host", "~/a/../.next-host", "~//.next-host", "~///.next-host")
@@ -1333,6 +1316,7 @@ def test_dotted_catalogue_spelling_is_observed_as_the_normalized_root(spelling):
     observed = facts("/owner", catalogue=(host,))
     assert "/owner/.next-host" in observed
     assert observed["/owner/.next-host"] is None
+    assert "/owner/.NEXT-HOST" not in observed
     assert "/owner/." not in observed
     again = facts("/owner", catalogue=(host,))
     assert again["/owner/.next-host"] is None
@@ -1340,6 +1324,7 @@ def test_dotted_catalogue_spelling_is_observed_as_the_normalized_root(spelling):
     homes = dict.fromkeys(("explicit", "ambient", "password"), "/owner")
     recorded = round2_facts(homes, catalogue=(host,))
     assert recorded["/owner/.next-host"] is None
+    assert "/owner/.NEXT-HOST" not in recorded
     assert "/owner/." not in recorded
 
 
@@ -1356,8 +1341,60 @@ def test_dotted_catalogue_observations_are_isolated_under_concurrency():
             return "ok"
         return spelling
 
+    spellings = [*_DOTTED_NEXT, "~/.", "~/.."] * 3
     with ThreadPoolExecutor(max_workers=3) as pool:
-        spellings = list(_DOTTED_NEXT) * 3
-        assert list(pool.map(once, spellings)) == ["ok"] * len(spellings)
+        assert list(pool.map(once, spellings, timeout=10)) == (["ok"] * 4 + ["defect", "defect"]) * 3
+
+
+@pytest.mark.parametrize(("present", "absent"), [
+    ("/owner/.NEXT-HOST", "/owner/.next-host"),
+    ("/owner/.next-host", "/owner/.NEXT-HOST"),
+], ids=["exact-present", "folded-present"])
+def test_mixed_case_catalogue_observations_preserve_explicit_metadata(present, absent):
+    catalogue = (_non_teams_host(("~/a/../.NEXT-HOST",)),)
+    homes = {"explicit": "/owner", "ambient": "/ambient/home", "password": "/password-home"}
+    plain = facts("/owner", catalogue=catalogue)
+    assert plain["/owner/.NEXT-HOST"] is None
+    assert plain["/owner/.next-host"] is None
+
+    observed = facts("/owner", present, catalogue=catalogue)
+    assert observed[present] == facts("/owner", present, catalogue=())[present]
+    assert stat.S_ISDIR(observed[present]["mode"])
+    assert observed[absent] is None
+
+    recorded = round2_facts(homes, present, catalogue=catalogue)
+    assert recorded[present] == round2_facts(homes, present, catalogue=())[present]
+    assert stat.S_ISDIR(recorded[present]["mode"])
+    assert all(recorded[path] is None for path in (
+        absent, "/ambient/home/.NEXT-HOST", "/ambient/home/.next-host",
+        "/password-home/.NEXT-HOST", "/password-home/.next-host",
+    ))
+
+
+def test_exact_catalogue_evidence_qualifies_public_mount_plan(core):
+    catalogue = (*hosts.HOSTS, _non_teams_host(("~/a/../.NEXT-HOST",)))
+    homes = {"explicit": "/owner", "ambient": "/ambient/home", "password": "/password-home"}
+    names = core.secret_names() | {".NEXT-HOST"}
+    eligible = "/owner/eligible"
+    expected = [
+        {"source": "/owner/eligible", "destination": "/owner/eligible", "rw": True},
+        {"source": "/source", "destination": "/source", "rw": False},
+        {"source": "/venv", "destination": "/venv", "rw": False},
+        {"source": "/work/run", "destination": "/work/run", "rw": True},
+    ]
+
+    def attempt(_):
+        observed = round2_facts(homes, eligible, catalogue=catalogue)
+        assert round2_plan(core, homes, observed, project=eligible, protected_names=names) == expected
+        incomplete = dict(observed)
+        del incomplete["/ambient/home/.NEXT-HOST"]
+        assert incomplete["/ambient/home/.next-host"] is None
+        with pytest.raises(core.IsolationRefusal, match="^mount_metadata$") as refused:
+            round2_plan(core, homes, incomplete, project=eligible, protected_names=names)
+        assert refused.value.message == core.REFUSALS["mount_metadata"]
+        fresh = round2_facts(homes, eligible, catalogue=catalogue)
+        assert round2_plan(core, homes, fresh, project=eligible, protected_names=names) == expected
+
+    attempt(None)
     with ThreadPoolExecutor(max_workers=3) as pool:
-        assert list(pool.map(once, ["~/.", "~/.."] * 3)) == ["defect"] * 6
+        list(pool.map(attempt, range(6), timeout=10))
