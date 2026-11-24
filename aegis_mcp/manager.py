@@ -9,10 +9,21 @@ from .stdio_reader import MANAGER_MAX_BYTES, check_text_size
 
 __all__ = ["INSTRUCTIONS", "TOOL_DEFINITIONS", "decode_frame", "execute", "validate_call"]
 
-INSTRUCTIONS = ("Aegis manager audit prototype. Scan a management action before recording "
-                "its outcome. Audit acknowledgement grants no fitness, approval, execution, "
-                "delegation authority or native Teams enforcement. Scope and policy are "
-                "fixed by this registration; repository implementation rules remain local.")
+INSTRUCTIONS = (
+    "Aegis manager decision audit. Use this registered session for the decision.\n"
+    "1. Call aegis_list_rules to inspect the active policy. Identify the subject by its enrolled "
+    "member_id and worktree_id from the owner-approved membership.\n"
+    "2. Call aegis_scan before deciding. Scan each action in a compound decision separately. "
+    "Retain the decision_ref, action, served rule revisions, policy_digest and membership_digest "
+    "for each scan. Stop and request review on missing activation, an unavailable subject "
+    "(including an unknown enrollment), an unexpected empty match or any refusal.\n"
+    "3. Call aegis_report_outcome after the decision for each action, using its decision_ref, "
+    "only rules served by that scan and a stable idempotency_key. On retry or reconnect, send "
+    "the identical report with the same key. A new scan creates a new decision.\n"
+    "Scope and policy are fixed by the registration and owner-approved activation. "
+    "Client identity is self-reported. Audit acknowledgement grants no fitness, approval, "
+    "execution, delegation authority or native Teams enforcement. Repository implementation rules remain local."
+)
 _ACTIONS = ["delegation", "ownership", "hierarchy", "resource_budget", "checkpoint", "handoff",
             "evidence_review", "escalation", "policy_change"]
 
