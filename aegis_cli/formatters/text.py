@@ -21,8 +21,7 @@ def render_card(doc: Mapping[str, Any]) -> List[str]:
     """The day-0 card (``aegis check --card``, the end of ``aegis init``)."""
     from aegis_cli.ui.theme import diagnostic_text
     from aegis_core.card import NEXT_RULE
-    from aegis_core.verification.ast_checks import (
-        AST_SIZE_NOTE_TOOL, SIZE_RECOVERY_HINT, is_size_coverage_reason)
+    from aegis_core.verification.ast_checks import AST_SIZE_NOTE_TOOL, is_size_coverage_reason
 
     scope, rules, layer1 = doc["scope"], doc["rules"], doc["layer1"]
     lines = ["Aegis day-0 card", f"  workspace: {scope['workspace']}"]
@@ -82,7 +81,7 @@ def render_card(doc: Mapping[str, Any]) -> List[str]:
         if isinstance(not_analyzed, (list, tuple)) and any(
                 isinstance(item, Mapping) and is_size_coverage_reason(item.get("reason"))
                 for item in not_analyzed):
-            lines.append("    " + diagnostic_text(SIZE_RECOVERY_HINT, 300))
+            lines.append("    Check the original source before bundling, or reduce the file size and check again.")
     if doc["top_files"]:
         lines.append("  files with the most findings:")
         lines.extend(f"    {row['findings']:>5}  {row['path']}" for row in doc["top_files"])

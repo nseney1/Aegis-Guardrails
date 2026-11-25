@@ -71,6 +71,25 @@ lexical ambiguity and unterminated tokens fail closed. TS type assertions and
 generics are distinguished from JSX by extension/context. A valid parse does not
 prove that every compiler-valid construct has a semantic model.
 
+In a `.tsx` file, plain JSX text that looks like the start of a generic signature
+can trigger `unsupported_lexical_context:tsx_generic_or_jsx`. For example, Aegis
+refuses this element with plain text.
+
+```tsx
+const label = <b>(1) item</b>;
+show(label);
+```
+
+Wrap the text in a JSX string expression to display the same `(1) item` text.
+Aegis can then see the call that follows the element.
+
+```tsx
+const label = <b>{"(1) item"}</b>;
+show(label);
+```
+
+Save the change and rerun `aegis check`.
+
 Literal computed members such as `obj['exec']()` are recognized. Arbitrary computed
 targets, assignment-based aliasing, `getattr`, `eval.call`, `eval.apply`,
 `Reflect.apply`, runtime import resolution and non-Python lexical shadowing are
