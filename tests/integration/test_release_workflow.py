@@ -1052,6 +1052,65 @@ def test_verify_refuses_an_overlong_digest_line_without_its_tail(tmp_path):
     assert proc.stderr.count("\n") == 1
 
 
+def test_verify_bounds_unexpected_manifest_rows_and_checks_the_last_line(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    dist = _dist(tmp_path)
+    _write_sums(dist)
+    sums = dist / "SHA256SUMS"
+    original = sums.read_bytes()
+    sdist, wheel = original.splitlines(keepends=True)
+    missing = sdist.decode("ascii").strip().split("  ", 1)[1]
+    prefix = "x" * 219 + "-"
+    name = prefix + "token=" + "s" * 24
+    extra_names = [name] + [f"extra-{index:04d}" for index in range(1024)] + [name, name]
+    extras = b"".join(("a" * 64 + "  " + extra + "\n").encode("ascii") for extra in extra_names)
+    manifest = wheel + extras
+    malformed = manifest + b"\xff\n"
+    sums.write_bytes(malformed)
+    refused = _verify("verify", str(dist))
+    assert (refused.returncode, refused.stdout, refused.stderr) == (
+        1, "", "verify_dist: refused dist name: member-sha256=unavailable\n")
+    assert sums.read_bytes() == malformed
+
+    sums.write_bytes(manifest)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: _verify("verify", str(dist)), range(2)))
+    expected = (
+        ' do not match SHA256SUMS: missing=["' + missing + '"], '
+        f'unexpected={len(extra_names)}, sample=["{prefix}[REDACTED]", '
+        '"extra-0000", "extra-0001", "extra-0002", "extra-0003"], '
+        f'omitted={len(extra_names) - 5}\n'
+    )
+    for refused in results:
+        assert (refused.returncode, refused.stdout) == (1, "")
+        assert len(refused.stderr) < 512
+        assert refused.stderr.endswith(expected)
+    assert sums.read_bytes() == manifest
+
+    sums.write_bytes(original)
+    accepted = _verify("verify", str(dist))
+    assert (accepted.returncode, accepted.stderr) == (0, "")
+    assert accepted.stdout.splitlines() == sorted(str(path) for path in dist.iterdir() if path != sums)
+
+
+def test_verify_uses_last_digest_for_each_expected_name(tmp_path):
+    dist = _dist(tmp_path)
+    _write_sums(dist)
+    sums = dist / "SHA256SUMS"
+    original = sums.read_bytes()
+    incorrect = b"".join(b"0" * 64 + row[64:] for row in original.splitlines(keepends=True))
+    sums.write_bytes(original + incorrect)
+    refused = _verify("verify", str(dist))
+    assert (refused.returncode, refused.stdout) == (1, "")
+    assert refused.stderr.endswith(" != recorded " + "0" * 64 + "\n")
+
+    sums.write_bytes(incorrect + original)
+    accepted = _verify("verify", str(dist))
+    assert (accepted.returncode, accepted.stderr) == (0, "")
+    assert accepted.stdout.splitlines() == sorted(str(path) for path in dist.iterdir() if path != sums)
+
+
 def test_concurrent_team_template_records_do_not_cross_wires(tmp_path):
     from concurrent.futures import ThreadPoolExecutor
 
@@ -2164,6 +2223,41 @@ def test_dist_inventory_caps_sample_and_preserves_release_stdout(tmp_path):
     verified = _verify("verify", str(dist))
     assert verified.returncode == 0 and verified.stderr == ""
     assert verified.stdout.splitlines() == paths
+
+
+def test_dist_inventory_reserves_a_slot_for_the_first_irregular_name(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    dist = _dist(tmp_path)
+    _write_sums(dist)
+    sums = dist / "SHA256SUMS"
+    original = sums.read_bytes()
+    paths = sorted(str(path) for path in dist.iterdir() if path != sums)
+    later = dist / "zz-extra.whl"
+    first = dist / ("z-token=" + "s" * 24 + ".tar.gz")
+    later.mkdir()
+    decoys = [dist / f"{index:02d}-extra.whl" for index in range(6)]
+    for decoy in reversed(decoys):
+        decoy.touch()
+    first.mkdir()
+    sample = ", ".join(f'wheel file "{decoy.name}"' for decoy in decoys[:4])
+    prefix = "verify_dist: expected exactly one wheel and one sdist, found wheels=7, sdists=1, "
+    for irregular, shown, removed in (
+        (2, 'sdist directory "z-[REDACTED]"', first),
+        (1, 'wheel directory "zz-extra.whl"', later),
+    ):
+        expected = prefix + f"irregular={irregular}, sample=[{sample}, {shown}], omitted={3 + irregular}\n"
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda command: _verify(command, str(dist)), ("record", "verify")))
+        for refused in results:
+            assert (refused.returncode, refused.stdout, refused.stderr) == (1, "", expected)
+        assert sums.read_bytes() == original
+        removed.rmdir()
+
+    for decoy in decoys:
+        decoy.unlink()
+    accepted = _verify("verify", str(dist))
+    assert (accepted.returncode, accepted.stderr, accepted.stdout.splitlines()) == (0, "", paths)
 
 
 def test_dist_inventory_quotes_a_delimiter_bearing_filename(tmp_path):
