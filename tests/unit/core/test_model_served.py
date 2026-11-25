@@ -1,6 +1,7 @@
 """Served receipts through public selection, observation and replay surfaces."""
 import copy
 import errno
+import hashlib
 import json
 import os
 import stat
@@ -67,6 +68,787 @@ def make_store(tmp_path, original):
     path = tmp_path / "receipts.jsonl"
     selection.append_decision(path, original)
     return path
+
+
+def probe_report(record):
+    return {"decision_id": record["decision_id"], "provenance": "runtime-receipt",
+            **{key: record["choice"][key] for key in ("host", "model", "level", "family")}}
+
+
+def marked_receipt(stage):
+    return {**stage, "outcome": {"served": chosen(stage), "probe_readback": {
+        "decision_id": stage["decision_id"], "registry_id": stage["registry_id"], "provenance": "runtime-receipt"}}}
+
+
+def reidentify(record):
+    immutable = {key: value for key, value in record.items() if key not in ("outcome", "decision_id")}
+    record["decision_id"] = hashlib.sha256(json.dumps(
+        immutable, sort_keys=True, separators=(",", ":")).encode("ascii")).hexdigest()
+
+
+def write_history(path, rows):
+    path.write_bytes(b"".join(
+        (json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii") for row in rows))
+
+
+def audit_readback(path, bindings, stage, host_kinds=("host-a", "host-b")):
+    with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+        core.admit_probe(path, bindings, stage["decision_id"], probe_report(stage), host_kinds=host_kinds)
+    return marked_receipt(stage)
+
+
+def stage_probe(tmp_path, scenario, original):
+    if os.name != "posix" or not confined_descriptor_supported():
+        pytest.skip("descriptor-relative no-follow decision logs required")
+    bindings, policy = scenario
+    path = tmp_path / "receipts.jsonl"
+    _, attempt = selection.select_and_append(path, bindings, policy, original["task_kind"], original["role_kind"],
+                                             subject=original["subject"], author_family=original["author_family"],
+                                             host_kinds=("host-a", "host-b"), probe_attempt=True)
+    return path, attempt
+
+
+def historical_probe(tmp_path, scenario, original, *, unbound=False):
+    path, stage = stage_probe(tmp_path, scenario, original)
+    stage.pop("counts_scope", None)
+    reidentify(stage)
+    receipt = marked_receipt(stage)
+    if unbound:
+        receipt["outcome"]["probe_readback"].pop("decision_id")
+    launch = {**stage, "outcome": {"launch_status": "launched", "registry_id": stage["registry_id"]}}
+    write_history(path, (stage, receipt, launch))
+    return path, stage, receipt, launch
+
+
+@pytest.mark.parametrize("wrong_host", [False, True])
+def test_generic_append_cannot_originate_a_probe_stage(tmp_path, scenario, original, wrong_host):
+    path = make_store(tmp_path, original)
+    stage = choose(scenario, [original], probe_attempt=True)
+    if wrong_host:
+        assert stage["choice"]["family"] != original["choice"]["family"]
+        stage["choice"].update(host=original["choice"]["host"], model=original["choice"]["model"])
+        reidentify(stage)
+    before = path.read_bytes()
+    bindings, _ = scenario
+    with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+        selection.append_decision(path, stage, probe_bindings=(bindings, ("host-a", "host-b")))
+    with pytest.raises(selection.ModelSelectionError, match="^unknown_decision_id$"):
+        selection.append_decision(path, None, known_decision=stage["decision_id"], prepare=lambda _: stage)
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("entry", ["admit", "direct", "prepared"])
+def test_exact_probe_evidence_is_audited_once_and_never_grants(tmp_path, scenario, original, entry):
+    path, stage = stage_probe(tmp_path, scenario, original)
+    bindings, _ = scenario
+    hosts = ("host-a", "host-b")
+    identity, receipt = stage["decision_id"], marked_receipt(stage)
+    for _ in range(2):
+        with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+            if entry == "admit":
+                core.admit_probe(path, bindings, identity, probe_report(stage), host_kinds=hosts)
+            elif entry == "direct":
+                selection.append_decision(path, receipt, probe_bindings=(bindings, hosts))
+            else:
+                selection.append_decision(path, None, known_decision=identity, prepare=lambda _: receipt,
+                                          probe_bindings=(bindings, hosts))
+    assert list(selection.read_decisions(path)) == [stage, receipt]
+    assert core.served_of(selection.read_decisions(path), identity, probe_bindings=(bindings, hosts)) is None
+
+
+@pytest.mark.parametrize("limit", ["MAX_HISTORY_RECORDS", "MAX_HISTORY_BYTES"])
+def test_full_probe_audit_preserves_bytes_and_cannot_grant(tmp_path, scenario, original, monkeypatch, limit):
+    path, stage = stage_probe(tmp_path, scenario, original)
+    bindings, _ = scenario
+    hosts = ("host-a", "host-b")
+    receipt = marked_receipt(stage)
+    write_history(path, (stage, receipt))
+    before = path.read_bytes()
+    if limit == "MAX_HISTORY_RECORDS":
+        monkeypatch.setattr(selection, "MAX_HISTORY_RECORDS", 2)
+    else:
+        monkeypatch.setattr(selection, "MAX_HISTORY_BYTES", len(before))
+    report = probe_report(stage)
+    for _ in range(2):
+        with pytest.raises(selection.ModelSelectionError, match="^history_limit_exceeded: archive_or_rotate"):
+            core.admit_probe(path, bindings, stage["decision_id"], {**report, "model": "different"}, host_kinds=hosts)
+        with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+            core.admit_probe(path, bindings, stage["decision_id"], report, host_kinds=hosts)
+    assert path.read_bytes() == before
+    assert core.served_of(selection.read_decisions(path), stage["decision_id"], probe_bindings=(bindings, hosts)) is None
+
+
+def test_probe_stage_uses_the_ordered_host_of_its_policy_family(scenario):
+    bindings, policy = scenario
+    bindings["hosts"].append({**bindings["hosts"][0], "host": "host-next", "model": "model-next"})
+    policy["family_hosts"]["alpha"].insert(0, "host-next")
+    choice, stage = selection.select_model(bindings, policy, "T9", "implementer", [],
+                                           host_kinds=("host-a", "host-b", "host-next"), subject="first",
+                                           probe_attempt=True)
+    assert (choice["family"], choice["host"], choice["model"]) == ("alpha", "host-next", "model-next")
+    assert stage["admission"] == "unprobed"
+    assert stage["outcome"] == {"launch_status": "not_launched"}
+
+
+@pytest.mark.parametrize("task,role", [("T1", "orchestrator"), ("T1", "decider"), ("T2", "implementer"),
+                                      ("T2", "integrator"), ("T4", "reviewer")])
+def test_staged_probe_uses_changed_binding_for_all_roles(tmp_path, scenario, task, role):
+    bindings, policy = scenario
+    hosts = ("host-a", "host-b")
+    before = selection.select_model(bindings, policy, task, role, [], subject="first-attempt",
+                                    author_family="alpha", host_kinds=hosts)[1]
+    make_store(tmp_path, before)
+    path, before = stage_probe(tmp_path, scenario, before)
+    for row in bindings["hosts"]:
+        row["model"] += "-next"
+        row["levels"]["deep"] = "medium"
+    binding_file, profile_file = tmp_path / "bindings.json", tmp_path / "profile.json"
+    binding_file.write_text(json.dumps(bindings), encoding="utf-8")
+    profile_file.write_text(json.dumps(policy), encoding="utf-8")
+    _, attempt = selection.select_and_append(path, binding_file, profile_file, task, role,
+                                            subject="next-attempt", author_family="alpha", host_kinds=hosts,
+                                            probe_attempt=True)
+    prior_receipt = audit_readback(path, binding_file, before, hosts)
+    report = probe_report(attempt)
+    result = audit_readback(path, binding_file, attempt, hosts)
+    assert result["choice"]["host"] == before["choice"]["host"] == report["host"]
+    assert result["choice"]["model"] == before["choice"]["model"] + "-next" == report["model"]
+    assert result["choice"]["level"] == report["level"] == "medium"
+    assert attempt["admission"] == "unprobed"
+    assert result["outcome"] == {"served": chosen(attempt), "probe_readback": {
+        "decision_id": attempt["decision_id"], "provenance": "runtime-receipt",
+        "registry_id": attempt["registry_id"]}}
+    stored = list(selection.read_decisions(path))
+    assert stored[0]["admission"] == "admitted"
+    assert stored[-2:] == [prior_receipt, result]
+
+
+@pytest.mark.parametrize("field,value,error", [
+    (None, None, "probe_readback_missing"), (None, {}, "invalid_probe_readback"),
+    ("decision_id", "0" * 64, "probe_readback_mismatch"),
+    ("model", "different", "probe_readback_mismatch"), ("level", "max", "probe_readback_mismatch"),
+    ("host", "host-b", "probe_readback_mismatch"), ("family", "beta", "probe_readback_mismatch"),
+    ("provenance", "receipt\nforged", "invalid_probe_readback"),
+    ("provenance", "x" * 129, "invalid_probe_readback"),
+])
+def test_bad_probe_readback_records_only_same_attempt_contradictions(tmp_path, scenario, original,
+                                                                   field, value, error):
+    path, original = stage_probe(tmp_path, scenario, original)
+    bindings, _ = scenario
+    report = value if field is None else {**probe_report(original), field: value}
+    before = path.read_bytes()
+
+    def refuse(_):
+        with pytest.raises(selection.ModelSelectionError, match="^" + error + "$"):
+            core.admit_probe(path, bindings, original["decision_id"], report, host_kinds=("host-a", "host-b"))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(refuse, range(2), timeout=10))
+    refuse(None)
+    if field in ("model", "level", "host", "family"):
+        staged, audit = list(selection.read_decisions(path))
+        assert staged == original
+        assert audit["outcome"]["served"][field] == value
+        assert audit["outcome"]["probe_readback"]["decision_id"] == original["decision_id"]
+        with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+            core.admit_probe(path, bindings, original["decision_id"], probe_report(original),
+                             host_kinds=("host-a", "host-b"))
+    else:
+        assert path.read_bytes() == before
+
+
+def test_exact_probe_audit_is_written_once_under_concurrency(tmp_path, scenario, original):
+    path, original = stage_probe(tmp_path, scenario, original)
+    bindings, _ = scenario
+    def admit(_):
+        return audit_readback(path, bindings, original)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, replay = pool.map(admit, range(2), timeout=10)
+    assert first == replay
+    before = path.read_bytes()
+    assert admit(None) == first
+    assert path.read_bytes() == before
+    rows = list(selection.read_decisions(path))
+    assert len(rows) == 2
+    assert rows[-1] == first
+    assert core.served_of(rows, original["decision_id"], probe_bindings=(bindings, ("host-a", "host-b"))) is None
+    assert sum(choose(scenario, rows)["counts_before"].values()) == 0
+
+
+def test_peer_publication_before_probe_lock_uses_current_snapshot(tmp_path, scenario, original, monkeypatch):
+    path, stage = stage_probe(tmp_path, scenario, original)
+    replacement = tmp_path / "peer-publication"
+    receipt = marked_receipt(stage)
+    write_history(replacement, [stage, receipt])
+    same_file, file_lock = selection._same_file, selection.file_lock
+
+    def publish_peer():
+        if replacement.exists():
+            replacement.replace(path)
+
+    def compare_after_peer(name, descriptor, directory):
+        if name == path.name:
+            publish_peer()
+        return same_file(name, descriptor, directory)
+
+    def lock_after_peer(name, *, timeout, dir_fd):
+        publish_peer()
+        return file_lock(name, timeout=timeout, dir_fd=dir_fd)
+
+    monkeypatch.setattr(selection, "_same_file", compare_after_peer)
+    monkeypatch.setattr(selection, "file_lock", lock_after_peer)
+    report = {**probe_report(stage), "model": "different"}
+    with pytest.raises(selection.ModelSelectionError, match="^probe_readback_mismatch$"):
+        core.admit_probe(path, scenario[0], stage["decision_id"], report, host_kinds=("host-a", "host-b"))
+    staged, observed, conflict = selection.read_decisions(path)
+    assert (staged, observed) == (stage, receipt)
+    assert conflict["outcome"]["served"]["model"] == "different"
+
+
+@pytest.mark.parametrize("known", [False, True])
+def test_probe_receipt_cannot_be_transplanted_by_either_append_form(tmp_path, scenario, original, known):
+    path, attempt = stage_probe(tmp_path, scenario, original)
+    bindings, policy = scenario
+    hosts = ("host-a", "host-b")
+    proof = audit_readback(path, bindings, attempt, hosts)
+    _, other = selection.select_and_append(path, bindings, policy, "T9", "implementer",
+                                          subject="other", host_kinds=hosts, probe_attempt=True)
+    pending = {**other, "outcome": proof["outcome"]}
+    before = path.read_bytes()
+    with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+        if known:
+            selection.append_decision(path, None, known_decision=other["decision_id"],
+                                      prepare=lambda _: pending, probe_bindings=(bindings, hosts))
+        else:
+            selection.append_decision(path, pending, probe_bindings=(bindings, hosts))
+    assert path.read_bytes() == before
+    assert audit_readback(path, bindings, other, hosts) == list(selection.read_decisions(path))[-1]
+
+
+@pytest.mark.parametrize("entry", ["direct", "prepared", "admit"])
+@pytest.mark.parametrize("launched", [False, True])
+def test_probe_provenance_conflict_persists_once_and_blocks_retries(tmp_path, scenario, original, entry, launched):
+    bindings, _ = scenario
+    hosts = ("host-a", "host-b")
+    if launched:
+        path, attempt, proof, launch = historical_probe(tmp_path, scenario, original)
+    else:
+        path, attempt = stage_probe(tmp_path, scenario, original)
+        proof = audit_readback(path, bindings, attempt, hosts)
+        launch = {**attempt, "outcome": {"launch_status": "launched", "registry_id": attempt["registry_id"]}}
+    identity, report = attempt["decision_id"], probe_report(attempt)
+    baseline = list(selection.read_decisions(path))
+    conflict = copy.deepcopy(proof)
+    conflict["outcome"]["probe_readback"]["provenance"] = "different-receipt"
+
+    def refuse(_):
+        with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+            if entry == "admit":
+                core.admit_probe(path, bindings, identity, {**report, "provenance": "different-receipt"},
+                                 host_kinds=hosts)
+            elif entry == "prepared":
+                selection.append_decision(path, None, known_decision=identity, prepare=lambda _: conflict,
+                                          probe_bindings=(bindings, hosts))
+            else:
+                selection.append_decision(path, conflict, probe_bindings=(bindings, hosts))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(refuse, range(2), timeout=10))
+    assert list(selection.read_decisions(path)) == [*baseline, conflict]
+    core.observe_served(path, identity, chosen(attempt))
+    with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+        core.admit_probe(path, bindings, identity, report, host_kinds=hosts)
+    with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+        selection.append_decision(path, launch, probe_bindings=(bindings, hosts))
+    assert sum(choose(scenario, selection.read_decisions(path))["counts_before"].values()) == 0
+
+
+@pytest.mark.parametrize("entry", ["admit", "direct", "prepared"])
+@pytest.mark.parametrize("field", ["model", "provenance"])
+def test_drift_preserves_contradictions_across_registry_restoration(tmp_path, scenario, original, entry, field):
+    path, stage, proof, launch = historical_probe(tmp_path, scenario, original)
+    bindings, _ = scenario
+    hosts = ("host-a", "host-b")
+    identity, report = stage["decision_id"], probe_report(stage)
+    before = list(selection.read_decisions(path))
+    changed = copy.deepcopy(bindings)
+    changed["hosts"][1]["model"] += "-next"
+    pending = copy.deepcopy(proof)
+    target = "served" if field == "model" else "probe_readback"
+    pending["outcome"][target][field] = "different"
+    refusal = "probe_readback_mismatch" if entry == "admit" and field == "model" else "decision_outcome_conflict"
+
+    def contradict(_):
+        with pytest.raises(selection.ModelSelectionError, match="^" + refusal + "$"):
+            if entry == "admit":
+                core.admit_probe(path, changed, identity, {**report, field: "different"}, host_kinds=hosts)
+            elif entry == "direct":
+                selection.append_decision(path, pending, probe_bindings=(changed, hosts))
+            else:
+                selection.append_decision(path, None, known_decision=identity, prepare=lambda _: pending,
+                                          probe_bindings=(changed, hosts))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(contradict, range(2), timeout=10))
+    assert list(selection.read_decisions(path)) == [*before, pending]
+    for current in (changed, bindings):
+        with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+            core.admit_probe(path, current, identity, report, host_kinds=hosts)
+        with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+            selection.append_decision(path, launch, probe_bindings=(current, hosts))
+        with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+            core.served_of(selection.read_decisions(path), identity, probe_bindings=(current, hosts))
+        assert sum(choose((current, scenario[1]), selection.read_decisions(path))["counts_before"].values()) == 0
+
+
+@pytest.mark.parametrize("container", [list, tuple, iter])
+def test_unbound_stage_metadata_cannot_project_as_ordinary(scenario, container):
+    stage = choose(scenario, probe_attempt=True)
+    stage.pop("probe_id")
+    rows = [stage, observation(stage, chosen(stage))]
+    with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+        core.served_of(container(rows), stage["decision_id"])
+
+
+def foreign_readback(original, *, launched=False):
+    outcome = {"probe_readback": {"decision_id": "0" * 64}, "served": chosen(original)}
+    if launched:
+        outcome["launch_status"] = "launched"
+    return {**original, "outcome": outcome}
+
+
+@pytest.mark.parametrize("entry", ["direct", "prepared"])
+def test_foreign_marked_readback_cannot_count_as_ordinary_launch(tmp_path, original, entry):
+    path = make_store(tmp_path, {**original, "outcome": {"launch_status": "not_launched"}})
+    pending = foreign_readback(original, launched=True)
+    before = path.read_bytes()
+    with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+        if entry == "direct":
+            selection.append_decision(path, pending)
+        else:
+            selection.append_decision(path, None, known_decision=original["decision_id"], prepare=lambda _: pending)
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("container", [list, tuple, iter])
+def test_foreign_marked_readback_refuses_ordinary_accounting(scenario, original, container):
+    with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+        choose(scenario, container([foreign_readback(original)]))
+
+
+@pytest.mark.parametrize("include_scope", [False, True])
+@pytest.mark.parametrize("surface", ["append", "disk", "list", "tuple", "iterator", "projection"])
+def test_stage_counts_derive_from_stage_registry(tmp_path, scenario, original, include_scope, surface):
+    path, stage, _, _ = historical_probe(tmp_path, scenario, original)
+    bindings, _ = scenario
+    hosts = ("host-a", "host-b")
+    rows = list(selection.read_decisions(path))
+    changed = copy.deepcopy(bindings)
+    changed["hosts"][1]["model"] += "-next"
+    current = (changed, scenario[1])
+    forged = choose(current, rows, probe_attempt=True)
+    assert forged["choice"]["family"] == "alpha"
+    if include_scope:
+        forged.pop("counts_scope")
+        forged["counts_registry_id"] = stage["registry_id"]
+    forged["counts_before"] = {"alpha": 1, "beta": 0}
+    forged["choice"].update(family="beta", host="host-b", model=changed["hosts"][1]["model"])
+    reidentify(forged)
+    refusal = "^decision_outcome_conflict$" if surface in ("append", "projection") else "^invalid_history:counts_before:"
+    with pytest.raises(selection.ModelSelectionError, match=refusal):
+        if surface == "append":
+            selection.append_decision(path, forged, probe_bindings=(changed, hosts))
+        elif surface == "disk":
+            with path.open("ab") as stream:
+                stream.write((json.dumps(forged, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii"))
+            list(selection.read_decisions(path))
+        elif surface == "projection":
+            receipt = {**forged, "outcome": {"served": chosen(forged), "probe_readback": {
+                "decision_id": forged["decision_id"], "registry_id": forged["registry_id"],
+                "provenance": "different-run"}}}
+            core.served_of(iter([*rows, forged, receipt]), forged["decision_id"], probe_bindings=(changed, hosts))
+        else:
+            container = {"list": list, "tuple": tuple, "iterator": iter}[surface]
+            choose(current, container([*rows, forged]))
+
+
+@pytest.mark.parametrize("container", [list, tuple, iter])
+@pytest.mark.parametrize("with_stage", [False, True])
+def test_unmarked_prefix_never_establishes_or_hides_probe_staging(tmp_path, scenario, original, container, with_stage):
+    path, attempt = stage_probe(tmp_path, scenario, original)
+    bindings, _ = scenario
+    hosts = ("host-a", "host-b")
+    identity = attempt["decision_id"]
+    prefix = observation({key: value for key, value in attempt.items() if key != "probe_id"}, fallback())
+    proof = audit_readback(path, bindings, attempt, hosts)
+    rows = [prefix, attempt, proof] if with_stage else [prefix, proof]
+    with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+        core.served_of(container(rows), identity)
+
+
+@pytest.mark.parametrize("replay", [False, True])
+def test_registry_replacement_during_audit_write_or_retry(tmp_path, scenario, original, monkeypatch, replay):
+    path, attempt = stage_probe(tmp_path, scenario, original)
+    bindings, _ = scenario
+    hosts = ("host-a", "host-b")
+    binding_file, replacement = tmp_path / "bindings.json", tmp_path / "next.json"
+    binding_file.write_text(json.dumps(bindings), encoding="utf-8")
+    changed = copy.deepcopy(bindings)
+    changed["hosts"][1]["model"] += "-next"
+    replacement.write_text(json.dumps(changed), encoding="utf-8")
+    identity = attempt["decision_id"]
+    if replay:
+        audit_readback(path, binding_file, attempt, hosts)
+    before = path.read_bytes()
+    check = selection._check_log_generation
+
+    def replace_bindings(name, directory, generation):
+        if replacement.exists():
+            replacement.replace(binding_file)
+        check(name, directory, generation)
+
+    monkeypatch.setattr(selection, "_check_log_generation", replace_bindings)
+    receipt = audit_readback(path, binding_file, attempt, hosts)
+    assert not replacement.exists()
+    assert (path.read_bytes() == before) is replay
+    assert list(selection.read_decisions(path)) == [attempt, receipt]
+    assert core.served_of(selection.read_decisions(path), identity) is None
+    assert core.served_of(selection.read_decisions(path), identity, probe_bindings=(binding_file, hosts)) is None
+    assert core.served_of(selection.read_decisions(path), identity, probe_bindings=(bindings, hosts)) is None
+
+
+def test_historical_launch_keeps_audit_counts_but_never_affects_selection(tmp_path, scenario, original):
+    path, stage, receipt, launch = historical_probe(tmp_path, scenario, original)
+    bindings, policy = scenario
+    hosts = ("host-a", "host-b")
+    historical = {**original, "counts_before": {"alpha": 1, "beta": 0},
+                  "previous_decision_id": stage["decision_id"], "outcome": {"launch_status": "not_launched"}}
+    historical["choice"] = {**original["choice"], "host": "host-b", "model": "model-b", "family": "beta"}
+    reidentify(historical)
+    rows = [stage, receipt, launch, historical]
+    write_history(path, rows)
+    assert list(selection.read_decisions(path)) == rows
+    changed = copy.deepcopy(bindings)
+    changed["hosts"][1]["model"] += "-next"
+    for current in (bindings, changed, bindings):
+        for history in (rows, tuple(rows), iter(rows), selection.read_decisions(path)):
+            next_record = choose((current, policy), history)
+            assert next_record["counts_before"] == {"alpha": 0, "beta": 0}
+            assert next_record["choice"]["family"] == "alpha"
+    for history in (rows, tuple(rows), iter(rows), selection.read_decisions(path)):
+        assert core.served_of(history, stage["decision_id"], probe_bindings=(bindings, hosts)) is None
+    _, probe = selection.select_and_append(path, bindings, policy, "T9", "implementer",
+                                          subject="next-a", host_kinds=hosts, probe_attempt=True)
+    _, ordinary = selection.select_and_append(path, changed, policy, "T9", "implementer",
+                                             subject="next-b", host_kinds=hosts)
+    assert probe["counts_before"] == ordinary["counts_before"] == {"alpha": 0, "beta": 0}
+    assert probe["counts_scope"] == ordinary["counts_scope"] == "ordinary"
+    assert list(selection.read_decisions(path)) == [*rows, probe, ordinary]
+    assert sum(choose(scenario, selection.read_decisions(path))["counts_before"].values()) == 1
+
+
+@pytest.mark.parametrize("known", [False, True])
+@pytest.mark.parametrize("revision", ["staged", "different", "absent"])
+def test_duplicate_stage_is_idempotent_for_historical_attempts(tmp_path, scenario, original, known, revision):
+    path, attempt, receipt, launch = historical_probe(tmp_path, scenario, original)
+    bindings, _ = scenario
+    hosts = ("host-a", "host-b")
+    changed = copy.deepcopy(bindings)
+    changed["hosts"][1]["model"] += "-next"
+    source = {"staged": (bindings, hosts), "different": (changed, hosts), "absent": None}[revision]
+    identity = attempt["decision_id"]
+    before = path.read_bytes()
+    for _ in range(2):
+        if known:
+            selection.append_decision(path, None, known_decision=identity, prepare=lambda _: attempt,
+                                      probe_bindings=source)
+        else:
+            selection.append_decision(path, attempt, probe_bindings=source)
+    assert path.read_bytes() == before
+    assert list(selection.read_decisions(path)) == [attempt, receipt, launch]
+    assert sum(choose(scenario, selection.read_decisions(path))["counts_before"].values()) == 0
+
+
+def test_historical_stage_reset_keeps_later_audit_rows_readable(tmp_path, scenario, original):
+    path, stage, receipt, launch = historical_probe(tmp_path, scenario, original)
+    following = {**original, "previous_decision_id": stage["decision_id"]}
+    reidentify(following)
+    rows = [stage, receipt, launch, stage, following]
+    write_history(path, rows)
+    assert list(selection.read_decisions(path)) == rows
+    assert choose(scenario, iter(rows))["counts_before"] == {"alpha": 1, "beta": 0}
+
+
+def test_legacy_unbound_receipt_and_launch_stay_in_audit_without_qualification(tmp_path, scenario, original):
+    path, attempt, receipt, launch = historical_probe(tmp_path, scenario, original, unbound=True)
+    bindings, _ = scenario
+    hosts = ("host-a", "host-b")
+    identity = attempt["decision_id"]
+    rows = list(selection.read_decisions(path))
+    assert rows == [attempt, receipt, launch]
+    assert core.served_of(iter(rows), identity, probe_bindings=(bindings, hosts)) is None
+    assert sum(choose(scenario, rows)["counts_before"].values()) == 0
+    with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+        core.admit_probe(path, bindings, identity, probe_report(attempt), host_kinds=hosts)
+    with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+        selection.append_decision(path, launch, probe_bindings=(bindings, hosts))
+    assert list(selection.read_decisions(path)) == rows
+
+
+def test_probe_promotion_cannot_reuse_an_older_attempt(tmp_path, scenario, original):
+    path, original = stage_probe(tmp_path, scenario, original)
+    # The same request in a different log generation is still a distinct attempt.
+    path.write_bytes(b"")
+    _, current = stage_probe(tmp_path, scenario, original)
+    bindings, _ = scenario
+    hosts = ("host-a", "host-b")
+    stale_report = probe_report(original)
+    assert all(stale_report[key] == current["choice"][key] for key in ("host", "model", "level", "family"))
+    before = path.read_bytes()
+    with pytest.raises(selection.ModelSelectionError, match="^probe_readback_mismatch$"):
+        core.admit_probe(path, bindings, current["decision_id"], stale_report, host_kinds=hosts)
+    assert path.read_bytes() == before
+    assert audit_readback(path, bindings, current, hosts) == list(selection.read_decisions(path))[-1]
+
+
+def test_exact_readback_remains_audit_for_an_offered_unprobed_endpoint(tmp_path, scenario, original):
+    bindings, _ = scenario
+    host_row = next(row for row in bindings["hosts"] if row["host"] == original["choice"]["host"])
+    host_row["admission"][original["intent"]] = "unprobed"
+    path, attempt = stage_probe(tmp_path, scenario, original)
+    assert attempt["admission"] == "unprobed"
+    receipt = audit_readback(path, bindings, attempt)
+    assert list(selection.read_decisions(path)) == [attempt, receipt]
+    assert core.served_of([attempt, receipt], attempt["decision_id"], probe_bindings=(bindings, ("host-a", "host-b"))) is None
+
+
+def test_probe_history_projection_requires_proof_for_the_original_revision(tmp_path, scenario, original):
+    path, attempt = stage_probe(tmp_path, scenario, original)
+    bindings, _ = scenario
+    identity = attempt["decision_id"]
+    receipt = core.observe_served(path, identity, chosen(attempt))
+    assert core.served_of([attempt, receipt], identity) is None
+    proof = audit_readback(path, bindings, attempt)
+    changed = {**proof, "registry_id": "f" * 64}
+    changed["outcome"] = {**proof["outcome"], "probe_readback": {
+        **proof["outcome"]["probe_readback"], "registry_id": "f" * 64}}
+    with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+        core.served_of([attempt, receipt, changed], identity)
+
+
+@pytest.mark.parametrize("reported", [False, True])
+def test_conflicting_observations_survive_and_block_probe_replay(tmp_path, scenario, original, reported):
+    path, attempt = stage_probe(tmp_path, scenario, original)
+    bindings, _ = scenario
+    identity = attempt["decision_id"]
+    report = probe_report(attempt)
+
+    def promote(_):
+        return core.admit_probe(path, bindings, identity, report, host_kinds=("host-a", "host-b"))
+
+    if reported:
+        audit_readback(path, bindings, attempt)
+    conflict = core.observe_served(path, identity, fallback())
+    before = path.read_bytes()
+
+    def refuse(_):
+        with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+            promote(None)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(refuse, range(2), timeout=10))
+    refuse(None)
+    rows = list(selection.read_decisions(path))
+    assert rows[-1] == conflict
+    with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+        core.served_of(rows, identity)
+    assert sum(choose(scenario, rows)["counts_before"].values()) == 0
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("known", [False, True])
+@pytest.mark.parametrize("outcome", [{"launch_status": "launched"}, {"probe_readback": {}},
+                                     {"probe_readback": {"provenance": "runner"}, "served": fallback()}])
+def test_both_append_forms_refuse_unproven_transitions(tmp_path, scenario, original, known, outcome):
+    path, attempt = stage_probe(tmp_path, scenario, original)
+    before = path.read_bytes()
+    pending = {**attempt, "outcome": outcome}
+    for _ in range(2):
+        with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+            if known:
+                selection.append_decision(path, None, known_decision=attempt["decision_id"],
+                                          prepare=lambda _: pending)
+            else:
+                selection.append_decision(path, pending)
+    assert path.read_bytes() == before
+    # A raw history row cannot bypass the same checks either.
+    with path.open("ab") as stream:
+        stream.write((json.dumps(pending, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii"))
+    with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+        list(selection.read_decisions(path))
+
+
+def test_registry_restoration_cannot_turn_audit_replay_into_admission(tmp_path, scenario, original):
+    path, attempt = stage_probe(tmp_path, scenario, original)
+    bindings, _ = scenario
+    identity, report = attempt["decision_id"], probe_report(attempt)
+    hosts = ("host-a", "host-b")
+    audit_readback(path, bindings, attempt, hosts)
+    before = path.read_bytes()
+    changed = copy.deepcopy(bindings)
+    changed["hosts"][1]["model"] += "-other-release"
+    for current in (changed, bindings):
+        with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+            core.admit_probe(path, current, identity, report, host_kinds=hosts)
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("known", [False, True])
+def test_probe_launch_refuses_before_and_after_exact_readback(tmp_path, scenario, original, known):
+    path, attempt = stage_probe(tmp_path, scenario, original)
+    bindings, _ = scenario
+    hosts = ("host-a", "host-b")
+    identity = attempt["decision_id"]
+    current = (bindings, hosts)
+    launch = {**attempt, "outcome": {"launch_status": "launched", "registry_id": attempt["registry_id"]}}
+
+    def append(row, registry):
+        if known:
+            return selection.append_decision(path, None, known_decision=identity,
+                                             prepare=lambda _: row, probe_bindings=registry)
+        return selection.append_decision(path, row, probe_bindings=registry)
+
+    before = path.read_bytes()
+    with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+        append(launch, current)
+    assert path.read_bytes() == before
+    audit_readback(path, bindings, attempt, hosts)
+    changed = copy.deepcopy(bindings)
+    changed["hosts"][1]["model"] += "-other-release"
+    for registry in (None, (changed, hosts), current):
+        before = path.read_bytes()
+        with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+            append(launch, registry)
+        assert path.read_bytes() == before
+    assert sum(choose(scenario, list(selection.read_decisions(path)))["counts_before"].values()) == 0
+    conflict = core.observe_served(path, identity, fallback())
+    rows = list(selection.read_decisions(path))
+    assert rows[-1] == conflict
+    assert sum(choose(scenario, rows)["counts_before"].values()) == 0
+    with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+        append(launch, current)
+    assert list(selection.read_decisions(path)) == rows
+    write_history(path, [*rows, launch])
+    with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+        list(selection.read_decisions(path))
+
+
+def test_concurrent_readback_and_conflicting_observation_leave_audit(tmp_path, scenario, original):
+    path, attempt = stage_probe(tmp_path, scenario, original)
+    bindings, _ = scenario
+    identity = attempt["decision_id"]
+    report = probe_report(attempt)
+
+    def promote():
+        return core.admit_probe(path, bindings, identity, report, host_kinds=("host-a", "host-b"))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        readback = pool.submit(promote)
+        audit = pool.submit(core.observe_served, path, identity, fallback()).result(timeout=10)
+        with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+            readback.result(timeout=10)
+    assert audit in list(selection.read_decisions(path))
+    before = path.read_bytes()
+    with pytest.raises(selection.ModelSelectionError, match="^decision_outcome_conflict$"):
+        promote()
+    assert path.read_bytes() == before
+
+
+def test_replaced_log_refuses_before_creating_temporary_output(tmp_path, original, monkeypatch):
+    path = make_store(tmp_path, original)
+    replacement = tmp_path / "replacement"
+    replacement.write_bytes(b"")
+
+    def prepare(row):
+        replacement.replace(path)
+        return observation(row, chosen(row))
+
+    def unexpected_allocation(_):
+        pytest.fail("stale snapshot reached temporary output allocation")
+
+    monkeypatch.setattr(selection, "secrets", SimpleNamespace(token_hex=unexpected_allocation))
+    with pytest.raises(selection.ModelSelectionError, match="^stale_decision$"):
+        selection.append_decision(path, None, known_decision=original["decision_id"], prepare=prepare)
+    assert path.read_bytes() == b""
+    assert not list(tmp_path.glob(".model-select-*"))
+
+
+def test_probe_promotion_refuses_an_ordinary_launch_decision(tmp_path, scenario, original):
+    path = make_store(tmp_path, original)
+    bindings, _ = scenario
+    before = path.read_bytes()
+    with pytest.raises(selection.ModelSelectionError, match="^not_probe_attempt$"):
+        core.admit_probe(path, bindings, original["decision_id"], probe_report(original),
+                         host_kinds=("host-a", "host-b"))
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("operation", ["stage", "readback", "observe", "conflict"])
+def test_probe_file_sync_failure_has_stable_code_and_can_retry(tmp_path, scenario, original, monkeypatch,
+                                                               operation):
+    path, original = stage_probe(tmp_path, scenario, original)
+    bindings, policy = scenario
+    hosts = ("host-a", "host-b")
+    before = path.read_bytes()
+
+    def fail_sync(descriptor):
+        raise OSError(errno.EIO, "descriptor sync failed")
+
+    failing_os = SimpleNamespace(
+        O_CREAT=os.O_CREAT, O_EXCL=os.O_EXCL, O_NOFOLLOW=os.O_NOFOLLOW,
+        O_NONBLOCK=os.O_NONBLOCK, O_RDONLY=os.O_RDONLY, O_WRONLY=os.O_WRONLY,
+        O_CLOEXEC=getattr(os, "O_CLOEXEC", 0), PathLike=os.PathLike, sep=os.sep, altsep=os.altsep,
+        close=os.close, fchmod=os.fchmod, fdopen=os.fdopen, fstat=os.fstat, fsync=fail_sync,
+        getuid=os.getuid, open=os.open, rename=os.rename, stat=os.stat, unlink=os.unlink, write=os.write,
+    )
+
+    def attempt():
+        if operation == "readback":
+            return core.admit_probe(path, bindings, original["decision_id"], probe_report(original),
+                                    host_kinds=hosts)
+        if operation == "conflict":
+            changed = copy.deepcopy(bindings)
+            changed["hosts"][1]["model"] += "-next"
+            return core.admit_probe(path, changed, original["decision_id"],
+                                    {**probe_report(original), "model": "different"}, host_kinds=hosts)
+        if operation == "observe":
+            return core.observe_served(path, original["decision_id"], chosen(original))
+        return selection.select_and_append(path, bindings, policy, "T2", "implementer", subject="new-probe",
+                                           host_kinds=hosts, probe_attempt=True)
+
+    monkeypatch.setattr(selection, "os", failing_os)
+    with pytest.raises(selection.ModelSelectionError, match="^probe_decision_io_failed$"):
+        attempt()
+    assert path.read_bytes() == before
+    assert not list(tmp_path.glob(".model-select-*"))
+    monkeypatch.setattr(selection, "os", os)
+    if operation in ("readback", "conflict"):
+        refusal = "probe_readback_mismatch" if operation == "conflict" else "decision_outcome_conflict"
+        with pytest.raises(selection.ModelSelectionError, match="^" + refusal + "$"):
+            attempt()
+    else:
+        attempt()
+    assert len(list(selection.read_decisions(path))) == 2
+
+
+def test_probe_promotion_refuses_without_descriptor_support(tmp_path, scenario, original, monkeypatch):
+    monkeypatch.setattr(core, "os", SimpleNamespace(name="nt", supports_dir_fd=set()))
+    bindings, _ = scenario
+    with pytest.raises(selection.ModelSelectionError, match="^anchored_io_unavailable$"):
+        core.admit_probe(tmp_path / "unused.jsonl", bindings, original["decision_id"], probe_report(original),
+                         host_kinds=("host-a", "host-b"))
+    assert list(tmp_path.iterdir()) == []
 
 
 def malformed_blocks():
@@ -312,12 +1094,12 @@ def test_newest_valid_receipt_wins_and_invalid_later_receipts_do_not_hide_it(ori
     assert core.served_of(rows, identity) == {**chosen(original), "cross_family": False}
 
 
-def test_coverage_uses_author_and_missing_author_cannot_claim_coverage(original):
-    other_author = {**original, "author_family": "beta"}
-    assert core.served_of([other_author, observation(other_author, fallback())], original["decision_id"]) == {
-        **fallback(), "cross_family": False}
-    no_author = {**original, "author_family": None}
-    assert core.served_of([no_author, observation(no_author, fallback())], original["decision_id"]) == {
+@pytest.mark.parametrize("author", ["beta", None])
+def test_coverage_uses_author_and_missing_author_cannot_claim_coverage(scenario, author):
+    bindings, policy = scenario
+    _, original = selection.select_model(bindings, policy, "T9", "implementer", [],
+                                         host_kinds=("host-a", "host-b"), subject="example", author_family=author)
+    assert core.served_of([original, observation(original, fallback())], original["decision_id"]) == {
         **fallback(), "cross_family": False}
 
 

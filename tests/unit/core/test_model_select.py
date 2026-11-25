@@ -74,6 +74,41 @@ def admission_refusal(host, intent, role, *, within_band=False):
     return message + (" or choose an admitted level within the band" if within_band else "")
 
 
+@requires_anchored_io
+def test_probe_staging_uses_the_current_registry_model_and_effort(bindings, policy, tmp_path):
+    if not core._DIR_FD_SUPPORTED:
+        pytest.skip("anchored I/O unavailable")
+    row = next(row for row in bindings["hosts"] if row["host"] == "codex-cli" and row["class"] == "coding")
+    row["model"] = "new-release"
+    row["effort_encoding"] = "model_suffix"
+    path = tmp_path / "decisions.jsonl"
+    hosts = ("codex-cli", "claude-code")
+    choice, attempt = core.select_and_append(path, bindings, policy, "T2", "implementer", subject="planned",
+                                             host_kinds=hosts, probe_attempt=True)
+    assert (choice["host"], choice["model"], choice["level"]) == ("codex-cli", "new-release-high", "high")
+    assert attempt["outcome"] == {"launch_status": "not_launched"}
+    assert attempt["counts_scope"] == "ordinary"
+    assert read_decisions(path) == [attempt]
+    before = path.read_bytes()
+    with pytest.raises(ModelSelectionError, match="^unknown_intent$"):
+        core.select_and_append(path, bindings, policy, "T2", "implementer", subject="unknown",
+                               host_kinds=hosts, probe_attempt=True, intent="unlisted")
+    row["admission"]["extended"] = "unprobed"
+    assert path.read_bytes() == before
+    choice, staged = core.select_and_append(path, bindings, policy, "T2", "implementer", subject="unprobed",
+                                            host_kinds=hosts, probe_attempt=True, intent="extended")
+    assert choice["admission"] == staged["admission"] == "unprobed"
+    assert staged["outcome"] == {"launch_status": "not_launched"}
+    assert read_decisions(path)[-1] == staged
+    row["admission"]["extended"] = "rejected"
+    before = path.read_bytes()
+    with pytest.raises(ModelSelectionError) as refused:
+        core.select_and_append(path, bindings, policy, "T2", "implementer", subject="rejected",
+                               host_kinds=hosts, probe_attempt=True, intent="extended")
+    assert str(refused.value) == admission_refusal("codex-cli", "extended", "implementer", within_band=True)
+    assert path.read_bytes() == before
+
+
 @pytest.mark.parametrize("failure", ["planned", "null", "admission"])
 @pytest.mark.parametrize("secret", ["github", "slack"])
 def test_r3_every_core_locator_is_redacted_without_cut_markers(bindings, policy, failure, secret):
@@ -1367,6 +1402,34 @@ def test_os_log_path_rejections_keep_stable_codes(bindings, policy, tmp_path, mo
             else:
                 append_decision(path, record)
     assert path.read_bytes() == before and read_decisions(path) == [record]
+
+
+@requires_anchored_io
+def test_decision_read_stream_error_propagates_unchanged(bindings, policy, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    if not core._DIR_FD_SUPPORTED:
+        pytest.skip("anchored I/O unavailable")
+    path = tmp_path / "log"
+    _, record = choose(bindings, policy)
+    append_decision(path, record)
+    error = OSError(errno.EIO, "injected decision stream failure")
+    descriptors = []
+
+    def fail_stream(descriptor, mode):
+        descriptors.append(descriptor)
+        raise error
+
+    monkeypatch.setattr(core, "os", SimpleNamespace(**{**vars(os), "fdopen": fail_stream}))
+    with pytest.raises(OSError) as raised:
+        read_decisions(path)
+    monkeypatch.setattr(core, "os", os)
+    assert raised.value is error
+    assert len(descriptors) == 1
+    with pytest.raises(OSError) as closed:
+        os.fstat(descriptors[0])
+    assert closed.value.errno == errno.EBADF
+    assert read_decisions(path) == [record]
 
 
 @requires_anchored_io
