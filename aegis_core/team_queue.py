@@ -717,13 +717,14 @@ def _observe(root, state, verb, moment, lanes, found, queue_paths, capabilities,
     return result
 
 
-def _unclaim(root, state, moment, caller, arguments):
+def _unclaim(root, state, moment, caller, arguments, covering):
     original = _read(root, (AEGIS_DIRNAME, "state", "team-queue.json"))
     def restore():
         _publish(root, state, raw=original)
     try:
         result = team_claims.transition(root, state, now=moment, caller=caller,
-                                       publish=_publish, restore=restore, shown=_shown, decode=_json, **arguments)
+                                       publish=_publish, restore=restore, shown=_shown, decode=_json,
+                                       covering=covering, **arguments)
     except team_claims.ClaimRefusal as error:
         raise QueueRefusal(error.reason, blockers=error.blockers) from None
     row = result.pop("row")
@@ -761,8 +762,8 @@ def _run_unclaim(root, moment, caller, arguments):
             stack.enter_context(locked(root, timeout=5.0))
             stack.enter_context(team_writer_binding.claim_exclusion(root, validated_workspace=True))
             state = _state(root)
-            team_claims.check_writer(root, state, arguments["identifier"],
-                                     arguments["lane"], arguments["writer_stopped"])
+            covering = team_claims.check_writer(root, state, arguments["identifier"],
+                                                arguments["lane"], arguments["writer_stopped"])
         except team_claims.ClaimRefusal:
             raise
         except team_writer_binding.BindingLockRefused as error:
@@ -775,7 +776,7 @@ def _run_unclaim(root, moment, caller, arguments):
             raise
         if input_error is not None:
             raise input_error
-        return _unclaim(root, state, moment, caller, arguments)
+        return _unclaim(root, state, moment, caller, arguments, covering)
 
 
 def _arguments(verb, valid_clock, caller, arguments):
