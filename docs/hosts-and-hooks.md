@@ -186,6 +186,21 @@ backs files up first. `aegis uninstall` removes Aegis's hooks, bootstrap and
 registrations while retaining a host another registered workspace uses; it never
 deletes `.aegis/`.
 
+## Residual risk
+
+On Linux, Git metadata discovery requires an absolute checkout path. Omitting
+the path or passing a relative path such as `.` fails with `git_path_unavailable`.
+A `.git` file may still point to a relative target. Restoring lookup from the
+current working directory is tracked in `HOOKS-GITFILE-LINUX-CWD-BOUND-ROUTE`.
+
+On macOS, FreeBSD and Windows, Git metadata discovery queries Git by checkout
+pathname and uses pathname-based discovery as a fallback. This route lacks a
+guarantee that Git answers through a held checkout and `.git` marker. Concurrent
+changes can affect the metadata selected during lookup.
+
+`HOOKS-GITFILE-POSIX-BOUND-ROUTE` tracks macOS and FreeBSD.
+`HOOKS-GITFILE-WINDOWS-BOUND-ROUTE` tracks Windows.
+
 ## Project skills
 
 ```sh
