@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -114,5 +115,16 @@ class TestAncestorDiscoveryMatchesGit:
         assert not Workspace.for_init(outer / "proj").is_git
 
     def test_ancestor_gitfile_to_missing_gitdir_is_not_adopted(self, outer: Path):
-        (outer / ".git").write_text(f"gitdir: {outer / 'gone' / '.git'}\n", encoding="utf-8")
-        assert not Workspace.resolve(start=outer / "proj").is_git
+        marker = outer / ".git"
+        marker.write_text(f"gitdir: {outer / 'gone' / '.git'}\n", encoding="utf-8")
+        if sys.platform != "linux":
+            assert not Workspace.resolve(start=outer / "proj").is_git
+            return
+        _git(outer.parent, "init", "-q", "-b", "main")
+        ws = Workspace.resolve(start=outer / "proj")
+        with pytest.raises(gitsafe.GitError) as caught:
+            _ = ws.is_git
+        assert (caught.value.code, str(caught.value)) == (
+            "git_path_unavailable",
+            "Git metadata path is unavailable.",
+        )
