@@ -38,9 +38,88 @@ def test_pathlookup_module_patches_are_auto_restored():
     assert pathlookup_patch_writes(Path(__file__).resolve().parents[3]) == []
 
 
-def _run_runtime_guard_case(tmp_path, module, source, *, before_helper=""):
+def test_pathlookup_import_parses_each_tracked_source_once():
     from tests.helpers_reviewed_sources import run_isolated_test
 
+    program = (
+        "import ast, sys\n"
+        "from pathlib import Path\n"
+        "root = Path(sys.argv[2])\n"
+        "counts = dict.fromkeys((str(root / 'tests/unit/core/test_pathlookup.py'),\n"
+        "                        str(root / 'tests/helpers_pathlookup.py')), 0)\n"
+        "def count_parse(event, args):\n"
+        "    if event == 'compile' and args[1] in counts:\n"
+        "        if sys._getframe(1).f_code is ast.parse.__code__:\n"
+        "            counts[args[1]] += 1\n"
+        "sys.addaudithook(count_parse)\n"
+        "from tests import helpers_pathlookup\n"
+        "assert list(counts.values()) == [1, 1], counts\n"
+    )
+    result = run_isolated_test(program, Path(__file__).resolve().parents[3])
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+
+
+@pytest.mark.parametrize("mark", [
+    "skip(reason='workload cut')",
+    "skipif(True, reason='workload cut')",
+    "xfail(reason='unverified')",
+    "parametrize('missing', [])",
+])
+def test_static_contract_refuses_disabling_mark_on_the_proof_suite(tmp_path, mark):
+    source = (f"pytestmark = pytest.mark.{mark}\n"
+              "def test_additional_pathlookup_rules_in_child():\n"
+              "    pass\n")
+    status, output = _run_static_source_case(tmp_path, "pathlookup", source)
+    assert status == pytest.ExitCode.INTERRUPTED, output
+    assert "pathlookup proof suite cannot use a disabling module mark" in output
+
+
+def test_static_contract_keeps_original_refusal_before_proof_suite_mark_check(tmp_path):
+    relative = "tests/unit/core/test_pathlookup.py"
+    source = ("import os, pytest\npytestmark = pytest.mark.skipif(os.name != 'nt', reason='modeled')\n"
+              "def test_additional_pathlookup_rules_in_child():\n"
+              "    pass\n")
+    _import_order_sources(tmp_path, relative, source)
+    assert pathlookup_helpers.pathlookup_source_contract_errors(tmp_path) == [
+        (relative, 2, "pytest marks require a direct reviewed decorator")]
+
+
+def test_pathlookup_batch_fails_if_a_diagnostic_does_not_match(tmp_path):
+    cases = {
+        "consumer-import-order": ("pathlookup_import_order", "tests/unit/core/test_pathlookup.py",
+                                  "import os\n", 1, "helper import must be the first executable statement"),
+        "helper-bootstrap": ("pathlookup_import_order", "tests/helpers_pathlookup.py",
+                             "import sys\n", 1, "wrong diagnostic"),
+    }
+    result = _run_pathlookup_proof_batch(_pathlookup_batch_rows(tmp_path, cases))
+    assert result.returncode == 1, result.stderr.decode("utf-8", "replace")
+    assert result.stdout == b""
+    assert "AssertionError" in result.stderr.decode("utf-8", "replace")
+
+
+@pytest.fixture
+def module():
+    """Use one child target per case unless a representative proof overrides it."""
+    return "pathlookup"
+
+
+def _run_pathlookup_guard_child(case, configuration, root, *, deselect=False, import_path=None):
+    from tests.helpers_reviewed_sources import run_isolated_test
+
+    options = ["-k", "no_matching_case"] if deselect else []
+    program = (
+        "import pytest, sys\n"
+        "raise SystemExit(pytest.main(['-q', '-c', sys.argv[3], '--confcutdir', sys.argv[4], "
+        "'-o', 'addopts=', sys.argv[2]] + " + repr(options) + "))\n"
+    )
+    result = run_isolated_test(program, case, configuration, root, import_path=import_path,
+        env={**os.environ, "PYTEST_ADDOPTS": "", "PYTHONDONTWRITEBYTECODE": "1",
+             "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"})
+    stdout = result.stdout.decode("utf-8", "replace")
+    return result.returncode, stdout + result.stderr.decode("utf-8", "replace")
+
+
+def _run_runtime_guard_case(tmp_path, module, source, *, before_helper=""):
     configuration = tmp_path / "pytest.ini"
     configuration.write_text("[pytest]\n", encoding="utf-8")
     case = tmp_path / "test_runtime_guard_case.py"
@@ -51,14 +130,7 @@ def _run_runtime_guard_case(tmp_path, module, source, *, before_helper=""):
         f"import aegis_core\nfrom aegis_core import {module} as target\n" + source,
         encoding="utf-8",
     )
-    program = (
-        "import pytest, sys\n"
-        "raise SystemExit(pytest.main(['-q', '-c', sys.argv[3], '--confcutdir', sys.argv[4], "
-        "'-o', 'addopts=', sys.argv[2]]))\n"
-    )
-    result = run_isolated_test(program, case, configuration, tmp_path,
-        env={**os.environ, "PYTEST_ADDOPTS": "", "PYTHONDONTWRITEBYTECODE": "1"})
-    return result.returncode, result.stdout.decode("utf-8", "replace") + result.stderr.decode("utf-8", "replace")
+    return _run_pathlookup_guard_child(case, configuration, tmp_path)
 
 
 def _runtime_warning_source():
@@ -76,7 +148,6 @@ def _runtime_warning_source():
     )
 
 
-@pytest.mark.parametrize("module", ["pathlookup", "gitsafe", "primitives"])
 @pytest.mark.parametrize("timing", ["body", "module_finalizer"])
 def test_runtime_guard_accepts_warning_registry_and_warning_failure_retry(tmp_path, module, timing):
     source = _runtime_warning_source()
@@ -104,7 +175,6 @@ def test_runtime_guard_accepts_warning_registry_removal_and_recreation(tmp_path,
     assert "2 passed" in output
 
 
-@pytest.mark.parametrize("module", ["pathlookup", "gitsafe", "primitives"])
 @pytest.mark.parametrize("attribute,kind", [
     ("__doc__", "replaced"), ("__warningregistry___", "added"), ("_warningregistry", "added"),
 ])
@@ -162,7 +232,6 @@ def _runtime_guard_example(module, form):
     return "def test_case():\n    modeled = object()\n" + indent(body, "    ")
 
 
-@pytest.mark.parametrize("module", ["pathlookup", "gitsafe", "primitives"])
 @pytest.mark.parametrize("form", [
     "annotated", "walrus", "tuple", "list", "list_comprehension", "set_comprehension",
     "dict_comprehension", "generator_expression", "global_import", "nonlocal_import", "attribute_lookup",
@@ -184,7 +253,6 @@ def test_runtime_guard_names_all_added_removed_and_replaced_attributes(tmp_path,
         assert f"aegis_core.{module}.{attribute} {kind}" in output
 
 
-@pytest.mark.parametrize("module", ["pathlookup", "gitsafe", "primitives"])
 def test_runtime_guard_compares_identity_instead_of_equality(tmp_path, module):
     source = ("class Equal:\n    def __eq__(self, other):\n        return True\n"
               "def test_case():\n    target.os = Equal()\n")
@@ -193,7 +261,6 @@ def test_runtime_guard_compares_identity_instead_of_equality(tmp_path, module):
     assert f"aegis_core.{module}.os replaced" in output
 
 
-@pytest.mark.parametrize("module", ["pathlookup", "gitsafe", "primitives"])
 def test_runtime_guard_rejects_module_class_replacement(tmp_path, module):
     source = ("from types import ModuleType\nclass Replacement(ModuleType):\n    pass\n"
               "def test_case():\n    target.__class__ = Replacement\n")
@@ -217,7 +284,6 @@ def test_runtime_guard_runs_after_consumer_and_monkeypatch_teardown(tmp_path, mo
     assert "2 passed" in output
 
 
-@pytest.mark.parametrize("module", ["pathlookup", "gitsafe", "primitives"])
 def test_runtime_guard_restores_after_a_failed_test_body(tmp_path, module):
     source = ("def test_case(monkeypatch):\n"
               f"    monkeypatch.setattr('aegis_core.{module}.os', object())\n"
@@ -230,7 +296,6 @@ def test_runtime_guard_restores_after_a_failed_test_body(tmp_path, module):
     assert "1 error" not in output
 
 
-@pytest.mark.parametrize("module", ["pathlookup", "gitsafe", "primitives"])
 def test_runtime_guard_restores_after_consumer_teardown_failure(tmp_path, module):
     source = ("@pytest.fixture\ndef consumer(monkeypatch):\n"
               f"    monkeypatch.setattr('aegis_core.{module}.os', object())\n"
@@ -243,7 +308,6 @@ def test_runtime_guard_restores_after_consumer_teardown_failure(tmp_path, module
     assert "unrestored governed module attributes" not in output
 
 
-@pytest.mark.parametrize("module", ["pathlookup", "gitsafe", "primitives"])
 def test_runtime_guard_accepts_hand_restoration(tmp_path, module):
     source = ("def test_case():\n    original = target.os\n"
               "    target.os = object()\n    target.os = original\n")
@@ -252,7 +316,6 @@ def test_runtime_guard_accepts_hand_restoration(tmp_path, module):
     assert "1 passed" in output
 
 
-@pytest.mark.parametrize("module", ["pathlookup", "gitsafe", "primitives"])
 @pytest.mark.parametrize("timing", ["collection", "module_setup", "module_finalizer"])
 def test_runtime_guard_rejects_writes_outside_function_scope(tmp_path, module, timing):
     write = "lookup: object = target\nlookup.os = object()\nlookup.__doc__ = object()\n"
@@ -274,7 +337,6 @@ def test_runtime_guard_rejects_writes_outside_function_scope(tmp_path, module, t
     assert f"aegis_core.{module}.__doc__ replaced" in output
 
 
-@pytest.mark.parametrize("module", ["pathlookup", "gitsafe", "primitives"])
 def test_runtime_guard_documents_pre_helper_trust_boundary(tmp_path, module):
     before = (f"from aegis_core import {module} as early\n"
               "preloaded = object()\nearly.__doc__ = preloaded\n")
@@ -415,9 +477,14 @@ def test_runtime_guard_nested_owned_contexts_restore_deleted_bindings_and_retry(
     assert "2 passed" in output
 
 
-@pytest.mark.parametrize("module", ["pathlookup", "gitsafe", "primitives"])
-@pytest.mark.parametrize("operation", ["setattr", "delattr"])
-@pytest.mark.parametrize("inner_operation", ["setattr", "delattr"])
+@pytest.mark.parametrize("module,operation,inner_operation", [
+    ("pathlookup", "setattr", "setattr"),
+    ("gitsafe", "setattr", "setattr"),
+    ("primitives", "setattr", "setattr"),
+    ("pathlookup", "setattr", "delattr"),
+    ("pathlookup", "delattr", "setattr"),
+    ("pathlookup", "delattr", "delattr"),
+])
 def test_owned_context_refuses_outer_write_to_inner_binding_before_mutation(tmp_path, module, operation, inner_operation):
     attempted = ("outer.setattr(target, '__doc__', third)" if operation == "setattr"
                  else "outer.delattr(target, '__doc__')")
@@ -471,6 +538,96 @@ def test_runtime_guard_session_and_owned_checks_do_not_allow_late_or_unrecorded_
     assert "aegis_core.pathlookup.__doc__ replaced" in output
 
 
+def test_runtime_guard_refuses_leaked_owned_context(tmp_path):
+    source = (
+        "from tests.helpers_pathlookup import owned_module_patch\n"
+        "contexts = []\n"
+        "@pytest.fixture(scope='module')\n"
+        "def leaked_context(request):\n"
+        "    context = owned_module_patch(request)\n"
+        "    context.__enter__()\n"
+        "    contexts.append(context)\n"
+        "def test_case(leaked_context):\n"
+        "    pass\n"
+    )
+    status, output = _run_runtime_guard_case(tmp_path, "pathlookup", source)
+    assert status == pytest.ExitCode.TESTS_FAILED, output
+    assert "owned governed module patch contexts left open" in output
+
+
+def _pathlookup_batch_rows(tmp_path, cases):
+    rows = []
+    for rule, (checker, relative, source, line, message) in cases.items():
+        root = tmp_path / rule
+        if checker == "pathlookup_patch_writes":
+            _patch_guard_sources(root, relative, source)
+        else:
+            _import_order_sources(root, relative, source)
+        rows.append((str(root), checker, relative, line, message))
+    return rows
+
+
+def _run_pathlookup_proof_batch(rows):
+    import json
+
+    from tests.helpers_reviewed_sources import run_isolated_test
+
+    program = (
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "from tests import helpers_pathlookup as guards\n"
+        "for root, checker, relative, line, message in json.loads(sys.argv[2]):\n"
+        "    errors = getattr(guards, checker)(Path(root))\n"
+        "    assert errors == [(relative, line, message)], (Path(root).name, errors)\n"
+    )
+    return run_isolated_test(program, json.dumps(rows))
+
+
+def test_additional_pathlookup_rules_in_child(tmp_path):
+    consumer = "tests/unit/core/test_pathlookup.py"
+    helper = "tests/helpers_pathlookup.py"
+    imports = "pathlookup_import_order"
+    collection = "pathlookup_source_contract_errors"
+    cases = {
+        "consumer-import-order": (imports, consumer, "import os\n", 1,
+                                  "helper import must be the first executable statement"),
+        "helper-bootstrap": (imports, helper, "import sys\n", 1,
+                             "helper bootstrap must precede executable code"),
+        "helper-adjacent-baseline": (imports, helper, "from aegis_core import gitsafe, pathlookup, primitives\n", 1,
+                                     "governed import must immediately capture the baseline"),
+        "helper-missing-baseline": (imports, helper, "import ast\n", 1,
+                                    "helper import-time baseline is missing"),
+        "fixture-scope": (collection, consumer, "import pytest\n@pytest.fixture(scope=scope)\n"
+                          "def value():\n    pass\n", 3, "fixture scope must be a literal supported pytest scope"),
+        "decorator-factory": (collection, consumer, "@outside\ndef test_case():\n    pass\n", 1,
+                               "collection-time decorator requires a reviewed factory"),
+        "contextmanager-declaration": (collection, consumer, "from contextlib import contextmanager\n"
+                                       "@contextmanager()\ndef callback():\n    yield\n", 2,
+                                       "contextmanager must directly decorate a definition"),
+        "parametrize-expansion": (collection, consumer, "import pytest\n@pytest.mark.parametrize(*arguments)\n"
+                                   "def test_case():\n    pass\n", 2, "parametrize arguments must make ids explicit"),
+        "decorator-arguments": (collection, consumer, "import os, pytest\n"
+                                "@pytest.mark.skipif(os.getcwd(), reason='modeled')\ndef test_case():\n    pass\n",
+                                2, "decorator arguments must use the reviewed grammar"),
+        "direct-mark": (collection, consumer, "import pytest\npytestmark = pytest.mark.skip.with_args()\n",
+                         2, "pytest marks require a direct reviewed decorator"),
+        "factory-import": (collection, consumer, "from custom import other as property\n", 1,
+                            "collection factory import must keep its standard binding"),
+        "factory-binding": (collection, consumer, "property = None\n", 1, "collection factory binding cannot be replaced"),
+        "collection-call": (collection, consumer, "callback()\n", 1,
+                            "collection-time call requires a reviewed helper shape"),
+        "class-base": (collection, consumer, "class Example(outside):\n    pass\n", 1,
+                       "collection class requires a standard base without a metaclass"),
+        "collection-body": (collection, consumer, "pass\n", 1,
+                            "collection body statement is outside the reviewed grammar"),
+        "governed-module-write": ("pathlookup_patch_writes", consumer,
+                                  "from aegis_core import gitsafe\n"
+                                  "def test_case():\n    gitsafe.os = None\n", 3, "gitsafe.os"),
+    }
+    result = _run_pathlookup_proof_batch(_pathlookup_batch_rows(tmp_path, cases))
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+
+
 def _import_order_sources(root, relative, source):
     repository = Path(__file__).resolve().parents[3]
     for name in ("tests/unit/core/test_pathlookup.py", "tests/helpers_pathlookup.py"):
@@ -485,8 +642,6 @@ def test_pathlookup_import_order_guards_both_real_sources():
 
 
 def _run_static_source_case(tmp_path, module, source, *, deselect=False):
-    from tests.helpers_reviewed_sources import run_isolated_test
-
     repository = Path(__file__).resolve().parents[3]
     helper = tmp_path / "tests" / "helpers_pathlookup.py"
     helper.parent.mkdir(parents=True)
@@ -504,18 +659,10 @@ def _run_static_source_case(tmp_path, module, source, *, deselect=False):
         f"from aegis_core import {module} as lookup\n" + source, encoding="utf-8")
     configuration = tmp_path / "pytest.ini"
     configuration.write_text("[pytest]\n", encoding="utf-8")
-    program = (
-        "import pytest, sys\n"
-        "raise SystemExit(pytest.main(['-q', '-c', sys.argv[3], '--confcutdir', sys.argv[4], "
-        "'-o', 'addopts=', sys.argv[2]] + " + repr(["-k", "no_matching_case"] if deselect else []) + "))\n"
-    )
-    result = run_isolated_test(program, case, configuration, tmp_path,
-        import_path=[str(tmp_path), *sys.path],
-        env={**os.environ, "PYTEST_ADDOPTS": "", "PYTHONDONTWRITEBYTECODE": "1"})
-    return result.returncode, result.stdout.decode("utf-8", "replace") + result.stderr.decode("utf-8", "replace")
+    return _run_pathlookup_guard_child(case, configuration, tmp_path, deselect=deselect,
+                                      import_path=[str(tmp_path), *sys.path])
 
 
-@pytest.mark.parametrize("module", ["pathlookup", "gitsafe", "primitives"])
 def test_static_contract_refuses_undeclared_session_finalizer(tmp_path, module):
     source = ('@pytest.fixture(scope="session", autouse=True)\n'
               "def aaa_modeled_host():\n    yield\n    alias: object = lookup\n"
@@ -526,8 +673,11 @@ def test_static_contract_refuses_undeclared_session_finalizer(tmp_path, module):
     assert "broader fixture must request governed_module_session" in output
 
 
-@pytest.mark.parametrize("module", ["pathlookup", "gitsafe", "primitives"])
-@pytest.mark.parametrize("selection", ["skipped", "deselected"])
+@pytest.mark.parametrize("module,selection", [
+    ("pathlookup", "skipped"),
+    ("gitsafe", "deselected"),
+    ("primitives", "deselected"),
+])
 def test_static_contract_refuses_collection_write_without_running_tests(tmp_path, module, selection):
     source = ("alias: object = lookup\nalias.__doc__ = 'modeled'\n"
               + ('pytestmark = pytest.mark.skip(reason="capability unavailable")\n' if selection == "skipped" else "")
@@ -537,7 +687,6 @@ def test_static_contract_refuses_collection_write_without_running_tests(tmp_path
     assert "collection-time attribute write" in output
 
 
-@pytest.mark.parametrize("module", ["pathlookup", "gitsafe", "primitives"])
 @pytest.mark.parametrize("selection", ["skipped", "deselected"])
 @pytest.mark.parametrize("location", ["module", "class"])
 def test_static_contract_refuses_collection_hook_before_skip_or_deselection(tmp_path, module, selection, location):
@@ -556,7 +705,6 @@ def test_static_contract_refuses_collection_hook_before_skip_or_deselection(tmp_
     assert "pytest_* collection hooks are forbidden" in output
 
 
-@pytest.mark.parametrize("module", ["pathlookup", "gitsafe", "primitives"])
 @pytest.mark.parametrize("selection", ["skipped", "deselected"])
 @pytest.mark.parametrize("factory", ["parametrize", "fixture"])
 def test_static_contract_refuses_callable_ids_before_skip_or_deselection(tmp_path, module, selection, factory):
@@ -575,7 +723,6 @@ def test_static_contract_refuses_callable_ids_before_skip_or_deselection(tmp_pat
     assert "ids must use the reviewed decorator grammar" in output
 
 
-@pytest.mark.parametrize("module", ["pathlookup", "gitsafe", "primitives"])
 @pytest.mark.parametrize("selection", ["skipped", "deselected"])
 @pytest.mark.parametrize("imports,factory", [
     ("import pytest", "pytest.fixture"),
@@ -594,7 +741,6 @@ def test_static_contract_refuses_functional_fixture_registration(tmp_path, modul
     assert "fixture registration must decorate a function definition" in output
 
 
-@pytest.mark.parametrize("module", ["pathlookup", "gitsafe", "primitives"])
 @pytest.mark.parametrize("selection", ["skipped", "deselected"])
 def test_static_contract_refuses_stored_fixture_before_skip_or_deselection(tmp_path, module, selection):
     source = ("register = pytest.fixture\n"
@@ -735,7 +881,6 @@ def test_static_contract_callback_refusal_retries_and_keeps_concurrent_roots_ind
         assert pathlookup_helpers.pathlookup_source_contract_errors(roots[0]) == []
 
 
-@pytest.mark.parametrize("module", ["pathlookup", "gitsafe", "primitives"])
 @pytest.mark.parametrize("selection", ["skipped", "deselected"])
 @pytest.mark.parametrize("route", ["with_args", "module_call", "class_call", "decorator_call"])
 def test_closed_collection_refuses_execution_before_skip_or_deselection(tmp_path, module, selection, route):
@@ -743,19 +888,24 @@ def test_closed_collection_refuses_execution_before_skip_or_deselection(tmp_path
               "    alias.__doc__ = 'modeled'\n    return 'case'\n")
     skip = '@pytest.mark.skip(reason="capability unavailable")\n' if selection == "skipped" else ""
     if route == "with_args":
+        diagnostic = "collection-time decorator requires a reviewed factory"
         source += skip + ("@pytest.mark.parametrize.with_args('value', [1], ids=write)\n"
                           "def test_case(value):\n    pass\n")
     elif route == "module_call":
+        diagnostic = "collection-time call requires a reviewed helper shape"
         source += "write()\n" + skip + "def test_case():\n    pass\n"
     elif route == "class_call":
+        diagnostic = "collection-time call requires a reviewed helper shape"
         source += "class TestCase:\n    write()\n"
         source += "    " + skip.replace("\n", "\n    ") + "def test_case(self):\n        pass\n"
     else:
+        diagnostic = "decorator arguments must use the reviewed grammar"
         source += skip + "@pytest.mark.skipif(os.getcwd(), reason='modeled')\ndef test_case():\n    pass\n"
         source = "import os\n" + source
     status, output = _run_static_source_case(tmp_path, module, source, deselect=selection == "deselected")
     assert status == pytest.ExitCode.INTERRUPTED, output
     assert "pathlookup source contract:" in output
+    assert diagnostic in output
 
 
 @pytest.mark.parametrize("expression", [

@@ -503,9 +503,10 @@ def _check_scan_open_error(directory, error, stat_directory):
 
 
 def _dist_matches(directory, scan_directory, stat_directory):
-    """Count matching entries and keep only the first few in name order."""
+    """Count matching entries and reserve a sample slot for the first irregular one."""
     counts = {"wheel": 0, "sdist": 0, "irregular": 0}
     sample = []
+    first_irregular = None
     try:
         scan = scan_directory(directory)
     except OSError as error:
@@ -527,14 +528,19 @@ def _dist_matches(directory, scan_directory, stat_directory):
                 else:
                     continue
                 shape = _entry_kind(entry)
+                row = (name, kind, shape)
                 counts[kind if shape == "file" else "irregular"] += 1
+                if shape != "file" and (first_irregular is None or row < first_irregular):
+                    first_irregular = row
                 if len(sample) == DIST_SAMPLE_LIMIT:
                     if name >= sample[-1][0]:
                         continue
                     sample.pop()
-                insort(sample, (name, kind, shape))
+                insort(sample, row)
     except OSError:
         fail("distribution directory is unreadable")
+    if first_irregular is not None and first_irregular not in sample:
+        sample[-1] = first_irregular
     return counts, sample
 
 
@@ -589,9 +595,11 @@ def record(d, *, discover=dists):
 _SUM_LINE_LIMIT = 64 + 2 + NAME_LIMIT + 1
 
 
-def _sums_entries(path):
-    """Read digest lines with a size cap before any name is parsed or opened."""
+def _sums_entries(path, present_names):
+    """Validate bounded lines through EOF and retain digests only for discovered names."""
     expected = {}
+    unexpected = 0
+    sample = []
     with open(path, "rb") as handle:
         while True:
             blob = handle.readline(_SUM_LINE_LIMIT + 1)
@@ -612,8 +620,14 @@ def _sums_entries(path):
             if len(parts) != 2:
                 fail("refused dist name: " + public_text(body))
             digest, name = parts
-            expected[_dist_member_name(name)] = digest
-    return expected
+            name = _dist_member_name(name)
+            if name in present_names:
+                expected[name] = digest
+            else:
+                unexpected += 1
+                if len(sample) < DIST_SAMPLE_LIMIT:
+                    sample.append(_inventory_name(name))
+    return expected, unexpected, sample
 
 
 def verify(d, *, discover=dists):
@@ -621,13 +635,16 @@ def verify(d, *, discover=dists):
     sums_path = os.path.join(d, SUMS)
     if not os.path.isfile(sums_path):
         fail(public_text(sums_path) + " is missing")
-    expected = _sums_entries(sums_path)
     present = {os.path.basename(wheel): (wheel, check_wheel),
                os.path.basename(sdist): (sdist, check_sdist)}
-    if present.keys() != expected.keys():
-        found = ", ".join(public_text(item) for item in sorted(present))
-        listed = ", ".join(public_text(item) for item in sorted(expected))
-        fail("dist/ contents " + found + " do not match " + SUMS + " " + listed)
+    expected, unexpected, sample = _sums_entries(sums_path, present.keys())
+    missing = present.keys() - expected.keys()
+    if missing or unexpected:
+        found = ", ".join(_inventory_name(name) for name in sorted(present))
+        absent = ", ".join(_inventory_name(name) for name in sorted(missing))
+        shown = ", ".join(sample)
+        fail(f"dist/ contents {found} do not match {SUMS}: missing=[{absent}], "
+             f"unexpected={unexpected}, sample=[{shown}], omitted={unexpected - len(sample)}")
     for name, digest in sorted(expected.items()):
         path, check = present[name]
         actual = sha256(path)
