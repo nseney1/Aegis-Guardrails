@@ -131,6 +131,9 @@ class HostSpec:
     session_marker_prefixes: Tuple[str, ...] = ()
     #: Launcher-local auth overrides must not cross a child boundary either.
     environment_overrides: Tuple[str, ...] = ()
+    #: Top-level binary evidence key emitted by this host's Teams report producer.
+    #: Empty means no producer. A producer declaration grants no qualification.
+    team_report_producer: str = ""
 
 
 HOSTS: Tuple[HostSpec, ...] = (
@@ -139,6 +142,7 @@ HOSTS: Tuple[HostSpec, ...] = (
         billing_variables=_CODEX_BILLING,
         session_variable=_CODEX_SESSION_VARIABLE,
         session_markers=_CODEX_MARKERS,
+        team_report_producer="codex",
         display_name="Codex CLI",
         vendor="OpenAI",
         client_names=("codex-mcp-client",),
