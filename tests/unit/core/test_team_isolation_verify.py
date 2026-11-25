@@ -951,6 +951,85 @@ def test_verify_skips_mixed_access_alias_comparisons_for_distinct_identities(
     assert compared == [(left, secret), (right, secret)]
 
 
+@pytest.mark.parametrize("same_access", [True, False, None], ids=["writable", "read-only", "protected"])
+def test_verify_skips_alias_pairs_when_repeats_cannot_cross_access(core, verifier, monkeypatch, same_access):
+    left, twin, right = "/common/left", "/common/twin", "/common/right"
+    secret, other_secret = "/owner/.ssh", "/owner/.gnupg"
+    observed = facts(left, twin, right, "/owner", secret, other_secret)
+    if same_access is None:
+        original, duplicate = secret, other_secret
+    else:
+        original, duplicate = left, twin
+    observed[duplicate]["inode"] = observed[duplicate]["after"]["inode"] = observed[original]["inode"]
+    writable = same_access is not False
+    rows = [dict(source=path, destination=path, rw=rw)
+            for path, rw in ((left, writable), (right, not writable), (twin, writable))]
+    context = dict(verification_context(), observed=observed)
+    wanted = round2_expected(verifier, context["owner_homes"], observed, rows)
+    actual = inspected(core, verifier, wanted)
+    compare, compared = core.aliases_overlap, []
+
+    def record_overlap(first, second, identities):
+        compared.append((str(first), str(second)))
+        return compare(first, second, identities)
+
+    monkeypatch.setattr("aegis_core.team_isolation_mounts.aliases_overlap", record_overlap)
+    assert verifier.verify(actual, wanted, **context) == []
+    assert compared == [(row["source"], root) for row in rows for root in (other_secret, secret)]
+
+
+@pytest.mark.parametrize("overlaps", [False, True], ids=["disjoint", "overlapping"])
+def test_deep_cross_access_alias_compares_suffixes_within_budget(core, verifier, monkeypatch, overlaps):
+    depth = "/d" * 124
+    left = "/left" + depth + "/branch/child"
+    right = "/right" + depth + ("/branch" if overlaps else "/sibling")
+    distinct = facts(left, right, "/owner")
+    context = verification_context()
+    homes = context["owner_homes"]
+    rows = [dict(source=path, destination=path, rw=rw) for path, rw in ((left, True), (right, False))]
+    wanted = round2_expected(verifier, homes, distinct, rows)
+    actual = inspected(core, verifier, wanted)
+    compare, lookups = core.inside_alias, []
+    sources = {PurePosixPath(left), PurePosixPath(right)}
+
+    def counted(child, parent, identities):
+        if {child, parent} != sources:
+            return compare(child, parent, identities)
+        count = [0]
+        budget = len(child.parts) + len(parent.parts)
+
+        def lookup(key):
+            count[0] += 1
+            assert count[0] <= budget, "deep mount pair exceeded its ancestor identity lookup budget"
+            return identities.get(key)
+
+        result = compare(child, parent, SimpleNamespace(get=lookup))
+        lookups.append(count[0])
+        return result
+
+    monkeypatch.setattr("aegis_core.team_isolation_mounts.inside_alias", counted)
+
+    def verify_snapshot(observed):
+        return verifier.verify(actual, wanted, **dict(context, observed=observed))
+
+    changed = copy.deepcopy(distinct)
+    changed["/right"]["after"]["inode"] = changed["/left"]["inode"]
+    aliased = copy.deepcopy(changed)
+    aliased["/right"]["inode"] = aliased["/left"]["inode"]
+    assert verify_snapshot(distinct) == []
+    with pytest.raises(core.IsolationRefusal, match="^mount_changed$"):
+        verify_snapshot(changed)
+    assert lookups == []
+    errors = ["mounts"] if overlaps else []
+    assert verify_snapshot(aliased) == errors
+    assert len(lookups) == (1 if overlaps else 2)
+    assert all(count >= len(sources_path.parts) for count in lookups for sources_path in sources)
+    assert _refusal(core, aliased, homes, rows) == ("mount_overlap" if overlaps else "accepted")
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(verify_snapshot, [distinct, aliased] * 2, timeout=10)) == [[], errors] * 2
+    assert verify_snapshot(distinct) == []
+
+
 @pytest.mark.parametrize("missing_tail", [False, True], ids=["mount-roots", "above-missing-tail"])
 def test_verify_rechecks_mixed_access_aliases_on_retry_and_in_parallel(core, verifier, missing_tail):
     suffix = "/missing/nested" if missing_tail else ""

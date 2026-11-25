@@ -18,7 +18,7 @@ from datetime import datetime
 
 from aegis_core import hosts
 from aegis_core.errors import LockTimeoutError, PathTraversalError
-from aegis_core.primitives import is_within, json_preflight, utc_stamp
+from aegis_core.primitives import is_within, json_preflight, strict_loads, utc_stamp
 from aegis_core.storage import file_lock
 from aegis_core.storage_confined import ConfinedFileError, confined_file, descriptor_supported as confined_supported
 from aegis_core.workspace.layout import UserLayout
@@ -152,18 +152,8 @@ def default_state_root():
 
 
 def probe_runner_ids():
-    """Host ids whose registration can name a single probe CLI, derived from HostSpec."""
-    found = []
-    for spec in hosts.HOSTS:
-        registration = spec.registration
-        if spec.retired or registration is None or registration.kind != "native_cli":
-            continue
-        if len(spec.binaries) != 1 or not registration.argv:
-            continue
-        binary = spec.binaries[0]
-        if registration.argv[0] == binary and binary in spec.aliases:
-            found.append(spec.id)
-    return tuple(found)
+    """Host ids with a declared report producer and an active catalog entry."""
+    return tuple(spec.id for spec in hosts.HOSTS if spec.team_report_producer and not spec.retired)
 
 
 def record_relative(host_id):
@@ -394,37 +384,13 @@ def _prepare(state_root, host, workspace):
     return (resolved, relative), None
 
 
-def _loads(text):
-    def pairs(items):
-        found = {}
-        for key, value in items:
-            if type(key) is not str or key in found:
-                raise ValueError("invalid")
-            found[key] = value
-        return found
-
-    def constant(_name):
-        raise ValueError("invalid")
-
-    def number(literal):
-        try:
-            value = float(literal)
-        except (ValueError, OverflowError):
-            raise ValueError("invalid") from None
-        if type(value) is not float or not math.isfinite(value):
-            raise ValueError("invalid")
-        return value
-
-    return json.loads(text, object_pairs_hook=pairs, parse_constant=constant, parse_float=number)
-
-
 def _parse(raw, limit):
     if type(raw) is not bytes or len(raw) > limit:
         raise ValueError("size")
     try:
         text = json_preflight(raw, max_bytes=limit, max_depth=_MAX_DEPTH, max_nodes=_MAX_NODES,
                               max_items=_MAX_ITEMS, max_string=_MAX_STRING, max_atom=64)
-        return _loads(text)
+        return strict_loads(text)
     except (ValueError, RecursionError, UnicodeError):
         raise ValueError("invalid") from None
 
@@ -508,9 +474,9 @@ def _accept_report(raw, resolved):
     if type(probe_id) is not str or _PROBE.fullmatch(probe_id) is None:
         return "report_rejected", None
     spec = hosts.get(resolved)
-    if len(spec.binaries) != 1 or ("host" in report and _resolved(report["host"]) != resolved):
+    if "host" in report and _resolved(report["host"]) != resolved:
         return "report_rejected", None
-    roles = accept_report(report, spec.binaries[0])
+    roles = accept_report(report, spec.team_report_producer)
     if roles is None:
         return "report_rejected", None
     return None, {"probe_id": probe_id, "roles": roles, "supplied": report.get("host_version", None),
