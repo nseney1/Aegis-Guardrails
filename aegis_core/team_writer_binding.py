@@ -111,7 +111,7 @@ def claim_exclusion(workspace, *, validated_workspace=False):
                 normalized = os.path.abspath(spelling)
                 common = Path(normalized) if validated_workspace else _root(normalized)
                 handle = stack.enter_context(storage_confined.confined_file(common, (_CLAIM_LOCK,)))
-                stack.enter_context(storage.file_lock(common / _CLAIM_LOCK, timeout=0, dir_fd=handle._parent))
+                stack.enter_context(storage.file_lock(common / _CLAIM_LOCK, timeout=0, dir_fd=handle.parent_fd))
         except storage.LockTimeoutError:
             raise BindingLockRefused("state_locked") from None
         except Exception:
