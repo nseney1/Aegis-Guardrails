@@ -544,10 +544,10 @@ def _read_one(root: Any, lane: str, oid: str) -> Lease:
     return parse_lease(gitsafe.read_object(root, oid, MAX_LEASE_BYTES), lane, oid)
 
 
-def read_leases(root: Any) -> LeaseSet:
+def read_leases(root: Any, *, observe=None) -> LeaseSet:
     """Every lease, sorted by lane; refs whose name is no lane, or whose blob is missing,
     too large or no v1 lease of that lane, are ``unreadable``. Reads only. Raises
-    GitError when git cannot list the refs."""
+    GitError when git cannot list refs. ``observe`` may supply a lease outcome for a listed ref."""
     leases: List[Lease] = []
     unreadable: List[Unreadable] = []
     for ref, oid in gitsafe.list_refs(root, LANES_REF):
@@ -556,9 +556,10 @@ def read_leases(root: Any) -> LeaseSet:
             unreadable.append(Unreadable(lane, ref, oid, "not a lane name"))
             continue
         try:
-            leases.append(_read_one(root, lane, oid))
+            outcome = (observe(root, lane, oid) if observe is not None else None) or _read_one(root, lane, oid)
         except (gitsafe.GitError, LeaseFormatError, ValueError) as exc:
-            unreadable.append(Unreadable(lane, ref, oid, str(exc)))
+            outcome = Unreadable(lane, ref, oid, str(exc))
+        (unreadable if isinstance(outcome, Unreadable) else leases).append(outcome)
     return LeaseSet(tuple(leases), tuple(unreadable))
 
 
