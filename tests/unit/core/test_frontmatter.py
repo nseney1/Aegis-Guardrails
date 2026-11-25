@@ -9,15 +9,18 @@ import json
 import os
 from pathlib import Path
 import signal
+import sys
+from threading import local
 from types import SimpleNamespace
 
 import pytest
 
 from aegis_core.errors import PathTraversalError, RuleNotFoundError, RuleParseError
-from aegis_core.rule_inventory import MAX_RULE_BYTES
+from aegis_core.rule_inventory import MAX_RULE_BYTES, MAX_RULE_PATH_CHARS
 from aegis_core.workspace.base import Workspace
+from aegis_core.yaml_engine import frontmatter
 from aegis_core.yaml_engine.frontmatter import (
-    AegisYAML, parse_rule_file, parse_rule_frontmatter,
+    AegisYAML, RuleReadError, parse_rule_file, parse_rule_frontmatter,
 )
 from aegis_core.yaml_engine.parser import AegisYAMLError
 from tests.conftest import symlink_or_skip
@@ -120,7 +123,7 @@ def test_rule_path_matrix(tmp_path, entry, kind):
 def module_os(*, o_path=True, **overrides):
     """An explicit owned OS boundary; the shared os module is never modified."""
     return SimpleNamespace(
-        path=os.path, stat=os.stat, fstat=os.fstat,
+        path=overrides.get("path", os.path), stat=overrides.get("stat", os.stat), fstat=os.fstat,
         open=overrides.get("open", os.open), close=overrides.get("close", os.close),
         read=overrides.get("read", os.read), O_RDONLY=os.O_RDONLY,
         O_BINARY=getattr(os, "O_BINARY", 0), O_CLOEXEC=getattr(os, "O_CLOEXEC", 0),
@@ -334,6 +337,795 @@ def test_explicit_path_refusals_have_fixed_code(path):
     with pytest.raises(RuleParseError, match="^Rule file read refused$") as refused:
         parse_rule_file(path)
     assert refused.value.code == "RULE_FILE_READ_REFUSED"
+
+
+@pytest.mark.parametrize("slot,rooted,tuple_result", [
+    ("path", False, False),
+    ("root", False, False),
+    ("source", False, False),
+    ("workspace-root", False, False),
+    ("resolved", False, False),
+    ("resolved", False, True),
+    ("resolved", True, False),
+    ("resolved", True, True),
+])
+@pytest.mark.parametrize("case", ["valid", "at-limit", "over-limit", "nul", "empty", "wrong-type"])
+def test_rule_path_spelling_at_read_boundaries(tmp_path, monkeypatch, slot, rooted, tuple_result, case):
+    root = tmp_path.resolve()
+    path = root / "rule.md"
+    path.write_bytes(TEXT.encode())
+    real = root if slot in ("root", "workspace-root") else path
+    # The application's limit can exceed the OS limit. Redundant separators
+    # name the same file. Normalize only at the test's OS boundary if needed.
+    if case == "at-limit":
+        extra = MAX_RULE_PATH_CHARS - len(str(real))
+        if real == root:
+            spelling = str(root) + os.sep * extra
+        else:
+            spelling = str(root) + os.sep * (extra + 1) + path.name
+        boundary = module_os(
+            open=lambda name, *a, **kw: os.open(real if name == spelling else name, *a, **kw),
+            stat=lambda name, **kw: os.stat(real if name == spelling else name, **kw),
+        )
+        monkeypatch.setattr(rule_inventory, "os", boundary)
+    else:
+        spelling = {"valid": real, "over-limit": "x" * (MAX_RULE_PATH_CHARS + 1), "nul": "\x00rule.md",
+                    "empty": "", "wrong-type": object()}[case]
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("invalid spelling advanced to path lookup or filesystem access")
+
+    diagnostic_paths = []
+
+    def normalize_refusal(value):
+        assert value == "."
+        diagnostic_paths.append(value)
+        return os.path.abspath(value)
+
+    valid = case in ("valid", "at-limit")
+    workspace_slot = slot in ("workspace-root", "resolved")
+    queries = []
+    path_checks = []
+    expected_path_checks = ["construct root", "join query", "check original for symlink"] if rooted else []
+    query = path.name
+
+    class RootPath:
+        def __truediv__(self, value):
+            assert value is query
+            path_checks.append("join query")
+            return SimpleNamespace(is_symlink=check_original)
+
+    def check_original():
+        path_checks.append("check original for symlink")
+        return path.is_symlink()
+
+    def construct_root(value):
+        assert rooted and value is root and not queries
+        path_checks.append("construct root")
+        return RootPath()
+
+    def confine(value):
+        assert value is query
+        if not valid:
+            assert path_checks == expected_path_checks
+        queries.append(value)
+        result = spelling if slot == "resolved" else path
+        return (result, path) if tuple_result else result
+
+    if workspace_slot:
+        if slot == "workspace-root":
+            adapter = SimpleNamespace(root=spelling, confine_path=confine if valid else unexpected)
+        else:
+            adapter = SimpleNamespace(root=root if rooted else None, confine_path=confine)
+        read = lambda: AegisYAML.parse_file(query, adapter).id
+        error, expected = RuleReadError, "bounded"
+    else:
+        arguments = {"path": path, "root": root, "source": path}
+        arguments[slot] = spelling
+        read = lambda: rule_inventory.read_rule_file(**arguments)
+        error, expected = rule_inventory.RuleInventoryError, TEXT.encode()
+    if valid:
+        assert read() == expected
+    else:
+        # The inventory refusal normalizes its fixed diagnostic path, ".".
+        # Joining or probing the input must still fail immediately.
+        metadata = SimpleNamespace(abspath=normalize_refusal, join=unexpected, exists=unexpected,
+                                   isfile=unexpected, islink=unexpected, isdir=unexpected)
+        os_boundary = module_os(path=metadata, stat=unexpected, open=unexpected)
+        locate_rule = rule_inventory._rule_read_location
+        monkeypatch.setattr(rule_inventory, "os", os_boundary)
+        monkeypatch.setattr(rule_inventory, "_rule_read_location", unexpected)
+        if workspace_slot:
+            monkeypatch.setattr(frontmatter, "os", os_boundary)
+            monkeypatch.setattr(frontmatter, "Path", construct_root if rooted else unexpected)
+            monkeypatch.setattr(frontmatter, "read_rule_file", unexpected)
+        with pytest.raises(error, match="^Rule file read refused$") as refused:
+            read()
+        assert type(refused.value) is error
+        assert refused.value.code == "RULE_FILE_READ_REFUSED"
+        assert diagnostic_paths == ([] if workspace_slot else ["."])
+        assert path_checks == expected_path_checks
+        monkeypatch.setattr(rule_inventory, "os", os)
+        monkeypatch.setattr(rule_inventory, "_rule_read_location", locate_rule)
+        if workspace_slot:
+            monkeypatch.setattr(frontmatter, "os", os)
+            monkeypatch.setattr(frontmatter, "Path", Path)
+            monkeypatch.setattr(frontmatter, "read_rule_file", rule_inventory.read_rule_file)
+        assert AegisYAML.parse_file(query, Workspace(root)).id == "bounded"
+    assert queries == ([query] if slot == "resolved" or slot == "workspace-root" and valid else [])
+
+
+@pytest.fixture
+def rule_path_boundary(monkeypatch):
+    """Allow only listed operations on the parser's own filesystem interfaces."""
+    active = local()
+
+    def check(operation, *operands):
+        pending = getattr(active, "pending", None)
+        if not pending:
+            pytest.fail(f"unexpected rule path operation: {operation}")
+        expected = pending.pop(0)
+        assert (operation, *operands) == expected
+        if operation == "join":
+            assert operands[-1] is expected[-1]
+
+    class DenyAccess:
+        def __getattr__(self, name):
+            pytest.fail(f"unexpected filesystem access: {name}")
+
+    class ObservedPath(DenyAccess):
+        def __init__(self, path):
+            self.path = path
+
+        def __str__(self):
+            return str(self.path)
+
+        def __truediv__(self, query):
+            check("join", self.path, query)
+            return ObservedPath(self.path / query)
+
+        def exists(self):
+            check("exists", self.path)
+            return self.path.exists()
+
+        def is_symlink(self):
+            check("is_symlink", self.path)
+            return self.path.is_symlink()
+
+        def is_dir(self):
+            check("is_dir", self.path)
+            return self.path.is_dir()
+
+    class PathType(type):
+        def __instancecheck__(cls, value):
+            return isinstance(value, Path)
+
+    class CheckedPath(metaclass=PathType):
+        def __new__(cls, value):
+            check("Path", value)
+            return ObservedPath(Path(value))
+
+    def read(target, *, root, source, preserve_os_errors, canonicalize_parent):
+        if isinstance(target, ObservedPath):
+            target = target.path
+        check("read", target, root, source, preserve_os_errors, canonicalize_parent)
+        return rule_inventory.read_rule_file(target, root=root, source=source, preserve_os_errors=preserve_os_errors,
+                                             canonicalize_parent=canonicalize_parent)
+
+    @contextmanager
+    def allow(*operations):
+        active.pending = list(operations)
+        try:
+            yield
+            assert active.pending == []
+        finally:
+            active.pending = []
+
+    monkeypatch.setattr(frontmatter, "os", DenyAccess())
+    monkeypatch.setattr(frontmatter, "Path", CheckedPath)
+    monkeypatch.setattr(frontmatter, "read_rule_file", read)
+    return SimpleNamespace(check=check, allow=allow)
+
+
+def rule_result_probes(source):
+    path = Path(source)
+    return (("Path", source), ("exists", path), ("is_symlink", path), ("is_dir", path))
+
+
+def rooted_rule_probe(root, query, target):
+    return (("Path", root), ("join", root, query), ("is_symlink", target))
+
+
+def rooted_rule_read(root, query, target, source):
+    return (*rule_result_probes(source), ("Path", root), ("join", root, query),
+            ("read", target, root, source, True, False))
+
+
+def test_relative_rule_path_spelling_refuses_before_confinement_and_retries(tmp_path, rule_path_boundary):
+    path = tmp_path / "rule.md"
+    path.write_bytes(TEXT.encode())
+    at_limit = "x" * MAX_RULE_PATH_CHARS
+
+    class Adapter:
+        @property
+        def root(self):
+            rule_path_boundary.check("root")
+            return None
+
+        def confine_path(self, spelling):
+            rule_path_boundary.check("confine", spelling)
+            return path
+
+    adapter = Adapter()
+
+    def parse_valid(query):
+        with rule_path_boundary.allow(
+            ("root",), ("confine", query), *rule_result_probes(path), ("read", path, None, path, True, False),
+        ):
+            return AegisYAML.parse_file(query, adapter).id
+
+    def refuse_and_retry(spelling):
+        with rule_path_boundary.allow():
+            with pytest.raises(RuleReadError, match="^Rule file read refused$") as refused:
+                AegisYAML.parse_file(spelling, adapter)
+        assert refused.value.code == "RULE_FILE_READ_REFUSED"
+        return parse_valid(path.name)
+
+    invalid = ("", at_limit + "x", at_limit + "\x00", None)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(refuse_and_retry, invalid, timeout=15)) == ["bounded"] * len(invalid)
+    assert parse_valid(at_limit) == "bounded"
+
+
+@pytest.mark.parametrize("kind", ["native", "opaque-refuses", "opaque-accepts", "invalid-root"])
+def test_bounded_nul_query_preserves_confiner_dispatch(tmp_path, rule_path_boundary, kind):
+    root = tmp_path.resolve()
+    path = root / "rule.md"
+    path.write_bytes(TEXT.encode())
+    workspace = Workspace(root)
+    query = "\x00rule.md"
+    roots = {"native": workspace.root, "invalid-root": ""}
+
+    def confine(value):
+        assert value is query
+        rule_path_boundary.check("confine", value)
+        if kind == "native":
+            return workspace.confine_path(value)
+        if kind == "opaque-refuses":
+            raise RuleReadError("Rule file read refused")
+        return path
+
+    class Adapter:
+        @property
+        def root(self):
+            rule_path_boundary.check("root")
+            return roots.get(kind)
+
+        confine_path = staticmethod(confine)
+
+    adapter = Adapter()
+    allowed = [("root",)]
+    if kind == "native":
+        allowed.extend(rooted_rule_probe(root, query, root / query))
+    if kind != "invalid-root":
+        allowed.append(("confine", query))
+    if kind == "opaque-accepts":
+        with rule_path_boundary.allow(*allowed, *rule_result_probes(path), ("read", path, None, path, True, False)):
+            assert AegisYAML.parse_file(query, adapter).id == "bounded"
+    else:
+        error, code, message = RuleReadError, "RULE_FILE_READ_REFUSED", "Rule file read refused"
+        if kind == "native":
+            error, code, message = PathTraversalError, "ERR_PATH_TRAVERSAL", "null bytes are not permitted in file paths"
+        with rule_path_boundary.allow(*allowed):
+            with pytest.raises(error) as refused:
+                AegisYAML.parse_file(query, adapter)
+        assert type(refused.value) is error
+        assert str(refused.value) == message
+        assert refused.value.code == code
+    retry = path.name
+    with rule_path_boundary.allow(
+        *rooted_rule_probe(root, retry, path), *rooted_rule_read(root, retry, path, str(path)),
+    ):
+        assert AegisYAML.parse_file(retry, workspace).id == "bounded"
+
+
+@pytest.mark.parametrize("base", [str, type(Path())], ids=["str", "path"])
+@pytest.mark.parametrize("rooted", [False, True], ids=["opaque", "rooted"])
+def test_relative_rule_path_preserves_custom_rendering(tmp_path, rule_path_boundary, base, rooted):
+    root = tmp_path.resolve()
+    path = root / "rule.md"
+    path.write_bytes(TEXT.encode())
+    calls = []
+
+    class Rendered(str):
+        def __contains__(self, item):
+            calls.append("membership")
+            raise LookupError("rendered membership")
+
+    class Query(base):
+        def __str__(self):
+            return Rendered("rule.md")
+
+    query = Query(path.name)
+
+    class Adapter:
+        @property
+        def root(self):
+            rule_path_boundary.check("root")
+            calls.append("root")
+            return root if rooted else None
+
+        def confine_path(self, value):
+            assert value is query
+            rule_path_boundary.check("confine", value)
+            calls.append("confine")
+            return path
+
+    if rooted and base is str:
+        try:
+            assert root / Query(path.name) == path
+        except LookupError as expected:
+            assert expected.args == ("rendered membership",)
+            calls.clear()
+            with rule_path_boundary.allow(("root",), ("Path", root), ("join", root, query)):
+                with pytest.raises(LookupError, match="^rendered membership$") as refused:
+                    AegisYAML.parse_file(query, Adapter())
+            assert type(refused.value) is LookupError
+            assert calls == ["root", "membership"]
+            return
+
+    original_probe = rooted_rule_probe(root, query, path) if rooted else ()
+    read = rooted_rule_read(root, query, path, path) if rooted else (
+        *rule_result_probes(path), ("read", path, None, path, True, False),
+    )
+    with rule_path_boundary.allow(
+        ("root",), *original_probe, ("confine", query), *read,
+    ):
+        document = AegisYAML.parse_file(query, Adapter())
+    assert (document.id, document.source_path, calls) == ("bounded", str(path), ["root", "confine"])
+
+
+@pytest.mark.parametrize("files", ["missing-rendered", "both-existing", "missing-original"])
+def test_rooted_rule_path_selects_runtime_join_name(tmp_path, rule_path_boundary, files):
+    root = tmp_path.resolve()
+    original, rendered = root / "rule.md", root / "display.md"
+    if files != "missing-original":
+        original.write_bytes(TEXT.encode())
+    if files != "missing-rendered":
+        rendered.write_bytes(TEXT.replace("bounded", "displayed").encode())
+
+    class Query(str):
+        def __str__(self):
+            return rendered.name
+
+    query = Query(original.name)
+    source = rendered if files == "missing-original" else original
+    target = rendered if sys.version_info < (3, 12) else original
+
+    def confine(value):
+        assert value is query
+        rule_path_boundary.check("confine", value)
+        return source
+
+    adapter = SimpleNamespace(root=root, confine_path=confine)
+    with rule_path_boundary.allow(
+        *rooted_rule_probe(root, query, target), ("confine", query),
+        *rooted_rule_read(root, query, target, source),
+    ):
+        if target == source:
+            document = AegisYAML.parse_file(query, adapter)
+            assert document.id == ("bounded" if source == original else "displayed")
+            assert document.source_path == str(source)
+        elif target.exists():
+            with pytest.raises(RuleReadError, match="^Rule file read refused$") as refused:
+                AegisYAML.parse_file(query, adapter)
+            assert type(refused.value) is RuleReadError
+            assert refused.value.code == "RULE_FILE_READ_REFUSED"
+        else:
+            with pytest.raises(FileNotFoundError) as refused:
+                AegisYAML.parse_file(query, adapter)
+            assert type(refused.value) is FileNotFoundError
+            assert str(refused.value) == f"File does not exist: {source}"
+
+
+@pytest.mark.parametrize("link_name", ["rule.md", "display.md"], ids=["original-link", "rendered-link"])
+def test_rooted_rule_path_refuses_symlink_selected_by_runtime(tmp_path, rule_path_boundary, link_name):
+    root = tmp_path.resolve()
+    original, rendered = root / "rule.md", root / "display.md"
+    link = root / link_name
+    regular = rendered if link == original else original
+    regular.write_bytes(TEXT.encode())
+    symlink_or_skip(regular, link)
+    workspace = Workspace(root)
+
+    class Query(str):
+        def __str__(self):
+            return rendered.name
+
+    query = Query(original.name)
+    target = rendered if sys.version_info < (3, 12) else original
+
+    def confine(value):
+        assert value is query
+        rule_path_boundary.check("confine", value)
+        return workspace.confine_path(value)
+
+    adapter = SimpleNamespace(root=root, confine_path=confine)
+    probe = rooted_rule_probe(root, query, target)
+    if target == link:
+        with rule_path_boundary.allow(*probe):
+            with pytest.raises(AegisYAMLError) as refused:
+                AegisYAML.parse_file(query, adapter)
+        assert type(refused.value) is AegisYAMLError
+        assert str(refused.value) == f"Symlink parsing prohibited for security: {link}"
+    else:
+        with rule_path_boundary.allow(
+            *probe, ("confine", query), *rooted_rule_read(root, query, regular, str(regular)),
+        ):
+            document = AegisYAML.parse_file(query, adapter)
+        assert (document.id, document.source_path) == ("bounded", str(regular))
+
+
+@pytest.mark.parametrize("style", ["empty", "over-limit", "dot-components"])
+def test_rooted_rule_path_preserves_rendered_length_admission(tmp_path, rule_path_boundary, style):
+    root = tmp_path.resolve()
+    path = root / "rule.md"
+    path.write_bytes(TEXT.encode())
+    spelling = {"empty": "", "over-limit": "x" * (MAX_RULE_PATH_CHARS + 1),
+                "dot-components": "./" * MAX_RULE_PATH_CHARS + path.name}[style]
+
+    class Rendering(str):
+        def __len__(self):
+            return 1
+
+    class Query(str):
+        def __str__(self):
+            return Rendering(spelling)
+
+    query = Query(path.name)
+    workspace = Workspace(root)
+    source = str(path) if style == "dot-components" else path
+
+    def confine(value):
+        assert value is query
+        rule_path_boundary.check("confine", value)
+        if style == "dot-components":
+            return workspace.confine_path(value)
+        return path
+
+    adapter = SimpleNamespace(root=root, confine_path=confine)
+    # Match the platform's join and probe before expecting confinement.
+    probe = [("Path", root), ("join", root, query)]
+    try:
+        target = root / Query(path.name)
+        probe.append(("is_symlink", target))
+        assert not target.is_symlink()
+    except (IndexError, TypeError, OSError) as expected:
+        with rule_path_boundary.allow(*probe):
+            with pytest.raises(type(expected)) as refused:
+                AegisYAML.parse_file(query, adapter)
+        assert type(refused.value) is type(expected)
+        assert refused.value.args == expected.args
+        assert getattr(refused.value, "filename", None) == getattr(expected, "filename", None)
+        return
+
+    with rule_path_boundary.allow(
+        *probe, ("confine", query), *rooted_rule_read(root, query, target, source),
+    ):
+        if target == path:
+            document = AegisYAML.parse_file(query, adapter)
+            assert (document.id, document.source_path) == ("bounded", str(path))
+        else:
+            with pytest.raises(RuleReadError, match="^Rule file read refused$") as refused:
+                AegisYAML.parse_file(query, adapter)
+            assert type(refused.value) is RuleReadError
+            assert refused.value.code == "RULE_FILE_READ_REFUSED"
+
+
+def test_rooted_rule_path_preserves_stateful_rendering_order(tmp_path, rule_path_boundary):
+    root = tmp_path.resolve()
+    path = root / "rule.md"
+    path.write_bytes(TEXT.encode())
+    first_join = root / "probe.md"
+    first_join.write_bytes(TEXT.replace("bounded", "probe").encode())
+    renderings = iter(("admission.md", first_join.name, path.name))
+    calls = []
+
+    class Query(str):
+        def __str__(self):
+            name = next(renderings)
+            calls.append(name)
+            return name
+
+    query = Query(path.name)
+    older_pathlib = sys.version_info < (3, 12)
+
+    def confine(value):
+        assert value is query
+        rule_path_boundary.check("confine", value)
+        calls.append("confine")
+        return path
+
+    adapter = SimpleNamespace(root=root, confine_path=confine)
+    with rule_path_boundary.allow(
+        *rooted_rule_probe(root, query, first_join if older_pathlib else path), ("confine", query),
+        *rooted_rule_read(root, query, path, path),
+    ):
+        document = AegisYAML.parse_file(query, adapter)
+    assert (document.id, document.source_path) == ("bounded", str(path))
+    expected = ["admission.md", first_join.name, "confine", path.name] if older_pathlib else ["admission.md", "confine"]
+    assert calls == expected
+
+
+def test_explicit_file_dispatch_uses_spelling_even_if_truthiness_is_overridden(tmp_path):
+    class FalsePath(str):
+        def __bool__(self):
+            return False
+
+    class TruePath(str):
+        def __bool__(self):
+            return True
+
+    path = tmp_path / "rule.md"
+    path.write_bytes(TEXT.encode())
+    assert parse_rule_file(FalsePath(str(path))) == ({"id": "bounded"}, "body\n")
+    with pytest.raises(RuleNotFoundError) as refused:
+        parse_rule_file(TruePath(""))
+    assert type(refused.value) is RuleNotFoundError
+    assert str(refused.value) == "Rule file not found: "
+    assert refused.value.code == "ERR_AEGIS"
+
+
+def test_rule_path_spelling_preserves_legacy_file_and_text_dispatch(tmp_path, monkeypatch):
+    path = tmp_path / "rule.md"
+    path.write_bytes(TEXT.encode())
+    at_limit = TEXT.ljust(MAX_RULE_PATH_CHARS, "x")
+    missing = "missing-rule-path.md"
+    queries = []
+
+    def exists(value):
+        queries.append(("exists", value))
+        return value in (path, tmp_path, at_limit)
+
+    def isfile(value):
+        queries.append(("isfile", value))
+        return value == path
+
+    monkeypatch.setattr(frontmatter, "os", SimpleNamespace(path=SimpleNamespace(exists=exists, isfile=isfile)))
+    assert parse_rule_frontmatter(path) == ({"id": "bounded"}, "body\n")
+    assert parse_rule_file(path) == ({"id": "bounded"}, "body\n")
+    for content in (at_limit, at_limit + "x", TEXT + "\x00"):
+        assert parse_rule_frontmatter(content) == ({"id": "bounded"}, content.split("---\n")[2])
+    with pytest.raises(ValueError, match="^No frontmatter delimiter$"):
+        parse_rule_frontmatter("")
+    with pytest.raises(ValueError, match="^No frontmatter delimiter$"):
+        parse_rule_frontmatter(missing)
+    with pytest.raises(RuleNotFoundError) as refused:
+        parse_rule_file(tmp_path)
+    assert str(refused.value) == f"Rule file not found: {tmp_path}"
+    with pytest.raises(RuleNotFoundError, match="^Rule file not found: $") as refused:
+        parse_rule_file("")
+    assert refused.value.code == "ERR_AEGIS"
+    with pytest.raises(RuleNotFoundError) as refused:
+        parse_rule_file(at_limit)
+    assert str(refused.value) == "Rule file not found: [diagnostic omitted: too_large]"
+    assert refused.value.code == "ERR_AEGIS"
+    for spelling in (at_limit + "x", "\x00rule.md"):
+        with pytest.raises(RuleParseError, match="^Rule file read refused$") as refused:
+            parse_rule_file(spelling)
+        assert refused.value.code == "RULE_FILE_READ_REFUSED"
+    assert queries == [
+        ("exists", path), ("isfile", path), ("isfile", path),
+        ("exists", at_limit), ("isfile", at_limit), ("exists", missing),
+        ("isfile", tmp_path), ("isfile", at_limit),
+    ]
+
+
+@pytest.mark.parametrize("entry", [parse_rule_frontmatter, parse_rule_file], ids=["mixed", "explicit"])
+@pytest.mark.parametrize("existing", [False, True], ids=["missing", "existing"])
+@pytest.mark.parametrize("rendering", ["empty", "nul", "over-limit", "valid"])
+def test_rule_dispatch_preserves_underlying_filename(tmp_path, monkeypatch, entry, existing, rendering):
+    rendered = {"empty": "", "nul": "shown\x00.md", "over-limit": "x" * (MAX_RULE_PATH_CHARS + 1),
+                "valid": "shown.md"}[rendering]
+
+    class RenderedPath(str):
+        def __str__(self):
+            return rendered
+
+    path = tmp_path / "rule.md"
+    if existing:
+        path.write_bytes(TEXT.encode())
+    original = RenderedPath(path)
+    calls = []
+    read_rule_file = frontmatter.read_rule_file
+
+    def exists(value):
+        assert value is original
+        calls.append("exists")
+        return os.path.exists(value)
+
+    def isfile(value):
+        assert value is original
+        calls.append("isfile")
+        return os.path.isfile(value)
+
+    def read(value, **kwargs):
+        assert value is original
+        calls.append("read")
+        return read_rule_file(value, **kwargs)
+
+    monkeypatch.setattr(frontmatter, "os", SimpleNamespace(path=SimpleNamespace(exists=exists, isfile=isfile)))
+    monkeypatch.setattr(frontmatter, "read_rule_file", read)
+    if existing and rendering == "valid":
+        assert entry(original) == ({"id": "bounded"}, "body\n")
+        expected_calls = ["isfile", "read"] if entry is parse_rule_file else ["exists", "isfile", "read"]
+    else:
+        if entry is parse_rule_frontmatter:
+            if rendering == "over-limit":
+                expected_calls = []
+            elif existing:
+                expected_calls = ["exists", "isfile", "read"]
+            else:
+                expected_calls = ["exists"]
+            if "read" in expected_calls:
+                error, code, message = RuleReadError, "RULE_FILE_READ_REFUSED", "Rule file read refused"
+            else:
+                error, code, message = ValueError, None, "No frontmatter delimiter"
+        elif rendering in ("empty", "valid") and not existing:
+            expected_calls = ["isfile"]
+            error, code, message = RuleNotFoundError, "ERR_AEGIS", f"Rule file not found: {rendered}"
+        else:
+            expected_calls = ["isfile", "read"] if rendering == "empty" else ["read"]
+            error, code, message = RuleParseError, "RULE_FILE_READ_REFUSED", "Rule file read refused"
+        with pytest.raises(error) as refused:
+            entry(original)
+        assert type(refused.value) is error
+        assert getattr(refused.value, "code", None) == code
+        assert str(refused.value) == message
+    assert calls == expected_calls
+
+
+@pytest.mark.parametrize("entry", [parse_rule_frontmatter, parse_rule_file], ids=["mixed", "explicit"])
+@pytest.mark.parametrize("length", [0, MAX_RULE_PATH_CHARS, MAX_RULE_PATH_CHARS + 1],
+                         ids=["empty", "at-limit", "over-limit"])
+def test_custom_string_dispatch_preserves_rendering_protocol(monkeypatch, entry, length):
+    calls = []
+    renderings = []
+
+    class Rendering(str):
+        def __len__(self):
+            calls.append(("length", len(renderings)))
+            return super().__len__()
+
+        def __contains__(self, value):
+            assert value == "\x00" and self is renderings[-1]
+            calls.append(("membership", len(renderings)))
+            raise LookupError("rendered membership")
+
+    class CustomType(type):
+        def __eq__(self, other):
+            calls.append("compare type")
+            return NotImplemented
+
+    class Markdown(str, metaclass=CustomType):
+        def __str__(self):
+            spelling = Rendering("x" * length)
+            renderings.append(spelling)
+            calls.append("render")
+            return spelling
+
+    original = Markdown(TEXT)
+    read_rule_file = frontmatter.read_rule_file
+
+    def exists(value):
+        assert value is original
+        calls.append("exists")
+        return False
+
+    def isfile(value):
+        pytest.fail("unexpected isfile probe for custom markdown")
+
+    def read(value, **kwargs):
+        assert value is original
+        calls.append("read")
+        return read_rule_file(value, **kwargs)
+
+    monkeypatch.setattr(frontmatter, "os", SimpleNamespace(path=SimpleNamespace(exists=exists, isfile=isfile)))
+    monkeypatch.setattr(frontmatter, "read_rule_file", read)
+    expected = ["render", ("length", 1)]
+    if entry is parse_rule_frontmatter:
+        if length <= MAX_RULE_PATH_CHARS:
+            expected.append("exists")
+        assert entry(original) == ({"id": "bounded"}, "body\n")
+    elif length <= MAX_RULE_PATH_CHARS:
+        expected.extend(["render", ("membership", 2)])
+        with pytest.raises(LookupError, match="^rendered membership$"):
+            entry(original)
+    else:
+        expected.extend(["read", "render", ("length", 2)])
+        with pytest.raises(RuleParseError, match="^Rule file read refused$") as refused:
+            entry(original)
+        assert refused.value.code == "RULE_FILE_READ_REFUSED"
+    assert calls == expected
+
+
+@pytest.mark.parametrize("entry", [parse_rule_frontmatter, parse_rule_file], ids=["mixed", "explicit"])
+def test_custom_path_dispatch_preserves_filesystem_conversion_order(tmp_path, monkeypatch, entry):
+    path = tmp_path / "rule.md"
+    path.write_bytes(TEXT.encode())
+    calls = []
+    mixed = entry is parse_rule_frontmatter
+    available_conversions = 2 if mixed else 1
+
+    class StatefulPath(type(tmp_path)):
+        def __str__(self):
+            calls.append("render")
+            return ""
+
+        def __fspath__(self):
+            calls.append("fspath")
+            return str(path if calls.count("fspath") <= available_conversions else tmp_path / "missing.md")
+
+    original = StatefulPath(path)
+    read_rule_file = frontmatter.read_rule_file
+
+    def probe(operation, predicate):
+        def check(value):
+            assert value is original
+            calls.append(operation)
+            return predicate(os.fspath(value))
+        return check
+
+    def read(value, **kwargs):
+        assert value is original
+        calls.append("read")
+        return read_rule_file(value, **kwargs)
+
+    monkeypatch.setattr(frontmatter, "os", SimpleNamespace(path=SimpleNamespace(
+        exists=probe("exists", os.path.exists), isfile=probe("isfile", os.path.isfile),
+    )))
+    monkeypatch.setattr(frontmatter, "read_rule_file", read)
+    error = RuleReadError if mixed else RuleParseError
+    with pytest.raises(error, match="^Rule file read refused$") as refused:
+        entry(original)
+    assert type(refused.value) is error
+    assert refused.value.code == "RULE_FILE_READ_REFUSED"
+    expected = ["render", "exists", "fspath"] if mixed else ["render", "render"]
+    assert calls == expected + ["isfile", "fspath", "read", "render"]
+
+
+@pytest.mark.parametrize("entry", [parse_rule_frontmatter, parse_rule_file], ids=["mixed", "explicit"])
+@pytest.mark.parametrize("make_path", [str, Path], ids=["str", "path"])
+def test_standard_rule_dispatch_classifies_at_limit_once(monkeypatch, entry, make_path):
+    original = make_path("x" * MAX_RULE_PATH_CHARS)
+    calls = []
+
+    def classify(value):
+        assert value is original
+        calls.append("classify")
+        return rule_inventory.classify_rule_path_spelling(value)
+
+    def exists(value):
+        assert value is original
+        calls.append("exists")
+        return True
+
+    def isfile(value):
+        assert value is original
+        calls.append("isfile")
+        return True
+
+    def read(value, **kwargs):
+        assert value is original
+        calls.append("read")
+        return TEXT.encode()
+
+    monkeypatch.setattr(frontmatter, "classify_rule_path_spelling", classify)
+    monkeypatch.setattr(frontmatter, "os", SimpleNamespace(path=SimpleNamespace(exists=exists, isfile=isfile)))
+    monkeypatch.setattr(frontmatter, "read_rule_file", read)
+    assert entry(original) == ({"id": "bounded"}, "body\n")
+    expected = ["classify", "exists"] if entry is parse_rule_frontmatter else ["classify"]
+    assert calls == expected + ["isfile", "read"]
 
 
 @pytest.mark.parametrize("entry", ENTRIES)
