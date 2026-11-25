@@ -4,6 +4,7 @@ from __future__ import annotations
 import codecs
 import errno
 from dataclasses import dataclass, field
+from enum import Enum, auto
 import hashlib
 import os
 from pathlib import Path
@@ -19,7 +20,30 @@ ZERO_WIDTH_CHARS = ("\ufeff", "\u200b", "\u200c", "\u200d")
 
 # A 64 KiB lifecycle body plus room for frontmatter.
 MAX_RULE_BYTES = 128 * 1024
+MAX_RULE_PATH_CHARS = 32768
 _CLOSING_DELIM_RE = re.compile(r"(?m)^---[ \t]*\r?$")
+
+
+class RulePathSpelling(Enum):
+    """Classification of a spelling before filesystem or confinement work."""
+
+    EMPTY = auto()
+    NUL = auto()
+    VALID = auto()
+    INVALID = auto()
+
+
+def classify_rule_path_spelling(value: object) -> RulePathSpelling:
+    """Distinguish empty and bounded NUL spellings for legacy dispatch."""
+    if not isinstance(value, (str, Path)):
+        return RulePathSpelling.INVALID
+    spelling = str(value)
+    size = len(spelling)
+    if size == 0:
+        return RulePathSpelling.EMPTY
+    if size > MAX_RULE_PATH_CHARS:
+        return RulePathSpelling.INVALID
+    return RulePathSpelling.NUL if "\x00" in spelling else RulePathSpelling.VALID
 
 
 def split_frontmatter(content: str) -> Tuple[str, Optional[str], str]:
@@ -341,7 +365,7 @@ def read_rule_file(path: str | Path, *, root: str | Path | None = None,
     try:
         values = (path, *(value for value in (root, source) if value is not None))
         for value in values:
-            if not isinstance(value, (str, Path)) or not 1 <= len(str(value)) <= 32768 or "\x00" in str(value):
+            if classify_rule_path_spelling(value) is not RulePathSpelling.VALID:
                 raise ValueError("invalid rule path")
         absolute, anchor, relative_parts = _rule_read_location(path, root, canonicalize_parent)
         if not relative_parts:
@@ -488,11 +512,14 @@ def inventory_rules(workspace: str) -> RuleInventory:
 
 __all__ = [
     "MAX_RULE_BYTES",
+    "MAX_RULE_PATH_CHARS",
     "RuleInventory",
     "RuleInventoryEntry",
     "RuleInventoryError",
+    "RulePathSpelling",
     "captured_entry",
     "classification_prefix",
+    "classify_rule_path_spelling",
     "fingerprint",
     "inventory_rules",
     "read_rule_file",
