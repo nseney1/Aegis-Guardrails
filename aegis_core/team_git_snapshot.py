@@ -532,10 +532,10 @@ def failure_cause(exc, ambient=None):
 
 
 def merge_tree_oid(out):
-    """Read only the bounded object ID from a merge result."""
+    """Read a bounded, NUL-terminated object ID from a merge result."""
     end = out.find(b"\0", 0, 65)
     if end == -1:
-        end = len(out)
+        raise GitRefusal("size_limit" if len(out) > 64 else "invalid_object")
     if end not in (40, 64):
         raise GitRefusal("invalid_oid")
     try:
@@ -548,11 +548,13 @@ def conflict_paths(out, start, display, max_paths, max_path_bytes):
     """Collect bounded path bytes up to Git's empty separator, then label them."""
     exact = []
     while start < len(out) and out[start] != 0:
+        if len(exact) >= max_paths:
+            raise GitRefusal("size_limit")
         end = out.find(b"\0", start, start + max_path_bytes + 1)
         if end == -1:
-            end = len(out)
-        if len(exact) >= max_paths or end - start > max_path_bytes:
-            raise GitRefusal("size_limit")
+            raise GitRefusal("size_limit" if len(out) - start > max_path_bytes else "invalid_object")
         exact.append(out[start:end])
         start = end + 1
+    if start >= len(out):
+        raise GitRefusal("invalid_object")
     return tuple(display(path) for path in exact), tuple(exact)

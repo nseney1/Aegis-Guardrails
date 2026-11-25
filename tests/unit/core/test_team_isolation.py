@@ -4,7 +4,6 @@ import dataclasses
 import importlib
 import json
 from pathlib import PurePosixPath
-import posixpath
 import stat
 import sys
 from threading import Barrier
@@ -15,6 +14,7 @@ from aegis_core import hosts, team_host_registry, team_isolation as core
 from aegis_core import team_isolation_mounts as mounts
 from aegis_core import team_isolation_verify as verifier
 from aegis_core.team_isolation_refusal import plan_response, plan_text
+from tests.helpers_isolation_catalogue import catalogue_config_parts, home_config_parts
 
 
 HOME = "/owner"
@@ -69,8 +69,11 @@ def direct(value, **options):
 
 
 def refused_as(code, stage=None):
-    body = {"status": "refused", "code": code, "reason": mounts.REFUSALS[code],
-            "next_action": {"actor": "operator", "command": mounts.REFUSALS[code]}}
+    reason = mounts.REFUSALS[code]
+    if stage == "image-inspection" and code in ("document_invalid", "document_size"):
+        reason = "Check local engine inspection for the configured image and retry."
+    body = {"status": "refused", "code": code, "reason": reason,
+            "next_action": {"actor": "operator", "command": reason}}
     if stage is not None:
         body["stage"] = stage
     return body
@@ -606,46 +609,16 @@ _ELIGIBLE = HOME + "/" + _ELIGIBLE_NAME
 _LOCAL_CHILD = HOME + "/.local/share/eligible"
 
 
-def _normalized_catalogue_root(config_path):
-    """Top-level component of one home-relative catalogue path.
-
-    Both the matrix generator and the coverage assertion call this helper.
-    The path is PurePosixPath(HOME).joinpath of the components after '~/',
-    then posixpath.normpath of that absolute path. The result must be strictly
-    below HOME. HOME itself or a path outside it is a catalogue-defect.
-    Callers do not skip that entry. The top-level root is the first component
-    below HOME.
-    """
-    if type(config_path) is not str or not config_path.startswith("~/"):
-        return None
-    absolute = PurePosixPath(HOME).joinpath(*config_path[2:].split("/"))
-    normalized = PurePosixPath(posixpath.normpath(str(absolute)))
-    try:
-        below = normalized.relative_to(PurePosixPath(HOME))
-    except ValueError:
-        raise AssertionError("catalogue-defect: config path normalizes outside the home directory")
-    if not below.parts:
-        raise AssertionError("catalogue-defect: config path normalizes to the home directory")
-    name = below.parts[0]
-    kind = "dir" if (len(below.parts) > 1 or name.count(".") <= 1) else "file"
-    return name, kind
-
-
-def _catalogue_roots(rows=None):
-    """Top-level components of home-relative host config paths."""
-    found = {}
-    for host in hosts.HOSTS if rows is None else rows:
-        paths = host.config_paths
-        if type(paths) not in (tuple, list):
-            continue
-        for config_path in paths:
-            root = _normalized_catalogue_root(config_path)
-            if root is None:
-                continue
-            name, kind = root
-            if found.get(name) != "dir":
-                found[name] = kind
-    return tuple(sorted(found.items()))
+def _catalogue_roots(rows):
+    """Each top-level root can be a directory. Only leaves can also be files."""
+    roots = set()
+    directories = set()
+    for parts in catalogue_config_parts(rows, HOME):
+        roots.add(parts[0])
+        if len(parts) > 1:
+            directories.add(parts[0])
+    return tuple(sorted({(name, "dir") for name in roots}
+                        | {(name, "file") for name in roots - directories}))
 
 
 def _non_teams_catalogue_host(config_paths):
@@ -654,14 +627,12 @@ def _non_teams_catalogue_host(config_paths):
     return dataclasses.replace(source, config_paths=tuple(config_paths))
 
 
-def _refusal_roots():
-    found = {name: kind for name, kind in _catalogue_roots()}
-    for name, kind in _FIXED_MINIMUM:
-        found[name] = kind
-    return tuple(sorted(found.items()))
+def _refusal_roots(rows):
+    return tuple(sorted(set(_catalogue_roots(rows)) | set(_FIXED_MINIMUM)))
 
 
-_ROOTS = _refusal_roots()
+_ROOTS = _refusal_roots(hosts.HOSTS)
+_OBSERVED_ROOTS = dict.fromkeys((name for name, _kind in _ROOTS), "dir") | dict(_FIXED_MINIMUM)
 
 
 def _owners():
@@ -683,14 +654,11 @@ def _install(facts, path, kind, ident):
 
 
 def _fill(facts, homes, extra=()):
-    ident = 1000
-    for home in dict.fromkeys(homes):
-        for name, kind in _ROOTS:
-            _install(facts, home + "/" + name, kind, ident)
-            ident += 1
-    for path, kind in extra:
+    observations = {home + "/" + name: kind for home in dict.fromkeys(homes)
+                    for name, kind in _OBSERVED_ROOTS.items()}
+    observations.update(extra)
+    for ident, (path, kind) in enumerate(observations.items(), 1000):
         _install(facts, path, kind, ident)
-        ident += 1
 
 
 def _complete(extra=()):
@@ -723,30 +691,42 @@ def _plan(path, rw, extra=()):
 
 def test_catalogue_oracle_covers_home_relative_config_roots():
     """The refusal matrix follows the host catalogue and keeps the fixed minimum."""
-    walked = []
-    for host in hosts.HOSTS:
-        paths = host.config_paths
-        if type(paths) not in (tuple, list):
-            continue
-        for config_path in paths:
-            root = _normalized_catalogue_root(config_path)
-            if root is not None:
-                walked.append(root[0])
-    assert walked
-    catalogue = {name for name, _kind in _catalogue_roots()}
-    assert catalogue == set(walked)
-    refused = dict(_ROOTS)
-    assert catalogue <= set(refused)
-    for name, kind in _FIXED_MINIMUM:
-        assert refused[name] == kind
-    assert _ELIGIBLE_NAME not in refused
-    assert any(kind == "file" for _name, kind in _ROOTS)
-    assert any(kind == "dir" for _name, kind in _ROOTS)
+    catalogue = {parts[0] for parts in catalogue_config_parts(hosts.HOSTS, HOME)}
+    assert catalogue
+    minimum = {
+        (".aws", "dir"), (".config", "dir"), (".docker", "dir"), (".git-credentials", "file"),
+        (".gnupg", "dir"), (".kube", "dir"), (".local", "dir"), (".netrc", "file"), (".ssh", "dir"),
+    }
+    assert set(_refusal_roots(())) == minimum
+    assert minimum <= set(_ROOTS)
+    assert catalogue <= _OBSERVED_ROOTS.keys()
+    assert _ELIGIBLE_NAME not in _OBSERVED_ROOTS
 
 
 def _matrix_cases(roots):
     """Read-only and writable cases for each catalogue or minimum root."""
     return tuple((name, kind, rw) for name, kind in roots for rw in (False, True))
+
+
+_MATRIX_CASES = _matrix_cases(_ROOTS)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_catalogue_matrix_covers_both_leaf_kinds_and_directory_ancestors(reverse):
+    rows = (
+        _non_teams_catalogue_host(("~/.claude.json", "~/.ssh", "~/.gemini")),
+        _non_teams_catalogue_host(("~/other/../.gemini/config", "~/.ssh", "/outside")),
+    )
+    if reverse:
+        rows = rows[::-1]
+    assert set(_matrix_cases(_catalogue_roots(rows))) == {
+        (".claude.json", "dir", False), (".claude.json", "dir", True),
+        (".claude.json", "file", False), (".claude.json", "file", True),
+        (".ssh", "dir", False), (".ssh", "dir", True),
+        (".ssh", "file", False), (".ssh", "file", True),
+        (".gemini", "dir", False), (".gemini", "dir", True),
+    }
+    assert {kind for name, kind in _refusal_roots(rows) if name == ".ssh"} == {"dir", "file"}
 
 
 def _matrix_failure(root):
@@ -760,8 +740,11 @@ def _public_matrix_case(root, kind, rw):
     matrix-failure message for that path. Callers do not treat that as success.
     """
     path = HOME + "/" + root
-    facts = _complete(((path, kind), (_ELIGIBLE, "dir")))
-    assert (stat.S_ISREG if kind == "file" else stat.S_ISDIR)(facts[path]["mode"])
+    extra = ((path, kind), (_ELIGIBLE, kind))
+    facts = _complete(extra)
+    for observed_path, observed_kind in extra:
+        row = facts[observed_path]
+        assert row["mode"] == row["after"]["mode"] == _mode(observed_kind)
     before = json.dumps(facts, sort_keys=True)
     try:
         _create(path, rw, facts)
@@ -774,12 +757,14 @@ def _public_matrix_case(root, kind, rw):
     assert path not in caught.message
     assert json.dumps(facts, sort_keys=True) == before
     assert _bind(_ELIGIBLE, rw) in _create(_ELIGIBLE, rw, facts)
-    assert _plan(path, rw, extra=((path, kind), (_ELIGIBLE, "dir"))) == refused_as("unsafe_mount")
+    assert _plan(path, rw, extra=extra) == refused_as("unsafe_mount")
     assert check(config(), host_table=_BASELINE_HOSTS)["status"] == "ok"
 
 
-@pytest.mark.parametrize("rw", [False, True], ids=["read-only", "writable"])
-@pytest.mark.parametrize(("root", "kind"), _ROOTS, ids=[name for name, _kind in _ROOTS])
+@pytest.mark.parametrize(
+    ("root", "kind", "rw"), _MATRIX_CASES,
+    ids=[name + "-" + kind + ("-writable" if rw else "-read-only") for name, kind, rw in _MATRIX_CASES],
+)
 def test_public_mount_refuses_catalogued_and_minimum_roots(root, kind, rw):
     """Each catalogue root and fixed minimum refuses both access modes.
 
@@ -793,7 +778,7 @@ def test_public_mount_refuses_catalogued_and_minimum_roots(root, kind, rw):
 @pytest.mark.parametrize("rw", [False, True], ids=["read-only", "writable"])
 def test_comparable_eligible_mount_with_complete_observations(rw):
     facts = _complete(((_ELIGIBLE, "dir"),))
-    for name, kind in _ROOTS:
+    for name, kind in _OBSERVED_ROOTS.items():
         assert facts[HOME + "/" + name]["mode"] == _mode(kind)
     assert stat.S_ISDIR(facts[_ELIGIBLE]["mode"])
     assert _bind(_ELIGIBLE, rw) in _create(_ELIGIBLE, rw, facts)
@@ -832,7 +817,7 @@ def test_local_descendant_stays_eligible(rw):
 
 
 @pytest.mark.parametrize("rw", [False, True], ids=["read-only", "writable"])
-@pytest.mark.parametrize("root", [name for name, _kind in _ROOTS], ids=[name for name, _kind in _ROOTS])
+@pytest.mark.parametrize("root", tuple(_OBSERVED_ROOTS))
 def test_missing_root_observation_refuses_on_that_root_then_retries(root, rw):
     """Dropping one exclusion's observation refuses that case, then a complete retry works."""
     facts = _complete(((_ELIGIBLE, "dir"),))
@@ -851,29 +836,10 @@ def test_missing_root_observation_refuses_on_that_root_then_retries(root, rw):
 
 def test_catalogue_refusals_and_eligible_mounts_are_isolated_under_concurrency():
     def refuse(item):
-        root, kind, rw = item
-        path = HOME + "/" + root
-        facts = _complete(((_ELIGIBLE, "dir"),))
-        present = stat.S_ISREG(facts[path]["mode"]) if kind == "file" else stat.S_ISDIR(facts[path]["mode"])
-        if not present:
-            return root
-        try:
-            _create(path, rw, facts)
-        except mounts.IsolationRefusal as exc:
-            code = "echoed" if path in exc.message else exc.code
-        else:
-            code = "allowed"
-        try:
-            argv = _create(_ELIGIBLE, rw, facts)
-        except mounts.IsolationRefusal as exc:
-            return root + ":" + exc.code
-        if code != "unsafe_mount" or _bind(_ELIGIBLE, rw) not in argv:
-            return root
-        return "ok"
+        _public_matrix_case(*item)
 
-    items = [(root, kind, rw) for root, kind in _ROOTS for rw in (False, True)]
     with ThreadPoolExecutor(max_workers=3) as pool:
-        assert list(pool.map(refuse, items)) == ["ok"] * len(items)
+        list(pool.map(refuse, _MATRIX_CASES, timeout=10))
 
     shared = _complete(((_ELIGIBLE, "dir"),))
     shared[HOME + "/.local"] = None
@@ -890,19 +856,18 @@ def test_catalogue_refusals_and_eligible_mounts_are_isolated_under_concurrency()
         return refused, _bind(_ELIGIBLE, rw) in argv
 
     with ThreadPoolExecutor(max_workers=3) as pool:
-        assert list(pool.map(share, [False, True] * 3)) == [("unsafe_mount", True)] * 6
+        assert list(pool.map(share, [False, True] * 3, timeout=10)) == [("unsafe_mount", True)] * 6
     assert json.dumps(shared, sort_keys=True) == before
 
 
 _DOTTED_NEXT = ("~/./.next-host", "~/a/../.next-host", "~//.next-host", "~///.next-host")
-_NEXT_ROOT = ".next-host"
 
 
 @pytest.mark.parametrize("config_path", ["~/.", "~/./.", "~/foo/..", "~/"])
 def test_catalogue_entry_that_is_the_home_directory_is_a_catalogue_defect(config_path):
     """A home-relative entry that normalizes to HOME itself is never skipped."""
     with pytest.raises(AssertionError, match="^catalogue-defect: config path normalizes to the home directory$"):
-        _normalized_catalogue_root(config_path)
+        home_config_parts(config_path, HOME)
     host = _non_teams_catalogue_host((config_path,))
     assert host.id not in team_host_registry.TEAM_HOSTS
     with pytest.raises(AssertionError, match="^catalogue-defect: config path normalizes to the home directory$"):
@@ -913,7 +878,7 @@ def test_catalogue_entry_that_is_the_home_directory_is_a_catalogue_defect(config
 def test_catalogue_entry_outside_home_is_a_catalogue_defect(config_path):
     """A home-relative entry that normalizes outside HOME is never skipped."""
     with pytest.raises(AssertionError, match="^catalogue-defect: config path normalizes outside the home directory$"):
-        _normalized_catalogue_root(config_path)
+        home_config_parts(config_path, HOME)
     host = _non_teams_catalogue_host((config_path,))
     assert host.id not in team_host_registry.TEAM_HOSTS
     with pytest.raises(AssertionError, match="^catalogue-defect: config path normalizes outside the home directory$"):
@@ -924,12 +889,8 @@ def test_dotted_spellings_name_the_same_top_level_root():
     """Every injected spelling survives normalization as one non-Teams catalogue root."""
     host = _non_teams_catalogue_host(_DOTTED_NEXT)
     assert host.id not in team_host_registry.TEAM_HOSTS
-    walked = []
-    for config_path in host.config_paths:
-        walked.append(_normalized_catalogue_root(config_path)[0])
-    assert walked == [_NEXT_ROOT] * len(_DOTTED_NEXT)
-    assert dict(_catalogue_roots((host,))) == {_NEXT_ROOT: "dir"}
-    assert {name for name, _kind in _catalogue_roots((host,))} == set(walked)
+    assert tuple(catalogue_config_parts((host,), HOME)) == ((".next-host",),) * len(_DOTTED_NEXT)
+    assert _catalogue_roots((host,)) == ((".next-host", "dir"), (".next-host", "file"))
 
 
 def test_normalized_catalogue_roots_stay_stable_under_concurrency():
@@ -937,19 +898,17 @@ def test_normalized_catalogue_roots_stay_stable_under_concurrency():
     def once(spelling):
         host = _non_teams_catalogue_host((spelling,))
         try:
-            root = _normalized_catalogue_root(spelling)
+            parts = home_config_parts(spelling, HOME)
             found = _catalogue_roots((host,))
         except AssertionError as exc:
             return "defect" if str(exc).startswith("catalogue-defect:") else spelling
-        if root == (_NEXT_ROOT, "dir") and found == ((_NEXT_ROOT, "dir"),):
+        if parts == (".next-host",) and found == ((".next-host", "dir"), (".next-host", "file")):
             return "ok"
         return spelling
 
-    spellings = list(_DOTTED_NEXT) * 3
+    spellings = [*_DOTTED_NEXT, "~/.", "~/.."] * 3
     with ThreadPoolExecutor(max_workers=3) as pool:
-        assert list(pool.map(once, spellings)) == ["ok"] * len(spellings)
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        assert list(pool.map(once, ["~/.", "~/.."] * 3)) == ["defect"] * 6
+        assert list(pool.map(once, spellings, timeout=10)) == (["ok"] * 4 + ["defect", "defect"]) * 3
 
 
 @pytest.mark.parametrize("spelling", ["~/./.ssh", "~/a/../.ssh"])
@@ -957,10 +916,12 @@ def test_normalized_catalogue_roots_stay_stable_under_concurrency():
 def test_dotted_spelling_of_a_fixed_root_is_refused_then_retried(spelling, rw):
     """A dotted spelling of an excluded root is refused in both modes, then again."""
     host = _non_teams_catalogue_host((spelling,))
-    assert _normalized_catalogue_root(spelling) == (".ssh", "dir")
-    assert dict(_catalogue_roots((host,)))[".ssh"] == "dir"
-    _public_matrix_case(".ssh", "dir", rw)
-    _public_matrix_case(".ssh", "dir", rw)
+    assert home_config_parts(spelling, HOME) == (".ssh",)
+    roots = _catalogue_roots((host,))
+    assert roots == ((".ssh", "dir"), (".ssh", "file"))
+    for root, kind in roots:
+        _public_matrix_case(root, kind, rw)
+        _public_matrix_case(root, kind, rw)
 
 
 def test_dotted_fixed_root_refusal_is_isolated_under_concurrency():
@@ -968,17 +929,20 @@ def test_dotted_fixed_root_refusal_is_isolated_under_concurrency():
     def once(item):
         spelling, rw = item
         host = _non_teams_catalogue_host((spelling,))
-        if dict(_catalogue_roots((host,))).get(".ssh") != "dir":
-            return spelling
-        try:
-            _public_matrix_case(".ssh", "dir", rw)
-        except AssertionError as exc:
-            return str(exc)
-        return "ok"
+        roots = _catalogue_roots((host,))
+        assert roots == ((".ssh", "dir"), (".ssh", "file"))
+        for root, kind in roots:
+            _public_matrix_case(root, kind, rw)
 
     items = [(spelling, rw) for spelling in ("~/./.ssh", "~/a/../.ssh") for rw in (False, True)]
     with ThreadPoolExecutor(max_workers=3) as pool:
-        assert list(pool.map(once, items)) == ["ok"] * len(items)
+        list(pool.map(once, items, timeout=10))
+
+
+def _assert_missing_exclusion(root, kind, rw):
+    with pytest.raises(AssertionError) as caught:
+        _public_matrix_case(root, kind, rw)
+    assert str(caught.value) == _matrix_failure(root)
 
 
 @pytest.mark.parametrize("spelling", _DOTTED_NEXT,
@@ -991,42 +955,27 @@ def test_missing_normalized_root_fails_its_matrix_case(spelling):
     """
     host = _non_teams_catalogue_host((spelling,))
     assert host.id not in team_host_registry.TEAM_HOSTS
-    roots = _catalogue_roots((host,))
-    assert dict(roots) == {_NEXT_ROOT: "dir"}
-    cases = _matrix_cases(roots)
-    assert (_NEXT_ROOT, "dir", False) in cases
-    assert (_NEXT_ROOT, "dir", True) in cases
-    message = _matrix_failure(_NEXT_ROOT)
-    for rw in (False, True):
-        with pytest.raises(AssertionError) as caught:
-            _public_matrix_case(_NEXT_ROOT, "dir", rw)
-        assert str(caught.value) == message
-        with pytest.raises(AssertionError) as again:
-            _public_matrix_case(_NEXT_ROOT, "dir", rw)
-        assert str(again.value) == message
+    cases = _matrix_cases(_catalogue_roots((host,)))
+    assert set(cases) == {
+        (".next-host", "dir", False), (".next-host", "dir", True),
+        (".next-host", "file", False), (".next-host", "file", True),
+    }
+    for root, kind, rw in cases:
+        _assert_missing_exclusion(root, kind, rw)
+        _assert_missing_exclusion(root, kind, rw)
 
 
 def test_missing_normalized_root_matrix_failures_are_isolated_under_concurrency():
     """Each dotted spelling fails its own matrix case without disturbing the other."""
-    message = _matrix_failure(_NEXT_ROOT)
-
-    def once(item):
-        spelling, rw = item
+    def once(spelling):
         host = _non_teams_catalogue_host((spelling,))
         roots = _catalogue_roots((host,))
-        if dict(roots).get(_NEXT_ROOT) != "dir":
-            return spelling
-        if (_NEXT_ROOT, "dir", rw) not in _matrix_cases(roots):
-            return spelling
-        try:
-            _public_matrix_case(_NEXT_ROOT, "dir", rw)
-        except AssertionError as exc:
-            return "ok" if str(exc) == message else str(exc)
-        return "allowed"
+        assert roots == ((".next-host", "dir"), (".next-host", "file"))
+        for root, kind, rw in _matrix_cases(roots):
+            _assert_missing_exclusion(root, kind, rw)
 
-    items = [(spelling, rw) for spelling in _DOTTED_NEXT for rw in (False, True)]
     with ThreadPoolExecutor(max_workers=3) as pool:
-        assert list(pool.map(once, items)) == ["ok"] * len(items)
+        list(pool.map(once, _DOTTED_NEXT, timeout=10))
 
 
 # RELEASE RULING 2026-11-21T15:14:28Z. Paired just-inside and just-outside records for the

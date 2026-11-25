@@ -66,6 +66,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.gitops_holder": 0,
     "aegis_core.gitops_rows": 0,
     "aegis_core.gitsafe": 0,
+    "aegis_core.gitsafe_bound": 0,
     "aegis_core.gitsafe_policy": 0,
     "aegis_core.gitsafe_run": 0,
     "aegis_core.team_board": 1,
@@ -127,6 +128,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_isolation_verify": 0,
     "aegis_core.team_jobs_recipes": 0,
     "aegis_core.team_jobs_source": 0,
+    "aegis_core.team_land_plan": 0,
     "aegis_core.team_lease_custody": 0,
     "aegis_core.team_lifecycle": 1,
     "aegis_core.team_lifecycle_writers": 1,
@@ -145,6 +147,8 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_metrics": 1,
     "aegis_core.team_native_authority": 1,
     "aegis_core.team_native_bridge": 1,
+    "aegis_core.team_native_codemode": 0,
+    "aegis_core.team_native_events": 0,
     "aegis_core.team_native_keys": 0,
     "aegis_core.team_native_rollout": 0,
     "aegis_core.team_native_session": 1,
@@ -167,7 +171,9 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.model_select": 1,
     # Manager-only policy and append-only audit domain; no repository credit imports.
     "aegis_core.manager_policy": 1,
+    "aegis_core.manager_runtime": 2,
     "aegis_core.manager_store": 1,
+    "aegis_core.manager_adjudication": 3,
     # Startup-pinned configuration and owner approval over the audit domain.
     "aegis_core.manager_config": 2,
     # Shared manager decision/report service over the pinned activation service.
@@ -229,6 +235,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_publish": 2,
     "aegis_core.team_qualify": 0,
     "aegis_core.team_queue": 2,
+    "aegis_core.team_review": 0,
     "aegis_core.team_review_copy": 0,
     "aegis_core.team_review_files": 0,
     "aegis_core.team_review_verify": 0,

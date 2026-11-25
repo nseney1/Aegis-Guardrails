@@ -1,8 +1,10 @@
 """Message tools through the public MCP transport and the shared CLI renderer."""
+from concurrent.futures import ThreadPoolExecutor
 import json
 import errno
 import re
 from pathlib import Path
+from threading import Barrier
 from types import SimpleNamespace
 
 import pytest
@@ -261,6 +263,59 @@ def test_first_write_creates_private_store_and_reads_back(workspace, tmp_path):
     assert directory.stat().st_mode & 0o777 == 0o700
     assert "*" in (directory.parent / ".gitignore").read_text(encoding="utf-8").splitlines()
     assert call("read", ref=rid)[1] is False
+
+
+@pytest.fixture
+def flat_default(store):
+    value = GOLDENS[0]["record"]
+    data = codec.canonical(value)
+    rid = codec.record_id(value)
+    path = store.root / (rid + ".json")
+    path.write_bytes(data)
+    (store.root.parent / ".gitignore").write_bytes(b"*\n")
+    expected = {"error": {"code": "E_AUTH", "message":
+        "flat message store layout is unsupported. Ask the workspace owner to preserve the old "
+        ".aegis/state/messages directory by moving it aside, then prepare a fresh default store. "
+        "Old references are unavailable in the fresh store."}}
+    return path, rid, data, expected
+
+
+def test_flat_default_store_owner_recovery(flat_default, tmp_path):
+    path, rid, data, expected = flat_default
+    for _ in range(2):
+        assert refuse("read", "E_AUTH", ref=rid) == expected
+        assert refuse("write", "E_AUTH", kind="text", content=CONTENT) == expected
+    assert list(path.parent.iterdir()) == [path]
+    assert path.read_bytes() == data
+
+    retained = tmp_path / "retained-messages"
+    path.parent.rename(retained)
+    path.parent.mkdir(mode=0o700)
+    assert refuse("read", "E_REF", ref=rid) == codec.CodecError("E_REF", detail="resolution").as_dict()
+    result, failed = call("write", kind="text", content=CONTENT)
+    assert not failed
+    text, failed = call("read", ref=json.loads(result)["id"])
+    assert not failed
+    assert json.loads(text)["data"]["body"] == json.loads(CONTENT)["body"]
+    assert list(retained.iterdir()) == [retained / path.name]
+    assert (retained / path.name).read_bytes() == data
+
+
+def test_flat_default_store_concurrent_read_and_write_refuse(flat_default, workspace):
+    path, rid, data, expected = flat_default
+    bound = Workspace(workspace)
+    ready = Barrier(2, timeout=5)
+
+    def dispatch(action, **arguments):
+        ready.wait()
+        return execute_tool("aegis_msg_" + action, dict(arguments, workspace=bound))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        reader = pool.submit(dispatch, "read", ref=rid)
+        writer = pool.submit(dispatch, "write", kind="text", content=CONTENT)
+        assert reader.result(timeout=5) == writer.result(timeout=5) == expected
+    assert list(path.parent.iterdir()) == [path]
+    assert path.read_bytes() == data
 
 
 def test_projection_cursor_and_expansion_parity(store, capsys):

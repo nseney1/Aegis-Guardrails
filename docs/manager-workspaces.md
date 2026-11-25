@@ -119,6 +119,9 @@ Owner signatures bind the local runtime membership identities. Replaced worktree
 Git-directory or common-directory identities require review and renewed approval.
 Missing worktrees remain explicit in status; stored policy inspection does not
 admit an unavailable member for a new management scan.
+The owner verifies the intended subject's `member_id` and `worktree_id` in the
+committed membership before approving activation. This prototype accepts the
+repository ID `aegis`; the worktree IDs are chosen in that membership.
 
 ## Management decisions and outcomes
 
@@ -178,10 +181,60 @@ transport provenance; the server session UUID is not an authenticated native ide
 Existing repository registrations retain their existing interfaces and refuse an
 unconfigured parent folder.
 
-After separately reviewed activation/registration, reconnect the same conversation,
-inspect the advertised manager tools and source identity, scan a real management
-decision, record its claim, inspect provenance and reconnect/replay. Those live
-observations are independent of local unit tests. No live result is asserted here.
+### Use the manager session at decision time
+
+Have the owner approve the registration separately from policy activation. Connect
+through that registration, confirm `initialize` identifies `aegis-manager-mcp`
+and read its standing instructions. Use `tools/list` to confirm the manager tool
+surface. Call `aegis_list_rules` to inspect the active policy and check the intended
+`member_id` and `worktree_id` against the approved membership before scanning.
+
+1. Call `aegis_scan` before deciding. For a compound decision, send one scan for
+   each action and inspect all of the returned matches. Retain each
+   `decision_ref`, action, served rule revisions, `policy_digest` and
+   `membership_digest` together.
+2. Stop and seek review when policy activation is missing (`policy_not_active`),
+   the subject is unknown or unavailable (`unauthorized_membership` or
+   `membership_unavailable`), or a scan unexpectedly returns no rules. A
+   successful empty scan still records a pending decision. Keep its reference
+   for review before taking the action or reporting an outcome.
+3. After deciding, send a corresponding `aegis_report_outcome` for each action.
+   Use the original `decision_ref`, only rule IDs served by that scan, and a
+   stable `idempotency_key`. After reconnecting, replay the identical report
+   with the same key to get the original acknowledgement. The server refuses a
+   changed request under that key (`idempotency_conflict`) and a rule outside
+   the decision's served rules (`unserved_rules`). A new scan creates a new
+   decision reference.
+
+Direct-wire test transcripts and registered-host qualification are distinct
+evidence:
+
+- **Direct-wire stdio evidence (local integration suite):** launches the
+  isolated manager server directly from parent-owned arguments and environment,
+  verified native command, working-directory and config identities, and the
+  pinned configuration SHA256 digest. It checks `initialize`
+  (`aegis-manager-mcp` and standing instructions) and each advertised
+  `tools/list` input schema against the shipped manager contract before tool
+  calls, exercises owner-signed activation, all nine actions, review/refusal
+  stops, historical CLI acknowledgement replay, and reconnect outcome replay,
+  and records `adapter` as `direct-wire` with `registration_fingerprint` set to
+  `null`. Direct-wire runs, historical CLI audits and skipped test legs never
+  count as registered-host observations.
+- **Registered-host qualification (separate acceptance workflow):** independent
+  registered-host decision, refusal and reconnect qualification—including proof
+  of the effective launch and tool policy of each serving thread through the
+  shipped-command workflow and separate owner observation—remains separate from
+  direct-wire verification. For that qualification, record the observed
+  registration and transport, the claimed client name, and the action and
+  decision reference joined to its report.
+
+The server's transport field identifies MCP; the transcript can establish that
+the connection used stdio. Historical CLI audits provide context, while
+qualifying a current session requires its own observed scan and matching
+report. The client label remains self-reported, and the report records a claim
+without granting approval, authority or fitness credit or establishing native
+execution or verified completion.
+
 Rollback removes only the additional manager registration and preserves control
 policy revisions, owner approvals and the external audit history.
 

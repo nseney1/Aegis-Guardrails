@@ -127,10 +127,16 @@ def _anchored_operations_supported():
 
 
 def emit_error(error, *, detail=None) -> int:
-    """Errors contain only the shared core's fixed next-action guidance."""
+    """Render fixed next-action guidance in the shared error envelope."""
     from aegis_core.message_codec_format import frontend_error
 
-    value = frontend_error(error, detail=detail)
+    value = frontend_error(
+        error, detail=detail,
+        flat_layout_message=(
+            "flat message store layout is unsupported. Retry with --store DIR pointing to a new empty store "
+            "directory. Old references are unavailable in the new store."
+        ),
+    )
     messages = {
         "pin": "workspace pin refused; check or unset AEGIS_WORKSPACE",
         "workspace_store": "workspace is not initialized; pass --workspace PROJECT",
@@ -221,6 +227,7 @@ class MsgCommand(AegisCommand):
 
     def execute(self, args: argparse.Namespace) -> int:
         from aegis_core import message_codec as codec
+        from aegis_core.message_codec_store import store_supported
         from aegis_core.workspace.layout import is_aegis_workspace
 
         try:
@@ -237,7 +244,8 @@ class MsgCommand(AegisCommand):
                 prepared = codec.preflight_read(True, selectors=args.fields, spans=args.spans, outline=args.outline,
                                                 since=args.since, expand=args.expand, format=args.format,
                                                 max_chars=args.max_chars)
-            if not _anchored_operations_supported():
+            default_write = args.msg_action == "write" and args.store is None
+            if not _anchored_operations_supported() or (default_write and not store_supported()):
                 return emit_error(codec.CodecError("E_AUTH"), detail="platform")
             # Validate caller content before creating even the default store.
             if args.msg_action == "write":

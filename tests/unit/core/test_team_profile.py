@@ -400,6 +400,47 @@ def test_shared_display_capacity_formatting_is_explicit():
     assert host not in profile.display_profile(value)["host"]
 
 
+def test_window_thresholds_inherit_host_values_and_keep_independent_overrides():
+    capacity = {"usage_source": "subscription-window",
+                "thresholds": {"hold_pct": 90, "route_pct": 85, "flex_route_pct": 75},
+                "window_thresholds": {"5h": {"hold_pct": 65}, "7d": {"flex_route_pct": 70}}}
+    resolved = profile.resolve(repo={"model_settings": {"capacity": {"primary": capacity}}})
+    entry = profile.display_profile(resolved)["profile"]["model_settings"]["capacity"]["primary"]
+    assert entry == capacity
+    assert profile.capacity_thresholds(entry) == capacity["thresholds"]
+    assert profile.capacity_thresholds(entry, window="5h") == {
+        "hold_pct": 65, "route_pct": 65, "flex_route_pct": 65}
+    assert profile.capacity_thresholds(entry, window="7d") == {
+        "hold_pct": 90, "route_pct": 85, "flex_route_pct": 70}
+    assert profile.capacity_thresholds(entry, window="30d") == capacity["thresholds"]
+
+
+def test_window_threshold_order_refuses_at_the_window_and_user_conflicts_are_ignored():
+    path = "model_settings.capacity.primary.window_thresholds.7d"
+    with pytest.raises(profile.ProfileError, match="capacity thresholds must satisfy") as refused:
+        profile.resolve(repo={"model_settings": {"capacity": {"primary": {
+            "window_thresholds": {"7d": {"hold_pct": 70, "route_pct": 80}}}}}})
+    assert refused.value.exit_code == 1
+    assert refused.value.path == path
+    resolved = profile.resolve(
+        repo={"model_settings": {"capacity": {"primary": {
+            "window_thresholds": {"7d": {"route_pct": 90}}}}}},
+        user={"model_settings": {"capacity": {"codex-cli": {"thresholds": {"hold_pct": 80}}}}},
+    )
+    preference = resolved["values"]["user.model_settings.capacity.codex-cli.thresholds.hold_pct"]
+    assert preference["status"] == "ignored"
+    assert preference["reason"] == "threshold preferences conflict with repository"
+
+
+def test_window_thresholds_refuse_an_oversized_map_first():
+    path = "model_settings.capacity.primary.window_thresholds"
+    with pytest.raises(profile.ProfileError, match="^profile object size limit exceeded$") as refused:
+        profile.resolve(repo={"model_settings": {"capacity": {"primary": {
+            "window_thresholds": {str(i): None for i in range(9)}}}}})
+    assert refused.value.exit_code == 1
+    assert refused.value.path == path
+
+
 def test_redaction_after_canonicalization_before_truncation():
     from aegis_cli.team import display_profile
     value = "x" * 490 + " token=\x1b[31msuper-secret-credential" + "y" * 20
@@ -1640,6 +1681,8 @@ def _numeric_field_bounds(schema, path=(), user_only=False):
         yield from _numeric_field_bounds(child, (*path, name), user_only)
     for child in schema.get("patternProperties", {}).values():
         name = "local" if path == ("run_config", "runners") else "writer" if path == ("run_config", "token_budgets") else "primary"
+        if path[-1:] == ("window_thresholds",):
+            name = "5h"
         yield from _numeric_field_bounds(child, (*path, name), user_only)
 
 

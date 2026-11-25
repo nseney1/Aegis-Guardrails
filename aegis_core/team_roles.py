@@ -21,7 +21,7 @@ from aegis_core.team_mailbox_primitives import (
 __all__ = [
     "RoleRefusal", "SCHEMA", "VOCABULARY", "ENDPOINT_ROLES", "LANE_KINDS", "VERTICAL_ROUTES",
     "SOURCE_VIEW_TOOLS", "WORKSPACE_TOOLS", "READ_TOOLS", "WRITE_TOOLS",
-    "require", "fields", "text", "load_registry", "registry", "role_tables", "role_name",
+    "require", "fields", "text", "load_registry", "registry", "git_capabilities", "role_tables", "role_name",
     "actions", "lifecycle_connection", "decision_connection", "validate_role", "validate",
     "role", "session_roles", "fixed_model_profile", "reader_shell_roles", "writer", "file_tools",
     "require_file_tools", "workspace_tools", "lifecycle_tools", "decision_tools", "takes_board",
@@ -34,6 +34,77 @@ _GRAMMAR = RoleTables()
 ENDPOINT_ROLES = _GRAMMAR.endpoint_roles
 LANE_KINDS = _GRAMMAR.lane_kinds
 VERTICAL_ROUTES = _GRAMMAR.vertical_routes
+
+
+# Git permissions describe scoped requests and effects. The installed registry may
+# remove grants, but can never assign an effect beyond the ADR's principal boundary.
+_STATUS = frozenset({"team:status"})
+_GIT_READ = _STATUS | {"git:read"}
+_OWN_LANE = _STATUS | {"git:read-own-lane", "lane:commit-own", "lane:sync-own"}
+_EXACT_REVIEW = _STATUS | {"git:read-exact-head", "review:record-exact-head"}
+_GIT_LIMITS = {
+    "root": _GIT_READ,
+    "router": _STATUS | {"queue:add"},
+    "orchestrator": _GIT_READ | {
+        "queue:list", "queue:claim-team", "queue:release-team", "queue:done-team",
+        "lane:start-team", "lane:commit-team", "lane:sync-team", "lane:land-team",
+        "lane:resume-team", "lane:done-preview", "lane:gc-preview",
+    },
+    "reviewer": _EXACT_REVIEW,
+    "decider": _GIT_READ,
+    "implementer": _OWN_LANE,
+    "test-author": _OWN_LANE,
+    "owner": _GIT_READ | {
+        "lane:start-owner", "lane:commit-owner", "lane:sync-owner", "lane:resume-owner",
+        "lane:done-preview", "lane:gc-preview", "lane:done-apply", "lane:gc-apply",
+        "git:recover", "git:prune", "git:configure", "forge:merge-review-target",
+        "forge:merge-signed-target", "git:sign-signature-target", "forge:owner-admin",
+    },
+    "watch-supervisor": _STATUS,
+    "provider-bridge": _STATUS,
+    "job-executor": _STATUS | {
+        "git:read-exact-head", "job:run-exact-export", "job:write-evidence", "broker:route-git-requests",
+    },
+    "architect": _GIT_READ,
+    "validation-operator": _EXACT_REVIEW | {"qualification:request-exact-tree"},
+    "integrator": _OWN_LANE,
+    "specialist-reviewer": _EXACT_REVIEW,
+    "release-operator": _GIT_READ | {
+        "release:open-review-or-signature-pr", "lane:land-repair-red-target", "lane:start-revert-red-target",
+    },
+    "front-door": _STATUS,
+    "session-helper": _STATUS | {"git:read-parent-scope"},
+    "git-custodian": _GIT_READ | {
+        "git:manage-leased-worktree", "git:snapshot-private-index", "git:create-tested-commit",
+        "git:create-queue-merge", "git:fast-forward-leased-lane-ref", "git:write-qualification-and-queue-refs",
+        "git:write-lane-records", "git:write-operation-journal",
+    },
+    "publisher": _GIT_READ | {
+        "forge:use-publisher-identity", "forge:push-qualified-none-target-without-rule-changes",
+        "forge:open-qualified-draft-pr", "forge:open-release-pr", "forge:cancel-superseded-run",
+        "forge:delete-merged-lane-branch", "forge:record-intent-result",
+    },
+}
+
+
+def _git_principal(name):
+    return type(name) is str and len(name) <= 64 and name in _GIT_LIMITS
+
+
+def _valid_git_capabilities(policy):
+    if type(policy) is not dict or len(policy) != len(_GIT_LIMITS):
+        return False
+    for name, grants in policy.items():
+        if not _git_principal(name):
+            return False
+        limit = _GIT_LIMITS[name]
+        if type(grants) is not list or len(grants) > len(limit):
+            return False
+        if any(type(grant) is not str or len(grant) > 64 or grant not in limit for grant in grants):
+            return False
+        if len(set(grants)) != len(grants):
+            return False
+    return True
 
 _NEXT = {
     "invalid_registry": "Restore a complete registry matching the role schema and retry.",
@@ -359,6 +430,19 @@ def registry():
     return load_registry(raw)
 
 
+@_operation(reason="not_permitted")
+def git_capabilities(name):
+    """Return declared grants for a principal already identified by the caller.
+
+    Lane grants describe scoped broker requests. The broker still checks the
+    caller's binding and the service still checks the lease and target policy.
+    """
+    require(_git_principal(name), reason="not_permitted")
+    data = registry()
+    require("git_capabilities" in data, reason="not_permitted")
+    return tuple(data["git_capabilities"][name])
+
+
 def _freeze(value):
     """Own a deeply read-only copy of an already bounded, validated JSON tree."""
     if type(value) is dict:
@@ -609,8 +693,10 @@ def _routes(routes):
 
 
 def _validate_body(registry):
-    fields(registry, {'schema', 'routes', 'roles'})
+    fields(registry, {'schema', 'routes', 'roles'}, {'git_capabilities'})
     require(registry['schema'] == SCHEMA, reason='unsupported_schema')
+    if 'git_capabilities' in registry:
+        require(_valid_git_capabilities(registry['git_capabilities']))
     roles = registry['roles']
     require(isinstance(roles, dict), repair="field_type")
     require(0 < len(roles) <= 64)

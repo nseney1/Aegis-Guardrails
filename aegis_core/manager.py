@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import copy
 import re
+import tempfile
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 
-from aegis_core import gitsafe, gitsafe_run
+from aegis_core import approval_shape, gitsafe, gitsafe_run
 from aegis_core.manager_config import initialize, load_config, verify_owner
 from aegis_core.manager_policy import (
     ACTIONS, CONTEXT_LIMITS, DECISION_REF_LENGTH, EVIDENCE_LIMITS, MAX_EVIDENCE, MAX_IDEMPOTENCY_KEY_LENGTH,
@@ -21,10 +23,18 @@ from aegis_core.manager_store import ManagerStore
 
 __all__ = ["ManagerService", "initialize"]
 _HEX = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+_REF = re.compile(r"[0-9a-f]{64}")
+_GIT_PATH_REFUSALS = frozenset({"git_path_limit", "git_path_invalid", "git_path_encoding", "git_path_record_invalid"})
+_NO_WORKTREE = b"fatal: this operation must be run in a work tree"
+_SHALLOW_FIELDS = ("true", "false", "--is-shallow-repository")
 
 
 def _bounded(value, limit):
     return type(value) is str and 0 < len(value) <= limit and "\x00" not in value
+
+
+def _valid_ref(value):
+    return type(value) is str and len(value) == DECISION_REF_LENGTH and _REF.fullmatch(value) is not None
 
 
 def _pending(rows):
@@ -39,12 +49,16 @@ def _activation(rows):
 
 def _statement(config, fingerprint, candidate, rows):
     previous = _activation(rows)
+    return _activation_statement(config, fingerprint, candidate, previous, rows[-1]["hash"], _pending(rows))
+
+
+def _activation_statement(config, fingerprint, candidate, previous, head, pending):
     return {"schema": "aegis.manager-activation/v1", "workspace_id": config["workspace_id"],
             "config_digest": fingerprint, "control_commit": candidate["control_commit"],
             "policy_digest": candidate["policy_digest"], "membership_digest": candidate["membership_digest"],
             "membership_bindings_digest": digest(candidate["bindings"]),
             "expected_activation": previous["activation_ref"] if previous else None,
-            "expected_audit_head": rows[-1]["hash"], "pending_decisions_digest": digest(_pending(rows))}
+            "expected_audit_head": head, "pending_decisions_digest": digest(pending)}
 
 
 def _context(value):
@@ -65,22 +79,109 @@ def _member(candidate, member_id, worktree_id):
 
 
 def _safe_runtime_path(path):
-    return path.is_dir() and path.resolve() == path and not any(
-        p.is_symlink() or (getattr(p, "is_junction", lambda: False)()) for p in (path, *path.parents))
+    return not any(p.is_symlink() or (getattr(p, "is_junction", lambda: False)())
+                   for p in (path, *path.parents)) and path.is_dir() and path.resolve() == path
+
+
+def _live_member_directory(path):
+    try:
+        safe = _safe_runtime_path(path)
+    except (OSError, RuntimeError, ValueError):
+        raise ManagerError("unsafe_path") from None
+    if not safe:
+        raise ManagerError("unsafe_path")
+    return path
+
+
+def _member_git_scope():
+    if gitsafe.custody_active():
+        return nullcontext()
+    try:
+        scratch = Path(tempfile.gettempdir()).resolve()
+    except (OSError, RuntimeError):
+        raise gitsafe.GitError("Member Git discovery scratch is unavailable.", code="git_failed") from None
+    return gitsafe.custody(scratch=scratch, stdout_limit=1024 * 1024)
+
+
+def _git_discovery_failure():
+    return gitsafe.GitError("Member Git discovery did not return a complete answer.", code="git_failed")
+
+
+def _member_path_output(stdout):
+    value = gitsafe_run.path_text(stdout)
+    if not value or not stdout.endswith(b"\n"):
+        raise _git_discovery_failure()
+    return value
+
+
+def _member_git_path(path, option):
+    result = gitsafe.run(["rev-parse", option], path, timeout=5)
+    if result.returncode:
+        raise _git_discovery_failure()
+    return _member_path_output(result.stdout)
+
+
+def _split_member_layout(path, answer):
+    common = _member_git_path(path, "--git-common-dir")
+    start = common + "\n"
+    if not answer.startswith(start):
+        raise _git_discovery_failure()
+    top = _member_git_path(path, "--show-toplevel")
+    end = "\n" + top
+    if not answer.endswith(end):
+        raise _git_discovery_failure()
+    prefix, separator, shallow = answer[len(start):-len(end)].rpartition("\n")
+    if not separator:
+        raise _git_discovery_failure()
+    return common, prefix, shallow, top
+
+
+def _member_layout(path):
+    result = gitsafe.run(["rev-parse", "--git-common-dir", "--show-prefix",
+                         "--is-shallow-repository", "--show-toplevel"], path, timeout=5)
+    # Git reports these three fields before refusing --show-toplevel outside a worktree.
+    no_worktree = result.returncode == 128 and result.stderr in (_NO_WORKTREE + b"\n", _NO_WORKTREE + b"\r\n")
+    if result.returncode and not no_worktree:
+        raise _git_discovery_failure()
+    answer = _member_path_output(result.stdout)
+    if no_worktree:
+        common, separator, shallow = answer.rpartition("\n\n")
+        if common and separator and shallow in _SHALLOW_FIELDS:
+            return path / common, None
+        raise _git_discovery_failure()
+
+    fields = answer.split("\n", 4)
+    if len(fields) == 4:
+        common, prefix, shallow, top = fields
+    elif len(fields) == 5 and any("\n" + flag + "\n" in answer for flag in _SHALLOW_FIELDS):
+        # Both split answers must fit the original record, including embedded newlines.
+        common, prefix, shallow, top = _split_member_layout(path, answer)
+    else:
+        raise _git_discovery_failure()
+    top = Path(top)
+    if not common or not top.is_absolute() or shallow not in _SHALLOW_FIELDS:
+        raise _git_discovery_failure()
+    if prefix and (top == path or not prefix.endswith("/")):
+        raise _git_discovery_failure()
+    return path / common, top
+
+
+def _binding_git_error(exc):
+    code = "membership_unavailable" if exc.code in _GIT_PATH_REFUSALS else "git_unavailable"
+    return ManagerError(code)
 
 
 @gitsafe.scrubbed()
 def _runtime_paths(member, worktree):
     path = Path(worktree["path"])
-    common = gitsafe.common_dir(path)
-    result = gitsafe.run(["rev-parse", "--absolute-git-dir"], path, timeout=5)
-    if result.returncode or common is None:
-        raise ManagerError("membership_unavailable")
-    try:
-        gitdir = Path(gitsafe_run.path_text(result.stdout))
-    except gitsafe.GitError:
-        raise ManagerError("membership_unavailable") from None
-    if gitsafe.toplevel(path) != path or common != Path(member["common_dir"]):
+    with _member_git_scope():
+        common, top = _member_layout(path)
+        if top is None:
+            raise ManagerError("membership_unavailable")
+        gitdir = Path(_member_git_path(path, "--absolute-git-dir"))
+        if not gitdir.is_absolute():
+            raise _git_discovery_failure()
+    if top != path or common != Path(member["common_dir"]):
         raise ManagerError("membership_unavailable")
     return {"root": path, "common_dir": common, "git_dir": gitdir}
 
@@ -97,19 +198,43 @@ def _path_identity(path):
 @gitsafe.scrubbed()
 def _bindings(candidate):
     result = {}
-    for member in candidate["membership"]["repositories"]:
-        for worktree in member["worktrees"]:
-            result[member["id"] + "/" + worktree["id"]] = {
-                key: _path_identity(path) for key, path in _runtime_paths(member, worktree).items()}
+    try:
+        for member in candidate["membership"]["repositories"]:
+            for worktree in member["worktrees"]:
+                result[member["id"] + "/" + worktree["id"]] = {
+                    key: _path_identity(path) for key, path in _runtime_paths(member, worktree).items()}
+    except gitsafe.GitError as exc:
+        raise _binding_git_error(exc) from None
     return result
+
+
+def _verify_live_membership(membership):
+    with _member_git_scope():
+        for member in membership["repositories"]:
+            declared_common = _live_member_directory(Path(member["common_dir"]))
+            for worktree in member["worktrees"]:
+                path = _live_member_directory(Path(worktree["path"]))
+                common, top = _member_layout(path)
+                if top != path or _live_member_directory(common) != declared_common:
+                    raise ManagerError("membership_identity_mismatch")
+
+
+def _read_binding_candidate(control_root, revision):
+    # Verify live membership here so control-repository Git errors keep their own refusal.
+    candidate = read_candidate(control_root, revision, verify_membership=False)
+    try:
+        _verify_live_membership(candidate["membership"])
+    except gitsafe.GitError as exc:
+        raise _binding_git_error(exc) from None
+    return candidate
 
 
 @gitsafe.scrubbed()
 def _identity(member, worktree, bindings=None):
     path = Path(worktree["path"])
-    if not path.is_dir():
-        return "missing"
     try:
+        if not path.is_dir():
+            return "missing"
         current = {key: _path_identity(value) for key, value in _runtime_paths(member, worktree).items()}
         if bindings is not None and current != bindings.get(member["id"] + "/" + worktree["id"]):
             return "mismatched"
@@ -282,11 +407,22 @@ class ManagerService:
     """One immutable startup binding over a shared external audit history."""
 
     def __init__(self, config_path, provenance=None, expected_config_digest=None):
+        self._bind(config_path, provenance, expected_config_digest)
+        self._rows()
+
+    def _bind(self, config_path, provenance, expected_config_digest):
         self.config_path = Path(config_path)
         self.config, self.config_digest = load_config(self.config_path, expected_config_digest)
         self.provenance = copy.deepcopy(provenance or {"transport": "cli", "native_identity": None})
         self.store = ManagerStore(self.config["store_root"], forbidden_roots=(self.config["control_root"],))
-        self._rows()
+
+    @classmethod
+    @gitsafe.scrubbed()
+    def for_adjudication(cls, config_path, expected_config_digest):
+        """Bind an owner request to the same validated read used at startup."""
+        service = cls.__new__(cls)
+        service._bind(config_path, None, expected_config_digest)
+        return service, service._adjudication_snapshot(service._validate(service.store.read()))
 
     def _validate(self, rows):
         if not rows or rows[0].get("kind") != "init" or rows[0].get("config_digest") != self.config_digest:
@@ -305,14 +441,14 @@ class ManagerService:
                 if type(kind) is not str or kind not in fields or set(row) != envelope | fields[kind] or (kind == "init" and index != 0):
                     raise ManagerError("audit_corrupt")
                 if kind == "activation":
-                    if not _bounded(row["activation_ref"], 64) or row["activation_ref"] in activations:
+                    if not _valid_ref(row["activation_ref"]) or row["activation_ref"] in activations:
                         raise ManagerError("audit_corrupt")
                     _candidate_shape(row["candidate"])
                     if type(row["approval"]) is not dict or type(row["statement"]) is not dict:
                         raise ManagerError("audit_corrupt")
                     activations[row["activation_ref"]] = row
                 elif kind == "decision":
-                    if not _bounded(row["decision_ref"], DECISION_REF_LENGTH) or not _bounded(row["activation_ref"], 64) \
+                    if not _valid_ref(row["decision_ref"]) or not _valid_ref(row["activation_ref"]) \
                             or row["decision_ref"] in decisions or type(row["action"]) is not str:
                         raise ManagerError("audit_corrupt")
                     _decision_valid(row, activations[row["activation_ref"]])
@@ -320,7 +456,7 @@ class ManagerService:
                 elif kind == "outcome":
                     request = row["request"]
                     if type(request) is not dict or type(request.get("idempotency_key")) is not str \
-                            or type(request.get("decision_ref")) is not str or type(row["result"]) is not dict:
+                            or not _valid_ref(request.get("decision_ref")) or type(row["result"]) is not dict:
                         raise ManagerError("audit_corrupt")
                     if request["idempotency_key"] in keys:
                         raise ManagerError("audit_corrupt")
@@ -342,17 +478,87 @@ class ManagerService:
         index = rows.index(current)
         if _pending(rows[:index]):
             raise ManagerError("activation_integrity")
+        candidate = self._activation_candidate(current)
+        statement = _statement(self.config, self.config_digest, candidate, rows[:index])
+        self._confirm_activation(current, candidate, statement)
+        return current
+
+    def _activation_candidate(self, current):
         candidate = read_candidate(self.config["control_root"], current["candidate"]["control_commit"],
                                    verify_membership=False)
         candidate["bindings"] = current["candidate"].get("bindings", {})
-        statement = _statement(self.config, self.config_digest, candidate, rows[:index])
+        return candidate
+
+    def _confirm_activation(self, current, candidate, statement):
         if current["candidate"] != candidate or current["statement"] != statement \
                 or current["activation_ref"] != digest(statement):
             raise ManagerError("activation_integrity")
         approval = {"statement": statement, "commit": current["approval"].get("approval_commit")}
         if verify_owner(self.config, statement, approval) != current["approval"]:
             raise ManagerError("activation_integrity")
-        return current
+
+    @gitsafe.scrubbed()
+    def adjudication_history(self):
+        """Return one validated audit snapshot for offline owner review."""
+        try:
+            return self._adjudication_snapshot(self._rows())
+        except OSError:
+            raise ManagerError("adjudication_unavailable") from None
+
+    def _adjudication_snapshot(self, rows):
+        try:
+            with gitsafe.memo():
+                if gitsafe.custody_active():
+                    return self._read_adjudication_history(rows)
+                with gitsafe.custody(scratch=Path(tempfile.gettempdir()).resolve(), stdout_limit=1024 * 1024):
+                    return self._read_adjudication_history(rows)
+        except gitsafe.GitError:
+            raise ManagerError("git_unavailable") from None
+
+    def _read_adjudication_history(self, rows):
+        previous = None
+        activations, decisions, pending = {}, {}, set()
+        for index in range(1, len(rows)):
+            row = rows[index]
+            if row["kind"] == "activation":
+                if pending:
+                    raise ManagerError("activation_integrity")
+                candidate = self._activation_candidate(row)
+                if candidate["workspace_id"] != self.config["workspace_id"]:
+                    raise ManagerError("activation_integrity")
+                statement = _activation_statement(self.config, self.config_digest, candidate, previous,
+                                                  rows[index - 1]["hash"], [])
+                self._preflight_adjudication_approval(row["approval"].get("approval_commit"))
+                self._confirm_activation(row, candidate, statement)
+                activations[row["activation_ref"]] = row
+                previous = row
+            elif row["kind"] == "decision":
+                if previous is None or row["activation_ref"] != previous["activation_ref"]:
+                    raise ManagerError("activation_integrity")
+                context = row["context"]
+                _member(previous["candidate"], context["member_id"], context["worktree_id"])
+                decisions[row["decision_ref"]] = row
+                pending.add(row["decision_ref"])
+            else:
+                pending.discard(row["request"]["decision_ref"])
+        checkpoints = {row["hash"]: row["seq"] for row in rows}
+        return rows[-1]["hash"], checkpoints, activations, decisions
+
+    def _preflight_adjudication_approval(self, approval):
+        root = self.config["control_root"]
+        if not _bounded(approval, 64) or not _HEX.fullmatch(approval) or gitsafe.resolve_commit(root, approval) != approval:
+            raise ManagerError("activation_integrity")
+        sizes = gitsafe.blob_sizes(root, [approval], kind="commit", timeout=5)
+        if sizes[approval] > 2 * approval_shape.MAX_MESSAGE_BYTES:
+            raise ManagerError("anchor_limit")
+
+    def verify_adjudication_binding(self, activation, decision):
+        """Require the served decision's approved worktree identity to remain available."""
+        candidate = activation["candidate"]
+        context = decision["context"]
+        member, worktree = _member(candidate, context["member_id"], context["worktree_id"])
+        if _identity(member, worktree, candidate["bindings"]) != "available":
+            raise ManagerError("membership_unavailable")
 
     def _active(self, rows):
         current = self._verified_activation(rows)
@@ -362,7 +568,7 @@ class ManagerService:
 
     def candidate(self, revision):
         rows = self._rows()
-        candidate = read_candidate(self.config["control_root"], revision)
+        candidate = _read_binding_candidate(self.config["control_root"], revision)
         if candidate["workspace_id"] != self.config["workspace_id"]:
             raise ManagerError("workspace_mismatch")
         candidate["bindings"] = _bindings(candidate)
@@ -373,7 +579,7 @@ class ManagerService:
                 "pending_decisions": _pending(rows), "fitness_credit": 0}
 
     def activate(self, revision, expected, approval):
-        candidate = read_candidate(self.config["control_root"], revision)
+        candidate = _read_binding_candidate(self.config["control_root"], revision)
         if candidate["workspace_id"] != self.config["workspace_id"]:
             raise ManagerError("workspace_mismatch")
         candidate["bindings"] = _bindings(candidate)
@@ -459,7 +665,7 @@ class ManagerService:
         return self.store.transaction(scan)
 
     def report(self, decision_ref, rules_used, outcome, evidence, idempotency_key, tests_passed=None):
-        if not _bounded(decision_ref, DECISION_REF_LENGTH) or not re.fullmatch(r"[0-9a-f]{64}", decision_ref):
+        if not _valid_ref(decision_ref):
             raise ManagerError("unknown_decision")
         if type(rules_used) is not list or len(rules_used) > MAX_RULES \
                 or any(not _bounded(rule, MAX_RULE_ID_LENGTH) for rule in rules_used) or len(set(rules_used)) != len(rules_used):

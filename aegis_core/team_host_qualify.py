@@ -17,7 +17,9 @@ import time
 from datetime import datetime
 
 from aegis_core import hosts
-from aegis_core.primitives import is_within, json_preflight, utc_stamp
+from aegis_core.errors import LockTimeoutError, PathTraversalError
+from aegis_core.primitives import is_within, json_preflight, strict_loads, utc_stamp
+from aegis_core.storage import file_lock
 from aegis_core.storage_confined import ConfinedFileError, confined_file, descriptor_supported as confined_supported
 from aegis_core.workspace.layout import UserLayout
 
@@ -63,6 +65,7 @@ _MAX_ITEMS = 1024
 _MAX_STRING = 4096
 _MAX_CLOCK = 4_000_000_000
 _RECORD_DIR = "host-qualification"
+_LOCK_TIMEOUT = 5.0
 _PROBE_ROLES = PROBE_ROLES
 _ROLE = re.compile(r"[a-z][a-z0-9-]{0,31}\Z")
 _PROBE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
@@ -91,6 +94,7 @@ REFUSALS = {
     "unsupported_platform": "host qualification requires descriptor custody",
     "record_unsafe": "host qualification record failed custody checks",
     "record_invalid": "host qualification record is invalid",
+    "record_busy": "host qualification record is busy",
     "record_exists": "host qualification record already exists",
     "record_inside_workspace": "host qualification record must stay outside the workspace",
     "host_mismatch": "host qualification record names another host",
@@ -113,6 +117,7 @@ NEXT_ACTIONS = {
     "unsupported_platform": {"actor": "owner", "command": "aegis team qualify host KIND"},
     "record_unsafe": {"actor": "owner", "command": "aegis team qualify host KIND --report PATH --record"},
     "record_invalid": {"actor": "owner", "command": "aegis team qualify host KIND --report PATH --record"},
+    "record_busy": {"actor": "owner", "command": "aegis team qualify host KIND --report PATH --record"},
     "record_exists": {"actor": "owner", "command": "aegis team qualify host KIND"},
     "record_inside_workspace": {"actor": "owner", "command": "aegis team qualify host KIND"},
     "host_mismatch": {"actor": "owner", "command": "aegis team qualify host KIND --report PATH --record"},
@@ -147,18 +152,8 @@ def default_state_root():
 
 
 def probe_runner_ids():
-    """Host ids whose registration can name a single probe CLI, derived from HostSpec."""
-    found = []
-    for spec in hosts.HOSTS:
-        registration = spec.registration
-        if spec.retired or registration is None or registration.kind != "native_cli":
-            continue
-        if len(spec.binaries) != 1 or not registration.argv:
-            continue
-        binary = spec.binaries[0]
-        if registration.argv[0] == binary and binary in spec.aliases:
-            found.append(spec.id)
-    return tuple(found)
+    """Host ids with a declared report producer and an active catalog entry."""
+    return tuple(spec.id for spec in hosts.HOSTS if spec.team_report_producer and not spec.retired)
 
 
 def record_relative(host_id):
@@ -389,37 +384,13 @@ def _prepare(state_root, host, workspace):
     return (resolved, relative), None
 
 
-def _loads(text):
-    def pairs(items):
-        found = {}
-        for key, value in items:
-            if type(key) is not str or key in found:
-                raise ValueError("invalid")
-            found[key] = value
-        return found
-
-    def constant(_name):
-        raise ValueError("invalid")
-
-    def number(literal):
-        try:
-            value = float(literal)
-        except (ValueError, OverflowError):
-            raise ValueError("invalid") from None
-        if type(value) is not float or not math.isfinite(value):
-            raise ValueError("invalid")
-        return value
-
-    return json.loads(text, object_pairs_hook=pairs, parse_constant=constant, parse_float=number)
-
-
 def _parse(raw, limit):
     if type(raw) is not bytes or len(raw) > limit:
         raise ValueError("size")
     try:
         text = json_preflight(raw, max_bytes=limit, max_depth=_MAX_DEPTH, max_nodes=_MAX_NODES,
                               max_items=_MAX_ITEMS, max_string=_MAX_STRING, max_atom=64)
-        return _loads(text)
+        return strict_loads(text)
     except (ValueError, RecursionError, UnicodeError):
         raise ValueError("invalid") from None
 
@@ -503,9 +474,9 @@ def _accept_report(raw, resolved):
     if type(probe_id) is not str or _PROBE.fullmatch(probe_id) is None:
         return "report_rejected", None
     spec = hosts.get(resolved)
-    if len(spec.binaries) != 1 or ("host" in report and _resolved(report["host"]) != resolved):
+    if "host" in report and _resolved(report["host"]) != resolved:
         return "report_rejected", None
-    roles = accept_report(report, spec.binaries[0])
+    roles = accept_report(report, spec.team_report_producer)
     if roles is None:
         return "report_rejected", None
     return None, {"probe_id": probe_id, "roles": roles, "supplied": report.get("host_version", None),
@@ -694,31 +665,83 @@ def _publish(state_root, relative, payload, resolved, version):
         with confined_file(state_root, relative, create_parents=True) as handle:
             if not _parent_private(handle):
                 return "record_unsafe"
-            name = relative[-1]
-            custody = _custody(handle, name)
-            if custody is False:
-                return "record_unsafe"
-            if custody is None:
-                return _create_record(handle, name, payload)
-            return _renew_record(handle, name, payload, resolved, version)
+            return _locked_decision(handle, relative[-1], payload, resolved, version)
     except ConfinedFileError as error:
         return _confined_reason(error, report=False)
 
 
+def _lock_name(leaf):
+    """Stable basename beside one receipt leaf, or None when that leaf is not one component."""
+    if type(leaf) is not str or not leaf.endswith(".json") or len(leaf) <= len(".json"):
+        return None
+    name = leaf[:-len(".json")] + ".lock"
+    if not 1 <= len(name) <= 255 or name in (".", "..", ".lock"):
+        return None
+    if any(char in name for char in "/\\\x00"):
+        return None
+    return name
+
+
+def _directory_fd(handle):
+    directory = handle.parent_fd
+    if type(directory) is not int or directory < 0 or os.name != "posix":
+        return None
+    return directory
+
+
+def _lock_timeout():
+    timeout = _LOCK_TIMEOUT
+    if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout < 0:
+        return None
+    return timeout
+
+
+def _locked_decision(handle, leaf, payload, resolved, version):
+    """One per-host lock from custody and version checks through publication and readback."""
+    name = _lock_name(leaf)
+    directory = _directory_fd(handle)
+    timeout = _lock_timeout()
+    if name is None or directory is None or timeout is None:
+        return "record_unsafe"
+    try:
+        with file_lock(name, timeout=timeout, dir_fd=directory):
+            return _decide(handle, leaf, payload, resolved, version)
+    except LockTimeoutError:
+        return "record_busy"
+    except ConfinedFileError:
+        raise
+    except PathTraversalError:
+        return "record_unsafe"
+    except OSError:
+        return "record_unsafe"
+    except ValueError:
+        return "record_unsafe"
+
+
+def _decide(handle, leaf, payload, resolved, version):
+    custody = _custody(handle, leaf)
+    if custody is False:
+        return "record_unsafe"
+    if custody is None:
+        return _create_record(handle, leaf, payload)
+    return _renew_record(handle, leaf, payload, resolved, version)
+
+
 def _create_record(handle, name, payload):
+    """Exclusive first creation. The caller holds the host lock through readback."""
     try:
         handle.publish_bytes(payload, replace=False, mode=0o600)
     except ConfinedFileError as error:
         if error.reason == "exists":
             return "record_exists"
         return "record_unsafe"
-    if _custody(handle, name) is not True:
+    if _leaf_bytes(handle) != payload or _custody(handle, name) is not True:
         return "record_unsafe"
     return None
 
 
 def _renew_record(handle, name, payload, resolved, version):
-    """Replace only when the stored version differs, and only if those bytes are still current."""
+    """Replace only when the stored version differs. The caller holds the host lock."""
     snapshot = handle.read_bytes(MAX_RECORD_BYTES)
     reason, stored = _stored_version(snapshot, resolved)
     if reason is not None:
