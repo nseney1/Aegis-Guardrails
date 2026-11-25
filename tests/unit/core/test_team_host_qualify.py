@@ -11,7 +11,9 @@ import os
 import shutil
 import tempfile
 import time
+from codecs import BOM_UTF8
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 import stat
 import threading
@@ -23,6 +25,7 @@ from aegis_core import hosts
 from aegis_core import team_host_qualify as qualify
 from aegis_core.primitives import utc_stamp
 from aegis_core.storage import file_lock
+from aegis_core.team_host_qualify_report import PROBE_ROLES, role_retained
 from conftest import symlink_or_skip
 
 
@@ -35,6 +38,10 @@ def _reader(value=VERSION):
     def read():
         return value
     return read
+
+
+def _unexpected_version_read():
+    pytest.fail("the version reader must not run")
 
 
 def _spec():
@@ -304,8 +311,8 @@ def _lock_leaf(spec):
     return relative, leaf[:-len(".json")] + ".lock"
 
 
-def _canonical(body):
-    return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+def _canonical(body, *, ensure_ascii=True):
+    return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=ensure_ascii).encode("utf-8")
 
 
 def _quiet(result):
@@ -418,6 +425,118 @@ def test_probe_runners_come_from_host_shape_without_a_fixed_id():
     assert qualify.record_relative(spec.aliases[0]) == qualify.record_relative(spec.id)
     assert qualify.record_relative(_other().id) is not None
     assert qualify.record_relative("not-a-host") is None
+
+
+def _replace_catalog_row(monkeypatch, updated):
+    catalog = tuple(updated if row.id == updated.id else row for row in hosts.HOSTS)
+    monkeypatch.setattr(hosts, "HOSTS", catalog)
+    monkeypatch.setattr(hosts, "_BY_ID", {row.id: row for row in catalog})
+    monkeypatch.setattr(hosts, "_BY_ALIAS", {alias: row.id for row in catalog for alias in row.aliases})
+
+
+def _assert_report_receipt(state, spec, result):
+    assert (result["status"], result["reason"], result["host"]) == ("unqualified", "receipt_recorded", spec.id)
+    current = qualify.status(str(state), spec.id, version_reader=_reader())
+    assert (current["status"], current["reason"], current["host"]) == ("unqualified", "receipt_current", spec.id)
+    assert current["record"] == result["record"]
+    with pytest.raises(qualify.HostUnqualified, match="^host is unqualified$") as caught:
+        qualify.require_qualified(str(state), spec.id, version_reader=_unexpected_version_read)
+    assert caught.value.code == "unqualified"
+
+
+@pytest.mark.parametrize("field,value", [
+    pytest.param("aliases", ("alternate-surface",), id="changed-aliases"),
+    pytest.param("aliases", (), id="empty-aliases"),
+    pytest.param("binaries", ("alternate-binary",), id="changed-binary"),
+    pytest.param("binaries", ("primary-binary", "alternate-binary"), id="multiple-binaries"),
+    pytest.param("binaries", (), id="empty-binaries"),
+    pytest.param("registration", None, id="no-registration"),
+    pytest.param("kind", "json_file", id="different-registration-kind"),
+    pytest.param("argv", ("installer-wrapper",), id="changed-argv"),
+    pytest.param("argv", (), id="empty-argv"),
+])
+def test_installer_metadata_does_not_remove_a_report_producer(tmp_path, monkeypatch, field, value):
+    state, spec = _state(tmp_path), _spec()
+    report = _report(spec, host=spec.id)
+    changes = {field: value}
+    if field in ("kind", "argv"):
+        changes = {"registration": replace(spec.registration, **changes)}
+    updated = replace(spec, **changes)
+    _replace_catalog_row(monkeypatch, updated)
+
+    assert qualify.probe_runner_ids() == (spec.id,)
+    _assert_report_receipt(state, updated, _record(state, updated, report))
+
+
+def test_installer_metadata_does_not_add_a_report_producer(monkeypatch):
+    producer = _spec()
+    other = _other()
+    updated = replace(other, registration=producer.registration, binaries=producer.binaries,
+                      aliases=producer.aliases)
+    _replace_catalog_row(monkeypatch, updated)
+    assert qualify.probe_runner_ids() == (producer.id,)
+
+
+@pytest.mark.parametrize("row", hosts.HOSTS, ids=lambda row: row.id)
+@pytest.mark.parametrize("key", [
+    pytest.param("", id="undeclared"),
+    pytest.param("synthetic-report-evidence", id="declared"),
+])
+def test_catalog_row_eligibility_and_evidence_follow_its_declaration(tmp_path, monkeypatch, row, key):
+    state, original = _state(tmp_path), _spec()
+    old_report = _report(original, host=row.id)
+    updated = replace(row, team_report_producer=key)
+    eligible = bool(key) and not row.retired
+    expected = {original.id} - {row.id}
+    if eligible:
+        expected.add(row.id)
+    _replace_catalog_row(monkeypatch, updated)
+
+    assert qualify.probe_runner_ids() == tuple(spec.id for spec in hosts.HOSTS if spec.id in expected)
+    before = qualify.status(str(state), row.id, version_reader=_unexpected_version_read)
+    old = _record(state, updated, old_report, version_reader=_unexpected_version_read)
+    assert before["host"] == old["host"] == row.id
+    assert "record" not in before and "record" not in old
+    assert not _path(state, updated).parent.exists()
+    if not eligible:
+        for result in (before, old):
+            assert (result["status"], result["reason"]) == ("unqualified", "no_probe_runner")
+        with pytest.raises(qualify.HostUnqualified, match="^host is unqualified$"):
+            qualify.require_qualified(str(state), row.id, version_reader=_unexpected_version_read)
+        return
+
+    assert (before["status"], before["reason"]) == ("unqualified", "missing_record")
+    assert (old["status"], old["reason"]) == ("refused", "report_rejected")
+    body = json.loads(old_report)
+    body[key] = body.pop(original.team_report_producer)
+    _assert_report_receipt(state, updated, _record(state, updated, _canonical(body)))
+
+
+@pytest.mark.parametrize("producer_key", ["", "alternate-producer"], ids=["cleared", "changed"])
+def test_only_the_producer_declaration_controls_report_eligibility(tmp_path, monkeypatch, producer_key):
+    state, spec = _state(tmp_path), _spec()
+    original_report = _report(spec)
+    updated = replace(spec, team_report_producer=producer_key)
+    _replace_catalog_row(monkeypatch, updated)
+
+    if not producer_key:
+        assert spec.id not in qualify.probe_runner_ids()
+        status = qualify.status(str(state), spec.id, version_reader=_reader())
+        submission = _record(state, spec, original_report)
+        for result in (status, submission):
+            assert (result["status"], result["reason"]) == ("unqualified", "no_probe_runner")
+            assert "record" not in result
+        assert not _path(state, spec).parent.exists()
+        return
+
+    assert spec.id in qualify.probe_runner_ids()
+    old = _record(state, spec, original_report)
+    assert (old["status"], old["reason"]) == ("refused", "report_rejected")
+    assert "record" not in old
+    assert not _path(state, spec).parent.exists()
+    report = json.loads(original_report)
+    report[producer_key] = report.pop(spec.team_report_producer)
+    _assert_report_receipt(state, updated, _record(state, updated, _canonical(report)))
 
 
 def test_passing_report_records_owner_only_file(tmp_path):
@@ -604,6 +723,185 @@ def test_oversized_report_is_malformed(tmp_path):
     found = _record(state, spec, b"{" + b" " * (qualify.MAX_REPORT_BYTES + 8))
     assert found["reason"] == "report_malformed"
     assert not (state / "host-qualification").exists()
+
+
+_THOUSAND_ITEMS = b"[" + b"0," * 999 + b"0]"
+_MALFORMED_SPELLINGS = [
+    pytest.param(b'"CANARY-SECRET-VALUE","probe_id":"probe-1"', id="duplicate"),
+    pytest.param(b"NaN", id="nan"),
+    pytest.param(b"Infinity", id="infinity"),
+    pytest.param(b"-Infinity", id="negative-infinity"),
+    pytest.param(b"1e999", id="overflow"),
+    pytest.param(b"-1e999", id="negative-overflow"),
+    pytest.param(b'"\xff"', id="utf8"),
+    pytest.param(b"[", id="syntax"),
+    pytest.param(b"[" * 16 + b"0" + b"]" * 16, id="depth"),
+    pytest.param(b"[" + b"0," * 1024 + b"0]", id="items"),
+    pytest.param(b"[" + b",".join([_THOUSAND_ITEMS] * 8) + b"]", id="nodes"),
+    pytest.param(b'"' + b"x" * 4097 + b'"', id="string"),
+    pytest.param(b"1" * 65, id="atom"),
+    pytest.param("bom", id="bom"),
+    pytest.param("oversized", id="bytes"),
+]
+
+
+def _invalid_json(valid, spelling, limit):
+    if spelling == "bom":
+        return BOM_UTF8 + valid
+    if spelling == "oversized":
+        return valid.ljust(limit + 1, b" ")
+    marker = b'"probe_id":"probe-1"'
+    assert marker in valid
+    return valid.replace(marker, b'"probe_id":' + spelling, 1)
+
+
+def _assert_refused(result, reason, spec):
+    assert (result["status"], result["reason"], result["host"]) == ("refused", reason, spec.id)
+    assert "record" not in result
+    _quiet(result)
+
+
+def _assert_submission_refused(state, spec, work, raw, reason, version_reader):
+    target = work / "report.json"
+    target.write_bytes(raw)
+    direct = _record(state, spec, raw, version_reader=version_reader)
+    _assert_refused(direct, reason, spec)
+    assert not _path(state, spec).parent.exists()
+    delegated = qualify.record_file(str(state), spec.id, str(target), version_reader=version_reader,
+                                    workspace=str(work), clock=CLOCK)
+    _assert_refused(delegated, reason, spec)
+    assert not _path(state, spec).parent.exists()
+    assert target.read_bytes() == raw
+
+
+@pytest.mark.parametrize("spelling", _MALFORMED_SPELLINGS)
+def test_malformed_submission_has_fixed_refusals(tmp_path, spelling):
+    state, spec, work = _state(tmp_path), _spec(), _work(tmp_path)
+    report = _report(spec)
+    malformed = _invalid_json(report, spelling, qualify.MAX_REPORT_BYTES)
+    assert malformed != report
+    _assert_submission_refused(state, spec, work, malformed, "report_malformed", _unexpected_version_read)
+    assert qualify.show_report(str(work)) == (2, {"schema": qualify.REPORT_SCHEMA, "state": "refused"})
+
+    (work / "report.json").write_bytes(report)
+    assert qualify.show_report(str(work)) == (
+        0, {"schema": qualify.REPORT_SCHEMA, "passed": True, "state": "completed", "fake": False},
+    )
+    stored = qualify.record_file(str(state), spec.id, str(work / "report.json"),
+                                 version_reader=_reader(), workspace=str(work), clock=CLOCK)
+    _assert_report_receipt(state, spec, stored)
+
+
+def _assert_stored_spelling_refused(state, spec, report, valid, invalid):
+    assert invalid != valid
+    path = _path(state, spec)
+    path.write_bytes(invalid)
+    status = qualify.status(str(state), spec.id, version_reader=_unexpected_version_read)
+    _assert_refused(status, "record_invalid", spec)
+    assert path.read_bytes() == invalid
+
+    newer = _reader("9.9.9")
+    renewal = _record(state, spec, report, version_reader=newer)
+    _assert_refused(renewal, "record_invalid", spec)
+    assert path.read_bytes() == invalid
+
+    path.write_bytes(valid)
+    retried = _record(state, spec, report, version_reader=newer)
+    assert (retried["status"], retried["reason"]) == ("unqualified", "receipt_recorded")
+    assert retried["record"]["host_version"] == newer()
+    current = qualify.status(str(state), spec.id, version_reader=newer)
+    assert (current["status"], current["reason"]) == ("unqualified", "receipt_current")
+    assert current["record"] == retried["record"]
+
+
+@pytest.mark.parametrize("spelling", _MALFORMED_SPELLINGS)
+def test_malformed_stored_receipt_cannot_be_read_or_renewed(tmp_path, spelling):
+    state, spec = _state(tmp_path), _spec()
+    report = _report(spec)
+    assert _record(state, spec, report)["reason"] == "receipt_recorded"
+    valid = _path(state, spec).read_bytes()
+    invalid = _invalid_json(valid, spelling, qualify.MAX_RECORD_BYTES)
+    _assert_stored_spelling_refused(state, spec, report, valid, invalid)
+
+
+@pytest.mark.parametrize("violation", ["utf16", "node-budget"])
+def test_schema_valid_stored_receipts_still_require_preflight(tmp_path, violation):
+    state, spec = _state(tmp_path), _spec()
+    report = _report(spec)
+    assert _record(state, spec, report)["reason"] == "receipt_recorded"
+    path = _path(state, spec)
+    valid = path.read_bytes()
+    body = json.loads(valid)
+
+    if violation == "utf16":
+        invalid = valid.decode("utf-8").encode("utf-16")
+    else:
+        template = body["roles"]["implementer"]
+        attempt = template["attempts"][0]
+        body["roles"] = {
+            name: {
+                **template,
+                "role": name,
+                "attempts": [dict(attempt, id=f"{name}-shell-{index}") for index in range(64)],
+            }
+            for name in sorted(PROBE_ROLES)
+        }
+        # Each attempt contributes its object and at least one node per key and value.
+        attempt_nodes = sum(1 + 2 * len(item) for role in body["roles"].values()
+                            for item in role["attempts"])
+        assert attempt_nodes > 8000
+        invalid = _canonical(body)
+    assert json.loads(invalid) == body
+    assert all(role_retained(name, role) for name, role in body["roles"].items())
+    assert len(invalid) <= qualify.MAX_RECORD_BYTES
+
+    _assert_stored_spelling_refused(state, spec, report, valid, invalid)
+
+
+# Each supplementary code point uses one literal unit and two surrogate escapes.
+_LONG_ENDPOINT = "\U0001f642" * 2049
+
+
+def test_generated_receipt_rechecks_the_escaped_string_budget(tmp_path):
+    state, spec, work = _state(tmp_path), _spec(), _work(tmp_path)
+    report = json.loads(_report(spec))
+    report["roles"][0]["endpoint"] = _LONG_ENDPOINT
+    escaped = _canonical(report)
+    literal = _canonical(report, ensure_ascii=False)
+    assert json.loads(escaped) == json.loads(literal) == report
+    assert len(escaped) < qualify.MAX_REPORT_BYTES
+
+    _assert_submission_refused(state, spec, work, escaped, "report_malformed", _unexpected_version_read)
+    assert qualify.show_report(str(work)) == (2, {"schema": qualify.REPORT_SCHEMA, "state": "refused"})
+
+    _assert_submission_refused(state, spec, work, literal, "record_invalid", _reader())
+    assert qualify.show_report(str(work)) == (
+        0, {"schema": qualify.REPORT_SCHEMA, "passed": True, "state": "completed", "fake": False},
+    )
+
+
+def test_stored_role_endpoint_literal_is_current_and_escaped_is_refused(tmp_path):
+    state, spec = _state(tmp_path), _spec()
+    report = _report(spec)
+    recorded = _record(state, spec, report)
+    assert recorded["reason"] == "receipt_recorded"
+    receipt = recorded["record"]
+    role = receipt["roles"]["implementer"]
+    role["endpoint"] = _LONG_ENDPOINT
+    assert role_retained("implementer", role)
+    literal = _canonical(receipt, ensure_ascii=False)
+    escaped = _canonical(receipt)
+    assert json.loads(escaped) == json.loads(literal) == receipt
+    assert len(escaped) < qualify.MAX_RECORD_BYTES
+
+    path = _path(state, spec)
+    path.write_bytes(literal)
+    current = qualify.status(str(state), spec.id, version_reader=_reader())
+    assert (current["status"], current["reason"]) == ("unqualified", "receipt_current")
+    assert current["record"] == receipt
+    assert path.read_bytes() == literal
+
+    _assert_stored_spelling_refused(state, spec, report, literal, escaped)
 
 
 def test_second_record_leaves_bytes_unchanged(tmp_path):

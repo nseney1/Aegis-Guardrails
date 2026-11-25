@@ -46,6 +46,7 @@ class _ModuleSnapshot:
 from aegis_core import gitsafe, pathlookup, primitives
 _GOVERNED_BASELINE = tuple(_ModuleSnapshot(module) for module in (pathlookup, gitsafe, primitives))
 
+from collections import deque
 from pathlib import Path
 
 __all__ = ["clean_host_os", "governed_module_session", "governed_module_state", "monkeypatch",
@@ -192,6 +193,12 @@ def _bootstrap_statement(node):
     return False
 
 
+def _pathlookup_source_trees(root):
+    for relative in ("tests/unit/core/test_pathlookup.py", "tests/helpers_pathlookup.py"):
+        path = root / relative
+        yield relative, ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+
 def pathlookup_import_order(root):
     """Require consumer import first and an uninterrupted read-only bootstrap.
 
@@ -201,10 +208,12 @@ def pathlookup_import_order(root):
     and standard-library/pytest imports. Every other helper statement follows.
     Tracked-source reads stay plain and cross-platform.
     """
+    return _import_order_errors(_pathlookup_source_trees(root))
+
+
+def _import_order_errors(sources):
     errors = []
-    for relative in ("tests/unit/core/test_pathlookup.py", "tests/helpers_pathlookup.py"):
-        path = root / relative
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for relative, tree in sources:
         body = list(tree.body)
         if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
             body.pop(0)
@@ -270,19 +279,31 @@ _REVIEWED_SESSION_ROOT = (
 )
 
 
-def _collection_nodes(node):
-    """Visit definition-time expressions and class bodies, never deferred bodies."""
-    yield node
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        children = [*node.decorator_list, node.args]
-        if node.returns is not None:
-            children.append(node.returns)
-    elif isinstance(node, ast.Lambda):
-        children = [node.args]
-    else:
+def _source_nodes(tree, exempt):
+    """Walk in breadth-first order and record the separate collection order.
+
+    Collection visits decorators before signature expressions and excludes
+    deferred bodies. Keep both orders so the first refusal never changes
+    when two rules find different problems in the same source.
+    """
+    pending = deque([(tree, None, ())])
+    while pending:
+        node, parent, position = pending.popleft()
+        yield node, parent, position
         children = ast.iter_child_nodes(node)
-    for child in children:
-        yield from _collection_nodes(child)
+        if position is None:
+            pending.extend((child, node, None) for child in children)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            evaluated = [node.args]
+            if not isinstance(node, ast.Lambda):
+                evaluated = [*node.decorator_list, node.args]
+                if node.returns is not None:
+                    evaluated.append(node.returns)
+            positions = {child: (*position, index) for index, child in enumerate(evaluated)}
+            pending.extend((child, node, positions.get(child)) for child in children)
+        else:
+            pending.extend((child, node, (*position, index) if child not in exempt else None)
+                           for index, child in enumerate(children))
 
 
 def _syntax_name(node):
@@ -382,6 +403,23 @@ def _closed_body_statement(node, *, methods, reviewed, platform, pytest_names):
             and all(keyword.arg is not None and _literal_value(keyword.value) for keyword in node.value.keywords))
 
 
+def _proof_suite_disabling_mark(tree, pytest_names):
+    """Protect the actual proof suite while allowing marked synthetic consumers."""
+    anchors = {"test_pathlookup_child_proof_census_covers_every_rule",
+               "test_additional_pathlookup_rules_in_child", "_CHILD_PROOF_TESTS"}
+    assignments = [node for node in tree.body if isinstance(node, ast.Assign)]
+    if not (any(isinstance(node, ast.FunctionDef) and node.name in anchors for node in tree.body)
+            or any(isinstance(target, ast.Name) and target.id in anchors
+                   for node in assignments for target in node.targets)):
+        return None
+    disabling = {prefix + ".mark." + mark for prefix in pytest_names
+                 for mark in ("skip", "skipif", "xfail", "parametrize")}
+    return next((node for node in assignments if isinstance(node.value, ast.Call)
+                 and _syntax_name(node.value.func) in disabling
+                 and any(isinstance(target, ast.Name) and target.id == "pytestmark" for target in node.targets)),
+                None)
+
+
 def pathlookup_source_contract_errors(root):
     """Enforce the closed declaration/body grammars and fixture dependencies.
 
@@ -390,24 +428,39 @@ def pathlookup_source_contract_errors(root):
     by the expression grammar keep their canonical bindings. Every scan owns its
     state and reads only the two named repository sources, including on retry.
     """
+    return _source_contract_errors(_pathlookup_source_trees(root))
+
+
+def _source_contract_errors(sources):
     errors = []
     reviewed = {ast.dump(ast.parse(source).body[0]) for source in _REVIEWED_COLLECTION_STATEMENTS}
     expressions = {(relative, ast.dump(ast.parse(source, mode="eval").body))
                    for relative, source in _REVIEWED_COLLECTION_EXPRESSIONS}
     session_root = ast.dump(ast.parse(_REVIEWED_SESSION_ROOT).body[0])
-    for relative in ("tests/unit/core/test_pathlookup.py", "tests/helpers_pathlookup.py"):
+    for relative, tree in sources:
         start = len(errors)
-        path = root / relative
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         helper = relative == "tests/helpers_pathlookup.py"
         platform = None if helper else ast.dump(ast.parse(_REVIEWED_PLATFORM_ASSIGNMENT).body[0])
-        parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+        exempt = {statement for statement in tree.body
+                  if helper and isinstance(statement, (ast.Assign, ast.Expr)) and ast.dump(statement) in reviewed}
         pytest_names, fixture_names, context_names = {"pytest"}, {"fixture"}, {"contextmanager", "contextlib.contextmanager"}
-        for node in ast.walk(tree):
+        functions, definitions, assignments, references, collection = [], [], [], [], []
+        for node, parent, position in _source_nodes(tree, exempt):
             if isinstance(node, ast.Import):
                 pytest_names.update(alias.asname or alias.name for alias in node.names if alias.name == "pytest")
             elif isinstance(node, ast.ImportFrom) and node.module == "pytest":
                 fixture_names.update(alias.asname or alias.name for alias in node.names if alias.name == "fixture")
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                definitions.append(node)
+                if not isinstance(node, ast.ClassDef):
+                    functions.append(node)
+            elif isinstance(node, ast.Assign) and isinstance(parent, (ast.Module, ast.ClassDef)):
+                assignments.append(node)
+            elif isinstance(node, (ast.Name, ast.Attribute)):
+                references.append((node, parent))
+            if position and isinstance(node, (ast.Import, ast.ImportFrom, ast.Name, ast.Attribute, ast.Call,
+                                               ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                collection.append((position, node))
         reserved = (pytest_names | fixture_names | {name.split(".")[0] for name in context_names}
                     | set(_BUILTIN_EXCEPTION_NAMES)
                     | {"staticmethod", "classmethod", "property", "object", "ast", "os", "sys", "hasattr", "frozenset"})
@@ -420,29 +473,25 @@ def pathlookup_source_contract_errors(root):
                         ("staticmethod", "classmethod", "property", "object", "hasattr", "frozenset")})
         fixture_targets = {
             decorator.func if isinstance(decorator, ast.Call) else decorator
-            for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            for node in functions
             for decorator in node.decorator_list
             if _pytest_declaration_kind(decorator.func if isinstance(decorator, ast.Call) else decorator,
                                         pytest_names, fixture_names) == "fixture"
         }
         declaration_targets = {
             decorator.func if isinstance(decorator, ast.Call) else decorator
-            for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            for node in definitions
             for decorator in node.decorator_list
         }
         marker_calls = {
-            node.value for node in ast.walk(tree)
-            if isinstance(node, ast.Assign) and len(node.targets) == 1
-            and isinstance(parents.get(node), (ast.Module, ast.ClassDef))
-            and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "pytestmark"
+            node.value for node in assignments
+            if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "pytestmark"
             and isinstance(node.value, ast.Call)
             and _closed_body_statement(node, methods=None, reviewed=set(), platform=None, pytest_names=pytest_names)
         }
         declaration_targets.update(node.func for node in marker_calls)
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            if helper and ast.dump(node) == session_root:
+        for node in functions:
+            if helper and node.name == "governed_module_session" and ast.dump(node) == session_root:
                 continue
             for decorator in node.decorator_list:
                 target = decorator.func if isinstance(decorator, ast.Call) else decorator
@@ -463,9 +512,7 @@ def pathlookup_source_contract_errors(root):
                 required.extend(argument for argument, default in zip(node.args.kwonlyargs, node.args.kw_defaults) if default is None)
                 if scope.value != "function" and "governed_module_session" not in {argument.arg for argument in required}:
                     errors.append((relative, node.lineno, "broader fixture must request governed_module_session"))
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                continue
+        for node in definitions:
             for decorator in node.decorator_list:
                 target = decorator.func if isinstance(decorator, ast.Call) else decorator
                 if not _collection_factory(target, pytest_names, fixture_names, context_names):
@@ -486,62 +533,58 @@ def pathlookup_source_contract_errors(root):
                     else:
                         message = "decorator arguments must use the reviewed grammar"
                     errors.append((relative, decorator.lineno, message))
-        for node in ast.walk(tree):
-            if (isinstance(node, (ast.Name, ast.Attribute)) and isinstance(node.ctx, ast.Load)
+        for node, parent in references:
+            if (isinstance(node.ctx, ast.Load)
                     and _pytest_declaration_kind(node, pytest_names, fixture_names) == "fixture"
                     and node not in fixture_targets):
                 errors.append((relative, node.lineno, "fixture registration must decorate a function definition"))
             if isinstance(node, ast.Attribute) and any(_syntax_name(node).startswith(prefix + ".mark.") for prefix in pytest_names):
-                parent = parents.get(node)
                 if not isinstance(parent, ast.Attribute) and node not in declaration_targets:
                     errors.append((relative, node.lineno, "pytest marks require a direct reviewed decorator"))
-        for statement in tree.body:
-            if helper and ast.dump(statement) in reviewed:
-                continue
-            for node in _collection_nodes(statement):
-                if isinstance(node, (ast.Import, ast.ImportFrom)):
-                    for alias in node.names:
-                        if isinstance(node, ast.Import):
-                            bound = alias.asname or alias.name.split(".")[0]
-                            origin = alias.name if alias.asname else alias.name.split(".")[0]
-                        else:
-                            bound = alias.asname or alias.name
-                            origin = node.module + "." + alias.name if node.module and not node.level else ""
-                        if bound.startswith("pytest_"):
-                            errors.append((relative, node.lineno, "pytest_* collection hooks are forbidden"))
-                            continue
-                        if bound in imports and origin != imports[bound]:
-                            errors.append((relative, node.lineno, "collection factory import must keep its standard binding"))
-                elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)) and node.id.startswith("pytest_"):
-                    errors.append((relative, node.lineno, "pytest_* collection hooks are forbidden"))
-                elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)) and node.id in reserved:
-                    errors.append((relative, node.lineno, "collection factory binding cannot be replaced"))
-                elif isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
-                    errors.append((relative, node.lineno, "collection-time attribute write"))
-                elif isinstance(node, ast.Call):
-                    if (relative, ast.dump(node)) in expressions:
-                        continue
-                    name = _syntax_name(node.func)
-                    if name.rsplit(".", 1)[-1] in {"setattr", "delattr"}:
-                        errors.append((relative, node.lineno, "collection-time attribute write"))
-                    elif not (_decorator_argument(node) or node in marker_calls
-                              or node.func in declaration_targets and _collection_factory(node.func, pytest_names, fixture_names, context_names)):
-                        errors.append((relative, node.lineno, "collection-time call requires a reviewed helper shape"))
-                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                    if node.name.startswith("pytest_"):
+        for _, node in sorted(collection, key=lambda entry: entry[0]):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    if isinstance(node, ast.Import):
+                        bound = alias.asname or alias.name.split(".")[0]
+                        origin = alias.name if alias.asname else alias.name.split(".")[0]
+                    else:
+                        bound = alias.asname or alias.name
+                        origin = node.module + "." + alias.name if node.module and not node.level else ""
+                    if bound.startswith("pytest_"):
                         errors.append((relative, node.lineno, "pytest_* collection hooks are forbidden"))
-                    if node.name in reserved:
-                        errors.append((relative, node.lineno, "collection factory binding cannot be replaced"))
-                    if isinstance(node, ast.ClassDef) and (node.keywords or any(
-                            _syntax_name(base) not in ({"object", "ast.NodeVisitor"} if helper else {"object"})
-                            for base in node.bases)):
-                        errors.append((relative, node.lineno, "collection class requires a standard base without a metaclass"))
-                    for decorator in node.decorator_list:
-                        target = decorator.func if isinstance(decorator, ast.Call) else decorator
-                        if not _collection_factory(target, pytest_names, fixture_names, context_names):
-                            errors.append((relative, decorator.lineno, "collection-time decorator requires a reviewed factory"))
+                        continue
+                    if bound in imports and origin != imports[bound]:
+                        errors.append((relative, node.lineno, "collection factory import must keep its standard binding"))
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)) and node.id.startswith("pytest_"):
+                errors.append((relative, node.lineno, "pytest_* collection hooks are forbidden"))
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)) and node.id in reserved:
+                errors.append((relative, node.lineno, "collection factory binding cannot be replaced"))
+            elif isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                errors.append((relative, node.lineno, "collection-time attribute write"))
+            elif isinstance(node, ast.Call):
+                if (relative, ast.dump(node)) in expressions:
+                    continue
+                name = _syntax_name(node.func)
+                if name.rsplit(".", 1)[-1] in {"setattr", "delattr"}:
+                    errors.append((relative, node.lineno, "collection-time attribute write"))
+                elif not (_decorator_argument(node) or node in marker_calls
+                          or node.func in declaration_targets and _collection_factory(node.func, pytest_names, fixture_names, context_names)):
+                    errors.append((relative, node.lineno, "collection-time call requires a reviewed helper shape"))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if node.name.startswith("pytest_"):
+                    errors.append((relative, node.lineno, "pytest_* collection hooks are forbidden"))
+                if node.name in reserved:
+                    errors.append((relative, node.lineno, "collection factory binding cannot be replaced"))
+                if isinstance(node, ast.ClassDef) and (node.keywords or any(
+                        _syntax_name(base) not in ({"object", "ast.NodeVisitor"} if helper else {"object"})
+                        for base in node.bases)):
+                    errors.append((relative, node.lineno, "collection class requires a standard base without a metaclass"))
+                for decorator in node.decorator_list:
+                    target = decorator.func if isinstance(decorator, ast.Call) else decorator
+                    if not _collection_factory(target, pytest_names, fixture_names, context_names):
+                        errors.append((relative, decorator.lineno, "collection-time decorator requires a reviewed factory"))
         if len(errors) == start:
-            scopes = [tree, *[node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)]]
+            scopes = [tree, *(node for node in definitions if isinstance(node, ast.ClassDef))]
             for scope in scopes:
                 methods = {node.name for node in scope.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))} if isinstance(scope, ast.ClassDef) else None
                 for node in scope.body:
@@ -549,12 +592,17 @@ def pathlookup_source_contract_errors(root):
                             reviewed=reviewed if helper and scope is tree else set(),
                             platform=platform if scope is tree else None, pytest_names=pytest_names):
                         errors.append((relative, node.lineno, "collection body statement is outside the reviewed grammar"))
+        if not helper and len(errors) == start:
+            mark = _proof_suite_disabling_mark(tree, pytest_names)
+            if mark is not None:
+                errors.append((relative, mark.lineno, "pathlookup proof suite cannot use a disabling module mark"))
         errors[start:] = errors[start:start + 1]
     return errors
 
 
 def _enforce_source_contract(root):
-    errors = pathlookup_import_order(root) + pathlookup_source_contract_errors(root)
+    sources = tuple(_pathlookup_source_trees(root))
+    errors = _import_order_errors(sources) + _source_contract_errors(sources)
     assert not errors, "pathlookup source contract: " + repr(errors)
 
 
@@ -675,9 +723,7 @@ def pathlookup_patch_writes(root):
     Each invocation owns its visitor state, including on failure and retry.
     """
     writes = []
-    for relative in ("tests/unit/core/test_pathlookup.py", "tests/helpers_pathlookup.py"):
-        path = root / relative
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for relative, tree in _pathlookup_source_trees(root):
         visitor = _ModuleWrites(relative)
         visitor.visit(tree)
         writes.extend(visitor.writes)
