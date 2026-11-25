@@ -6,16 +6,16 @@ from dataclasses import dataclass, replace
 import os
 from pathlib import Path
 import stat
-from typing import Any, Dict, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Set, Tuple
 
 from aegis_core import atomicio, storage
 from aegis_core.errors import PathTraversalError
 from aegis_core.storage_confined import ConfinedFileError, open_directory
 
-__all__ = ["before_read", "contains", "reconcile", "remember", "reset", "root_key", "settled",
+__all__ = ["before_read", "contains", "exposure_keys", "reconcile", "remember", "reset", "root_key", "settled",
            "filesystem_clock_supported", "filesystem_now"]
 
-_Key = Tuple[str, str, str, str, Optional[str]]
+_Key = Tuple[str, str, str, str, Optional[str], Optional[str]]
 _Ancestors = Tuple[Tuple[Path, Tuple[int, int]], ...]
 _PERSISTED: Set[_Key] = set()
 _MAX_PERSISTED = 50_000
@@ -225,9 +225,17 @@ def before_read(root: str, site: storage.LedgerSite) -> Optional[_ReadGeneration
                                filesystem_now(site.lock, current.st_dev))
 
 
-def reconcile(root: str, seen: Set[Tuple[str, str, Optional[str]]]) -> None:
+def exposure_keys(root: str, rows: Iterable[Mapping[str, Any]]) -> Set[_Key]:
+    """Recover persistence identities from the exposure rows of a locked read."""
+    fields = ("host", "session", "rule", "scope_basis", "rev")
+    return {(root, row.get("host") or "", row.get("session") or "", row.get("rule") or "",
+             row.get("scope_basis"), row.get("rev")) for row in rows
+            if all(row.get(field) is None or isinstance(row[field], str) for field in fields)}
+
+
+def reconcile(root: str, seen: Set[_Key]) -> None:
     """Keep only keys actually found by the caller's locked read; perform no I/O."""
-    _PERSISTED.difference_update({k for k in _PERSISTED if k[0] == root and (k[2], k[3], k[4]) not in seen})
+    _PERSISTED.difference_update({key for key in _PERSISTED if key[0] == root and key not in seen})
 
 
 def remember(root: str, keys: Sequence[_Key], path: Path, before: Optional[_ReadGeneration],

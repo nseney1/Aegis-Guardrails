@@ -122,7 +122,8 @@ def test_ordinary_initialize_and_tools_list_bytes_unchanged():
     raw = json.dumps(listed).encode("utf-8")
     assert len(listed["result"]["tools"]) == 10
     assert len(raw) == 11267
-    assert hashlib.sha256(raw).hexdigest() == "77a29feb7616930a79f4977448e8c784834ebf2de00bee0615a44356b9b07197"
+    # The scan_ref field is part of RULES-EVIDENCE-ATTRIBUTION-b.
+    assert hashlib.sha256(raw).hexdigest() == "988fac033ecf63635185f9451f4311d020212bbf35a032debb198a3db6db4455"
 
 
 @pytest.mark.parametrize("count", [1, queue_role.MAX_LANES], ids=["one", "max"])
