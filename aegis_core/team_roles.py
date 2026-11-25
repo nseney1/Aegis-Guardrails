@@ -128,8 +128,6 @@ _REPAIR = {
     "routes": "Restore the required endpoint route pairs and retry.",
 }
 _BOUNDED = ContextVar("aegis_role_bounded_ids", default=None)
-# Tests record ids of nodes the cache walk actually expands. Production leaves this unset.
-_EXPANSIONS = ContextVar("aegis_role_expansions", default=None)
 
 
 class _Unproven(Exception):
@@ -249,9 +247,6 @@ def _account(item, completed, budget, depth):
 
 def _account_new(item, completed, budget, depth):
     """Mirror bounded_tree's one-budget walk. Completed containers contribute stored costs."""
-    record = _EXPANSIONS.get()
-    if record is not None:
-        record.append(id(item))
     start_bytes, start_nodes = budget[0], budget[1]
     _tree_limit(depth <= MAX_JSON_DEPTH)
     budget[1] += 1
