@@ -8,7 +8,7 @@ import sys
 from aegis_core.manager_adjudication import prepare, verify
 from aegis_core.manager_policy import ManagerError
 from aegis_core.primitives import sanitize_display
-from aegis_core.redaction import clip_atomic_text, redact_command_secrets
+from aegis_core.redaction import REDACTION_MASK_RE, clip_atomic_text, redact_command_secrets
 
 
 class _Parser(argparse.ArgumentParser):
@@ -30,16 +30,55 @@ def _parser():
     return parser
 
 
-def _display(value):
+def _episode_ids(value):
     if type(value) is dict:
-        return {key: _display(item) for key, item in value.items()}
+        for key, item in value.items():
+            if key == "episode_id" and type(item) is str:
+                yield item
+            else:
+                yield from _episode_ids(item)
+    elif type(value) is list:
+        for item in value:
+            yield from _episode_ids(item)
+
+
+def _redact(value, episodes=()):
+    canonical = sanitize_display(value, max_len=None)
+    standalone = canonical in episodes
+    if not standalone and any(episode in canonical for episode in episodes):
+        return "[REDACTED]"
+
+    redacted = redact_command_secrets(canonical)
+    if standalone and REDACTION_MASK_RE.fullmatch(redacted) is None:
+        return "[REDACTED]"
+    return redacted
+
+
+def _display(value, episodes, *, episode_id=False):
+    if type(value) is dict:
+        return {key: _display(item, episodes, episode_id=(key == "episode_id"))
+                for key, item in value.items()}
     if type(value) is list:
-        return [_display(item) for item in value]
+        return [_display(item, episodes) for item in value]
     if type(value) is str:
-        canonical = sanitize_display(value, max_len=None)
-        redacted = redact_command_secrets(canonical)
+        if episode_id and value in episodes:
+            redacted = episodes[value]
+        else:
+            redacted = _redact(value, episodes)
         return clip_atomic_text(redacted, 128, policy="guidance")
     return value
+
+
+def _render(report):
+    # Verification bounds distinct assignments by the anchor limit and each ID by its grammar.
+    ids = dict.fromkeys(_episode_ids(report))
+    private = tuple(episode for episode in ids if _redact(episode) != episode)
+    episodes = {}
+    for episode in ids:
+        if any(secret in episode for secret in private):
+            # Brackets keep display ordinals outside the episode ID grammar.
+            episodes[episode] = f"[redacted-episode-{len(episodes) + 1}]"
+    return _display(report, episodes)
 
 
 def main(argv=None):
@@ -53,7 +92,7 @@ def main(argv=None):
     except ManagerError as exc:
         print(json.dumps({"status": "refused", "reason": str(exc)}, sort_keys=True), file=sys.stderr)
         return 1
-    print(json.dumps(_display(result), sort_keys=True, separators=(",", ":")))
+    print(json.dumps(_render(result), sort_keys=True, separators=(",", ":")))
     return 0
 
 
