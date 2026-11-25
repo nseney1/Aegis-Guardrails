@@ -11,28 +11,21 @@ and remote credential helpers. Each call uses these defenses:
   <devnull> (command-line config beats repo config);
 - sets ``GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0 GIT_NO_REPLACE_OBJECTS=1 LC_ALL=C``.
   ``GIT_ALLOW_PROTOCOL= GIT_NO_LAZY_FETCH=1`` blocks fetches; validated sync push opts in.
-  The system config is read, as git reads it: the machine's administrator writes it,
-  and Git for Windows keeps ``core.autocrlf=true`` there, without which every file of a
-  Windows checkout (CRLF in the work tree, LF in the repository) looks modified;
+  The machine's Git config still supplies Git for Windows' ``core.autocrlf`` setting;
 - reads with plumbing: ``rev-parse``, ``merge-base``, ``diff-tree``, ``diff-index``,
   ``ls-tree``, ``ls-files``, ``cat-file --batch``/``--batch-check``, ``for-each-ref``,
   ``check-ref-format``, ``hash-object``, ``version``, ``config`` and ``symbolic-ref`` (the
   branch ``refs/remotes/origin/HEAD`` names, which ``resolve_base_ref`` tries before the fixed
   names: repository data, as ``origin/main`` is). It never writes to the work tree, the index,
-  a branch or a tag; it writes with ``hash-object -w`` (a blob),
-  ``update-ref --no-deref --stdin`` (one ref under compare-and-swap, always under
-  ``refs/aegis/``: the team's leases), ``merge-tree --write-tree`` (a trial merge's objects,
-  referenced by nothing, which git's gc collects), ``read-tree`` into a private index in a fresh
-  0700 temporary directory and ``checkout-index -a -f --prefix`` below the caller's scratch
-  directory (``export_tree``), and ``interpret-trailers --in-place`` (the prepare-commit-msg
-  message file, no repository config read: its ``trailer.*`` commands are programs).
+  a branch or a tag. Write helpers use ``hash-object -w``, ``update-ref`` under
+  ``refs/aegis/``, ``merge-tree`` trial objects, ``read-tree`` and ``checkout-index``
+  with a private export index, or ``interpret-trailers`` without repository config.
   Callers also use ``run`` for approval commits and ``sync --pr`` (SECURITY.md).
 
-Working-tree plumbing disables repository filters and fsmonitor; trusted user/system
-filters still run. Blob reads verify their requested object ids.
+Working-tree plumbing excludes repository filters and fsmonitor. It retains trusted
+user/system filters. Blob reads verify their requested object ids.
 
-The query helpers answer None when git cannot answer. The ref, object, diff and merge
-primitives raise GitError instead, so "git could not say" never means "nothing there".
+Git path helpers may return None. Ref, object, diff and merge primitives raise GitError.
 ``merge-tree`` runs merge drivers and, with ``merge.renormalize``, filters: a merge
 driver the repository's own config defines makes it unavailable, and the repository's
 filter drivers and renormalization are switched off for it.
@@ -50,13 +43,13 @@ import stat
 import subprocess
 import tempfile
 import time
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Literal, Mapping, NamedTuple, Optional, Sequence, Tuple, Union
 
-from aegis_core import atomicio, pathlookup, gitsafe_run
-from aegis_core.gitsafe_run import custody_active, scrubbed
-from aegis_core.gitsafe_run import BASE_ENV as _ENV, LOCAL_ENV as _LOCAL_ENV
-from aegis_core.gitsafe_run import DEFAULT_HARDENING as _HARDENING
-from aegis_core.gitsafe_run import HARDENING_KEEP_HOOKS_PATH as _HARDENING_KEEP_HOOKS_PATH
+from aegis_core import atomicio, gitsafe_run, pathlookup
+from aegis_core.gitsafe_run import (
+    BASE_ENV as _ENV, LOCAL_ENV as _LOCAL_ENV, DEFAULT_HARDENING as _HARDENING,
+    HARDENING_KEEP_HOOKS_PATH as _HARDENING_KEEP_HOOKS_PATH, GitError, custody_active, scrubbed,
+)
 from aegis_core.errors import AegisError
 from aegis_core.primitives import is_within, safe_parts
 
@@ -76,6 +69,7 @@ __all__ = [
     "blob_id",
     "blob_oid",
     "blob_sizes",
+    "bound_git_metadata",
     "changed_files",
     "common_dir",
     "custody",
@@ -127,9 +121,6 @@ _WRITABLE_REFS = "refs/aegis/"
 _ACMR = "--diff-filter=ACMR"
 
 
-GitError = gitsafe_run.GitError
-
-
 class RefNameError(GitError):
     """A ref name (or ref hierarchy) git would not accept, or one update_ref may not write
     (anything outside ``refs/aegis/``); refused before anything is written."""
@@ -160,12 +151,12 @@ def _reset_for_tests() -> None:
     _GIT_FOUND.clear()
 
 
-def git_executable(*, environ=None, cwd=None) -> str:
+def git_executable(*, environ=None, cwd=None, missing_ok=False) -> Optional[str]:
     """Resolve Git centrally; ordinary reads fence the bound root, else the outermost checkout."""
     return gitsafe_run.find_executable(_GIT_FOUND, environ,
         lambda options: pathlookup.which("git",
             **options),
-        error=GitError, cwd=cwd, ordinary_git=True)
+        error=GitError, cwd=cwd, ordinary_git=True, missing_ok=missing_ok)
 
 
 def custody_program(cwd, *, environ=None) -> Optional[str]:
@@ -378,6 +369,15 @@ def git_path(cwd: Path | str, name: str) -> Optional[Path]:
     """Absolute Git service path, preserving the legacy hooks-path query."""
     return gitsafe_run.git_path(cwd, name, runner=_text,
         hardening=_HARDENING if gitsafe_run.strict_active() else _HARDENING_KEEP_HOOKS_PATH)
+
+
+def bound_git_metadata(checkout_fd: int, marker_fd: int, query: Literal["hooks", "dirs"], *,
+                       verify: Optional[Callable[[], None]] = None) -> Path | tuple[Path, Path]:
+    """Query hooks or the admin/common pair using a caller-held checkout and .git."""
+    from aegis_core import gitsafe_bound
+    return gitsafe_bound.bound_git_metadata(
+        checkout_fd, marker_fd, query, executable=git_executable, timeout=GIT_TIMEOUT_SECONDS, verify=verify,
+    )
 
 
 def resolve_commit(cwd: Path | str, ref: str) -> Optional[str]:
