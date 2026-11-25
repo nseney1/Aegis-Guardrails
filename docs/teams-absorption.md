@@ -55,22 +55,297 @@ registry using a fixed resource name.
    template_bytes = template.read_bytes()
    ```
 
-3. Run `python -m build` from the Aegis source root with a clean `dist/`. Check
-   that the wheel and sdist contain the resource at the expected package-relative
-   path (beneath the sdist's top-level directory) and that its bytes match the
-   source. Install the wheel and read back the resource with the checkout hidden.
-   See [archive admission](#archive-admission) and the
-   [build-parity test](../tests/unit/cli/test_install_package_data.py),
-   `test_verify_dist_record_matches_the_built_team_templates`, which checks
-   the wheel's template inventory and runs both verifier commands on built
-   artifacts. The dirty-checkout wheel test also checks that nested resources
-   ship and bytecode is excluded.
+3. Follow the [offline build and readback](#offline-build-and-readback) recipe.
+   It checks every selected template against the wheel, the sdist and the
+   installed package.
+   The real-source test snapshots reviewed templates before staging and checks
+   their exact inventories and bytes in both verified archives. The independent
+   dirty-checkout test checks for representative root and nested wheel members
+   and confirms cache and bytecode exclusions. A separate pattern test checks
+   root-only and recursive matches. Synthetic inventory and byte parity across
+   both archive formats moves from 5.0 to `TEAM-TEMPLATE-SYNTHETIC-ARCHIVE-PARITY`.
+   See the [packaging tests](../tests/unit/cli/test_install_package_data.py).
 
-Record the checked artifacts and verify the same files in this order.
+### Offline build and readback
+
+Use a build environment with `build`, `setuptools>=68.0` and `wheel` already
+installed, including their own dependencies. Use Python with `venv` and `pip`
+available for the install check. The project has zero runtime dependencies.
+From the source root, set `TMPDIR` to the absolute path of a writable directory
+outside the checkout and run this POSIX shell recipe. It first reads the
+selected regular files from the reviewed checkout, including dot-prefixed
+files and directories. It rejects links and unsupported entries, prunes
+cache directories, and applies bytecode exclusions to files. The build uses
+a staged copy checked against that snapshot. It compares both verified
+archives with the snapshot before installing that wheel and checking the
+installed resources.
 
 ```sh
-python .github/scripts/verify_dist.py record dist
-python .github/scripts/verify_dist.py verify dist
+(
+    set -eu
+    umask 022
+    work=$(mktemp -d)
+    dist="$work/dist"
+    reviewed="$work/reviewed"
+    staged="$work/source"
+    verifier="$PWD/.github/scripts/verify_dist.py"
+
+    cat > "$work/check_templates.py" <<'PY'
+from contextlib import contextmanager
+import fnmatch
+from importlib import resources
+import os
+from pathlib import Path
+import runpy
+import shutil
+import stat
+import sys
+import tarfile
+import zipfile
+import zlib
+
+try:
+    from lzma import LZMAError
+except ImportError:
+    LZMAError = RuntimeError  # zipfile refuses the codec when it is unavailable.
+
+package = "aegis_core.team_templates"
+prefix = package.replace(".", "/")
+read_errors = (OSError, EOFError, tarfile.TarError, zipfile.BadZipFile, zlib.error, LZMAError)
+
+
+def refuse(reason, path, public_text):
+    raise SystemExit(f"{reason}: {public_text(str(path))}")
+
+
+def supports_confined_walk():
+    return (os.open in os.supports_dir_fd and os.stat in os.supports_dir_fd
+            and os.stat in os.supports_follow_symlinks and os.scandir in os.supports_fd
+            and all(hasattr(os, flag) for flag in ("O_NOFOLLOW", "O_DIRECTORY", "O_NONBLOCK")))
+
+
+@contextmanager
+def open_at(parent, name, label, directory, public_text):
+    flags = os.O_RDONLY | os.O_NOFOLLOW | (os.O_DIRECTORY if directory else os.O_NONBLOCK)
+    try:
+        mode = os.stat(name, dir_fd=parent, follow_symlinks=False).st_mode
+        if stat.S_ISLNK(mode):
+            refuse("linked template path", label, public_text)
+        is_expected = stat.S_ISDIR if directory else stat.S_ISREG
+        if not is_expected(mode):
+            refuse("unsupported template entry", label, public_text)
+        fd = os.open(name, flags, dir_fd=parent)
+    except OSError:
+        refuse("cannot open template path", label, public_text)
+    try:
+        if not is_expected(os.fstat(fd).st_mode):
+            refuse("unsupported template entry", label, public_text)
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def walk_directory(parent, relative, excludes, consume, public_text):
+    try:
+        with os.scandir(parent) as entries:
+            for entry in entries:
+                path = relative / entry.name
+                label = Path(prefix) / path
+                try:
+                    mode = entry.stat(follow_symlinks=False).st_mode
+                except OSError:
+                    refuse("cannot inspect template path", label, public_text)
+                if stat.S_ISLNK(mode):
+                    refuse("linked template path", label, public_text)
+                if stat.S_ISDIR(mode):
+                    if excludes is None or entry.name != "__pycache__":
+                        with open_at(parent, entry.name, label, True, public_text) as directory:
+                            walk_directory(directory, path, excludes, consume, public_text)
+                    continue
+                if not stat.S_ISREG(mode):
+                    refuse("unsupported template entry", label, public_text)
+                if excludes is not None and (entry.name == "__pycache__" or any(
+                        fnmatch.fnmatch(path.as_posix(), pattern) for pattern in excludes)):
+                    continue
+                with open_at(parent, entry.name, label, False, public_text) as fd:
+                    try:
+                        with open(fd, "rb", closefd=False) as member:
+                            consume(path, member)
+                    except OSError:
+                        refuse("cannot read template file", label, public_text)
+    except OSError:
+        refuse("cannot read template directory", Path(prefix) / relative, public_text)
+
+
+def walk_templates(checkout, excludes, consume, public_text, *, supports=supports_confined_walk):
+    if not supports():
+        raise SystemExit("template source scan requires descriptor-relative no-follow support")
+    with open_at(None, checkout, "checkout", True, public_text) as root:
+        with open_at(root, "aegis_core", "aegis_core", True, public_text) as core:
+            with open_at(core, "team_templates", prefix, True, public_text) as templates:
+                walk_directory(templates, Path(), excludes, consume, public_text)
+
+
+def snapshot_sources(checkout, reviewed, public_text):
+    if sys.version_info >= (3, 11):
+        import tomllib
+    else:
+        import tomli as tomllib  # A build dependency on Python 3.9 and 3.10.
+
+    with (checkout / "pyproject.toml").open("rb") as config:
+        settings = tomllib.load(config)["tool"]["setuptools"]
+    manifest = (checkout / "MANIFEST.in").read_text(encoding="utf-8").splitlines()
+    if not settings.get("include-package-data") or "recursive-include aegis_core *" not in manifest:
+        raise SystemExit("template snapshot requires the recursive aegis_core package-data rule")
+    excludes = settings.get("exclude-package-data", {}).get(package, [])
+
+    def save(relative, member):
+        target = reviewed / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("xb") as handle:
+            shutil.copyfileobj(member, handle, length=64 * 1024)
+        target.chmod(stat.S_IMODE(os.fstat(member.fileno()).st_mode))
+
+    walk_templates(checkout, excludes, save, public_text)
+    if not reviewed.is_dir():
+        raise SystemExit("No selected Teams templates")
+
+
+def stage_checkout(checkout, staged, reviewed):
+    staged.mkdir()
+
+    def ignore(directory, names):
+        parent = Path(directory)
+        ignored = {name for name in names if name == "__pycache__"
+                   or (fnmatch.fnmatch(name, "*.py[cod]") and (parent / name).is_file())}
+        if parent == checkout / "aegis_core":
+            ignored.add("team_templates")
+        return ignored
+
+    for name in ("aegis_cli", "aegis_core", "aegis_mcp", "aegis_sdk", "rules", "skills"):
+        shutil.copytree(checkout / name, staged / name, symlinks=True, ignore=ignore)
+    for name in ("pyproject.toml", "MANIFEST.in", "README.md", "LICENSE", "NOTICE", "Makefile"):
+        shutil.copyfile(checkout / name, staged / name)
+    shutil.copytree(reviewed, staged / prefix)
+
+
+def compare_streams(label, name, source, member, public_text):
+    with source.open("rb") as expected:
+        while True:
+            block = expected.read(64 * 1024)
+            if member.read(len(block) or 1) != block:
+                refuse(f"{label}: template bytes differ from source", name, public_text)
+            if not block:
+                return
+
+
+def compare(label, name, source, open_member, public_text, *args):
+    try:
+        member = open_member(*args)
+        if member is None:
+            refuse(f"{label}: missing template", name, public_text)
+        with member:
+            compare_streams(label, name, source, member, public_text)
+    except (FileNotFoundError, KeyError):
+        refuse(f"{label}: missing template", name, public_text)
+    except read_errors:
+        refuse(f"{label}: cannot read template", name, public_text)
+
+
+def check_staged(staged, reviewed, expected, public_text):
+    remaining = set(expected)
+
+    def check(relative, member):
+        if relative not in remaining:
+            refuse("staged: unexpected template", relative, public_text)
+        compare_streams("staged", relative, reviewed / relative, member, public_text)
+        remaining.remove(relative)
+
+    walk_templates(staged, None, check, public_text)
+    if remaining:
+        refuse("staged: missing template", min(remaining), public_text)
+
+
+def check_archives(wheel_path, sdist_path, reviewed, expected, public_text):
+    with zipfile.ZipFile(wheel_path) as wheel, tarfile.open(sdist_path, "r:gz") as sdist:
+        first = sdist.next()
+        if first is None:
+            raise SystemExit("sdist: no archive root")
+        tar_prefix = f"{first.name.split('/', 1)[0]}/{prefix}/"
+        wheel_prefix = f"{prefix}/"
+        members = {wheel_prefix + relative.as_posix() for relative in expected}
+        for relative in expected:
+            name = relative.as_posix()
+            source = reviewed / relative
+            compare("wheel", name, source, wheel.open, public_text, wheel_prefix + name)
+            compare("sdist", name, source, sdist.extractfile, public_text, tar_prefix + name)
+        wheel_members = {item.filename for item in wheel.infolist()
+                         if not item.is_dir() and item.filename.startswith(wheel_prefix)}
+        if wheel_members != members:
+            raise SystemExit("wheel: template inventory differs from source")
+        sdist_members = {item.name for item in sdist.getmembers()
+                         if item.isfile() and item.name.startswith(tar_prefix)}
+        if sdist_members != {tar_prefix + relative.as_posix() for relative in expected}:
+            raise SystemExit("sdist: template inventory differs from source")
+    print(f"Wheel and sdist match all {len(expected)} selected source templates")
+
+
+def check_installed(reviewed, expected, public_text):
+    installed = resources.files("aegis_core").joinpath("team_templates")
+    for relative in expected:
+        resource = installed
+        for part in relative.parts:
+            resource = resource.joinpath(part)
+        compare("installed wheel", relative.as_posix(), reviewed / relative, resource.open, public_text, "rb")
+    print(f"Installed wheel matches all {len(expected)} selected source templates")
+
+
+def main():
+    verifier, phase, snapshot, *inputs = sys.argv[1:]
+    public_text = runpy.run_path(verifier)["public_text"]
+    reviewed = Path(snapshot)
+    if phase == "snapshot":
+        snapshot_sources(Path("."), reviewed, public_text)
+        return
+    if phase == "stage":
+        stage_checkout(Path.cwd(), Path(inputs[0]), reviewed)
+        return
+
+    expected = sorted(path.relative_to(reviewed) for path in reviewed.rglob("*") if path.is_file())
+    if not expected:
+        raise SystemExit("No selected Teams templates")
+    if phase == "staged":
+        check_staged(Path(inputs[0]), reviewed, expected, public_text)
+    elif phase == "archives":
+        check_archives(*inputs, reviewed, expected, public_text)
+    elif phase == "installed":
+        check_installed(reviewed, expected, public_text)
+    else:
+        raise SystemExit("unknown template verification phase")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (*read_errors, ImportError, RuntimeError, ValueError):
+        raise SystemExit("cannot complete template verification") from None
+PY
+
+    python -I "$work/check_templates.py" "$verifier" snapshot "$reviewed"
+    python -I "$work/check_templates.py" "$verifier" stage "$reviewed" "$staged"
+    python -I "$work/check_templates.py" "$verifier" staged "$reviewed" "$staged"
+    (cd "$staged" && python -m build --no-isolation --outdir "$dist")
+    python "$verifier" record "$dist"
+    python "$verifier" verify "$dist"
+    set -- "$dist"/*.whl "$dist"/*.tar.gz
+    wheel=$1
+    python -I "$work/check_templates.py" "$verifier" archives "$reviewed" "$wheel" "$2"
+
+    python -m venv "$work/venv"
+    cd "$work"
+    "$work/venv/bin/python" -I -m pip install --no-index --no-deps "$wheel"
+    "$work/venv/bin/python" -I "$work/check_templates.py" "$verifier" installed "$reviewed"
+)
 ```
 
 `record` checks both archives before writing `dist/SHA256SUMS`. `verify`

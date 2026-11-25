@@ -1514,6 +1514,600 @@ def test_size_checked_before_read_and_growth_bounded(tmp_path, monkeypatch):
         assert refused.value.reason == "too_large" and calls == [5]
 
 
+@pytest.mark.parametrize("fault,code", [
+    ("policy", "CONFINED_UNSAFE"),
+    ("size", "CONFINED_TOO_LARGE"),
+    ("read", "CONFINED_IO"),
+    ("read-after-replace", "CONFINED_CHANGED"),
+    ("rewrite", "CONFINED_CHANGED"),
+    ("replace", "CONFINED_CHANGED"),
+    ("unlink", "CONFINED_MISSING"),
+    ("stat", "CONFINED_IO"),
+])
+def test_checked_read_validates_generation_closes_and_can_retry(tmp_path, monkeypatch, fault, code):
+    root = make_store(tmp_path)
+    target = root / "file"
+    target.write_bytes(b"first")
+    opened, closed, checked, consumed = [], [], [], []
+
+    def open_at(*args, **kwargs):
+        if fault == "size":
+            target.write_bytes(b"larger")
+        fd = os.open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    def close(fd):
+        closed.append(fd)
+        os.close(fd)
+
+    def policy(info):
+        checked.append(info)
+        assert info.st_ino == target.stat().st_ino
+        if fault == "policy":
+            raise storage.ConfinedFileError("unsafe")
+
+    def read(fd, count):
+        consumed.append(fd)
+        assert checked and checked[0].st_ino == os.fstat(fd).st_ino
+        if fault == "read":
+            raise OSError(errno.EIO, "private-value")
+        if fault == "read-after-replace":
+            replacement = target.with_suffix(".new")
+            replacement.write_bytes(b"other")
+            replacement.replace(target)
+            raise OSError(errno.EIO, "private-value")
+        data = os.read(fd, count)
+        if data and fault == "replace":
+            replacement = target.with_suffix(".new")
+            replacement.write_bytes(b"other")
+            replacement.replace(target)
+        if data and fault == "unlink":
+            target.unlink()
+        return data
+
+    def stat_at(*args, **kwargs):
+        if fault == "stat" and consumed:
+            raise OSError(errno.EIO, "private-value")
+        info = os.stat(*args, **kwargs)
+        if fault == "rewrite" and consumed:
+            target.write_bytes(b"other")
+            os.utime(target, ns=(0, 0))
+        return info
+
+    with storage.confined_file(root, ("file",)) as handle:
+        if fault == "size":
+            target.write_bytes(b"four")
+        monkeypatch.setattr("aegis_core.storage_confined.os", ModuleOS(open=open_at, close=close, read=read, stat=stat_at))
+        with pytest.raises(storage.ConfinedFileError) as caught:
+            handle.read_checked(4 if fault == "size" else 5, policy=policy)
+        monkeypatch.setattr("aegis_core.storage_confined.os", os)
+        assert caught.value.code == code and "private-value" not in str(caught.value)
+        assert len(opened) == 1 and closed == opened
+        if fault in ("size", "policy"):
+            assert not consumed
+        if fault == "size":
+            assert not checked
+            target.write_bytes(b"first")
+        if fault == "unlink":
+            target.write_bytes(b"first")
+        seen = []
+        raw, info = handle.read_checked(5, policy=seen.append)
+        assert raw == target.read_bytes()
+        assert seen == [info] and info.st_ino == target.stat().st_ino and info.st_size == len(raw)
+
+
+def test_checked_read_unsupported_name_probe_refuses_before_open(tmp_path, monkeypatch):
+    from aegis_core import storage_confined
+
+    parent_fd = 1  # Simulated handle. The absent capability must prevent any I/O.
+    opens = []
+
+    def open_at(*args, **kwargs):
+        assert kwargs["dir_fd"] is None
+        opens.append(args)
+        return parent_fd
+
+    install_confined_os(monkeypatch, present=("open", "stat", "mkdir", "link", "rename", "unlink"),
+                        follow=False, open_impl=open_at, close_impl=lambda fd: None)
+    with pytest.raises(storage.ConfinedFileError) as owned:
+        storage_confined.read_checked_file(Path(tmp_path.anchor), ("file",), 5)
+    assert owned.value.code == "CONFINED_UNSUPPORTED" and opens == []
+    with storage.confined_file(Path(tmp_path.anchor), ("file",)) as handle:
+        with pytest.raises(storage.ConfinedFileError) as caught:
+            handle.read_checked(5, policy=lambda _: pytest.fail("checked policy"))
+    assert caught.value.code == "CONFINED_UNSUPPORTED" and len(opens) == 1
+
+
+@pytest.mark.parametrize("fault,code", [
+    ("unsafe", "CONFINED_UNSAFE"), ("missing", "CONFINED_MISSING"),
+    ("changed", "CONFINED_CHANGED"), ("io", "CONFINED_IO"),
+    ("unreadable", "CONFINED_UNSAFE"),
+    ("definite-missing", "CONFINED_MISSING"), ("definite-unsafe", "CONFINED_UNSAFE"),
+])
+def test_checked_read_classifies_failed_open(tmp_path, monkeypatch, fault, code):
+    root = make_store(tmp_path)
+    target = root / "file"
+    target.write_bytes(b"first")
+    target.chmod(0o600)
+    uid = target.stat().st_uid
+    replacement = root / "replacement"
+    replacement.write_bytes(b"other")
+    replacement.chmod(0o600)
+    name_checks = []
+
+    def fail_open(name, flags, *, dir_fd):
+        assert name == target.name and flags & os.O_NOFOLLOW and dir_fd == handle.parent_fd
+        if fault == "changed" or fault.startswith("definite-"):
+            replacement.replace(target)
+        if fault == "definite-missing":
+            raise OSError(errno.ENOENT, "private-value")
+        if fault == "definite-unsafe":
+            raise OSError(errno.ELOOP, "private-value")
+        if fault == "unreadable":
+            target.chmod(0o000)
+            raise OSError(errno.EACCES, "private-value")
+        if fault in ("missing", "unsafe"):
+            target.unlink()
+            if fault == "unsafe":
+                target.mkdir()
+        raise OSError(errno.EIO, "private-value")
+
+    def stat_at(name, *, dir_fd, follow_symlinks):
+        assert name == target.name and dir_fd == handle.parent_fd and follow_symlinks is False
+        name_checks.append(name)
+        return os.stat(name, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    def reject_policy(info):
+        pytest.fail("failed open reached record policy")
+
+    with storage.confined_file(root, ("file",)) as handle:
+        monkeypatch.setattr("aegis_core.storage_confined.os", ModuleOS(open=fail_open, stat=stat_at))
+        with pytest.raises(storage.ConfinedFileError) as caught:
+            handle.read_checked(5, owner_uid=uid, policy=reject_policy)
+        monkeypatch.setattr("aegis_core.storage_confined.os", os)
+        assert caught.value.code == code and "private-value" not in str(caught.value)
+        assert len(name_checks) == (1 if fault.startswith("definite-") else 2)
+        if fault == "unsafe":
+            target.rmdir()
+        if fault == "unreadable":
+            target.chmod(0o600)
+        target.write_bytes(b"first")
+        assert handle.read_checked(5, policy=lambda info: None)[0] == b"first"
+
+
+def test_checked_read_refuses_initial_oversize_before_open_io(tmp_path, monkeypatch):
+    root = make_store(tmp_path)
+    target = root / "file"
+    target.write_bytes(b"first")
+    opens = []
+
+    def open_at(*args, **kwargs):
+        opens.append(args)
+        raise OSError(errno.EIO, "private-value")
+
+    with storage.confined_file(root, ("file",)) as handle:
+        monkeypatch.setattr("aegis_core.storage_confined.os", ModuleOS(open=open_at))
+        with pytest.raises(storage.ConfinedFileError) as caught:
+            handle.read_checked(4, policy=lambda _: pytest.fail("descriptor policy ran"))
+        monkeypatch.setattr("aegis_core.storage_confined.os", os)
+        assert caught.value.code == "CONFINED_TOO_LARGE"
+        assert opens == []
+        assert handle.read_checked(5, policy=lambda _: None)[0] == b"first"
+
+
+@pytest.mark.parametrize("fault,code", [
+    ("missing", "CONFINED_MISSING"), ("unsafe", "CONFINED_UNSAFE"),
+    ("changed", "CONFINED_CHANGED"), ("stable", "CONFINED_IO"),
+    ("oversize", "CONFINED_TOO_LARGE"), ("nonprivate", "CONFINED_UNSAFE"),
+])
+def test_checked_read_classifies_failed_fstat_and_closes(tmp_path, monkeypatch, fault, code):
+    root = make_store(tmp_path)
+    target = root / "file"
+    target.write_bytes(b"first")
+    target.chmod(0o600)
+    uid = target.stat().st_uid
+    replacement = root / "replacement"
+    replacement.write_bytes(b"other")
+    replacement.chmod(0o600)
+    closed, inspected = [], []
+
+    def inspect(fd):
+        inspected.append(fd)
+        if fault == "changed":
+            replacement.replace(target)
+        elif fault == "oversize":
+            target.write_bytes(b"longer")
+        elif fault == "nonprivate":
+            target.chmod(0o640)
+        elif fault in ("missing", "unsafe"):
+            target.unlink()
+            if fault == "unsafe":
+                target.mkdir()
+        raise OSError(errno.EIO, "private-value")
+
+    def close(fd):
+        os.close(fd)
+        closed.append(fd)
+
+    with storage.confined_file(root, ("file",)) as handle:
+        monkeypatch.setattr("aegis_core.storage_confined.os", ModuleOS(fstat=inspect, close=close))
+        with pytest.raises(storage.ConfinedFileError) as caught:
+            handle.read_checked(5, owner_uid=uid, policy=lambda _: pytest.fail("descriptor policy ran"))
+        monkeypatch.setattr("aegis_core.storage_confined.os", os)
+        assert caught.value.code == code and "private-value" not in str(caught.value)
+        assert closed == inspected and len(closed) == 1
+        if fault == "unsafe":
+            target.rmdir()
+        target.write_bytes(b"first")
+        assert handle.read_checked(5, policy=lambda _: None)[0] == b"first"
+
+
+@pytest.mark.parametrize("fault,code", [
+    ("stable", "CONFINED_IO"), ("changed", "CONFINED_CHANGED"), ("detached", "CONFINED_CHANGED"),
+    ("nonprivate", "CONFINED_UNSAFE"), ("oversize", "CONFINED_TOO_LARGE"),
+])
+def test_checked_read_classifies_name_io_after_opened_stat(tmp_path, monkeypatch, fault, code):
+    root = make_store(tmp_path)
+    target = root / "file"
+    target.write_bytes(b"first")
+    target.chmod(0o600)
+    replacement = root / "replacement"
+    replacement.write_bytes(b"other")
+    replacement.chmod(0o600)
+    opened, closed = [], []
+
+    def open_at(name, flags, *, dir_fd):
+        if fault == "changed":
+            replacement.replace(target)
+        fd = os.open(name, flags, dir_fd=dir_fd)
+        opened.append(fd)
+        if fault == "detached":
+            target.unlink()
+        elif fault == "nonprivate":
+            os.fchmod(fd, 0o640)
+        elif fault == "oversize":
+            target.write_bytes(b"longer")
+        return fd
+
+    def stat_at(name, *, dir_fd, follow_symlinks):
+        assert name == target.name and dir_fd == handle.parent_fd and follow_symlinks is False
+        if opened:
+            raise OSError(errno.EIO, "private-value")
+        return os.stat(name, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    def close(fd):
+        os.close(fd)
+        closed.append(fd)
+        if fault in ("nonprivate", "oversize"):
+            raise OSError(errno.EIO, "private-value")
+
+    with storage.confined_file(root, ("file",)) as handle:
+        _, expected = handle.read_checked(5, owner_uid=target.stat().st_uid)
+        monkeypatch.setattr("aegis_core.storage_confined.os", ModuleOS(open=open_at, stat=stat_at, close=close))
+        with pytest.raises(storage.ConfinedFileError) as caught:
+            handle.read_checked(5, owner_uid=expected.st_uid, expected=expected,
+                                policy=lambda _: pytest.fail("descriptor policy ran"))
+        monkeypatch.setattr("aegis_core.storage_confined.os", os)
+        assert caught.value.code == code and "private-value" not in str(caught.value)
+        assert closed == opened and len(closed) == 1
+        if fault == "nonprivate":
+            target.chmod(0o600)
+        if fault in ("detached", "oversize"):
+            target.write_bytes(b"first")
+            target.chmod(0o600)
+        assert handle.read_checked(5, owner_uid=expected.st_uid)[0] == target.read_bytes()
+
+
+def test_checked_read_keeps_descriptor_policy_off_named_metadata(tmp_path, monkeypatch):
+    root = make_store(tmp_path)
+    target = root / "file"
+    target.write_bytes(b"first")
+    target.chmod(0o600)
+    opened_stats = []
+
+    def inspect(fd):
+        info = os.fstat(fd)
+        opened_stats.append(info)
+        return info
+
+    with storage.confined_file(root, ("file",)) as handle:
+        uid = target.stat().st_uid
+        monkeypatch.setattr("aegis_core.storage_confined.os", ModuleOS(
+            open=lambda *a, **k: pytest.fail("opened a foreign record")))
+        with pytest.raises(storage.ConfinedFileError) as caught:
+            handle.read_checked(5, owner_uid=uid + 1, policy=lambda _: pytest.fail("descriptor policy ran"))
+        assert caught.value.code == "CONFINED_UNSAFE"
+
+        def policy(info):
+            assert len(opened_stats) == 1 and info is opened_stats[0]
+
+        monkeypatch.setattr("aegis_core.storage_confined.os", ModuleOS(fstat=inspect))
+        raw, info = handle.read_checked(5, owner_uid=uid, policy=policy)
+        assert raw == b"first" and info is opened_stats[0]
+        assert len(opened_stats) == 2
+
+
+@pytest.mark.parametrize("surface", ["borrowed", "owned"])
+@pytest.mark.parametrize("defect,later_name,code", [
+    ("mode", "restored", "CONFINED_UNSAFE"),
+    ("size", "restored", "CONFINED_TOO_LARGE"),
+    ("mode", "different", "CONFINED_UNSAFE"),
+    ("size", "different", "CONFINED_TOO_LARGE"),
+    ("mode", "missing", "CONFINED_UNSAFE"),
+    ("size", "missing", "CONFINED_TOO_LARGE"),
+    ("detached", "different", "CONFINED_CHANGED"),
+    ("detached", "missing", "CONFINED_MISSING"),
+    ("detached", "io", "CONFINED_CHANGED"),
+])
+def test_checked_read_descriptor_defect_precedes_competing_name(
+        tmp_path, monkeypatch, surface, defect, later_name, code):
+    from aegis_core import storage_confined
+
+    root = make_store(tmp_path)
+    parent = root / "records"
+    parent.mkdir()
+    target = parent / "file"
+    target.write_bytes(b"first")
+    target.chmod(0o600)
+    uid = target.stat().st_uid
+    replacement = parent / "replacement"
+    replacement.write_bytes(b"other")
+    replacement.chmod(0o600)
+    live = {}
+    closed, name_checks, inspected = [], [], []
+
+    def open_at(name, flags, *, dir_fd):
+        fd = os.open(name, flags, dir_fd=dir_fd)
+        assert fd not in live
+        live[fd] = name
+        return fd
+
+    def inspect(fd):
+        assert live[fd] == target.name and not inspected
+        if defect == "mode":
+            os.fchmod(fd, 0o640)
+        elif defect == "size":
+            target.write_bytes(b"too long")
+        else:
+            target.unlink()
+        info = os.fstat(fd)
+        inspected.append(info)
+        if later_name == "restored":
+            if defect == "mode":
+                os.fchmod(fd, 0o600)
+            else:
+                target.write_bytes(b"first")
+        elif defect != "detached":
+            target.rename(parent / "displaced")
+        if later_name == "different":
+            replacement.replace(target)
+        return info
+
+    def stat_at(name, *, dir_fd, follow_symlinks):
+        assert name == target.name and live[dir_fd] == parent.name and follow_symlinks is False
+        name_checks.append(name)
+        if inspected and later_name == "io":
+            raise OSError(errno.EIO, "private-value")
+        return os.stat(name, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    def close(fd):
+        name = live.pop(fd)
+        os.close(fd)
+        closed.append(name)
+        if name == target.name:
+            raise OSError(errno.EIO, "private-value")
+
+    def policy(info):
+        pytest.fail("refused record reached descriptor policy")
+
+    monkeypatch.setattr("aegis_core.storage_confined.os", ModuleOS(
+        open=open_at, fstat=inspect, stat=stat_at, close=close,
+        read=lambda *args: pytest.fail("refused record reached byte consumption")))
+    parts = (parent.name, target.name)
+    with pytest.raises(storage.ConfinedFileError) as caught:
+        if surface == "owned":
+            storage_confined.read_checked_file(root, parts, 5, owner_uid=uid, policy=policy)
+        else:
+            with storage.confined_file(root, parts) as handle:
+                handle.read_checked(5, owner_uid=uid, policy=policy)
+    assert caught.value.code == code and "private-value" not in str(caught.value)
+    assert len(inspected) == 1 and inspected[0].st_nlink == (0 if defect == "detached" else 1)
+    assert len(name_checks) == (2 if defect == "detached" else 1)
+    assert not live and closed.count(target.name) == closed.count(parent.name) == 1
+
+
+@pytest.mark.parametrize("read_fault,change,name_io,fd_io,close_io,code", [
+    (None, "rewrite", True, False, False, "CONFINED_CHANGED"),
+    ("io", "rewrite", True, False, False, "CONFINED_CHANGED"),
+    (None, None, True, True, False, "CONFINED_IO"),
+    (None, None, True, False, False, "CONFINED_IO"),
+    (None, "unlink", False, True, False, "CONFINED_MISSING"),
+    (None, "unlink", False, False, True, "CONFINED_MISSING"),
+    (None, None, False, True, False, "CONFINED_IO"),
+    ("io", None, False, False, False, "CONFINED_IO"),
+    ("short", None, False, False, True, "CONFINED_CHANGED"),
+    (None, None, False, False, True, "CONFINED_IO"),
+])
+def test_checked_read_decides_from_both_observations_and_leaf_cleanup(
+        tmp_path, monkeypatch, read_fault, change, name_io, fd_io, close_io, code):
+    root = make_store(tmp_path)
+    target = root / "file"
+    target.write_bytes(b"first")
+    opened, closed, reads, final_fstats = [], [], [], []
+
+    def open_at(name, flags, *, dir_fd):
+        fd = os.open(name, flags, dir_fd=dir_fd)
+        opened.append(fd)
+        return fd
+
+    def read(fd, count):
+        if not reads:
+            reads.append(fd)
+            if change == "rewrite":
+                os.utime(target, ns=(0, 0))
+            if change == "unlink":
+                target.unlink()
+            if read_fault == "io":
+                raise OSError(errno.EIO, "private-value")
+            if read_fault == "short":
+                return b""
+        return os.read(fd, count)
+
+    def stat_at(name, *, dir_fd, follow_symlinks):
+        assert name == target.name and dir_fd == handle.parent_fd and follow_symlinks is False
+        if reads and name_io:
+            raise OSError(errno.EIO, "private-value")
+        return os.stat(name, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    def fstat(fd):
+        if reads:
+            final_fstats.append(fd)
+            if fd_io:
+                raise OSError(errno.EIO, "private-value")
+        return os.fstat(fd)
+
+    def close(fd):
+        os.close(fd)
+        closed.append(fd)
+        if close_io:
+            raise OSError(errno.EIO, "private-value")
+
+    with storage.confined_file(root, ("file",)) as handle:
+        monkeypatch.setattr("aegis_core.storage_confined.os", ModuleOS(
+            open=open_at, read=read, stat=stat_at, fstat=fstat, close=close))
+        with pytest.raises(storage.ConfinedFileError) as caught:
+            handle.read_checked(5)
+        monkeypatch.setattr("aegis_core.storage_confined.os", os)
+        assert caught.value.code == code and "private-value" not in str(caught.value)
+        assert len(opened) == 1 and closed == reads == final_fstats == opened
+        if change == "unlink":
+            target.write_bytes(b"first")
+        assert handle.read_checked(5)[0] == b"first"
+
+
+@pytest.mark.parametrize("fault,code", [
+    ("ancestor-close", "CONFINED_IO"),
+    ("ancestor-close-and-missing-leaf", "CONFINED_MISSING"),
+    ("missing-parent", "CONFINED_MISSING"),
+    ("parent-policy", "CONFINED_UNSAFE"),
+    ("missing-leaf", "CONFINED_MISSING"),
+    ("read-io", "CONFINED_IO"),
+    ("close-only", "CONFINED_IO"),
+])
+def test_checked_file_preserves_decision_through_parent_cleanup(tmp_path, monkeypatch, fault, code):
+    from aegis_core import storage_confined
+
+    root = make_store(tmp_path)
+    directory = root / "records"
+    directory.mkdir()
+    parts = ("records", "absent", "file") if fault == "missing-parent" else ("records", "file")
+    target = root.joinpath(*parts)
+    if fault not in ("missing-parent", "ancestor-close-and-missing-leaf"):
+        target.write_bytes(b"first")
+    close_name = root.name if fault.startswith("ancestor-close") else directory.name
+    opened, closed, live = [], [], {}
+
+    def open_at(name, flags, *, dir_fd):
+        fd = os.open(name, flags, dir_fd=dir_fd)
+        assert fd not in live
+        live[fd] = name
+        opened.append(name)
+        return fd
+
+    def close(fd):
+        name = live.pop(fd)
+        os.close(fd)
+        closed.append(name)
+        if name == close_name:
+            raise OSError(errno.EIO, "private-value")
+
+    def read(fd, count):
+        if fault == "read-io":
+            raise OSError(errno.EIO, "private-value")
+        data = os.read(fd, count)
+        if data and fault == "missing-leaf":
+            target.unlink()
+        return data
+
+    def parent_policy(info):
+        assert info.st_ino == directory.stat().st_ino
+        if fault == "parent-policy":
+            raise storage.ConfinedFileError("unsafe")
+
+    monkeypatch.setattr("aegis_core.storage_confined.os", ModuleOS(open=open_at, read=read, close=close))
+    with pytest.raises(storage.ConfinedFileError) as caught:
+        storage_confined.read_checked_file(root, parts, 5, parent_policy=parent_policy)
+    monkeypatch.setattr("aegis_core.storage_confined.os", os)
+    assert caught.value.code == code and "private-value" not in str(caught.value)
+    assert not live and sorted(closed) == sorted(opened) and closed.count(close_name) == 1
+    if fault.startswith("ancestor-close"):
+        assert target.name not in opened
+    if fault.endswith("missing-leaf") or fault == "missing-parent":
+        target.parent.mkdir(exist_ok=True)
+        target.write_bytes(b"first")
+    assert storage_confined.read_checked_file(root, parts, 5)[0] == b"first"
+
+
+@pytest.mark.parametrize("fault,code", [
+    ("short", "CONFINED_CHANGED"), ("growth", "CONFINED_CHANGED"),
+    ("replace", "CONFINED_CHANGED"), ("unlink", "CONFINED_MISSING"),
+])
+def test_checked_read_refuses_length_drift_and_detached_inode(tmp_path, monkeypatch, fault, code):
+    root = make_store(tmp_path)
+    target = root / "file"
+    target.write_bytes(b"first")
+    replacement = root / "replacement"
+    replacement.write_bytes(b"other")
+    opened, closed, checked, counts = [], [], [], []
+
+    def open_at(name, flags, *, dir_fd):
+        fd = os.open(name, flags, dir_fd=dir_fd)
+        opened.append(fd)
+        return fd
+
+    def inspect_opened(fd):
+        if fault == "replace":
+            replacement.replace(target)
+        if fault == "unlink":
+            target.unlink()
+        return os.fstat(fd)
+
+    def close(fd):
+        closed.append(fd)
+        os.close(fd)
+
+    def policy(info):
+        checked.append(info)
+        if info.st_nlink != 1:
+            raise storage.ConfinedFileError("unsafe")
+
+    def read(fd, count):
+        assert checked and fd == opened[0]
+        counts.append(count)
+        if fault == "short":
+            return os.read(fd, 2) if len(counts) == 1 else b""
+        if len(counts) == 1:
+            target.write_bytes(b"first-and-more")
+        return os.read(fd, count)
+
+    with storage.confined_file(root, ("file",)) as handle:
+        monkeypatch.setattr("aegis_core.storage_confined.os", ModuleOS(
+            open=open_at, close=close, fstat=inspect_opened, read=read))
+        with pytest.raises(storage.ConfinedFileError) as caught:
+            handle.read_checked(8, policy=policy)
+        monkeypatch.setattr("aegis_core.storage_confined.os", os)
+        assert caught.value.code == code
+        assert len(opened) == 1 and opened == closed
+        if fault in ("replace", "unlink"):
+            assert not checked and not counts
+        else:
+            assert counts[0] == 6
+        target.write_bytes(b"first")
+        raw, info = handle.read_checked(8, policy=policy)
+        assert raw == b"first" and len(raw) == info.st_size
+
+
 @pytest.mark.parametrize("component", [0, 1, 2])
 @pytest.mark.parametrize("operation", ["read", "exclusive", "replace"])
 def test_symlinks_at_every_component_refuse(tmp_path, component, operation):

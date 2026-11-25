@@ -1,9 +1,11 @@
 """Owner-bound queue connections: hostile inputs never enroll a caller."""
 from contextlib import contextmanager
+import errno
 import hashlib
 import json
 import os
 import shutil
+import stat
 import sys
 import tempfile
 import threading
@@ -82,6 +84,15 @@ def _os_view(**overrides):
     """Product os reference with the directory-opener callbacks authority() passes through."""
     values = dict(geteuid=os.geteuid, getpid=os.getpid, open=os.open, close=os.close,
                   fstat=os.fstat, stat=os.stat, fsencode=os.fsencode)
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _confined_os_view(**overrides):
+    values = dict(name=os.name, supports_dir_fd=os.supports_dir_fd, supports_follow_symlinks=os.supports_follow_symlinks,
+                  O_RDONLY=os.O_RDONLY, O_DIRECTORY=os.O_DIRECTORY, O_NOFOLLOW=os.O_NOFOLLOW,
+                  O_NONBLOCK=os.O_NONBLOCK, O_CLOEXEC=os.O_CLOEXEC, fsencode=os.fsencode,
+                  open=os.open, close=os.close, read=os.read, fstat=os.fstat, stat=os.stat)
     values.update(overrides)
     return SimpleNamespace(**values)
 
@@ -515,31 +526,24 @@ def test_owner_lock_timeout_is_retryable(owner_factory, monkeypatch):
 
 
 def test_ancestor_rename_between_validation_and_read_is_confined(owner_factory, monkeypatch):
-    from contextlib import contextmanager
-    from aegis_core import storage_confined
-
     role, root, path, workspace, policy = owner_factory()
     moved = path.parent.with_name("registrations-old")
-    original = storage_confined.confined_file
-    @contextmanager
-    def swapping_file(anchor, parts, **options):
-        with original(anchor, parts, **options) as handle:
-            if parts != ("registrations", "alpha.json"):
-                yield handle
-                return
-            if not moved.exists():
-                path.parent.rename(moved)
-                symlink_or_skip(workspace, path.parent, target_is_directory=True)
-            yield SimpleNamespace(parent_fd=handle.parent_fd, parent_stat=handle.parent_stat,
-                                  read_bytes=handle.read_bytes)
-    monkeypatch.setattr(queue_role, "storage_confined", SimpleNamespace(
-        confined_file=swapping_file, descriptor_supported=storage_confined.descriptor_supported,
-        ConfinedFileError=storage_confined.ConfinedFileError))
+    parent = path.parent.stat()
+
+    def inspect(fd):
+        info = os.fstat(fd)
+        if (info.st_dev, info.st_ino) == (parent.st_dev, parent.st_ino) and not moved.exists():
+            path.parent.rename(moved)
+            symlink_or_skip(workspace, path.parent, target_is_directory=True)
+        return info
+
+    monkeypatch.setattr("aegis_core.storage_confined.os", SimpleNamespace(**{**vars(os), "fstat": inspect}))
     # The anchored original parent may complete issuance; its replacement cannot
     # redirect the read. Binding then refuses the new symlinked pathname.
     role.issue("alpha")
     with pytest.raises(role.RoleRefusal, match="^role_invalid$"):
         role.bind("alpha")
+    monkeypatch.setattr("aegis_core.storage_confined.os", os)
     path.parent.unlink()
     moved.rename(path.parent)
     assert role.bind("alpha").workspace == str(workspace)
@@ -552,23 +556,341 @@ def test_record_generation_change_during_read_refuses_then_allows_retry(owner_fa
     replacement.chmod(0o600)
     parent = path.parent.stat()
     stats = []
+    opened_leaves = []
+
+    def opened(name, flags, *, dir_fd):
+        descriptor = os.open(name, flags, dir_fd=dir_fd)
+        if name == path.name:
+            opened_leaves.append(descriptor)
+        return descriptor
 
     def inspect(name, *, dir_fd=None, follow_symlinks=True):
         if name == path.name:
             assert dir_fd is not None and follow_symlinks is False
             held = os.fstat(dir_fd)
             assert (held.st_dev, held.st_ino) == (parent.st_dev, parent.st_ino)
-            stats.append(dir_fd)
-            if len(stats) == 2:
-                replacement.replace(path)
+            if opened_leaves:
+                stats.append(dir_fd)
+                if len(stats) == 2:
+                    replacement.replace(path)
         return os.stat(name, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
 
-    monkeypatch.setattr(queue_role, "os", _os_view(stat=inspect))
+    monkeypatch.setattr("aegis_core.storage_confined.os", _confined_os_view(open=opened, stat=inspect))
     with pytest.raises(role.RoleRefusal, match="^role_stale$"):
         role.issue("alpha")
+    monkeypatch.setattr("aegis_core.storage_confined.os", os)
     assert len(stats) == 2 and stats[0] == stats[1]
     assert not (root / "sessions").exists()
     role.issue("alpha")
+    assert role.bind("alpha").workspace == str(workspace)
+
+
+def test_issue_checks_opened_record_policy_before_reading(owner_factory, monkeypatch):
+    role, root, path, workspace, _ = owner_factory()
+    original = path.with_suffix(".original")
+    replacement = path.with_suffix(".replacement")
+    replacement.write_bytes(path.read_bytes())
+    replacement.chmod(0o640)
+    consumed = []
+    leaves = []
+
+    def opened(name, flags, *args, **kwargs):
+        if name == path.name:
+            path.rename(original)
+            replacement.replace(path)
+            leaf = os.open(name, flags, *args, **kwargs)
+            leaves.append(leaf)
+            return leaf
+        return os.open(name, flags, *args, **kwargs)
+
+    def read(fd, count):
+        if fd in leaves:
+            consumed.append(count)
+        return os.read(fd, count)
+
+    monkeypatch.setattr("aegis_core.storage_confined.os", _confined_os_view(open=opened, read=read))
+    with pytest.raises(role.RoleRefusal, match="^role_invalid$"):
+        role.issue("alpha")
+    monkeypatch.setattr("aegis_core.storage_confined.os", os)
+    assert consumed == []
+    assert not (root / "sessions").exists()
+    original.replace(path)
+    role.issue("alpha")
+    assert role.bind("alpha").workspace == str(workspace)
+
+
+def _authority_socket(directory):
+    path = directory / "authority.sock"
+    os.mknod(path, stat.S_IFSOCK | 0o600)
+    return path
+
+
+_LAUNCH_READ_ADVICE = {
+    "role_missing": "Ask the owner to install the registration and restart the queue connection.",
+    "role_invalid": "Ask the owner to repair the authority records and restart the queue connection.",
+    "role_stale": "Retry the launch.",
+    "role_io_unavailable": "Ask the owner to inspect authority storage and restart the queue connection.",
+}
+
+
+@pytest.mark.parametrize("operation,record", [("issue", "registration"), ("bind", "registration"), ("bind", "session")])
+@pytest.mark.parametrize("fault,reason", [
+    ("socket", "role_invalid"), ("unlink", "role_missing"), ("replace", "role_stale"),
+    ("short", "role_stale"), ("growth", "role_stale"), ("io", "role_io_unavailable"),
+    ("unreadable", "role_invalid"), ("nonprivate", "role_invalid"),
+    ("hardlink", "role_invalid"), ("oversize", "role_invalid"),
+    ("definite-missing", "role_missing"), ("definite-unsafe", "role_invalid"),
+    ("open-unreadable", "role_invalid"), ("fstat-oversize", "role_invalid"),
+])
+def test_launch_checked_authority_read_refusals(owner_factory, monkeypatch, operation, record, fault, reason):
+    role, root, path, workspace, _ = owner_factory()
+    if operation == "bind":
+        role.issue("alpha")
+    target = path if record == "registration" else _session_file(root)
+    original = target.read_bytes()
+    replacement = target.with_suffix(".new")
+    replacement.write_bytes(original)
+    replacement.chmod(0o600)
+    sock = _authority_socket(workspace.parent) if fault == "socket" else None
+    reading = set()
+    initial_defects = ("unreadable", "nonprivate", "hardlink", "oversize")
+    hardlink = target.with_suffix(".link")
+    if fault == "unreadable":
+        target.chmod(0o000)
+    elif fault == "nonprivate":
+        target.chmod(0o640)
+    elif fault == "hardlink":
+        os.link(target, hardlink)
+    elif fault == "oversize":
+        target.write_bytes(b"x" * (role.MAX_BYTES + 1))
+    failed_opens = []
+
+    def opened(name, flags, *args, **kwargs):
+        if name != target.name:
+            return os.open(name, flags, *args, **kwargs)
+        if fault in ("definite-missing", "definite-unsafe"):
+            replacement.replace(target)
+            number = errno.ENOENT if fault == "definite-missing" else errno.ELOOP
+            raise OSError(number, "private-value")
+        if fault == "open-unreadable":
+            target.chmod(0o000)
+            raise OSError(errno.EACCES, "private-value")
+        if fault == "socket":
+            sock.replace(target)
+        if fault == "io" or fault in initial_defects:
+            failed_opens.append(name)
+            raise OSError(errno.EIO, "private-value")
+        fd = os.open(name, flags, *args, **kwargs)
+        reading.add(fd)
+        return fd
+
+    def inspect_opened(fd):
+        if fd in reading:
+            if fault == "unlink":
+                target.unlink()
+            if fault == "replace":
+                replacement.replace(target)
+            if fault == "fstat-oversize":
+                target.write_bytes(original + b" " * role.MAX_BYTES)
+                raise OSError(errno.EIO, "private-value")
+        return os.fstat(fd)
+
+    def read(fd, count):
+        if fd in reading:
+            reading.discard(fd)
+            if fault == "short":
+                return b""
+            if fault == "growth":
+                target.write_bytes(original + b" " * role.MAX_BYTES)
+        return os.read(fd, count)
+
+    launch = role.issue if operation == "issue" else role.bind
+    monkeypatch.setattr("aegis_core.storage_confined.os", _confined_os_view(open=opened, fstat=inspect_opened, read=read))
+    with pytest.raises(role.RoleRefusal) as caught:
+        launch("alpha")
+    monkeypatch.setattr("aegis_core.storage_confined.os", os)
+    assert caught.value.reason == str(caught.value) == reason
+    assert role.launch_advice(caught.value.reason) == _LAUNCH_READ_ADVICE[reason]
+    if fault in initial_defects:
+        assert failed_opens == []
+    if operation == "issue":
+        assert not (root / "sessions").exists()
+    if fault == "socket":
+        target.unlink()
+    if fault == "hardlink":
+        hardlink.unlink()
+    if fault in ("unreadable", "open-unreadable"):
+        target.chmod(0o600)
+    target.write_bytes(original)
+    target.chmod(0o600)
+    if operation == "issue":
+        role.issue("alpha")
+    assert role.bind("alpha").workspace == str(workspace)
+
+
+@pytest.mark.parametrize("operation,record", [("issue", "registration"), ("bind", "registration"), ("bind", "session")])
+@pytest.mark.parametrize("defect,later_name", [
+    ("mode", "restored"), ("size", "restored"), ("mode", "different"), ("size", "missing"),
+])
+def test_launch_descriptor_defect_preserves_repair_advice(
+        owner_factory, monkeypatch, operation, record, defect, later_name):
+    role, root, path, workspace, _ = owner_factory()
+    if operation == "bind":
+        role.issue("alpha")
+    target = path if record == "registration" else _session_file(root)
+    original = target.read_bytes()
+    replacement = target.with_suffix(".new")
+    replacement.write_bytes(original)
+    replacement.chmod(0o600)
+    leaves = set()
+    name_checks, observed = [], []
+
+    def opened(name, flags, *args, **kwargs):
+        fd = os.open(name, flags, *args, **kwargs)
+        if name == target.name:
+            leaves.add(fd)
+        return fd
+
+    def inspect(fd):
+        if fd not in leaves:
+            return os.fstat(fd)
+        assert not observed
+        if defect == "mode":
+            os.fchmod(fd, 0o640)
+        else:
+            target.write_bytes(original + b" " * role.MAX_BYTES)
+        info = os.fstat(fd)
+        observed.append(info)
+        if later_name == "restored":
+            if defect == "mode":
+                os.fchmod(fd, 0o600)
+            else:
+                target.write_bytes(original)
+        else:
+            target.rename(target.with_suffix(".displaced"))
+            if later_name == "different":
+                replacement.replace(target)
+        return info
+
+    def stat_at(name, *args, **kwargs):
+        if name == target.name:
+            assert kwargs.get("dir_fd") is not None and kwargs.get("follow_symlinks") is False
+            name_checks.append(name)
+        return os.stat(name, *args, **kwargs)
+
+    def read(fd, count):
+        assert fd not in leaves, "refused record reached byte consumption"
+        return os.read(fd, count)
+
+    def close(fd):
+        leaves.discard(fd)
+        os.close(fd)
+
+    launch = role.issue if operation == "issue" else role.bind
+    monkeypatch.setattr("aegis_core.storage_confined.os", _confined_os_view(
+        open=opened, fstat=inspect, stat=stat_at, read=read, close=close))
+    with pytest.raises(role.RoleRefusal) as caught:
+        launch("alpha")
+    assert caught.value.reason == str(caught.value) == "role_invalid"
+    assert role.launch_advice(caught.value.reason) == _LAUNCH_READ_ADVICE["role_invalid"]
+    assert not leaves and name_checks == [target.name]
+    assert len(observed) == 1 and observed[0].st_nlink == 1
+    if operation == "issue":
+        assert not (root / "sessions").exists()
+
+
+_CHECKED_READ_FAULTS = [
+    ("name-io-after-rewrite", "role_stale"),
+    ("name-and-read-io-after-rewrite", "role_stale"),
+    ("leaf-close-after-unlink", "role_missing"),
+    ("parent-close-after-unlink", "role_missing"),
+    ("leaf-close", "role_io_unavailable"),
+    ("parent-close", "role_io_unavailable"),
+    ("parent-stat", "role_io_unavailable"),
+    ("admission-stat-after-unlink", "role_io_unavailable"),
+]
+
+
+class _RecordReadFault:
+    def __init__(self, target, fault, *, active):
+        self.target = target
+        self.fault = fault
+        self.active = active
+        self.started = False
+        self.owned = {}
+        self.closed = []
+
+    def open(self, name, flags, *args, **kwargs):
+        fd = os.open(name, flags, *args, **kwargs)
+        if self.active and name == self.target.name:
+            self.owned[fd] = "leaf"
+        elif self.active and name == self.target.parent.name:
+            self.owned[fd] = "parent"
+        return fd
+
+    def read(self, fd, count):
+        if not self.started and self.owned.get(fd) == "leaf":
+            self.started = True
+            if self.fault.endswith("rewrite"):
+                os.utime(self.target, ns=(0, 0))
+            if self.fault.endswith("unlink"):
+                self.target.unlink()
+            if self.fault.startswith("name-and-read-io"):
+                raise OSError(errno.EIO, "private-value")
+        return os.read(fd, count)
+
+    def stat(self, name, *args, **kwargs):
+        if (self.fault == "admission-stat-after-unlink" and name == self.target.name
+                and "leaf" in self.owned.values()):
+            self.target.unlink()
+            raise OSError(errno.EIO, "private-value")
+        if self.started and name == self.target.name and self.fault.startswith("name"):
+            assert kwargs.get("dir_fd") is not None and kwargs.get("follow_symlinks") is False
+            raise OSError(errno.EIO, "private-value")
+        return os.stat(name, *args, **kwargs)
+
+    def fstat(self, fd):
+        if self.fault == "parent-stat" and self.owned.get(fd) == "parent":
+            raise OSError(errno.EIO, "private-value")
+        return os.fstat(fd)
+
+    def close(self, fd):
+        os.close(fd)
+        kind = self.owned.pop(fd, None)
+        if kind is not None:
+            self.closed.append(kind)
+            if self.fault.startswith(kind + "-close"):
+                raise OSError(errno.EIO, "private-value")
+
+    def os_view(self):
+        return _confined_os_view(open=self.open, read=self.read, stat=self.stat, fstat=self.fstat, close=self.close)
+
+
+@pytest.mark.parametrize("operation,record", [("issue", "registration"), ("bind", "registration"), ("bind", "session")])
+@pytest.mark.parametrize("fault,reason", _CHECKED_READ_FAULTS)
+def test_launch_checked_read_decision_through_cleanup(owner_factory, monkeypatch, operation, record, fault, reason):
+    role, root, path, workspace, _ = owner_factory()
+    if operation == "bind":
+        role.issue("alpha")
+    target = path if record == "registration" else _session_file(root)
+    original = target.read_bytes()
+    failure = _RecordReadFault(target, fault, active=True)
+    launch = role.issue if operation == "issue" else role.bind
+    monkeypatch.setattr("aegis_core.storage_confined.os", failure.os_view())
+    with pytest.raises(role.RoleRefusal) as caught:
+        launch("alpha")
+    monkeypatch.setattr("aegis_core.storage_confined.os", os)
+    assert caught.value.reason == str(caught.value) == reason
+    assert role.launch_advice(caught.value.reason) == _LAUNCH_READ_ADVICE[reason]
+    assert failure.closed == (["parent"] if fault == "parent-stat" else ["leaf", "parent"])
+    assert not failure.owned
+    if operation == "issue":
+        assert not (root / "sessions").exists()
+    if fault.endswith("unlink"):
+        target.write_bytes(original)
+        target.chmod(0o600)
+    if operation == "issue":
+        role.issue("alpha")
     assert role.bind("alpha").workspace == str(workspace)
 
 
@@ -630,7 +952,7 @@ def _no_role_io(monkeypatch):
     # is the public probe team_queue calls before descriptor I/O.
     monkeypatch.setattr(queue_role, "authority", unavailable)
     monkeypatch.setattr(queue_role, "storage_confined", SimpleNamespace(
-        confined_file=unavailable, descriptor_supported=unavailable))
+        confined_file=unavailable, read_checked_file=unavailable, descriptor_supported=unavailable))
     monkeypatch.setattr(team_queue, "descriptor_supported", unavailable)
 
 
@@ -641,6 +963,17 @@ def _assert_role_refusal(result):
     assert result["next_action"] == _ROLE_ARGUMENT_NEXT
     assert "\n" not in rendered and "injected" not in rendered and "private-value" not in rendered
     assert "bad id" not in rendered
+
+
+def _assert_stale_claim(result):
+    fields = dict(result)
+    assert fields.pop("checked_at")
+    assert fields == {
+        "schema": "aegis.team.queue.claim/v1", "source": "aegis team queue claim",
+        "aegis_version": __version__, "scope": {}, "refused": True, "status": "refused",
+        "reason": "role_stale", "error": "role_stale", "exit_code": 1,
+        "next_action": "Ask the owner to restart the queue connection with a fresh session record.",
+    }
 
 
 @pytest.mark.parametrize("identifier,revision,lane,stopped", [
@@ -879,10 +1212,7 @@ def test_claim_replacement_is_role_stale_without_decoding(owner_factory, monkeyp
     assert result["exit_code"] == 1 and grant.stale is True
     assert seen["loads"] == 0
     assert "\n" not in rendered and "private-value" not in rendered and b"x" * 8 not in rendered.encode()
-    if fault == "mode-widened":
-        assert seen["hashes"] == 0
-    else:
-        assert seen["hashes"] == 2
+    assert seen["hashes"] == (1 if fault == "session-replaced" else 0)
     _restore_registration(path, original)
     if fault == "session-replaced":
         session.write_bytes(session_original)
@@ -891,7 +1221,7 @@ def test_claim_replacement_is_role_stale_without_decoding(owner_factory, monkeyp
     assert not (workspace / ".aegis" / "state" / "team-queue.json").exists()
 
 
-def test_mutate_replacement_raises_role_stale_without_latching(owner_factory, monkeypatch):
+def test_mutate_replacement_spends_grant_before_lock_exit(owner_factory, monkeypatch):
     _require_authority()
     role, root, path, workspace, policy = owner_factory()
     start_owner()
@@ -903,8 +1233,8 @@ def test_mutate_replacement_raises_role_stale_without_latching(owner_factory, mo
         path.write_bytes(b"x" * len(original))
         with pytest.raises(role.RoleRefusal, match="^role_stale$") as caught:
             grant._mutate(anchor, chain, arguments, grant.session)
-    assert str(caught.value) == "role_stale" and grant.stale is False
-    assert seen["loads"] == 0 and seen["hashes"] == 2
+    assert str(caught.value) == "role_stale" and grant.stale is True
+    assert seen["loads"] == 0 and seen["hashes"] == 0
     _restore_registration(path, original)
     # Rewriting the record moves its generation, so restored bytes stay stale.
     assert claim(arguments)["reason"] == "role_stale"
@@ -981,7 +1311,7 @@ def test_queue_lock_waits_see_a_concurrent_registration_change(owner_factory, mo
     try:
         arguments = {"id": "ONE", "expect": "a" * 64, "lane": "alpha"}
         assert claim(arguments)["reason"] == "role_stale"
-        assert grant.stale is True and seen["loads"] == 0 and seen["hashes"] == 4
+        assert grant.stale is True and seen["loads"] == 0 and seen["hashes"] == 2
         _restore_registration(path, original)
         assert claim(arguments)["reason"] == "role_stale"
     finally:
@@ -1016,6 +1346,388 @@ def test_claim_acquires_the_queue_lock_inside_authority(owner_factory, monkeypat
     assert claim({"id": "ONE", "expect": "a" * 64, "lane": "alpha"})["reason"] == "queue_io_unavailable"
     assert events.index("queue-enter") < events.index("authority-exit")
     assert events.index("queue-exit") < events.index("authority-exit")
+
+
+@pytest.mark.parametrize("phase", ["before-lock", "under-lock"])
+@pytest.mark.parametrize("record", ["registration", "session"])
+@pytest.mark.parametrize("fault", ["missing", "unsafe", "socket", "changed", "io", "io-fstat", "io-read", "io-stat"])
+def test_claim_authority_read_failure_policy(owner_factory, monkeypatch, phase, record, fault):
+    role, root, path, workspace, _ = owner_factory()
+    start_owner()
+    grant = server._queue_grant
+    target = path if record == "registration" else _session_file(root)
+    original = target.read_bytes()
+    sock = _authority_socket(workspace.parent) if fault == "socket" else None
+    added = team_queue.add(workspace, {
+        "id": "ONE", "title": "Queue work", "paths": ["src/**"], "capabilities": ["core"],
+    }, caller="owner")
+    assert not added["refused"], added
+    queue_file = workspace / ".aegis/state/team-queue.json"
+    before = queue_file.read_bytes()
+    real = queue_role.storage
+    observations = []
+    lock_state = {"phase": "before-lock", "read_started": False}
+    faulted_leaves = set()
+    stable_io = fault.startswith("io")
+
+    @contextmanager
+    def locked(*args, **kwargs):
+        with real.locked(*args, **kwargs) as held:
+            lock_state["phase"] = "under-lock"
+            try:
+                yield held
+            finally:
+                lock_state["phase"] = "before-lock"
+
+    def opened(name, flags, *args, **kwargs):
+        if name == target.name:
+            current_phase = lock_state["phase"]
+            observations.append(current_phase)
+            if current_phase == phase:
+                if fault == "io":
+                    raise OSError(errno.EIO, "private-value")
+                if fault == "socket":
+                    sock.replace(target)
+                elif fault == "changed":
+                    replacement = target.with_suffix(".new")
+                    replacement.write_bytes(original)
+                    replacement.chmod(0o600)
+                    replacement.replace(target)
+                elif not stable_io:
+                    target.unlink()
+                    if fault == "unsafe":
+                        symlink_or_skip(path.parent / "absent", target)
+                if stable_io:
+                    fd = os.open(name, flags, *args, **kwargs)
+                    faulted_leaves.add(fd)
+                    return fd
+        return os.open(name, flags, *args, **kwargs)
+
+    def inspect(fd):
+        if fault == "io-fstat" and fd in faulted_leaves:
+            raise OSError(errno.EIO, "private-value")
+        return os.fstat(fd)
+
+    def read(fd, count):
+        if fd in faulted_leaves:
+            lock_state["read_started"] = True
+            if fault == "io-read":
+                raise OSError(errno.EIO, "private-value")
+        return os.read(fd, count)
+
+    def stat_at(name, *args, **kwargs):
+        if fault == "io-stat" and lock_state["read_started"] and name == target.name:
+            raise OSError(errno.EIO, "private-value")
+        return os.stat(name, *args, **kwargs)
+
+    def close(fd):
+        faulted_leaves.discard(fd)
+        os.close(fd)
+
+    monkeypatch.setattr(queue_role, "storage", SimpleNamespace(
+        locked=locked, file_lock=real.file_lock, LockTimeoutError=real.LockTimeoutError))
+    arguments = {"id": "ONE", "expect": added["item"]["revision"], "lane": "alpha"}
+    monkeypatch.setattr("aegis_core.storage_confined.os", _confined_os_view(
+        open=opened, close=close, fstat=inspect, read=read, stat=stat_at))
+    result = claim(arguments)
+    monkeypatch.setattr("aegis_core.storage_confined.os", os)
+    assert observations == (["before-lock"] if phase == "before-lock" else ["before-lock", "under-lock"])
+    assert faulted_leaves == set()
+    _assert_stale_claim(result)
+    assert grant.stale is True
+    assert queue_file.read_bytes() == before
+
+    if not stable_io:
+        if fault == "socket" or target.is_symlink():
+            target.unlink()
+        target.write_bytes(original)
+        target.chmod(0o600)
+    _assert_stale_claim(claim(arguments))
+    assert server._queue_grant is grant
+    assert queue_file.read_bytes() == before
+
+
+@pytest.mark.parametrize("phase", ["before-lock", "under-lock"])
+@pytest.mark.parametrize("record", ["registration", "session"])
+@pytest.mark.parametrize("fault", [fault for fault, _ in _CHECKED_READ_FAULTS])
+def test_claim_checked_read_decision_through_cleanup(owner_factory, monkeypatch, phase, record, fault):
+    role, root, path, workspace, _ = owner_factory()
+    start_owner()
+    grant = server._queue_grant
+    target = path if record == "registration" else _session_file(root)
+    original = target.read_bytes()
+    added = team_queue.add(workspace, {
+        "id": "ONE", "title": "Queue work", "paths": ["src/**"], "capabilities": ["core"],
+    }, caller="owner")
+    assert not added["refused"], added
+    queue_file = workspace / ".aegis/state/team-queue.json"
+    before = queue_file.read_bytes()
+    real = role.storage
+    failure = _RecordReadFault(target, fault, active=phase == "before-lock")
+
+    @contextmanager
+    def locked(*args, **kwargs):
+        with real.locked(*args, **kwargs) as held:
+            failure.active = phase == "under-lock"
+            yield held
+
+    monkeypatch.setattr(queue_role, "storage", SimpleNamespace(
+        locked=locked, file_lock=real.file_lock, LockTimeoutError=real.LockTimeoutError))
+    monkeypatch.setattr("aegis_core.storage_confined.os", failure.os_view())
+    arguments = {"id": "ONE", "expect": added["item"]["revision"], "lane": "alpha"}
+    result = claim(arguments)
+    monkeypatch.setattr("aegis_core.storage_confined.os", os)
+    _assert_stale_claim(result)
+    assert grant.stale is True
+    assert failure.closed == (["parent"] if fault == "parent-stat" else ["leaf", "parent"])
+    assert not failure.owned
+    assert queue_file.read_bytes() == before
+    if fault.endswith("unlink"):
+        target.write_bytes(original)
+        target.chmod(0o600)
+    _assert_stale_claim(claim(arguments))
+    assert server._queue_grant is grant
+    assert queue_file.read_bytes() == before
+
+
+@pytest.mark.parametrize("phase,queue_close,authority_close", [
+    ("before-lock", False, True), ("under-lock", True, False), ("under-lock", True, True),
+])
+@pytest.mark.parametrize("record", ["registration", "session"])
+def test_claim_preserves_spent_grant_through_lock_cleanup(
+        owner_factory, monkeypatch, phase, queue_close, authority_close, record):
+    role, root, path, workspace, _ = owner_factory()
+    start_owner()
+    grant = server._queue_grant
+    target = path if record == "registration" else _session_file(root)
+    added = team_queue.add(workspace, {
+        "id": "ONE", "title": "Queue work", "paths": ["src/**"], "capabilities": ["core"],
+    }, caller="owner")
+    assert not added["refused"], added
+    queue_file = workspace / ".aegis/state/team-queue.json"
+    before = queue_file.read_bytes()
+    real = role.storage
+    failure = _RecordReadFault(target, "leaf-close", active=phase == "before-lock")
+    teardown = []
+
+    @contextmanager
+    def locked(*args, **kwargs):
+        with real.locked(*args, **kwargs) as held:
+            failure.active = phase == "under-lock"
+            try:
+                yield held
+            finally:
+                if queue_close:
+                    teardown.append("queue")
+                    raise OSError(errno.EIO, "private-value")
+
+    @contextmanager
+    def file_lock(*args, **kwargs):
+        with real.file_lock(*args, **kwargs):
+            try:
+                yield
+            finally:
+                if authority_close:
+                    teardown.append("authority")
+                    raise OSError(errno.EIO, "private-value")
+
+    monkeypatch.setattr(queue_role, "storage", SimpleNamespace(
+        locked=locked, file_lock=file_lock, LockTimeoutError=real.LockTimeoutError))
+    monkeypatch.setattr("aegis_core.storage_confined.os", failure.os_view())
+    arguments = {"id": "ONE", "expect": added["item"]["revision"], "lane": "alpha"}
+    result = claim(arguments)
+    monkeypatch.setattr("aegis_core.storage_confined.os", os)
+    monkeypatch.setattr(queue_role, "storage", real)
+    _assert_stale_claim(result)
+    assert grant.stale is True
+    assert teardown == [kind for kind, failed in (("queue", queue_close), ("authority", authority_close)) if failed]
+    assert failure.closed == ["leaf", "parent"] and not failure.owned
+    assert queue_file.read_bytes() == before
+    _assert_stale_claim(claim(arguments))
+    assert server._queue_grant is grant and queue_file.read_bytes() == before
+
+
+def test_queue_lock_io_allows_retry_on_the_same_grant(owner_factory, monkeypatch):
+    role, root, path, workspace, _ = owner_factory()
+    start_owner()
+    grant = server._queue_grant
+    added = team_queue.add(workspace, {
+        "id": "ONE", "title": "Queue work", "paths": ["src/**"], "capabilities": ["core"],
+    }, caller="owner")
+    assert not added["refused"], added
+    queue_file = workspace / ".aegis/state/team-queue.json"
+    before = queue_file.read_bytes()
+    real = role.storage
+
+    def fail_lock(*args, **kwargs):
+        raise OSError(errno.EIO, "private-value")
+
+    monkeypatch.setattr(queue_role, "storage", SimpleNamespace(
+        locked=fail_lock, file_lock=real.file_lock, LockTimeoutError=real.LockTimeoutError))
+    arguments = {"id": "ONE", "expect": added["item"]["revision"], "lane": "alpha"}
+    result = claim(arguments)
+    assert result["reason"] == result["error"] == "queue_io_unavailable"
+    assert result["next_action"] == "Check the trusted workspace and queue, then list before retrying."
+    assert grant.stale is False and queue_file.read_bytes() == before
+    monkeypatch.setattr(queue_role, "storage", real)
+    retry = claim(arguments)
+    assert retry["reason"] == "queue_io_unavailable"
+    assert retry["next_action"] == "Check the trusted workspace and queue paths, then list before retrying a mutation."
+    assert grant.stale is False and server._queue_grant is grant and queue_file.read_bytes() == before
+
+
+def test_claim_preserves_process_refusal_cleanup_behavior(owner_factory, monkeypatch):
+    role, root, path, workspace, _ = owner_factory()
+    start_owner()
+    grant = server._queue_grant
+    real = role.storage
+
+    @contextmanager
+    def file_lock(*args, **kwargs):
+        with real.file_lock(*args, **kwargs):
+            try:
+                yield
+            finally:
+                raise OSError(errno.EIO, "private-value")
+
+    monkeypatch.setattr(queue_role, "process_identity", lambda: {**grant.process, "pid": 0})
+    monkeypatch.setattr(queue_role, "storage", SimpleNamespace(
+        locked=real.locked, file_lock=file_lock, LockTimeoutError=real.LockTimeoutError))
+    arguments = {"id": "ONE", "expect": "a" * 64, "lane": "alpha"}
+    denied = claim(arguments)
+    assert denied["reason"] == denied["error"] == "role_io_unavailable"
+    assert grant.stale is True and not (workspace / ".aegis/state/team-queue.json").exists()
+    monkeypatch.setattr(queue_role, "storage", real)
+    _assert_stale_claim(claim(arguments))
+
+
+@pytest.mark.parametrize("phase", ["before-lock", "under-lock"])
+@pytest.mark.parametrize("record", ["registration", "session"])
+def test_claim_preserves_unsupported_record_reason(owner_factory, monkeypatch, phase, record):
+    role, root, path, workspace, _ = owner_factory()
+    start_owner()
+    grant = server._queue_grant
+    target = path if record == "registration" else _session_file(root)
+    confined = role.storage_confined
+    real = role.storage
+    state = {"phase": "before-lock"}
+
+    def read_checked_file(root, parts, *args, **kwargs):
+        if parts[-1] == target.name and state["phase"] == phase:
+            raise confined.ConfinedFileError("unsupported")
+        return confined.read_checked_file(root, parts, *args, **kwargs)
+
+    @contextmanager
+    def locked(*args, **kwargs):
+        with real.locked(*args, **kwargs) as held:
+            state["phase"] = "under-lock"
+            yield held
+
+    monkeypatch.setattr(queue_role, "storage", SimpleNamespace(
+        locked=locked, file_lock=real.file_lock, LockTimeoutError=real.LockTimeoutError))
+    monkeypatch.setattr(queue_role, "storage_confined", SimpleNamespace(**{
+        **vars(confined), "read_checked_file": read_checked_file,
+    }))
+    arguments = {"id": "ONE", "expect": "a" * 64, "lane": "alpha"}
+    denied = claim(arguments)
+    assert denied["reason"] == denied["error"] == "unsupported_platform"
+    assert denied["next_action"] == "Use Linux with descriptor-relative no-follow operations."
+    assert grant.stale is False and server._queue_grant is grant
+    assert not (workspace / ".aegis/state/team-queue.json").exists()
+
+
+@pytest.mark.parametrize("phase", ["before-lock", "under-lock"])
+@pytest.mark.parametrize("record", ["registration", "session"])
+@pytest.mark.parametrize("defect", ["unreadable", "generation", "digest"])
+def test_known_claim_defect_precedes_later_io(owner_factory, monkeypatch, phase, record, defect):
+    role, root, path, workspace, _ = owner_factory()
+    start_owner()
+    grant = server._queue_grant
+    session = _session_file(root)
+    target = path if record == "registration" else session
+    original = target.read_bytes()
+    added = team_queue.add(workspace, {
+        "id": "ONE", "title": "Queue work", "paths": ["src/**"], "capabilities": ["core"],
+    }, caller="owner")
+    assert not added["refused"], added
+    queue_file = workspace / ".aegis/state/team-queue.json"
+    before = queue_file.read_bytes()
+    real = role.storage
+    process_identity = role.process_identity
+    state = {"active": False}
+    target_descriptors = set()
+    later_io = []
+
+    def introduce_defect():
+        state["active"] = True
+        if defect == "unreadable":
+            target.chmod(0o000)
+        elif defect == "generation":
+            replacement = target.with_suffix(".new")
+            replacement.write_bytes(original)
+            replacement.chmod(0o600)
+            replacement.replace(target)
+
+    @contextmanager
+    def locked(*args, **kwargs):
+        with real.locked(*args, **kwargs) as held:
+            if phase == "under-lock":
+                introduce_defect()
+            yield held
+
+    def fail_io():
+        later_io.append(True)
+        raise OSError(errno.EIO, "private-value")
+
+    def opened(name, flags, *args, **kwargs):
+        current = state["active"] and name == target.name
+        if current and defect != "digest":
+            fail_io()
+        if state["active"] and defect == "digest" and record == "registration" and name == session.name:
+            fail_io()
+        fd = os.open(name, flags, *args, **kwargs)
+        if current:
+            target_descriptors.add(fd)
+        return fd
+
+    def read(fd, count):
+        data = os.read(fd, count)
+        if data and fd in target_descriptors:
+            return _same_length(data)
+        return data
+
+    def close(fd):
+        target_descriptors.discard(fd)
+        os.close(fd)
+
+    def inspect_process():
+        if state["active"] and defect == "digest" and record == "session":
+            fail_io()
+        return process_identity()
+
+    seen = _watch_decodes_and_hashes(monkeypatch)
+    arguments = {"id": "ONE", "expect": added["item"]["revision"], "lane": "alpha"}
+    monkeypatch.setattr(queue_role, "storage", SimpleNamespace(
+        locked=locked, file_lock=real.file_lock, LockTimeoutError=real.LockTimeoutError))
+    monkeypatch.setattr(queue_role, "process_identity", inspect_process)
+    monkeypatch.setattr("aegis_core.storage_confined.os", _confined_os_view(open=opened, read=read, close=close))
+    if phase == "before-lock":
+        introduce_defect()
+    result = claim(arguments)
+    monkeypatch.setattr("aegis_core.storage_confined.os", os)
+    monkeypatch.setattr(queue_role, "process_identity", process_identity)
+    monkeypatch.setattr(queue_role, "storage", real)
+    assert result["reason"] == result["error"] == "role_stale"
+    assert result["next_action"] == "Ask the owner to restart the queue connection with a fresh session record."
+    assert result["exit_code"] == 1 and result["refused"] is True
+    assert later_io == [] and target_descriptors == set()
+    assert seen == {"loads": 0, "hashes": 2 * (phase == "under-lock") + (record == "session") + (defect == "digest")}
+    assert grant.stale is True
+    assert queue_file.read_bytes() == before
+    target.chmod(0o600)
+    target.write_bytes(original)
+    assert claim(arguments)["reason"] == "role_stale"
+    assert queue_file.read_bytes() == before
 
 
 def _authority_tree(components):
