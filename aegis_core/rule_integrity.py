@@ -1,8 +1,10 @@
 """Rule integrity: git is the witness (v4.3 spec T3)."""
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field
+from dataclasses import replace as replace  # Compatibility re-export for the 4.3.3 public-name pin.
 import os
+import re
 from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Tuple
 
 from aegis_core import primitives
@@ -10,10 +12,12 @@ from aegis_core import gitevidence, gitsafe, governance, rule_inventory
 from aegis_core.diagnostic_messages import GuidanceMessage, MESSAGE_TEMPLATES, MessageRow, guidance_value
 from aegis_core.config import read_user_config
 from aegis_core.errors import AegisError
+from aegis_core.guidance_projection import ServedRule
 from aegis_core.lane_ast import pytest_config_view
 from aegis_core.match import normalize_path, sets_overlap
 from aegis_core.rule_inventory import RuleInventory, RuleInventoryEntry, inventory_rules
-from aegis_core.rules import KNOWN_KEYS, Rule, RuleCache, RuleSet, VALID_ENFORCEMENT, load_rules, workspace_root
+from aegis_core.rules import KNOWN_KEYS, Rule, RuleCache, RuleSet, VALID_ENFORCEMENT, lf_digest, load_rules, workspace_root
+from aegis_core.taxonomy import DIR_RULE_TYPES, RULE_TYPE_DIRS, RULE_TYPES
 from aegis_core.workspace.layout import RULES_RELDIR
 
 __all__ = [
@@ -28,6 +32,7 @@ __all__ = [
     "check_ci",
     "effective",
     "effective_ruleset",
+    "exact_revision",
     "policy_view",
     "resolve_base",
     "weakenings",
@@ -181,6 +186,118 @@ def _tree_files(root: str, commit: str) -> List[str]:
 
 def policy_view(rule: Rule) -> Tuple[Any, Any, Any]:
     return (rule.type, dict(rule.meta), rule.body.replace("\r\n", "\n"))
+
+
+@dataclass(frozen=True)
+class _ComposedRule(Rule):
+    """Effective instructions assembled from a reviewed rule and working policy."""
+
+
+def exact_revision(rule: Rule) -> Optional[str]:
+    """Return the captured revision of a servable source rule."""
+    identity = exact_policy(rule)
+    return identity[0] if identity is not None else None
+
+
+@dataclass(frozen=True)
+class ServedPolicy(ServedRule):
+    """A delivered rule with the type captured by the rule loader."""
+
+    rule_type: str
+
+
+class PolicyProvenance(NamedTuple):
+    identity: Optional[Tuple[str, str]] = None
+    synthetic: bool = False
+
+
+def policy_provenance(rule: Rule) -> PolicyProvenance:
+    """Classify a served rule using its source, composition marker, and bounded captured bytes."""
+    if type(rule) not in (Rule, _ComposedRule) or not rule.served:
+        return PolicyProvenance()
+    kind, raw, revision = rule.type, rule.raw, rule.digest
+    if (not isinstance(kind, str) or kind not in RULE_TYPES
+            or type(raw) is not bytes or not 0 < len(raw) <= rule_inventory.MAX_RULE_BYTES
+            or not isinstance(revision, str) or len(revision) != 64 or lf_digest(raw) != revision):
+        return PolicyProvenance()
+    if rule.path != f"{RULES_RELDIR}/{RULE_TYPE_DIRS[kind]}/{rule.id}.md":
+        return PolicyProvenance()
+    if type(rule) is _ComposedRule:
+        return PolicyProvenance(synthetic=True)
+    return PolicyProvenance((revision, kind))
+
+
+def exact_policy(rule: Rule) -> Optional[Tuple[str, str]]:
+    return policy_provenance(rule).identity
+
+
+@dataclass(frozen=True)
+class ReportAttribution:
+    scan_ref: Optional[str]
+    revisions: Mapping[str, str]
+    empty_join: bool = False
+    live: Optional[Callable[[], bool]] = None
+    rule_types: Mapping[str, str] = field(default_factory=dict)
+
+
+def valid_report_policy(row: Mapping[str, Any]) -> bool:
+    """Check typed and historical receipt evidence without consulting working files."""
+    from aegis_core.scan_exposure import valid_ref
+
+    revision, kind = row.get("rule_revision"), row.get("rule_type")
+    return bool(row.get("tree") and row.get("witness") == "aegis" and valid_ref(row.get("scan_ref"))
+                and isinstance(revision, str) and len(revision) == 64 and re.fullmatch(r"[0-9a-f]{64}", revision)
+                and ("rule_type" not in row or isinstance(kind, str) and kind in RULE_TYPES))
+
+
+def _historical_source(output: bytes, expected: Mapping[bytes, str], oid_size: int) -> Optional[Tuple[str, str]]:
+    if (type(output) is not bytes or len(output) > sum(len(name) + 80 for name in expected)
+            or (output and not output.endswith(b"\0"))):
+        raise IntegrityError("historical policy proof unavailable")
+    sources, seen = [], set()
+    modes = {b"100644": b"blob", b"100755": b"blob", b"120000": b"blob",
+             b"040000": b"tree", b"160000": b"commit"}
+    for record in output.split(b"\0")[:-1]:
+        header, tab, name = record.partition(b"\t")
+        fields = header.split()
+        if not tab or name not in expected or name in seen or len(fields) != 3:
+            raise IntegrityError("historical policy proof unavailable")
+        mode, kind, oid = fields
+        if (modes.get(mode) != kind or len(oid) != oid_size or not re.fullmatch(rb"[0-9a-f]+", oid)):
+            raise IntegrityError("historical policy proof unavailable")
+        seen.add(name)
+        if mode in (b"100644", b"100755"):
+            sources.append((expected[name], oid.decode("ascii")))
+    return sources[0] if len(sources) == 1 else None
+
+
+def historical_policy_type(workspace: Any, tree: str, rule_id: str, revision: str) -> Optional[str]:
+    """Recover a unique source type. A completed negative proof returns None."""
+    if (len(tree) not in (40, 64) or any(ch not in "0123456789abcdef" for ch in tree)
+            or not rule_id or len(rule_id) > 255 or rule_id.startswith(".") or "/" in rule_id or "\0" in rule_id):
+        raise IntegrityError("historical policy proof unavailable")
+    root = workspace_root(workspace)
+    paths = [f"{RULES_RELDIR}/{directory}/{rule_id}.md" for directory in DIR_RULE_TYPES]
+    try:
+        expected = {os.fsencode(path): path for path in paths}
+        # Nonrecursive literal paths yield at most one record per requested file.
+        output = gitsafe.run_checked(["--literal-pathspecs", "ls-tree", "-z", tree, "--", *paths], root).stdout
+        source = _historical_source(output, expected, len(tree))
+        if source is None:
+            return None
+        path, oid = source
+        size = gitsafe.blob_sizes(root, [oid])[oid]
+        if size > rule_inventory.MAX_RULE_BYTES:
+            return None
+        data = gitsafe.read_blobs(root, [oid])[oid]
+        if len(data) != size:
+            raise IntegrityError("historical policy proof unavailable")
+    except (gitsafe.GitError, OSError, ValueError, KeyError):
+        raise IntegrityError("historical policy proof unavailable") from None
+    entries = (rule_inventory.captured_entry(path, os.path.join(root, *path.split("/")), data),)
+    rule = load_rules(root, inventory=RuleInventory(entries, rule_inventory.fingerprint(entries))).get(rule_id)
+    identity = exact_policy(rule) if rule is not None else None
+    return identity[1] if identity is not None and identity[0] == revision else None
 
 
 def title_of(rule: Rule) -> str:
@@ -492,14 +609,19 @@ def _compose(root: str, head: RuleSet, base: RuleSet, anchor: BaseAnchor) -> Eff
         if policy_view(reviewed) == policy_view(rule):
             served.append(rule)
         elif _stricter(reviewed, rule):
-            merged = replace(
-                reviewed,
+            merged = _ComposedRule(
+                id=reviewed.id,
                 type=rule.type,
                 path=rule.path,
                 meta={
                     **reviewed.meta,
                     **{k: rule.meta[k] for k in ("target_paths", "forbid_ast", "enforcement") if k in rule.meta},
                 },
+                body=reviewed.body,
+                digest=reviewed.digest,
+                legacy_keys=reviewed.legacy_keys,
+                raw=reviewed.raw,
+                size=reviewed.size,
             )
             kept = {normalize_path(p) for p in reviewed.target_paths}
             added = tuple(p for p in merged.target_paths if normalize_path(p) not in kept)

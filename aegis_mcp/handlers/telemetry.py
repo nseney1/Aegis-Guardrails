@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+import os
 from pathlib import PurePath
 import sys
 from typing import Dict, List, Optional, Tuple
 
-from aegis_core import credit, gitsafe, treeid
+from aegis_core import credit, gitsafe, rule_integrity, scan_exposure, treeid
 from aegis_core.primitives import envelope
 from aegis_core.errors import PathTraversalError
 from aegis_core.rule_inventory import RuleInventoryError
@@ -33,27 +34,57 @@ def _fail(message: str) -> dict:
     return {"status": STATUS_FAIL, "error": message}
 
 
-def _credited_rules(workspace, check, bound, host: Optional[str], session: Optional[str]) -> List[str]:
-    """Rules exposed in this server session's scans and matching ``diff(base, check tree)``."""
-    from aegis_core.scan import RULE_CACHE
+def _checked_rule_blobs(bound, tree, candidates):
+    if len(candidates) > 256 or sum(map(len, candidates)) > 16 * 1024:
+        return {}
+    # With no selected path an ancestor of another, nonrecursive ls-tree emits
+    # at most one entry per literal path, including when a path is now a tree.
+    if any(path[:index] in candidates for path in candidates for index, char in enumerate(path) if char == "/"):
+        return {}
+    expected = {os.fsencode(path): rule for path, rule in candidates.items()}
+    entry = bound.run(["--literal-pathspecs", "ls-tree", "-z", "--full-tree", tree, "--", *candidates])
+    if entry.returncode or len(entry.stdout) > sum(len(path) + 80 for path in expected):
+        return {}
+    if entry.stdout and not entry.stdout.endswith(b"\0"):
+        return {}
+    matching, seen = {}, set()
+    for record in entry.stdout.split(b"\0")[:-1]:
+        header, separator, name = record.partition(b"\t")
+        rule = expected.get(name)
+        fields = header.split()
+        if rule is None or name in seen or not separator or len(fields) != 3:
+            return {}
+        seen.add(name)
+        if (isinstance(rule, rule_integrity.ServedPolicy)
+                and fields[0] in (b"100644", b"100755") and fields[1] == b"blob"
+                and fields[2].decode("ascii") in rule.blob_ids):
+            matching[rule.rule_id] = (rule.revision, rule.rule_type)
+    return dict(sorted(matching.items()))
 
-    exposed = credit.witnessed_exposed_rules(workspace.root, host, session)
-    if not exposed or bound is None:
-        return []
+
+def _credited_rules(workspace, check, bound, exposure, live) -> credit.ReportAttribution:
+    """Join the exact in-session projection to rule blobs and changed paths in the tested tree."""
+    if exposure is None or bound is None or bound.binding.tree != check.get("tree"):
+        return credit.ReportAttribution(None, {})
+    reference, snapshot = exposure
     try:
-        if bound.binding.tree != check.get("tree"):
-            return []
         # diff_entries names top-level paths; rule patterns are workspace-relative.
         prefix = gitsafe.show_prefix(workspace.root)
-        changed = [
+        scope = set(snapshot.paths)
+        changed = {
             relative
             for status, path in bound.diff_entries(str(check.get("base")))
-            if status != "D" and (relative := gitsafe.relative_to_prefix(prefix, path)) is not None
-        ]
-        ruleset = RULE_CACHE.get(workspace)
-    except Exception:  # an unreadable tree or rule set credits nothing
-        return []
-    return sorted(rule.id for rule in ruleset.served if rule.id in exposed and rule.matching_files(changed))
+            if status != "D" and (relative := gitsafe.relative_to_prefix(prefix, path)) in scope
+        }
+        if all(changed.isdisjoint(paths) for _, paths in snapshot.coverage):
+            return credit.ReportAttribution(reference, {}, empty_join=True, live=live)
+        candidates = {prefix + rule.source_path: rule for rule in snapshot.rules
+                      if not changed.isdisjoint(rule.matched_paths)}
+        matching = _checked_rule_blobs(bound, check["tree"], candidates) if candidates else {}
+    except (gitsafe.GitError, treeid.TreeError, OSError, ValueError):
+        return credit.ReportAttribution(reference, {}, live=live)
+    return credit.ReportAttribution(reference, {rule: identity[0] for rule, identity in matching.items()},
+                                    live=live, rule_types={rule: identity[1] for rule, identity in matching.items()})
 
 
 def handle_report_outcome(args: dict) -> dict:
@@ -94,11 +125,21 @@ def handle_report_outcome(args: dict) -> dict:
         except ValueError as exc:
             return _fail(str(exc))
 
-    # Attribution comes from the server (clientInfo and its session), never the caller. The
-    # credited rules are the server's: those this session's scans exposed that also match the
-    # change the check covered. 'rules_used' above only had to be well formed.
+    # Attribution joins the server's scan projection and the tested diff. The caller's
+    # 'rules_used' labels have already been validated.
     host, session = args.get("_host"), args.get("_session")
-    # One bind per report, held open: the check is chosen under the ledger lock, then diffed against it.
+    reference = args.get("scan_ref")
+    if "scan_ref" in args and not scan_exposure.valid_ref(reference):
+        return _fail("invalid_scan_ref")
+    subject = (str(workspace.root), host or "", session or "")
+    exposure = scan_exposure.resolve(*subject, reference)
+    if reference is not None and exposure is None:
+        return _fail("invalid_scan_ref")
+
+    def live():
+        return scan_exposure.resolve(*subject, reference) == exposure
+
+    # The tested diff is verified outside the append lock; submit_report rechecks the selected witness.
     with ExitStack() as stack:
         try:
             bound = stack.enter_context(treeid.bind(workspace.root))
@@ -108,7 +149,7 @@ def handle_report_outcome(args: dict) -> dict:
         try:
             result = credit.submit_report(
                 workspace.root, tree=tree, session=session, host=host, key=idempotency_key, outcome=outcome,
-                rules_for=lambda check: _credited_rules(workspace, check, bound, host, session))
+                rules_for=lambda check: _credited_rules(workspace, check, bound, exposure, live))
         except credit.ReportConflict:
             return _fail(
                 f"'idempotency_key' {idempotency_key!r} was already used for a different report: "
@@ -117,7 +158,7 @@ def handle_report_outcome(args: dict) -> dict:
         except Exception as exc:
             return _fail(f"Failed to record outcome: {exc}")
     # A report the ledger did not take (capped, or a repeat claim) writes nothing at all.
-    if edited and result.get("status") != "rate_limited" and result.get("recorded") is not False:
+    if edited and result.get("status") not in ("rate_limited", STATUS_FAIL) and result.get("recorded") is not False:
         _record_edit(workspace, args, idempotency_key, edited)
     return {**envelope("aegis_report_outcome", {"tree": tree}), **result}
 

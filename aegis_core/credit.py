@@ -10,27 +10,30 @@ a revert of its landing commit on the protected branch (``reverted``, found by `
 """
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone  # noqa: F401 - names the 4.3.3 public-names pin holds
 import json
 from pathlib import Path
 import re
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from threading import Lock
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from aegis_core import ghcli, gitevidence, gitsafe, human_gate
 from aegis_core import credit_memo as _credit_memo
 from aegis_core.errors import AegisError, PathTraversalError
 from aegis_core.primitives import utc_stamp
+from aegis_core.rule_integrity import ReportAttribution
 from aegis_core.storage import RowsResult, ledger_locked, read_jsonl
 from aegis_core.telemetry_engine import ledger
 
 __all__ = [
     "EVENTS", "MAX_REPORT_ROWS_PER_SESSION", "CIUnavailable", "Credit", "CreditProjection",
-    "GhRestClient", "ReportConflict", "approval_lookup", "check_ci_divergence", "claimed_summary",
+    "GhRestClient", "ReportAttribution", "ReportConflict", "approval_lookup", "check_ci_divergence", "claimed_summary",
     "confirm", "confirmed_outcome_rows", "derive", "exposed_rules", "format_trailer",
     "landed_lookup", "parse_trailer", "passing_check", "project_credits", "read_rows", "read_rows_with_report", "required_workflow",
     "record_adjudication", "record_detection", "record_detections", "record_exposure", "record_override",
-    "record_void", "resolve_protected_branch", "select_ci_run", "submit_report",
+    "record_void", "resolve_protected_branch", "retire_exposure_session", "select_ci_run", "submit_report",
     "verify_commit_trailers", "void_tree", "witnessed_exposed_rules",
 ]
 EVENTS = ("check", "claimed", "report", "ci", "void", "exposure", "detection", "adjudication", "override")
@@ -67,23 +70,25 @@ def _canon_root(root: Any) -> str:
 def _normalize_event_row(row: Mapping[str, Any]) -> Dict[str, Any]:
     item = dict(row)
     rule_id = item.get("rule") or item.get("for_rule")
-    if isinstance(rule_id, str) and rule_id:
+    if isinstance(rule_id, str) and rule_id and (item.get("event") != "report" or ledger.report_identity(item)):
         item["rule"] = rule_id
         item.setdefault("for_rule", rule_id)
     return item
 
 
 def _event_rows(raw_rows: Iterable[Any]) -> List[Dict[str, Any]]:
-    return [_normalize_event_row(r) for r in raw_rows if isinstance(r, dict) and r.get("v") == ledger.LEDGER_VERSION and r.get("event") in EVENTS]
+    return [_normalize_event_row(r) for r in ledger.credit_event_rows(raw_rows)]
 
 
-def _read_ledger_events(root: Any, view: Any = None) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+def _read_ledger_events(root: Any, view: Any = None, *,
+                        report: Optional[Tuple[Optional[str], str]] = None) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     """The event rows and why some could not be read; use ``view``'s snapshot if present."""
-    result, error = _read_ledger_events_with_report(root, view)
+    result, error = _read_ledger_events_with_report(root, view, report=report)
     return result.rows, error
 
 
-def _read_ledger_events_with_report(root: Any, view: Any = None) -> Tuple[RowsResult, Optional[str]]:
+def _read_ledger_events_with_report(root: Any, view: Any = None, *,
+                                    report: Optional[Tuple[Optional[str], str]] = None) -> Tuple[RowsResult, Optional[str]]:
     """Keep descriptor evidence explicit while filtering a ledger read to credit events."""
     raw = getattr(view, "raw_rows", None)
     if raw is not None:
@@ -94,6 +99,13 @@ def _read_ledger_events_with_report(root: Any, view: Any = None) -> Tuple[RowsRe
     except (PathTraversalError, OSError) as exc:
         return RowsResult([]), str(exc)
     err = res.error or (f"{len(res.skipped_lines)} unreadable line(s)" if res.skipped_lines else None)
+    if report is not None:
+        tree, report_key = report
+        check = passing_check(ledger.credit_event_rows(res.rows), tree)
+        check_id = check["id"] if check is not None else None
+        if res.torn_tail or any(ledger.report_row_unusable(r, tree, check_id, report_key) for r in res.rows):
+            err = err or "unreadable ledger event"
+        return RowsResult(res.rows, res.report), err
     return RowsResult(_event_rows(res.rows), res.report), err
 
 
@@ -281,7 +293,15 @@ def landed_lookup(
 
 
 _EXPOSED: Dict[Tuple[str, str, str], Set[str]] = {}
+_EXPOSURE_LOCK = Lock()
 _MAX_EXPOSED_SESSIONS = 256
+
+
+def retire_exposure_session(session: Optional[str]) -> None:
+    with _EXPOSURE_LOCK:
+        for key in tuple(_EXPOSED):
+            if key[2] == (session or ""):
+                del _EXPOSED[key]
 
 
 def record_exposure(
@@ -294,27 +314,29 @@ def record_exposure(
     exposure to a correction only at the rule's current revision."""
     rule_list = [r for r in dict.fromkeys(rules) if isinstance(r, str) and r]
     key = (str(root), host or "", session or "")
-    if key not in _EXPOSED and len(_EXPOSED) >= _MAX_EXPOSED_SESSIONS:
-        _EXPOSED.pop(next(iter(_EXPOSED)))
-    _EXPOSED.setdefault(key, set()).update(rule_list)
+    with _EXPOSURE_LOCK:
+        if key not in _EXPOSED and len(_EXPOSED) >= _MAX_EXPOSED_SESSIONS:
+            _EXPOSED.pop(next(iter(_EXPOSED)))
+        _EXPOSED.setdefault(key, set()).update(rule_list)
     if not persist or not rule_list:
         return []
     stamp, s_id, h_id = ts or utc_stamp(), session or "", host or ""
+    basis = str(scope_basis) if scope_basis is not None else None
     root_id, path = _credit_memo.root_key(root)
-    kept = [(root_id, h_id, s_id, rule_id, scope_basis) for rule_id in rule_list]
+    kept = [(root_id, h_id, s_id, rule_id, basis, (revs or {}).get(rule_id, rev)) for rule_id in rule_list]
     if _credit_memo.contains(root_id, kept, path):
         return []
     path_list = [str(p) for p in (paths or ()) if isinstance(p, str)]
     with ledger_locked(root) as site:
         before = _credit_memo.before_read(root_id, site)
         read = read_rows_with_report(root)
-        seen = {(str(r.get("session") or ""), str(r.get("rule") or r.get("for_rule") or ""), r.get("scope_basis")) for r in _of(read.rows, "exposure")}
+        seen = _credit_memo.exposure_keys(root_id, _of(read.rows, "exposure"))
         _credit_memo.reconcile(root_id, seen)
         to_append: List[Dict[str, Any]] = []
-        for rule_id in rule_list:
-            if (s_id, rule_id, scope_basis) in seen:
+        for identity in kept:
+            if identity in seen:
                 continue
-            seen.add((s_id, rule_id, scope_basis))
+            _, _, _, rule_id, _, revision = identity
             row: Dict[str, Any] = {
                 "v": ledger.LEDGER_VERSION,
                 "ts": stamp,
@@ -323,10 +345,10 @@ def record_exposure(
                 "session": s_id,
                 "host": h_id,
                 "paths": path_list,
-                "rev": (revs or {}).get(rule_id, rev),
+                "rev": revision,
             }
-            if scope_basis is not None:
-                row["scope_basis"] = str(scope_basis)
+            if basis is not None:
+                row["scope_basis"] = basis
             if heartbeat is not None:
                 row["heartbeat"] = bool(heartbeat)
             to_append.append(row)
@@ -337,7 +359,7 @@ def record_exposure(
 
 def exposed_rules(root: Any, host: Optional[str], session: Optional[str] = None) -> Set[str]:
     h_id, s_id = host or "", session or ""
-    found = set(_EXPOSED.get((str(root), h_id, s_id), ()))
+    found = witnessed_exposed_rules(root, h_id, s_id)
     if s_id:
         for row in _of(read_rows(root), "exposure"):
             if str(row.get("session") or "") == s_id and str(row.get("host") or "") == h_id:
@@ -348,9 +370,9 @@ def exposed_rules(root: Any, host: Optional[str], session: Optional[str] = None)
 
 
 def witnessed_exposed_rules(root: Any, host: Optional[str], session: Optional[str]) -> Set[str]:
-    """What this process's scans showed (host, session): the credited set of spec T1. Ledger exposure
-    rows are agent-writable, so only ``exposed_rules`` (display, other processes) merges them."""
-    return set(_EXPOSED.get((str(root), host or "", session or ""), ()))
+    """Return the in-process IDs used for telemetry display."""
+    with _EXPOSURE_LOCK:
+        return set(_EXPOSED.get((str(root), host or "", session or ""), ()))
 
 
 def record_detection(
@@ -516,8 +538,8 @@ def confirm(
     by_id = {r["id"]: r for r in _of(rows, "check") if isinstance(r.get("id"), str)}
     summary: Dict[str, Any] = {"asked": 0, "confirmed": 0, "voided": 0, "errors": []}
     commits: Dict[str, List[str]] = {}
-    for check_id in sorted({r.get("check") for r in _of(rows, "report")}):
-        if check_id not in voided_checks and check_id in by_id:
+    for check_id in sorted({identity[0] for identity, _, _ in ledger.checked_reports(rows)}):
+        if check_id not in voided_checks:
             chk = by_id[check_id]
             tree, head = str(chk.get("tree")), chk.get("head")
             commit = look(tree, head) if isinstance(head, str) and head else look(tree)
@@ -566,39 +588,93 @@ def confirm(
     return summary
 
 
-def _count(rows: Iterable[Mapping[str, Any]], session: Optional[str]) -> int:
-    return sum(1 for r in rows if r.get("event") in ("claimed", "report") and r.get("session") == session)
+def _append_report_rows(root: Any, rows: List[Dict[str, Any]]) -> bool:
+    try:
+        return len(ledger.append_rows(root, rows)) == len(rows)
+    except (OSError, PathTraversalError):
+        return False
 
 
 def submit_report(
     root: Any, *, tree: Optional[str], session: Optional[str], host: Optional[str], key: str,
-    outcome: str, rules_for: Callable[[Mapping[str, Any]], Sequence[str]],
+    outcome: str, rules_for: Callable[[Mapping[str, Any]], Union[Sequence[str], ReportAttribution]],
     cap: Optional[int] = None, source: str = "mcp",
 ) -> Dict[str, Any]:
     limit = MAX_REPORT_ROWS_PER_SESSION if cap is None else cap
     result, namespaced = _RESULT.get(outcome, "trigger"), (f"{host}/{session}/{key}" if session else key)
-    with ledger_locked(root):
-        rows = read_rows(root)
-        for row in rows:
-            if row.get("report_key") == namespaced and row.get("event") in ("claimed", "report") and row.get("result", result) != result:
+    before, error = _read_ledger_events(root, report=(tree, namespaced))
+    if error:
+        return {"status": "FAIL", "error": "report_ledger_unavailable"}
+    candidate = passing_check(_event_rows(before), tree)
+    attribution = rules_for(candidate) if candidate is not None else ()
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(ledger_locked(root))
+        except (OSError, PathTraversalError):
+            return {"status": "FAIL", "error": "report_ledger_unavailable"}
+        raw, error = _read_ledger_events(root, report=(tree, namespaced))
+        if error:
+            return {"status": "FAIL", "error": "report_ledger_unavailable"}
+        rows = _event_rows(raw)
+        reports = list(ledger.checked_reports(rows))
+        claims = _of(rows, "claimed")
+        acknowledged = [*claims, *(report for _, report, _ in reports)]
+        for row in acknowledged:
+            if row.get("report_key") == namespaced and row.get("result", result) != result:
                 raise ReportConflict(namespaced)
-        used, check = _count(rows, session), passing_check(rows, tree)
+        used = sum(row.get("session") == session for row in acknowledged)
+        check = passing_check(rows, tree)
+        if check != candidate:
+            return {"status": "FAIL", "error": "report_check_changed"}
+        if isinstance(attribution, ReportAttribution) and attribution.live is not None and not attribution.live():
+            return {"status": "FAIL", "error": "invalid_scan_ref"}
         if check is None:
-            if any(r.get("session") == session and r.get("tree") == tree for r in _of(rows, "claimed")):
+            if any(r.get("session") == session and r.get("tree") == tree for r in claims):
                 return {"status": "claimed", "witness": "self", "credited": [], "tree": tree, "recorded": False}
             if used >= limit:
                 return {"status": "rate_limited", "limit": limit, "witness": "self", "credited": []}
-            ledger.append_rows(root, [{"v": ledger.LEDGER_VERSION, "ts": utc_stamp(), "event": "claimed", "witness": "self", "tree": tree, "source": source, "session": session, "host": host, "key": f"claim:{host}/{session}:{tree}", "report_key": namespaced, "result": result}])
+            claim = {"v": ledger.LEDGER_VERSION, "ts": utc_stamp(), "event": "claimed", "witness": "self", "tree": tree, "source": source, "session": session, "host": host, "key": f"claim:{host}/{session}:{tree}", "report_key": namespaced, "result": result}
+            if not _append_report_rows(root, [claim]):
+                return {"status": "FAIL", "error": "report_ledger_unavailable"}
             return {"status": "claimed", "witness": "self", "credited": [], "tree": tree, "recorded": True}
-        rules = list(dict.fromkeys(rules_for(check)))
-        have = {(r.get("rule") or r.get("for_rule")) for r in _of(rows, "report") if r.get("check") == check["id"]}
+        attested = isinstance(attribution, ReportAttribution)
+        if attested:
+            rules = list(attribution.revisions) if attribution.scan_ref and _tested(check) else []
+        else:
+            rules = list(dict.fromkeys(attribution))
+        have = {rule for ((_, rule), _, witnessed) in reports if witnessed == check}
         fresh = [r for r in rules if r not in have]
         if used + len(fresh) > limit:
             return {"status": "rate_limited", "limit": limit, "witness": "aegis", "credited": []}
         if fresh:
             stamp = utc_stamp()
-            ledger.append_rows(root, [{"v": ledger.LEDGER_VERSION, "ts": stamp, "event": "report", "witness": "aegis", "check": check["id"], "tree": tree, "rule": rule, "for_rule": rule, "result": result, "source": source, "session": session, "host": host, "key": f"credit:{check['id']}:{rule}", "report_key": namespaced} for rule in fresh])
+            new_rows = [{"v": ledger.LEDGER_VERSION, "ts": stamp, "event": "report", "witness": "aegis", "check": check["id"], "tree": tree, "rule": rule, "for_rule": rule, "result": result, "source": source, "session": session, "host": host, "key": f"credit:{check['id']}:{rule}", "report_key": namespaced} for rule in fresh]
+            if attested:
+                for row in new_rows:
+                    rule = row["rule"]
+                    row.update(scan_ref=attribution.scan_ref, rule_revision=attribution.revisions[rule],
+                               rule_type=attribution.rule_types.get(rule))
+            if (any(ledger.report_identity(row) is None for row in new_rows)
+                    or not _append_report_rows(root, new_rows)):
+                return {"status": "FAIL", "error": "report_ledger_unavailable"}
+        elif attested and attribution.empty_join and not rules and used < limit and _tested(check):
+            if not _record_empty_join(root, raw, check["id"], tree):
+                return {"status": "FAIL", "error": "report_ledger_unavailable"}
         return {"status": "recorded", "witness": "aegis", "credited": rules, "check": check["id"], "tree": tree}
+
+
+def _record_empty_join(root: Any, rows: Sequence[Mapping[str, Any]], check_id: str, tree: Optional[str]) -> bool:
+    """Persist at most one rule-free diagnostic per check/tree, under the report lock."""
+    key = f"observation:empty_join:{check_id}:{tree}"
+    count = 0
+    for row in rows:
+        if (ledger.row_version(row) == ledger.LEDGER_VERSION and row.get("event") is None
+                and row.get("observation") == "empty_join"):
+            count += 1
+            if count >= MAX_REPORT_ROWS_PER_SESSION or row.get("key") == key:
+                return True
+    return _append_report_rows(root, [{"v": ledger.LEDGER_VERSION, "ts": utc_stamp(), "observation": "empty_join",
+                                      "check": check_id, "tree": tree, "key": key}])
 
 
 @dataclass(frozen=True)
@@ -614,6 +690,8 @@ class Credit:
     counts: bool = False
     ts: str = ""
     protected: Tuple[str, ...] = ()
+    rule_revision: Optional[str] = None
+    rule_type: Optional[str] = None
 
 
 def derive(
@@ -621,17 +699,11 @@ def derive(
     approved: Optional[Callable[[str, Sequence[str]], bool]] = None,
     verified_ci: Optional[Mapping[str, str]] = None,
 ) -> List[Credit]:
-    checks = {r["id"]: r for r in _of(rows, "check") if isinstance(r.get("id"), str)}
     voids = {str(r.get("check")): str(r.get("reason") or "voided") for r in _of(rows, "void")}
     ci_rows = {str(r.get("commit")): r for r in _of(rows, "ci") if r.get("commit")}
     c_root = getattr(landed, "_aegis_root", None)
-    flaky, credits, seen = flaky_keys(rows), [], set()
-    for report in _of(rows, "report"):
-        identity = (str(report.get("check")), str(report.get("rule") or report.get("for_rule")))
-        check = checks.get(identity[0])
-        if check is None or identity in seen:
-            continue
-        seen.add(identity)
+    flaky, credits = flaky_keys(rows), []
+    for identity, report, check in ledger.checked_reports(rows):
         tree = str(check.get("tree"))
         head = check.get("head")
         commit = landed(tree, head) if isinstance(head, str) and head else landed(tree)
@@ -668,7 +740,7 @@ def derive(
             counts, reason = False, "protected_changed"
         elif is_flaky and not reason:
             reason = "flaky"
-        credits.append(Credit(check=identity[0], rule=identity[1], tree=tree, state=state, result=_sign(report.get("result"), check), commit=commit, reason=reason, flaky=is_flaky, counts=counts, ts=str(report.get("ts") or ""), protected=categories))
+        credits.append(Credit(check=identity[0], rule=identity[1], tree=tree, state=state, result=_sign(report.get("result"), check), commit=commit, reason=reason, flaky=is_flaky, counts=counts, ts=str(report.get("ts") or ""), protected=categories, rule_revision=report.get("rule_revision"), rule_type=report.get("rule_type")))
     return credits
 
 
@@ -679,6 +751,10 @@ def confirmed_outcome_rows(credits: Iterable[Credit]) -> List[Dict[str, Any]]:
         if c.counts and (c.check, c.rule) not in seen:
             seen.add((c.check, c.rule))
             out.append({"v": ledger.LEDGER_VERSION, "ts": c.ts, "rule": c.rule, "outcome": c.result, "source": "ci", "key": f"credit:{c.check}:{c.rule}", "host": None, "session": None})
+            if c.rule_revision is not None:
+                out[-1]["rule_revision"] = c.rule_revision
+            if c.rule_type is not None:
+                out[-1]["rule_type"] = c.rule_type
     return out
 
 

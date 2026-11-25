@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from bisect import bisect_right
+from dataclasses import dataclass
 import json
 import math
 import re
@@ -16,6 +17,7 @@ from aegis_core.guidance_grammar import (
 from aegis_core.taxonomy import JIT_DEFAULT_MAX_TOKENS, RULE_TYPES, WORDS_TO_TOKENS_FACTOR
 
 __all__ = ["CONTROL_GUIDANCE", "GuidanceProjectionError", "GuidanceResult", "MAX_GUIDANCE_CHARS",
+           "ScanExposure", "ServedRule",
            "SLOT_REF_PATTERN", "WITHHELD_GUIDANCE", "checked_result_copy", "projection_refusal_copy",
            "projection_refusal", "projection_refusal_reason", "projection_refusal_repair", "rule_error_rows_fit",
            "assembled_text", "contains_control_characters", "estimate_tokens", "field_text", "finish_payload",
@@ -53,6 +55,24 @@ class _Slots(Protocol):
     def get(self, key: str, default: Optional[str] = None) -> Optional[str]: ...
 
 
+@dataclass(frozen=True)
+class ServedRule:
+    rule_id: str
+    revision: str
+    source_path: str
+    matched_paths: tuple[str, ...]
+    blob_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ScanExposure:
+    paths: tuple[str, ...]
+    rules: tuple[ServedRule, ...]
+    response_digest: str
+    attribution_digest: str
+    coverage: tuple[tuple[str, tuple[str, ...]], ...]
+
+
 class GuidanceResult(dict, ABC):
     """A JSON-compatible result that can reproject its captured input snapshot."""
 
@@ -62,6 +82,14 @@ class GuidanceResult(dict, ABC):
 
     def exposure_rule_ids(self) -> tuple[str, ...]:
         """Canonical identities for trusted telemetry only; never mapping fields."""
+        return ()
+
+    def exposure_snapshot(self) -> Optional[ScanExposure]:
+        """Repository attribution for the exact rendered selection, outside the JSON mapping."""
+        return None
+
+    def exposure_revisions(self) -> tuple[tuple[str, str], ...]:
+        """Revisions for ambient telemetry even when attribution cannot retain the scope."""
         return ()
 
     def staged_mandatory_count(self) -> int:

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import re
 import sys
@@ -28,7 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-from aegis_core import hosts, pathlookup_gitcache
+from aegis_core import hosts, pathlookup_gitcache, scan_exposure
 from aegis_core._version import __version__
 from aegis_core.bootstrap import instructions_text
 from aegis_core.config import env_client, env_manager_registration, env_workspace
@@ -152,7 +153,13 @@ def _check_rate_limit(tool_name: str) -> bool:
 
 def send_response(response: Dict[str, Any]):
     # stdout is the JSON-RPC transport: only framed messages may be written here.
-    print(json.dumps(response), flush=True)
+    sent = False
+    try:
+        print(json.dumps(response, allow_nan=False), flush=True)
+        sent = True
+    finally:
+        if isinstance(response, _ScanResponse):
+            (scan_exposure.commit if sent else scan_exposure.discard)(response.receipt)
 
 
 def _error(req_id: Any, code: int, message: str) -> Dict[str, Any]:
@@ -165,7 +172,7 @@ def send_error(id: Any, code: int, message: str):
 
 def _valid_id(value: Any) -> bool:
     """JSON-RPC ids are strings, numbers or null; anything else is never echoed."""
-    return value is None or isinstance(value, str) or (isinstance(value, (int, float)) and not isinstance(value, bool))
+    return value is None or type(value) in (str, int) or (type(value) is float and math.isfinite(value))
 
 
 def _safe_id(value: Any) -> Any:
@@ -326,10 +333,10 @@ def _tool_result(req_id: Any, text: str, is_error: bool) -> Dict[str, Any]:
     }
 
 
-def _json_tool_result(req_id: Any, value: Any, is_error: bool) -> Dict[str, Any]:
+def _json_tool_result(req_id: Any, value: Any, is_error: bool, *, strict: bool = False) -> Dict[str, Any]:
     """Compact successful text payloads; keep refusal text formatting unchanged."""
     separators = (", ", ": ") if is_error else (",", ":")
-    return _tool_result(req_id, json.dumps(value, separators=separators), is_error)
+    return _tool_result(req_id, json.dumps(value, separators=separators, allow_nan=not strict), is_error)
 
 
 def _message_refusal(req_id, code, *, detail=None, binding_reason=None):
@@ -495,7 +502,46 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     ordinary_scope = pathlookup_gitcache.bound_ordinary_root(None)
     with ordinary_scope:
+        params = request.get("params") if isinstance(request, dict) else None
+        if (isinstance(params, dict) and request.get("method") == "tools/call"
+                and params.get("name") == "aegis_scan" and _manager_config is None):
+            return _scan_response(request, params)
         return _handle_request(request)
+
+
+class _ScanResponse(dict):
+    def __init__(self, response, receipt):
+        super().__init__(response)
+        self.receipt = receipt
+
+
+def _scan_response(request, params):
+    with scan_exposure.capture() as pending:
+        response = _handle_request(request)
+    if not pending:
+        return response
+    for receipt in pending[:-1]:
+        scan_exposure.discard(receipt)
+    receipt = pending[-1]
+    result = response.get("result") if response is not None and "id" in request else None
+    if not isinstance(result, dict) or result.get("isError") is not False:
+        scan_exposure.discard(receipt)
+        return response
+    metadata = params.get("_meta")
+    if (receipt.reference is not None and isinstance(metadata, dict)
+            and metadata.get("aegis/returnScanRef") is True):
+        result["_meta"] = {"aegis/scanRef": receipt.reference}
+    if scan_exposure.stdio.get():
+        return _ScanResponse(response, receipt)
+    scan_exposure.commit(receipt)
+    return response
+
+
+def _retire_session():
+    from aegis_core.credit import retire_exposure_session
+
+    scan_exposure.retire(_session_id)
+    retire_exposure_session(_session_id)
 
 
 def _handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -528,6 +574,7 @@ def _handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         params = params if isinstance(params, dict) else {}
         # One id per initialize: it never equals the host's session id that the insight hook
         # sees, so insight joins go by host, time window and rule rev (insights.JOIN_WINDOW_S).
+        _retire_session()
         _session_id = uuid.uuid4().hex
         _client_platform, _client_name, _client_version = _identify(params)
         capabilities = params.get("capabilities")
@@ -623,11 +670,16 @@ def _finish_repository_call(req_id, name, args, binding):
     args["_session"] = _session_id
     args["_client_name"] = _client_name
     args["_client_version"] = _client_version
+    encoding_scan = False
     try:
-        # Handlers may print progress notes; stdout belongs to the JSON-RPC framing.
         with contextlib.redirect_stdout(sys.stderr):
             result = execute_tool(name, args)
+        if name == "aegis_scan":
+            encoding_scan = True
+            return _json_tool_result(req_id, result, is_error_result(result), strict=True)
     except Exception as exc:
+        if encoding_scan:
+            return _error(req_id, -32603, "Internal error")
         if name == "aegis_team_queue":
             return _queue_refusal(req_id, "queue_io_unavailable")
         if name == "aegis_team_model":
@@ -698,6 +750,7 @@ def _start(environ: Optional[Dict[str, str]] = None, *, queue_registration=None)
     """Reset the connection state and read what the process was started with."""
     global _canonical_workspace, _workspace_error, _workspace_pin, _server_cwd, _claude_project_dir
     global _manager_config, _manager_digest, _manager_error
+    _retire_session()
     for attr, value in fresh_state().items():
         globals()[attr] = value
     if queue_registration is not None:
@@ -760,6 +813,7 @@ def harden_process() -> bool:
 
 def run_stdio_server(*, queue_registration=None):
     harden_process()
+    receipt_mode = scan_exposure.stdio.set(True)
     try:
         _start(queue_registration=queue_registration)
         stream = input_stream(sys.stdin)
@@ -820,6 +874,8 @@ def run_stdio_server(*, queue_registration=None):
         pass
     finally:
         # Nothing of this connection may outlive it in an embedding process.
+        _retire_session()
+        scan_exposure.stdio.reset(receipt_mode)
         for attr, value in fresh_state().items():
             globals()[attr] = value
 

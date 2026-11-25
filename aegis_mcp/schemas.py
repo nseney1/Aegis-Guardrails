@@ -106,10 +106,9 @@ TOOL_DEFINITIONS = [
     {
         "name": "aegis_report_outcome",
         "description": (
-            "After tests or `aegis check`, report rules from `aegis_scan`; corrections use `aegis_capture_insight`. "
-            "A passing `aegis check --record --tests` row for this tree enables credit for scan-exposed rules matching the diff "
-            "once CI passes on the landing commit; otherwise at most one uncredited claim per session/tree. "
-            "Limit: 200 report rows per session and 5 calls per 60 seconds."
+            "Report aegis_scan evidence; use aegis_capture_insight for corrections. "
+            "Matching tested changes earn credit once CI passes on the landing commit. "
+            "Limit: one uncredited claim per session/tree, 200 report rows per session and 5 calls per 60 seconds."
         ),
         "annotations": _write("Report Outcome"),
         "inputSchema": {
@@ -131,14 +130,18 @@ TOOL_DEFINITIONS = [
                         "another outcome fails."
                     ),
                 },
+                "scan_ref": {
+                    "type": "string",
+                    "minLength": 32,
+                    "maxLength": 32,
+                    "pattern": "^[0-9a-f]{32}$",
+                    "description": "Optional scan receipt from the same session.",
+                },
                 "rules_used": {
                     "type": "array",
                     "items": {"type": "string"},
                     "minItems": 1,
-                    "description": (
-                        "Rule IDs from aegis_scan; credit comes from this session's scan exposure and the "
-                        "diff, not this list."
-                    ),
+                    "description": "Rule IDs from aegis_scan. Exposure and the tested diff determine credit.",
                 },
                 "tests_passed": {"type": "boolean", "description": _IGNORED},
                 "rework_count": {"type": "integer", "default": 0, "description": _IGNORED},

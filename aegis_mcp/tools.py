@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any, Optional
 from pathlib import Path
 
+from aegis_core import scan_exposure
 from aegis_core.primitives import sanitize_display
 from aegis_core.guidance_grammar import clip_redacted
 from aegis_core.guidance_projection import (
@@ -384,15 +385,17 @@ def execute_tool(name: str, args: dict, *, client_arguments: bool = False, queue
         shown = [_project_diagnostic(key) for key in sorted(unknown)]
         return {"status": "FAIL", "error": _project_diagnostic(
             f"Unknown argument(s) for {_project_diagnostic(name)}: {shown}")}
+    if name == "aegis_report_outcome" and "scan_ref" in args and not scan_exposure.valid_ref(args["scan_ref"]):
+        return {"status": "FAIL", "error": "invalid_scan_ref"}
     invalid = _invalid_scalar(name, args)
     if invalid:
         return {"status": "FAIL", "error": invalid}
 
-    result = _TOOL_HANDLERS[name](args)  # handle_request answers an unknown name before dispatch
     view = args.get("view")
-    if view:
-        return project_response(result, view=view)
-    return result
+    if name == "aegis_scan":
+        return _TOOL_HANDLERS[name](args, project=lambda result: project_response(result, view=view) if view else result)
+    result = _TOOL_HANDLERS[name](args)  # handle_request answers an unknown name before dispatch
+    return project_response(result, view=view) if view else result
 
 
 __all__ = ["execute_tool", "is_known_tool"]

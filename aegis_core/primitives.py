@@ -341,9 +341,9 @@ def parse_utc(value: object, *, lenient: bool = False) -> Optional[datetime]:
     if lenient:
         try:
             parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
-        except ValueError:
+            return parsed.replace(tzinfo=timezone.utc) if parsed.utcoffset() is None else parsed.astimezone(timezone.utc)
+        except (ValueError, OverflowError):
             return None
-        return parsed.replace(tzinfo=timezone.utc) if parsed.utcoffset() is None else parsed.astimezone(timezone.utc)
     found = _CANONICAL_TS.fullmatch(value)
     if found:
         try:
