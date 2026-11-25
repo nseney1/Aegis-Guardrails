@@ -66,6 +66,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.gitops_holder": 0,
     "aegis_core.gitops_rows": 0,
     "aegis_core.gitsafe": 0,
+    "aegis_core.gitsafe_bound": 0,
     "aegis_core.gitsafe_policy": 0,
     "aegis_core.gitsafe_run": 0,
     "aegis_core.team_board": 1,
@@ -170,6 +171,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.model_select": 1,
     # Manager-only policy and append-only audit domain; no repository credit imports.
     "aegis_core.manager_policy": 1,
+    "aegis_core.manager_runtime": 2,
     "aegis_core.manager_store": 1,
     "aegis_core.manager_adjudication": 3,
     # Startup-pinned configuration and owner approval over the audit domain.
@@ -233,6 +235,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_publish": 2,
     "aegis_core.team_qualify": 0,
     "aegis_core.team_queue": 2,
+    "aegis_core.team_review": 0,
     "aegis_core.team_review_copy": 0,
     "aegis_core.team_review_files": 0,
     "aegis_core.team_review_verify": 0,

@@ -3643,7 +3643,6 @@ _TAIL_LIMIT = 4096
 _DIGEST_BUDGET = 1048576
 _SOURCE_LIMIT = 65536
 _COLLECTION_LOCK = threading.Lock()
-_COLLECTION_EXPORTS = {}
 _COLLECTION_SERIAL = [0]
 PRE686_NODE_BASELINE = (
     ("test_display_escape_boundaries_mask_secrets_on_every_surface", 80, "da1b5cdc9c8fe991668847e292ab714727a40d0cd4311c9b371a5cc3e2e657bd"),
@@ -3927,20 +3926,20 @@ def _fixture_label_error(label):
 
 
 def _original_targets(functions):
-    """Names to collect, plus callables that are not the live module objects."""
-    names = []
+    """Names to retain, plus callables that are not the live module objects."""
+    names = set()
     replacements = {}
     for function in functions:
         name = getattr(function, "__name__", None)
         if not isinstance(name, str) or not name.isidentifier():
             return None, None, ("node-id",)
-        if name in replacements or name in names:
+        if name in names:
             return None, None, ("duplicate", name)
-        names.append(name)
+        names.add(name)
         current = getattr(regressions, name, None)
         if current is not function:
             replacements[name] = function
-    return tuple(names), replacements, None
+    return names, replacements, None
 
 
 def _singleton_label_plugin(label):
@@ -3988,24 +3987,21 @@ class _ReplaceCollectedCallables:
         return list(generated(name, replacement))
 
 
-def _collect_real_originals(directory, names, replacements, limit, fixture_label,
-                            post_yield_relabel=False):
-    """Collect regressions through pytest, then keep only the requested names.
+def _collect_real_originals(directory, allowed, replacements, limit, fixture_label,
+                            post_yield_relabel=False, collection_plugin=None):
+    """Collect the entire module and keep the requested names in observed order.
 
-    Root discovery loads the repository conftest hooks. A label plugin adds one
-    autouse fixture id on the negative-control path. Ids above the limit are
-    not stored. Node-id text is not returned. The session is retained and its
-    final items are filtered only after pytest.main returns.
+    Root discovery loads the repository conftest hooks. The session is retained
+    and its final items are filtered only after pytest.main returns.
     """
     module_path = getattr(regressions, "__file__", None)
-    if not names or not isinstance(module_path, str) or not module_path.endswith(".py"):
+    if not allowed or not isinstance(module_path, str) or not module_path.endswith(".py"):
         return None, ("collection", "raised")
     try:
         directory.mkdir(parents=True)
     except OSError:
         return None, ("collection", "raised")
 
-    allowed = set(names)
     holder = _CollectionSession()
     plugins = [holder]
     if replacements:
@@ -4014,11 +4010,11 @@ def _collect_real_originals(directory, names, replacements, limit, fixture_label
         plugins.append(_singleton_label_plugin(fixture_label))
     if post_yield_relabel:
         plugins.append(_PostYieldLayoutLabel())
+    if collection_plugin is not None:
+        plugins.append(collection_plugin)
     argv = ["--collect-only", "-q", "-n", "0", "-o", "addopts=",
             "--import-mode=importlib", "-p", "no:cacheprovider",
-            "--basetemp", str(directory / "run")]
-    for name in names:
-        argv.append(module_path + "::" + name)
+            "--basetemp", str(directory / "run"), module_path]
     saved_path = list(sys.path)
     try:
         try:
@@ -4031,13 +4027,13 @@ def _collect_real_originals(directory, names, replacements, limit, fixture_label
 
 
 def collect_original_node_ids(directory, functions, source=None, limit=_NODE_ID_LIMIT,
-                              fixture_label=None, post_yield_relabel=False):
+                              fixture_label=None, post_yield_relabel=False, *, collection_plugin=None):
     """Collect the live original module, including its fixtures and hooks.
 
     Callers share one lock. A caller-supplied source string is only the
     import-failure probe. A callable that is not the live function is collected
-    from the real module so its fixture closure still applies. The export map
-    is cleared on every exit, including a failure.
+    from the real module so its fixture closure still applies. The optional
+    collection plugin applies only to the live module.
     """
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
         return None, ("limit",)
@@ -4047,19 +4043,17 @@ def collect_original_node_ids(directory, functions, source=None, limit=_NODE_ID_
     if post_yield_relabel is not True and post_yield_relabel is not False:
         return None, ("node-id",)
     with _COLLECTION_LOCK:
-        try:
-            if source is not None:
-                if fixture_label is not None or post_yield_relabel:
-                    return None, ("node-id",)
-                stem = _next_collection_stem()
-                return _collect_module(directory, source, limit, stem)
-            names, replacements, error = _original_targets(functions)
-            if error is not None:
-                return None, error
-            return _collect_real_originals(
-                directory, names, replacements, limit, fixture_label, post_yield_relabel)
-        finally:
-            _COLLECTION_EXPORTS.clear()
+        if source is not None:
+            if fixture_label is not None or post_yield_relabel or collection_plugin is not None:
+                return None, ("node-id",)
+            stem = _next_collection_stem()
+            return _collect_module(directory, source, limit, stem)
+        allowed, replacements, error = _original_targets(functions)
+        if error is not None:
+            return None, error
+        return _collect_real_originals(
+            directory, allowed, replacements, limit, fixture_label, post_yield_relabel,
+            collection_plugin)
 
 
 def bound_original_functions():
@@ -4225,6 +4219,39 @@ def test_original_node_ids_reject_post_yield_hookwrapper_relabel_then_retry(tmp_
     _assert_no_collection_text(capsys)
 
 
+def test_original_node_ids_reject_module_collection_reorder_then_retry(tmp_path, capsys):
+    functions, bind_error = bound_original_functions()
+    assert bind_error is None
+    functions = functions[:2]
+    baseline = PRE686_NODE_BASELINE[:2]
+    first, second = (function.__name__ for function in functions)
+
+    class ReorderModuleCollection:
+        @pytest.hookimpl(hookwrapper=True)
+        def pytest_make_collect_report(self, collector):
+            outcome = yield
+            if not isinstance(collector, pytest.Module) or collector.path.name != "test_primitives.py":
+                return
+            # Change the module's child order before pytest matches CLI selectors.
+            report = outcome.get_result()
+            rank = {second: 0, first: 1}
+            report.result.sort(key=lambda item: rank.get(_item_function_name(item), 2))
+
+    changed, error = collect_original_node_ids(
+        tmp_path / "reordered", functions, collection_plugin=ReorderModuleCollection())
+    original, clean_error = collect_original_node_ids(tmp_path / "clean", functions)
+
+    assert error is None
+    assert clean_error is None
+    assert node_id_errors(original, baseline) == ()
+    assert node_id_errors(changed, baseline) == (("function", first), ("function", second))
+    assert node_id_errors(changed, baseline[::-1]) == ()
+    restored, error = collect_original_node_ids(tmp_path / "retry", functions)
+    assert error is None
+    assert node_id_errors(restored, baseline) == ()
+    _assert_no_collection_text(capsys)
+
+
 def test_node_id_guard_retries_after_rejection_and_concurrent_callers_agree(tmp_path, capsys):
     functions, bind_error = bound_original_functions()
     assert bind_error is None
@@ -4249,7 +4276,6 @@ def test_node_id_guard_retries_after_rejection_and_concurrent_callers_agree(tmp_
     swapped = (collected[1], collected[0]) + collected[2:]
     assert any(item[0] == "function" for item in check(swapped))
     assert saved is PRE686_NODE_BASELINE
-    assert _COLLECTION_EXPORTS == {}
     _assert_no_collection_text(capsys)
 
 
@@ -4271,7 +4297,6 @@ def test_original_node_collection_refuses_limit_and_import_failure_then_retries(
         tmp_path / "broken", (), source="import does_not_exist_for_original_node_ids\n", limit=8)
     assert broken is None and error[0] == "collection" and error[1] != 0
     assert all(isinstance(part, (str, int)) and "does_not_exist_for_original_node_ids" not in str(part) for part in error)
-    assert _COLLECTION_EXPORTS == {}
     restored, error = collect_original_node_ids(tmp_path / "later" / "retry", (function,))
     assert error is None
     assert node_id_errors(restored, (row,)) == ()

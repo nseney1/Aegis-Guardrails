@@ -117,10 +117,6 @@ def _identity(info):
     return info.st_dev, info.st_ino
 
 
-def _generation(info):
-    return (*_identity(info), info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_mode, info.st_uid)
-
-
 def _owned_directory(info):
     require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and not info.st_mode & 0o022)
 
@@ -158,7 +154,7 @@ def authority():
     except FileNotFoundError:
         raise RoleRefusal("role_missing") from None
     except storage_confined.ConfinedFileError as exc:
-        reason = {"missing": "role_missing", "unsafe": "role_invalid", "too_large": "role_invalid",
+        reason = {"missing": "role_missing", "changed": "role_stale", "unsafe": "role_invalid", "too_large": "role_invalid",
                   "invalid_path": "role_invalid", "unsupported": "unsupported_platform"}.get(exc.reason, "role_io_unavailable")
         raise RoleRefusal(reason) from None
     except (OSError, ValueError, RuntimeError, KeyError, OverflowError):
@@ -213,24 +209,17 @@ def _json(raw):
         raise RoleRefusal("role_invalid") from None
 
 
-def _record_bytes(root, parts):
-    """Re-read one record. Mode, owner, link count and size are checked before the read."""
-    with storage_confined.confined_file(root, parts) as handle:
-        _owned_directory(handle.parent_stat())
-        name = parts[-1]
-        before = os.stat(name, dir_fd=handle.parent_fd, follow_symlinks=False)
-        require(stat.S_ISREG(before.st_mode) and before.st_uid == os.geteuid() and
-                not before.st_mode & 0o077 and before.st_nlink == 1 and before.st_size <= MAX_BYTES)
-        raw = handle.read_bytes(MAX_BYTES)
-        after = os.stat(name, dir_fd=handle.parent_fd, follow_symlinks=False)
-        require(_generation(before) == _generation(after), "role_stale")
-        return raw, _generation(after)
+def _record_bytes(root, parts, *, expected=None):
+    """Read one bounded record through validation and descriptor cleanup."""
+    return storage_confined.read_checked_file(root, parts, MAX_BYTES, owner_uid=os.geteuid(),
+                                             expected=expected, parent_policy=_owned_directory)
 
 
-def _pin(root, parts):
-    """Size-check and hash the current record. Claim checkpoints do not decode it."""
-    raw, generation = _record_bytes(root, parts)
-    return generation, hashlib.sha256(raw).hexdigest()
+def _check_pin(root, parts, pin):
+    """Check one record's pinned generation and full digest without decoding."""
+    expected, digest = pin
+    raw, _ = _record_bytes(root, parts, expected=expected)
+    require(hashlib.sha256(raw).hexdigest() == digest, "role_stale")
 
 
 def _read(root, parts):
@@ -396,11 +385,23 @@ class Grant:
 
     def _check(self, root, chain, session):
         require(not self.stale and session == self.session and chain == self.chain, "role_stale")
-        policy_pin = _pin(root, ("registrations", self.registration + ".json"))
-        record_pin = _pin(root, _session_parts(self.process))
-        require(policy_pin == self.policy_pin and record_pin == self.record_pin, "role_stale")
-        require(process_identity() == self.process and int(time.time()) < self.record["expires_at"], "role_stale")
-        require(_workspace_identity(self.workspace) == self.workspace_pin, "role_stale")
+        try:
+            _check_pin(root, ("registrations", self.registration + ".json"), self.policy_pin)
+            _check_pin(root, _session_parts(self.process), self.record_pin)
+        except (RoleRefusal, storage_confined.ConfinedFileError, OSError) as error:
+            if getattr(error, "reason", None) in ("unsupported", "unsupported_platform"):
+                raise RoleRefusal("unsupported_platform") from None
+            self.invalidate()
+            raise RoleRefusal("role_stale") from None
+        try:
+            require(process_identity() == self.process and int(time.time()) < self.record["expires_at"], "role_stale")
+            require(_workspace_identity(self.workspace) == self.workspace_pin, "role_stale")
+        except (RoleRefusal, storage_confined.ConfinedFileError) as error:
+            if error.reason in ("io", "role_io_unavailable"):
+                raise RoleRefusal("queue_io_unavailable") from None
+            if error.reason in ("unsupported", "unsupported_platform"):
+                raise RoleRefusal("unsupported_platform") from None
+            raise RoleRefusal("role_stale") from None
 
     def _mutate(self, root, chain, arguments, session):
         from aegis_core import team_queue
@@ -417,6 +418,10 @@ class Grant:
                                         caller="mcp-queue:" + self.session)
         except storage.LockTimeoutError:
             return team_queue.refusal("queue_lock_timeout", verb="claim")
+        except RoleRefusal:
+            raise
+        except (OSError, ValueError, RuntimeError):
+            return refusal("queue_io_unavailable")
 
     def claim(self, arguments, session):
         """Revalidate the startup snapshot under authority -> queue lock ordering."""
@@ -425,28 +430,28 @@ class Grant:
         invalid = claim_argument_refusal(arguments)
         if invalid is not None:
             return invalid
+        record_refused = False
         try:
             require(not self.stale, "role_stale")
             with authority() as (root, chain):
                 try:
                     self._check(root, chain, session)
-                except (RoleRefusal, storage_confined.ConfinedFileError):
-                    self.stale = True
-                    raise RoleRefusal("role_stale") from None
-                require(self.policy["role"] == "orchestrator" and arguments["lane"] in self.policy["lanes"], "role_forbidden")
-                try:
+                    require(self.policy["role"] == "orchestrator" and arguments["lane"] in self.policy["lanes"], "role_forbidden")
                     result = self._mutate(root, chain, arguments, session)
-                except RoleRefusal:
-                    self.stale = True
-                    raise RoleRefusal("role_stale") from None
-                except (OSError, ValueError, RuntimeError):
-                    return refusal("queue_io_unavailable")
+                except RoleRefusal as error:
+                    # Only the record checks latch before this handler.
+                    record_refused = self.stale
+                    if error.reason == "role_stale":
+                        self.invalidate()
+                    raise
+                record_refused = self.stale
                 if result.get("refused"):
                     result["error"] = result["reason"]
-                return result
+            # Lock cleanup can replace a refusal after a pin check spent the grant.
+            return refusal("role_stale") if record_refused else result
         except RoleRefusal as exc:
-            if exc.reason in ("role_missing", "role_invalid", "role_foreign"):
-                self.stale = True
+            if record_refused or exc.reason in ("role_missing", "role_invalid", "role_foreign"):
+                self.invalidate()
                 return refusal("role_stale")
             return refusal(exc.reason)
 

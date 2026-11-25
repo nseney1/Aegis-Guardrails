@@ -113,6 +113,12 @@ AUDIT_WRITERS = {
     ("aegis_core/manager_adjudication.py", "_bounded_git"): "Private temporary scratch directory for bounded Git reads during owner adjudication. The context cleans up on success and refusal.",
     ("aegis_core/manager_config.py", "initialize.create"): "existing mkdir; source lines 110, 116",
     ("aegis_core/manager_config.py", "verify_owner"): "existing TemporaryDirectory; source lines 144",
+    ("aegis_core/manager_runtime.py", "_export"): "Makes only the authenticated private build export writable through directory descriptors with symlink traversal disabled.",
+    ("aegis_core/manager_runtime.py", "_place_packages"): "Remove only known generated launch scripts in private scratch through a held directory and rename the private staged package directory into the candidate site before pin validation and publication.",
+    ("aegis_core/manager_runtime.py", "_run"): "Opens the system null device for unused streams of a checked, bounded Python child.",
+    ("aegis_core/manager_runtime.py", "_stage"): "Creates private candidate generations under held roots and removes only those generations on failed staging.",
+    ("aegis_core/manager_runtime.py", "_verified_pin"): "Allocates and cleans the private verification scratch directory for API verification and host bootstrap.",
+    ("aegis_core/manager_runtime.py", "build_pin"): "Allocates and cleans the private per-build scratch directory under the validated output root.",
     ("aegis_core/manager_store.py", "ManagerStore._anchor.missing"): "RF-32: mkdir mode 0700 relative to the held parent, after _anchor_check of the already opened prefix; fsync parent; concurrent creator is reopened without following links",
     ("aegis_core/manager_store.py", "ManagerStore._append"): "existing _audit; source lines 257",
     ("aegis_core/manager_store.py", "ManagerStore._check"): "existing mkdir; source lines 82",
@@ -359,6 +365,12 @@ AUDIT_FORWARDER_OPERATIONS = {
 # These operations do not own a mutation in the approving frame: read-only I/O
 # or delegation to an independently registered writer/storage boundary.
 AUDIT_READ_ONLY_OPERATIONS = {
+    ("aegis_core/gitsafe_bound.py", "_Namespace.__init__", "os.open"): "Read-only descriptor for the trusted Linux root.",
+    ("aegis_core/gitsafe_bound.py", "_Namespace.directory", "os.open"): "Read-only descriptor for the observed directory identity.",
+    ("aegis_core/gitsafe_bound.py", "_Namespace.regular_marker", "os.open"): "Read-only descriptor for bounded inspection of the observed Git marker.",
+    ("aegis_core/workspace/hooks.py", "_watch_directory", "os.open"): "HOOKS-GITFILE-CONFINED-READ bind and retain witnessed root and child directory descriptors without duplicate reopens.",
+    ("aegis_core/workspace/hooks.py", "_read_git_record", "os.open"): "HOOKS-GITFILE-CONFINED-READ read an existing Git metadata leaf through bounded portable and parent-anchored opens.",
+    ("aegis_core/workspace/hooks.py", "_select_target", "aegis_core.workspace.hooks._watch_directory"): "HOOKS-GITFILE-CONFINED-READ bind witnessed checkout, directory .git, gitdir/commondir, and parent-step targets.",
     ('aegis_core/message_codec_store.py', 'Store._shard', 'os.open'): 'RF-44: inspect the selected shard with a read-only directory open and check its identity under the bound root',
     ("aegis_core/team_git.py", "_read_path", "os.open"): "GM-5 O_RDONLY no-follow parent and regular-leaf opens from the held trusted root; read-only snapshot inspection, every descriptor closed",
     ("aegis_core/team_git.py", "_snapshot_attribute_candidates", "os.open"): "GM-5-ATTR-CONTEXT r2 (coordinator-applied): read-only no-follow directory open for attribute candidate capture from the held trusted root; no create or mutation; descriptors closed in finally",
@@ -397,6 +409,8 @@ AUDIT_READ_ONLY_OPERATIONS = {
     ("aegis_core/lane_gate.py", "check_lane", "aegis_core.team.load_team"): "read-only team policy for lane admission; this approved call requests read-only inspection",
     ("aegis_core/manager_config.py", "initialize", "aegis_core.manager_config.public_file"): "read-only bounded public signer or private manager config inspection; this approved call requests read-only inspection",
     ("aegis_core/manager_config.py", "load_config", "aegis_core.manager_config.public_file"): "read-only bounded public signer or private manager config inspection; this approved call requests read-only inspection",
+    ("aegis_core/manager_runtime.py", "_directory", "os.open"): "Open a bound runtime directory read-only with O_DIRECTORY and O_NOFOLLOW. The anchor or recursive caller closes it.",
+    ("aegis_core/manager_runtime.py", "_open_python", "os.open"): "Read-only executable descriptor used for digest verification and process launch. The context owns closure.",
     ("aegis_core/manager_store.py", "ManagerStore._anchor", "os.open"): "RF-32: fixed read-only directory callback; mutation belongs to separately registered ManagerStore._anchor.missing",
     ("aegis_core/manager_store.py", "ManagerStore._locked", "aegis_core.manager_store.ManagerStore._anchor"): "bind directory descriptors for the separate manager audit store; any mutation belongs to the deeper registered writer/storage frame",
     ("aegis_core/manager_store.py", "ManagerStore._read", "aegis_core.manager_store.ManagerStore._audit"): "passes O_RDONLY to the generic audit opener; no append/create flags",
@@ -517,6 +531,7 @@ _ATOMIC_WRAPPERS = {
 # Opener -> flags position in a function/bound-method call; None means no flags
 # parameter. Fixed-flag readers may remain declared so their calls stay reviewed.
 FORWARDING_OPENERS = dict.fromkeys(_ATOMIC_WRAPPERS, None) | {
+    "aegis_core.workspace.hooks._watch_directory": None,
     "aegis_cli.language_capabilities._package": None,
     "aegis_core.atomicio._open_regular": 1,
     "aegis_core.atomicio.open_regular": 1,
@@ -610,6 +625,12 @@ CALLBACK_EXCEPTIONS = {
 # (file, scope, operation) -> (exact call sites, reason). No scope-wide bypass:
 # another call in an already reviewed function still requires explicit review.
 REVIEWED_DESCRIPTOR_OPERATIONS = {
+    ("aegis_core/gitsafe_bound.py", "_Namespace.__init__", "os.open"): (1, "Open the trusted Linux root read-only with directory and no-follow flags. ExitStack closes it."),
+    ("aegis_core/gitsafe_bound.py", "_Namespace.directory", "os.open"): (1, "Bind an observed directory relative to its held parent. Reuse descriptors by identity and close through ExitStack."),
+    ("aegis_core/gitsafe_bound.py", "_Namespace.regular_marker", "os.open"): (1, "Open the observed regular Git marker read-only and no-follow relative to the held checkout. ExitStack closes it."),
+    ("aegis_core/workspace/hooks.py", "_watch_directory", "os.open"): (2, "HOOKS-GITFILE-CONFINED-READ read-only no-follow root and child-directory opens; ExitStack closes every descriptor."),
+    ("aegis_core/workspace/hooks.py", "_read_git_record", "os.open"): (2, "HOOKS-GITFILE-CONFINED-READ read-only no-follow portable and parent-anchored Git metadata leaf opens; finally closes every descriptor."),
+    ("aegis_core/workspace/hooks.py", "_select_target", "aegis_core.workspace.hooks._watch_directory"): (1, "HOOKS-GITFILE-CONFINED-READ single witness-carrying binder for checkout, directory .git, gitdir/commondir, and ancestor steps."),
     ('aegis_core/message_codec_store.py', 'Store._shard', 'os.open'): (1, 'RF-44: read-only directory open beneath the bound root with O_DIRECTORY and O_NOFOLLOW, followed by identity and privacy checks'),
     ("aegis_core/team_board.py", "Board.move_position", "os.replace"): (1, "TA-1d: one atomic replacement with both names relative to the held positions descriptor; no pathname traversal or symlink following."),
     ("aegis_core/team_git.py", "_read_path", "os.open"): (2, "GM-5 O_RDONLY no-follow parent and regular-leaf opens from the held trusted root; every descriptor closed"),
@@ -794,6 +815,9 @@ REVIEWED_DESCRIPTOR_OPERATIONS = {
     ("aegis_core/language_runtime.py", "read_runtime_report", "os.open"): (1, "read-only bounded runtime report inspection"),
     ("aegis_core/lifecycle/selection.py", "_park", "os.replace"): (1, "existing rule archival moves a rule into its archive; no new content is authored"),
     ("aegis_core/manager_config.py", "public_file", "os.open"): (1, "read-only public manager config inspection"),
+    ("aegis_core/manager_runtime.py", "_directory", "os.open"): (1, "Read-only no-follow anchored directory open for runtime roots and installed package traversal"),
+    ("aegis_core/manager_runtime.py", "_open_python", "os.open"): (1, "Open a regular executable read-only beneath a held physical parent with no-follow and nonblocking flags for identity checks and descriptor execution."),
+    ("aegis_core/manager_runtime.py", "_place_packages", "os.rename"): (1, "Move the private pip staging directory to the candidate site through held source and destination parents."),
     ("aegis_core/manager_store.py", "ManagerStore._anchor", "os.open"): (1, "RF-32: shared read-only directory-opener callback; directory creation belongs to the missing callback"),
     ("aegis_core/manager_store.py", "ManagerStore._audit", "os.open"): (1, "manager audit log outside repository worktrees; read/append flags supplied by callers"),
     ("aegis_core/manager_store.py", "_sync_directory", "os.open"): (1, "read-only directory descriptor for audit durability"),

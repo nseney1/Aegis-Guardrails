@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import replace
 from hashlib import sha256
 import re
+from types import MappingProxyType
 
 from aegis_core import human_gate, team_qualify
 from aegis_core.merge_queue_types import (
@@ -20,7 +21,7 @@ __all__ = [
     "Completion", "HostedResult", "IssuedRecord", "Landing", "QueueEntry", "QueueState",
     "QueueStorage", "Review", "QueueRefused", "REFUSALS", "REQUIRED_LEGS", "MAX_ENTRIES",
     "MAX_RESULTS", "MAX_STATE_BYTES", "MAX_REPLAY_RESULTS", "MAX_REVIEWS", "MAX_PARENTS",
-    "CLEANUP_RESOLUTIONS",
+    "CLEANUP_RESOLUTIONS", "cleanup_handler",
     "valid_oid", "valid_lane", "ready_landing", "validate_configuration", "validate_entry",
     "check_acyclic", "valid_result", "merge_result", "retained_result", "check_result_capacity",
     "validate_completion", "pin_ref", "validate_state", "apply_result", "apply_observed_health",
@@ -33,8 +34,16 @@ MAX_STATE_BYTES = 32 * 1024 * 1024
 MAX_REPLAY_RESULTS = MAX_STATE_BYTES // 64
 MAX_REVIEWS = 32
 MAX_PARENTS = 32
-# Durable cleanup resolutions accepted on restart. Recovery tests own a separate table.
-CLEANUP_RESOLUTIONS = ("issuing", "aborted", "done", "not_applied", "released")
+# Durable cleanup labels and their recovery actions, in checkpoint compatibility order.
+_CLEANUP_ACTIONS = MappingProxyType({
+    "issuing": "abort",
+    "aborted": "abort",
+    "done": "acknowledge",
+    "not_applied": "settle",
+    "released": "release",
+})
+CLEANUP_RESOLUTIONS = tuple(_CLEANUP_ACTIONS)
+_MAX_CLEANUP_RESOLUTION_LENGTH = max(map(len, CLEANUP_RESOLUTIONS))
 REFUSALS = {
     "state_unavailable": "durable queue state is unavailable; reload before any effect",
     "state_capacity": "bounded queue state capacity reached; reconcile retained observations",
@@ -103,6 +112,16 @@ class QueueRefused(ValueError):
             action["lane"] = withdrawal.lane
             action["expected_head"] = withdrawal.head
         self.next_action = action
+
+
+def cleanup_handler(resolution):
+    """Return the action for an exact durable cleanup label."""
+    if type(resolution) is not str or len(resolution) > _MAX_CLEANUP_RESOLUTION_LENGTH:
+        raise QueueRefused("state_unavailable")
+    handler = _CLEANUP_ACTIONS.get(resolution)
+    if handler is None:
+        raise QueueRefused("state_unavailable")
+    return handler
 
 
 def valid_oid(value):
@@ -338,10 +357,11 @@ def validate_state(state, target, required, entry_legs, capacity):
         row = _record(record, target)
         if row.landing.issuance > state.serial:
             raise QueueRefused("state_unavailable")
-        if not cleanup and (record.resolution is not None or row.entry not in state.entries):
-            raise QueueRefused("state_unavailable")
-        if cleanup and (state.issued is not None or type(record.resolution) is not str
-                or record.resolution not in CLEANUP_RESOLUTIONS):
+        if cleanup:
+            if state.issued is not None:
+                raise QueueRefused("state_unavailable")
+            cleanup_handler(record.resolution)
+        elif record.resolution is not None or row.entry not in state.entries:
             raise QueueRefused("state_unavailable")
     return replace(state, reconciliation_required=True) if len(state.results) > MAX_RESULTS else state
 

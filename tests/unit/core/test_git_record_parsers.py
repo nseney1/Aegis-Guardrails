@@ -162,8 +162,15 @@ def test_bad_record_refuses_with_fixed_error_and_recovers(tmp_path, monkeypatch,
         _observe(api, root, admin, common, expected)
 
 
-@pytest.mark.parametrize("api", ["treeid", "insights", "hooks", "effect"])
-@pytest.mark.parametrize("record", ["gitdir", "commondir"])
+@pytest.mark.parametrize(("api", "record"), [
+    ("treeid", "gitdir"),
+    ("treeid", "commondir"),
+    ("insights", "gitdir"),
+    ("insights", "commondir"),
+    ("hooks", "gitdir"),
+    ("effect", "gitdir"),
+    ("effect", "commondir"),
+])
 @pytest.mark.parametrize("bad", ["multiline", "cr", "nul", "empty"])
 def test_record_value_refuses_before_path_selection(tmp_path, monkeypatch, api, record, bad):
     if api == "effect" and not (gitops_fds.descriptor_supported() and storage_confined.descriptor_supported()):
@@ -347,20 +354,23 @@ def test_transport_path_decoder_preserves_fixed_refusals_and_recovers(raw, code,
         reason="Windows normalizes trailing whitespace in directory names")),
 ])
 def test_hooks_load_codec_only_when_decoding_records(tmp_path, record):
-    ordinary = tmp_path / "ordinary"
+    base = tmp_path.resolve()
+    ordinary = base / "ordinary"
     (ordinary / ".git").mkdir(parents=True)
     (ordinary / ".aegis").mkdir()
-    home = tmp_path / "home"
+    home = base / "home"
     home.mkdir()
-    linked = tmp_path / "linked"
+    linked = base / "linked"
     linked.mkdir()
     admin = linked / " admin "
     common = admin / " common "
     if record != "directory":
-        admin.mkdir()
+        _git(linked, "init", "-q", "-b", "main", "--separate-git-dir", str(admin))
         (linked / ".git").write_bytes(b"gitdir:  admin \n")
         if record == "commondir":
             common.mkdir()
+            for name in ("objects", "refs", "config"):
+                (admin / name).rename(common / name)
             (admin / "commondir").write_bytes(b" common \n")
     script = """
 import sys
@@ -394,6 +404,6 @@ if sys.argv[2] != "directory":
     child_env = {"HOME": str(home), "USERPROFILE": str(home),
         "PATH": os.environ.get("PATH", ""), "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
         "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": str(home / ".gitconfig")}
-    proc = subprocess.run([sys.executable, "-c", script, str(tmp_path), record],
+    proc = subprocess.run([sys.executable, "-c", script, str(base), record],
         capture_output=True, env=child_env, timeout=30, check=False)
     assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")

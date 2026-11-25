@@ -139,6 +139,92 @@ def test_malformed_refusals_are_fixed_and_leave_bytes_unchanged(make_store, raw)
     assert records(path)[0][3] == {}
 
 
+@pytest.mark.parametrize("case,action", [
+    ("wrong-session", "Select the rollout for the requested session, then retry."),
+    ("no-metadata", "Restore session metadata from trusted rollout evidence, then retry."),
+    ("no-session-id", "Restore session metadata from trusted rollout evidence, then retry."),
+    ("no-context", "Wait for the current turn context to be recorded, then retry."),
+    ("resumed", "Wait for the current turn context to be recorded, then retry."),
+    ("stale-context", "Wait for the current turn context to be recorded, then retry."),
+])
+def test_inspection_refusal_explains_how_to_recover(make_store, case, action):
+    metadata = {"type": "session_meta", "payload": {"id": CID}}
+    start = event("task_started", turn_id="private-marker-current-turn")
+    requested = "private-marker-requested-session" if case == "wrong-session" else CID
+    rows = {
+        "wrong-session": [metadata, context()],
+        "no-metadata": [context()],
+        "no-session-id": [{"type": "session_meta", "payload": {}}, context()],
+        "no-context": [metadata],
+        "resumed": [metadata, context(turn_id="previous"), start],
+        "stale-context": [metadata, start, context(turn_id="private-marker-stale-turn")],
+    }[case]
+    path = write_rollout(make_store, rows)
+    private_path = path.with_name("private-marker-rollout.jsonl")
+    path.rename(private_path)
+    before = private_path.read_bytes()
+
+    with pytest.raises(core.NativeRolloutRefusal, match="^native rollout refused: invalid_record$") as caught:
+        core.inspect_codex(private_path, requested)
+    envelope = json.dumps(caught.value.as_dict())
+    assert json.loads(envelope) == {"state": "NATIVE_HOLD", "status": "refused", "code": 2,
+                                    "reason": "invalid_record", "next_action": action}
+    assert str(private_path) not in envelope and CID not in envelope and "private-marker" not in envelope
+    assert private_path.read_bytes() == before
+
+    if case != "wrong-session":
+        private_path.write_bytes(write_rollout(make_store).read_bytes())
+    assert core.inspect_codex(private_path, CID) == legacy.inspect_codex(private_path, CID)
+
+
+def test_malformed_rollout_line_is_safe_and_local_to_each_read(make_store):
+    metadata = {"type": "session_meta", "payload": {"id": CID}}
+    broken = [b'{private-marker}\n', b'[]\n', b'{"a":1,"a":2}\n']
+    cases = []
+    for line, raw in enumerate(broken, 2):
+        path = make_store / f"private-marker-{line}.jsonl"
+        prefix = json.dumps(metadata).encode() + b"\n" + b"{}\n" * (line - 2)
+        path.write_bytes(prefix + raw)
+        cases.append((path, line, prefix, raw))
+
+    def check(case):
+        path, line, prefix, raw = case
+        for read in (lambda: records(path, tolerant=True), lambda: core.inspect_codex(path, CID)):
+            with pytest.raises(core.NativeRolloutRefusal, match="^native rollout refused: invalid_record$") as caught:
+                read()
+            envelope = caught.value.as_dict()
+            action = f"Restore a valid native rollout record at line {line} from trusted evidence, then retry."
+            assert envelope == {"state": "NATIVE_HOLD", "status": "refused", "code": 2,
+                                "reason": "invalid_record", "next_action": action}
+            assert "private-marker" not in json.dumps(envelope) and CID not in json.dumps(envelope)
+        assert path.read_bytes() == prefix + raw
+        path.write_bytes(prefix + json.dumps(context()).encode() + b"\n")
+        assert core.inspect_codex(path, CID) == legacy.inspect_codex(path, CID)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(check, cases, timeout=10))
+
+
+@pytest.mark.parametrize("malformed", [
+    {"type": ["private-marker"]},
+    {"type": "turn_context", "payload": ["private-marker"]},
+    event("task_started", turn_id=["private-marker"]),
+    event("thread_settings_applied", thread_settings=["private-marker"]),
+    context(permission_profile={"type": "managed", "file_system": {"type": "restricted", "entries": [
+        {"path": {"type": ["private-marker"]}},
+    ]}}),
+], ids=["kind", "payload", "start", "settings", "permissions"])
+def test_malformed_inspection_record_identifies_its_line(make_store, malformed):
+    metadata = {"type": "session_meta", "payload": {"id": CID}}
+    path = write_rollout(make_store, [metadata, {}, malformed, {}])
+    before = path.read_bytes()
+    with pytest.raises(core.NativeRolloutRefusal, match="^native rollout refused: invalid_record$") as caught:
+        core.inspect_codex(path, CID)
+    assert caught.value.next_action == "Restore a valid native rollout record at line 3 from trusted evidence, then retry."
+    assert path.read_bytes() == before
+    assert core.inspect_codex(write_rollout(make_store, [metadata, {}, context(), {}]), CID)["cid"] == CID
+
+
 def test_tolerant_tail_matches_legacy_and_does_not_hide_malformed_middle(make_store):
     path = make_store / "rollout.jsonl"
     path.write_bytes(b'{}\n{"still":')
