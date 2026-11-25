@@ -602,11 +602,22 @@ kept when none qualifies. A standalone `draft-handoff` preview still lists every
 brief. When a governing host plan omits a brief, the preview and bound checkpoint
 have different SHA-256 digests. Without a plan, briefs carry forward unchanged.
 
-Each successor reads its bound checkpoint and inbox, then uses the successful
-replacement entry's `acknowledge` object for its own acknowledgment. For the CLI,
-submit that object with `ack-handoff --request` against the entry's mailbox root.
-Through its own mailbox connection, the successor calls `mailbox_ack_handoff` with
-the object's `checkpoint_sha256`. The connection supplies the binding identity.
+Inspect every row in `entries`, including after partial exit code `3`. Skip rows
+with `ready: true`. Resolve each `ok: false` row using its `error` before rerunning
+the batch. A row with `ok: true` and `ready: false` is a candidate based on the
+readiness snapshot from the batch. At that row's mailbox `root` and `endpoint`,
+read the current bound checkpoint and inbox. Compare the current binding's
+`host` with the batch result's `host` and its `endpoint`, `session`, `generation`
+and `checkpoint_sha256` with the row's `acknowledge` object. Stop processing that
+request if the binding differs or cannot be verified. Skip a binding that is
+already ready, including on duplicate rows and retries.
+
+Acknowledge each matching pending binding once in a separate operation after
+the read. Duplicate rows for the same binding at the same root need one
+acknowledgment. For the CLI, submit that row's `acknowledge` object unchanged
+with `ack-handoff --request` at that row's root. For MCP, use the connection
+configured for that same root, endpoint and successor binding. Call
+`mailbox_ack_handoff` with only that row's `checkpoint_sha256`.
 
 With `delivery_dir`, the draft includes every unread message ID, including messages
 that were woken but not read. The delivery status page's 100-ID display limit does
