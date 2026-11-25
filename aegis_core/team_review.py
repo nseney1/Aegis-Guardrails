@@ -1,4 +1,4 @@
-"""Record bounded, immutable review observations for coordinator inspection."""
+"""Bind immutable review evidence and reduce the current checked votes."""
 from __future__ import annotations
 
 import hashlib
@@ -6,6 +6,7 @@ import json
 import re
 import threading
 from copy import deepcopy
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 
 from aegis_core.diagnostic_messages import receipt_value
@@ -18,10 +19,12 @@ __all__ = [
     "NEXT",
     "REFUSALS",
     "ReviewLedger",
+    "authorize_vote",
     "authorize_waiver",
     "bind_report",
     "notify_waiter",
     "release_hold",
+    "repair_copy",
     "review_record",
     "served_identity",
 ]
@@ -29,6 +32,9 @@ __all__ = [
 _RECORD_SCHEMA = "aegis.team.review.record/v1"
 _MAX_OBJECTS = 128
 _MAX_ROUNDS = 32
+_MAX_EVENTS = 4 * _MAX_ROUNDS
+_MAX_SITES = 64
+_MAX_FINDINGS = 64
 _MAX_CONTROL_INCARNATION = 320
 _MAX_ITEMS = 32
 _MAX_KNOWN = 64
@@ -46,12 +52,40 @@ _SERVED_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _SERVED_MODEL = re.compile(r"[A-Za-z0-9_.-]{1,128}\Z")
 _TREE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
-_VERDICTS = MappingProxyType({
-    "VERDICT: ACCEPT": "accept",
-    "VERDICT: REQUEST CHANGES": "request_changes",
-    "VERDICT: FIX FIRST": "request_changes",
-    "VERDICT: INCOMPLETE": "incomplete",
-})
+_CANONICAL_DISPOSITIONS = {
+    b"VERDICT: ACCEPT": "accept",
+    b"VERDICT: ACCEPT\n": "accept",
+    b"VERDICT: REQUEST CHANGES": "request_changes",
+    b"VERDICT: REQUEST CHANGES\n": "request_changes",
+    b"VERDICT: FIX FIRST": "fix_first",
+    b"VERDICT: FIX FIRST\n": "fix_first",
+}
+_REPORT_BREAK = re.compile(r"\r\n|[\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]")
+_MARKDOWN = re.compile(r"^(?:#{1,6}[ \t]+|[-+*][ \t]+|[0-9]{1,6}[.)][ \t]+)")
+_CLAIM_LINE = re.compile(
+    r'(?i)(?P<mark>\*{1,3}|_{1,3}|`{1,3}|")?(?P<label>verdict|checked-site)'
+    r"(?(mark)(?:(?P=mark)\s*:|\s*:(?P=mark))|\s*:)\s*(?P<value>.*)\Z"
+)
+_VERDICT_LABEL = re.compile(r"(?i)(?<![^\W_])verdict(?![^\W_])")
+_VERDICT_TERM = r"(?<![^\W_])(?:ACCEPT|INCOMPLETE|(?i:request[\W_]+changes|fix[\W_]+first))(?![^\W_])"
+_BARE_VERDICT = re.compile(_VERDICT_TERM)
+_VERDICT_WORDS = re.compile(_VERDICT_TERM, re.IGNORECASE)
+_FIELD_VALUE = re.compile(r"(?:^|[:=：])(?:[^\w:=：]|_)*" + _VERDICT_TERM, re.IGNORECASE)
+_CONTEXT_TERM = r"(?<![^\W_])(?:decision|outcome|recommendation)(?![^\W_])"
+_CONTEXT_LABEL = re.compile(_CONTEXT_TERM, re.IGNORECASE)
+_CONTEXT_FIELD = re.compile(
+    r"^[\W_]*" + _CONTEXT_TERM + r"[\W_]*\Z|" + _CONTEXT_TERM + r"[\W_]*[:=：–—]",
+    re.IGNORECASE,
+)
+_CONTEXT_VALUE = re.compile(_CONTEXT_TERM + r"\s+(?:is|was)\s+" + _VERDICT_TERM, re.IGNORECASE)
+_VERDICT_VALUES = {
+    "accept": "accept", "request changes": "request_changes", "fix first": "request_changes",
+    "incomplete": "incomplete",
+}
+_REJECTION = re.compile(r"(?i)(?:request changes|fix first)(?:\Z|[ \t]*[.:;–—]|[ \t]+-[ \t]+)")
+_SOURCE_LOCATION = re.compile(r"(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_-]+\.[A-Za-z0-9]+:[1-9][0-9]*")
+_TABLE_HEADER = re.compile(r"(?i)\|\s*(?:field\s*\|\s*value|:?-+:?\s*\|\s*:?-+:?)\s*\|")
+_FINDING = re.compile(r"(?i)^[*_]*\[?(p[0-3])\b[\]*_ \t]*(?:line[ \t]+([1-9][0-9]{0,6})(?![0-9]))?")
 
 DEFAULT_POLICY = MappingProxyType({
     "max_report_bytes": 262144,
@@ -71,6 +105,7 @@ REFUSALS = MappingProxyType({
     "unauthorized_waiver": "review observations do not authorize waivers",
     "multiline_signed_value": "a signed review value must be a single line",
     "not_provenance_bound": "a completed observation requires served family and model",
+    "incomplete_evidence": "the current observation lacks complete checked evidence",
     "hold_mismatch": "this request has no matching waiter or round owner",
     "unknown_review": "no review record is bound to that object",
 })
@@ -82,12 +117,21 @@ NEXT = MappingProxyType({
     "unauthorized_waiver": "ask the coordinator to review the waiver request",
     "multiline_signed_value": "submit the signed value as a single line",
     "not_provenance_bound": "submit the served family and model for the completed review",
+    "incomplete_evidence": "obtain a checked receipt for the current report and all declared sites",
     "hold_mismatch": "ask the coordinator to review the round and owner",
     "unknown_review": "bind a review for that object before reading it",
 })
 GATE_NEXT = MappingProxyType({
     "evidence_only": "ask the coordinator to review the recorded observation",
     "refuse": "ask the coordinator to review the observed refusal",
+    "ambiguous": "ask the coordinator for an unambiguous verdict",
+    "integrity": "ask the coordinator to verify the review copy",
+    "peer_refusal": "ask the coordinator to resolve the current round's refusal",
+    "policy_stop": "ask the coordinator for an authorized disposition of the policy stop",
+    "check_incomplete": "ask the coordinator for a complete checked receipt",
+    "cross_family": "ask the coordinator for a checked vote from another served family",
+    "pass": "use the checked votes for the current review round",
+    "superseded": "read the current review round",
 })
 _USAGE = frozenset(("invalid_input", "limit_exceeded", "multiline_signed_value", "not_provenance_bound"))
 EXIT_CODES = MappingProxyType({code: (2 if code in _USAGE else 1) for code in REFUSALS})
@@ -105,6 +149,15 @@ def _identifier(value, verb="bind"):
     _require(type(value) is str and len(value) <= 64 and _IDENT.fullmatch(value) is not None, verb=verb)
     _require(receipt_value(value, limit=64, identifier=True) == value, verb=verb)
     return value
+
+def _site_set(value, verb):
+    _require(type(value) in (tuple, list), verb=verb)
+    _require(len(value) <= _MAX_SITES, "limit_exceeded", verb)
+    submitted = value[:_MAX_SITES + 1]
+    _require(len(submitted) <= _MAX_SITES, "limit_exceeded", verb)
+    sites = {_identifier(site, verb) for site in submitted}
+    _require(len(sites) == len(submitted), verb=verb)
+    return tuple(sorted(sites))
 
 def _served_token(value, pattern=_SERVED_TOKEN):
     _require(type(value) is str and len(value) <= 128 and pattern.fullmatch(value) is not None)
@@ -215,7 +268,14 @@ def _unchanged_value(value):
         return ()
     _require(type(value) in (list, tuple))
     _require(len(value) <= _MAX_UNCHANGED, "limit_exceeded")
-    return tuple(_whole(item, 1, 10000000) for item in value)
+    submitted = value[:_MAX_UNCHANGED + 1]
+    _require(len(submitted) <= _MAX_UNCHANGED, "limit_exceeded")
+    lines = tuple(_whole(item, 1, 10000000) for item in submitted)
+    if not lines:
+        return ()
+    # Keep the exact verification scope in the version without retaining every line in the journal.
+    raw = json.dumps(lines, separators=(",", ":")).encode("ascii")
+    return hashlib.sha256(raw).hexdigest()
 
 def _qualification_value(value):
     if value is None:
@@ -238,18 +298,162 @@ def _decode(report):
     _require("\x00" not in text, "malformed_report")
     return text
 
-def _observed_verdict(text, launch):
-    state = launch["state"]
-    if state != "completed":
-        return ("unavailable" if state == "error" else state), "not_scored"
-    if not launch["brief_seen"]:
-        return "incomplete", "brief_unseen"
-    verdict = _VERDICTS.get(text.removesuffix("\n"))
-    if verdict is None:
-        return "incomplete", "no_verdict" if text else "empty"
-    return verdict, "unanimous"
+def _report_lines(text, limit):
+    start = int(text.startswith("\ufeff"))
+    for _ in range(limit):
+        if start >= len(text):
+            return
+        boundary = _REPORT_BREAK.search(text, start)
+        if boundary is None:
+            yield text[start:]
+            return
+        yield text[start:boundary.start()]
+        start = boundary.end()
+    if start < len(text):
+        yield None
 
-def _prepare(launch, tree, report, review_round, policy, copy_evidence, verified, unchanged_lines, qualification):
+
+def _unemphasize(value):
+    for mark in ('***', '___', '```', '**', '__', '``', '*', '_', '`', '"'):
+        if len(value) > 2 * len(mark) and value.startswith(mark) and value.endswith(mark):
+            return value[len(mark):-len(mark)].strip()
+    return value
+
+
+def _claim_on(line):
+    if line.startswith("|"):
+        name, _, remainder = line[1:].partition("|")
+        value, end, tail = remainder.partition("|")
+        if end and not tail.strip():
+            name = name.strip()
+            if name.endswith(":"):
+                name = _unemphasize(name[:-1].rstrip())
+            else:
+                name = _unemphasize(name).removesuffix(":").rstrip()
+            name = name.lower()
+            if name in ("verdict", "checked-site"):
+                return name, _unemphasize(value.strip())
+    match = _CLAIM_LINE.fullmatch(line)
+    if match is None:
+        match = _CLAIM_LINE.fullmatch(_unemphasize(line))
+        if match is not None and match["mark"] is not None:
+            return None, line
+    if match is None:
+        return None, line
+    return match["label"].lower(), _unemphasize(match["value"].strip())
+
+
+def _has_verdict_claim(line):
+    # These cues preserve ambiguity in the read record.
+    if _VERDICT_LABEL.search(line) or _BARE_VERDICT.search(line) or _FIELD_VALUE.search(line):
+        return True
+    if "|" in line:
+        return _CONTEXT_LABEL.search(line) is not None or _VERDICT_WORDS.search(line) is not None
+    return _CONTEXT_FIELD.search(line) is not None or _CONTEXT_VALUE.search(line) is not None
+
+
+def _verdict_value(value):
+    observed = _VERDICT_VALUES.get(value.lower())
+    if observed is not None:
+        return observed
+    refusal = _REJECTION.match(value)
+    if refusal is not None and not _has_verdict_claim(value[refusal.end():]):
+        return "request_changes"
+    return "ambiguous"
+
+
+def _parse_report(text, limit):
+    """Collect bounded diagnostic observations and indicate unread text."""
+    verdicts, findings = set(), []
+    overflow = False
+    for raw in _report_lines(text, limit):
+        if raw is None:
+            overflow = True
+            break
+        line = _MARKDOWN.sub("", raw.strip(), count=1)
+        if not line or _TABLE_HEADER.fullmatch(line):
+            continue
+        label, value = _claim_on(line)
+        if label == "verdict":
+            verdicts.add(_verdict_value(value))
+            continue
+        if label == "checked-site":
+            continue
+        if not line.startswith(">") and not _SOURCE_LOCATION.fullmatch(line) and _has_verdict_claim(line):
+            verdicts.add("ambiguous")
+        finding = _FINDING.match(line)
+        if finding is not None and finding[2] is not None and len(findings) < _MAX_FINDINGS:
+            findings.append((finding[1].lower(), int(finding[2])))
+    if "ambiguous" in verdicts or len(verdicts) > 1:
+        note = "unparsed_block" if "ambiguous" in verdicts else "conflict"
+        return "ambiguous", note, tuple(findings), overflow
+    if not verdicts:
+        note = "window_exceeded" if overflow else "no_verdict" if text else "empty"
+        return "incomplete", note, (), overflow
+    verdict, = verdicts
+    if overflow and verdict == "accept":
+        return verdict, "window_exceeded", tuple(findings), overflow
+    return verdict, "unanimous", tuple(findings), overflow
+
+
+def _version(payload, previous, operation):
+    versioned = payload if previous is None else {**payload, "previous": previous, "operation": operation}
+    raw = json.dumps(versioned, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+@dataclass(frozen=True)
+class _Observation:
+    origin: int
+    bound_origin: int
+    payload: dict
+    version: str
+    parsed_verdict: str
+    note: str
+    disposition: str
+    findings: tuple
+    overflow: bool
+    previous: str = None
+    operation: str = "bound"
+
+    @property
+    def round_id(self):
+        return self.payload["round_id"]
+
+    @property
+    def number(self):
+        return self.payload["number"]
+
+    @property
+    def family(self):
+        return self.payload["launch"]["family"]
+
+    @property
+    def expected_sites(self):
+        return self.payload.get("expected_sites", ())
+
+    @property
+    def refuses(self):
+        return self.disposition in ("request_changes", "fix_first")
+
+    @property
+    def voting(self):
+        lens = self.payload["launch"]["lens"]
+        return lens == "gating" or (lens == "second_family" and self.payload["policy"]["second_family_reviewer"])
+
+    @property
+    def gating(self):
+        return self.payload["launch"]["lens"] == "gating"
+
+
+@dataclass(frozen=True)
+class _Vote:
+    origin: int
+    version: str
+    sites: tuple
+
+def _prepare(launch, tree, report, review_round, policy, copy_evidence, verified, unchanged_lines, qualification,
+             previous, expected_sites):
     launch = _launch_value(launch)
     tree = _tree_oid(tree)
     identity = _round_value(review_round)
@@ -261,10 +465,23 @@ def _prepare(launch, tree, report, review_round, policy, copy_evidence, verified
     verification = _verified_value(verified)
     unchanged = _unchanged_value(unchanged_lines)
     qualification = _qualification_value(qualification)
+    sites = () if expected_sites is None else _site_set(expected_sites, "bind")
+    if previous is not None:
+        _sha(previous)
 
-    if launch["state"] == "completed":
+    state = launch["state"]
+    if state == "completed":
         _require(launch["family"] is not None and launch["model"] is not None, "not_provenance_bound")
-    verdict, note = _observed_verdict(_decode(report), launch)
+    text = _decode(report)
+    if state != "completed":
+        disposition = "unavailable" if state == "error" else state
+        parsed, note, findings, overflow = disposition, "not_scored", (), False
+    elif not launch["brief_seen"]:
+        disposition = "incomplete"
+        parsed, note, findings, overflow = disposition, "brief_unseen", (), False
+    else:
+        disposition = _CANONICAL_DISPOSITIONS.get(report, "incomplete")
+        parsed, note, findings, overflow = _parse_report(text, policy["window_lines"])
     for witness in (copy, verification):
         _require(witness is None or witness["tree"] == tree, "stale_report")
 
@@ -273,41 +490,164 @@ def _prepare(launch, tree, report, review_round, policy, copy_evidence, verified
         **identity, "launch": launch, "tree": tree, "report_sha256": digest, "policy": policy, "copy": copy,
         "verified": verification, "unchanged": unchanged, "qualification": qualification,
     }
-    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    refused = verdict == "request_changes"
+    if sites:
+        payload["expected_sites"] = sites
+    operation = "bound" if previous is None else "corrected"
+    return _Observation(expected, expected, payload, _version(payload, previous, operation), parsed, note,
+                        disposition, findings, overflow, previous, operation)
+
+
+def _row(observation, reason, *, counted=False, obsolete=False):
+    payload = observation.payload
+    launch, copy, tree = payload["launch"], payload["copy"], payload["tree"]
+    qualification = payload["qualification"]
     qualified = (qualification is not None and qualification["qualified"] and qualification["tree"] == tree
-                 and qualification["review_object"] == identity["review_object"] and qualification["lens"] == launch["lens"])
-    row = {
-        **identity, "launch": launch, "tree": tree, "report_sha256": digest,
-        "evidence_version": hashlib.sha256(raw).hexdigest(),
-        "parsed_verdict": verdict, "parse_note": note,
-        "effective_gate": "refuse" if refused else "hold", "gate_reason": "refuse" if refused else "evidence_only",
-        "authorized_waiver": None, "waiver_history": [], "findings": [], "follow_ups": [],
-        "counted": False, "eligible_retry": False, "preferred_independent": False, "obsolete": False,
-        "copy_ok": copy["ok"] if copy is not None else None, "copy_evidence": copy, "qualification_retained": qualified,
-    }
-    return row, expected
-
-def _view(review_object, rounds):
-    # Responses own their nested structures, including launch and copy metadata.
-    ordered = sorted((row for _, row in rounds.values()), key=lambda row: (row["number"], row["round_id"]))
-    attempts = []
-    for round_id in sorted(rounds):
-        _, row = rounds[round_id]
-        launch = row["launch"]
-        if launch["state"] != "completed":
-            attempts.append({
-                "family": launch["family"], "model": launch["model"], "round_id": round_id,
-                "tree": row["tree"], "lens": launch["lens"], "state": row["parsed_verdict"],
-            })
+                 and qualification["review_object"] == payload["review_object"] and qualification["lens"] == launch["lens"])
     return {
-        "schema": _RECORD_SCHEMA, "review_object": review_object, "generation": len(rounds),
-        "manual_flag": False, "qualification_voided": False, "rounds": deepcopy(ordered),
-        "history": [], "holds": [], "votes": [], "attempts": attempts,
+        **{key: payload[key] for key in ("review_object", "round_id", "owner", "number", "tree", "report_sha256")},
+        "launch": deepcopy(launch), "evidence_version": observation.version,
+        "parsed_verdict": observation.parsed_verdict, "parse_note": observation.note,
+        "effective_gate": reason if reason in ("pass", "refuse") else "hold", "gate_reason": reason,
+        "authorized_waiver": None, "waiver_history": [], "follow_ups": [],
+        "findings": [{"severity": severity, "line": line} for severity, line in observation.findings],
+        "counted": counted, "eligible_retry": False, "preferred_independent": False, "obsolete": obsolete,
+        "copy_ok": copy["ok"] if copy is not None else None, "copy_evidence": deepcopy(copy),
+        "qualification_retained": qualified,
     }
 
-def _success(verb, effect, review_object, rounds, round_id):
-    record = _view(review_object, rounds)
+class _ReviewState:
+    def __init__(self, events):
+        self.generation = len(events)
+        self.observations = {event.version: event for event in events if isinstance(event, _Observation)}
+        self.authorizations = {event.version: event for event in events if isinstance(event, _Vote)}
+        self.rounds = {event.round_id: event for event in self.observations.values()}
+        self.latest = max(self.rounds.values(), key=lambda row: (row.number, row.bound_origin), default=None)
+        self.number = self.latest.number if self.latest is not None else 0
+        self.active = sorted((row for row in self.rounds.values() if row.number == self.number and row.voting),
+                             key=lambda row: row.bound_origin)
+        self.families = {row.family: row for row in self.active}
+        current = [row for row in self.observations.values() if row.number == self.number and row.voting]
+        self.refusals = self._unresolved(row for row in current if row.refuses)
+        self.unread = self._unresolved((row for row in current if row.overflow), refusal_disposes=True)
+        # A new round on identical bytes cannot stand in for disposition of a policy stop.
+        self.policy_stop = self.latest is not None and any(
+            row.voting and row.disposition == "content_filter" and row.payload["tree"] == self.latest.payload["tree"]
+            for row in self.observations.values()
+        )
+        self.counted = {
+            row.version for row in self.families.values()
+            if row.version in self.authorizations and self._can_count(row)
+        }
+        self.accept_reason = self._accept_reason(current)
+
+    def _unresolved(self, history, *, refusal_disposes=False):
+        pending = {row.round_id for row in history}
+        return {
+            row.round_id for row in self.active if row.round_id in pending
+            and not (refusal_disposes and row.refuses)
+            and not (row.disposition == "accept" and row.version in self.authorizations)
+        }
+
+    def _can_count(self, row):
+        return row.disposition == "request_changes" or not (self.refusals or self.policy_stop)
+
+    def _needs_independent_gating(self, current, counted_gating):
+        successful = [row for row in current if row.disposition == "accept" and row.version in self.authorizations]
+        failures = (row for row in self.active if row.gating and row.disposition in ("unavailable", "timeout"))
+        for failed in failures:
+            # Authorization, repair and correction may arrive after the failure.
+            prior = {row.family for row in successful if row.bound_origin < failed.bound_origin}
+            prior.add(failed.family)
+            if not any(row.bound_origin > failed.bound_origin and row.family not in prior for row in counted_gating):
+                return True
+        return False
+
+    def _accept_reason(self, current):
+        if self.refusals:
+            return "peer_refusal"
+        if self.policy_stop:
+            return "policy_stop"
+        if self.unread or any(row.payload["launch"]["state"] == "completed" and row.version not in self.authorizations
+                              for row in self.active):
+            return "check_incomplete"
+        counted_gating = [row for row in self.families.values() if row.gating and row.version in self.counted]
+        if not counted_gating or self._needs_independent_gating(current, counted_gating):
+            return "check_incomplete"
+        policy = self.latest.payload["policy"]
+        if policy["require_cross_family"] and len(self.counted) < 2:
+            return "cross_family"
+        return "pass"
+
+    def row(self, row):
+        counted = row.version in self.counted
+        obsolete = row.number != self.number
+        copy = row.payload["copy"]
+        if row.refuses or (row.number == self.number and row.round_id in self.refusals):
+            reason = "refuse"
+        elif row.disposition == "content_filter":
+            reason = "policy_stop"
+        elif obsolete:
+            reason = "superseded"
+        elif row.voting and self.policy_stop:
+            reason = "policy_stop"
+        elif row.version in self.authorizations and self.families.get(row.family) is row:
+            reason = self.accept_reason
+        elif copy is not None and not copy["ok"] and row.expected_sites:
+            reason = "integrity"
+        else:
+            reason = "evidence_only"
+        return _row(row, reason, counted=counted, obsolete=obsolete)
+
+    def record(self, review_object):
+        rounds = sorted(self.rounds.values(), key=lambda row: (row.number, row.round_id))
+        attempts = [_attempt(row) for row in rounds if row.payload["launch"]["state"] != "completed"]
+        votes = [
+            _vote_record(row, self.authorizations[row.version]) for row in rounds if row.version in self.counted
+        ]
+        return {
+            "schema": _RECORD_SCHEMA, "review_object": review_object, "generation": self.generation,
+            "manual_flag": False, "qualification_voided": False, "rounds": [self.row(row) for row in rounds],
+            "history": self.history(), "holds": [], "votes": votes, "attempts": attempts,
+        }
+
+    def history(self):
+        events = []
+        for row in self.observations.values():
+            if self.rounds[row.round_id] is not row:
+                reason = "refuse" if row.refuses else "superseded"
+                body = _row(row, reason, obsolete=True)
+            elif row.previous is not None:
+                body = {key: row.payload[key] for key in ("review_object", "round_id", "owner", "tree")}
+                body["evidence_version"] = row.version
+            else:
+                continue
+            events.append(dict(body, generation=row.origin + 1, operation=row.operation, previous=row.previous))
+        events.extend(
+            dict(_vote_record(self.observations[version], vote, counted=False), operation="authorized")
+            for version, vote in self.authorizations.items() if version not in self.counted
+        )
+        return sorted(events, key=lambda event: event["generation"])
+
+
+def _attempt(row):
+    launch = row.payload["launch"]
+    return {
+        "family": launch["family"], "model": launch["model"], "round_id": row.round_id,
+        "tree": row.payload["tree"], "lens": launch["lens"], "state": row.disposition,
+    }
+
+
+def _vote_record(row, vote, *, counted=True):
+    return {
+        **_identity(row, counted), "number": row.number, "owner": row.payload["owner"],
+        "tree": row.payload["tree"], "report_sha256": row.payload["report_sha256"],
+        "evidence_version": row.version, "generation": vote.origin + 1, "verdict": row.disposition,
+        "checked_sites": list(vote.sites),
+    }
+
+
+def _success(verb, effect, review_object, state, round_id):
+    record = state.record(review_object)
     affected = next(row for row in record["rounds"] if row["round_id"] == round_id)
     payload = envelope("aegis team review " + verb, {"review_object": review_object},
                        schema="aegis.team.review." + verb + "/v1")
@@ -328,29 +668,89 @@ class ReviewLedger:
         self._lock = threading.Lock()
         self._objects = {}
 
-    def _bind(self, row, expected):
-        review_object, round_id = row["review_object"], row["round_id"]
+    def _append(self, verb, effect, review_object, round_id, events, event):
+        _require(len(events) < _MAX_EVENTS, "limit_exceeded", verb)
+        proposed = (*events, event)
+        result = _success(verb, effect, review_object, _ReviewState(proposed), round_id)
+        self._objects[review_object] = proposed
+        return result
+
+    def _bind(self, row):
+        supplied = row.payload
+        review_object, owner = supplied["review_object"], supplied["owner"]
         with self._lock:
-            rounds = self._objects.get(review_object)
-            if rounds is None:
+            events = self._objects.get(review_object)
+            if events is None:
                 _require(len(self._objects) < _MAX_OBJECTS, "limit_exceeded")
-                rounds = {}
-            generation = len(rounds)
-            latest = next(reversed(rounds.values()), None)
-            current_number = latest[1]["number"] if latest is not None else 0
-            binding = rounds.get(round_id)
-            if binding is not None:
-                origin, current = binding
-                _require(current["owner"] == row["owner"], "hold_mismatch")
-                _require(current["number"] == row["number"] == current_number
-                         and current["evidence_version"] == row["evidence_version"]
-                         and expected in (origin, generation), "stale_report")
-                return _success("bind", "already", review_object, rounds, round_id)
-            _require(expected == generation and row["number"] >= current_number, "stale_report")
-            _require(generation < _MAX_ROUNDS, "limit_exceeded")
-            rounds[round_id] = (generation, row)
-            self._objects[review_object] = rounds
-            return _success("bind", "bound", review_object, rounds, round_id)
+                events = ()
+            state = _ReviewState(events)
+            current = state.rounds.get(row.round_id)
+            if current is not None:
+                _require(current.payload["owner"] == owner, "hold_mismatch")
+                _require(current.number == row.number == state.number, "stale_report")
+                if row.operation == "corrected" and current.voting:
+                    _require(state.families.get(current.family) is current, "stale_report")
+                if current.version == row.version:
+                    _require((current.operation, current.previous, current.payload)
+                             == (row.operation, row.previous, row.payload)
+                             and row.origin in (current.origin, state.generation), "stale_report")
+                    return _success("bind", "already", review_object, state, row.round_id)
+                _check_correction(current, row)
+                row = replace(row, bound_origin=current.bound_origin)
+            else:
+                _require(row.previous is None and row.number >= state.number, "stale_report")
+                if row.number == state.number:
+                    reference = state.latest.payload
+                    _require(supplied["tree"] == reference["tree"] and supplied["policy"] == reference["policy"],
+                             "stale_report")
+                _require(len(state.rounds) < _MAX_ROUNDS, "limit_exceeded")
+            _require(row.origin == state.generation, "stale_report")
+            return self._append("bind", row.operation, review_object, row.round_id, events, row)
+
+    def _target(self, review_object, round_id, owner, verb):
+        events = self._objects.get(review_object)
+        _require(events is not None, "unknown_review", verb)
+        state = _ReviewState(events)
+        current = state.rounds.get(round_id)
+        _require(current is not None, "stale_report", verb)
+        _require(current.payload["owner"] == owner, "hold_mismatch", verb)
+        return events, state, current
+
+    def _authorize(self, review_object, round_id, owner, vote):
+        verb = "vote"
+        with self._lock:
+            events, state, current = self._target(review_object, round_id, owner, verb)
+            _require(current.version == vote.version and current.number == state.number, "stale_report", verb)
+            _require(current.voting, "incomplete_evidence", verb)
+            _require(state.families.get(current.family) is current, "stale_report", verb)
+            previous = state.authorizations.get(vote.version)
+            if previous is not None:
+                _require(previous.sites == vote.sites and vote.origin in (previous.origin, state.generation),
+                         "stale_report", verb)
+                return _success(verb, "already", review_object, state, round_id)
+            _require(vote.origin == state.generation, "stale_report", verb)
+            verification, copy = current.payload["verified"], current.payload["copy"]
+            _require(current.disposition in ("accept", "request_changes") and current.expected_sites
+                     and current.expected_sites == vote.sites
+                     and verification is not None and verification["verified"] and (copy is None or copy["ok"]),
+                     "incomplete_evidence", verb)
+            return self._append(verb, "authorized", review_object, round_id, events, vote)
+
+    def _repair(self, review_object, round_id, owner, previous, expected, copy):
+        verb = "repair"
+        with self._lock:
+            events, state, current = self._target(review_object, round_id, owner, verb)
+            old_copy = current.payload["copy"]
+            if current.operation == "repaired" and current.previous == previous and copy == old_copy:
+                _require(expected in (current.origin, state.generation), "stale_report", verb)
+                return _success(verb, "already", review_object, state, round_id)
+            _require(expected == state.generation and current.version == previous, "stale_report", verb)
+            _require(old_copy is not None and not old_copy["ok"] and copy == {**old_copy, "ok": True},
+                     "stale_report", verb)
+            payload = {**current.payload, "copy": copy}
+            repaired = replace(current, origin=expected, payload=payload, version=_version(payload, previous, "repaired"),
+                               previous=previous, operation="repaired")
+            return self._append(verb, "repaired", review_object, round_id, events, repaired)
 
     def read(self, review_object):
         try:
@@ -358,10 +758,11 @@ class ReviewLedger:
         except _Refuse as refused:
             return _refusal(refused.verb, refused.code)
         with self._lock:
-            rounds = self._objects.get(review_object)
-            if rounds is None:
+            events = self._objects.get(review_object)
+            if events is None:
                 return _refusal("read", "unknown_review")
-            return _success("read", "read", review_object, rounds, next(reversed(rounds)))
+            state = _ReviewState(events)
+            return _success("read", "read", review_object, state, state.latest.round_id)
 
     def identities(self, tree):
         try:
@@ -369,34 +770,46 @@ class ReviewLedger:
         except _Refuse as refused:
             return _refusal(refused.verb, refused.code)
         with self._lock:
-            rows = [
-                _identity(row)
-                for rounds in self._objects.values()
-                for _, row in rounds.values()
-                if row["tree"] == tree
-            ]
+            states = (_ReviewState(events) for events in self._objects.values())
+            rows = [_identity(row, row.version in state.counted) for state in states for row in state.rounds.values()
+                    if row.payload["tree"] == tree]
         rows.sort(key=lambda item: (item["review_object"], item["round_id"]))
         payload = envelope("aegis team review read", {"tree": tree}, schema="aegis.team.review.read/v1")
         payload.update(refused=False, reason="", next_action="", exit_code=0, effect="read",
                        record=None, round=None, tree=tree, identities=rows)
         return payload
 
-def _identity(row):
-    launch = row["launch"]
+def _check_correction(current, replacement):
+    _require(replacement.previous == current.version and current.payload["launch"]["state"] == "completed",
+             "stale_report")
+    _require(replacement.payload != current.payload and all(
+        replacement.payload[key] == value for key, value in current.payload.items()
+        if key not in ("report_sha256", "verified", "expected_sites")
+    ), "stale_report")
+
+
+def _identity(row, counted):
+    launch = row.payload["launch"]
     return {
         "family": launch["family"], "model": launch["model"], "host": launch["host"],
-        "fallback": deepcopy(launch["fallback"]), "round_id": row["round_id"],
-        "review_object": row["review_object"], "lens": launch["lens"], "counted": False,
+        "fallback": deepcopy(launch["fallback"]), "round_id": row.round_id,
+        "review_object": row.payload["review_object"], "lens": launch["lens"], "counted": counted,
     }
 
+
 def bind_report(ledger, launch, tree, report, review_round, policy=None, copy_evidence=None,
-                verified=None, unchanged_lines=None, qualification=None):
-    """Append one observation or replay identical evidence for a current round."""
+                verified=None, unchanged_lines=None, qualification=None, *, replaces=None, expected_sites=None):
+    """Bind a report or append a correction naming the current evidence version.
+
+    The trusted caller supplies expected sites for this version independently
+    of the report text. A missing or empty sequence binds observation only.
+    """
     if type(ledger) is not ReviewLedger:
         return _refusal("bind", "invalid_input")
     try:
-        return ledger._bind(*_prepare(
-            launch, tree, report, review_round, policy, copy_evidence, verified, unchanged_lines, qualification))
+        return ledger._bind(_prepare(
+            launch, tree, report, review_round, policy, copy_evidence, verified, unchanged_lines, qualification,
+            replaces, expected_sites))
     except _Refuse as refused:
         return _refusal(refused.verb, refused.code)
 
@@ -420,6 +833,36 @@ def _validate_control(ledger, review_object, round_id, owner, generation, verb):
     _identifier(round_id, verb)
     _identifier(owner, verb)
     _whole(generation, 0, 1000000000, verb)
+
+
+def authorize_vote(ledger, review_object, round_id, owner, evidence_version, expected_generation, checked_sites):
+    """Record the trusted caller's checks for the exact current observation.
+
+    The checked sites must equal the trusted set bound for a canonical verdict.
+    A later receipt requires a fresh authorization.
+    """
+    verb = "vote"
+    try:
+        _validate_control(ledger, review_object, round_id, owner, expected_generation, verb)
+        _sha(evidence_version, verb)
+        vote = _Vote(expected_generation, evidence_version, _site_set(checked_sites, verb))
+        return ledger._authorize(review_object, round_id, owner, vote)
+    except _Refuse as refused:
+        return _refusal(verb, refused.code)
+
+
+def repair_copy(ledger, review_object, round_id, owner, evidence_version, expected_generation, copy_evidence):
+    """Bind a verified copy of the same manifest to the selected failed receipt."""
+    verb = "repair"
+    try:
+        _validate_control(ledger, review_object, round_id, owner, expected_generation, verb)
+        _sha(evidence_version, verb)
+        copy = _copy_value(copy_evidence)
+        _require(copy is not None and copy["ok"], verb=verb)
+        return ledger._repair(review_object, round_id, owner, evidence_version, expected_generation, copy)
+    except _Refuse as refused:
+        return _refusal(verb, refused.code)
+
 
 def authorize_waiver(ledger, review_object, round_id, owner, report_sha256, tree, ruling,
                      deferred_items, known_items, covers, expected_generation, *, evidence_version=None):
