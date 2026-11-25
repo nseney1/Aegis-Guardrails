@@ -365,6 +365,12 @@ AUDIT_FORWARDER_OPERATIONS = {
 # These operations do not own a mutation in the approving frame: read-only I/O
 # or delegation to an independently registered writer/storage boundary.
 AUDIT_READ_ONLY_OPERATIONS = {
+    ("aegis_core/gitsafe_bound.py", "_Namespace.__init__", "os.open"): "Read-only descriptor for the trusted Linux root.",
+    ("aegis_core/gitsafe_bound.py", "_Namespace.directory", "os.open"): "Read-only descriptor for the observed directory identity.",
+    ("aegis_core/gitsafe_bound.py", "_Namespace.regular_marker", "os.open"): "Read-only descriptor for bounded inspection of the observed Git marker.",
+    ("aegis_core/workspace/hooks.py", "_watch_directory", "os.open"): "HOOKS-GITFILE-CONFINED-READ bind and retain witnessed root and child directory descriptors without duplicate reopens.",
+    ("aegis_core/workspace/hooks.py", "_read_git_record", "os.open"): "HOOKS-GITFILE-CONFINED-READ read an existing Git metadata leaf through bounded portable and parent-anchored opens.",
+    ("aegis_core/workspace/hooks.py", "_select_target", "aegis_core.workspace.hooks._watch_directory"): "HOOKS-GITFILE-CONFINED-READ bind witnessed checkout, directory .git, gitdir/commondir, and parent-step targets.",
     ('aegis_core/message_codec_store.py', 'Store._shard', 'os.open'): 'RF-44: inspect the selected shard with a read-only directory open and check its identity under the bound root',
     ("aegis_core/team_git.py", "_read_path", "os.open"): "GM-5 O_RDONLY no-follow parent and regular-leaf opens from the held trusted root; read-only snapshot inspection, every descriptor closed",
     ("aegis_core/team_git.py", "_snapshot_attribute_candidates", "os.open"): "GM-5-ATTR-CONTEXT r2 (coordinator-applied): read-only no-follow directory open for attribute candidate capture from the held trusted root; no create or mutation; descriptors closed in finally",
@@ -525,6 +531,7 @@ _ATOMIC_WRAPPERS = {
 # Opener -> flags position in a function/bound-method call; None means no flags
 # parameter. Fixed-flag readers may remain declared so their calls stay reviewed.
 FORWARDING_OPENERS = dict.fromkeys(_ATOMIC_WRAPPERS, None) | {
+    "aegis_core.workspace.hooks._watch_directory": None,
     "aegis_cli.language_capabilities._package": None,
     "aegis_core.atomicio._open_regular": 1,
     "aegis_core.atomicio.open_regular": 1,
@@ -618,6 +625,12 @@ CALLBACK_EXCEPTIONS = {
 # (file, scope, operation) -> (exact call sites, reason). No scope-wide bypass:
 # another call in an already reviewed function still requires explicit review.
 REVIEWED_DESCRIPTOR_OPERATIONS = {
+    ("aegis_core/gitsafe_bound.py", "_Namespace.__init__", "os.open"): (1, "Open the trusted Linux root read-only with directory and no-follow flags. ExitStack closes it."),
+    ("aegis_core/gitsafe_bound.py", "_Namespace.directory", "os.open"): (1, "Bind an observed directory relative to its held parent. Reuse descriptors by identity and close through ExitStack."),
+    ("aegis_core/gitsafe_bound.py", "_Namespace.regular_marker", "os.open"): (1, "Open the observed regular Git marker read-only and no-follow relative to the held checkout. ExitStack closes it."),
+    ("aegis_core/workspace/hooks.py", "_watch_directory", "os.open"): (2, "HOOKS-GITFILE-CONFINED-READ read-only no-follow root and child-directory opens; ExitStack closes every descriptor."),
+    ("aegis_core/workspace/hooks.py", "_read_git_record", "os.open"): (2, "HOOKS-GITFILE-CONFINED-READ read-only no-follow portable and parent-anchored Git metadata leaf opens; finally closes every descriptor."),
+    ("aegis_core/workspace/hooks.py", "_select_target", "aegis_core.workspace.hooks._watch_directory"): (1, "HOOKS-GITFILE-CONFINED-READ single witness-carrying binder for checkout, directory .git, gitdir/commondir, and ancestor steps."),
     ('aegis_core/message_codec_store.py', 'Store._shard', 'os.open'): (1, 'RF-44: read-only directory open beneath the bound root with O_DIRECTORY and O_NOFOLLOW, followed by identity and privacy checks'),
     ("aegis_core/team_board.py", "Board.move_position", "os.replace"): (1, "TA-1d: one atomic replacement with both names relative to the held positions descriptor; no pathname traversal or symlink following."),
     ("aegis_core/team_git.py", "_read_path", "os.open"): (2, "GM-5 O_RDONLY no-follow parent and regular-leaf opens from the held trusted root; every descriptor closed"),

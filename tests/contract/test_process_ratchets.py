@@ -25,6 +25,7 @@ POPEN_POSITIONAL_APIS = {"subprocess." + name for name in ("Popen", "run", "call
 # Coordinator ruling 2026-11-15T04:52:12Z: this reviewed source inventory is
 # the completeness gate. Resolver precision does not grant admission to a site.
 SELECTOR_SITE_TABLE = (
+    ('aegis_core/gitsafe.py', 'bound_git_metadata', 'reviewed-dynamic', 'Pass the central Git executable resolver to the fixed descriptor-bound metadata query with bounded capture.'),
     ('aegis_core/manager_runtime.py', 'main', 'lexer-or-message', 'Label the argument parser with the public Python module invocation.'),
     ('aegis_core/manager_runtime.py', '_smoke', 'reviewed-dynamic', 'Probe installed import origins and run the fixed manager MCP module over isolated stdio.'),
     ('aegis_core/manager_runtime.py', '_run', 'reviewed-dynamic', 'Launch only fixed stage recipes on the explicit build or generated runtime Python with no shell, a scrubbed environment and bounded stdio.'),
