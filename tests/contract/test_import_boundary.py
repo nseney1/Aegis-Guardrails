@@ -73,6 +73,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_claims": 2,
     "aegis_core.team_custody": 1,
     "aegis_core.team_custody_checks": 1,
+    "aegis_core.team_gate": 0,
     "aegis_core.team_git": 0,
     "aegis_core.atomicio": 0,
     "aegis_core.git_path_codec": 0,
