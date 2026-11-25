@@ -7,7 +7,7 @@ descriptor_supported and does not open a home.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import errno
 import json
 import os
@@ -20,7 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from aegis_core import kernel_identity, storage_confined, team
+from aegis_core import kernel_identity, storage, storage_confined, team
 from aegis_core import team_writer_binding as binding
 from tests.conftest import symlink_or_skip
 from tests.helpers_writer_binding import call_bind, lease, make_home, make_store, root_binding_case
@@ -245,6 +245,64 @@ def test_leaf_symlink_keeps_target_bytes(tmp_path, monkeypatch):
     result = call_bind(home, workspace)
     assert result == _refusal("state_unavailable")
     assert target.read_bytes() == b"KEEP"
+
+
+def test_claim_exclusion_borrows_parent_fd_until_the_lock_is_released(tmp_path, monkeypatch):
+    workspace = make_store(tmp_path)
+    common = workspace / "common"
+    common.mkdir()
+    moved = workspace / "moved"
+    lock_name = "aegis-writer.lock"
+    borrowed = []
+    lock_dir_fds = []
+
+    @contextmanager
+    def confined_file(root, parts):
+        with storage_confined.confined_file(root, parts) as handle:
+            parent_fd = handle.parent_fd
+            borrowed.append(parent_fd)
+            common.rename(moved)
+            common.mkdir()
+            yield SimpleNamespace(parent_fd=parent_fd)
+            assert handle.parent_fd == parent_fd
+            assert os.path.samestat(os.fstat(parent_fd), moved.stat())
+
+    def record_file_lock(path, timeout=5.0, *, dir_fd=None):
+        lock_dir_fds.append(dir_fd)
+        return storage.file_lock(path, timeout=timeout, dir_fd=dir_fd)
+
+    monkeypatch.setattr(binding, "gitsafe", SimpleNamespace(common_dir=lambda _: common))
+    monkeypatch.setattr(binding, "storage_confined", SimpleNamespace(confined_file=confined_file))
+    monkeypatch.setattr(binding, "storage", SimpleNamespace(
+        file_lock=record_file_lock, LockTimeoutError=storage.LockTimeoutError))
+    with binding.claim_exclusion(workspace):
+        assert (moved / lock_name).is_file()
+        assert not (common / lock_name).exists()
+        assert os.path.samestat(os.fstat(borrowed[0]), moved.stat())
+
+    assert lock_dir_fds == [borrowed[0]]
+    with pytest.raises(OSError) as closed:
+        os.fstat(borrowed[0])
+    assert closed.value.errno == errno.EBADF
+
+
+def test_claim_exclusion_refuses_a_closed_handle_then_retries(tmp_path, monkeypatch):
+    workspace = make_store(tmp_path)
+    lock_name = "aegis-writer.lock"
+    with storage_confined.confined_file(workspace, (lock_name,)) as closed:
+        pass
+
+    monkeypatch.setattr(binding, "gitsafe", SimpleNamespace(common_dir=lambda _: workspace))
+    monkeypatch.setattr(binding, "storage_confined", SimpleNamespace(confined_file=lambda *_: nullcontext(closed)))
+    with pytest.raises(binding.BindingLockRefused, match="^writer lease is unavailable$") as refused:
+        with binding.claim_exclusion(workspace):
+            pytest.fail("claim lock accepted a closed handle")
+    assert refused.value.code == "lease_unavailable"
+    assert not (workspace / lock_name).exists()
+
+    monkeypatch.setattr(binding, "storage_confined", storage_confined)
+    with binding.claim_exclusion(workspace):
+        assert (workspace / lock_name).is_file()
 
 
 def test_second_bind_while_flock_held_then_retry_publishes(tmp_path, monkeypatch):
