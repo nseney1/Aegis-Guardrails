@@ -11,7 +11,7 @@ components of at most 255 UTF-8 bytes. Keep the context open while using its han
 Removal rechecks the named parent identity, unlinks only relative to the held
 descriptor and flushes that parent, even when a retry finds the child missing.
 
-ConfinedFileError.reason distinguishes missing, exists, unsafe, too_large,
+ConfinedFileError.reason distinguishes missing, exists, unsafe, changed, too_large,
 unsupported, invalid_path, invalid_limit, invalid_data, invalid_mode, closed and
 io and durability. Messages contain neither supplied paths nor OS error text. This API handles
 bytes only; callers retain their own parsing and schema refusal contracts.
@@ -26,13 +26,14 @@ import stat
 import uuid
 
 __all__ = ("ConfinedFile", "ConfinedFileError", "DirectoryAnchor", "confined_file",
-           "descriptor_supported", "open_directory")
+           "descriptor_supported", "open_directory", "read_checked_file")
 
 
 _MESSAGES = {
     "missing": "confined file path missing",
     "exists": "confined file already exists",
     "unsafe": "unsafe confined file path; regular file and directories required",
+    "changed": "confined file generation changed during read",
     "too_large": "confined file size limit exceeded",
     "unsupported": "unsupported platform: confined file operations unavailable",
     "invalid_path": "invalid confined file path",
@@ -359,6 +360,71 @@ def _open_parent(root, components, create):
     return _walk_directory(_directory_path(root), components, create)[0]
 
 
+def _file_generation(info):
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+            info.st_mode, info.st_uid, info.st_gid, info.st_nlink)
+
+
+def _check_read_record(info, max_bytes, owner_uid, generation=None, *, admitted=False):
+    if not stat.S_ISREG(info.st_mode):
+        raise ConfinedFileError("unsafe")
+    changed = generation is not None and _file_generation(info) != generation
+    if admitted and changed:
+        raise ConfinedFileError("changed")
+    if info.st_size > max_bytes:
+        raise ConfinedFileError("too_large")
+    if owner_uid is not None and (info.st_uid != owner_uid or not info.st_mode & stat.S_IRUSR
+                                  or info.st_mode & 0o077 or info.st_nlink != 1):
+        raise ConfinedFileError("unsafe")
+    if changed:
+        raise ConfinedFileError("changed")
+
+
+def _read_bounded(fd, max_bytes, *, overflow="too_large"):
+    data = bytearray()
+    while True:
+        remaining = max_bytes - len(data)
+        chunk = os.read(fd, min(8192, remaining + 1))
+        if not chunk:
+            return bytes(data)
+        if len(chunk) > remaining:
+            raise ConfinedFileError(overflow)
+        data.extend(chunk)
+
+
+def _check_read_limit(max_bytes, *, checked=False):
+    if type(max_bytes) is not int or max_bytes < 0:
+        raise ConfinedFileError("invalid_limit")
+    if checked and not _walk_supported():
+        raise ConfinedFileError("unsupported")
+
+
+class _ReadDecision:
+    """Keep the first typed defect and record unresolved I/O failures."""
+
+    def __init__(self):
+        self.error = None
+
+    @contextmanager
+    def observe(self):
+        try:
+            yield
+        except ConfinedFileError as error:
+            if self.error is None or self.error.reason == "io":
+                self.error = error
+        except OSError:
+            if self.error is None:
+                self.error = ConfinedFileError("io")
+
+    def close(self, fd):
+        with self.observe():
+            os.close(fd)
+
+    def require_success(self):
+        if self.error is not None:
+            raise self.error from None
+
+
 class ConfinedFile:
     """A file name bound to one held parent; obtain through confined_file."""
 
@@ -437,25 +503,96 @@ class ConfinedFile:
     def read_bytes(self, max_bytes):
         """Read a regular file, refusing size before allocation and on growth."""
         self._check_open()
-        if type(max_bytes) is not int or max_bytes < 0:
-            raise ConfinedFileError("invalid_limit")
+        _check_read_limit(max_bytes)
         with _refusals():
-            fd = os.open(self._name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0), dir_fd=self._parent)
+            fd = self._open_read_fd()
             try:
-                info = os.fstat(fd)
-                if not stat.S_ISREG(info.st_mode):
-                    raise ConfinedFileError("unsafe")
-                if info.st_size > max_bytes:
-                    raise ConfinedFileError("too_large")
-                data = bytearray()
-                while len(data) <= max_bytes:
-                    chunk = os.read(fd, min(8192, max_bytes + 1 - len(data)))
-                    if not chunk:
-                        return bytes(data)
-                    data.extend(chunk)
-                raise ConfinedFileError("too_large")
+                _check_read_record(os.fstat(fd), max_bytes, None)
+                return _read_bounded(fd, max_bytes)
             finally:
                 os.close(fd)
+
+    def read_checked(self, max_bytes, *, owner_uid=None, expected=None, policy=None):
+        """Return bounded bytes and their opened stat result.
+
+        When owner_uid is supplied, require a private, owner-readable file with
+        that UID and one link. When expected is a previous checked stat result,
+        require its generation at the initial observation. Named metadata can
+        refuse a read. Only the name-verified descriptor supplies bytes and
+        reaches the optional policy callback. Read exactly the opened length
+        and verify the name and descriptor again before returning. Use
+        read_checked_file when the read must also own the parent lifetime.
+        """
+        self._check_open()
+        _check_read_limit(max_bytes, checked=True)
+        decision = _ReadDecision()
+        with decision.observe():
+            result = self._read_checked(decision, max_bytes, owner_uid, expected, policy)
+        decision.require_success()
+        return result
+
+    def _open_read_fd(self):
+        return os.open(self._name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0),
+                       dir_fd=self._parent)
+
+    def _read_checked(self, decision, max_bytes, owner_uid, expected, policy):
+        expected_generation = _file_generation(expected) if expected is not None else None
+        initial = self._observe_read_name(decision, max_bytes, owner_uid, expected_generation)
+        decision.require_success()
+        fd = None
+        with decision.observe(), _refusals():
+            fd = self._open_read_fd()
+        if fd is None:
+            if decision.error.reason == "io":
+                self._observe_read_name(decision, max_bytes, owner_uid, initial)
+            decision.require_success()
+        try:
+            info, generation = self._admit_read_fd(decision, fd, max_bytes, owner_uid, initial)
+            if policy is not None:
+                policy(info)
+            raw = None
+            with decision.observe():
+                raw = _read_bounded(fd, info.st_size, overflow="changed")
+                if len(raw) != info.st_size:
+                    raise ConfinedFileError("changed")
+            self._verify_read_fd(decision, fd, max_bytes, owner_uid, generation)
+            return raw, info
+        finally:
+            decision.close(fd)
+
+    def _observe_read_name(self, decision, max_bytes, owner_uid, generation, *, admitted=False):
+        with decision.observe(), _refusals():
+            named = os.stat(self._name, dir_fd=self._parent, follow_symlinks=False)
+            _check_read_record(named, max_bytes, owner_uid, generation, admitted=admitted)
+            return _file_generation(named)
+
+    def _admit_read_fd(self, decision, fd, max_bytes, owner_uid, initial):
+        info = None
+        with decision.observe():
+            info = os.fstat(fd)
+        if info is not None and info.st_nlink > 0:
+            # Commit descriptor eligibility before a later name observation.
+            with decision.observe():
+                _check_read_record(info, max_bytes, owner_uid)
+            decision.require_success()
+        generation = _file_generation(info) if info is not None else initial
+        self._observe_read_name(decision, max_bytes, owner_uid, generation)
+        if info is not None and (info.st_nlink == 0 or generation != initial):
+            # A reliable name refusal takes precedence for a detached descriptor.
+            with decision.observe():
+                raise ConfinedFileError("changed")
+        decision.require_success()
+        return info, generation
+
+    def _verify_read_fd(self, decision, fd, max_bytes, owner_uid, generation):
+        named = self._observe_read_name(decision, max_bytes, owner_uid, generation, admitted=True)
+        current = None
+        with decision.observe():
+            current = os.fstat(fd)
+            _check_read_record(current, max_bytes, owner_uid, generation, admitted=True)
+        if current is None and named is not None:
+            # The entry may have changed while the descriptor stat failed.
+            self._observe_read_name(decision, max_bytes, owner_uid, generation, admitted=True)
 
     def _inspect_destination(self, replace):
         try:
@@ -528,3 +665,28 @@ def confined_file(root, relative_parts, create_parents=False):
             handle._parent = None
         with _refusals():
             os.close(parent)
+
+
+def read_checked_file(root, relative_parts, max_bytes, *, owner_uid=None, expected=None,
+                      policy=None, parent_policy=None):
+    """Read a checked record and include owned parent cleanup in its refusal.
+
+    The parent and optional record policies receive held descriptor metadata.
+    See ConfinedFile.read_checked for the record and generation checks.
+    """
+    parts = _parts(relative_parts)
+    _check_read_limit(max_bytes, checked=True)
+    decision = _ReadDecision()
+    with decision.observe():
+        with _refusals():
+            parent = _walk_directory(_directory_path(root), parts[:-1],
+                                     close_fd=decision.close, cleanup_fd=decision.close)[0]
+        try:
+            handle = ConfinedFile(parent, parts[-1])
+            if parent_policy is not None:
+                parent_policy(handle.parent_stat())
+            result = handle._read_checked(decision, max_bytes, owner_uid, expected, policy)
+        finally:
+            decision.close(parent)
+    decision.require_success()
+    return result

@@ -19,7 +19,7 @@ try:
 except ImportError:  # Windows has no passwd database.
     pwd = None
 
-from aegis_core import events, gitsafe, storage, storage_confined, team, team_paths, team_writer_binding
+from aegis_core import events, gitsafe, storage, team, team_paths, team_writer_binding
 from aegis_core.primitives import sanitize_display
 from aegis_core.redaction import redact_command_secrets
 
@@ -38,36 +38,68 @@ def _passwd_home():
     return pwd.getpwuid(os.getuid()).pw_dir
 
 
-def _writer_verdict(root, lane, oid):
-    """Judge only the covering claim, even after its ref was released in recovery."""
+_LEASE_ERRORS = (AttributeError, ImportError, KeyError, OSError, ValueError, RuntimeError)
+
+
+class _CoveringLeases:
+    """The first outcome of each covering object read within one locked unclaim."""
+
+    def __init__(self, root, lane):
+        self.root = root
+        self.lane = lane
+        self._outcomes = {}
+
+    def read(self, root, lane, oid):
+        if root != self.root or lane != self.lane:
+            return None
+        if oid not in self._outcomes:
+            try:
+                data = gitsafe.read_object(root, oid, team.MAX_LEASE_BYTES)
+                outcome = team.parse_lease(data, lane, oid)
+            except _LEASE_ERRORS + (gitsafe.GitError,):
+                outcome = team.Unreadable(lane, team.lane_ref(lane), oid, "unreadable")
+            self._outcomes[oid] = outcome
+        return self._outcomes[oid]
+
+
+def _writer_verdict(root, lane, oid, covering):
+    """Judge only the covering claim, even after its ref was released in recovery.
+
+    Absence is the binding observation ``no_binding_config`` published by the
+    real ``judge``. A storage failure is never treated as a missing config, a
+    replaced ``judge`` keeps the reason it returned, and the object is not read
+    again. A non-string reason is refused before that absence fact is read.
+    """
     if oid is None:
         return "no_bound_liveness_source"
     try:
-        lease = team.parse_lease(gitsafe.read_object(root, oid, team.MAX_LEASE_BYTES), lane, oid)
+        lease = covering.read(root, lane, oid)
+        if not isinstance(lease, team.Lease):
+            return "bindings_unavailable"
         home = _passwd_home()
+        token = team_writer_binding.observation_token()
         verdict = team_writer_binding.judge(home, team.LeaseSet((lease,), ()), {})
-        reason = verdict.get("reason") if type(verdict) is dict else None
+        if type(verdict) is not dict:
+            return "bindings_unavailable"
+        reason = verdict.get("reason")
         if type(reason) is not str:
             return "bindings_unavailable"
-        if reason == "bindings_unavailable":
-            # judge cannot distinguish a missing config directory from unsafe
-            # storage. Only descriptor-proven absence keeps the legacy path.
-            try:
-                with storage_confined.confined_file(home, (".config", "aegis", team_writer_binding.NAME)) as handle:
-                    handle.parent_stat()
-            except storage_confined.ConfinedFileError as error:
-                if error.reason == "missing":
-                    return "no_bound_liveness_source"
+        observed = team_writer_binding.observation_since(token)
+        if (reason == "bindings_unavailable" and type(observed) is dict
+                and observed.get("binding") == "no_binding_config"):
+            return "no_bound_liveness_source"
         if reason in _WRITER_REASONS or reason in ("writer_bound", "no_bound_liveness_source"):
             return reason
-    except (AttributeError, ImportError, KeyError, OSError, ValueError, RuntimeError, gitsafe.GitError):
+    except _LEASE_ERRORS + (gitsafe.GitError,):
         pass
     return "bindings_unavailable"
 
 
-def _check_writer(root, lane, oid, writer_stopped):
+def _check_writer(root, lane, oid, writer_stopped, *, covering=None):
     """A verified live writer defeats acknowledgement; uncertainty requires it."""
-    reason = _writer_verdict(root, lane, oid)
+    if covering is None:
+        covering = _CoveringLeases(root, lane)
+    reason = _writer_verdict(root, lane, oid, covering)
     if reason == "writer_bound":
         raise ClaimRefusal("writer_live")
     if not writer_stopped:
@@ -79,20 +111,28 @@ def check_writer(root, state, identifier, lane, writer_stopped):
 
     A stale requested revision must not hide the item's actual live writer.
     Recovery retains the original immutable lease after its ref is released.
+    Return the operation's covering observations. An unreadable ref is remembered
+    without becoming the checked oid, preserving the initial no-ack refusal.
     """
     intent = state.get("unclaim")
     oid = None
     if intent is not None and intent["id"] == identifier:
         lane, oid = intent["lane"], intent["lease_oid"]
+        row = None
     else:
         row = state["items"].get(identifier)
-        if row is not None and row["state"] == "claimed":
+        if row is not None and row["state"] != "claimed":
+            row = None
+        if row is not None:
             lane = row["lane"]
-            lease = team.read_leases(root).get(lane)
-            if lease is not None and team_paths.overlap(
-                    lease.path_set, team_paths.claim_paths(row["item"]["paths"])):
-                oid = lease.oid
-    _check_writer(root, lane, oid, writer_stopped)
+    covering = _CoveringLeases(root, lane)
+    if row is not None:
+        lease = team.read_leases(root, observe=covering.read).get(lane)
+        if lease is not None and team_paths.overlap(
+                lease.path_set, team_paths.claim_paths(row["item"]["paths"])):
+            oid = lease.oid
+    _check_writer(root, lane, oid, writer_stopped, covering=covering)
+    return covering
 
 
 class ClaimRefusal(ValueError):
@@ -290,8 +330,8 @@ def _lease_refusal(root, lane, oid):
                                  trailer=trailer)}])
 
 
-def _preflight(root, row, lane, caller, now):
-    found = team.read_leases(root)
+def _preflight(root, row, lane, caller, now, covering):
+    found = team.read_leases(root, observe=covering.read)
     scope = team_paths.claim_paths(row["item"]["paths"])
     for bad in found.unreadable:
         raise _lease_refusal(root, bad.lane, bad.oid)
@@ -442,7 +482,7 @@ def _finished_unclaim(root, state, identifier, expect, lane, caller, reason, dec
     return {"row": row, "released_lease_ids": intent["released_lease_ids"], "state": state}
 
 
-def _initial_intent(root, state, identifier, expect, lane, reason, caller, now, writer_stopped):
+def _initial_intent(root, state, identifier, expect, lane, reason, caller, now, writer_stopped, covering):
     if identifier in state["completed"]:
         raise ClaimRefusal("item_done")
     row = state["items"].get(identifier)
@@ -456,17 +496,17 @@ def _initial_intent(root, state, identifier, expect, lane, reason, caller, now, 
         raise ClaimRefusal("not_claimed")
     if row["lane"] != lane:
         raise ClaimRefusal("lane_mismatch")
-    oid = _preflight(root, row, lane, caller, now)
-    _check_writer(root, lane, oid, writer_stopped)
+    oid = _preflight(root, row, lane, caller, now, covering)
+    _check_writer(root, lane, oid, writer_stopped, covering=covering)
     return {"id": identifier, "revision": expect, "lane": lane, "caller": caller,
             "reason": reason, "lease_oid": oid, "to_revision": secrets.token_hex(32),
             "writer_stopped": True, "released_lease_ids": []}
 
 
-def _check_leases(root, state, intent, now, *, released=False):
+def _check_leases(root, state, intent, now, covering, *, released=False):
     oid = intent["lease_oid"]
-    _check_writer(root, intent["lane"], oid, intent["writer_stopped"])
-    selected = _preflight(root, state["items"][intent["id"]], intent["lane"], intent["caller"], now)
+    _check_writer(root, intent["lane"], oid, intent["writer_stopped"], covering=covering)
+    selected = _preflight(root, state["items"][intent["id"]], intent["lane"], intent["caller"], now, covering)
     if oid is None:
         if selected is not None:
             raise _lease_refusal(root, intent["lane"], selected)
@@ -508,9 +548,9 @@ def _release_lease(root, lane, oid, *, caller, shown, recovering=False):
     return True
 
 
-def _release(root, state, intent, now, recovering, receipt, publish, progress):
+def _release(root, state, intent, now, recovering, receipt, publish, progress, covering):
     """Only a successful call acknowledges our deletion; absence attests nothing."""
-    _check_leases(root, state, intent, now)
+    _check_leases(root, state, intent, now, covering)
     oid = intent["lease_oid"]
     if oid is None:
         return
@@ -536,10 +576,12 @@ def _release(root, state, intent, now, recovering, receipt, publish, progress):
 
 
 def transition(root, state, *, identifier, expect, lane, reason, caller, writer_stopped,
-               now, publish, restore, shown, decode):
+               now, publish, restore, shown, decode, covering=None):
     """Separate rollback-capable initial execution from irreversible recovery."""
     recovering = "unclaim" in state
     intent = state.get("unclaim")
+    if covering is None:
+        covering = _CoveringLeases(root, lane)
     progress = {"release_attempted": False, "receipt": False, "finalized": False, "shown": shown}
     try:
         if not recovering:
@@ -550,13 +592,14 @@ def transition(root, state, *, identifier, expect, lane, reason, caller, writer_
             if ((intent["id"], intent["revision"], intent["lane"], intent["caller"]) != (
                     identifier, expect, lane, caller) or (reason and reason != intent["reason"])):
                 raise recovery_refusal(intent, root=root)
-            _check_writer(root, lane, intent["lease_oid"], writer_stopped)
+            _check_writer(root, lane, intent["lease_oid"], writer_stopped, covering=covering)
             receipt = _receipt_state(root, intent, decode)
             if receipt is not None:
                 progress["receipt"] = True
             intent["writer_stopped"] = writer_stopped
         else:
-            intent = _initial_intent(root, state, identifier, expect, lane, reason, caller, now, writer_stopped)
+            intent = _initial_intent(root, state, identifier, expect, lane, reason, caller, now,
+                                     writer_stopped, covering)
             if _receipt_state(root, intent, decode) is not None:
                 raise ClaimRefusal("unclaim_event_unavailable")
             state["unclaim"] = intent
@@ -566,21 +609,21 @@ def transition(root, state, *, identifier, expect, lane, reason, caller, writer_
                 publish(root, state)
             except (OSError, RuntimeError, gitsafe.GitError):
                 raise recovery_refusal(intent, root=root, cause="queue_io_unavailable") from None
-        _release(root, state, intent, now, recovering, receipt, publish, progress)
-        _check_leases(root, state, intent, now, released=intent["lease_oid"] is not None)
+        _release(root, state, intent, now, recovering, receipt, publish, progress, covering)
+        _check_leases(root, state, intent, now, covering, released=intent["lease_oid"] is not None)
         if receipt is None:
             # Publication/fsync can fail after the exclusive link landed.
             progress["receipt"] = True
             _write_receipt(root, intent)
             _record(root, intent, shown)
-        _check_leases(root, state, intent, now, released=intent["lease_oid"] is not None)
+        _check_leases(root, state, intent, now, covering, released=intent["lease_oid"] is not None)
         row = dict(state["items"][identifier])
         row.update(state="queued", lane=None, expires_at=None, revision=intent["to_revision"])
         row.pop("branch", None)
         final = {key: value for key, value in state.items() if key != "unclaim"}
         final["items"] = {**state["items"], identifier: row}
         publish(root, final, before_publish=lambda: _check_leases(
-            root, state, intent, now, released=intent["lease_oid"] is not None))
+            root, state, intent, now, covering, released=intent["lease_oid"] is not None))
         progress["finalized"] = True
         # The queue is committed even if cleanup fails. A retry authenticates
         # this completed transaction from its remaining private receipt.
