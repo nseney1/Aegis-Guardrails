@@ -567,7 +567,19 @@ def _mount_operation_context(*, home, observed, owner_uid, private_gids=(), owne
     return context
 
 
+def _mount_ancestor_identities(paths, identities):
+    """Group observed mount ancestors by identity within one access domain."""
+    ancestors = {ancestor for path in paths for ancestor in (path, *path.parents)}
+    by_identity = {}
+    for ancestor in ancestors:
+        identity = identities.get(str(ancestor))
+        if identity is not None:
+            by_identity.setdefault(identity, set()).add(ancestor)
+    return by_identity
+
+
 def _enforce_mount_policy(rows, observed, identities, protected, *, owner_uid, private_gids, qualified):
+    paths = {True: [], False: []}
     for row in rows:
         path = Path(row["source"])
         require(path.name != ".local" or all(path.parent != root for root, kind in protected if kind == "home"),
@@ -577,16 +589,19 @@ def _enforce_mount_policy(rows, observed, identities, protected, *, owner_uid, p
         for root, kind in protected:
             unsafe = aliases_overlap(path, root, identities) if kind == "secret" else inside_alias(root, path, identities)
             require(not unsafe, "unsafe_mount")
+        paths[row["rw"]].append(path)
     # mount_rows checked lexical overlap. Distinct paths can only alias through a repeated identity.
-    if len(set(identities.values())) == len(identities):
+    if not all(paths.values()) or len(set(identities.values())) == len(identities):
         return rows
-    # Bind aliases share an ancestor identity. Compare the remaining suffixes,
-    # including missing lexical relationships, across both access domains.
-    for index, row in enumerate(rows):
-        for other in rows[index + 1:]:
-            left, right = Path(row["source"]), Path(other["source"])
-            if row["rw"] == other["rw"]:
-                continue
+    writable = _mount_ancestor_identities(paths[True], identities)
+    read_only = _mount_ancestor_identities(paths[False], identities)
+    # A shared lexical ancestor alone cannot create a new suffix overlap.
+    if not any(len(writable[key]) > 1 or writable[key] != read_only[key]
+               for key in writable.keys() & read_only.keys()):
+        return rows
+    # Compare the suffixes from matching ancestors, including confirmed missing tails.
+    for left in paths[True]:
+        for right in paths[False]:
             require(not aliases_overlap(left, right, identities), "mount_overlap")
     return rows
 
