@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 import ast
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 import errno
 import io
 import json
@@ -19,6 +19,7 @@ import sys
 import tempfile
 import threading
 import types
+from unittest.mock import patch
 
 import pytest
 
@@ -2267,8 +2268,14 @@ def test_exact_budget_with_an_empty_first_subdirectory_has_no_false_cap(tmp_path
     assert "scan_capped" not in _codes(report)
 
 
+_scratch_duplicate_tracker = threading.RLock()
+
+
 @contextmanager
-def _track_scratch_duplicates(monkeypatch):
+def _track_scratch_duplicates():
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError("scratch duplicate tracker requires the test thread")
+
     calls = []
     outstanding = set()
 
@@ -2283,13 +2290,30 @@ def _track_scratch_duplicates(monkeypatch):
         outstanding.discard(fd)
         os.close(fd)
 
-    monkeypatch.setattr(doctor_git_observe, "os", types.SimpleNamespace(
-        **{**vars(doctor_git_observe.os), "dup": duplicate, "close": close}))
-    try:
-        yield calls
-    finally:
+    def close_outstanding():
+        failure = None
         while outstanding:
-            os.close(outstanding.pop())
+            fd = outstanding.pop()
+            try:
+                os.close(fd)
+            except OSError as error:
+                if error.errno != errno.EBADF and failure is None:
+                    failure = error
+        if failure is not None:
+            raise failure
+
+    with _scratch_duplicate_tracker:
+        original = doctor_git_observe.os
+        proxy = types.SimpleNamespace(**{**vars(original), "dup": duplicate, "close": close})
+        try:
+            with patch.object(doctor_git_observe, "os", proxy):
+                try:
+                    yield calls
+                finally:
+                    close_outstanding()
+        finally:
+            if doctor_git_observe.os is not original:
+                raise AssertionError("doctor os proxy outlived the descriptor tracker")
 
 
 @contextmanager
@@ -2333,7 +2357,9 @@ def test_scratch_duplicate_closes_on_exit_failure_and_on_successful_retry(tmp_pa
         borrowed = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
         try:
             original = os.fstat(borrowed)
-            with _track_scratch_duplicates(monkeypatch) as duplicates:
+            doctor_os = doctor_git_observe.os
+            with _track_scratch_duplicates() as duplicates:
+                assert doctor_git_observe.os is not doctor_os
                 for count, code in enumerate(("scratch_unsupported", "scratch_outside"), start=1):
                     report = doctor_git.collect(tmp_path, tier="A", now=10)
                     assert code in _codes(report)
@@ -2347,6 +2373,7 @@ def test_scratch_duplicate_closes_on_exit_failure_and_on_successful_retry(tmp_pa
                     if fail_exit:
                         recycled = recycled_owner.enter_context(_recycled_descriptor(fd, replacement.fileno()))
                     fail_exit = False
+            assert doctor_git_observe.os is doctor_os
             assert os.path.samestat(os.fstat(borrowed), original)
             assert os.path.samestat(os.fstat(recycled), os.fstat(replacement.fileno()))
         finally:
@@ -2434,8 +2461,10 @@ def test_scratch_validation_error_is_a_refusal_and_closes_the_descriptor(tmp_pat
     monkeypatch.setattr(doctor_git_observe, "_scratch_env", lambda: {"AEGIS_SCRATCH": str(scratch)})
     monkeypatch.setattr(doctor_git_observe, "_scratch_ok", denied)
     monkeypatch.setattr(doctor_git, "_run_git", lambda *args: "git_missing")
+    doctor_os = doctor_git_observe.os
     with (tmp_path / "replacement").open("w+b") as replacement, ExitStack() as recycled_owner:
-        with _track_scratch_duplicates(monkeypatch):
+        with _track_scratch_duplicates():
+            assert doctor_git_observe.os is not doctor_os
             if early_assertion:
                 with pytest.raises(AssertionError, match="^scratch validation interrupted$"):
                     doctor_git.collect(tmp_path, tier="A", now=10)
@@ -2447,7 +2476,139 @@ def test_scratch_validation_error_is_a_refusal_and_closes_the_descriptor(tmp_pat
                 os.fstat(held[0])
             assert error.value.errno == errno.EBADF
             recycled = recycled_owner.enter_context(_recycled_descriptor(held[0], replacement.fileno()))
+        assert doctor_git_observe.os is doctor_os
         assert os.path.samestat(os.fstat(recycled), os.fstat(replacement.fileno()))
+
+
+def test_nested_scratch_duplicate_trackers_restore_the_doctor_os_object():
+    original = doctor_git_observe.os
+    with _track_scratch_duplicates():
+        outer = doctor_git_observe.os
+        assert outer is not original
+        with _track_scratch_duplicates():
+            assert doctor_git_observe.os is not outer
+        assert doctor_git_observe.os is outer
+    assert doctor_git_observe.os is original
+
+
+def test_scratch_duplicate_tracker_restores_doctor_os_after_failure_and_retry(tmp_path):
+    original = doctor_git_observe.os
+    source_path = tmp_path / "source"
+    source_path.write_bytes(b"")
+    source = os.open(os.fspath(source_path), os.O_RDONLY)
+    try:
+        for _attempt in range(2):
+            held = []
+            with pytest.raises(RuntimeError, match="^tracker body failed$"):
+                with _track_scratch_duplicates() as calls:
+                    assert doctor_git_observe.os is not original
+                    held.append(doctor_git_observe.os.dup(source))
+                    assert calls == [(source, held[0])]
+                    raise RuntimeError("tracker body failed")
+            assert doctor_git_observe.os is original
+            with pytest.raises(OSError) as error:
+                os.fstat(held[0])
+            assert error.value.errno == errno.EBADF
+        with pytest.raises(OSError, match="^fdopen failed$"):
+            with _track_scratch_duplicates():
+                released = doctor_git_observe.os.dup(source)
+                still_open = doctor_git_observe.os.dup(source)
+                os.close(released)
+                raise OSError("fdopen failed")
+        assert doctor_git_observe.os is original
+        for fd in (released, still_open):
+            with pytest.raises(OSError) as error:
+                os.fstat(fd)
+            assert error.value.errno == errno.EBADF
+    finally:
+        os.close(source)
+
+
+def test_scratch_duplicate_tracker_refuses_worker_entry():
+    original = doctor_git_observe.os
+    errors = []
+
+    def work():
+        try:
+            with _track_scratch_duplicates():
+                pass
+        except RuntimeError as error:
+            errors.append(str(error))
+
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert doctor_git_observe.os is original
+    assert errors == ["scratch duplicate tracker requires the test thread"]
+
+
+@pytest.mark.parametrize("unwind", ["normal", "timed-join", "partial-startup"])
+def test_concurrent_scratch_duplicate_trackers_restore_the_doctor_os_object(tmp_path, unwind):
+    original = doctor_git_observe.os
+    release = threading.Event()
+    attempted = [threading.Event(), threading.Event()]
+    results = [[], []]
+
+    def probe(index):
+        acquired = _scratch_duplicate_tracker.acquire(blocking=False)
+        if acquired:
+            _scratch_duplicate_tracker.release()
+        results[index].append(acquired)
+        attempted[index].set()
+        # Stay parked until the test thread finishes checking restoration.
+        release.wait()
+        acquired = _scratch_duplicate_tracker.acquire(timeout=5)
+        if acquired:
+            _scratch_duplicate_tracker.release()
+        results[index].append(acquired)
+
+    class FailingStartThread(threading.Thread):
+        def start(self):
+            raise RuntimeError("second scratch tracker worker failed to start")
+
+    second_starts = unwind != "partial-startup"
+    second_thread = threading.Thread if second_starts else FailingStartThread
+    threads = [
+        threading.Thread(target=probe, args=(0,), daemon=True),
+        second_thread(target=probe, args=(1,), daemon=True),
+    ]
+    if unwind == "timed-join":
+        expected = pytest.raises(TimeoutError, match="^scratch tracker worker still running$")
+    elif unwind == "partial-startup":
+        expected = pytest.raises(RuntimeError, match="^second scratch tracker worker failed to start$")
+    else:
+        expected = nullcontext()
+
+    try:
+        with (tmp_path / "source").open("w+b") as source:
+            with expected, _track_scratch_duplicates() as calls:
+                assert doctor_git_observe.os is not original
+                duplicate = doctor_git_observe.os.dup(source.fileno())
+                assert calls == [(source.fileno(), duplicate)]
+                for thread, ready in zip(threads, attempted):
+                    thread.start()
+                    assert ready.wait(timeout=5)
+                if unwind == "timed-join":
+                    threads[0].join(timeout=0)
+                    if threads[0].is_alive():
+                        raise TimeoutError("scratch tracker worker still running")
+            assert doctor_git_observe.os is original
+            assert [thread.is_alive() for thread in threads] == [True, second_starts]
+            assert results == [[False], [False] if second_starts else []]
+            with pytest.raises(OSError) as error:
+                os.fstat(duplicate)
+            assert error.value.errno == errno.EBADF
+            os.fstat(source.fileno())
+    finally:
+        release.set()
+        for thread in threads:
+            if thread.ident is not None:
+                thread.join(timeout=5)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert doctor_git_observe.os is original
+    assert results == [[False, True], [False, True] if second_starts else []]
 
 
 @pytest.mark.parametrize("count", [None, False, -1])
