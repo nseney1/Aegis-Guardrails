@@ -1,16 +1,20 @@
-"""Validate bounded process measurements and their numeric table on synthetic data."""
+"""Validate bounded measurements and provide the opt-in hosted observation plugin."""
 
 from __future__ import annotations
 
 from collections import ChainMap
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from dataclasses import astuple, dataclass, fields, replace
 import errno
 from itertools import islice
 import os
 import re
 import struct
 import sys
+from threading import Barrier, get_ident
+from types import SimpleNamespace
 from typing import Any, List, Optional, Tuple, Union
 import unicodedata
 
@@ -37,6 +41,8 @@ ENV_NAME_MARKERS = frozenset({
     "OVERSIZE_ENV_NAME",
 })
 REFUSAL_CODES = frozenset({
+    "capture_incomplete",
+    "capture_unsupported",
     "invalid_family",
     "invalid_context",
     "argv_type",
@@ -1135,3 +1141,861 @@ def test_validation_invariants_codec_closure_and_multiline_refusal() -> None:
     with pytest.raises(ExecMeasurementError) as substr_err:
         validate_prebuilt_env_name(_SubStr("PATH"))
     assert substr_err.value.code == "item_type"
+
+
+# Capture observes these trials within ordinary full-shard execution.
+_HOSTED_TRIALS = {
+    "tests/unit/core/test_redaction.py::test_redaction_isolated_import_bootstrap[parent]":
+        ("unit-core-a", "normal", "run_isolated_test"),
+    "tests/unit/core/test_redaction.py::test_private_name_census_rejects_an_unreviewed_importer_path":
+        ("unit-core-a", "error", "run_isolated_test"),
+    "tests/unit/verification/test_mutation_tester.py::TestMutationTesterContract::test_real_test_passes":
+        ("unit-rest", "normal", "_check_tests"),
+    "tests/unit/verification/test_mutation_tester.py::TestMutationTesterFailsClosed::test_baseline_assertion_failure_fails_closed":
+        ("unit-rest", "error", "_check_tests"),
+}
+# Builder name -> family and module containing the reviewed exec site.
+_HOSTED_SITES = {
+    "run_isolated_test": ("reviewed_isolated", "tests.helpers_reviewed_sources"),
+    "_check_tests": ("mutation_tester", "aegis_core.verification.mutation_tester"),
+}
+_HOSTED_CALLERS = frozenset((module, builder) for builder, (_, module) in _HOSTED_SITES.items())
+_HOSTED_REPORT = "aegis_hosted_exec_observations"
+_HOSTED_OBSERVER = "hosted-exec-observer"
+_HOSTED_SHARDS = ("unit-core-a", "unit-rest")
+# Keep the existing per-summary limits for the retained shards.
+_HOSTED_ROW_LIMIT = 10
+_HOSTED_BYTE_LIMIT = 2730
+_MEASUREMENT_FIELDS = len(fields(ExecBoundaryMeasurement))
+
+
+def _hosted_trials(shard):
+    return {node: (trial, builder) for node, (owner, trial, builder) in _HOSTED_TRIALS.items() if owner == shard}
+
+
+def _format_hosted_capture(shard, in_worker, reports):
+    trials = _hosted_trials(shard)
+    if not trials or reports.keys() != trials.keys():
+        raise ExecMeasurementError("capture_incomplete")
+    context = "worker" if in_worker else "fresh"
+    sections = [
+        f"## Hosted isolated child capture ({shard}, {context})\n\n",
+        "| Trial | Builder | Exec site | E2BIG status | Measurement rows |\n",
+        "| --- | --- | --- | --- | ---: |\n",
+    ]
+    rows = []
+    for node, (trial, builder) in trials.items():
+        attempts = reports[node]
+        if len(rows) + len(attempts) > _HOSTED_ROW_LIMIT:
+            raise ExecMeasurementError("summary_rows_limit")
+        if not attempts:
+            raise ExecMeasurementError("capture_incomplete")
+        family, module = _HOSTED_SITES[builder]
+        line = attempts[0][0]
+        first = len(rows) + 1
+        for observed_line, raw_row in attempts:
+            row = validate_measurement_row(raw_row)
+            if (type(observed_line) is not int or not 1 <= observed_line <= 2147483647
+                    or observed_line != line or row.family != family or row.in_worker != in_worker):
+                raise ExecMeasurementError("capture_incomplete")
+            rows.append(row)
+        observed = rows[first - 1:]
+        if trial == "error" and not any(row.error_errno or row.child_rc for row in observed):
+            raise ExecMeasurementError("capture_incomplete")
+        status = "E2BIG reproduced" if any(row.error_errno == errno.E2BIG for row in observed) else "E2BIG not reproduced"
+        sections.append(f"| {trial} | {builder} | {module}.{builder}:{line} | {status} | {first}-{len(rows)} |\n")
+    sections.extend(("\n", format_step_summary_metrics(rows), "\n"))
+    if sum(map(len, sections)) > _HOSTED_BYTE_LIMIT:
+        raise ExecMeasurementError("summary_size_limit")
+    return "".join(sections)
+
+
+def _qualify_hosted_trial(passed, failed, rows):
+    if (not rows or any(type(row.child_rc) is not int or row.error_errno not in (0, errno.E2BIG)
+                        or (row.error_errno == 0 and row.child_rc < 0)
+                        or (row.error_errno == errno.E2BIG and row.child_rc != -1) for row in rows)
+            or not (passed or (failed and any(row.error_errno == errno.E2BIG for row in rows)))):
+        raise ExecMeasurementError("capture_incomplete")
+
+
+def _hosted_limits():
+    # Imported only in a Linux observer, where an unavailable limit uses the
+    # existing -1 sentinel. Each process measures its own limits.
+    import resource
+
+    try:
+        arg_max = os.sysconf("SC_ARG_MAX")
+    except (OSError, ValueError):
+        arg_max = -1
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_STACK)
+    except (OSError, ValueError):
+        soft, hard = -1, -1
+    return (
+        arg_max if 1 <= arg_max <= _LIMIT_UPPER_BOUND else -1,
+        soft if soft != resource.RLIM_INFINITY and 0 <= soft <= _LIMIT_UPPER_BOUND else -1,
+        hard if hard != resource.RLIM_INFINITY and 0 <= hard <= _LIMIT_UPPER_BOUND else -1,
+    )
+
+
+@dataclass
+class _HostedAttempt:
+    line: int
+    process: Any
+    metrics: Optional[ExecBoundaryMeasurement] = None
+    exec_error: Optional[OSError] = None
+    launch_finished: bool = False
+    constructor_finished: bool = False
+    constructor_saw_exec_error: bool = False
+    indeterminate: bool = False
+
+    def trace_constructor(self, _frame, event, arg):
+        if event == "exception":
+            if arg[1] is self.exec_error:
+                self.constructor_saw_exec_error = True
+            else:
+                self.indeterminate = True
+        elif event == "return":
+            self.constructor_finished = True
+        return self.trace_constructor
+
+    def trace_launch(self, frame, event, arg):
+        if event == "exception":
+            error = arg[1]
+            # The fork/exec error-pipe payload ends at the colon for an exec
+            # failure. Earlier failures either have a noexec suffix or never
+            # received a child error-pipe payload. All reviewed calls fork/exec.
+            exec_error = f"OSError:{errno.E2BIG:x}:".encode("ascii")
+            if (isinstance(error, OSError) and error.errno == errno.E2BIG
+                    and frame.f_locals.get("errpipe_data") == exec_error and self.exec_error is None):
+                self.exec_error = error
+            else:
+                self.indeterminate = True
+        elif event == "return":
+            self.launch_finished = True
+        return self.trace_launch
+
+    def wire_row(self):
+        if (self.metrics is None or not self.launch_finished or not self.constructor_finished
+                or self.indeterminate or (self.exec_error is not None) != self.constructor_saw_exec_error):
+            raise ExecMeasurementError("capture_incomplete")
+        error_errno = errno.E2BIG if self.exec_error is not None else 0
+        rc = -1 if error_errno else self.process.returncode
+        # An empty exec error pipe cannot distinguish exec from a pre-exec
+        # signal death. A signed status alone supplies no exec evidence.
+        if type(rc) is not int or (not error_errno and rc < 0):
+            raise ExecMeasurementError("capture_incomplete")
+        row = replace(self.metrics, error_errno=error_errno, child_rc=rc)
+        return self.line, astuple(validate_measurement_row(row))
+
+
+class _HostedCapture:
+    def __init__(self, config, shard):
+        import subprocess
+
+        self.constructor_code = subprocess.Popen.__init__.__code__
+        self.in_worker = int(hasattr(config, "workerinput"))
+        self.worker_context = int(self.in_worker or bool(config.getoption("numprocesses")))
+        self.shard = shard
+        self.trials = _hosted_trials(self.shard)
+        self.summary = b""
+        self.builder = None
+        self.thread = None
+        self.attempts = []
+        self.trial_refusal = None
+        self.reports = {}
+        self.refusal = None
+        self.row_count = 0
+        if self.in_worker or not self.worker_context:
+            sys.addaudithook(self.audit)
+
+    def _reviewed_caller(self, constructor):
+        if constructor is None or constructor.f_code is not self.constructor_code:
+            return None
+        caller = constructor.f_back
+        if (caller.f_globals.get("__name__"), caller.f_code.co_name) == ("subprocess", "run"):
+            caller = caller.f_back
+        location = caller.f_globals.get("__name__"), caller.f_code.co_name
+        if location not in _HOSTED_CALLERS:
+            return None
+        family, module = _HOSTED_SITES[self.builder]
+        if location != (module, self.builder):
+            self.trial_refusal = "capture_incomplete"
+            return None
+        return family, caller.f_lineno
+
+    def trace_entry(self, frame, event, _arg):
+        if event != "call" or self.trial_refusal:
+            return None
+        site = self._reviewed_caller(frame)
+        if site is None:
+            return None
+        if len(self.attempts) >= _HOSTED_ROW_LIMIT:
+            self.trial_refusal = "summary_rows_limit"
+            return None
+        _, line = site
+        attempt = _HostedAttempt(line, frame.f_locals["self"])
+        self.attempts.append(attempt)
+        frame.f_trace_lines = False
+        return attempt.trace_constructor
+
+    def audit(self, event, args):
+        if event != "subprocess.Popen" or self.thread != get_ident() or self.trial_refusal:
+            return
+        launch = sys._getframe(1)
+        if (launch.f_globals.get("__name__"), launch.f_code.co_name) != ("subprocess", "_execute_child"):
+            return
+        constructor = launch.f_back
+        site = self._reviewed_caller(constructor)
+        if site is None:
+            return
+        family, line = site
+        process = constructor.f_locals["self"]
+        attempt = next((entry for entry in self.attempts if entry.process is process), None)
+        if attempt is None or attempt.line != line or attempt.metrics is not None:
+            self.trial_refusal = "capture_incomplete"
+            return
+        try:
+            _, argv, _, env = args
+            # CPython exposes normalized inputs before fork/exec. The reviewed
+            # callers supply explicit maps, so no environment reconstruction is needed.
+            attempt.metrics = collect_boundary_metrics(family, argv, env, in_worker=self.in_worker,
+                                                       limits=_hosted_limits())
+        except ExecMeasurementError as error:
+            self.trial_refusal = error.code
+            return
+        launch.f_trace_lines = False
+        launch.f_trace = attempt.trace_launch
+
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_runtest_call(self, item):
+        case = self.trials.get(item.nodeid)
+        if case is None:
+            yield
+            return
+        if sys.gettrace() is not None:
+            yield
+            item.user_properties.append((_HOSTED_REPORT, "capture_unsupported"))
+            return
+        self.builder = case[1]
+        self.thread = get_ident()
+        try:
+            sys.settrace(self.trace_entry)
+            yield
+        finally:
+            self.thread = None
+            self.builder = None
+            sys.settrace(None)
+        try:
+            payload = self.trial_refusal or tuple(attempt.wire_row() for attempt in self.attempts)
+        except ExecMeasurementError as error:
+            payload = error.code
+        self.attempts.clear()
+        self.trial_refusal = None
+        item.user_properties.append((_HOSTED_REPORT, payload))
+
+    def pytest_runtest_logreport(self, report):
+        if self.in_worker or report.nodeid not in self.trials or self.refusal:
+            return
+        if report.when != "call":
+            if not report.passed:
+                self.refusal = "capture_incomplete"
+            return
+        payloads = [value for key, value in report.user_properties if key == _HOSTED_REPORT]
+        if len(payloads) != 1 or report.nodeid in self.reports:
+            self.refusal = "capture_incomplete"
+            return
+        payload = payloads[0]
+        if type(payload) is not tuple:
+            self.refusal = ExecMeasurementError(payload).code
+            return
+        self.row_count += len(payload)
+        if self.row_count > _HOSTED_ROW_LIMIT:
+            self.refusal = "summary_rows_limit"
+            return
+        rows = []
+        for attempt in payload:
+            if type(attempt) is not tuple or len(attempt) != 2:
+                self.refusal = "capture_incomplete"
+                return
+            line, values = attempt
+            if type(values) is not tuple or len(values) != _MEASUREMENT_FIELDS:
+                self.refusal = "capture_incomplete"
+                return
+            rows.append((line, ExecBoundaryMeasurement(*values)))
+        try:
+            _qualify_hosted_trial(report.passed, report.failed, tuple(row for _, row in rows))
+        except ExecMeasurementError as error:
+            self.refusal = error.code
+            return
+        self.reports[report.nodeid] = tuple(rows)
+
+    @pytest.hookimpl(optionalhook=True)
+    def pytest_xdist_setupnodes(self, specs):
+        for spec in specs:
+            if not spec.popen or spec.chdir or spec.via:
+                raise pytest.UsageError("capture_unsupported")
+            # execnet passes -B at interpreter startup. xdist retains the
+            # gateway spec when it starts a replacement worker.
+            spec.dont_write_bytecode = True
+
+    @pytest.hookimpl(optionalhook=True)
+    def pytest_testnodedown(self, error):
+        if error is not None:
+            self.refusal = "capture_incomplete"
+
+    @pytest.hookimpl(trylast=True)
+    def pytest_sessionfinish(self, exitstatus):
+        if self.in_worker or self.refusal or exitstatus not in (pytest.ExitCode.OK, pytest.ExitCode.TESTS_FAILED):
+            return
+        try:
+            self.summary = _format_hosted_capture(self.shard, self.worker_context, self.reports).encode("ascii")
+        except ExecMeasurementError as error:
+            self.refusal = error.code
+
+
+class _HostedResult:
+    # Installed in the controller only. Workers return the existing bounded
+    # test report properties through xdist.
+    observer: Optional[_HostedCapture] = None
+
+    @pytest.hookimpl(trylast=True)
+    def pytest_configure(self, config):
+        self.observer = config.pluginmanager.get_plugin(_HOSTED_OBSERVER)
+
+
+def _supports_hosted_capture():
+    return sys.platform == "linux" and sys.implementation.name == "cpython"
+
+
+def pytest_addoption(parser):
+    parser.addoption("--aegis-hosted-workers", choices=("0", "auto"))
+
+
+def _outside_hosted_checkouts(path, *, replaces_tree=False):
+    from pathlib import Path
+
+    try:
+        raw = os.fspath(path)
+        if len(raw) > 4096:
+            raise ExecMeasurementError("capture_incomplete")
+        # Pytest resolves the default root directly, but normalizes an
+        # explicit basetemp first. Check both orders when a symlink meets '..'.
+        lexical = Path(os.path.abspath(raw))
+        resolved = Path(raw).resolve()
+        spellings = (lexical, lexical.resolve(), resolved)
+        roots = (Path.cwd(), Path(__file__).resolve().parents[3],
+                 os.environ.get("GITHUB_WORKSPACE"), os.environ.get("RUNNER_TOOL_CACHE"))
+        for raw_root in roots:
+            if not raw_root:
+                continue
+            root = Path(raw_root).resolve()
+            if any(candidate.is_relative_to(root)
+                   or (replaces_tree and root.is_relative_to(candidate)) for candidate in spellings):
+                raise ExecMeasurementError("capture_incomplete")
+        return resolved
+    except ExecMeasurementError:
+        raise
+    except (OSError, RuntimeError, ValueError):
+        raise ExecMeasurementError("capture_incomplete") from None
+
+
+def _validate_hosted_default_temp():
+    import tempfile
+
+    if tempfile.tempdir is None:
+        # Let CPython select the usual default, including fallback after a
+        # failed writable-directory probe. Refuse unsafe probes before open.
+        thread = get_ident()
+
+        def check_probe(event, args):
+            if event != "open" or thread != get_ident():
+                return
+            path, _, flags = args
+            # CPython 3.9 also audits io.open wrapping the existing probe fd.
+            if not isinstance(path, int) and flags & os.O_CREAT:
+                _outside_hosted_checkouts(os.path.dirname(path))
+
+        sys.addaudithook(check_probe)
+        try:
+            tempfile.gettempdir()
+        except OSError:
+            raise ExecMeasurementError("capture_incomplete") from None
+        finally:
+            thread = None
+    return _outside_hosted_checkouts(tempfile.gettempdir())
+
+
+def _hosted_pytest_users():
+    import getpass
+
+    try:
+        user = getpass.getuser() or "unknown"
+    except (ImportError, OSError, KeyError):
+        user = "unknown"
+    if not 1 <= len(user) <= 128 or not re.fullmatch(r"[A-Za-z0-9_.-]+", user):
+        raise ExecMeasurementError("capture_incomplete")
+    return tuple(dict.fromkeys(("pytest-of-" + user, "pytest-of-unknown")))
+
+
+def _validate_hosted_pytest_temp(basetemp):
+    if basetemp is not None:
+        # xdist supplies the effective worker base before configuring the worker.
+        _outside_hosted_checkouts(basetemp, replaces_tree=True)
+        return
+    default = _validate_hosted_default_temp()
+    root = _outside_hosted_checkouts(os.environ.get("PYTEST_DEBUG_TEMPROOT") or default)
+    for name in _hosted_pytest_users():
+        _outside_hosted_checkouts(root / name, replaces_tree=True)
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_load_initial_conftests():
+    # This plugin loads before initial conftests on the controller and in
+    # each xdist worker. Protect library temp selection without overriding it.
+    if not _supports_hosted_capture():
+        raise pytest.UsageError("capture_unsupported")
+    try:
+        _validate_hosted_default_temp()
+    except ExecMeasurementError as error:
+        raise pytest.UsageError(error.code) from None
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_configure(config):
+    if not _supports_hosted_capture() or not sys.dont_write_bytecode:
+        raise pytest.UsageError("capture_unsupported")
+    shard = os.environ.get("TEST_VALIDATE_SHARD")
+    workers = "auto" if hasattr(config, "workerinput") or config.getoption("numprocesses") else "0"
+    if shard not in _HOSTED_SHARDS or workers != config.getoption("aegis_hosted_workers"):
+        raise pytest.UsageError("capture_incomplete")
+    try:
+        _validate_hosted_pytest_temp(config.getoption("basetemp"))
+    except ExecMeasurementError as error:
+        raise pytest.UsageError(error.code) from None
+    config.pluginmanager.register(_HostedCapture(config, shard), _HOSTED_OBSERVER)
+
+
+def capture_validate_shard(shard, paths, attempt):
+    """Observe one full Validate invocation, returning its status and bounded evidence."""
+    import tempfile
+
+    if not _supports_hosted_capture() or os.environ.get("EXECNET_DEBUG"):
+        raise ExecMeasurementError("capture_unsupported")
+    if (shard not in _HOSTED_SHARDS or type(paths) not in (list, tuple)
+            or not 1 <= len(paths) <= MAX_ARGV_ELEMENTS
+            or any(type(path) is not str or not path for path in paths)
+            or sum(map(len, paths)) > MAX_SINGLE_ITEM_CHARS
+            or type(attempt) is not str or attempt not in ("1", "2")):
+        raise ExecMeasurementError("capture_incomplete")
+    runner_temp = os.environ.get("RUNNER_TEMP", "")
+    if not os.path.isabs(runner_temp):
+        raise ExecMeasurementError("capture_incomplete")
+    runner_temp = _outside_hosted_checkouts(runner_temp, replaces_tree=True)
+    _validate_hosted_default_temp()
+    try:
+        # Runner teardown owns this directory, including when the job times out.
+        cache = tempfile.mkdtemp(prefix="aegis-child-exec-", dir=runner_temp)
+    except OSError:
+        raise ExecMeasurementError("capture_incomplete") from None
+    workers = "auto" if attempt == "1" else "0"
+    result = _HostedResult()
+    status = int(pytest.main([
+        "-n", workers, "--durations=25", "-p", __name__, "--aegis-hosted-workers", workers,
+        "-o", "cache_dir=" + cache, "--", *paths,
+    ], plugins=[result]))
+    if result.observer is None or status not in (pytest.ExitCode.OK, pytest.ExitCode.TESTS_FAILED):
+        return status, b""
+    return status, result.observer.summary
+
+
+def test_hosted_capture_renders_distinct_trials_and_contexts() -> None:
+    assert (_HOSTED_ROW_LIMIT, _HOSTED_BYTE_LIMIT) == (10, 2730)
+    summaries = []
+    for shard in ("unit-core-a", "unit-rest"):
+        trials = _hosted_trials(shard)
+        for worker, context in enumerate(("fresh", "worker")):
+            results = {}
+            for node, (trial, builder) in trials.items():
+                family, _ = _HOSTED_SITES[builder]
+                failure = worker == 1 and trial == "error"
+                row = collect_boundary_metrics(
+                    family, ["private/path/to/child"], {"PATH": "private/environment/value"},
+                    in_worker=worker, error_errno=errno.E2BIG if failure else 0,
+                    child_rc=-1 if failure else int(trial == "error"),
+                )
+                results[node] = ((42, row),)
+            summary = _format_hosted_capture(shard, worker, results)
+            for trial, builder in trials.values():
+                family, module = _HOSTED_SITES[builder]
+                status = "reproduced" if worker and trial == "error" else "not reproduced"
+                assert f"{trial} | {builder} | {module}.{builder}:42 | E2BIG {status}" in summary
+                assert f"| {family} |" in summary
+            assert f"({shard}, {context})" in summary
+            summaries.append(summary)
+    assert sum(map(len, summaries)) <= MAX_SUMMARY_BYTES
+    assert "private/" not in "".join(summaries)
+
+
+def test_hosted_capture_refuses_missing_and_oversized_trials_then_recovers() -> None:
+    shard = "unit-rest"
+    results = {
+        node: ((42, collect_boundary_metrics(
+            _HOSTED_SITES[builder][0], ["python"], {}, in_worker=1, child_rc=int(trial == "error"),
+        )),)
+        for node, (trial, builder) in _hosted_trials(shard).items()
+    }
+    key = next(iter(results))
+    row = results.pop(key)
+    with pytest.raises(ExecMeasurementError, match=r"\Acapture_incomplete\Z"):
+        _format_hosted_capture(shard, 1, results)
+    results[key] = row * MAX_SUMMARY_ROWS
+    with pytest.raises(ExecMeasurementError, match=r"\Asummary_rows_limit\Z"):
+        _format_hosted_capture(shard, 1, results)
+    results[key] = row
+    assert "E2BIG not reproduced" in _format_hosted_capture(shard, 1, results)
+
+
+def test_hosted_capture_refuses_unsupported_platform(monkeypatch) -> None:
+    monkeypatch.setattr("tests.unit.core.test_hosted_child_exec_measurements._supports_hosted_capture", lambda: False)
+    with pytest.raises(pytest.UsageError, match=r"\Acapture_unsupported\Z"):
+        pytest_configure(None)
+    with pytest.raises(ExecMeasurementError, match=r"\Acapture_unsupported\Z"):
+        capture_validate_shard("unit-core-a", ["tests"], "1")
+
+
+def test_hosted_capture_refuses_failed_trial_without_exec_e2big_then_recovers() -> None:
+    row = collect_boundary_metrics("reviewed_isolated", ["python"], {}, in_worker=0)
+    with pytest.raises(ExecMeasurementError, match=r"\Acapture_incomplete\Z"):
+        _qualify_hosted_trial(False, True, (row,))
+    _qualify_hosted_trial(True, False, (row,))
+    refused = replace(row, error_errno=errno.E2BIG, child_rc=-1)
+    _qualify_hosted_trial(False, True, (refused,))
+    with pytest.raises(ExecMeasurementError, match=r"\Acapture_incomplete\Z"):
+        _qualify_hosted_trial(False, False, (refused,))
+    with pytest.raises(ExecMeasurementError, match=r"\Acapture_incomplete\Z"):
+        _qualify_hosted_trial(True, False, (row, replace(row, error_errno=errno.EMFILE, child_rc=-1)))
+
+
+@pytest.mark.skipif(not _supports_hosted_capture(), reason="requires the Linux CPython exec boundary")
+def test_hosted_capture_observes_real_errno_and_recovers_in_independent_trials(tmp_path) -> None:
+    from tests.helpers_reviewed_sources import run_isolated_test
+
+    # Linux MAX_ARG_STRLEN is 32 pages, including the terminating NUL.
+    limit = 32 * os.sysconf("SC_PAGESIZE")
+    if not 0 < limit <= MAX_SINGLE_ITEM_CHARS:
+        pytest.skip("Linux single-argument limit exceeds the measurement budget")
+    shard = "unit-core-a"
+    node = next(iter(_hosted_trials(shard)))
+    start = Barrier(2, timeout=5)
+
+    def measure(worker):
+        config = SimpleNamespace(getoption=lambda _name: 0)
+        if worker:
+            config.workerinput = {}
+        capture = _HostedCapture(config, shard)
+        if worker:
+            incomplete = SimpleNamespace(nodeid=node, user_properties=[])
+            with contextmanager(capture.pytest_runtest_call)(incomplete):
+                with pytest.raises(FileNotFoundError):
+                    run_isolated_test("pass", cwd=tmp_path / "absent")
+            assert incomplete.user_properties == [(_HOSTED_REPORT, "capture_incomplete")]
+        item = SimpleNamespace(nodeid=node, user_properties=[])
+        with contextmanager(capture.pytest_runtest_call)(item):
+            start.wait()
+            if worker:
+                with pytest.raises(OSError) as failure:
+                    run_isolated_test("pass", "x" * limit)
+                assert failure.value.errno == errno.E2BIG
+            assert run_isolated_test("pass").returncode == 0
+        [(key, payload)] = item.user_properties
+        assert key == _HOSTED_REPORT
+        return [ExecBoundaryMeasurement(*values) for _, values in payload]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fresh = pool.submit(measure, False)
+        worker = pool.submit(measure, True)
+        fresh_row, = fresh.result(timeout=15)
+        failure, retry = worker.result(timeout=15)
+    assert (fresh_row.in_worker, fresh_row.error_errno, fresh_row.child_rc) == (0, 0, 0)
+    assert (failure.in_worker, failure.error_errno, failure.child_rc) == (1, errno.E2BIG, -1)
+    assert failure.argv_max_bytes == limit
+    assert (retry.in_worker, retry.error_errno, retry.child_rc) == (1, 0, 0)
+    assert (retry.arg_max_bytes, retry.stack_soft_bytes, retry.stack_hard_bytes) == _hosted_limits()
+
+
+@pytest.mark.skipif(not _supports_hosted_capture(), reason="requires the Linux CPython exec boundary")
+@pytest.mark.parametrize("preaudit_first", [True, False])
+def test_hosted_capture_refuses_mixed_constructor_outcomes(preaudit_first):
+    from tests.helpers_reviewed_sources import run_isolated_test
+
+    limit = 32 * os.sysconf("SC_PAGESIZE")
+    if not 0 < limit <= MAX_SINGLE_ITEM_CHARS:
+        pytest.skip("Linux single-argument limit exceeds the measurement budget")
+    fail_open = False
+    thread = get_ident()
+
+    def fail_before_audit(event, args):
+        if fail_open and get_ident() == thread and event == "open" and args[0] == os.devnull:
+            raise OSError(errno.EMFILE, "test pre-audit failure")
+
+    sys.addaudithook(fail_before_audit)
+    capture = _HostedCapture(SimpleNamespace(getoption=lambda _name: 0), "unit-core-a")
+    node = next(iter(capture.trials))
+    item = SimpleNamespace(nodeid=node, user_properties=[])
+    with contextmanager(capture.pytest_runtest_call)(item):
+        for before_audit in (preaudit_first, not preaudit_first):
+            fail_open = before_audit
+            try:
+                with pytest.raises(OSError) as failure:
+                    run_isolated_test("pass", "x" * limit)
+                assert failure.value.errno == (errno.EMFILE if before_audit else errno.E2BIG)
+            finally:
+                fail_open = False
+    assert item.user_properties == [(_HOSTED_REPORT, "capture_incomplete")]
+    retry = SimpleNamespace(nodeid=node, user_properties=[])
+    with contextmanager(capture.pytest_runtest_call)(retry):
+        assert run_isolated_test("pass").returncode == 0
+    [(key, ((_, values),))] = retry.user_properties
+    assert key == _HOSTED_REPORT
+    assert ExecBoundaryMeasurement(*values).child_rc == 0
+
+
+@pytest.mark.skipif(not _supports_hosted_capture(), reason="requires the Linux CPython exec boundary")
+@pytest.mark.parametrize("signal_first", [True, False])
+def test_hosted_capture_refuses_signal_only_outcome_even_beside_exec_e2big(signal_first):
+    import signal
+
+    from tests.helpers_reviewed_sources import run_isolated_test
+
+    limit = 32 * os.sysconf("SC_PAGESIZE")
+    if not 0 < limit <= MAX_SINGLE_ITEM_CHARS:
+        pytest.skip("Linux single-argument limit exceeds the measurement budget")
+    capture = _HostedCapture(SimpleNamespace(getoption=lambda _name: 0), "unit-core-a")
+    node = next(iter(capture.trials))
+    item = SimpleNamespace(nodeid=node, user_properties=[])
+    program = "import os, signal\nos.kill(os.getpid(), signal.SIGKILL)"
+    with contextmanager(capture.pytest_runtest_call)(item):
+        for signal_only in (signal_first, not signal_first):
+            if signal_only:
+                assert run_isolated_test(program).returncode == -signal.SIGKILL
+            else:
+                with pytest.raises(OSError) as failure:
+                    run_isolated_test("pass", "x" * limit)
+                assert failure.value.errno == errno.E2BIG
+    assert item.user_properties == [(_HOSTED_REPORT, "capture_incomplete")]
+    row = collect_boundary_metrics("reviewed_isolated", ["python"], {}, in_worker=0,
+                                   child_rc=-signal.SIGKILL)
+    assert validate_measurement_row(row).child_rc == -signal.SIGKILL
+
+
+def _hosted_validate_step():
+    from pathlib import Path
+
+    import yaml
+
+    workflow = Path(__file__).resolve().parents[3] / ".github" / "workflows" / "validate.yml"
+    job = yaml.safe_load(workflow.read_text())["jobs"]["validate"]
+    [step] = (step for step in job["steps"] if step.get("id") == "test")
+    return job, step
+
+
+def _hosted_workflow_body():
+    _, step = _hosted_validate_step()
+    return step["run"].split(" <<'PYTHON'\n", 1)[1].rsplit("\nPYTHON", 1)[0]
+
+
+@pytest.fixture
+def hosted_shard(tmp_path):
+    """A small full shard with ordinary queued work and both reviewed trials."""
+    from pathlib import Path
+
+    checkout = tmp_path / "checkout"
+    core = checkout / "tests" / "unit" / "core"
+    core.mkdir(parents=True)
+    runtime, ordinary_temp, traces = (tmp_path / name for name in ("runner", "ordinary-temp", "traces"))
+    for path in (runtime, ordinary_temp, traces):
+        path.mkdir()
+    (checkout / "pytest.ini").write_text("[pytest]\naddopts = --import-mode=importlib\n", encoding="utf-8")
+    (checkout / "conftest.py").write_text(
+        "import os, sys, pytest\n"
+        "import tests.helpers_reviewed_sources\n"
+        "assert sys.dont_write_bytecode\n"
+        "@pytest.fixture(autouse=True)\n"
+        "def selected_setup(request):\n"
+        "    if os.environ['CAPTURE_TEST_SCENARIO'] == 'setup' and 'isolated_import' in request.node.name:\n"
+        "        pytest.fail('selected setup failed')\n",
+        encoding="utf-8",
+    )
+    (core / "test_a_queued.py").write_text(
+        "import os, pytest\n"
+        "from pathlib import Path\n"
+        "from tests.helpers_reviewed_sources import run_isolated_test\n"
+        "@pytest.mark.parametrize('case', range(24))\n"
+        "def test_queued(case):\n"
+        "    worker = os.environ.get('PYTEST_XDIST_WORKER', 'fresh')\n"
+        "    with Path(os.environ['CAPTURE_TEST_TRACES'], str(case)).open('a') as record:\n"
+        "        record.write(worker + '\\n')\n"
+        "    if case == 0:\n"
+        "        assert run_isolated_test('raise SystemExit(19)').returncode == 19\n"
+        "        assert os.environ['CAPTURE_TEST_SCENARIO'] != 'other-failure'\n",
+        encoding="utf-8",
+    )
+    (core / "test_redaction.py").write_text(
+        "import os, pytest\n"
+        "from tests.helpers_reviewed_sources import run_isolated_test\n"
+        "scenario = os.environ['CAPTURE_TEST_SCENARIO']\n"
+        "@pytest.mark.parametrize('case', ['other' if scenario == 'missing' else 'parent'])\n"
+        "def test_redaction_isolated_import_bootstrap(case, tmp_path):\n"
+        "    if scenario == 'worker-loss':\n"
+        "        os._exit(88)\n"
+        "    if scenario == 'interrupt':\n"
+        "        pytest.exit('stop the ordinary run', returncode=pytest.ExitCode.INTERRUPTED)\n"
+        "    if scenario == 'exec-too-big':\n"
+        "        run_isolated_test('pass', 'x' * (32 * os.sysconf('SC_PAGESIZE')))\n"
+        "    assert run_isolated_test('pass', tmp_path).returncode == 0\n"
+        "def test_private_name_census_rejects_an_unreviewed_importer_path(tmp_path):\n"
+        "    assert run_isolated_test('raise SystemExit(1)', tmp_path).returncode == 1\n",
+        encoding="utf-8",
+    )
+    env = {
+        "PATH": os.defpath, "HOME": str(tmp_path), "PYTHONPATH": str(Path(__file__).resolve().parents[3]),
+        "RUNNER_TEMP": str(runtime), "TMPDIR": str(ordinary_temp), "TEST_VALIDATE_SHARD": "unit-core-a",
+        "CAPTURE_HOSTED_CHILD_EXEC": "true", "GITHUB_STEP_SUMMARY": str(runtime / "summary"),
+        "GITHUB_REF": "refs/heads/feature/teams-t2a-hosted-ci-isolated-child-e2big-hosted-capture",
+        "CAPTURE_TEST_TRACES": str(traces), "PYTEST_XDIST_AUTO_NUM_WORKERS": "2",
+    }
+    return checkout, traces, runtime / "summary", env
+
+
+def _run_hosted_dispatch(hosted_shard, attempt, scenario, *, program=None, **environment):
+    import subprocess
+
+    checkout, _, _, env = hosted_shard
+    return subprocess.run(
+        [sys.executable, "-"], cwd=checkout,
+        env={**env, "GITHUB_RUN_ATTEMPT": attempt, "CAPTURE_TEST_SCENARIO": scenario, **environment},
+        input=_hosted_workflow_body() if program is None else program,
+        text=True, capture_output=True, timeout=45,
+    )
+
+
+def test_hosted_dispatch_uses_the_existing_job_deadline_and_attempt_scope():
+    job, step = _hosted_validate_step()
+    assert job["timeout-minutes"] == 360
+    guard = step["env"]["CAPTURE_HOSTED_CHILD_EXEC"]
+    for clause in ("github.event_name == 'workflow_dispatch'",
+                   "runner.environment == 'github-hosted'", "runner.os == 'Linux'",
+                   "(github.run_attempt == '1' || github.run_attempt == '2')"):
+        assert clause in guard
+    assert not step.get("continue-on-error", False)
+
+
+@pytest.mark.skipif(not _supports_hosted_capture(), reason="requires the Linux diagnostic workflow")
+@pytest.mark.parametrize("ref_prefix", ["refs/tags/feature/", "refs/heads/Feature/"], ids=["tag", "case"])
+def test_hosted_dispatch_uses_ordinary_pytest_on_other_refs(hosted_shard, ref_prefix):
+    _, traces, summary, env = hosted_shard
+    ref = ref_prefix + env["GITHUB_REF"].rsplit("/", 1)[-1]
+    result = _run_hosted_dispatch(hosted_shard, "2", "pass", GITHUB_REF=ref, PYTHONDONTWRITEBYTECODE="1")
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert len(list(traces.iterdir())) == 24
+    assert not summary.exists()
+
+
+@pytest.mark.skipif(not _supports_hosted_capture(), reason="requires the Linux diagnostic workflow")
+@pytest.mark.parametrize("attempt", ["1", "2"])
+@pytest.mark.parametrize("failing", [False, True])
+def test_hosted_dispatch_leaves_core_b_in_ordinary_validate(hosted_shard, attempt, failing):
+    checkout, traces, summary, _ = hosted_shard
+    core = checkout / "tests" / "unit" / "core"
+    (core / "test_a_queued.py").rename(core / "test_z_ordinary.py")
+    result = _run_hosted_dispatch(
+        hosted_shard, attempt, "other-failure" if failing else "pass",
+        TEST_VALIDATE_SHARD="unit-core-b", PYTHONDONTWRITEBYTECODE="1",
+    )
+    assert result.returncode == int(failing), result.stdout + result.stderr
+    completed = {path.name: path.read_text().splitlines() for path in traces.iterdir()}
+    assert completed.keys() == {str(case) for case in range(24)}
+    assert all(len(executions) == 1 for executions in completed.values())
+    assert {executions[0] for executions in completed.values()} == {"gw0", "gw1"}
+    assert not list(summary.parent.iterdir())
+    assert REFUSAL_CODES.isdisjoint(result.stderr.splitlines())
+
+
+@pytest.mark.skipif(not _supports_hosted_capture(), reason="requires the Linux CPython exec boundary")
+@pytest.mark.parametrize("attempt,context,workers", [("1", "worker", {"gw0", "gw1"}), ("2", "fresh", {"fresh"})])
+def test_hosted_dispatch_runs_one_full_shard_with_ordinary_scheduler(hosted_shard, attempt, context, workers):
+    checkout, traces, summary, _ = hosted_shard
+    result = _run_hosted_dispatch(hosted_shard, attempt, "pass")
+    assert result.returncode == 0, result.stderr
+    completed = {path.name: path.read_text().splitlines() for path in traces.iterdir()}
+    assert completed.keys() == {str(case) for case in range(24)}
+    assert all(len(executions) == 1 for executions in completed.values())
+    assert {executions[0] for executions in completed.values()} == workers
+    output = summary.read_bytes()
+    assert len(output) <= _HOSTED_BYTE_LIMIT
+    assert output.count(b"## Hosted isolated child capture") == 1
+    assert f"(unit-core-a, {context})".encode("ascii") in output
+    assert output.count(b"E2BIG not reproduced") == 2
+    assert len(re.findall(rb"(?m)^\| reviewed_isolated \|", output)) == 2
+    assert not list(checkout.rglob("*.pyc"))
+
+
+@pytest.mark.skipif(not _supports_hosted_capture(), reason="requires the Linux CPython exec boundary")
+@pytest.mark.parametrize("attempt,scenario,status,publish", [
+    ("2", "setup", 1, False), ("2", "missing", 1, False), ("1", "worker-loss", 1, False),
+    ("2", "other-failure", 1, True), ("1", "exec-too-big", 1, True), ("2", "exec-too-big", 1, True),
+    ("2", "interrupt", 2, False),
+])
+def test_hosted_dispatch_preserves_pytest_failure_and_qualifies_evidence(hosted_shard, attempt, scenario, status, publish):
+    _, _, summary, _ = hosted_shard
+    result = _run_hosted_dispatch(hosted_shard, attempt, scenario)
+    assert result.returncode == status, (result.stdout, result.stderr)
+    assert summary.is_file() is publish
+    if publish:
+        assert "capture_incomplete" not in result.stderr
+        if scenario == "exec-too-big":
+            assert b"E2BIG reproduced" in summary.read_bytes()
+    else:
+        assert result.stderr.splitlines().count("capture_incomplete") == 1
+
+
+@pytest.mark.skipif(not _supports_hosted_capture(), reason="requires the Linux CPython temp guard")
+def test_hosted_dispatch_accepts_existing_descriptor_open_during_default_temp_probe(hosted_shard):
+    from textwrap import indent
+
+    _, _, summary, _ = hosted_shard
+    setup = (
+        "import io, os, sys, tempfile\n"
+        "with tempfile.TemporaryFile(dir=os.environ['RUNNER_TEMP']) as witness:\n"
+        "    wrapped = []\n"
+        "    def wrap_probe(event, args):\n"
+        "        if not wrapped and event == 'open' and isinstance(args[0], str) and args[2] & os.O_CREAT:\n"
+        "            wrapped.append(True)\n"
+        "            with io.open(witness.fileno(), 'wb', closefd=False):\n"
+        "                print('descriptor observed')\n"
+        "    sys.addaudithook(wrap_probe)\n"
+    )
+    result = _run_hosted_dispatch(hosted_shard, "2", "pass", program=setup + indent(_hosted_workflow_body(), "    "))
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines().count("descriptor observed") == 1
+    assert summary.is_file()
+
+
+@pytest.mark.skipif(not _supports_hosted_capture(), reason="requires Linux diagnostic startup")
+@pytest.mark.parametrize("refusal", ["attempt", "default-temp", "pytest-temp", "runner-temp"])
+def test_hosted_dispatch_refuses_invalid_startup_without_running_ordinary_pytest(hosted_shard, refusal):
+    checkout, traces, summary, _ = hosted_shard
+    overrides = {
+        "attempt": ("3", {}),
+        "default-temp": ("2", {"TMPDIR": str(checkout)}),
+        "pytest-temp": ("2", {"PYTEST_DEBUG_TEMPROOT": str(checkout)}),
+        "runner-temp": ("2", {"RUNNER_TEMP": str(checkout)}),
+    }
+    attempt, env = overrides[refusal]
+    result = _run_hosted_dispatch(hosted_shard, attempt, "pass", **env)
+    assert result.returncode in (1, int(pytest.ExitCode.USAGE_ERROR))
+    assert result.stderr.splitlines().count("capture_incomplete") == 1
+    assert not summary.exists()
+    assert not list(traces.iterdir())
+    assert not list(checkout.glob("pytest-*"))

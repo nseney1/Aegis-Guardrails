@@ -577,6 +577,8 @@ jobs:
         env:
           TEST_VALIDATE_SHARD: ${{ matrix.shard }}
           TEST_VALIDATE_UNIT_REST: tests/unit/cli tests/unit/mcp tests/unit/sdk tests/unit/verification tests/unit/test_ac24_acceptance_audit.py tests/unit/test_ac24_acquire.py tests/unit/test_changelog.py tests/unit/test_docs_claims.py tests/unit/test_docs_links.py tests/unit/test_no_real_gh.py tests/unit/test_p6_noadmin.py tests/unit/test_pypi_state.py tests/unit/test_readme.py tests/unit/test_release_guard.py
+          # One dispatch and one full rerun collect both contexts. Remove after retaining both Linux legs.
+          CAPTURE_HOSTED_CHILD_EXEC: ${{ github.event_name == 'workflow_dispatch' && runner.environment == 'github-hosted' && runner.os == 'Linux' && (github.run_attempt == '1' || github.run_attempt == '2') }}
         run: |
           set -euo pipefail
           userbase="${PYTHONUSERBASE:-$(python -c 'import site; print(site.getuserbase())')}"
@@ -610,6 +612,33 @@ jobs:
               raise SystemExit("Invalid validate shard")
           if not paths:
               raise SystemExit("Validate shard has no test paths")
+
+          lane_ref = "refs/heads/feature/teams-t2a-hosted-ci-isolated-child-e2big-hosted-capture"
+          if (os.environ.pop("CAPTURE_HOSTED_CHILD_EXEC", None) == "true" and os.environ.get("GITHUB_REF") == lane_ref
+                  and shard in ("unit-core-a", "unit-rest")):
+              import sys
+
+              sys.dont_write_bytecode = True
+              summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "")
+              try:
+                  from tests.unit.core import test_hosted_child_exec_measurements as probe
+              except (ImportError, OSError):
+                  raise SystemExit("capture_incomplete") from None
+              # The disposable hosted job's timeout and teardown bound this single pytest run.
+              try:
+                  status, evidence = probe.capture_validate_shard(shard, paths, os.environ.get("GITHUB_RUN_ATTEMPT"))
+              except probe.ExecMeasurementError as error:
+                  raise SystemExit(error.code) from None
+              if not evidence:
+                  print("capture_incomplete", file=sys.stderr)
+                  raise SystemExit(status or 1)
+              try:
+                  with open(summary_path, "ab") as summary:
+                      summary.write(evidence)
+              except OSError:
+                  print("capture_publish_failed", file=sys.stderr)
+                  raise SystemExit(status or 1) from None
+              raise SystemExit(status)
 
           # Keep the normal header for the interpreter and actual xdist worker count.
           import pytest
