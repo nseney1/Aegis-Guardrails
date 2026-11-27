@@ -3,11 +3,18 @@ from __future__ import annotations
 
 import errno
 import os
-from pathlib import Path
+from pathlib import Path, PosixPath, WindowsPath
 from typing import Any, Dict, Optional, Tuple
 
 from aegis_core.diagnostic_messages import receipt_value
-from aegis_core.rule_inventory import RuleInventoryError, read_rule_file, split_frontmatter
+from aegis_core.rule_inventory import (
+    MAX_RULE_PATH_CHARS,
+    RuleInventoryError,
+    RulePathSpelling,
+    classify_rule_path_spelling,
+    read_rule_file,
+    split_frontmatter,
+)
 from aegis_core.yaml_engine.document import AegisDocument
 from aegis_core.yaml_engine.parser import (
     AegisYAMLError,
@@ -78,11 +85,20 @@ def _parse_rule_text(content: str) -> Tuple[Dict[str, Any], str]:
     return data, body.lstrip("\r\n")
 
 
+def _is_standard_rule_path(value: object) -> bool:
+    """Use exact types so custom inputs keep their dispatch protocol."""
+    kind = type(value)
+    return kind is str or kind is PosixPath or kind is WindowsPath
+
+
 def parse_rule_frontmatter(content_or_path: str) -> Tuple[Dict[str, Any], str]:
     """Parse a rule file or markdown string into (frontmatter_dict, body)."""
     content = content_or_path
-    if (isinstance(content_or_path, (str, Path)) and len(str(content_or_path)) <= 32768
-            and os.path.exists(content_or_path) and os.path.isfile(content_or_path)):
+    if _is_standard_rule_path(content_or_path):
+        may_probe = classify_rule_path_spelling(content_or_path) is RulePathSpelling.VALID
+    else:
+        may_probe = isinstance(content_or_path, (str, Path)) and len(str(content_or_path)) <= MAX_RULE_PATH_CHARS
+    if may_probe and os.path.exists(content_or_path) and os.path.isfile(content_or_path):
         content = _read_rule_text(content_or_path)
     return _parse_rule_text(content)
 
@@ -97,8 +113,15 @@ def parse_rule_file(filepath: str) -> Tuple[Dict[str, Any], str]:
     """
     from aegis_core.errors import RuleNotFoundError, RuleParseError
 
-    if (isinstance(filepath, (str, Path)) and len(str(filepath)) <= 32768
-            and "\x00" not in str(filepath) and not os.path.isfile(filepath)):
+    if _is_standard_rule_path(filepath):
+        spelling = classify_rule_path_spelling(filepath)
+        empty = spelling is RulePathSpelling.EMPTY
+        may_probe = spelling is RulePathSpelling.VALID
+    else:
+        empty = False
+        may_probe = (isinstance(filepath, (str, Path)) and len(str(filepath)) <= MAX_RULE_PATH_CHARS
+                     and "\x00" not in str(filepath))
+    if empty or (may_probe and not os.path.isfile(filepath)):
         raise RuleNotFoundError(f"Rule file not found: {receipt_value(str(filepath), 400, identifier=True)}")
     try:
         return _parse_rule_text(_read_rule_text(filepath))
@@ -126,8 +149,7 @@ def _rule_workspace_root(workspace):
         owner = getattr(workspace.confine_path, "__self__", None)
         if isinstance(owner, Workspace):
             root = owner.root
-    if root is not None and (not isinstance(root, (str, Path))
-            or not 1 <= len(str(root)) <= 32768 or "\x00" in str(root)):
+    if root is not None and classify_rule_path_spelling(root) is not RulePathSpelling.VALID:
         raise RuleReadError("Rule file read refused")
     return root
 
@@ -163,7 +185,7 @@ class AegisYAML:
         """
         if not hasattr(workspace, "confine_path"):
             raise AegisYAMLError("Workspace with confine_path() required to parse file")
-        if not isinstance(rel_path, (str, Path)) or not 1 <= len(str(rel_path)) <= 32768:
+        if not isinstance(rel_path, (str, Path)) or not 1 <= len(str(rel_path)) <= MAX_RULE_PATH_CHARS:
             raise RuleReadError("Rule file read refused")
 
         ws_root = _rule_workspace_root(workspace)
@@ -180,8 +202,7 @@ class AegisYAML:
             resolved_abs = resolved
 
         source_path = resolved_abs
-        if (not isinstance(resolved_abs, (str, Path)) or not 1 <= len(str(resolved_abs)) <= 32768
-                or "\x00" in str(resolved_abs)):
+        if classify_rule_path_spelling(resolved_abs) is not RulePathSpelling.VALID:
             raise RuleReadError("Rule file read refused")
         path_obj = Path(resolved_abs)
         if not path_obj.exists():

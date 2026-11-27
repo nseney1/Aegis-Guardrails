@@ -23,7 +23,6 @@ _SEQ_MAPPING_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]*:(?:\s|$)")
 _MAPPING_COLON_RE = re.compile(r":(?:[ \t]|$)")
 _UNSUPPORTED_PREFIXES = ("&", "*", "!", "%", "@", "`")
 _ESCAPES = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\", "/": "/", "'": "'", " ": " "}
-_CLOSING_DELIM_RE = re.compile(r"(?m)^---[ \t]*\r?$")
 _HEX_RE = re.compile(r"[0-9A-Fa-f]+")
 _BLOCK_INDICATORS = ("|", "|-", "|+", ">", ">-", ">+")
 

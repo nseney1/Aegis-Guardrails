@@ -67,13 +67,18 @@ __all__ = [
     "append_epoch",
     "append_rows",
     "append_rows_with_report",
+    "credit_event_rows",
     "incomplete",
     "is_ambient_session_row",
     "ledger_path",
     "merge_rows",
     "normalize_rows",
+    "ordered_history",
     "plan_merge",
+    "positive_tp",
     "read",
+    "report_row_unusable",
+    "row_version",
 ]
 
 LEDGER_VERSION = 2
@@ -151,57 +156,164 @@ def is_ambient_session_row(row: Mapping[str, Any]) -> bool:
             and row.get("outcome") in ("tp", "fp") and "from" not in row)
 
 
+def _row_header(row: Mapping[str, Any]) -> Tuple[Optional[int], Any]:
+    version = row.get("v", 1)
+    return (version if type(version) is int else None), row.get("event")
+
+
+def row_version(row: Mapping[str, Any]) -> Optional[int]:
+    """Legacy rows may omit the version. Unknown versions have no outcome semantics here."""
+    version, _ = _row_header(row)
+    return version if version in (1, LEDGER_VERSION) else None
+
+
+def _credit_kind(version: Optional[int], event: Any) -> Optional[str]:
+    if version == LEDGER_VERSION and isinstance(event, str) and event in _CREDIT_EVENTS:
+        return event
+    return None
+
+
+def credit_event_rows(rows: Iterable[Any]) -> Iterable[Dict[str, Any]]:
+    """Read only registered credit events in the supported credit schema."""
+    return (row for row in rows if isinstance(row, dict) and _credit_kind(*_row_header(row)) is not None)
+
+
+def report_identity(row: Mapping[str, Any]) -> Optional[Tuple[str, str]]:
+    """The check and rule of a usable report, independent of its stored append key."""
+    check, primary, alias = row.get("check"), row.get("rule"), row.get("for_rule")
+    rule = primary or alias
+    if (not isinstance(check, str) or not check or not isinstance(rule, str) or not rule
+            or (primary is not None and alias is not None and primary != alias)):
+        return None
+    tree = row.get("tree")
+    if tree is not None and (not isinstance(tree, str) or not tree):
+        return None
+    if row.get("witness") not in (None, "aegis") or ("result" in row and row["result"] not in OUTCOMES):
+        return None
+    if any(field in row for field in ("scan_ref", "rule_revision", "rule_type")):
+        from aegis_core.rule_integrity import valid_report_policy
+        if not valid_report_policy(row):
+            return None
+    return check, rule
+
+
+def checked_reports(rows: Sequence[Mapping[str, Any]]) -> Iterable[
+        Tuple[Tuple[str, str], Mapping[str, Any], Mapping[str, Any]]]:
+    """Yield the first valid report per check/rule alongside its check."""
+    checks = {r["id"]: r for r in rows if r.get("event") == "check" and isinstance(r.get("id"), str)}
+    seen = set()
+    for report in (row for row in rows if row.get("event") == "report"):
+        identity = report_identity(report)
+        if identity is None or identity in seen:
+            continue
+        check = checks.get(identity[0])
+        if check is None or report.get("tree") not in (None, check.get("tree")):
+            continue
+        seen.add(identity)
+        yield identity, report, check
+
+
+def report_row_unusable(row: Mapping[str, Any], tree: Optional[str], check_id: Optional[str], report_key: str) -> bool:
+    """Identify malformed evidence that could affect report selection or deduplication."""
+    version, event = _row_header(row)
+    if event is None or (version is not None and version != LEDGER_VERSION):
+        return False
+    if not isinstance(event, str):
+        return True
+    if event not in ("check", "report", "claimed"):
+        return False
+    row_tree = row.get("tree")
+    if (isinstance(row_tree, str) and row_tree and row_tree != tree and row.get("report_key") != report_key
+            and (event != "report" or row.get("check") != check_id)):
+        return False
+    if version is None:
+        return True
+    if event == "check":
+        return (not isinstance(row_tree, str) or not row_tree or type(row.get("passed")) is not bool
+                or not isinstance(row.get("id"), str) or not row["id"]
+                or (row.get("tests") is not None and not isinstance(row["tests"], dict)))
+    if event == "claimed":
+        return row_tree is not None and not isinstance(row_tree, str)
+    return (report_identity(row) is None
+            or (row.get("check") == check_id and row_tree is not None and row_tree != tree))
+
+
+def _valid_outcome(row: Dict[str, Any]) -> bool:
+    return (isinstance(row.get("rule"), str) and bool(row["rule"])
+            and row.get("outcome") in OUTCOMES and _weight(row) is not None)
+
+
+def positive_tp(row: Dict[str, Any]) -> bool:
+    """A usable, normalized ordinary outcome can reinforce only at positive TP weight."""
+    return row.get("outcome") == "tp" and bool(_weight(row))
+
+
 def normalize_rows(
     rows: Iterable[Dict[str, Any]], origins: Optional[List[Any]] = None,
 ) -> Tuple[List[Dict[str, Any]], int]:
-    """Return ``(v2 outcome rows, unusable row count)`` for raw ledger rows of any version.
+    """Return usable ordinary outcomes in storage order and the unusable row count.
 
-    v2 rows pass through (``is_ambient_session_row`` rows as triggers); rows without
-    ``rule`` and ``outcome`` (an epoch row) are dropped without counting as unusable. v1 rows are converted in memory, never
-    rewritten on disk. v1 counted triggers in separate ``trigger`` rows (v3 ``aegis
-    check`` wrote one trigger row and one outcome row per rule and run), while a v2
-    outcome row is itself a trigger. So per rule, a v1 trigger row is dropped for each
-    v1 outcome row it pairs with: the rule ends with max(v1 triggers, v1 outcomes)
-    triggers, as v3 readers counted it. The trigger rows kept are the latest ones, so
-    the last trigger time survives. v1 MCP rows (``source: "mcp"``) never pair: v3
-    wrote a report as one outcome row, and a "partial" as one trigger row.
-
-    ``origins``, parallel to ``rows``, gives each converted row's ``from`` (provenance,
-    e.g. the v3 file and line ``aegis migrate`` read it from); the default is "v1".
+    Ambient v2 verdicts become triggers. Legacy v1 rows convert in memory and pair.
+    Paired triggers are dropped oldest first, retaining
+    v3's max(v1 triggers, v1 outcomes) count. v1 MCP rows never pair.
+    Parallel ``origins`` supplies each converted row's ``from`` value, defaulting to "v1".
     """
+    history, unusable = _classify_rows(rows, origins)
+    return _outcomes(history), unusable
+
+
+def _outcomes(history: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [row for row in history if row.get("event") is None]
+
+
+def _outcome_identity(row: Mapping[str, Any]) -> Optional[Tuple[str, str]]:
+    key, rule = row.get("key"), row.get("rule")
+    return (key, rule) if isinstance(key, str) and key and isinstance(rule, str) and rule else None
+
+
+def _classify_rows(rows: Iterable[Dict[str, Any]], origins: Optional[List[Any]] = None, *, first_wins: bool = False
+                   ) -> Tuple[List[Dict[str, Any]], int]:
+    """Normalize outcomes and retain registered events in their original ledger order."""
     out: List[Dict[str, Any]] = []
     unusable = 0
-    v1_triggers: Dict[str, List[Dict[str, Any]]] = {}
+    v1_triggers: Dict[str, List[int]] = {}
     v1_outcomes: Dict[str, int] = {}
+    seen = set()
     for index, row in enumerate(rows):
-        if isinstance(row, dict) and row.get("event") in _CREDIT_EVENTS and "outcome" not in row:
-            continue
-        if row.get("v") == LEDGER_VERSION:
-            if "rule" not in row and "outcome" not in row:
-                continue  # epoch or other bookkeeping row
-            if (
-                isinstance(row.get("rule"), str) and row["rule"]
-                and row.get("outcome") in OUTCOMES and _weight(row) is not None
-            ):
-                out.append(dict(row, outcome="trigger") if is_ambient_session_row(row) else row)
-            else:
-                unusable += 1
-            continue
-        converted = _v1_to_v2(row, origins[index] if origins is not None else "v1")
-        if converted is None or _weight(converted) is None:
+        version, event = _row_header(row) if isinstance(row, dict) else (None, None)
+        if version not in (1, LEDGER_VERSION):
             unusable += 1
             continue
-        rule = converted["rule"]
-        if converted["source"] == "mcp":
-            out.append(converted)
-        elif converted["outcome"] == "trigger":
-            v1_triggers.setdefault(rule, []).append(converted)
+        if event is not None:
+            if _credit_kind(version, event) is None:
+                unusable += 1
+            else:
+                out.append(row)
+            continue
+        if version == LEDGER_VERSION:
+            if "rule" not in row and "outcome" not in row:
+                continue  # epoch or other bookkeeping row
+            normalized = dict(row, outcome="trigger") if is_ambient_session_row(row) else row
         else:
-            v1_outcomes[rule] = v1_outcomes.get(rule, 0) + 1
-            out.append(converted)
-    for rule, triggers in v1_triggers.items():
-        paired = min(len(triggers), v1_outcomes.get(rule, 0))
-        out.extend(triggers[paired:])
+            normalized = _v1_to_v2(row, origins[index] if origins is not None else "v1")
+        if normalized is None or not _valid_outcome(normalized):
+            unusable += 1
+            continue
+        identity = _outcome_identity(normalized) if first_wins else None
+        if identity is not None:
+            if identity in seen:
+                continue
+            seen.add(identity)
+        if version == 1 and normalized["source"] != "mcp":
+            rule = normalized["rule"]
+            if normalized["outcome"] == "trigger":
+                v1_triggers.setdefault(rule, []).append(len(out))
+            else:
+                v1_outcomes[rule] = v1_outcomes.get(rule, 0) + 1
+        out.append(normalized)
+    paired = {index for rule, triggers in v1_triggers.items() for index in triggers[:v1_outcomes.get(rule, 0)]}
+    if paired:
+        out = [row for index, row in enumerate(out) if index not in paired]
     return out, unusable
 
 
@@ -220,6 +332,8 @@ class LedgerView:
     # Every row as read (events included), for the other readers of the same call: one snapshot,
     # one parse. None on a view that never read the file; such a reader reads it and says why not.
     raw_rows: Optional[Tuple[Dict[str, Any], ...]] = field(default=None, repr=False, compare=False)
+    _history: Optional[Tuple[Tuple[Dict[str, Any], ...], Tuple[Dict[str, Any], ...]]] = field(
+        default=None, repr=False, compare=False)
 
     def health(self) -> Dict[str, Any]:
         """What the read could not use, as derived.json and ``aegis status`` record it."""
@@ -265,9 +379,17 @@ def read(workspace: Any) -> LedgerView:
     except OSError as exc:  # the shared state dir cannot be listed for its confinement check
         return LedgerView([], error=f"cannot read {exc.filename or 'the ledger directory'}: {exc.strerror or exc}")
     raw = read_jsonl(path)
-    rows, unusable = normalize_rows(raw.rows)
-    return LedgerView(rows, list(raw.skipped_lines), unusable, raw.torn_tail, raw.error, path,
-                      None if raw.error else tuple(raw.rows))
+    history, unusable = _classify_rows(raw.rows, first_wins=True)
+    raw_rows = None if raw.error else tuple(raw.rows)
+    snapshot = (raw_rows, tuple(history)) if raw_rows is not None else None
+    return LedgerView(_outcomes(history), list(raw.skipped_lines), unusable, raw.torn_tail, raw.error,
+                      path, raw_rows, snapshot)
+
+
+def ordered_history(rows: Sequence[Dict[str, Any]], view: Any = None) -> Sequence[Dict[str, Any]]:
+    """Reuse the classified snapshot when it describes the requested ledger rows."""
+    cached = view._history if isinstance(view, LedgerView) else None
+    return cached[1] if cached is not None and cached[0] is rows else _classify_rows(rows, first_wins=True)[0]
 
 
 def _plain(value: Decimal) -> Any:
@@ -289,6 +411,8 @@ def aggregate_rows(rows: Iterable[Dict[str, Any]], rule: Optional[str] = None) -
     """aggregate() over rows already read (normalized v2 outcome rows)."""
     sums: Dict[str, Dict[str, Any]] = {}
     for row in rows:
+        if row.get("event") is not None:
+            continue
         name = row["rule"]
         if rule is not None and name != rule:
             continue
@@ -316,9 +440,17 @@ def _payload_digest(row: Dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("ascii")).hexdigest()
 
 
+_AppendKey = Tuple[Optional[str], str, str]
+
+
+def _append_key(row: Mapping[str, Any], kind: Optional[str]) -> Optional[_AppendKey]:
+    identity = report_identity(row) if kind == "report" else _outcome_identity(row)
+    return (kind, *identity) if identity is not None else None
+
+
 @dataclass
 class _Index:
-    """What appends need from the ledger: the next seq and the (key, rule) identities.
+    """The next sequence number and identities scoped to each row kind.
 
     Reuse only an unchanged generation captured by a settled read. An append or
     rewrite rebuilds the index: matching end bytes cannot prove prefix continuity.
@@ -328,19 +460,19 @@ class _Index:
     inode: int = -1
     offset: int = 0
     last_seq: int = 0
-    keyed: Dict[Tuple[str, str], Dict[str, Any]] = field(default_factory=dict)
+    keyed: Dict[_AppendKey, Dict[str, Any]] = field(default_factory=dict)
     report: Optional[FileReport] = None
 
-    def absorb(self, raw_rows: Iterable[Dict[str, Any]]) -> None:
+    def absorb(self, raw_rows: Sequence[Dict[str, Any]]) -> None:
         for raw in raw_rows:
             seq = raw.get("seq")
             if isinstance(seq, int) and not isinstance(seq, bool) and seq > self.last_seq:
                 self.last_seq = seq
-        rows, _ = normalize_rows(raw_rows)
+        rows, _ = _classify_rows(raw_rows)
         for row in rows:
-            key = row.get("key")
-            if isinstance(key, str) and key:
-                self.keyed.setdefault((key, row["rule"]), row)
+            identity = _append_key(row, row.get("event"))
+            if identity is not None:
+                self.keyed.setdefault(identity, row)
 
 
 _INDEX_GUARD = threading.Lock()
@@ -432,6 +564,8 @@ def _write(path: Path, rows: List[Dict[str, Any]]) -> Optional[FileReport]:
     finally:
         with _INDEX_GUARD:
             _INDEXES.pop(str(path), None)  # A failed write may also have changed the file.
+    if written.count != len(rows):
+        raise OSError("ledger append did not persist all rows")
     return written.report
 
 
@@ -496,13 +630,13 @@ def append(workspace: Any, events: Iterable[Dict[str, Any]]) -> List[Dict[str, A
     with ledger_locked(workspace) as site:
         path = site.path
         index = _current_index(path, site.lock)
-        seen: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        seen: Dict[_AppendKey, Dict[str, Any]] = {}
         results: List[Dict[str, Any]] = []
         new_rows: List[Dict[str, Any]] = []
         seq = index.last_seq
         stamp = utc_stamp()
         for row in planned:
-            identity = (row["key"], row["rule"]) if row["key"] else None
+            identity = _append_key(row, None)
             existing = None
             if identity is not None:
                 existing = seen.get(identity) or index.keyed.get(identity)
@@ -546,10 +680,10 @@ def append_rows(workspace: Any, rows: List[Dict[str, Any]]) -> List[Dict[str, An
 
 
 def append_rows_with_report(workspace: Any, rows: List[Dict[str, Any]]) -> RowsResult:
-    """Append already-formed v2 outcome rows (``aegis migrate``), renumbering their seq.
+    """Append already-formed v2 rows, renumbering their sequence numbers.
 
-    Rows whose ``(key, rule)`` is already in the ledger are skipped, so a re-run adds
-    nothing. Returns the rows written and optional write-descriptor evidence.
+    A keyed row deduplicates within its own kind. Returns the rows written and
+    optional write-descriptor evidence.
     """
     with ledger_locked(workspace) as site:
         path = site.path
@@ -558,8 +692,8 @@ def append_rows_with_report(workspace: Any, rows: List[Dict[str, Any]]) -> RowsR
         seen = set(index.keyed)
         new_rows = []
         for row in rows:
-            key = row.get("key")
-            identity = (key, row.get("rule")) if isinstance(key, str) and key else None
+            kind = _credit_kind(LEDGER_VERSION, row.get("event"))
+            identity = _append_key(row, kind) if kind is not None or (row.get("event") is None and _valid_outcome(row)) else None
             if identity is not None and identity in seen:
                 continue
             seq += 1

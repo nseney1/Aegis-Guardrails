@@ -107,3 +107,96 @@ def test_cli_clips_redacted_fields_at_complete_marker_boundaries(monkeypatch, ca
     assert captured.err == ""
     value = json.loads(captured.out)["decisions"][0]["decision_ref"]
     assert value == "://a:[REDACTED]@ " * 7
+
+
+def test_cli_assigns_report_local_ordinals_to_redacted_episodes(monkeypatch, capsys):
+    first = "ghp_" + "a" * 36
+    second = "ghp_" + "b" * 36
+    containing = "retry" + first
+    partial = first + ".review"
+    ordinary = "redacted-episode-1"
+    episodes = (containing, first, ordinary, second, first, containing, partial, None)
+    report = {
+        "workspace_id": "team" + containing,
+        "decisions": [{"episode_id": episode} for episode in episodes],
+        "unsigned_tail": {"opportunities": [{"episode_id": None, "member_id": first,
+                                             "worktree_id": "tail" + second}]},
+    }
+    monkeypatch.setattr(cli, "verify", lambda *_: report)
+    args = ["verify", "--config", "owner", "--config-digest", "x", "--anchor", "y"]
+
+    assert cli.main(args) == 0
+    initial = capsys.readouterr()
+    assert initial.err == ""
+    assert not any(episode in initial.out for episode in (first, second, containing, partial))
+    rendered = json.loads(initial.out)
+    assert rendered["workspace_id"] == "[REDACTED]"
+    assert [row["episode_id"] for row in rendered["decisions"]] == [
+        "[redacted-episode-1]", "[redacted-episode-2]", ordinary, "[redacted-episode-3]",
+        "[redacted-episode-2]", "[redacted-episode-1]", "[redacted-episode-4]", None,
+    ]
+    assert rendered["unsigned_tail"] == {"opportunities": [
+        {"episode_id": None, "member_id": "ghp_REDACTED", "worktree_id": "[REDACTED]"},
+    ]}
+
+    assert cli.main(args) == 0
+    assert capsys.readouterr() == initial
+
+    report["decisions"] = [{"episode_id": second}, {"episode_id": containing}, {"episode_id": first}]
+    assert cli.main(args) == 0
+    fresh = capsys.readouterr()
+    assert fresh.err == ""
+    assert [row["episode_id"] for row in json.loads(fresh.out)["decisions"]] == [
+        "[redacted-episode-1]", "[redacted-episode-2]", "[redacted-episode-3]",
+    ]
+
+
+@pytest.mark.parametrize("case", ["partial", "crossing", "self_overlap", "adjacent", "interacting", "composite"])
+def test_cli_masks_fields_containing_private_episodes(monkeypatch, capsys, case):
+    private = "ghp_" + "a" * 20
+    remainder = "b" * 16
+    partial = private + ".xoxb-" + "c" * 10
+    crossing = "retry-context-lead" + private
+    repeated = "q." + private + ".q"
+    shared = "xoxb-abcd-sk-_" + "c" * 20
+    value, episodes = {
+        "partial": ("x" + partial + "extra.xoxb-" + "d" * 10 + ".z", [partial]),
+        "crossing": ("x" + crossing + remainder + ".end", [crossing, private + remainder, private]),
+        "self_overlap": ("x" + repeated + "." + private + ".q.end", [repeated]),
+        "adjacent": ("x" + private + private + ".end", [private]),
+        "interacting": (shared + "." + private, [private]),
+        "composite": (partial, [partial]),
+    }[case]
+    assert len(value) <= 64
+    context = dict.fromkeys(("workspace_id", "member_id", "worktree_id"), value)
+    rule = {"rule_id": value}
+    report = {
+        "workspace_id": value,
+        "decisions": [{**context, **rule, "episode_id": episode} for episode in episodes],
+        "by_revision": [{**rule, "eligible": 1}],
+        "unsigned_tail": {
+            "decisions": [context, {**context, "member_id": "aegis", "worktree_id": shared}],
+            "opportunities": [{**context, **rule, "episode_id": None}],
+            "by_revision": [{**rule, "eligible": 1}],
+        },
+    }
+    monkeypatch.setattr(cli, "verify", lambda *_: report)
+    args = ["verify", "--config", "owner", "--config-digest", "x", "--anchor", "y"]
+
+    assert cli.main(args) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    shown = dict.fromkeys(context, "[REDACTED]")
+    shown_rule = {"rule_id": "[REDACTED]"}
+    assert json.loads(captured.out) == {
+        "workspace_id": "[REDACTED]",
+        "decisions": [{**shown, **shown_rule, "episode_id": f"[redacted-episode-{index}]"}
+                      for index in range(1, len(episodes) + 1)],
+        "by_revision": [{**shown_rule, "eligible": 1}],
+        "unsigned_tail": {
+            "decisions": [shown, {**shown, "member_id": "aegis", "worktree_id": "[REDACTED_TOKEN]"}],
+            "opportunities": [{**shown, **shown_rule, "episode_id": None}],
+            "by_revision": [{**shown_rule, "eligible": 1}],
+        },
+    }
+    assert not any(secret in captured.out for secret in (*episodes, private, remainder, "abcd"))

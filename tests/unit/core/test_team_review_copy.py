@@ -5,11 +5,13 @@ import errno
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
-import importlib
+import importlib.util
 import json
 import os
 from pathlib import Path
+import select
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -32,6 +34,16 @@ from aegis_core.team_host_registry import child_environment
 
 
 ROOT = Path(__file__).resolve().parents[3]
+_REVIEW_WORKER = ROOT / "tests" / "helpers_review_copy_limits.py"
+_REVIEW_SUPPORT_SPEC = importlib.util.spec_from_file_location("review_copy_test_support", _REVIEW_WORKER)
+if _REVIEW_SUPPORT_SPEC is None or _REVIEW_SUPPORT_SPEC.loader is None:
+    raise ImportError("cannot load review-copy test support")
+_REVIEW_SUPPORT = importlib.util.module_from_spec(_REVIEW_SUPPORT_SPEC)
+_REVIEW_SUPPORT_SPEC.loader.exec_module(_REVIEW_SUPPORT)
+real_spawn = _REVIEW_SUPPORT.real_spawn
+_require_review_check = _REVIEW_SUPPORT.require
+_prepare_verified = _REVIEW_SUPPORT.prepare_verified
+_review_record = _REVIEW_SUPPORT.review_record
 _HEX = "0123456789abcdef"
 
 
@@ -55,52 +67,6 @@ def _review_umask():
     previous = os.umask(0o022)
     yield
     os.umask(previous)
-
-
-class GitProcess:
-    """Bounded git child. stderr is discarded; reads are the caller's size."""
-
-    def __init__(self, popen):
-        self.popen = popen
-        self.closed = False
-
-    def close_stdin(self):
-        stream = self.popen.stdin
-        if stream is not None and not stream.closed:
-            stream.close()
-
-    def read(self, count):
-        return self.popen.stdout.read(count)
-
-    def wait(self, timeout):
-        return self.popen.wait(timeout=timeout)
-
-    def kill(self):
-        if self.popen.poll() is None:
-            self.popen.kill()
-
-    def close(self):
-        if self.closed:
-            return
-        self.closed = True
-        self.close_stdin()
-        if self.popen.stdout is not None:
-            self.popen.stdout.close()
-        self.kill()
-        try:
-            self.popen.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self.kill()
-            self.popen.wait(timeout=5)
-
-
-def real_spawn(repository, args, env, timeout):
-    del timeout
-    popen = subprocess.Popen(
-        args, env=env, cwd=f"/proc/{os.getpid()}/fd/{repository}",
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0,
-    )
-    return GitProcess(popen)
 
 
 class Scripted:
@@ -1120,51 +1086,160 @@ def test_prepare_uses_the_spawn_ports_git_outside_default_path(tmp_path, monkeyp
     assert (out / "candidate" / "src" / "app.py").read_bytes() == b"value = 2\n"
 
 
+def _wait_for_review_worker(worker, marker):
+    prefix = b".pending-"
+    size = 1 + len(prefix) + 32 if marker == b"R" else 1
+    ready, _, _ = select.select([worker.stdout], [], [], 30)
+    if not ready:
+        pytest.fail(f"no review worker checkpoint {marker!r}")
+    reply = worker.stdout.read(size)
+    if not reply:
+        _, errors = worker.communicate(timeout=5)
+        pytest.fail(f"review worker missed checkpoint {marker!r}: {errors.decode('utf-8', 'replace')}")
+    _require_review_check(len(reply) == size and reply.startswith(marker), "invalid review worker checkpoint")
+    if marker == b"R":
+        stage = reply[1:]
+        _require_review_check(
+            stage.startswith(prefix) and all(digit in b"0123456789abcdef" for digit in stage[len(prefix):]),
+            "invalid review worker stage name",
+        )
+        return stage.decode("ascii")
+
+
+def _review_entry_stat(path, checkpoint, description):
+    try:
+        return path.lstat()
+    except FileNotFoundError:
+        raise AssertionError(f"{checkpoint}: {description} disappeared") from None
+
+
+def _review_directory_entries(path):
+    _require_review_check(stat.S_ISDIR(path.lstat().st_mode), f"expected a directory at {path}")
+    return {entry.name for entry in path.iterdir()}
+
+
+def _review_tree_modes(root):
+    pending = [root]
+    modes = {}
+    while pending:
+        entry = pending.pop()
+        mode = entry.lstat().st_mode
+        modes[entry.relative_to(root)] = mode
+        if stat.S_ISDIR(mode):
+            pending.extend(entry.iterdir())
+    return modes
+
+
 @pytest.mark.parametrize("phase", ["stage", "scaffold", "lock"])
 def test_prepare_rolls_back_with_a_low_descriptor_limit(tmp_path, phase):
     repo, base, _, candidate, _ = make_repo(tmp_path)
-    import resource
+    resource = pytest.importorskip("resource")
+    if not hasattr(resource, "RLIMIT_NOFILE"):
+        pytest.skip("RLIMIT_NOFILE is unavailable")
 
-    out = tmp_path.joinpath(*(["new"] * 48 if phase == "stage" else ["new"]), "review")
-    listing = b"100644 blob " + _git(repo, "rev-parse", base + ":src/app.py").strip()
-    listing += b"\t" + b"d/" * 80 + b"file\0"
+    outputs = tmp_path / "outputs"
+    peer_parent = outputs / "peer-output"
+    peer_parent.mkdir(parents=True)
+    (peer_parent / "retained").mkdir()
+    out, peer = outputs / "new" / "review", peer_parent / "peer"
+    concurrent = peer_parent / "concurrent"
+    records = _records(tmp_path)
+    record_dir = Path(records)
+    parents_before = _review_directory_entries(outputs)
+    peer_entries_before = _review_directory_entries(peer_parent)
+    _require_review_check(_review_directory_entries(record_dir) == set(), "expected no preparation records")
 
-    borrowed = []
+    def check_layout(checkpoint, *, peers=(), worker_entries=None, record_names=()):
+        parents = parents_before if worker_entries is None else parents_before | {out.parent.name}
+        _require_review_check(_review_directory_entries(outputs) == parents, f"{checkpoint}: unexpected output parents")
+        _require_review_check(
+            _review_directory_entries(peer_parent) == peer_entries_before.union(peers),
+            f"{checkpoint}: unexpected peer parent entries",
+        )
+        if worker_entries is not None:
+            _require_review_check(
+                _review_directory_entries(out.parent) == set(worker_entries),
+                f"{checkpoint}: unexpected worker parent entries",
+            )
+        _require_review_check(
+            _review_directory_entries(record_dir) == set(record_names),
+            f"{checkpoint}: unexpected preparation records",
+        )
 
-    def spawn(root, args, env, timeout):
-        if phase == "lock" and "ls-tree" in args:
-            return _Buffer({"stdout": listing})
-        return real_spawn(root, args, env, timeout)
+    def remove(destination):
+        removed = review_copy.remove(str(destination), preparation_dir=records)
+        _require_review_check(removed == (0, {"removed": str(destination)}), removed)
 
-    def exhaust_at_scaffold(root, args, env, timeout):
-        if phase == "scaffold" and "init" in args:
-            try:
-                for _ in range(limit):
-                    borrowed.append(os.open(os.devnull, os.O_RDONLY))
-            except OSError as error:
-                assert error.errno == errno.EMFILE
-                raise
-            pytest.fail("the descriptor fixture did not reach EMFILE")
-        return spawn(root, args, env, timeout)
+    options = _keywords(real_spawn, tmp_path)
+    digest = _prepare_verified(str(repo), base, candidate, str(peer), **options)
+    peer_identity = peer.lstat()
+    _require_review_check(stat.S_ISDIR(peer_identity.st_mode), "peer root is not a directory")
+    peer_record = _review_record(peer_identity, records)
+    record_identity = peer_record.lstat()
+    _require_review_check(stat.S_ISREG(record_identity.st_mode), "peer record is not a regular file")
+    payload = f"{peer_identity.st_dev:x}:{peer_identity.st_ino:x}:{digest}\n".encode("ascii")
+    peer_modes = _review_tree_modes(peer)
 
-    opened = [int(fd) for fd in _fds() if os.path.exists("/proc/self/fd/" + fd)]
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    slots = len(out.parent.parts) + 1 if phase == "stage" else 32
-    limit = len(opened) + slots
-    assert limit > max(opened) and (soft == resource.RLIM_INFINITY or limit < soft)
-    resource.setrlimit(resource.RLIMIT_NOFILE, (limit, hard))
-    try:
-        status, result = review_copy.prepare(str(repo), base, candidate, str(out), **_keywords(exhaust_at_scaffold, tmp_path))
-        assert (status, result.get("code")) == (2, "filesystem")
-    finally:
-        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
-        for fd in borrowed:
-            os.close(fd)
-    assert bool(borrowed) == (phase == "scaffold")
-    assert {int(fd) for fd in _fds() if os.path.exists("/proc/self/fd/" + fd)} == set(opened)
-    assert not (tmp_path / "new").exists()
-    assert review_copy.prepare(str(repo), base, candidate, str(out), **_keywords(spawn, tmp_path))[0] == 0
-    assert review_copy.remove(str(out), preparation_dir=_records(tmp_path))[0] == 0
+    def check_peer(checkpoint):
+        current = _review_entry_stat(peer, checkpoint, "peer root")
+        _require_review_check(os.path.samestat(current, peer_identity), f"{checkpoint}: peer root was replaced")
+        _require_review_check(_review_tree_modes(peer) == peer_modes, f"{checkpoint}: peer tree types or modes changed")
+        record = _review_entry_stat(peer_record, checkpoint, "peer record")
+        _require_review_check(os.path.samestat(record, record_identity), f"{checkpoint}: peer record was replaced")
+        _require_review_check(record.st_mode == record_identity.st_mode, f"{checkpoint}: peer record mode changed")
+        with peer_record.open("rb") as stream:
+            _require_review_check(stream.read(len(payload) + 1) == payload, f"{checkpoint}: peer record bytes changed")
+        status, verified = review_copy.verify(str(peer), expect_manifest=digest)
+        _require_review_check(status == 0 and verified.get("ok") is True, (checkpoint, verified))
+
+    peer_names, peer_records = (peer.name,), (peer_record.name,)
+    check_peer("peer prepared")
+    check_layout("peer prepared", peers=peer_names, record_names=peer_records)
+
+    argv = [sys.executable, "-I", "-B", str(_REVIEW_WORKER), phase, str(repo), base, candidate, str(out), records]
+    with subprocess.Popen(argv, cwd=ROOT, close_fds=True, stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0) as worker:
+        try:
+            stage = _wait_for_review_worker(worker, b"R")
+            check_peer("R")
+            check_layout("R", peers=peer_names, worker_entries=(stage,), record_names=peer_records)
+
+            # The worker is still stopped at the failed open with every slot occupied.
+            _prepare_verified(str(repo), base, candidate, str(concurrent), **options)
+            concurrent_record = _review_record(concurrent.lstat(), records)
+            check_peer("concurrent copy prepared")
+            check_layout(
+                "concurrent copy prepared", peers=(*peer_names, concurrent.name),
+                worker_entries=(stage,), record_names=(*peer_records, concurrent_record.name),
+            )
+            remove(concurrent)
+            check_peer("concurrent copy removed")
+            check_layout("concurrent copy removed", peers=peer_names, worker_entries=(stage,), record_names=peer_records)
+
+            worker.stdin.write(b"G")
+            _wait_for_review_worker(worker, b"B")
+            check_peer("B")
+            check_layout("B", peers=peer_names, record_names=peer_records)
+
+            worker.stdin.write(b"G")
+            _wait_for_review_worker(worker, b"P")
+            retry_record = _review_record(out.lstat(), records)
+            check_peer("retry prepared")
+            check_layout(
+                "retry prepared", peers=peer_names, worker_entries=(out.name,),
+                record_names=(*peer_records, retry_record.name),
+            )
+
+            _, errors = worker.communicate(input=b"G", timeout=30)
+            _require_review_check(worker.returncode == 0, errors.decode("utf-8", "replace"))
+            check_peer("retry removed")
+            check_layout("retry removed", peers=peer_names, worker_entries=(), record_names=peer_records)
+            remove(peer)
+            check_layout("peer removed", worker_entries=())
+        finally:
+            if worker.poll() is None:
+                worker.kill()
+                worker.wait(timeout=5)
 
 
 def test_remove_directory_open_count_is_linear_for_disjoint_chains(monkeypatch, tmp_path):
@@ -1727,6 +1802,36 @@ def test_timeout_refuses_and_closes_without_a_copy(tmp_path):
     assert code == 2 and result["code"] == "git_timeout"
     assert "slow" not in json.dumps(result)
     assert not out.exists()
+
+
+@pytest.mark.parametrize("program", [
+    "import time; time.sleep(3)",
+    "import os, time\nfor _ in range(30):\n    os.write(1, b'x')\n    time.sleep(0.1)",
+    "import os, time; os.close(1); time.sleep(3)",
+], ids=["silent", "chunks", "wait"])
+def test_real_git_deadline_refuses_and_reaps(tmp_path, program):
+    _require_git_descriptors()
+    repo = _scripted_repo(tmp_path)
+    out = tmp_path / "review"
+    children = []
+
+    def spawn(repository, args, env, timeout):
+        assert args[-2:] == ["rev-parse", "--show-toplevel"]
+        child = real_spawn(repository, [sys.executable, "-I", "-B", "-c", program], env, min(timeout, 1))
+        children.append(child.popen)
+        return child
+
+    result = review_copy.prepare(str(repo), "2" * 40, "3" * 40, str(out), **_keywords(spawn, tmp_path))
+    assert result == (2, {
+        "reason": "git_timeout",
+        "code": "git_timeout",
+        "next_action": "Retry the local Git read within the documented time limit.",
+    })
+    child, = children
+    assert child.returncode == -signal.SIGKILL
+    assert child.stdin.closed and child.stdout.closed
+    assert not out.exists()
+    assert list(Path(_records(tmp_path)).iterdir()) == []
 
 
 @pytest.mark.parametrize("header", [b"0" * 40 + b" blob 1\nx\n", b""])

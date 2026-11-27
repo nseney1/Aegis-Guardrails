@@ -20,6 +20,7 @@ from aegis_cli import team as cli_team
 from aegis_cli import msg as cli_msg
 from aegis_core import events, message_codec, model_select, storage, team, team_claims, team_profile, team_queue
 from aegis_core import team_writer_binding as binding
+from tests.helpers_writer_binding import prepare_passwd_home
 
 
 # Captured on b13c9d8e before the adapter/policy move. Each digest covers the
@@ -468,6 +469,14 @@ def test_queue_flow_golden_rejects_wrong_revision(workspace, capsys, monkeypatch
         _assert_queue_flow_golden("add", observation)
 
 
+@pytest.fixture(autouse=True)
+def passwd_home(tmp_path, monkeypatch):
+    """Queue verdicts observe this mode-0700 home, never the host passwd home or HOME."""
+    home = prepare_passwd_home(tmp_path / "passwd-home")
+    monkeypatch.setattr(team_claims, "_passwd_home", lambda: str(home))
+    return home
+
+
 @pytest.fixture
 def workspace(tmp_path):
     if not team_queue.descriptor_supported():
@@ -650,7 +659,11 @@ def test_cli_unclaim_live_binding_defeats_stop_acknowledgement(workspace, capsys
         pytest.skip("requires Linux process identity and confined storage")
     home = workspace.parent / "passwd-home"
     (home / ".config/aegis").mkdir(parents=True)
-    monkeypatch.setattr(team_claims, "pwd", SimpleNamespace(getpwuid=lambda uid: SimpleNamespace(pw_dir=str(home))))
+    if os.name == "posix":
+        os.chmod(home, 0o700)
+        os.chmod(home / ".config", 0o700)
+        os.chmod(home / ".config/aegis", 0o700)
+    monkeypatch.setattr(team_claims, "_passwd_home", lambda: str(home))
     added = team_queue.add(workspace, {"id": "ONE", "title": "Work", "paths": ["src/**"], "capabilities": []})
     claimed = team_queue.claim(workspace, "ONE", expect=added["item"]["revision"], lane="writer")
     lease = team.claim(workspace, "writer", ["src/**"])

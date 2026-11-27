@@ -7,7 +7,7 @@ from pathlib import Path, PureWindowsPath
 import shlex
 import shutil
 import subprocess
-from threading import Event
+from threading import Barrier, Event, get_ident
 import time
 from types import SimpleNamespace
 
@@ -17,6 +17,7 @@ from conftest import symlink_or_skip
 from aegis_core import events, gitsafe, storage, team, team_claims, team_queue as queue
 from aegis_core import team_writer_binding as binding
 from aegis_core.workspace.binding import resolve_cli_root
+from tests.helpers_writer_binding import install_passwd_home, prepare_passwd_home, root_binding_case
 
 
 @pytest.fixture
@@ -54,13 +55,18 @@ def receipts(root):
     return [row for row in events.read(root).rows if row["detail"].get("action") == "unclaim"]
 
 
+@pytest.fixture(autouse=True)
+def passwd_home(tmp_path, monkeypatch):
+    """Every in-process verdict observes this mode-0700 directory, never the host passwd home."""
+    home = prepare_passwd_home(tmp_path / "passwd-home")
+    monkeypatch.setattr(team_claims, "_passwd_home", lambda: str(home))
+    return home
+
+
 @pytest.fixture
-def binding_home(make_store, monkeypatch):
-    home = make_store.parent / "passwd-home"
-    (home / ".config/aegis").mkdir(parents=True)
-    monkeypatch.setattr(team_claims, "pwd", SimpleNamespace(
-        getpwuid=lambda uid: SimpleNamespace(pw_dir=str(home))))
-    return str(home)
+def binding_home(passwd_home):
+    (passwd_home / ".config/aegis").mkdir(parents=True)
+    return str(passwd_home)
 
 
 def linked_writer(root):
@@ -602,9 +608,9 @@ def test_binding_storage_refusals_and_absence_are_distinct(make_store, binding_h
             outside.mkdir()
             symlink_or_skip(outside, config, target_is_directory=True)
     elif case == "unreadable-home":
-        def unavailable(uid):
+        def unavailable():
             raise OSError("private-value")
-        monkeypatch.setattr(team_claims, "pwd", SimpleNamespace(getpwuid=unavailable))
+        monkeypatch.setattr(team_claims, "_passwd_home", unavailable)
     else:
         (config / binding.NAME).write_bytes(b"x" * (binding.MAX_BYTES + 1) if case == "oversized" else b"{")
     result = queue.unclaim(make_store, "ONE", expect=revision, lane="alpha", now=102, caller="owner")
@@ -739,13 +745,30 @@ def test_crash_recovery_blocks_other_transitions_and_records_once(make_store, mo
 
 
 def race_unclaim(arguments):
-    return unclaim(*arguments)
+    """Run one unclaim in this process after installing the caller's home."""
+    root, revision, home = arguments
+    restore = install_passwd_home(home)
+    try:
+        return unclaim(root, revision)
+    finally:
+        restore()
 
 
-def test_concurrent_unclaims_have_one_recorded_winner(make_store):
+def probe_unclaim_home(arguments):
+    """No-ack unclaim used to prove a spawned worker observed the installed home."""
+    root, revision, home = arguments
+    restore = install_passwd_home(home)
+    try:
+        return queue.unclaim(root, "ONE", expect=revision, lane="alpha", now=102,
+                             caller="owner", writer_stopped=False)
+    finally:
+        restore()
+
+
+def test_concurrent_unclaims_have_one_recorded_winner(make_store, passwd_home):
     revision, _ = held(make_store)
     with ProcessPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(race_unclaim, [(make_store, revision)] * 2, timeout=30))
+        results = list(pool.map(race_unclaim, [(make_store, revision, str(passwd_home))] * 2, timeout=30))
     assert sorted(row["refused"] for row in results) == [False, True]
     assert next(row for row in results if row["refused"])["reason"] == "stale_revision"
     assert len(receipts(make_store)) == 1
@@ -851,7 +874,8 @@ def test_fingerprint_tracks_holds_leases_and_completion_without_clock_noise(make
     assert queue.list(make_store, capabilities=["other"], include_done=True, now=102)["claimable_fingerprint"] == fingerprint()
 
 
-def test_operator_must_acknowledge_stopped_writer(make_store):
+def test_operator_must_acknowledge_stopped_writer(make_store, passwd_home):
+    assert team_claims._passwd_home() == str(passwd_home)
     revision, oid = held(make_store)
     path = make_store / ".aegis" / "state" / "team-queue.json"
     before = path.read_bytes()
@@ -1245,7 +1269,7 @@ def test_initial_io_refusal_before_release_restores_exact_bytes(make_store, monk
     path.write_text(json.dumps(json.loads(path.read_text()), indent=2) + "\n", encoding="utf-8")
     before, original, reads = path.read_bytes(), team.read_leases, []
 
-    def failed(root):
+    def failed(root, **_kwargs):
         reads.append(True)
         if len(reads) > 1:
             raise gitsafe.GitError("private-value")
@@ -1607,6 +1631,28 @@ def plant_pending(root, monkeypatch):
     return revision, oid, path
 
 
+def plant_released(root, monkeypatch):
+    """Stop after the lease ref is gone and before the receipt is published."""
+    revision, oid = held(root)
+    original = queue._publish
+
+    def fail_after(store, state, **kwargs):
+        original(store, state, **kwargs)
+        intent = state.get("unclaim")
+        if intent is not None and intent.get("released_lease_ids"):
+            raise OSError("injected")
+
+    monkeypatch.setattr(queue, "_publish", fail_after)
+    failed = unclaim(root, revision)
+    monkeypatch.setattr(queue, "_publish", original)
+    assert failed["reason"] == "unclaim_recovery_required", failed
+    path = root / ".aegis" / "state" / "team-queue.json"
+    saved = json.loads(path.read_bytes())
+    assert saved["unclaim"]["released_lease_ids"] == [oid]
+    assert team.read_leases(root).get("alpha") is None
+    return revision, oid, path
+
+
 def cause_of(result):
     assert result["reason"] == "unclaim_recovery_required" and result["exit_code"] == 1, result
     assert result["blockers"][0]["reason"] == "unclaim_recovery_required"
@@ -1627,6 +1673,739 @@ def test_initial_event_refusal_restores_queue_bytes(make_store):
     target.unlink()
     assert not unclaim(make_store, revision)["refused"]
 
+
+
+def _covering_double(tmp_path, monkeypatch, raw):
+    """One covering object at the shared Git boundary. No repository and no getuid."""
+    oid = "d" * 40
+    reads = []
+
+    def read_object(root, object_id, limit):
+        reads.append(object_id)
+        return raw
+
+    def list_refs(root, prefix):
+        return [(team.lane_ref("alpha"), oid)]
+
+    monkeypatch.setattr(gitsafe, "read_object", read_object)
+    monkeypatch.setattr(gitsafe, "list_refs", list_refs)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(team_claims, "_passwd_home", lambda: str(home))
+    state = {"items": {"ONE": {"state": "claimed", "lane": "alpha",
+                               "item": {"id": "ONE", "paths": ["src/**"]}}}}
+    return tmp_path / "repo", state, oid, reads
+
+
+def test_later_verdicts_reuse_the_parsed_covering_lease(tmp_path, monkeypatch):
+    """check_writer and a later verdict share one object read. A new check reads again."""
+    root, state, oid, reads = _covering_double(tmp_path, monkeypatch, _lease_raw())
+    seen = []
+
+    def observe(user_root, found, summary):
+        seen.append(found.leases[0])
+        return {"binding": "no_binding_config", "verdict": {
+            "state": "unknown", "reason": "bindings_unavailable", "leases": summary}}
+
+    monkeypatch.setattr(binding, "observe", observe)
+    covering = team_claims.check_writer(root, state, "ONE", "alpha", True)
+    team_claims._check_writer(root, "alpha", oid, True, covering=covering)
+    assert reads == [oid]
+    assert len(seen) == 2 and seen[0] is seen[1] and seen[0].oid == oid
+    team_claims.check_writer(root, state, "ONE", "alpha", True)
+    assert reads == [oid, oid]
+    assert seen[2] is not seen[0]
+
+
+def test_failed_covering_read_retries_only_on_the_next_unclaim(tmp_path, monkeypatch):
+    """A failed verdict read is reused until the next transaction resets it."""
+    root, state, oid, reads = _covering_double(tmp_path, monkeypatch, _lease_raw())
+
+    def read_object(root, object_id, limit):
+        reads.append(object_id)
+        raise gitsafe.GitError("private-value")
+
+    monkeypatch.setattr(gitsafe, "read_object", read_object)
+    covering = team_claims.check_writer(root, state, "ONE", "alpha", True)
+    for _ in range(2):
+        assert _refusal_reason(lambda: team_claims._check_writer(
+            root, "alpha", oid, False, covering=covering)) == "bindings_unavailable"
+    assert reads == [oid]
+    assert _refusal_reason(lambda: team_claims._check_writer(root, "alpha", oid, False)) == "bindings_unavailable"
+    assert reads == [oid, oid]
+    assert _refusal_reason(lambda: team_claims.check_writer(root, state, "ONE", "alpha", False)) == "writer_not_stopped"
+
+
+def _lease_raw():
+    return json.dumps({
+        "v": 1, "lane": "alpha", "role": "implementer", "owner": "owner", "claim_id": "a" * 16,
+        "gen": 1, "branch": "lane/writer", "paths": ["src/**"], "ts": 50, "ttl_s": 100,
+    }).encode()
+
+
+def _refusal_reason(call):
+    with pytest.raises(team_claims.ClaimRefusal) as caught:
+        call()
+    assert "private-value" not in str(caught.value)
+    return caught.value.reason
+
+
+@pytest.mark.parametrize("kind,verdict_reason,stopped,expected", [
+    ("no_binding_config", "bindings_unavailable", False, "writer_not_stopped"),
+    ("no_binding_config", "bindings_unavailable", True, None),
+    ("storage_unsafe", "bindings_unavailable", False, "bindings_unavailable"),
+    ("storage_unsafe", "bindings_unavailable", True, None),
+    ("ready", "no_bound_liveness_source", False, "writer_not_stopped"),
+    ("ready", "writer_bound", True, "writer_live"),
+    ("ready", "writer_bound", False, "writer_live"),
+])
+def test_verdict_uses_the_published_observation_once(tmp_path, monkeypatch, kind, verdict_reason,
+                                                     stopped, expected):
+    """Absence is remapped only from this call's observation. The lease is reused."""
+    root, state, oid, reads = _covering_double(tmp_path, monkeypatch, _lease_raw())
+    seen = []
+
+    def observe(user_root, found, summary):
+        seen.append(found.leases[0])
+        return {"binding": kind, "verdict": {
+            "state": "unknown", "reason": verdict_reason, "leases": summary}}
+
+    monkeypatch.setattr(binding, "observe", observe)
+
+    def once():
+        return team_claims.check_writer(root, state, "ONE", "alpha", stopped)
+
+    if expected is None:
+        covering = once()
+        team_claims._check_writer(root, "alpha", oid, stopped, covering=covering)
+        assert reads == [oid]
+        assert seen[0] is seen[1]
+    else:
+        assert _refusal_reason(once) == expected
+        assert _refusal_reason(lambda: team_claims._check_writer(root, "alpha", oid, stopped)) == expected
+        assert reads == [oid, oid]
+        assert seen[0] is not seen[1]
+    assert len(seen) == 2
+
+
+def test_patched_judge_is_not_remapped_from_a_stale_observation(tmp_path, monkeypatch):
+    """A replacement judge owns its reason, including a missing config directory."""
+    root, state, oid, reads = _covering_double(tmp_path, monkeypatch, _lease_raw())
+
+    def observe(user_root, found, summary):
+        return {"binding": "no_binding_config", "verdict": {
+            "state": "unknown", "reason": "bindings_unavailable", "leases": summary}}
+
+    monkeypatch.setattr(binding, "observe", observe)
+    assert _refusal_reason(lambda: team_claims.check_writer(root, state, "ONE", "alpha", False)) == "writer_not_stopped"
+    monkeypatch.setattr(binding, "judge", lambda home, found, summary: {
+        "state": "unknown", "reason": "bindings_unavailable", "leases": summary})
+    assert _refusal_reason(lambda: team_claims.check_writer(root, state, "ONE", "alpha", False)) == "bindings_unavailable"
+    monkeypatch.setattr(binding, "judge", lambda *args: {"reason": ("private-value", "trailer")})
+    assert _refusal_reason(lambda: team_claims.check_writer(root, state, "ONE", "alpha", False)) == "bindings_unavailable"
+    monkeypatch.setattr(binding, "judge", lambda *args: None)
+    assert _refusal_reason(lambda: team_claims.check_writer(root, state, "ONE", "alpha", False)) == "bindings_unavailable"
+    assert reads == [oid, oid, oid, oid]
+
+
+def test_non_string_verdict_is_not_joined_or_treated_as_absence(tmp_path, monkeypatch):
+    root, state, oid, reads = _covering_double(tmp_path, monkeypatch, _lease_raw())
+
+    def observe(user_root, found, summary):
+        return {"binding": "no_binding_config", "verdict": {"reason": ("private-value", "trailer")}}
+
+    monkeypatch.setattr(binding, "observe", observe)
+    assert _refusal_reason(lambda: team_claims.check_writer(root, state, "ONE", "alpha", False)) == "bindings_unavailable"
+    assert _refusal_reason(lambda: team_claims._check_writer(root, "alpha", oid, False)) == "bindings_unavailable"
+    monkeypatch.setattr(binding, "observe", lambda *args: {
+        "binding": "no_binding_config", "verdict": {"reason": "private-value\ntrailer"}})
+    assert _refusal_reason(lambda: team_claims._check_writer(root, "alpha", oid, False)) == "bindings_unavailable"
+    assert reads == [oid, oid, oid]
+
+
+def test_unsupported_binding_probe_stays_unavailable(tmp_path, monkeypatch):
+    """A platform that cannot open the binding store is not a missing config."""
+    root, state, oid, reads = _covering_double(tmp_path, monkeypatch, _lease_raw())
+    opened = []
+    probes = {"storage": 0}
+
+    def confined(*args, **kwargs):
+        opened.append(args)
+        raise AssertionError("unsupported probe must not open")
+
+    def storage_probe():
+        probes["storage"] += 1
+        return False
+
+    monkeypatch.setattr(binding.storage_confined, "descriptor_supported", storage_probe)
+    monkeypatch.setattr(binding, "open_directory", confined)
+    monkeypatch.setattr(binding, "_confined_file", confined)
+    assert _refusal_reason(lambda: team_claims.check_writer(root, state, "ONE", "alpha", False)) == "bindings_unavailable"
+    assert probes["storage"] >= 1
+    assert opened == []
+    assert reads == [oid]
+    team_claims.check_writer(root, state, "ONE", "alpha", True)
+    assert reads == [oid, oid]
+    assert opened == []
+
+
+def test_root_passwd_home_preserves_no_ack_reason(tmp_path, monkeypatch, root_binding_case):
+    home, allows_absence, assert_walk_closed = root_binding_case
+    root, state, oid, reads = _covering_double(tmp_path, monkeypatch, _lease_raw())
+    monkeypatch.setattr(team_claims, "_passwd_home", lambda: home)
+    expected = "writer_not_stopped" if allows_absence else "bindings_unavailable"
+    assert _refusal_reason(lambda: team_claims.check_writer(root, state, "ONE", "alpha", False)) == expected
+    assert reads == [oid]
+    assert_walk_closed()
+
+
+def test_absence_without_kernel_identity_is_writer_not_stopped(tmp_path, monkeypatch):
+    if not binding.storage_confined.descriptor_supported():
+        pytest.skip("requires descriptor-relative no-follow storage")
+    home = tmp_path / "zzmarker-home"
+    home.mkdir()
+    os.chmod(home, 0o700)
+    root, state, oid, reads = _covering_double(tmp_path, monkeypatch, _lease_raw())
+    monkeypatch.setattr(team_claims, "_passwd_home", lambda: str(home))
+    monkeypatch.setattr(binding, "descriptor_supported", lambda: False)
+    assert _refusal_reason(lambda: team_claims.check_writer(root, state, "ONE", "alpha", False)) == "writer_not_stopped"
+    assert reads == [oid]
+    assert not (home / ".config").exists()
+
+
+def test_concurrent_unclaims_do_not_share_a_covering_lease(tmp_path, monkeypatch):
+    """Each unclaim context parses its own object and reuses that object only."""
+    root, state, oid, reads = _covering_double(tmp_path, monkeypatch, _lease_raw())
+    bodies = {}
+    seen = []
+    lock_reads = []
+
+    def read_object(store, object_id, limit):
+        ident = get_ident()
+        body = bodies[ident]
+        lock_reads.append(ident)
+        return body
+
+    monkeypatch.setattr(gitsafe, "read_object", read_object)
+
+    def observe(user_root, found, summary):
+        seen.append((get_ident(), found.leases[0]))
+        return {"binding": "no_binding_config", "verdict": {
+            "state": "unknown", "reason": "bindings_unavailable", "leases": summary}}
+
+    monkeypatch.setattr(binding, "observe", observe)
+    barrier = Barrier(2)
+
+    def worker(marker):
+        raw = _lease_raw().replace(b'"gen": 1', b'"gen": ' + str(marker).encode("ascii"))
+        bodies[get_ident()] = raw
+        barrier.wait(timeout=5)
+        covering = team_claims.check_writer(root, state, "ONE", "alpha", True)
+        barrier.wait(timeout=5)
+        team_claims._check_writer(root, "alpha", oid, True, covering=covering)
+        return get_ident()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        idents = [future.result(timeout=15) for future in (pool.submit(worker, 3), pool.submit(worker, 4))]
+    assert len(set(idents)) == 2
+    assert sorted(lock_reads) == sorted(idents)
+    by_ident = {}
+    for ident, lease in seen:
+        by_ident.setdefault(ident, []).append(lease)
+    assert set(by_ident) == set(idents)
+    for leases in by_ident.values():
+        assert len(leases) == 2 and leases[0] is leases[1]
+    assert by_ident[idents[0]][0] is not by_ident[idents[1]][0]
+    assert {by_ident[idents[0]][0].gen, by_ident[idents[1]][0].gen} == {3, 4}
+
+
+def _spy_covering_reads(monkeypatch):
+    """Count blob reads where both team and team_claims resolve gitsafe."""
+    reads = []
+    original = gitsafe.read_object
+
+    def spy(root, object_id, limit):
+        reads.append(object_id)
+        return original(root, object_id, limit)
+
+    monkeypatch.setattr(gitsafe, "read_object", spy)
+    return reads
+
+
+def _spy_ref_checks(monkeypatch):
+    lists, refs = [], []
+    original_list, original_ref = gitsafe.list_refs, gitsafe.read_ref
+
+    def list_refs(root, prefix):
+        lists.append(prefix)
+        return original_list(root, prefix)
+
+    def read_ref(root, ref):
+        refs.append(ref)
+        return original_ref(root, ref)
+
+    monkeypatch.setattr(gitsafe, "list_refs", list_refs)
+    monkeypatch.setattr(gitsafe, "read_ref", read_ref)
+    return lists, refs
+
+
+@pytest.mark.parametrize("exit_at, reason", [
+    ("ack", "writer_not_stopped"),
+    ("input", "invalid_item"),
+    ("snapshot", "queue_io_unavailable"),
+])
+def test_unclaim_early_exit_preserves_state_and_retry_reads_again(make_store, monkeypatch, exit_at, reason):
+    revision, oid = held(make_store)
+    path = make_store / ".aegis/state/team-queue.json"
+    before = path.read_bytes()
+    ref = team.lane_ref("alpha")
+    reads = _spy_covering_reads(monkeypatch)
+    read_file = queue._read
+    queue_reads = []
+
+    def read(root, parts, limit=queue.MAX_BYTES):
+        if parts[-1] == "team-queue.json":
+            queue_reads.append(parts)
+            if len(queue_reads) == 2 and exit_at == "snapshot":
+                raise OSError("private-value")
+        return read_file(root, parts, limit)
+
+    monkeypatch.setattr(queue, "_read", read)
+    first = queue.unclaim(make_store, "ONE", expect=revision, lane="alpha", caller="owner", now=102,
+                          writer_stopped=exit_at != "ack", reason="private-value\ntrailer" if exit_at == "input" else "")
+    monkeypatch.setattr(queue, "_read", read_file)
+    assert first["reason"] == reason and first["refused"], first
+    assert "private-value" not in json.dumps(first)
+    assert reads == [oid]
+    assert path.read_bytes() == before and receipts(make_store) == []
+    assert gitsafe.read_ref(make_store, ref) == oid
+    retried = unclaim(make_store, revision)
+    assert retried["exit_code"] == 0 and retried["released_lease_ids"] == [oid], retried
+    assert reads == [oid, oid]
+    assert gitsafe.read_ref(make_store, ref) is None and len(receipts(make_store)) == 1
+
+
+def test_overlapping_unclaims_in_one_context_keep_their_own_covering_lease(make_store, monkeypatch):
+    revision, oid = held(make_store)
+    second = make_store.with_name("second-repo")
+    shutil.copytree(make_store, second)
+    read_object, real_observe = gitsafe.read_object, binding.observe
+    reads, results, judged = [], [], []
+
+    def read(root, object_id, limit):
+        reads.append((Path(root), object_id))
+        return read_object(root, object_id, limit)
+
+    def observe(home, found, summary):
+        judged.append(found.leases[0])
+        if len(judged) == 1:
+            results.append(unclaim(second, revision))
+        return real_observe(home, found, summary)
+
+    monkeypatch.setattr(gitsafe, "read_object", read)
+    monkeypatch.setattr(binding, "observe", observe)
+    results.append(unclaim(make_store, revision))
+    assert reads == [(make_store, oid), (second, oid)]
+    assert len(judged) == 12
+    first, nested = judged[0], judged[1]
+    assert first is not nested
+    assert all(value is nested for value in judged[1:7])
+    assert all(value is first for value in judged[7:])
+    for root, result in zip((second, make_store), results):
+        assert result["exit_code"] == 0 and result["released_lease_ids"] == [oid], result
+        assert gitsafe.read_ref(root, team.lane_ref("alpha")) is None
+        assert len(receipts(root)) == 1
+
+
+@pytest.mark.parametrize("returning, unreadable", [(False, False), (True, False), (True, True)])
+def test_unclaim_observes_renewed_and_returning_oids_once(make_store, monkeypatch, returning, unreadable):
+    revision, first = held(make_store)
+    renewed = team.renew(make_store, "alpha", first, now=101).oid
+    other = team.claim(make_store, "beta", ["docs/**"], owner="other", now=101).oid
+    ref = team.lane_ref("alpha")
+    gitsafe.update_ref(make_store, ref, first, renewed, single_attempt=True)
+    queue_path = make_store / ".aegis/state/team-queue.json"
+    before = queue_path.read_bytes()
+    real_list, real_read, real_observe = gitsafe.list_refs, gitsafe.read_object, binding.observe
+    snapshots, reads, judged = [], [], []
+
+    def list_refs(root, prefix):
+        if len(snapshots) == 1:
+            gitsafe.update_ref(root, ref, renewed, first, single_attempt=True)
+        if len(snapshots) == 2 and returning:
+            gitsafe.update_ref(root, ref, first, renewed, single_attempt=True)
+        found = real_list(root, prefix)
+        snapshots.append(dict(found).get(ref))
+        return found
+
+    def read_object(root, oid, limit):
+        reads.append(oid)
+        if unreadable and oid == first and reads.count(first) == 1:
+            raise gitsafe.GitError("private-value")
+        return real_read(root, oid, limit)
+
+    def observe(home, found, summary):
+        judged.append(found.leases[0])
+        return real_observe(home, found, summary)
+
+    monkeypatch.setattr(gitsafe, "list_refs", list_refs)
+    monkeypatch.setattr(gitsafe, "read_object", read_object)
+    monkeypatch.setattr(binding, "observe", observe)
+    result = unclaim(make_store, revision)
+
+    assert [oid for oid in reads if oid != other] == [first, renewed]
+    assert reads.count(other) == len(snapshots)
+    checkpoints = ([] if unreadable else [first]) + [renewed] * (2 if returning else 5)
+    assert [lease.oid for lease in judged] == checkpoints
+    assert all(lease is judged[-1] for lease in judged if lease.oid == renewed)
+    assert "private-value" not in json.dumps(result)
+    if returning:
+        assert snapshots == [first, renewed, first]
+        assert result["reason"] == "unclaim_lease_refused" and result["exit_code"] == 1, result
+        assert result["blockers"][0]["lease_oid"] == first
+        assert gitsafe.read_ref(make_store, ref) == first
+        assert queue_path.read_bytes() == before and receipts(make_store) == []
+    else:
+        assert snapshots == [first, renewed, renewed, None, None, None]
+        assert result["exit_code"] == 0 and result["released_lease_ids"] == [renewed], result
+        assert gitsafe.read_ref(make_store, ref) is None
+        assert json.loads(queue_path.read_bytes())["items"]["ONE"]["state"] == "queued"
+        assert len(receipts(make_store)) == 1
+
+
+@pytest.mark.parametrize("phase, unreadable", [
+    ("initial", True), ("before-release", False), ("before-release", True),
+    ("after-release", False), ("after-release", True),
+])
+def test_unclaim_preflight_observes_replacement_ref(make_store, monkeypatch, phase, unreadable):
+    revision, first = _phase_claim(make_store, monkeypatch, phase)
+    ref = team.lane_ref("alpha")
+    real_list, real_read, real_observe = gitsafe.list_refs, gitsafe.read_object, binding.observe
+    current = gitsafe.read_ref(make_store, ref)
+    if current is None:
+        gitsafe.update_ref(make_store, ref, first, None, single_attempt=True)
+    renewed = team.renew(make_store, "alpha", first, now=101).oid
+    gitsafe.update_ref(make_store, ref, current, renewed, single_attempt=True)
+    path = make_store / ".aegis/state/team-queue.json"
+    before = path.read_bytes()
+    old_receipts = receipts(make_store)
+    snapshots, reads, judged = [], [], []
+
+    def list_refs(root, prefix):
+        if len(snapshots) == (1 if phase == "initial" else 0):
+            gitsafe.update_ref(root, ref, renewed, current, single_attempt=True)
+        found = real_list(root, prefix)
+        snapshots.append(dict(found).get(ref))
+        return found
+
+    def read_object(root, oid, limit):
+        reads.append(oid)
+        if unreadable and oid == renewed:
+            raise gitsafe.GitError("private-value")
+        return real_read(root, oid, limit)
+
+    def observe(home, found, summary):
+        judged.append(found.leases[0])
+        return real_observe(home, found, summary)
+
+    monkeypatch.setattr(gitsafe, "list_refs", list_refs)
+    monkeypatch.setattr(gitsafe, "read_object", read_object)
+    monkeypatch.setattr(binding, "observe", observe)
+    result = unclaim(make_store, revision)
+    assert reads == [first, renewed]
+    assert snapshots == ([first, renewed] if phase == "initial" else [renewed])
+    assert len(judged) == (1 if phase == "initial" else 3)
+    assert all(lease is judged[0] and lease.oid == first for lease in judged)
+    if phase == "initial":
+        assert result["reason"] == "unclaim_lease_refused" and result["exit_code"] == 1, result
+        blocker = result["blockers"][0]
+    else:
+        assert result["reason"] == "unclaim_recovery_required" and result["exit_code"] == 1, result
+        blocker = cause_of(result)
+    assert blocker["reason"] == "unclaim_lease_refused" and blocker["lease_oid"] == renewed
+    assert "private-value" not in json.dumps(result)
+    assert path.read_bytes() == before and receipts(make_store) == old_receipts
+    assert gitsafe.read_ref(make_store, ref) == renewed
+
+
+@pytest.mark.parametrize("recovering", [False, True])
+def test_unclaim_reads_covering_lease_once(make_store, binding_home, monkeypatch, recovering):
+    """One unclaim parses the covering object once and still lists and reads refs."""
+    if recovering:
+        revision, oid, _ = plant_pending(make_store, monkeypatch)
+    else:
+        revision, oid = held(make_store)
+    reads = _spy_covering_reads(monkeypatch)
+    lists, refs = _spy_ref_checks(monkeypatch)
+    seen = []
+    original = binding.observe
+
+    def observe(home, found, summary):
+        seen.append(found.leases[0])
+        return original(home, found, summary)
+
+    monkeypatch.setattr(binding, "observe", observe)
+    result = unclaim(make_store, revision)
+    assert result["exit_code"] == 0, result
+    assert [item for item in reads if item == oid] == [oid]
+    assert len(lists) >= 2 and len(refs) >= 1
+    assert len(seen) > 1
+    assert all(lease is seen[0] and lease.oid == oid for lease in seen)
+
+
+def _arm_covering_failure(monkeypatch, oid, *, malformed=False):
+    reads = []
+    original = gitsafe.read_object
+    armed = {"on": True}
+
+    def spy(root, object_id, limit):
+        if not armed["on"] or object_id != oid:
+            return original(root, object_id, limit)
+        reads.append(object_id)
+        if malformed:
+            return b'{"token":"private-value"}'
+        raise gitsafe.GitError("private-value")
+
+    monkeypatch.setattr(gitsafe, "read_object", spy)
+    return reads, armed
+
+
+def test_unreadable_covering_lease_is_once_per_transaction(make_store, binding_home, monkeypatch):
+    """A shared-boundary read failure is not a second copy of team_claims.gitsafe."""
+    revision, oid = held(make_store)
+    path = make_store / ".aegis/state/team-queue.json"
+    before = path.read_bytes()
+    reads, armed = _arm_covering_failure(monkeypatch, oid)
+    refused = queue.unclaim(make_store, "ONE", expect=revision, lane="alpha", now=102,
+                            caller="owner", writer_stopped=False)
+    assert refused["reason"] == "writer_not_stopped" and refused["exit_code"] == 1, refused
+    assert "private-value" not in json.dumps(refused)
+    assert path.read_bytes() == before
+    assert reads == [oid]
+    again = queue.unclaim(make_store, "ONE", expect=revision, lane="alpha", now=102,
+                          caller="owner", writer_stopped=False)
+    assert again["reason"] == "writer_not_stopped"
+    assert reads == [oid, oid]
+    armed["on"] = False
+    assert team.read_leases(make_store).get("alpha").oid == oid
+
+
+@pytest.mark.parametrize("phase", ["initial", "before-release", "after-release"])
+def test_failed_reread_cannot_release_a_parsed_live_writer(make_store, binding_home, monkeypatch, phase):
+    """writer_stopped must not release a writer whose lease was already parsed."""
+    if phase == "initial":
+        revision, oid = held(make_store)
+    elif phase == "before-release":
+        revision, oid, _ = plant_pending(make_store, monkeypatch)
+    else:
+        revision, oid, _ = plant_released(make_store, monkeypatch)
+    path = make_store / ".aegis/state/team-queue.json"
+    before = path.read_bytes()
+    reads = []
+    original = gitsafe.read_object
+    armed = {"on": True}
+
+    def spy(root, object_id, limit):
+        if armed["on"] and object_id == oid:
+            reads.append(object_id)
+            if len(reads) > 1:
+                raise gitsafe.GitError("private-value")
+        return original(root, object_id, limit)
+
+    monkeypatch.setattr(gitsafe, "read_object", spy)
+    seen = []
+
+    def observe(home, found, summary):
+        seen.append(found.leases[0])
+        return {"binding": "ready", "verdict": {
+            "state": "unknown", "reason": "writer_bound", "leases": summary}}
+
+    monkeypatch.setattr(binding, "observe", observe)
+    result = unclaim(make_store, revision)
+    assert result["reason"] == "writer_live" and result["exit_code"] == 1, result
+    assert "private-value" not in json.dumps(result)
+    assert path.read_bytes() == before
+    assert reads == [oid]
+    assert seen and all(lease is seen[0] for lease in seen)
+    armed["on"] = False
+    if phase == "after-release":
+        assert team.read_leases(make_store).get("alpha") is None
+    else:
+        assert team.read_leases(make_store).get("alpha").oid == oid
+
+
+def _phase_claim(make_store, monkeypatch, phase):
+    if phase == "initial":
+        return held(make_store)
+    if phase == "before-release":
+        revision, oid, _ = plant_pending(make_store, monkeypatch)
+        return revision, oid
+    revision, oid, _ = plant_released(make_store, monkeypatch)
+    return revision, oid
+
+
+@pytest.mark.parametrize("phase", ["initial", "before-release", "after-release"])
+@pytest.mark.parametrize("defect", ["non-string", "malformed"])
+def test_repeated_malformed_verdicts_share_one_parsed_lease(make_store, binding_home, monkeypatch,
+                                                            phase, defect):
+    """A non-dict or non-string verdict is refused at every real transition site."""
+    revision, oid = _phase_claim(make_store, monkeypatch, phase)
+    reads = _spy_covering_reads(monkeypatch)
+    seen = []
+
+    def judge(home, found, summary):
+        seen.append(found.leases[0])
+        if defect == "malformed":
+            return ["private-value", "trailer"]
+        return {"reason": ("private-value", "trailer")}
+
+    monkeypatch.setattr(binding, "judge", judge)
+    result = unclaim(make_store, revision)
+    assert result["exit_code"] == 0, result
+    assert "private-value" not in json.dumps(result) and "trailer" not in json.dumps(result)
+    assert [item for item in reads if item == oid] == [oid]
+    assert len(seen) >= 2 and all(lease is seen[0] and lease.oid == oid for lease in seen)
+
+
+@pytest.mark.parametrize("phase", ["initial", "before-release", "after-release"])
+def test_repeated_unreadable_verdicts_do_not_echo_the_object(make_store, binding_home, monkeypatch, phase):
+    """Unreadable covering bytes stay a fixed refusal on both sides of release."""
+    revision, oid = _phase_claim(make_store, monkeypatch, phase)
+    path = make_store / ".aegis/state/team-queue.json"
+    before = path.read_bytes()
+    reads, _armed = _arm_covering_failure(monkeypatch, oid)
+    first = unclaim(make_store, revision)
+    assert "private-value" not in json.dumps(first)
+    if phase == "after-release":
+        assert first["exit_code"] == 0, first
+        assert [item for item in reads if item == oid] == [oid]
+        return
+    assert first["refused"], first
+    assert path.read_bytes() == before
+    second = unclaim(make_store, revision)
+    assert second["refused"] and "private-value" not in json.dumps(second)
+    assert path.read_bytes() == before
+    assert len([item for item in reads if item == oid]) <= 4
+
+
+def _arm_fail_then_read(monkeypatch, oid):
+    """The first covering read fails. A later read would return the real object."""
+    reads = []
+    original = gitsafe.read_object
+
+    def spy(root, object_id, limit):
+        if object_id != oid:
+            return original(root, object_id, limit)
+        reads.append(object_id)
+        if len(reads) == 1:
+            raise gitsafe.GitError("private-value")
+        return original(root, object_id, limit)
+
+    monkeypatch.setattr(gitsafe, "read_object", spy)
+    return reads, original
+
+
+@pytest.mark.parametrize("phase", ["initial", "pending"])
+def test_failed_then_readable_covering_ref_is_refused_before_release(make_store, monkeypatch, phase):
+    """One failed covering read stays unreadable through every preflight, including acknowledgement."""
+    if phase == "pending":
+        revision, oid, path = plant_pending(make_store, monkeypatch)
+    else:
+        revision, oid = held(make_store)
+        path = make_store / ".aegis/state/team-queue.json"
+    before = path.read_bytes()
+    reads, original = _arm_fail_then_read(monkeypatch, oid)
+    real_observe = binding.observe
+
+    def observe(home, found, summary):
+        return {"binding": "ready", "verdict": {
+            "state": "unknown", "reason": "writer_bound", "leases": summary}}
+
+    monkeypatch.setattr(binding, "observe", observe)
+    result = unclaim(make_store, revision)
+    rendered = json.dumps(result)
+    assert "private-value" not in rendered and "\n" not in result["reason"]
+    assert path.read_bytes() == before
+    assert reads == [oid]
+    assert team.read_leases(make_store).get("alpha").oid == oid
+    if phase == "pending":
+        cause = cause_of(result)
+        assert cause["reason"] == "unclaim_lease_refused" and cause["lease_oid"] == oid
+    else:
+        assert result["reason"] == "unclaim_lease_refused" and result["exit_code"] == 1, result
+        assert result["blockers"][0]["reason"] == "unclaim_lease_refused"
+    monkeypatch.setattr(gitsafe, "read_object", original)
+    monkeypatch.setattr(binding, "observe", real_observe)
+    retried = unclaim(make_store, revision)
+    assert retried["exit_code"] == 0, retried
+    assert team.read_leases(make_store).get("alpha") is None
+
+
+@pytest.mark.parametrize("phase", ["initial", "pending"])
+def test_unreadable_no_ack_keeps_the_first_wire_reason(make_store, monkeypatch, phase):
+    """Acknowledgement is what changes the refusal. The first no-ack reason stays fixed."""
+    if phase == "pending":
+        revision, oid, path = plant_pending(make_store, monkeypatch)
+        expected = "bindings_unavailable"
+    else:
+        revision, oid = held(make_store)
+        path = make_store / ".aegis/state/team-queue.json"
+        expected = "writer_not_stopped"
+    before = path.read_bytes()
+    reads, _original = _arm_fail_then_read(monkeypatch, oid)
+    result = queue.unclaim(make_store, "ONE", expect=revision, lane="alpha", now=102,
+                           caller="owner", writer_stopped=False)
+    assert result["reason"] == expected and result["exit_code"] == 1, result
+    assert result["reason"] != "unclaim_recovery_required"
+    assert "private-value" not in json.dumps(result)
+    assert path.read_bytes() == before
+    assert reads == [oid]
+    assert team.read_leases(make_store).get("alpha").oid == oid
+
+
+def test_admitted_unreadable_matches_only_its_oid(tmp_path, monkeypatch):
+    """A returned unreadable ref keeps its first outcome only within its root and lane."""
+    first, second = "a" * 40, "b" * 40
+    seen = []
+
+    def read_object(root, object_id, limit):
+        seen.append(object_id)
+        if seen == [first]:
+            raise gitsafe.GitError("private-value\nsecret")
+        return _lease_raw()
+
+    monkeypatch.setattr(gitsafe, "read_object", read_object)
+    current = [first]
+    monkeypatch.setattr(gitsafe, "list_refs", lambda root, prefix: [(team.lane_ref("alpha"), current[0])])
+    covering = team_claims._CoveringLeases(tmp_path, "alpha")
+    original = team.read_leases(tmp_path, observe=covering.read)
+    current[0] = second
+    moved = team.read_leases(tmp_path, observe=covering.read)
+    assert seen == [first, second]
+    assert moved.get("alpha").oid == second
+    current[0] = first
+    found = team.read_leases(tmp_path, observe=covering.read)
+    assert seen == [first, second]
+    assert found.leases == ()
+    assert found.unreadable[0] is original.unreadable[0]
+    assert found.unreadable[0].oid == first
+    assert found.unreadable[0].error == "unreadable"
+    assert "\n" not in found.unreadable[0].error and "private-value" not in found.unreadable[0].error
+    assert team.read_leases(tmp_path / "different-root", observe=covering.read).get("alpha").oid == first
+    assert seen == [first, second, first]
+
+
+def test_spawned_unclaim_observes_the_initialized_home(make_store, passwd_home, tmp_path):
+    """A worker installs and restores its home. A missing home is not the host passwd home."""
+    revision, oid = held(make_store)
+    missing = tmp_path / "no-such-passwd-home"
+    with ProcessPoolExecutor(max_workers=1) as pool:
+        absent = pool.submit(probe_unclaim_home, (make_store, revision, str(missing))).result(timeout=30)
+        ordinary = pool.submit(probe_unclaim_home, (make_store, revision, str(passwd_home))).result(timeout=30)
+    assert absent["reason"] == "bindings_unavailable" and absent["exit_code"] == 1, absent
+    assert ordinary["reason"] == "writer_not_stopped" and ordinary["exit_code"] == 1, ordinary
+    assert team.read_leases(make_store).get("alpha").oid == oid
+    assert team_claims._passwd_home() == str(passwd_home)
 
 
 def test_initial_duplicate_rows_are_not_a_receipt_conflict(make_store):
@@ -1701,7 +2480,7 @@ def test_recovery_cause_omits_unsanitized_lease_facts(make_store, monkeypatch):
     revision, _, path = plant_pending(make_store, monkeypatch)
     before = path.read_bytes()
 
-    def hostile(root):
+    def hostile(root, **_kwargs):
         return SimpleNamespace(leases=(), unreadable=(SimpleNamespace(
             lane="beta\nprivate-value", oid="not-an-oid/private-value"),))
 
@@ -1736,13 +2515,13 @@ def test_recovery_lease_refusal_omits_exception_text(make_store, monkeypatch):
     assert path.read_bytes() == before
 
 
-def test_concurrent_recovery_retries_keep_one_lease_cause(make_store, monkeypatch):
+def test_concurrent_recovery_retries_keep_one_lease_cause(make_store, passwd_home, monkeypatch):
     revision, oid, path = plant_pending(make_store, monkeypatch)
     before = path.read_bytes()
     team.release(make_store, "alpha", oid, caller="external")
     team.claim(make_store, "beta", ["src/**"], owner="someone-else", now=100)
     with ProcessPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(race_unclaim, [(make_store, revision)] * 2, timeout=30))
+        results = list(pool.map(race_unclaim, [(make_store, revision, str(passwd_home))] * 2, timeout=30))
     assert path.read_bytes() == before
     assert [result["reason"] for result in results] == ["unclaim_recovery_required"] * 2
     for result in results:
@@ -1835,13 +2614,13 @@ def test_inconsistent_receipt_names_event_cause(make_store, monkeypatch, defect)
     assert team.read_leases(make_store).get("alpha") is None
 
 
-def test_concurrent_inconsistent_receipts_keep_the_event_cause(make_store, monkeypatch):
+def test_concurrent_inconsistent_receipts_keep_the_event_cause(make_store, passwd_home, monkeypatch):
     revision, _oid, path = plant_pending(make_store, monkeypatch)
     before = path.read_bytes()
     pending = json.loads(before)["unclaim"]
     log, original = _append_correlated(make_store, pending, writer_stopped=False)
     with ProcessPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(race_unclaim, [(make_store, revision)] * 2, timeout=30))
+        results = list(pool.map(race_unclaim, [(make_store, revision, str(passwd_home))] * 2, timeout=30))
     assert path.read_bytes() == before
     assert [result["reason"] for result in results] == ["unclaim_recovery_required"] * 2
     for result in results:
@@ -2278,7 +3057,7 @@ def test_private_receipt_refusals_preserve_intent_and_retry(make_store, monkeypa
 
 
 @pytest.mark.parametrize("intervening_claim", [False, True])
-def test_finalized_receipt_recovery_consumes_only_its_transaction(make_store, monkeypatch, intervening_claim):
+def test_finalized_receipt_recovery_consumes_only_its_transaction(make_store, passwd_home, monkeypatch, intervening_claim):
     revision, oid = held(make_store)
     publish, token = queue._publish, []
 
@@ -2310,7 +3089,7 @@ def test_finalized_receipt_recovery_consumes_only_its_transaction(make_store, mo
         assert len(receipts(make_store)) == 1
         return
     with ProcessPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(race_unclaim, [(make_store, revision)] * 2, timeout=30))
+        results = list(pool.map(race_unclaim, [(make_store, revision, str(passwd_home))] * 2, timeout=30))
     assert sorted(row["refused"] for row in results) == [False, True]
     recovered = next(row for row in results if not row["refused"])
     assert recovered["released_lease_ids"] == [oid]
@@ -2483,13 +3262,13 @@ def race_completed_claim(arguments):
 
 
 @pytest.mark.parametrize("competitor", ["claim", "unclaim"])
-def test_revision_reconciliation_serializes_concurrent_mutations(make_store, monkeypatch, competitor):
+def test_revision_reconciliation_serializes_concurrent_mutations(make_store, passwd_home, monkeypatch, competitor):
     revision, _ = held(make_store)
     token, target = interrupt_final_publication(make_store, revision, monkeypatch)
     with ProcessPoolExecutor(max_workers=2) as pool:
         first = pool.submit(race_completed_claim, (make_store, token))
         second = (pool.submit(race_completed_claim, (make_store, token)) if competitor == "claim"
-                  else pool.submit(race_unclaim, (make_store, revision)))
+                  else pool.submit(race_unclaim, (make_store, revision, str(passwd_home))))
         results = [first.result(timeout=30), second.result(timeout=30)]
     if competitor == "claim":
         assert sorted(row["refused"] for row in results) == [False, True]

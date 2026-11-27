@@ -1,6 +1,7 @@
 """Exposure persistence follows the ledger currently on disk, within one process."""
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import errno
@@ -15,10 +16,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from aegis_core import atomicio, credit, credit_memo, storage
+from aegis_core import atomicio, config as config_service, credit, credit_memo, rule_integrity, storage
 from aegis_core.errors import PathTraversalError
 from aegis_core.telemetry_engine import ledger
 from tests.conftest import symlink_or_skip
+from tests import helpers_humangate as hg
+from tests import helpers_verified as hv
 
 
 @pytest.fixture(autouse=True, params=["native", "portable"])
@@ -26,6 +29,446 @@ def snapshot_capabilities(request, monkeypatch):
     """Keep every exposure assertion on the native and portable memo paths."""
     if request.param == "portable":
         monkeypatch.setattr(credit_memo, "_anchored_snapshot_supported", lambda: False)
+
+
+def test_empty_join_retries_share_one_non_fitness_observation(tmp_path):
+    tree = "1" * 40
+    ledger.append_rows(tmp_path, [{"v": ledger.LEDGER_VERSION, "event": "check", "id": "check",
+                                  "tree": tree, "witness": "aegis", "passed": True,
+                                  "tests": {"exit": 0, "passed": 1}}])
+
+    def report(key):
+        return credit.submit_report(
+            tmp_path, tree=tree, session="s", host="h", key=key, outcome="success",
+            rules_for=lambda _: credit.ReportAttribution("a" * 32, {}, empty_join=True),
+        )
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        replies = list(executor.map(report, ("one", "two", "one", "three"), timeout=20))
+    assert all(reply["status"] == "recorded" and reply["credited"] == [] for reply in replies)
+    view = ledger.read(tmp_path)
+    observation, = (row for row in view.raw_rows if row.get("observation") == "empty_join")
+    assert (observation["check"], observation["tree"]) == ("check", tree)
+    assert view.rows == [] and view.unusable_rows == 0
+
+
+def test_report_refuses_a_witness_replaced_during_attribution(tmp_path):
+    tree = "1" * 40
+    first = {"v": ledger.LEDGER_VERSION, "event": "check", "id": "first", "tree": tree,
+             "witness": "aegis", "passed": True, "tests": {"exit": 0, "passed": 1}}
+    ledger.append_rows(tmp_path, [first])
+
+    def attribution(check):
+        assert check["id"] == "first"
+        ledger.append_rows(tmp_path, [dict(first, id="second")])
+        return credit.ReportAttribution("a" * 32, {"trap-exact": "b" * 64},
+                                        rule_types={"trap-exact": "trap"})
+
+    result = credit.submit_report(tmp_path, tree=tree, session="s", host="h", key="race", outcome="success",
+                                  rules_for=attribution)
+    assert result == {"status": "FAIL", "error": "report_check_changed"}
+    assert [row["event"] for row in credit.read_rows(tmp_path)] == ["check", "check"]
+
+
+@pytest.mark.parametrize("fields", [
+    {"event": ["invalid"]},
+    {"event": "check", "id": [], "tree": "1" * 40, "passed": True, "witness": "aegis", "tests": {}},
+    {"event": "report", "check": "c", "tree": "1" * 40, "rule": "rule-a", "scan_ref": "invalid"},
+], ids=["event", "check", "report"])
+def test_invalid_raw_ledger_event_refuses_without_appending(tmp_path, fields):
+    ledger.append_rows(tmp_path, [{"v": ledger.LEDGER_VERSION, **fields}])
+    result = credit.submit_report(tmp_path, tree="1" * 40, session="s", host="h", key="bad", outcome="success",
+                                  rules_for=lambda _: ())
+    assert result == {"status": "FAIL", "error": "report_ledger_unavailable"}
+    assert ledger.read(tmp_path).raw_rows == ({"v": ledger.LEDGER_VERSION, "seq": 1, **fields},)
+
+
+def test_exposure_identity_includes_host_scope_and_revision(tmp_path, monkeypatch):
+    def record(host, revision, scope="match"):
+        return credit.record_exposure(tmp_path, host, "same-session", ["rule-a"], rev=revision, scope_basis=scope)
+
+    identities = [("host-a", None, "match"), ("host-a", "a" * 16, "match"),
+                  ("host-a", "b" * 16, "match"), ("host-b", "b" * 16, "match"),
+                  ("host-a", "b" * 16, "other")]
+    for identity in identities:
+        written = record(*identity)
+        assert len(written) == 1
+        assert written[0]["host"] == identity[0]
+        assert record(*identity) == []
+    credit_memo.reset()
+    if credit_memo.filesystem_clock_supported():
+        _settle_keyed_index(tmp_path, monkeypatch)
+    for identity in identities:
+        assert record(*identity) == []
+        assert record(*identity) == []
+    assert [(row["host"], row["rev"], row["scope_basis"]) for row in credit.read_rows(tmp_path)] == identities
+
+
+def test_credit_events_never_become_ordinary_outcomes(tmp_path):
+    path = storage.ledger_site(tmp_path).path
+    rows = [{"v": 2, "event": event, "rule": "rule-a", "outcome": "tp"} for event in credit.EVENTS]
+    rows += [{"rule_id": "rule-a", "signal": "success", "source": "ci"},
+             {"v": 2, "rule": "rule-a", "outcome": "fp", "source": "ci"}]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    totals = ledger.aggregate(tmp_path, "rule-a")
+    assert (totals["triggers"], totals["tp"], totals["fp"]) == (2, 1, 1)
+
+
+@pytest.mark.parametrize("credit_first", [False, True])
+@pytest.mark.parametrize("null_event", [False, True], ids=["absent-event", "null-event"])
+def test_credit_and_ordinary_appends_keep_separate_keys(tmp_path, credit_first, null_event):
+    ordinary = {"v": 2, "rule": "rule-a", "key": "shared", "outcome": "tp", "source": "manual"}
+    if null_event:
+        ordinary["event"] = None
+    detection = dict(ordinary, event="detection", outcome="trigger")
+    rows = [detection, ordinary] if credit_first else [ordinary, detection]
+    assert len(ledger.append_rows(tmp_path, rows)) == 2
+    assert ledger.append_rows(tmp_path, rows) == []
+    assert len(ledger.read(tmp_path).raw_rows) == 2
+    assert ledger.append(tmp_path, [ordinary])[0]["outcome"] == "tp"
+    assert ledger.aggregate(tmp_path, "rule-a")["triggers"] == 1
+
+
+@pytest.mark.parametrize("prime", [False, True], ids=["cold", "warm"])
+def test_unrelated_version_with_unusable_event_cannot_block_a_report(tmp_path, prime):
+    tree = "1" * 40
+    check = {"v": 2, "event": "check", "id": "check", "tree": tree,
+             "witness": "aegis", "passed": True, "tests": {"exit": 0, "passed": 1}}
+    unrelated = {"v": 99, "event": ["unknown"], "key": "ordinary", "rule_id": "rule-a", "signal": "tp"}
+    prior = {"v": 2, "event": None, "rule": "older-rule", "outcome": "trigger", "source": "ci"}
+    path = storage.ledger_site(tmp_path).path
+    path.write_text("".join(json.dumps(row) + "\n" for row in [check, unrelated, prior]), encoding="utf-8")
+    ordinary = {"key": "ordinary", "rule": "rule-a", "outcome": "fp", "source": "ci"}
+    if prime:
+        ledger.append(tmp_path, [dict(ordinary, key="prime")])
+    result = credit.submit_report(tmp_path, tree=tree, session="s", host="h", key="r", outcome="success",
+                                  rules_for=lambda _: ("rule-a",))
+    assert result == {"status": "recorded", "witness": "aegis", "credited": ["rule-a"], "check": "check", "tree": tree}
+    written, = ledger.append(tmp_path, [ordinary])
+    assert ledger.append(tmp_path, [ordinary]) == [written]
+    outcomes = ledger.read(tmp_path).rows
+    assert prior in outcomes
+    assert [row.get("key") for row in outcomes].count("ordinary") == 1
+    assert [row["event"] for row in credit.read_rows(tmp_path)] == ["check", "report"]
+
+
+@pytest.mark.parametrize("damaged", [b'{"v": 2,', b'{"v": 2, broken}\n'])
+def test_unreadable_report_ledger_refuses_without_appending(tmp_path, damaged):
+    path = storage.ledger_site(tmp_path).path
+    path.write_bytes(damaged)
+    result = credit.submit_report(tmp_path, tree="1" * 40, session="s", host="h", key="r", outcome="success",
+                                  rules_for=lambda _: ())
+    assert result == {"status": "FAIL", "error": "report_ledger_unavailable"}
+    assert path.read_bytes() == damaged
+
+
+@pytest.mark.parametrize(("fields", "refused"), [
+    ({"event": []}, False),
+    ({"event": {}}, False),
+    ({"event": 7}, False),
+    ({"v": 1, "event": []}, False),
+    ({"v": 99, "event": {}}, False),
+    ({"v": "2", "event": "report"}, True),
+    ({"v": None, "event": []}, True),
+    ({"v": 2, "event": []}, True),
+], ids=["implicit-array", "implicit-object", "implicit-scalar", "explicit-v1", "future-version",
+        "string-version", "null-version", "current-unknown"])
+@pytest.mark.parametrize("arrival", ["initial", "locked"])
+def test_report_classifies_well_framed_history_on_both_reads(tmp_path, fields, refused, arrival):
+    tree = "1" * 40
+    ledger.append_rows(tmp_path, [{"v": 2, "event": "check", "id": "check", "tree": tree,
+                                  "witness": "aegis", "passed": True, "tests": {"exit": 0, "passed": 1}}])
+    path = ledger.ledger_path(tmp_path)
+    historical = {"seq": 12, "rule_id": "rule-a", "signal": "tp", **fields}
+
+    def insert():
+        with path.open("ab") as stream:
+            stream.write(json.dumps(historical).encode("ascii") + b"\n")
+
+    if arrival == "initial":
+        insert()
+    visits = []
+
+    def attribute(check):
+        assert check["id"] == "check"
+        if not visits and arrival == "locked":
+            insert()
+        visits.append(check["id"])
+        return credit.ReportAttribution("a" * 32, {"rule-a": "b" * 64},
+                                        rule_types={"rule-a": "trap"})
+
+    def report():
+        return credit.submit_report(tmp_path, tree=tree, session="s", host="h", key="r",
+                                    outcome="success", rules_for=attribute)
+
+    if refused:
+        assert report() == {"status": "FAIL", "error": "report_ledger_unavailable"}
+        assert visits == (["check"] if arrival == "locked" else [])
+        assert [row["seq"] for row in ledger.read(tmp_path).raw_rows] == [1, 12]
+    else:
+        expected = {"status": "recorded", "witness": "aegis", "credited": ["rule-a"], "check": "check", "tree": tree}
+        assert report() == report() == expected
+        assert [row["seq"] for row in ledger.read(tmp_path).raw_rows] == [1, 12, 13]
+        assert [row["event"] for row in credit.read_rows(tmp_path)] == ["check", "report"]
+    assert ledger.read(tmp_path).unusable_rows == 1
+
+
+def test_fitness_uses_valid_normalized_rows_in_storage_order(tmp_path):
+    from aegis_core import fitness
+    from aegis_core.adjudication import Adjudications
+
+    rid = "rule-a"
+    now = datetime(2026, 11, 20, tzinfo=timezone.utc)
+    rule = SimpleNamespace(id=rid, type="trap")
+
+    def stamp(day):
+        return f"2026-11-{day:02d}T00:00:00Z"
+
+    def event(kind, ts, **fields):
+        return {"v": 2, "rule": rid, "event": kind, "ts": ts, **fields}
+
+    def modern(outcome, day, **fields):
+        return event(None, stamp(day), outcome=outcome, **{"source": "ci", **fields})
+
+    def historical(signal, ts, **fields):
+        return {"rule_id": rid, "signal": signal, "source": "ci", "timestamp": ts, **fields}
+
+    def score(root, old):
+        root.mkdir()
+        path = storage.ledger_site(root).path
+        rows = [event("exposure", stamp(1), session="before")]
+        if old:
+            rows.extend([historical("trigger", "2001-01-01T00:00:00Z"), historical("trigger", stamp(2)),
+                         historical("success", stamp(3), metadata={"credit_weight": 0.5})])
+        else:
+            rows.append(modern("tp", 3, weight=0.5))
+        rows.append(event("exposure", stamp(2), session="recorded-after-tp"))
+        if old:
+            rows.extend([historical("success", None, v=1, triggered_at=stamp(4), metadata={"credit_weight": 0}),
+                         historical("trigger", stamp(5))])
+        else:
+            rows.extend([modern("tp", 4, weight=0), modern("trigger", 5)])
+        rows.extend([modern("tp", 6, weight="unusable"), modern("success", 7, source="session"),
+                     modern("tp", 8, source="session"), event("unknown", "2000-01-01T00:00:00Z"),
+                     event("adjudication", "2000-01-01T00:00:00Z", verdict="tp")])
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        return fitness.for_rules(root, [rule], now=now, adjudications=Adjudications())[rid]
+
+    legacy = score(tmp_path / "legacy", True)
+    current = score(tmp_path / "current", False)
+    assert legacy == current
+    assert (legacy.triggers, legacy.tp, legacy.eligible_sessions) == (4, 0.5, 1)
+    assert legacy.last_ts == stamp(8) and legacy.mde is None
+    assert legacy.evidence_available is False and legacy.evidence_error == "3 unusable row(s)"
+
+
+@pytest.mark.parametrize("arrival", ["cold", "warm", "locked"])
+def test_report_identity_comes_from_checked_evidence(tmp_path, monkeypatch, arrival):
+    tree = "1" * 40
+    check = {"v": 2, "event": "check", "id": "checked", "tree": tree,
+             "witness": "aegis", "passed": True, "tests": {"exit": 0, "passed": 1}}
+    ledger.append_rows(tmp_path, [check])
+    poison = {"v": 2, "event": "report", "check": "other", "rule": "rule-a",
+              "tree": "2" * 40, "scan_ref": "bad", "key": "credit:checked:rule-a"}
+
+    if arrival != "locked":
+        ledger.append_rows(tmp_path, [poison])
+    reads = None
+    if arrival == "warm":
+        if credit_memo.filesystem_clock_supported():
+            _settle_keyed_index(tmp_path, monkeypatch)
+        ledger.append_rows(tmp_path, [])
+        if credit_memo.filesystem_clock_supported():
+            reads = _ledger_reads(monkeypatch)
+    visits = []
+
+    def attribute(selected):
+        assert selected["id"] == "checked"
+        if arrival == "locked" and not visits:
+            ledger.append_rows(tmp_path, [poison])
+        visits.append(selected["id"])
+        return ("rule-a", "rule-b")
+
+    def report(outcome, key="join"):
+        return credit.submit_report(tmp_path, tree=tree, session="s", host="h", key=key,
+                                    outcome=outcome, rules_for=attribute, cap=2)
+
+    expected = {"status": "recorded", "witness": "aegis", "credited": ["rule-a", "rule-b"],
+                "check": "checked", "tree": tree}
+    assert report("success") == expected
+    if reads is not None:
+        assert reads == []
+    assert report("success") == expected
+    assert report("success", key="retry") == expected
+    with pytest.raises(credit.ReportConflict):
+        report("partial")
+    raw = ledger.read(tmp_path).raw_rows
+    assert [row["seq"] for row in raw] == [1, 2, 3, 4]
+    assert [(row["check"], row["rule"]) for row in raw[2:]] == [
+        ("checked", "rule-a"), ("checked", "rule-b")]
+    assert ledger.append_rows(tmp_path, [dict(raw[2], key="alternate", result="fp")]) == []
+    refused = credit.submit_report(tmp_path, tree=tree, session="s", host="h", key="new",
+                                   outcome="success", rules_for=lambda _: ("rule-a", "rule-c"), cap=2)
+    assert refused == {"status": "rate_limited", "limit": 2, "witness": "aegis", "credited": []}
+    assert ledger.read(tmp_path).raw_rows == raw
+
+
+def test_report_refuses_to_acknowledge_a_write_that_did_not_persist(tmp_path, monkeypatch):
+    tree = "1" * 40
+    ledger.append_rows(tmp_path, [{"v": 2, "event": "check", "id": "checked", "tree": tree,
+                                  "witness": "aegis", "passed": True,
+                                  "tests": {"exit": 0, "passed": 1}}])
+    append = ledger.append_jsonl_with_report
+    monkeypatch.setattr(ledger, "append_jsonl_with_report", lambda path, rows: storage.AppendResult(0))
+    result = credit.submit_report(tmp_path, tree=tree, session="s", host="h", key="unwritten",
+                                  outcome="success", rules_for=lambda _: ("rule-a",))
+    assert result == {"status": "FAIL", "error": "report_ledger_unavailable"}
+    assert [row["event"] for row in credit.read_rows(tmp_path)] == ["check"]
+    monkeypatch.setattr(ledger, "append_jsonl_with_report", append)
+    assert credit.submit_report(tmp_path, tree=tree, session="s", host="h", key="unwritten",
+                                outcome="success", rules_for=lambda _: ("rule-a",))["credited"] == ["rule-a"]
+
+
+@pytest.mark.parametrize("mixed", [False, True], ids=["v1-v1", "v1-v2"])
+def test_fitness_uses_the_first_ordinary_identity_for_decay_and_totals(tmp_path, mixed):
+    from aegis_core import fitness
+    from aegis_core.adjudication import Adjudications
+
+    rid = "rule-a"
+    now = datetime(2026, 11, 20, tzinfo=timezone.utc)
+    latest = "2026-11-15T00:00:00Z"
+    exposure = {"v": 2, "event": "exposure", "rule": rid, "session": "observed", "scope_basis": "match"}
+    legacy = {"rule_id": rid, "signal": "fp", "source": "ci", "event_id": "once",
+              "timestamp": "2026-11-11T00:00:00Z"}
+    duplicate = ({"v": 2, "rule": rid, "outcome": "tp", "source": "manual", "key": "once",
+                  "ts": "2000-01-01T00:00:00Z"} if mixed else
+                 dict(legacy, signal="success", timestamp="2000-01-01T00:00:00Z"))
+    distinct = {"v": 2, "rule": rid, "outcome": "tp", "source": "manual",
+                "key": "another", "weight": 0.5, "ts": latest}
+    unkeyed = {"v": 2, "rule": rid, "outcome": "fp", "source": "manual", "weight": 0.5, "ts": latest}
+    path = ledger.ledger_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rule = SimpleNamespace(id=rid, type="trap")
+
+    def score(rows):
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        return fitness.for_rules(tmp_path, [rule], now=now, adjudications=Adjudications())[rid]
+
+    baseline = [legacy, exposure, unkeyed, unkeyed]
+    expected = score(baseline)
+    assert (expected.triggers, expected.tp, expected.fp, expected.eligible_sessions, expected.mde) == (3, 0, 2, 1, None)
+    assert score([legacy, exposure, duplicate, unkeyed, unkeyed]) == expected
+    after = score([*baseline, distinct])
+    assert (after.triggers, after.tp, after.eligible_sessions) == (4, 0.5, 0)
+
+
+@pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+@pytest.mark.parametrize("failure", ["inventory", "integrity", "ruleset", "historical", "framing", "mismatch"])
+def test_archive_requires_available_policy_proof(tmp_path, monkeypatch, failure):
+    from aegis_core import fitness
+    from aegis_core.adjudication import Adjudications
+    from aegis_core.lifecycle.selection import archive_rule
+    from aegis_core.rule_inventory import RuleInventoryError
+    from aegis_core.rules import lf_digest, load_rules
+    from aegis_core.workspace.layout import UserLayout, WorkspaceLayout
+
+    repo = hv.make_project(tmp_path)
+    monkeypatch.setattr(config_service, "UserLayout", SimpleNamespace(current=lambda: UserLayout(repo.home.path)))
+    rid = "trap-sample"
+    path = repo.root / ".aegis/rules/traps/trap-sample.md"
+    original = path.read_bytes()
+    earlier = "2001-01-01T00:00:00Z"
+    later = "2025-01-01T00:00:00Z"
+    commit = repo.head()
+    tree = repo.git("rev-parse", "HEAD^{tree}")
+    check = {"v": 2, "event": "check", "id": "checked", "tree": tree, "witness": "aegis",
+             "passed": True, "tests": {"exit": 0, "passed": 1}}
+    report = {"v": 2, "event": "report", "rule": rid, "check": "checked", "tree": tree,
+              "witness": "aegis", "result": "tp", "ts": later, "scan_ref": "a" * 32,
+              "rule_revision": lf_digest(original)}
+    if failure not in ("historical", "framing"):
+        report["rule_type"] = "trap"
+    ledger.append_rows(repo.root, [{"v": 2, "event": "exposure", "rule": rid, "session": f"earlier-{i}",
+                                   "ts": earlier, "scope_basis": "match"} for i in range(205)] + [check, report])
+    projection = credit.project_credits(repo.root, client=hv.FakeCI([hv.ci_run(commit)]), verify_ci=True)
+    assert [item.result for item in projection.credits if item.counts] == ["tp"]
+    snapshot = rule_integrity.effective(repo.root)
+
+    def score(effective_view=None):
+        rules = [load_rules(repo.root).get(rid), SimpleNamespace(id="unrelated", type="trap")]
+        result = fitness.for_rules(repo.root, rules, adjudications=Adjudications(), effective_view=effective_view)
+        assert result["unrelated"].evidence_available
+        return result[rid]
+
+    healthy = score()
+    assert (healthy.tp, healthy.eligible_sessions, healthy.evidence_available) == (1, 0, True)
+    assert score(snapshot) == healthy
+
+    def inventory_failure(*args):
+        raise RuleInventoryError("read", str(path), "private inventory detail")
+
+    def integrity_failure(*args):
+        raise rule_integrity.IntegrityError("private integrity detail")
+
+    if failure == "inventory":
+        monkeypatch.setattr(rule_integrity, "inventory_rules", inventory_failure)
+    elif failure == "integrity":
+        monkeypatch.setattr(rule_integrity, "_rule_blobs", integrity_failure)
+    elif failure == "ruleset":
+        repo.write(".aegis/rules/traps/unreadable.md", "---\n# Unfinished rule\n")
+    elif failure in ("historical", "framing"):
+        git = rule_integrity.gitsafe
+
+        def run_checked(args, *positional, **options):
+            if args[:2] == ["--literal-pathspecs", "ls-tree"]:
+                if failure == "historical":
+                    raise git.GitError("private object detail")
+                return SimpleNamespace(stdout=b"incomplete tree record")
+            return git.run_checked(args, *positional, **options)
+
+        monkeypatch.setattr(rule_integrity, "gitsafe", SimpleNamespace(**dict(vars(git), run_checked=run_checked)))
+    else:
+        path.write_bytes(original + b"\nComplete policy change.\n")
+
+    observed = score()
+    refusal = archive_rule(repo.root, rid)
+    audit = WorkspaceLayout(repo.root).lifecycle_log
+    archive = path.parent.parent / ".archive"
+    assert (observed.tp, observed.eligible_sessions, observed.archive_candidate) == (0, 205, True)
+    if failure == "mismatch":
+        assert observed.evidence_available and observed.evidence_error is None
+        assert refusal["status"] == "archived"
+        assert not path.exists() and (archive / path.name).exists() and audit.exists()
+        return
+    diagnostic = ("historical policy proof unavailable" if failure in ("historical", "framing")
+                  else "effective policy proof unavailable")
+    assert refusal == {"status": "ineligible",
+                       "message": f"Rule '{rid}' was not archived: its evidence is unavailable ({diagnostic})"}
+    assert not observed.evidence_available and observed.evidence_error == diagnostic
+    assert path.read_bytes() == original and not archive.exists() and not audit.exists()
+    if failure in ("inventory", "integrity"):
+        assert score(snapshot) == healthy
+    elif failure == "ruleset":
+        assert score(rule_integrity.effective(repo.root)) == observed
+    else:
+        assert score(snapshot) == observed
+    if failure == "inventory":
+        pending = "8" * 40
+        ledger.append_rows(repo.root, [{"v": 2, "event": "ci", "commit": pending,
+                                       "ci_conclusion": "success", "run_id": 2, "ci_run_attempt": 1}])
+        stopped = hv.FakeCI(error="private CI detail")
+        monkeypatch.setattr(credit, "GhRestClient", lambda cwd: stopped)
+        rule = load_rules(repo.root).get(rid)
+        offline = fitness.for_rules(repo.root, [rule], adjudications=Adjudications())[rid]
+        assert offline == observed and stopped.asked == []
+        refused = fitness.for_rules(repo.root, [rule], adjudications=Adjudications(), verify_ci=True)[rid]
+        assert not refused.evidence_available and stopped.asked == [pending]
+        assert refused.evidence_error == (
+            "effective policy proof unavailable, CI verification stopped after gh failed for "
+            "888888888888; 1 commit(s) were not verified")
+        ledger.append_rows(repo.root, [{"v": 99, "event": "outcome"}])
+        incomplete = fitness.for_rules(repo.root, [rule], adjudications=Adjudications())[rid]
+        assert not incomplete.evidence_available and incomplete.evidence_error == "1 unusable row(s)"
 
 
 @contextmanager
@@ -574,9 +1017,9 @@ def test_delayed_fill_with_coarse_unchanged_stamps_stays_ineligible(tmp_path, mo
     with monkeypatch.context() as patch:
         patch.setattr(credit, "read_rows_with_report", read)
         rules = ["rule-a"] if operation == "read" else ["rule-a", "rule-e"]
-        credit.record_exposure(tmp_path, "other-host", "session", rules)
+        credit.record_exposure(tmp_path, "host", "session", rules)
     clock[0] = tick + 10_000_000_000
-    assert [row["rule"] for row in credit.record_exposure(tmp_path, "other-host", "session", ["rule-a"])] == ["rule-a"]
+    assert [row["rule"] for row in credit.record_exposure(tmp_path, "host", "session", ["rule-a"])] == ["rule-a"]
 
 
 @pytest.mark.parametrize("settled_read", [False, True], ids=["after-append", "after-settled-read"])
@@ -646,11 +1089,11 @@ def test_multirow_reset_during_fill_cannot_certify_removed_rule(tmp_path, monkey
                       "read_rows_with_report" if phase != "append" else "append_rows",
                       read if phase != "append" else append)
         rules = ["rule-a"] if phase == "read" else ["rule-a", "rule-e"]
-        written = credit.record_exposure(tmp_path, "other-host", "session", rules, paths=paths, ts=stamp)
+        written = credit.record_exposure(tmp_path, "host", "session", rules, paths=paths, ts=stamp)
         assert [row["rule"] for row in written] == ([] if phase == "read" else ["rule-e"])
 
     assert [row["rule"] for row in credit.record_exposure(
-        tmp_path, "other-host", "session", ["rule-a"], paths=paths, ts=stamp)] == ["rule-a"]
+        tmp_path, "host", "session", ["rule-a"], paths=paths, ts=stamp)] == ["rule-a"]
     assert [row["rule"] for row in real_read(tmp_path).rows] == (
         ["rule-c", "rule-b", "rule-d"] + ([] if phase == "read" else ["rule-e"]) + ["rule-a"])
 
@@ -878,11 +1321,11 @@ def test_fill_preserves_the_head_used_by_its_locked_read_when_it_also_appends(tm
 
     with monkeypatch.context() as patch:
         patch.setattr(credit, "read_rows_with_report", read)
-        written = credit.record_exposure(tmp_path, "other-host", "session", ["rule-a", "rule-c"], paths=paths, ts=stamp)
+        written = credit.record_exposure(tmp_path, "host", "session", ["rule-a", "rule-c"], paths=paths, ts=stamp)
     assert [row["rule"] for row in written] == ["rule-c"]
     assert [row["rule"] for row in real_read(tmp_path).rows] == ["rule-b", "rule-c"]
 
-    written = credit.record_exposure(tmp_path, "other-host", "session", ["rule-a"], paths=paths, ts=stamp)
+    written = credit.record_exposure(tmp_path, "host", "session", ["rule-a"], paths=paths, ts=stamp)
 
     assert [row["rule"] for row in written] == ["rule-a"]
     assert [row["rule"] for row in real_read(tmp_path).rows] == ["rule-b", "rule-c", "rule-a"]
@@ -1219,9 +1662,9 @@ def test_reset_between_locked_read_and_fill_without_append_restores_exposure(tmp
 
     with monkeypatch.context() as patch:
         patch.setattr(credit, "read_rows_with_report", read)
-        assert credit.record_exposure(tmp_path, "other-host", "session", ["rule-a"]) == []
+        assert credit.record_exposure(tmp_path, "host", "session", ["rule-a"]) == []
 
-    written = credit.record_exposure(tmp_path, "other-host", "session", ["rule-a"])
+    written = credit.record_exposure(tmp_path, "host", "session", ["rule-a"])
     assert [row["rule"] for row in written] == ["rule-a"]
     assert [row["rule"] for row in real_read(tmp_path).rows] == ["rule-a"]
 
@@ -1259,9 +1702,9 @@ def test_blank_regrowth_after_no_append_read_does_not_certify_missing_exposure(t
 
     with monkeypatch.context() as patch:
         patch.setattr(credit, "read_rows_with_report", read)
-        assert credit.record_exposure(tmp_path, "other-host", "session", ["rule-a"]) == []
+        assert credit.record_exposure(tmp_path, "host", "session", ["rule-a"]) == []
 
-    written = credit.record_exposure(tmp_path, "other-host", "session", ["rule-a"])
+    written = credit.record_exposure(tmp_path, "host", "session", ["rule-a"])
     assert [row["rule"] for row in written] == ["rule-a"]
     assert [row["rule"] for row in real_read(tmp_path).rows] == ["rule-a"]
 
@@ -1324,16 +1767,15 @@ def test_argon_0735_reset_traces_restore_exposure(tmp_path, monkeypatch, trace):
         reset()
         return rows
 
-    host = "other-host" if trace == "read-detection" else "host"
     with monkeypatch.context() as patch:
         if trace == "read-detection":
             patch.setattr(credit, "read_rows_with_report", read)
         else:
             patch.setattr(ledger, "append_rows", append)
-        written = credit.record_exposure(tmp_path, host, "session", ["rule-a"])
+        written = credit.record_exposure(tmp_path, "host", "session", ["rule-a"])
         assert [row["rule"] for row in written] == ([] if trace == "read-detection" else ["rule-a"])
 
-    written = credit.record_exposure(tmp_path, host, "session", ["rule-a"])
+    written = credit.record_exposure(tmp_path, "host", "session", ["rule-a"])
     assert [row["rule"] for row in written] == ["rule-a"]
     expected = ["rule-a"] if trace == "first-replace" else ["rule-d", "rule-a"]
     assert [row["rule"] for row in real_read(tmp_path).rows] == expected

@@ -6,21 +6,24 @@ the current lease itself. ``observe`` reads without the lock and never writes.
 from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
+import contextvars
 import json
 import os
+from os import fstat as _fstat
 from pathlib import Path
 import re
 import stat
 
 from aegis_core import gitsafe, kernel_identity, storage, storage_confined, team
+from aegis_core.storage_confined import open_directory
 from aegis_core.primitives import json_preflight, sanitize_display
 from aegis_core.redaction import redact_command_secrets
 from aegis_core.team_supervisor import read_owned_leaf
 from aegis_core.workspace.layout import WorkspaceLayout
 
 __all__ = [
-    "NAME", "MAX_BYTES", "descriptor_supported", "process_identity", "bind", "load", "judge",
-    "BindingLockRefused", "claim_exclusion",
+    "NAME", "MAX_BYTES", "descriptor_supported", "process_identity", "bind", "load", "observe",
+    "observation_token", "observation_since", "judge", "BindingLockRefused", "claim_exclusion",
 ]
 
 NAME = "writer-bindings.json"
@@ -57,6 +60,10 @@ class BindingLockRefused(ValueError):
     def __init__(self, code):
         super().__init__(_REASONS[code])
         self.code = code
+
+
+class _ConfigAbsent(Exception):
+    """The binding config path is descriptor-proven missing. Not a storage failure."""
 
 
 def _git_marker_above(workspace):
@@ -104,7 +111,7 @@ def claim_exclusion(workspace, *, validated_workspace=False):
                 normalized = os.path.abspath(spelling)
                 common = Path(normalized) if validated_workspace else _root(normalized)
                 handle = stack.enter_context(storage_confined.confined_file(common, (_CLAIM_LOCK,)))
-                stack.enter_context(storage.file_lock(common / _CLAIM_LOCK, timeout=0, dir_fd=handle._parent))
+                stack.enter_context(storage.file_lock(common / _CLAIM_LOCK, timeout=0, dir_fd=handle.parent_fd))
         except storage.LockTimeoutError:
             raise BindingLockRefused("state_locked") from None
         except Exception:
@@ -249,6 +256,7 @@ def _publish_leaf(directory, data):
 
 @contextmanager
 def _directory(home):
+    """Yield the config directory descriptor. Callers do not create it."""
     try:
         with _confined_file(home, (".config", "aegis", NAME)) as handle:
             info = handle.parent_stat()
@@ -259,6 +267,134 @@ def _directory(home):
         raise
     except Exception:
         raise _Refusal("state_unavailable") from None
+
+
+def _home_path(home):
+    """Return the original spelling and validated lexical path for the home.
+
+    The length is decided before ``Path`` or ``fsencode``. Newlines may name a
+    real directory; NUL, a relative path, and ``..`` may not.
+    """
+    if isinstance(home, Path):
+        spelling = str(home)
+    elif type(home) is str:
+        spelling = home
+    else:
+        raise _Refusal("state_unavailable")
+    if not 1 <= len(spelling) <= 32768 or "\x00" in spelling:
+        raise _Refusal("state_unavailable")
+    try:
+        os.fsencode(spelling)
+        path = Path(spelling)
+    except (OSError, ValueError, UnicodeError):
+        raise _Refusal("state_unavailable") from None
+    if not path.is_absolute() or ".." in path.parts:
+        raise _Refusal("state_unavailable")
+    return spelling, path
+
+
+def _fact_field(fact, index, name):
+    if type(fact) is tuple and len(fact) == 4:
+        return fact[index]
+    return getattr(fact, name, None)
+
+
+def _directory_mode(fact):
+    mode = _fact_field(fact, 3, "st_mode")
+    if type(mode) is not int or not stat.S_ISDIR(mode):
+        return None
+    return mode
+
+
+def _trusted_directory(fact, *, system_root=False):
+    """Require an owner-private directory, allowing UID 0 at the system root."""
+    mode = _directory_mode(fact)
+    uid = _fact_field(fact, 2, "st_uid")
+    return (mode is not None and not mode & (stat.S_IWGRP | stat.S_IWOTH)
+            and type(uid) is int and (uid == _current_uid() or (system_root and uid == 0)))
+
+
+def _close_owned(fds):
+    """Close descriptors this walk opened. A close error must not replace the refusal."""
+    if type(fds) is int:
+        fds = [fds]
+    while fds:
+        fd = fds.pop()
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _open_config_child(parent, name):
+    """Open one fixed name relative to a held directory descriptor."""
+    if name not in (".config", "aegis"):
+        raise _Refusal("state_unavailable")
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                     dir_fd=parent)
+    except FileNotFoundError:
+        raise
+    except OSError:
+        raise _Refusal("state_unavailable") from None
+    owned = True
+    try:
+        info = _fstat(fd)
+        entry = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if ((info.st_dev, info.st_ino) != (entry.st_dev, entry.st_ino)
+                or not stat.S_ISDIR(info.st_mode) or not stat.S_ISDIR(entry.st_mode)):
+            raise _Refusal("state_unavailable")
+        owned = False
+        return fd, info
+    except OSError:
+        raise _Refusal("state_unavailable") from None
+    finally:
+        if owned:
+            _close_owned(fd)
+
+
+def _child_or_absent(parent, name, home_info, *ancestors, system_root):
+    try:
+        return _open_config_child(parent, name)
+    except FileNotFoundError:
+        if (_trusted_directory(home_info, system_root=system_root)
+                and all(_trusted_directory(fact) for fact in ancestors)):
+            raise _ConfigAbsent() from None
+        raise _Refusal("state_unavailable") from None
+
+
+def _descend_binding(anchor, spelling, opened, *, system_root):
+    """Descend ``.config`` then ``aegis`` from the held home descriptor."""
+    if not anchor.observations:
+        raise _Refusal("state_unavailable")
+    home_info = anchor.observations[-1]
+    config_fd, config_info = _child_or_absent(anchor.fd, ".config", home_info, system_root=system_root)
+    opened.append(config_fd)
+    leaf_fd, leaf_info = _child_or_absent(config_fd, "aegis", home_info, config_info, system_root=system_root)
+    opened.append(leaf_fd)
+    if not _trusted_directory(leaf_info):
+        raise _Refusal("state_unavailable")
+    _root(spelling)
+
+
+@contextmanager
+def _observed_config(home):
+    """Walk the passwd home, then the two fixed names from its held descriptor.
+
+    Absence requires owner-private parent directories. The home alone may be
+    the canonical ``/`` owned by UID 0 with no group or other write access.
+    A present owner-private ``aegis`` leaf uses bind/load's spelling and owner
+    rules. A missing home, a writable absence ancestor, or an indeterminate
+    directory is a storage refusal.
+    """
+    spelling, path = _home_path(home)
+    opened = []
+    try:
+        with open_directory(os.open, path, close_fd=os.close, stat_fd=os.fstat, stat_entry=os.stat) as anchor:
+            _descend_binding(anchor, spelling, opened, system_root=path == Path("/"))
+            yield opened[-1]
+    finally:
+        _close_owned(opened)
 
 
 @contextmanager
@@ -391,6 +527,73 @@ def load(user_root):
         return _read_map(directory)
 
 
+def _binding_map(user_root):
+    """Read the binding map once. Absence is a missing child of a verified home.
+
+    Storage descriptors prove the walk. Linux process identity is required only
+    after a present config directory; it does not turn proven absence into storage.
+    """
+    if not storage_confined.descriptor_supported():
+        return "storage_unsafe", None
+    try:
+        with _observed_config(user_root) as directory:
+            records = _read_map(directory)
+    except _ConfigAbsent:
+        return "no_binding_config", None
+    except Exception:
+        return "storage_unsafe", None
+    if not descriptor_supported():
+        return "storage_unsafe", None
+    return "ready", records
+
+
+_OBSERVED = contextvars.ContextVar("aegis_writer_binding_observation", default=None)
+_OBSERVED_EPOCH = contextvars.ContextVar("aegis_writer_binding_observation_epoch", default=0)
+
+
+def observation_token():
+    """Epoch visible before this context's next ``judge`` publication."""
+    return _OBSERVED_EPOCH.get()
+
+
+def observation_since(token):
+    """Observation published after ``token``, or None when ``judge`` did not run.
+
+    A replacement ``judge`` leaves the epoch unchanged, so an older observation
+    cannot be mistaken for the verdict just returned.
+    """
+    if _OBSERVED_EPOCH.get() == token:
+        return None
+    current = _OBSERVED.get()
+    return current if type(current) is dict else None
+
+
+def observe(user_root, found, summary):
+    """Observe binding facts for these leases. Never writes and never raises.
+
+    ``binding`` is ``no_binding_config`` when a config component is missing
+    beneath trusted home and config directories. A present owner-private
+    binding directory stays authoritative. Missing home, untrusted absence
+    ancestry or indeterminate storage yields ``storage_unsafe``. ``judge``
+    returns ``verdict`` alone.
+    """
+    safe = summary if type(summary) is dict else {}
+    unavailable = {"binding": "storage_unsafe", "verdict": _unavailable(safe)}
+    try:
+        if (type(summary) is not dict or not isinstance(found, team.LeaseSet)
+                or type(found.leases) is not tuple or type(found.unreadable) is not tuple
+                or len(found.leases) + len(found.unreadable) > 256):
+            return unavailable
+        kind, records = _binding_map(user_root)
+        if kind == "no_binding_config":
+            return {"binding": "no_binding_config", "verdict": _unavailable(safe)}
+        if kind != "ready":
+            return unavailable
+        return {"binding": "ready", "verdict": _assemble(records, found, summary)}
+    except Exception:
+        return unavailable
+
+
 def _judge_one(records, scope, lease):
     record = records.get(lease.lane) if type(lease.lane) is str else None
     if record is None or record.get("claim_id") != lease.claim_id or record.get("gen") != lease.gen:
@@ -465,12 +668,12 @@ def _unavailable(summary):
 
 
 def judge(user_root, found, summary):
-    """Judge current leases against the binding file. Never writes and never raises."""
-    try:
-        if (type(summary) is not dict or not isinstance(found, team.LeaseSet)
-                or type(found.leases) is not tuple or type(found.unreadable) is not tuple
-                or len(found.leases) + len(found.unreadable) > 256 or not descriptor_supported()):
-            return _unavailable(summary if type(summary) is dict else {})
-        return _assemble(load(user_root), found, summary)
-    except Exception:
-        return _unavailable(summary if type(summary) is dict else {})
+    """Judge current leases against the binding file. Never writes and never raises.
+
+    The returned dict is only the verdict. The same call publishes the full
+    observation for ``observation_since``; callers that replace ``judge`` do not.
+    """
+    observed = observe(user_root, found, summary)
+    _OBSERVED.set(observed)
+    _OBSERVED_EPOCH.set(_OBSERVED_EPOCH.get() + 1)
+    return observed["verdict"]

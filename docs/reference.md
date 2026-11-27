@@ -1213,13 +1213,14 @@ Input schema:
 
 **Report Outcome**
 
-After tests or `aegis check`, report rules from `aegis_scan`; corrections use `aegis_capture_insight`. A passing `aegis check --record --tests` row for this tree enables credit for scan-exposed rules matching the diff once CI passes on the landing commit; otherwise at most one uncredited claim per session/tree. Limit: 200 report rows per session and 5 calls per 60 seconds.
+Report aegis_scan evidence; use aegis_capture_insight for corrections. Matching tested changes earn credit once CI passes on the landing commit. Limit: one uncredited claim per session/tree, 200 report rows per session and 5 calls per 60 seconds.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | `outcome` | string: one of `"success"`, `"partial"`, `"failure"`, `"tp"`, `"fp"`, `"pass"`, `"fail"` | yes | 'success', 'tp' and 'pass' claim a true positive (credited only after CI); the others read as a neutral trigger, never a false positive. |
 | `idempotency_key` | string | yes | Unique per report (scoped by host and session): a retry is a no-op; reuse with another outcome fails. |
-| `rules_used` | array of string | yes | Rule IDs from aegis_scan; credit comes from this session's scan exposure and the diff, not this list. |
+| `scan_ref` | string | no | Optional scan receipt from the same session. |
+| `rules_used` | array of string | yes | Rule IDs from aegis_scan. Exposure and the tested diff determine credit. |
 | `tests_passed` | boolean | no | Accepted for compatibility; ignored, never stored. |
 | `rework_count` | integer | no | Accepted for compatibility; ignored, never stored. |
 | `notes` | string | no | Accepted for compatibility; ignored, never stored. |
@@ -1250,13 +1251,20 @@ Input schema:
       "maxLength": 256,
       "description": "Unique per report (scoped by host and session): a retry is a no-op; reuse with another outcome fails."
     },
+    "scan_ref": {
+      "type": "string",
+      "minLength": 32,
+      "maxLength": 32,
+      "pattern": "^[0-9a-f]{32}$",
+      "description": "Optional scan receipt from the same session."
+    },
     "rules_used": {
       "type": "array",
       "items": {
         "type": "string"
       },
       "minItems": 1,
-      "description": "Rule IDs from aegis_scan; credit comes from this session's scan exposure and the diff, not this list."
+      "description": "Rule IDs from aegis_scan. Exposure and the tested diff determine credit."
     },
     "tests_passed": {
       "type": "boolean",

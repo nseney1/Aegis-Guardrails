@@ -27,6 +27,7 @@ rule into a system prompt, it returns only the rules for the changed files:
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+from hashlib import sha256
 import json
 from pathlib import Path, PurePath
 import posixpath
@@ -36,7 +37,7 @@ from aegis_core.adjudication import Adjudications
 from aegis_core.fitness import Fitness, compute, for_rules
 from aegis_core.guidance_projection import (
     ASCII_CHARS_PER_TOKEN as ASCII_CHARS_PER_TOKEN,
-    GuidanceProjectionError, GuidanceResult,
+    GuidanceProjectionError, GuidanceResult, ScanExposure, ServedRule,
     MAX_GUIDANCE_CHARS, WITHHELD_GUIDANCE,
     assembled_text, checked_result_copy, raw_rule_text,
     estimate_tokens as estimate_tokens,
@@ -46,9 +47,9 @@ from aegis_core.guidance_projection import (
 )
 from aegis_core.match import normalize_path, workspace_files
 from aegis_core import gitsafe, match as rule_match, rule_integrity
-from aegis_core.rule_integrity import MANDATORY_SLOT_CAP
+from aegis_core.rule_integrity import MANDATORY_SLOT_CAP, PolicyProvenance, ServedPolicy, policy_provenance
 from aegis_core.rule_inventory import RuleInventory, RuleInventoryError
-from aegis_core.rules import Rule, RuleCache, RuleSet, workspace_root
+from aegis_core.rules import Rule, RuleCache, RuleSet, load_rules, workspace_root
 from aegis_core.skills.slots import SlotRegistry
 from aegis_core.scan_simulation import (
     COLD_LIST_LIMIT as _COLD_LIST_LIMIT,
@@ -108,11 +109,11 @@ def resolve_token_budget(workspace: Any, max_tokens: Optional[int] = None) -> in
     return jit_max_tokens(workspace, JIT_DEFAULT_MAX_TOKENS)
 
 
-def _git_changed_files(workspace: Any) -> List[str]:
+def _git_changed_files(workspace: Any) -> Optional[List[str]]:
     """Files changed in the working tree or the index."""
     from aegis_core import gitsafe
 
-    return gitsafe.changed_files(workspace, "working") or []
+    return gitsafe.changed_files(workspace, "working")
 
 
 @dataclass(frozen=True)
@@ -128,7 +129,8 @@ class _SelectedPayload(dict):
 
     def __init__(self, payload: Dict[str, Any], staged: List[Dict[str, Any]]) -> None:
         super().__init__(payload)
-        self.rule_ids = tuple(entry["match"].rule.id for entry in staged)
+        self.served = tuple(entry["match"] for entry in staged)
+        self.rule_ids = tuple(match.rule.id for match in self.served)
         self.mandatory_count = sum(entry["match"].rule.mandatory for entry in staged)
 
 
@@ -143,6 +145,7 @@ class _Projection:
     matches: Tuple[_Match, ...]
     total_rules: int
     changed_files: int
+    exposure_paths: Optional[Tuple[str, ...]]
     budget: int
     token_budget: int
     stale: Tuple[Dict[str, Any], ...]
@@ -151,6 +154,8 @@ class _Projection:
 
     def render(self, registry: Optional[SlotRegistry]) -> GuidanceResult:
         identities: Tuple[str, ...] = ()
+        revisions: Tuple[Tuple[str, str], ...] = ()
+        snapshot = None
         mandatory_count = 0
         try:
             selected = _select_projection(self, registry)
@@ -159,25 +164,85 @@ class _Projection:
                 selected, preserve_omissions=True, staged_mandatory_count=selected_mandatory)
             if isinstance(selected, _SelectedPayload) and payload is selected:
                 identities = selected.rule_ids
+                proofs = tuple((match, policy_provenance(match.rule)) for match in selected.served)
+                revisions = tuple((match.rule.id, proof.identity[0]) for match, proof in proofs
+                                  if proof.identity is not None)
                 mandatory_count = selected.mandatory_count
+                if (self.exposure_paths is not None and (revisions or not identities)
+                        and all(proof.identity is not None or proof.synthetic for _, proof in proofs)):
+                    snapshot = _exposure_snapshot(self.exposure_paths, proofs, payload)
+            elif self.exposure_paths == () and not self.changed_files and payload.get("status") != _STATUS_FAIL:
+                snapshot = _exposure_snapshot((), (), payload)
         except GuidanceProjectionError as exc:
             payload = _failure(exc.code)
-        return _ScanResult(payload, self, identities, mandatory_count)
+        return _ScanResult(payload, self, identities, mandatory_count, snapshot, revisions)
+
+
+def _exposure_paths(raw: List[str], normalized: List[str]) -> Optional[Tuple[str, ...]]:
+    # Limit attribution's retained copy without affecting the guidance selection.
+    if len(raw) > 256 or sum(map(len, raw)) > 16 * 1024:
+        return None
+    if any(not path or path.startswith(("/", "../")) or path in (".", "..")
+           or posixpath.normpath(path) != path for path in raw):
+        return None
+    exact = set(raw)
+    if exact != set(normalized) or any(path != normalize_path(path) for path in exact):
+        return None
+    return tuple(sorted(exact))
+
+
+def _exposure_snapshot(paths: Tuple[str, ...], proofs: Tuple[Tuple[_Match, PolicyProvenance], ...],
+                       payload: dict) -> ScanExposure:
+    rules: List[ServedRule] = []
+    coverage = []
+    for match, proof in proofs:
+        rule = match.rule
+        matched = tuple(sorted(match.files))
+        coverage.append((rule.id, matched))
+        if proof.identity is None:
+            continue
+        revision, kind = proof.identity
+        # Git may normalize a CRLF checkout. Accept only the original or LF-normalized blob.
+        variants = (rule.raw, rule.raw.replace(b"\r\n", b"\n")) if b"\r\n" in rule.raw else (rule.raw,)
+        blobs = tuple(gitsafe.blob_id(raw, length) for raw in variants for length in (40, 64))
+        rules.append(ServedPolicy(rule.id, revision, rule.path, matched, blobs, kind))
+    digest = sha256(json.dumps(payload, sort_keys=True).encode("ascii")).hexdigest()
+    normalized = payload
+    provenance = payload.get("rules_base")
+    if isinstance(provenance, dict) and provenance.get("source") == "local-head":
+        # Unreviewed local HEAD movement changes the response's provenance, but
+        # not the served instruction or its revision. Keep the wire digest exact.
+        basis = {key: value for key, value in provenance.items() if key != "commit"}
+        normalized = {**payload, "rules_base": basis}
+    covered = tuple(sorted(coverage))
+    # Implicit receipt equality includes canonical coverage even if displayed paths coincide.
+    attribution_digest = sha256(json.dumps((normalized, covered), sort_keys=True).encode("ascii")).hexdigest()
+    return ScanExposure(paths, tuple(sorted(rules, key=lambda rule: rule.rule_id)),
+                        digest, attribution_digest, covered)
 
 
 class _ScanResult(GuidanceResult):
     def __init__(self, payload: Dict[str, Any], projection: _Projection,
-                 identities: Tuple[str, ...], mandatory_count: int) -> None:
+                 identities: Tuple[str, ...], mandatory_count: int, snapshot: Optional[ScanExposure],
+                 revisions: Tuple[Tuple[str, str], ...]) -> None:
         super().__init__(payload)
         self._projection = projection
         self._canonical_rule_ids = identities
         self._mandatory_count = mandatory_count
+        self._exposure = snapshot
+        self._revisions = revisions
 
     def with_registry(self, registry: SlotRegistry) -> Dict[str, Any]:
         return self._projection.render(registry)
 
     def exposure_rule_ids(self) -> Tuple[str, ...]:
         return self._canonical_rule_ids
+
+    def exposure_snapshot(self) -> Optional[ScanExposure]:
+        return self._exposure
+
+    def exposure_revisions(self) -> Tuple[Tuple[str, str], ...]:
+        return self._revisions
 
     def staged_mandatory_count(self) -> int:
         return self._mandatory_count
@@ -482,6 +547,7 @@ def scan(
     max_tokens: Optional[int] = None,
     *,
     registry: Optional[SlotRegistry] = None,
+    exposure_allowed: bool = True,
 ) -> Dict[str, Any]:
     """The rules for ``changed_files`` (default: the git working tree and index changes).
 
@@ -493,11 +559,12 @@ def scan(
     error code ``guidance_projection_limit`` without quoting rule content.
     """
     with gitsafe.memo():  # one answer per repository question for the whole scan
-        return _scan(workspace, changed_files, budget, max_tokens, registry)
+        return _scan(workspace, changed_files, budget, max_tokens, registry, exposure_allowed=exposure_allowed)
 
 
 def _scan(workspace: Any, changed_files: Optional[List[str]], budget: Optional[int],
-          max_tokens: Optional[int], registry: Optional[SlotRegistry], cache: Optional[RuleCache] = None) -> Dict[str, Any]:
+          max_tokens: Optional[int], registry: Optional[SlotRegistry], cache: Optional[RuleCache] = None,
+          *, exposure_allowed: bool = True) -> Dict[str, Any]:
     from aegis_core.sync import read_derived, stale_rules
 
     token_budget = resolve_token_budget(workspace, max_tokens)
@@ -524,12 +591,17 @@ def _scan(workspace: Any, changed_files: Optional[List[str]], budget: Optional[i
             compare_candidates(ruleset)
 
     # Workspace-relative, each file once, as every other surface matches them.
-    files = workspace_files(workspace_root(workspace), changed_files if changed_files else _git_changed_files(workspace))
+    root = workspace_root(workspace)
+    raw_files = changed_files or _git_changed_files(workspace)
+    files = workspace_files(root, raw_files or [])
+    exact_scope = None
+    if exposure_allowed and raw_files is not None and (changed_files or gitsafe.toplevel(root) == Path(root)):
+        exact_scope = _exposure_paths(raw_files, files)
     stale = stale_rules(ruleset, read_derived(workspace))
     # Labels are read only by decision callers: scan ranks without them and spawns no git for them.
     return select_guidance(ruleset, files, budget, token_budget, stale,
-                   lambda served: for_rules(workspace, served, adjudications=Adjudications()),
-                   _integrity_extras(view), registry)
+                   lambda served: for_rules(workspace, served, adjudications=Adjudications(), effective_view=view),
+                   _integrity_extras(view), registry, exposure_paths=exact_scope)
 
 
 def simulate_rule_selection(workspace: Any, inventory: RuleInventory, ruleset: RuleSet) -> Dict[str, str]:
@@ -657,6 +729,8 @@ def select_guidance(
     fitness_of: Callable[[List[Rule]], Dict[str, Fitness]],
     extras: Optional[Dict[str, Any]] = None,
     registry: Optional[SlotRegistry] = None,
+    *,
+    exposure_paths: Optional[Tuple[str, ...]] = None,
 ) -> Dict[str, Any]:
     """Capture matching source and fitness once, then select and project it.
 
@@ -674,7 +748,8 @@ def select_guidance(
     except GuidanceProjectionError as exc:
         return _failure(exc.code)
     projection = _Projection(
-        tuple(_match(r, f, fits[r.id]) for r, f in hits), len(served), len(files), slots, token_budget,
+        tuple(_match(r, f, fits[r.id]) for r, f in hits), len(served), len(files), exposure_paths,
+        slots, token_budget,
         tuple(source["stale_rules"]), tuple(source["warnings"]),
         {k: v for k, v in source.items() if k not in {"stale_rules", "warnings"}},
     )

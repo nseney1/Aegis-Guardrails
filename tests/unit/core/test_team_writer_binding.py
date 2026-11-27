@@ -7,9 +7,11 @@ descriptor_supported and does not open a home.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+import errno
 import json
 import os
+from pathlib import Path
 import shutil
 import stat
 import subprocess
@@ -18,10 +20,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from aegis_core import storage_confined, team
+from aegis_core import kernel_identity, storage, storage_confined, team
 from aegis_core import team_writer_binding as binding
 from tests.conftest import symlink_or_skip
-from tests.helpers_writer_binding import call_bind, lease, make_home, make_store
+from tests.helpers_writer_binding import call_bind, lease, make_home, make_store, root_binding_case
 
 
 def found(*leases, unreadable=()):
@@ -243,6 +245,64 @@ def test_leaf_symlink_keeps_target_bytes(tmp_path, monkeypatch):
     result = call_bind(home, workspace)
     assert result == _refusal("state_unavailable")
     assert target.read_bytes() == b"KEEP"
+
+
+def test_claim_exclusion_borrows_parent_fd_until_the_lock_is_released(tmp_path, monkeypatch):
+    workspace = make_store(tmp_path)
+    common = workspace / "common"
+    common.mkdir()
+    moved = workspace / "moved"
+    lock_name = "aegis-writer.lock"
+    borrowed = []
+    lock_dir_fds = []
+
+    @contextmanager
+    def confined_file(root, parts):
+        with storage_confined.confined_file(root, parts) as handle:
+            parent_fd = handle.parent_fd
+            borrowed.append(parent_fd)
+            common.rename(moved)
+            common.mkdir()
+            yield SimpleNamespace(parent_fd=parent_fd)
+            assert handle.parent_fd == parent_fd
+            assert os.path.samestat(os.fstat(parent_fd), moved.stat())
+
+    def record_file_lock(path, timeout=5.0, *, dir_fd=None):
+        lock_dir_fds.append(dir_fd)
+        return storage.file_lock(path, timeout=timeout, dir_fd=dir_fd)
+
+    monkeypatch.setattr(binding, "gitsafe", SimpleNamespace(common_dir=lambda _: common))
+    monkeypatch.setattr(binding, "storage_confined", SimpleNamespace(confined_file=confined_file))
+    monkeypatch.setattr(binding, "storage", SimpleNamespace(
+        file_lock=record_file_lock, LockTimeoutError=storage.LockTimeoutError))
+    with binding.claim_exclusion(workspace):
+        assert (moved / lock_name).is_file()
+        assert not (common / lock_name).exists()
+        assert os.path.samestat(os.fstat(borrowed[0]), moved.stat())
+
+    assert lock_dir_fds == [borrowed[0]]
+    with pytest.raises(OSError) as closed:
+        os.fstat(borrowed[0])
+    assert closed.value.errno == errno.EBADF
+
+
+def test_claim_exclusion_refuses_a_closed_handle_then_retries(tmp_path, monkeypatch):
+    workspace = make_store(tmp_path)
+    lock_name = "aegis-writer.lock"
+    with storage_confined.confined_file(workspace, (lock_name,)) as closed:
+        pass
+
+    monkeypatch.setattr(binding, "gitsafe", SimpleNamespace(common_dir=lambda _: workspace))
+    monkeypatch.setattr(binding, "storage_confined", SimpleNamespace(confined_file=lambda *_: nullcontext(closed)))
+    with pytest.raises(binding.BindingLockRefused, match="^writer lease is unavailable$") as refused:
+        with binding.claim_exclusion(workspace):
+            pytest.fail("claim lock accepted a closed handle")
+    assert refused.value.code == "lease_unavailable"
+    assert not (workspace / lock_name).exists()
+
+    monkeypatch.setattr(binding, "storage_confined", storage_confined)
+    with binding.claim_exclusion(workspace):
+        assert (workspace / lock_name).is_file()
 
 
 def test_second_bind_while_flock_held_then_retry_publishes(tmp_path, monkeypatch):
@@ -607,3 +667,578 @@ def test_successful_bind_closes_fds_and_records_the_lease_triple(tmp_path, monke
     assert row["start_ticks"] == identity["start_ticks"]
     assert row["boot_id"] == scope["boot_id"]
     assert row["pid_namespace"] == scope["pid_namespace"]
+
+
+def _fds():
+    if os.name != "posix" or not os.path.isdir("/proc/self/fd"):
+        return None
+    return set(os.listdir("/proc/self/fd"))
+
+
+def _require_linux_identity():
+    if not kernel_identity.descriptor_supported():
+        pytest.skip("requires Linux identity support")
+
+
+def _require_storage_descriptors():
+    if not storage_confined.descriptor_supported():
+        pytest.skip("requires descriptor-relative no-follow storage")
+
+
+def test_each_judge_publishes_its_own_observation(monkeypatch):
+    """A constant observe result is still a new publication. The verdict stays bare."""
+    constant = {"binding": "no_binding_config", "verdict": {
+        "state": "unknown", "reason": "bindings_unavailable", "leases": {}}}
+    monkeypatch.setattr(binding, "observe", lambda *args: constant)
+    token = binding.observation_token()
+    assert binding.observation_since(token) is None
+    judged = binding.judge("unused", "unused", {})
+    assert judged == constant["verdict"] and "binding" not in judged
+    assert binding.observation_since(token) is constant
+    again = binding.observation_token()
+    assert binding.judge("unused", "unused", {}) == judged
+    assert binding.observation_since(again) is constant
+    assert binding.observation_since(token) is constant
+
+
+def test_observe_unsupported_platform_does_not_open(monkeypatch, tmp_path):
+    """Unsupported probes are storage-unsafe and never touch a home."""
+    opened = _opens(monkeypatch)
+    probes = {"storage": 0}
+
+    def storage_probe():
+        probes["storage"] += 1
+        return False
+
+    def refused(*args, **kwargs):
+        opened.append(args)
+        raise AssertionError("unsupported probe must not open")
+
+    monkeypatch.setattr(binding.storage_confined, "descriptor_supported", storage_probe)
+    monkeypatch.setattr(binding.storage_confined, "open_directory", refused)
+    home = tmp_path / "zzmarker-home"
+    summary = {}
+    observed = binding.observe(str(home), found(lease()), summary)
+    judged = binding.judge(str(home), found(lease()), summary)
+    assert observed["binding"] == "storage_unsafe"
+    assert observed["verdict"]["reason"] == "bindings_unavailable"
+    assert "lanes" not in observed["verdict"]
+    assert judged == observed["verdict"]
+    assert "binding" not in judged
+    assert probes["storage"] >= 1
+    assert opened == []
+    assert not home.exists()
+
+
+def test_invalid_observation_inputs_do_not_open(monkeypatch, tmp_path):
+    opened = _opens(monkeypatch)
+    home = tmp_path / "zzmarker-home"
+    observed = binding.observe(str(home), "not-a-lease-set", [])
+    assert observed["binding"] == "storage_unsafe"
+    assert observed["verdict"] == {
+        "state": "unknown", "reason": "bindings_unavailable", "leases": {}}
+    assert binding.judge(str(home), "not-a-lease-set", []) == observed["verdict"]
+    assert opened == []
+    assert not home.exists()
+
+
+def test_missing_config_directory_is_absence_not_storage_failure(tmp_path):
+    """Absence is a binding fact. Retry does not create the directory."""
+    _require_linux_identity()
+    home = tmp_path.resolve() / "zzmarker-home"
+    home.mkdir()
+    os.chmod(home, 0o700)
+    chosen = found(lease())
+    before = _fds()
+    observed = binding.observe(str(home), chosen, {})
+    assert observed["binding"] == "no_binding_config"
+    assert observed["verdict"]["reason"] == "bindings_unavailable"
+    assert "lanes" not in observed["verdict"]
+    assert "zzmarker" not in repr(observed)
+    judged = binding.judge(str(home), chosen, {})
+    assert judged == {"state": "unknown", "reason": "bindings_unavailable", "leases": {}}
+    assert judged == binding.observe(str(home), chosen, {})["verdict"]
+    again = binding.observe(str(home), chosen, {})
+    assert again["binding"] == "no_binding_config"
+    assert not (home / ".config").exists()
+    if before is not None:
+        assert _fds() == before
+
+
+def test_missing_binding_file_is_ready_and_projects_judge(tmp_path):
+    _require_linux_identity()
+    home = make_home(tmp_path)
+    chosen = found(lease())
+    observed = binding.observe(str(home), chosen, {})
+    assert observed["binding"] == "ready"
+    assert observed["verdict"]["reason"] == "no_bound_liveness_source"
+    assert binding.judge(str(home), chosen, {}) == observed["verdict"]
+    assert "binding" not in binding.judge(str(home), chosen, {})
+
+
+def test_config_symlink_is_storage_unsafe_not_absence(tmp_path):
+    _require_linux_identity()
+    home = make_home(tmp_path)
+    config = home / ".config" / "aegis"
+    config.rmdir()
+    outside = tmp_path / "outside-config"
+    outside.mkdir()
+    os.chmod(outside, 0o700)
+    symlink_or_skip(outside, config, target_is_directory=True)
+    before = _fds()
+    observed = binding.observe(str(home), found(lease()), {})
+    assert observed["binding"] == "storage_unsafe"
+    assert observed["verdict"]["reason"] == "bindings_unavailable"
+    assert binding.judge(str(home), found(lease()), {})["reason"] == "bindings_unavailable"
+    assert not (outside / binding.NAME).exists()
+    assert "outside-config" not in repr(observed)
+    if before is not None:
+        assert _fds() == before
+
+
+def test_malformed_binding_stays_unsafe_on_retry(tmp_path):
+    _require_linux_identity()
+    home = make_home(tmp_path)
+    path = leaf(home)
+    path.write_bytes(b"{")
+    os.chmod(path, 0o600)
+    before_bytes = path.read_bytes()
+    before = _fds()
+    observed = binding.observe(str(home), found(lease()), {})
+    assert observed["binding"] == "storage_unsafe"
+    assert observed["verdict"]["reason"] == "bindings_unavailable"
+    assert path.read_bytes() == before_bytes
+    assert binding.observe(str(home), found(lease()), {})["binding"] == "storage_unsafe"
+    assert path.read_bytes() == before_bytes
+    if before is not None:
+        assert _fds() == before
+
+
+def test_concurrent_observations_do_not_create_config_or_leak(tmp_path):
+    _require_linux_identity()
+    home = tmp_path.resolve() / "zzmarker-home"
+    home.mkdir()
+    os.chmod(home, 0o700)
+    before = _fds()
+    barrier = threading.Barrier(4)
+    results = []
+    errors = []
+
+    def worker():
+        try:
+            barrier.wait(timeout=5)
+            results.append(binding.observe(str(home), found(lease()), {})["binding"])
+        except Exception as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert errors == []
+    assert results == ["no_binding_config"] * 4
+    assert not (home / ".config").exists()
+    if before is not None:
+        assert _fds() == before
+
+
+def test_missing_passwd_home_is_storage_not_absence(tmp_path):
+    _require_storage_descriptors()
+    missing = tmp_path.resolve() / "no-such-zzmarker-home"
+    before = _fds()
+    observed = binding.observe(str(missing), found(lease()), {})
+    assert observed["binding"] == "storage_unsafe"
+    assert observed["verdict"]["reason"] == "bindings_unavailable"
+    assert "zzmarker" not in repr(observed)
+    assert not missing.exists()
+    if before is not None:
+        assert _fds() == before
+
+
+def _foreign_uid():
+    return 0 if os.getuid() != 0 else 1
+
+
+class _HeldDirectory:
+    """Test double for DirectoryAnchor. Closes its own dup and nothing else."""
+
+    def __init__(self, source, observations):
+        self.fd = os.dup(source)
+        self.observations = observations
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+        return False
+
+
+def _patch_descriptor_facts(monkeypatch, tmp_path, observations, child):
+    """Replace the home walk and the two fixed descents. Does not patch os.open or os.close."""
+    _require_storage_descriptors()
+    source_dir = tmp_path / "anchor-source"
+    source_dir.mkdir()
+    source = os.open(source_dir, os.O_RDONLY | os.O_DIRECTORY)
+    opened = []
+
+    def open_directory(_opener, root, **_kwargs):
+        opened.append(os.fspath(root))
+        return _HeldDirectory(source, observations)
+
+    monkeypatch.setattr(binding, "open_directory", open_directory)
+    monkeypatch.setattr(binding, "_open_config_child", child)
+    monkeypatch.setattr(binding.storage_confined, "descriptor_supported", lambda: True)
+    return opened, source
+
+
+@pytest.mark.parametrize("missing, ownership, mode, spelling, expected", [
+    (".config", "owner", 0o755, "/home/writer", "no_binding_config"),
+    ("aegis", "owner", 0o755, "/home/writer", "no_binding_config"),
+    (".config", "foreign", 0o755, "/home/writer", "storage_unsafe"),
+    ("aegis", "foreign", 0o755, "/home/writer", "storage_unsafe"),
+    (".config", "root", 0o755, "/", "no_binding_config"),
+    (".config", "root", 0o755, "/home/writer", "storage_unsafe"),
+    (".config", "root", 0o755, "//", "storage_unsafe"),
+    (".config", "foreign", 0o755, "/", "storage_unsafe"),
+    ("aegis", "root", 0o755, "/", "storage_unsafe"),
+    ("aegis", "owner", 0o755, "/", "no_binding_config"),
+    (".config", "root", 0o775, "/", "storage_unsafe"),
+    ("aegis", "owner", 0o757, "/", "storage_unsafe"),
+])
+def test_missing_child_requires_trusted_descriptor_facts(tmp_path, monkeypatch, missing, ownership,
+                                                         mode, spelling, expected):
+    owner = 1001
+    uid = {"owner": owner, "root": 0, "foreign": 1002}[ownership]
+    monkeypatch.setattr(binding, "_current_uid", lambda: owner)
+    home_uid = uid if missing == ".config" else (0 if spelling == "/" else owner)
+    home_mode = mode if missing == ".config" else 0o755
+    home = (1, 2, home_uid, stat.S_IFDIR | home_mode)
+    children = []
+
+    def open_child(parent, name):
+        children.append(name)
+        if name == missing:
+            raise FileNotFoundError(name)
+        return os.dup(parent), (1, 3, uid, stat.S_IFDIR | mode)
+
+    opened, source = _patch_descriptor_facts(monkeypatch, tmp_path, (home,), open_child)
+    try:
+        before = _fds()
+        for value in (spelling, Path(spelling)):
+            observed = binding.observe(value, found(lease()), {})
+            assert observed["binding"] == expected, observed
+            assert observed["verdict"]["reason"] == "bindings_unavailable"
+        assert opened == [spelling, spelling]
+        names = [".config"] if missing == ".config" else [".config", "aegis"]
+        assert children == names * 2
+        if before is not None:
+            assert _fds() == before
+    finally:
+        os.close(source)
+
+
+def test_private_leaf_remains_authoritative_under_foreign_writable_home(tmp_path, monkeypatch):
+    """A safe system-root home can establish absence when a child is missing.
+
+    A present owner-private aegis directory stays authoritative. Group-writable
+    ancestry with a missing child stays storage.
+    """
+    if os.name != "posix" or not hasattr(os, "getuid"):
+        pytest.skip("requires a passwd uid")
+    root_owned = (1, 2, 0, stat.S_IFDIR | 0o755)
+    writable = (1, 2, _foreign_uid(), stat.S_IFDIR | 0o777)
+    reads = []
+
+    def missing(_parent, _name):
+        raise FileNotFoundError(_name)
+
+    def present(_parent, name):
+        source = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+        if name == "aegis":
+            info = SimpleNamespace(st_uid=os.getuid(), st_mode=stat.S_IFDIR | 0o700, st_dev=1, st_ino=4)
+        else:
+            info = SimpleNamespace(st_uid=_foreign_uid(), st_mode=stat.S_IFDIR | 0o755, st_dev=1, st_ino=3)
+        return source, info
+
+    def read_map(directory):
+        reads.append(directory)
+        return {}
+
+    opened, anchor = _patch_descriptor_facts(monkeypatch, tmp_path, (root_owned,), missing)
+    try:
+        absent = binding.observe("/", found(lease()), {})
+        assert absent["binding"] == "no_binding_config"
+        assert opened == ["/"]
+        opened.clear()
+        monkeypatch.setattr(binding, "open_directory", lambda _opener, root, **_kwargs: (
+            opened.append(os.fspath(root)) or _HeldDirectory(
+                anchor, ((1, 2, _foreign_uid(), stat.S_IFDIR | 0o777),))))
+        monkeypatch.setattr(binding, "_open_config_child", present)
+        monkeypatch.setattr(binding, "_read_map", read_map)
+        present_leaf = binding.observe("/", found(lease()), {})
+        assert present_leaf["binding"] != "no_binding_config"
+        assert reads, "a present private leaf is read"
+        if kernel_identity.descriptor_supported():
+            assert present_leaf["binding"] == "ready"
+        else:
+            assert present_leaf["binding"] == "storage_unsafe"
+        opened.clear()
+        monkeypatch.setattr(binding, "_open_config_child", missing)
+        _patch_opened = opened
+        monkeypatch.setattr(binding, "open_directory", lambda _opener, root, **_kwargs: (
+            _patch_opened.append(os.fspath(root)) or _HeldDirectory(anchor, (writable,))))
+        unsafe = binding.observe("/", found(lease()), {})
+        assert unsafe["binding"] == "storage_unsafe"
+    finally:
+        os.close(anchor)
+
+
+def test_root_passwd_home_uses_descriptor_facts(root_binding_case):
+    home, allows_absence, assert_walk_closed = root_binding_case
+    observed = binding.observe(home, found(lease()), {})
+    assert observed["binding"] == ("no_binding_config" if allows_absence else "storage_unsafe")
+    assert observed["verdict"]["reason"] == "bindings_unavailable"
+    assert "lanes" not in observed["verdict"]
+    assert_walk_closed()
+
+
+def test_missing_aegis_under_group_writable_config_is_storage(tmp_path):
+    _require_storage_descriptors()
+    home = tmp_path.resolve() / "zzmarker-home"
+    config = home / ".config"
+    config.mkdir(parents=True)
+    os.chmod(home, 0o700)
+    os.chmod(config, 0o770)
+    before = _fds()
+    observed = binding.observe(str(home), found(lease()), {})
+    assert observed["binding"] == "storage_unsafe"
+    assert not (config / "aegis").exists()
+    assert "zzmarker" not in repr(observed)
+    if before is not None:
+        assert _fds() == before
+
+
+def test_descriptor_proven_absence_without_kernel_identity(tmp_path, monkeypatch):
+    _require_storage_descriptors()
+    monkeypatch.setattr(binding, "descriptor_supported", lambda: False)
+    home = tmp_path.resolve() / "zzmarker-home"
+    home.mkdir()
+    os.chmod(home, 0o700)
+    before = _fds()
+    observed = binding.observe(str(home), found(lease()), {})
+    assert observed["binding"] == "no_binding_config"
+    assert binding.judge(str(home), found(lease()), {})["reason"] == "bindings_unavailable"
+    assert not (home / ".config").exists()
+    if before is not None:
+        assert _fds() == before
+
+
+def test_present_config_without_kernel_identity_stays_unsafe(tmp_path, monkeypatch):
+    _require_storage_descriptors()
+    monkeypatch.setattr(binding, "descriptor_supported", lambda: False)
+    home = make_home(tmp_path)
+    observed = binding.observe(str(home), found(lease()), {})
+    assert observed["binding"] == "storage_unsafe"
+    assert observed["verdict"]["reason"] == "bindings_unavailable"
+
+
+def test_absence_ignores_binding_spelling_limits(tmp_path):
+    _require_storage_descriptors()
+    home = tmp_path.resolve() / "zz\nmarker"
+    home.mkdir()
+    os.chmod(home, 0o700)
+    with pytest.raises(binding._Refusal):
+        binding._root(str(home))
+    before = _fds()
+    observed = binding.observe(str(home), found(lease()), {})
+    assert observed["binding"] == "no_binding_config"
+    assert not (home / ".config").exists()
+    assert "\n" not in repr(observed)
+    if before is not None:
+        assert _fds() == before
+
+
+def test_absence_under_a_deep_home_spelling(tmp_path):
+    _require_storage_descriptors()
+    home = tmp_path.resolve().joinpath(*(["d"] * 130))
+    if len(str(home)) > 32768:
+        pytest.skip("home spelling exceeds confined storage")
+    home.mkdir(parents=True)
+    os.chmod(home, 0o700)
+    spelling = str(home)
+    assert spelling.count("/") + spelling.count("\\") > 128
+    with pytest.raises(binding._Refusal):
+        binding._root(spelling)
+    observed = binding.observe(spelling, found(lease()), {})
+    assert observed["binding"] == "no_binding_config"
+    assert not (home / ".config").exists()
+
+
+@pytest.mark.parametrize("length", [32754, 32755, 32768])
+def test_absence_uses_the_home_budget_not_the_config_suffix(tmp_path, monkeypatch, length):
+    """The home keeps the full 32768-character root budget. .config and aegis are descents."""
+    spelling = "/" + ("h" * (length - 1))
+    assert len(spelling) == length
+    home_fact = (1, 2, os.getuid() if hasattr(os, "getuid") else 0, stat.S_IFDIR | 0o700)
+
+    def missing(_parent, name):
+        raise FileNotFoundError(name)
+
+    opened, source = _patch_descriptor_facts(monkeypatch, tmp_path, (home_fact,), missing)
+    before = _fds()
+    try:
+        observed = binding.observe(spelling, found(lease()), {})
+        assert observed["binding"] == "no_binding_config", observed
+        assert opened == [spelling]
+        assert "/.config/aegis" not in opened[0]
+        same = binding.observe(Path(spelling), found(lease()), {})
+        assert same["binding"] == "no_binding_config"
+        assert opened[-1] == spelling
+        if before is not None:
+            assert _fds() == before
+    finally:
+        os.close(source)
+
+
+@pytest.mark.parametrize("spelling", ["/" + "h" * 32768, "/" * 32769], ids=["component", "separators"])
+def test_overlong_home_is_storage_before_the_walk(monkeypatch, spelling):
+    assert len(spelling) == 32769
+    opened = []
+
+    def open_directory(*_args, **_kwargs):
+        opened.append(True)
+        raise AssertionError("overlong home must be refused before open_directory")
+
+    monkeypatch.setattr(binding, "open_directory", open_directory)
+    monkeypatch.setattr(binding.storage_confined, "descriptor_supported", lambda: True)
+    observed = binding.observe(spelling, found(lease()), {})
+    assert observed["binding"] == "storage_unsafe"
+    assert opened == []
+    assert "h" * 40 not in repr(observed)
+
+
+@pytest.mark.parametrize("spelling", ["/" + "h" * 32754, "/" * 129], ids=["length", "separators"])
+def test_present_leaf_past_the_binding_spelling_limit_is_storage(tmp_path, monkeypatch, spelling):
+    """Apply the original spelling limits when a private directory is present."""
+    home_fact = (1, 2, os.getuid() if hasattr(os, "getuid") else 0, stat.S_IFDIR | 0o700)
+    source_box = []
+
+    def present(_parent, name):
+        fd = os.dup(source_box[0])
+        info = SimpleNamespace(st_uid=os.getuid() if hasattr(os, "getuid") else 0,
+                               st_mode=stat.S_IFDIR | 0o700, st_dev=1, st_ino=4)
+        return fd, info
+
+    opened, source = _patch_descriptor_facts(monkeypatch, tmp_path, (home_fact,), present)
+    source_box.append(source)
+    reads = []
+    monkeypatch.setattr(binding, "_read_map", lambda directory: reads.append(directory) or {})
+    before = _fds()
+    try:
+        observed = binding.observe(spelling, found(lease()), {})
+        assert observed["binding"] == "storage_unsafe"
+        assert reads == []
+        assert opened == [str(Path(spelling))]
+        if spelling.endswith("/"):
+            binding.observe(Path(spelling), found(lease()), {})
+            assert len(reads) == 1
+        if before is not None:
+            assert _fds() == before
+    finally:
+        os.close(source)
+
+
+def test_path_and_str_homes_observe_the_same_binding(tmp_path):
+    home = make_home(tmp_path)
+    chosen = found(lease())
+    as_path = binding.observe(home, chosen, {})
+    as_text = binding.observe(str(home), chosen, {})
+    assert as_path["binding"] == as_text["binding"]
+    assert binding.judge(home, chosen, {}) == binding.judge(str(home), chosen, {})
+    if kernel_identity.descriptor_supported():
+        assert as_path["binding"] == "ready"
+
+
+def test_group_writable_home_is_storage_when_config_is_missing(tmp_path):
+    _require_storage_descriptors()
+    home = tmp_path.resolve() / "zzmarker-home"
+    home.mkdir()
+    os.chmod(home, 0o775)
+    before = _fds()
+    observed = binding.observe(str(home), found(lease()), {})
+    assert observed["binding"] == "storage_unsafe"
+    assert not (home / ".config").exists()
+    if before is not None:
+        assert _fds() == before
+
+
+def test_group_writable_home_keeps_a_private_binding_directory(tmp_path):
+    _require_linux_identity()
+    home = make_home(tmp_path)
+    os.chmod(home, 0o775)
+    os.chmod(home / ".config", 0o700)
+    os.chmod(home / ".config" / "aegis", 0o700)
+    before = _fds()
+    observed = binding.observe(home, found(lease()), {})
+    assert observed["binding"] == "ready", observed
+    assert binding.observe(str(home), found(lease()), {})["binding"] == "ready"
+    if before is not None:
+        assert _fds() == before
+
+
+def test_config_child_closes_when_fstat_fails(tmp_path, monkeypatch):
+    """A child descriptor is closed when the post-open stat fails."""
+    _require_storage_descriptors()
+    home = tmp_path.resolve() / "zzmarker-home"
+    config = home / ".config"
+    config.mkdir(parents=True)
+    os.chmod(home, 0o700)
+    os.chmod(config, 0o700)
+
+    opened = []
+
+    def fail_fstat(fd):
+        opened.append(fd)
+        raise OSError(1, "injected")
+
+    parent = os.open(home, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    before = _fds()
+    try:
+        monkeypatch.setattr(binding, "_fstat", fail_fstat)
+        with pytest.raises(binding._Refusal) as caught:
+            binding._open_config_child(parent, ".config")
+        assert caught.value.code == "state_unavailable"
+        assert "injected" not in str(caught.value)
+        assert len(opened) == 1
+        with pytest.raises(OSError) as closed:
+            os.fstat(opened[0])
+        assert closed.value.errno == errno.EBADF
+        if before is not None:
+            assert _fds() == before
+    finally:
+        os.close(parent)
+
+
+def test_unsupported_platform_does_not_descend_config_children(monkeypatch, tmp_path):
+    """The storage probe is the gate. A false probe never opens the home or a child."""
+    calls = []
+
+    def child(*_args, **_kwargs):
+        calls.append("child")
+        raise AssertionError("unsupported probe must not descend")
+
+    def storage_probe():
+        calls.append("probe")
+        return False
+
+    monkeypatch.setattr(binding.storage_confined, "descriptor_supported", storage_probe)
+    monkeypatch.setattr(binding, "_open_config_child", child)
+    monkeypatch.setattr(binding, "open_directory", lambda *_args, **_kwargs: calls.append("open"))
+    observed = binding.observe(str(tmp_path / "zzmarker-home"), found(lease()), {})
+    assert observed["binding"] == "storage_unsafe"
+    assert calls == ["probe"]
+    assert not (tmp_path / "zzmarker-home").exists()
